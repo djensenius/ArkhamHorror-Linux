@@ -1,0 +1,59 @@
+name: Feature request
+description: Propose a Steam Deck or desktop Linux capability or interaction
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      description: Select every environment this proposal affects.
+      multiple: true
+      options:
+        - Steam Deck Gaming Mode
+        - Steam Deck Desktop Mode
+        - Desktop Wayland
+        - Desktop X11
+        - Shared Linux implementation
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user need rather than only the proposed control.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+      description: Explain the workflow and expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: native-interaction
+    attributes:
+      label: Native interaction
+      description: Describe controller, Steam Input, touch, keyboard, pointer, and focus behavior without a virtual cursor.
+    validations:
+      required: true
+  - type: textarea
+    id: accessibility
+    attributes:
+      label: Accessibility considerations
+      description: Include AT-SPI, Orca, contrast, text scaling, reduced motion, or alternate-input implications.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Checklist
+      options:
+        - label: I reviewed the roadmap and searched existing issues.
+          required: true
+        - label: This proposal does not require distributing official card or gaming-mat artwork.
+          required: true

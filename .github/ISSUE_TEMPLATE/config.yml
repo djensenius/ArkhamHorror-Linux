@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/djensenius/ArkhamHorror-Linux/security/advisories/new
+    about: Report security issues privately. Do not include exploit details in a public issue.
+  - name: Linux client roadmap
+    url: https://github.com/djensenius/ArkhamHorror-Linux/issues/5
+    about: Review planned phases and existing implementation issues.
+  - name: Backend issue
+    url: https://github.com/djensenius/ArkhamHorror/issues/new/choose
+    about: Report reproducible server or protocol behavior in the backend fork.
