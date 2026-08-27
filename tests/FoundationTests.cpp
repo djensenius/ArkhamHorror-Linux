@@ -17,8 +17,8 @@ private slots:
 };
 
 void FoundationTests::normalizesApiUrls() {
-  const Arkham::ServerProfile profile(
-      QUrl(QStringLiteral("https://example.com/ignored?q=1")));
+  const Arkham::ServerProfile profile(QUrl(
+      QStringLiteral("https://investigator:secret@example.com/ignored?q=1")));
 
   QCOMPARE(profile.baseUrl(), QUrl(QStringLiteral("https://example.com")));
   QCOMPARE(profile.apiUrl(u"whoami"),

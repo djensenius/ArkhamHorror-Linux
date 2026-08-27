@@ -5,6 +5,7 @@
 namespace Arkham {
 
 ServerProfile::ServerProfile(QUrl baseUrl) : m_baseUrl(std::move(baseUrl)) {
+  m_baseUrl.setUserInfo(QString{});
   m_baseUrl.setPath({});
   m_baseUrl.setQuery(QString{});
   m_baseUrl.setFragment({});
