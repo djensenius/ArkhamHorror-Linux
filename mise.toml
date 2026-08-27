@@ -1,0 +1,57 @@
+[tools]
+cmake = "4.4.3"
+ninja = "1.13.1"
+
+[env]
+BUILD_DIR = "build"
+
+[tasks."setup:macos"]
+description = "Install Qt development dependencies with Homebrew"
+run = "brew install clang-format qtbase qtdeclarative qtshadertools qtsvg qtwebsockets"
+
+[tasks.configure]
+description = "Configure the Qt build"
+run = '''
+QT_PREFIX="${QT_PREFIX:-${QTDIR:-$(brew --prefix 2>/dev/null || true)}}"
+cmake -S . -B "$BUILD_DIR" -G Ninja \
+  ${QT_PREFIX:+-DCMAKE_PREFIX_PATH="$QT_PREFIX"} \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON
+'''
+
+[tasks.build]
+description = "Build the application and tests"
+depends = ["configure"]
+run = "cmake --build \"$BUILD_DIR\" --parallel"
+
+[tasks.test]
+description = "Run headless foundation tests"
+depends = ["build"]
+env.QT_QPA_PLATFORM = "offscreen"
+run = "ctest --test-dir \"$BUILD_DIR\" --output-on-failure"
+
+[tasks."format:check"]
+description = "Check C++ and QML formatting"
+run = '''
+clang-format --dry-run --Werror src/*.cpp src/*.h tests/*.cpp
+for file in qml/*.qml; do
+  formatted="$(mktemp)"
+  qmlformat "$file" > "$formatted"
+  if ! cmp -s "$file" "$formatted"; then
+    echo "$file is not formatted; run: qmlformat -i $file" >&2
+    rm -f "$formatted"
+    exit 1
+  fi
+  rm -f "$formatted"
+done
+'''
+
+[tasks.lint]
+description = "Run QML static analysis"
+depends = ["configure"]
+run = "qmllint -I \"$BUILD_DIR\" qml/*.qml"
+
+[tasks."package:appimage"]
+description = "Build a Linux x86_64 AppImage"
+depends = ["build"]
+run = "packaging/build-appimage.sh \"$BUILD_DIR\""
