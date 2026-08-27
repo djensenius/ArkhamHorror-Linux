@@ -1,5 +1,7 @@
 #include "ServerProfile.h"
 
+#include <utility>
+
 namespace Arkham {
 
 ServerProfile::ServerProfile(QUrl baseUrl) : m_baseUrl(std::move(baseUrl)) {
