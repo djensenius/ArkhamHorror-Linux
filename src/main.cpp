@@ -1,6 +1,8 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 
+#include <cstdlib>
+
 #include "ServerProfile.h"
 
 int main(int argc, char *argv[]) {

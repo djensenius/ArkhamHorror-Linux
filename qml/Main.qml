@@ -81,6 +81,11 @@ ApplicationWindow {
                     }
                 ]
 
+                onItemAdded: (index, item) => {
+                    if (index === 0)
+                        item.forceActiveFocus();
+                }
+
                 delegate: Button {
                     id: destination
 
@@ -89,11 +94,10 @@ ApplicationWindow {
                     Layout.preferredWidth: 280
                     Layout.preferredHeight: 150
                     activeFocusOnTab: true
-                    focus: index === 0
                     text: modelData.title
 
                     KeyNavigation.left: index > 0 ? destinations.itemAt(index - 1) : null
-                    KeyNavigation.right: index < 2 ? destinations.itemAt(index + 1) : null
+                    KeyNavigation.right: index + 1 < destinations.count ? destinations.itemAt(index + 1) : null
 
                     contentItem: Column {
                         anchors {
