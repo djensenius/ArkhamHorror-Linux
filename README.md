@@ -25,11 +25,12 @@ not implemented yet. Official artwork is not bundled in this repository.
 
 - [mise](https://mise.jdx.dev/)
 - CMake and Ninja
-- Qt 6.11 with Quick, Quick Controls, SVG, and WebSockets
+- Qt 6.8 or newer with Quick, Quick Controls, and WebSockets
 - C++23 compiler
 
 On macOS, `mise run setup:macos` installs the Homebrew dependencies. On Linux,
-install the equivalent Qt development packages or use CI as the reference.
+install the equivalent Qt development packages or use CI as the reference. CI
+currently pins Qt 6.11.1 while CMake retains 6.8 as the supported minimum.
 
 ## Commands
 
