@@ -17,10 +17,15 @@ The Haskell backend remains authoritative for game rules.
 
 ## Local workflow
 
-Install the pinned tools and platform dependencies:
+Install the pinned tools on every development platform:
 
 ```sh
 mise install
+```
+
+On macOS, install the Homebrew Qt development dependencies:
+
+```sh
 mise run setup:macos
 ```
 

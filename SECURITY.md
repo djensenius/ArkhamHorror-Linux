@@ -15,5 +15,5 @@ disclosure.
 
 Include the affected distribution, display environment, build, reproduction
 conditions, expected impact, and any suggested mitigation. Remove server
-tokens, passwords, private game data, and personally identifying information
+tokens, passwords, private game data, and personally identifiable information
 from all attachments.
