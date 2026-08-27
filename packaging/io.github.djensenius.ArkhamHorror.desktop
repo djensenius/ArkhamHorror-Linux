@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Arkham Horror
+Comment=Controller-first client for the Arkham Horror LCG backend
+Exec=arkham-horror
+Icon=io.github.djensenius.ArkhamHorror
+Categories=Game;CardGame;
+Terminal=false

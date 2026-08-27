@@ -1,0 +1,7 @@
+build/
+.cache/
+.qt/
+.qmlls.ini
+*.AppImage
+AppDir/
+.DS_Store
