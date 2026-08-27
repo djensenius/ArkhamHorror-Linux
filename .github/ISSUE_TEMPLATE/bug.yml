@@ -1,0 +1,92 @@
+name: Bug report
+description: Report reproducible incorrect behavior in the Steam Deck or Linux client
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the client. Never include passwords, tokens, private game exports, or copyrighted artwork.
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      description: Select every environment where the issue occurs.
+      multiple: true
+      options:
+        - Steam Deck Gaming Mode (Gamescope/Wayland)
+        - Steam Deck Desktop Mode
+        - Desktop Wayland
+        - Desktop X11
+        - Offscreen or CI
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Build or commit
+      description: Provide the AppImage version, release tag, or commit SHA.
+      placeholder: "Example: main at 2a977b5"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System details
+      description: Include distribution, Qt version, display protocol, and GPU where relevant.
+      placeholder: "Example: SteamOS 3.x, Gamescope, Qt 6.11.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: server
+    attributes:
+      label: Server
+      options:
+        - Hosted service
+        - Self-hosted server
+        - Fixture gallery or no server
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest repeatable sequence.
+      placeholder: |
+        1. Launch ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: input
+    attributes:
+      label: Input and accessibility context
+      description: Note controller model, Steam Input mapping, touch, keyboard, pointer, Orca, or other relevant settings.
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Attach screenshots or logs only after removing secrets, private data, and unlicensed artwork.
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials and private data from this report.
+          required: true
