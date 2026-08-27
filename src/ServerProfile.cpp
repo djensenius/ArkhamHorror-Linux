@@ -11,6 +11,10 @@ ServerProfile::ServerProfile(QUrl baseUrl) : m_baseUrl(std::move(baseUrl)) {
 const QUrl &ServerProfile::baseUrl() const { return m_baseUrl; }
 
 QUrl ServerProfile::apiUrl(const QStringView path) const {
+  if (!isValid()) {
+    return {};
+  }
+
   QUrl result = m_baseUrl;
   const QString pathString = path.toString();
   const QString normalizedPath = pathString.startsWith(QLatin1Char('/'))
@@ -21,6 +25,10 @@ QUrl ServerProfile::apiUrl(const QStringView path) const {
 }
 
 QUrl ServerProfile::websocketUrl(const QStringView path) const {
+  if (!isValid()) {
+    return {};
+  }
+
   QUrl result = apiUrl(path);
   if (result.scheme() == QStringLiteral("https")) {
     result.setScheme(QStringLiteral("wss"));

@@ -1,3 +1,5 @@
+#include <array>
+
 #include <QtTest>
 
 #include "AppCommand.h"
@@ -37,8 +39,11 @@ void FoundationTests::convertsWebsocketSchemes() {
 }
 
 void FoundationTests::rejectsUnsupportedServerSchemes() {
-  QVERIFY(!Arkham::ServerProfile(QUrl(QStringLiteral("file:///tmp/server")))
-               .isValid());
+  const Arkham::ServerProfile unsupported(
+      QUrl(QStringLiteral("file:///tmp/server")));
+  QVERIFY(!unsupported.isValid());
+  QVERIFY(unsupported.apiUrl(u"whoami").isEmpty());
+  QVERIFY(unsupported.websocketUrl(u"/arkham/games/game-id").isEmpty());
   QVERIFY(!Arkham::ServerProfile(QUrl(QStringLiteral("https:///missing-host")))
                .isValid());
   QVERIFY(
@@ -47,10 +52,25 @@ void FoundationTests::rejectsUnsupportedServerSchemes() {
 }
 
 void FoundationTests::givesSemanticCommandsStableNames() {
-  QCOMPARE(Arkham::commandName(Arkham::AppCommand::Select),
-           QStringLiteral("select"));
-  QCOMPARE(Arkham::commandName(Arkham::AppCommand::OpenHand),
-           QStringLiteral("open-hand"));
+  const std::array mappings{
+      std::pair{Arkham::AppCommand::MoveUp, QStringLiteral("move-up")},
+      std::pair{Arkham::AppCommand::MoveDown, QStringLiteral("move-down")},
+      std::pair{Arkham::AppCommand::MoveLeft, QStringLiteral("move-left")},
+      std::pair{Arkham::AppCommand::MoveRight, QStringLiteral("move-right")},
+      std::pair{Arkham::AppCommand::Select, QStringLiteral("select")},
+      std::pair{Arkham::AppCommand::Back, QStringLiteral("back")},
+      std::pair{Arkham::AppCommand::Inspect, QStringLiteral("inspect")},
+      std::pair{Arkham::AppCommand::OpenActions,
+                QStringLiteral("open-actions")},
+      std::pair{Arkham::AppCommand::OpenHand, QStringLiteral("open-hand")},
+      std::pair{Arkham::AppCommand::OpenLog, QStringLiteral("open-log")},
+      std::pair{Arkham::AppCommand::RestoreCamera,
+                QStringLiteral("restore-camera")},
+  };
+
+  for (const auto &[command, expectedName] : mappings) {
+    QCOMPARE(Arkham::commandName(command), expectedName);
+  }
 }
 
 QTEST_APPLESS_MAIN(FoundationTests)

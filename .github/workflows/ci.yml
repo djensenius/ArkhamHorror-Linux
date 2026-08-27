@@ -32,7 +32,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtsvg qtwebsockets
+          modules: qtwebsockets
           cache: true
       - name: Install formatter
         run: sudo apt-get update && sudo apt-get install -y clang-format
@@ -50,7 +50,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtsvg qtwebsockets
+          modules: qtwebsockets
           cache: true
       - run: mise run lint
 
@@ -66,7 +66,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtsvg qtwebsockets
+          modules: qtwebsockets
           cache: true
       - run: mise run test
 
@@ -82,7 +82,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtsvg qtwebsockets
+          modules: qtwebsockets
           cache: true
       - run: mise run build
 
@@ -103,7 +103,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtsvg qtwebsockets
+          modules: qtwebsockets
           cache: true
       - name: Download packaging tools
         run: |

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-build_dir="${1:-build}"
-app_dir="${APPDIR:-$PWD/AppDir}"
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+build_dir="${1:-$repo_root/build}"
+app_dir="$repo_root/AppDir"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "AppImage packaging requires x86_64 Linux." >&2
@@ -12,9 +13,9 @@ fi
 rm -rf "$app_dir"
 DESTDIR="$app_dir" cmake --install "$build_dir" --prefix /usr
 
-install -Dm644 packaging/io.github.djensenius.ArkhamHorror.desktop \
+install -Dm644 "$repo_root/packaging/io.github.djensenius.ArkhamHorror.desktop" \
   "$app_dir/usr/share/applications/io.github.djensenius.ArkhamHorror.desktop"
-install -Dm644 packaging/io.github.djensenius.ArkhamHorror.svg \
+install -Dm644 "$repo_root/packaging/io.github.djensenius.ArkhamHorror.svg" \
   "$app_dir/usr/share/icons/hicolor/scalable/apps/io.github.djensenius.ArkhamHorror.svg"
 
 linuxdeploy="${LINUXDEPLOY:-linuxdeploy-x86_64.AppImage}"
@@ -29,11 +30,11 @@ command -v "$qt_plugin" >/dev/null 2>&1 || {
   exit 2
 }
 
-export QML_SOURCES_PATHS="$PWD/qml"
+export QML_SOURCES_PATHS="$repo_root/qml"
 export LINUXDEPLOY_PLUGIN_QT="$qt_plugin"
 "$linuxdeploy" \
   --appdir "$app_dir" \
-  --desktop-file packaging/io.github.djensenius.ArkhamHorror.desktop \
-  --icon-file packaging/io.github.djensenius.ArkhamHorror.svg \
+  --desktop-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.desktop" \
+  --icon-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.svg" \
   --plugin qt \
   --output appimage

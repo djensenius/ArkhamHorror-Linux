@@ -9,7 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(QT_QML_GENERATE_QMLLS_INI ON)
 
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick QuickControls2 Svg WebSockets)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick QuickControls2 WebSockets)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -39,7 +39,6 @@ target_link_libraries(arkham-horror PRIVATE
     Qt6::Gui
     Qt6::Quick
     Qt6::QuickControls2
-    Qt6::Svg
     Qt6::WebSockets
 )
 

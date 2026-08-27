@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QStringView>
 #include <QUrl>
 
 namespace Arkham {
