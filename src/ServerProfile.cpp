@@ -23,19 +23,13 @@ static ValueOrError<QString> validateDisplayName(QString name) {
   return name;
 }
 
-ServerProfile::ServerProfile(QUrl baseUrl) : m_baseUrl(std::move(baseUrl)) {
-  m_baseUrl.setUserInfo(QString{});
-  m_baseUrl.setPath({});
-  m_baseUrl.setQuery(QString{});
-  m_baseUrl.setFragment({});
-}
-
 ServerProfile ServerProfile::hostedDefault() {
   ServerProfile p;
   p.m_kind = ServerProfileKind::HostedDefault;
   p.m_id = QString::fromLatin1(kHostedDefaultId);
   p.m_displayName = QStringLiteral("Arkham Horror");
   p.m_baseUrl = QUrl(QStringLiteral("https://arkhamhorror.app"));
+  p.m_validatedProvenance = true;
   return p;
 }
 
@@ -54,6 +48,7 @@ ValueOrError<ServerProfile> ServerProfile::custom(QString displayName,
   p.m_id = QUuid::createUuid().toString(QUuid::WithoutBraces);
   p.m_displayName = *nameResult;
   p.m_baseUrl = *urlResult;
+  p.m_validatedProvenance = true;
   return p;
 }
 
@@ -89,6 +84,15 @@ ServerProfile::customWithId(const QString &id, QString displayName,
   p.m_id = canonicalId;
   p.m_displayName = *nameResult;
   p.m_baseUrl = *urlResult;
+  p.m_validatedProvenance = true;
+  return p;
+}
+
+ServerProfile ServerProfile::unvalidatedForTesting(QUrl baseUrl) {
+  ServerProfile p;
+  p.m_baseUrl = std::move(baseUrl);
+  // m_id stays empty and m_validatedProvenance stays false: this is the
+  // otherwise-unreachable state the defensive rejection tests exercise.
   return p;
 }
 
@@ -106,8 +110,9 @@ QUrl ServerProfile::apiUrl(const QStringView path) const {
   }
 
   // Honour any stored path prefix (e.g. /selfhosted set by custom()).
-  // The default constructor clears the path, so basePath is empty for profiles
-  // created via ServerProfile(QUrl).
+  // basePath is empty for a default-constructed profile, since a default
+  // profile's baseUrl is always empty and never reaches this point anyway
+  // (isValid() is false for it).
   QString basePath = m_baseUrl.path();
   if (basePath.size() > 1 && basePath.endsWith(QLatin1Char('/'))) {
     basePath.chop(1);
@@ -142,6 +147,10 @@ QUrl ServerProfile::websocketUrl(const QStringView path) const {
 bool ServerProfile::isValid() const {
   return m_baseUrl.isValid() && !m_baseUrl.host().isEmpty() &&
          (m_baseUrl.scheme() == "https"_L1 || m_baseUrl.scheme() == "http"_L1);
+}
+
+bool ServerProfile::hasValidatedProvenance() const {
+  return m_validatedProvenance;
 }
 
 } // namespace Arkham

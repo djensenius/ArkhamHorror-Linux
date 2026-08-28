@@ -208,7 +208,14 @@ AuthRequestHandle NetworkAuthenticationClient::rejectInvalidInput(
 AuthRequestHandle NetworkAuthenticationClient::issueTokenRequest(
     const ServerProfile &profile, QStringView path, const QJsonObject &body,
     AuthTokenCallback callback) {
-  if (!profile.isValid()) {
+  // Reject not only an invalid profile but also one lacking validated
+  // provenance (i.e. not produced by ServerProfile::hostedDefault(),
+  // custom(), or customWithId(), each of which validates its URL against
+  // UrlValidator::validateCustomUrl() before returning). Ordinary calling
+  // code cannot construct such a profile at all -- ServerProfile no longer
+  // exposes a raw-QUrl constructor -- so this is defense-in-depth against
+  // any future internal code path that might otherwise bypass validation.
+  if (!profile.isValid() || !profile.hasValidatedProvenance()) {
     return rejectInvalidInput<AuthToken>(
         std::move(callback),
         QStringLiteral("server profile is invalid; cannot issue request"));
@@ -301,7 +308,10 @@ AuthRequestHandle
 NetworkAuthenticationClient::whoAmI(const ServerProfile &profile,
                                     const QString &token,
                                     CurrentUserCallback callback) {
-  if (!profile.isValid()) {
+  // See the matching comment in issueTokenRequest(): reject any profile
+  // lacking validated provenance as well as any profile that is merely
+  // structurally invalid.
+  if (!profile.isValid() || !profile.hasValidatedProvenance()) {
     return rejectInvalidInput<CurrentUser>(
         std::move(callback),
         QStringLiteral("server profile is invalid; cannot issue request"));

@@ -423,90 +423,113 @@ void NetworkTests::urlRejectsInsecureTransport() {
 void NetworkTests::urlStrictLoopbackPolicy_data() {
   QTest::addColumn<QString>("urlString");
   QTest::addColumn<bool>("expectAccepted");
+  // Meaningful only when expectAccepted is false: the exact UrlErrorCode
+  // (stored as int; UrlErrorCode is not a registered QMetaType) every
+  // rejected row must produce. Asserting the precise code per row (rather
+  // than accepting either InsecureTransport or CredentialsPresent for
+  // every row) ensures a regression that misclassifies one row under the
+  // wrong error code is still caught.
+  QTest::addColumn<int>("expectedErrorCode");
+
+  const int insecureTransport =
+      static_cast<int>(UrlErrorCode::InsecureTransport);
+  const int credentialsPresent =
+      static_cast<int>(UrlErrorCode::CredentialsPresent);
 
   // ── Accepted: exact canonical loopback spellings over http ─────────────
-  QTest::newRow("http-localhost") << QStringLiteral("http://localhost") << true;
+  QTest::newRow("http-localhost")
+      << QStringLiteral("http://localhost") << true << 0;
   QTest::newRow("http-localhost-port")
-      << QStringLiteral("http://localhost:9000") << true;
+      << QStringLiteral("http://localhost:9000") << true << 0;
   QTest::newRow("http-localhost-path")
-      << QStringLiteral("http://localhost/selfhosted") << true;
-  QTest::newRow("http-127.0.0.1") << QStringLiteral("http://127.0.0.1") << true;
+      << QStringLiteral("http://localhost/selfhosted") << true << 0;
+  QTest::newRow("http-127.0.0.1")
+      << QStringLiteral("http://127.0.0.1") << true << 0;
   QTest::newRow("http-127.0.0.1-port-path")
-      << QStringLiteral("http://127.0.0.1:9000/selfhosted") << true;
-  QTest::newRow("http-bracketed-::1") << QStringLiteral("http://[::1]") << true;
+      << QStringLiteral("http://127.0.0.1:9000/selfhosted") << true << 0;
+  QTest::newRow("http-bracketed-::1")
+      << QStringLiteral("http://[::1]") << true << 0;
   QTest::newRow("http-bracketed-::1-port")
-      << QStringLiteral("http://[::1]:9000") << true;
+      << QStringLiteral("http://[::1]:9000") << true << 0;
 
   // ── Accepted: https for any host, including odd literals and base paths ─
   QTest::newRow("https-any-host")
-      << QStringLiteral("https://example.com") << true;
+      << QStringLiteral("https://example.com") << true << 0;
   QTest::newRow("https-lan-ip")
-      << QStringLiteral("https://192.168.1.100:8080/selfhosted") << true;
+      << QStringLiteral("https://192.168.1.100:8080/selfhosted") << true << 0;
   QTest::newRow("https-127.1-unrestricted")
-      << QStringLiteral("https://127.1") << true;
+      << QStringLiteral("https://127.1") << true << 0;
   QTest::newRow("https-localhost-lookalike")
-      << QStringLiteral("https://localhost.evil.example") << true;
+      << QStringLiteral("https://localhost.evil.example") << true << 0;
   QTest::newRow("https-base-path")
-      << QStringLiteral("https://example.com/arkham") << true;
+      << QStringLiteral("https://example.com/arkham") << true << 0;
 
   // ── Rejected: ambiguous/non-canonical numeric loopback spellings ────────
-  QTest::newRow("http-127.1") << QStringLiteral("http://127.1") << false;
+  QTest::newRow("http-127.1")
+      << QStringLiteral("http://127.1") << false << insecureTransport;
   QTest::newRow("http-single-integer")
-      << QStringLiteral("http://2130706433") << false;
+      << QStringLiteral("http://2130706433") << false << insecureTransport;
   QTest::newRow("http-octal-looking")
-      << QStringLiteral("http://0177.0.0.1") << false;
+      << QStringLiteral("http://0177.0.0.1") << false << insecureTransport;
   QTest::newRow("http-hex-looking")
-      << QStringLiteral("http://0x7f.0.0.1") << false;
+      << QStringLiteral("http://0x7f.0.0.1") << false << insecureTransport;
   QTest::newRow("http-octal-single-integer")
-      << QStringLiteral("http://017700000001") << false;
+      << QStringLiteral("http://017700000001") << false << insecureTransport;
   QTest::newRow("http-leading-zero-full")
-      << QStringLiteral("http://127.000.000.001") << false;
+      << QStringLiteral("http://127.000.000.001") << false << insecureTransport;
   QTest::newRow("http-leading-zero-last-octet")
-      << QStringLiteral("http://127.0.0.01") << false;
+      << QStringLiteral("http://127.0.0.01") << false << insecureTransport;
   QTest::newRow("http-shortened-form")
-      << QStringLiteral("http://127.0.1") << false;
+      << QStringLiteral("http://127.0.1") << false << insecureTransport;
 
   // ── Rejected: IPv4-mapped / expanded / alternate IPv6 spellings ─────────
   QTest::newRow("http-ipv4-mapped-ipv6")
-      << QStringLiteral("http://[::ffff:127.0.0.1]") << false;
+      << QStringLiteral("http://[::ffff:127.0.0.1]") << false
+      << insecureTransport;
   QTest::newRow("http-ipv6-expanded")
-      << QStringLiteral("http://[0:0:0:0:0:0:0:1]") << false;
+      << QStringLiteral("http://[0:0:0:0:0:0:0:1]") << false
+      << insecureTransport;
   QTest::newRow("http-ipv6-alternate-shortened")
-      << QStringLiteral("http://[::0:1]") << false;
+      << QStringLiteral("http://[::0:1]") << false << insecureTransport;
   QTest::newRow("http-ipv6-zone-id")
-      << QStringLiteral("http://[::1%25eth0]") << false;
+      << QStringLiteral("http://[::1%25eth0]") << false << insecureTransport;
 
   // ── Rejected: trailing-dot / subdomain / lookalike localhost forms ──────
   QTest::newRow("http-localhost-trailing-dot")
-      << QStringLiteral("http://localhost.") << false;
+      << QStringLiteral("http://localhost.") << false << insecureTransport;
   QTest::newRow("http-localhost-subdomain")
-      << QStringLiteral("http://localhost.evil.example") << false;
+      << QStringLiteral("http://localhost.evil.example") << false
+      << insecureTransport;
   QTest::newRow("http-127-lookalike-subdomain")
-      << QStringLiteral("http://127.0.0.1.evil.example") << false;
+      << QStringLiteral("http://127.0.0.1.evil.example") << false
+      << insecureTransport;
   QTest::newRow("http-notlocalhost")
-      << QStringLiteral("http://notlocalhost") << false;
+      << QStringLiteral("http://notlocalhost") << false << insecureTransport;
 
   // ── Rejected: userinfo, malformed, LAN/public addresses over http ───────
+  // Userinfo is rejected unconditionally (CredentialsPresent), even for an
+  // otherwise-canonical loopback host, and is checked before the
+  // http/loopback policy itself (see UrlValidator::validateCustomUrl()'s
+  // ordering), so this row must produce CredentialsPresent, not
+  // InsecureTransport.
+  QTest::newRow("http-userinfo-on-loopback")
+      << QStringLiteral("http://user:pass@localhost:9000") << false
+      << credentialsPresent;
   QTest::newRow("http-lan-ip")
-      << QStringLiteral("http://192.168.1.100") << false;
+      << QStringLiteral("http://192.168.1.100") << false << insecureTransport;
   QTest::newRow("http-public-host")
-      << QStringLiteral("http://example.com") << false;
+      << QStringLiteral("http://example.com") << false << insecureTransport;
 }
 
 void NetworkTests::urlStrictLoopbackPolicy() {
   QFETCH(QString, urlString);
   QFETCH(bool, expectAccepted);
+  QFETCH(int, expectedErrorCode);
 
   const auto r = validateCustomUrl(urlString);
   QCOMPARE(r.has_value(), expectAccepted);
   if (!expectAccepted) {
-    // None of the rejected rows above contain userinfo ('@'), so every
-    // rejection here must be attributed specifically to the insecure
-    // http-transport policy; asserting the exact code (rather than also
-    // accepting CredentialsPresent) ensures a regression that
-    // mis-classifies one of these rows under a different error code is
-    // still caught rather than silently accepted.
-    QCOMPARE(r.error().code, UrlErrorCode::InsecureTransport);
+    QCOMPARE(static_cast<int>(r.error().code), expectedErrorCode);
   }
 }
 
@@ -911,13 +934,15 @@ void NetworkTests::storeSaveRejectsProfileWithoutId() {
   QVERIFY(tmp.open());
   tmp.close();
 
-  // ServerProfile(QUrl) constructor leaves profileId() empty.
-  const ServerProfile legacyProfile(
-      QUrl(QStringLiteral("https://example.com")));
-  QVERIFY(legacyProfile.profileId().isEmpty());
+  // A default-constructed profile has no ID; this is the only public
+  // constructor ServerProfile exposes besides the validated factories
+  // (hostedDefault()/custom()/customWithId()), all of which always set a
+  // stable ID.
+  const ServerProfile blankProfile;
+  QVERIFY(blankProfile.profileId().isEmpty());
 
   QSettingsProfileStore store(tmp.fileName());
-  const auto result = store.saveProfiles({legacyProfile});
+  const auto result = store.saveProfiles({blankProfile});
   QVERIFY(!result.has_value());
   QVERIFY(result.error().contains(QStringLiteral("ID")));
 }
@@ -1323,8 +1348,10 @@ void NetworkTests::probeTransportFailure() {
 }
 
 void NetworkTests::probeRejectsInvalidProfile() {
-  // An unsupported scheme produces an invalid custom profile.
-  const ServerProfile bad(QUrl(QStringLiteral("ftp://bad")));
+  // A default-constructed profile (no scheme, no host) is always invalid;
+  // this is the only public constructor ServerProfile exposes besides the
+  // validated factories.
+  const ServerProfile bad;
   QVERIFY(!bad.isValid());
 
   StubNetworkAccessManager nam; // no request should be issued

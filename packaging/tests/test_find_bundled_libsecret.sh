@@ -111,4 +111,31 @@ result_4="$(PATH="$restricted_path" find_bundled_libsecret "$work_dir/also-does-
   || fail "case 4 (nothing found): expected empty result, got '$result_4'"
 echo "PASS: no candidate anywhere -> empty result, no abort"
 
-echo "All find_bundled_libsecret() regression cases passed."
+# --- Case 5: find_bundled_libgpgerror() is a distinct wrapper over the
+# same generic find_bundled_library() helper, for the separate library
+# force-bundled to satisfy bundled libgcrypt's dependency (see
+# build-appimage.sh). Proves it resolves its own library name correctly
+# via ldconfig and never cross-matches libsecret's name/result.
+install_fake_ldconfig 0 \
+  "libgpg-error.so.0 (libc6,x86-64) => /opt/fake/libgpg-error.so.0.32.1"
+result_5="$(PATH="$restricted_path" find_bundled_libgpgerror "$work_dir/does-not-exist")"
+[[ "$result_5" == "/opt/fake/libgpg-error.so.0.32.1" ]] \
+  || fail "case 5 (libgpgerror via ldconfig): expected '/opt/fake/libgpg-error.so.0.32.1', got '$result_5'"
+echo "PASS: find_bundled_libgpgerror resolves its own library via ldconfig"
+
+# --- Case 6: find_bundled_libgpgerror() falls back to find() when
+# ldconfig is absent, exactly like find_bundled_libsecret() does, and
+# locates only the gpg-error file, not a co-located libsecret file.
+remove_fake_ldconfig
+fake_root_6="$work_dir/root6/lib"
+mkdir -p "$fake_root_6"
+: > "$fake_root_6/libsecret-1.so.0"
+expected_6="$fake_root_6/libgpg-error.so.0"
+: > "$expected_6"
+result_6="$(PATH="$restricted_path" find_bundled_libgpgerror "$fake_root_6")"
+[[ "$result_6" == "$expected_6" ]] \
+  || fail "case 6 (libgpgerror find fallback): expected '$expected_6', got '$result_6'"
+echo "PASS: find_bundled_libgpgerror find() fallback locates only its own library"
+
+echo "All find_bundled_libsecret()/find_bundled_libgpgerror() regression cases passed."
+

@@ -82,10 +82,14 @@ namespace Arkham {
 // of non-canonical spellings happens earlier, in validateCustomUrl(), which
 // calls isCleartextAuthAllowedForRawInput() against the pristine raw input
 // before any QUrl-based normalisation occurs. This function remains a
-// defense-in-depth request-time check (e.g. for ServerProfile instances
-// created via the legacy raw-QUrl constructor, which bypasses
-// validateCustomUrl() and is retained for existing unit tests only) and
-// still correctly rejects LAN/public hosts and non-matching text over http.
+// defense-in-depth request-time check: ServerProfile no longer exposes any
+// public constructor that can carry an unvalidated URL (its only public
+// constructor is the argument-less default one, which is always invalid),
+// and NetworkAuthenticationClient additionally rejects any profile whose
+// ServerProfile::hasValidatedProvenance() is false, so this check only
+// matters if some future internal code path ever bypassed those structural
+// guarantees -- and it still correctly rejects LAN/public hosts and
+// non-matching text over http in that case.
 //
 // This function has no knowledge of redirects: callers that may follow
 // redirects must not rely on this check alone to keep a redirected request

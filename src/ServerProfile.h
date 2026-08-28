@@ -16,11 +16,19 @@ enum class ServerProfileKind {
 
 class ServerProfile {
 public:
-  // Construct from a raw QUrl, stripping credentials, path, query, and
-  // fragment.  Retained for existing unit tests only; prefer the factory
-  // methods for new code.  Profiles created this way have no stable ID and
-  // cannot be persisted.
-  explicit ServerProfile(QUrl baseUrl = {});
+  // Default-constructs an empty, permanently-invalid profile (no scheme, no
+  // host, no ID, unvalidated provenance). Because this constructor takes no
+  // argument, it can never carry a caller-supplied URL, so it cannot be used
+  // to smuggle an unvalidated host/scheme past auth's transport-security
+  // checks -- unlike the raw-QUrl constructor this class used to expose,
+  // which let a caller pass any QUrl (including one QUrl had already
+  // silently canonicalised from an ambiguous loopback spelling such as
+  // "127.1") directly into a profile without going through
+  // UrlValidator::validateCustomUrl(). Use hostedDefault(), custom(), or
+  // customWithId() to build a usable profile; every one of those factories
+  // validates its input URL against the same rules and marks the result as
+  // having validated provenance (see hasValidatedProvenance()).
+  ServerProfile() = default;
 
   // Returns a profile for the canonical hosted service
   // (https://arkhamhorror.app).  Always carries the same deterministic ID.
@@ -43,8 +51,8 @@ public:
                const QString &urlString);
 
   // Stable identifier for factory-created profiles: deterministic for
-  // HostedDefault and UUID-based for Custom. Empty only for the legacy
-  // QUrl constructor retained for tests.
+  // HostedDefault and UUID-based for Custom. Empty for a default-constructed
+  // profile.
   [[nodiscard]] const QString &profileId() const;
 
   [[nodiscard]] ServerProfileKind kind() const;
@@ -58,11 +66,34 @@ public:
   [[nodiscard]] QUrl websocketUrl(QStringView path) const;
   [[nodiscard]] bool isValid() const;
 
+  // True only for a profile produced by hostedDefault(), custom(), or
+  // customWithId() -- i.e. one whose baseUrl was validated by
+  // UrlValidator::validateCustomUrl() (or is the hardcoded hosted-default
+  // URL) before being stored. False for a default-constructed profile.
+  // NetworkAuthenticationClient rejects any profile for which this is false
+  // in addition to rejecting any profile for which isValid() is false, so
+  // that even if some future code path were to construct a profile outside
+  // the three sanctioned factories, it could still never reach the network
+  // with an unvalidated host/scheme.
+  [[nodiscard]] bool hasValidatedProvenance() const;
+
 private:
+  // Test-only escape hatch used exclusively by the regression tests that
+  // must prove NetworkAuthenticationClient, QSettingsProfileStore, and
+  // NetworkCapabilityProbe defensively reject a profile lacking validated
+  // provenance, in case such a profile were ever produced by a future code
+  // path. No production code may construct a ServerProfile this way: every
+  // sanctioned public entry point (hostedDefault(), custom(),
+  // customWithId()) always validates its URL and sets
+  // m_validatedProvenance = true before returning.
+  friend class ServerProfileTestSupport;
+  [[nodiscard]] static ServerProfile unvalidatedForTesting(QUrl baseUrl);
+
   ServerProfileKind m_kind{ServerProfileKind::Custom};
   QString m_id;
   QString m_displayName;
   QUrl m_baseUrl;
+  bool m_validatedProvenance{false};
 };
 
 } // namespace Arkham

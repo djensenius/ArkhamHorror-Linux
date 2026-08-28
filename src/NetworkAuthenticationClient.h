@@ -49,16 +49,20 @@ namespace Arkham {
 // of such spellings actually happens earlier still, in
 // UrlValidator::validateCustomUrl() against the raw pre-QUrl input text,
 // before QUrl can canonicalize an unsafe spelling into an accepted one --
-// this check here is retained purely as request-time defense-in-depth
-// (e.g. for the legacy raw-QUrl ServerProfile constructor, which bypasses
-// UrlValidator). This preserves local development/self-hosting over plain
-// HTTP without ever allowing a LAN or public host to receive a password or
-// bearer token in cleartext. A hostname that merely resembles a loopback
-// address without being one (e.g. "localhost.evil.com",
-// "127.0.0.1.evil.com") is a different DNS name and is never treated as
-// loopback; userinfo in the URL is rejected unconditionally. Because 3xx
-// is never followed, this exception can never be leveraged to redirect a
-// loopback request to an insecure remote origin.
+// this check here is retained purely as request-time defense-in-depth.
+// ServerProfile exposes no public constructor that can carry an unvalidated
+// URL (its only public constructor is the argument-less default one, which
+// is permanently invalid), and this class additionally rejects any profile
+// for which ServerProfile::hasValidatedProvenance() is false, so this
+// defense-in-depth layer only matters if some future internal code path
+// ever bypassed those structural guarantees. This preserves local
+// development/self-hosting over plain HTTP without ever allowing a LAN or
+// public host to receive a password or bearer token in cleartext. A
+// hostname that merely resembles a loopback address without being one
+// (e.g. "localhost.evil.com", "127.0.0.1.evil.com") is a different DNS name
+// and is never treated as loopback; userinfo in the URL is rejected
+// unconditionally. Because 3xx is never followed, this exception can never
+// be leveraged to redirect a loopback request to an insecure remote origin.
 //
 // The optional |timeout| caps the wall-clock time to wait for each response.
 // Defaults to 30 s in production; inject a shorter value in tests. Pass

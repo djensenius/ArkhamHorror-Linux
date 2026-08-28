@@ -63,6 +63,27 @@ libsecret_so="$(find_bundled_libsecret)"
   exit 2
 }
 
+# libsecret-1 pulls in libgcrypt transitively (via gnome-keyring/GPG-Agent
+# integration), and libgcrypt in turn requires libgpg-error -- but
+# linuxdeploy's own default library blacklist excludes libgpg-error from
+# automatic bundling (it assumes, incorrectly for a portable AppImage
+# intended to run on arbitrary distros, that a compatible system copy is
+# always already present). Left unbundled, a target host without its own
+# libgpg-error would fail to dlopen() libsecret-1 at all -- an entirely
+# different, and much less obvious, failure mode than the "missing
+# libsecret-1 itself" case above. Force-bundling it here the same way
+# closes that gap; recursive-closure verification in CI
+# (packaging/audit_dependency_closure.py) then proves no other transitive
+# dependency is silently missing.
+# shellcheck disable=SC2119
+libgpgerror_so="$(find_bundled_libgpgerror)"
+[[ -n "$libgpgerror_so" && -e "$libgpgerror_so" ]] || {
+  echo "Could not locate libgpg-error.so.0 to bundle into the AppImage." \
+    "Install libgpg-error0 (runtime) or libgpg-error-dev." >&2
+  exit 2
+}
+
+
 # Package the third-party attribution files (QtKeychain's BSD-3-Clause
 # LICENSE and this project's own NOTICE.md) into the distributed AppImage
 # so end users receive accurate attribution without this unlicensed
@@ -88,5 +109,6 @@ export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
   --desktop-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.desktop" \
   --icon-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.svg" \
   --library "$libsecret_so" \
+  --library "$libgpgerror_so" \
   --plugin qt \
   --output appimage

@@ -1,12 +1,17 @@
 # shellcheck shell=bash
 #
-# find_bundled_libsecret [search_root...]
+# find_bundled_library <name-glob> [search_root...]
 #
-# Prints the resolved path to a system libsecret-1.so.0 to stdout (empty
-# output if none is found), for build-appimage.sh to bundle into the
-# AppImage via linuxdeploy --library. Never aborts the caller's script
-# under `set -euo pipefail`, even when `ldconfig` is missing/erroring or
-# the `find` fallback matches nothing:
+# Prints the resolved path to a system shared library matching name-glob
+# (e.g. 'libsecret-1.so.0*') to stdout (empty output if none is found).
+# Used by build-appimage.sh to locate libraries that must be force-bundled
+# into the AppImage via linuxdeploy --library because they are either
+# dlopen()-only (never an ELF DT_NEEDED dependency linuxdeploy's automatic
+# ldd-based bundling would follow, e.g. libsecret-1) or a transitive
+# dependency linuxdeploy's own blacklist excludes from automatic bundling
+# by default (e.g. libgpg-error, required by bundled libgcrypt). Never
+# aborts the caller's script under `set -euo pipefail`, even when
+# `ldconfig` is missing/erroring or the `find` fallback matches nothing:
 #
 #   - `ldconfig -p` is only invoked when `ldconfig` exists on PATH, and its
 #     output is captured on its own line before being parsed with `awk` as
@@ -35,11 +40,22 @@
 # would search on a Debian/Ubuntu-based AppImage builder; tests pass a
 # fake temporary root instead so this function is exercised without
 # touching real host paths.
-find_bundled_libsecret() {
+find_bundled_library() {
+  local name_glob="$1"
+  shift
   local search_roots=("$@")
   if [[ ${#search_roots[@]} -eq 0 ]]; then
     search_roots=(/usr/lib /usr/lib/x86_64-linux-gnu /lib)
   fi
+
+  # Every caller's glob ends in '*' (e.g. 'libsecret-1.so.0*', to also match
+  # versioned filenames like libsecret-1.so.0.0.0). Strip that trailing '*'
+  # to get the fixed prefix ldconfig -p's first column (the SONAME/filename)
+  # must start with; ldconfig -p only ever lists concrete filenames, so a
+  # plain prefix check is both correct and simpler/safer here than trying to
+  # translate a shell glob into an awk/POSIX regex (in which a literal '.'
+  # and a bare trailing '*' mean something different from glob syntax).
+  local name_prefix="${name_glob%\*}"
 
   local candidate=""
 
@@ -47,13 +63,36 @@ find_bundled_libsecret() {
     local ldconfig_output
     ldconfig_output="$(ldconfig -p 2>/dev/null || true)"
     candidate="$(printf '%s\n' "$ldconfig_output" \
-      | awk '/libsecret-1\.so\.0/ {print $NF; exit}' || true)"
+      | awk -v prefix="$name_prefix" 'index($1, prefix) == 1 {print $NF; exit}' || true)"
   fi
 
   if [[ -z "$candidate" ]]; then
     candidate="$(find "${search_roots[@]}" -maxdepth 3 \
-      -name 'libsecret-1.so.0*' -print -quit 2>/dev/null || true)"
+      -name "$name_glob" -print -quit 2>/dev/null || true)"
   fi
 
   printf '%s' "$candidate"
 }
+
+# find_bundled_libsecret [search_root...]
+#
+# Thin wrapper over find_bundled_library for libsecret-1.so.0 specifically
+# (kept as its own named function for existing callers/tests).
+find_bundled_libsecret() {
+  find_bundled_library 'libsecret-1.so.0*' "$@"
+}
+
+# find_bundled_libgpgerror [search_root...]
+#
+# Thin wrapper over find_bundled_library for libgpg-error.so.0. QtKeychain's
+# Secret Service/libsecret backend transitively depends on libgcrypt, which
+# depends on libgpg-error -- but linuxdeploy's own default blacklist
+# excludes libgpg-error from automatic bundling (it is treated as a "core"
+# system library on the assumption a suitable copy is always present on the
+# target host), which is false for a portable AppImage that must run on
+# arbitrary distros. Force-bundling it the same way as libsecret closes
+# that gap.
+find_bundled_libgpgerror() {
+  find_bundled_library 'libgpg-error.so.0*' "$@"
+}
+

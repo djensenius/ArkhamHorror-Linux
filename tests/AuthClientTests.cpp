@@ -27,6 +27,7 @@
 #include "IAuthenticationClient.h"
 #include "NetworkAuthenticationClient.h"
 #include "ServerProfile.h"
+#include "UrlValidator.h"
 
 using namespace Arkham;
 
@@ -142,6 +143,26 @@ ServerProfile customProfile(const QString &url) {
   return *result;
 }
 
+} // namespace
+
+namespace Arkham {
+// Grants this test file access to ServerProfile's private
+// unvalidatedForTesting() factory (see the friend declaration and its
+// rationale in ServerProfile.h). Used exclusively by the two defense-in-
+// depth tests below, which prove that NetworkAuthenticationClient still
+// rejects a profile lacking validated provenance even in the otherwise-
+// unreachable state where one exists -- ServerProfile's public API can
+// never construct such a profile itself.
+class ServerProfileTestSupport {
+public:
+  static ServerProfile unvalidated(QUrl baseUrl) {
+    return ServerProfile::unvalidatedForTesting(std::move(baseUrl));
+  }
+};
+} // namespace Arkham
+
+namespace {
+
 template <typename T>
 std::optional<AuthResult<T>>
 runAndWait(std::function<AuthRequestHandle(std::function<void(AuthResult<T>)>)>
@@ -176,6 +197,7 @@ private slots:
   void httpLoopbackIPv4Permitted();
   void httpLoopbackIPv6Permitted();
   void httpLookalikeLoopbackHostRejected();
+  void unvalidatedProvenanceRejectedEvenForLoopbackUrl();
   void httpsPermittedForAnyHost();
   void httpWithUserInfoRejectedEvenForLoopback();
   void threeXxMapsToUnexpectedStatus();
@@ -449,24 +471,29 @@ void AuthClientTests::httpToNonLoopbackHostRejectedBeforeRequest() {
   // The authoritative rejection now happens at ServerProfile construction
   // time (UrlValidator::validateCustomUrl), which is earlier than -- and a
   // superset of -- "before the request is built": a profile pointing at a
-  // non-loopback host over http can never even be constructed, so no
-  // NetworkAuthenticationClient call, request, or network I/O is possible.
+  // non-loopback host over http can never even be constructed through the
+  // public API, so no NetworkAuthenticationClient call, request, or network
+  // I/O is possible.
   const auto result = ServerProfile::custom(
       QStringLiteral("Test Server"), QStringLiteral("http://example.com"));
   QVERIFY(!result.has_value());
 
-  // Defense-in-depth: NetworkAuthenticationClient's own request-time check
-  // (isSecureOrLoopbackAuthTransport) still independently rejects the same
-  // host if a profile ever reaches it via a path that bypasses
-  // validateCustomUrl (e.g. the legacy raw-QUrl ServerProfile constructor,
-  // retained for existing unit tests only).
+  // Defense-in-depth: even if a profile carrying this host somehow reached
+  // NetworkAuthenticationClient without having been constructed through
+  // custom()/customWithId()/hostedDefault() (ServerProfile's public API can
+  // never produce this state itself; ServerProfileTestSupport is a
+  // friend-only test seam that reproduces it), the client rejects it --
+  // here via both isSecureOrLoopbackAuthTransport (non-loopback host over
+  // http) and the hasValidatedProvenance() check.
   StubNetworkAccessManager nam;
   NetworkAuthenticationClient client(nam);
-  const ServerProfile legacyProfile(QUrl(QStringLiteral("http://example.com")));
+  const ServerProfile unvalidatedProfile =
+      ServerProfileTestSupport::unvalidated(
+          QUrl(QStringLiteral("http://example.com")));
   const auto requestResult =
       runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
         return client.authenticate(
-            legacyProfile,
+            unvalidatedProfile,
             AuthenticateRequest{QStringLiteral("a@b.com"),
                                 QStringLiteral("pw")},
             std::move(cb));
@@ -555,16 +582,20 @@ void AuthClientTests::httpLookalikeLoopbackHostRejected() {
     QVERIFY(!profileResult.has_value());
 
     // Defense-in-depth: the same host is also rejected by
-    // NetworkAuthenticationClient's own request-time check when a profile
-    // reaches it via a path that bypasses validateCustomUrl.
+    // NetworkAuthenticationClient's own request-time checks
+    // (isSecureOrLoopbackAuthTransport and hasValidatedProvenance()) if a
+    // profile carrying it were ever produced outside the public factories
+    // (reproduced here only via the friend-only ServerProfileTestSupport
+    // test seam).
     StubNetworkAccessManager nam;
     NetworkAuthenticationClient client(nam);
-    const ServerProfile legacyProfile{QUrl(urlString)};
+    const ServerProfile unvalidatedProfile =
+        ServerProfileTestSupport::unvalidated(QUrl(urlString));
 
     const auto result = runAndWait<AuthToken>(
         [&](std::function<void(AuthResult<AuthToken>)> cb) {
           return client.authenticate(
-              legacyProfile,
+              unvalidatedProfile,
               AuthenticateRequest{QStringLiteral("a@b.com"),
                                   QStringLiteral("pw")},
               std::move(cb));
@@ -574,6 +605,46 @@ void AuthClientTests::httpLookalikeLoopbackHostRejected() {
     QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
     QCOMPARE(nam.requests().size(), 0);
   }
+}
+
+void AuthClientTests::unvalidatedProvenanceRejectedEvenForLoopbackUrl() {
+  // The strongest possible regression for the provenance guard: a URL that
+  // would otherwise pass every other check (canonical "localhost" over
+  // http, so isSecureOrLoopbackAuthTransport and isValid() both accept it)
+  // must still be rejected because it was never run through
+  // UrlValidator::validateCustomUrl(). This proves hasValidatedProvenance()
+  // is doing real work, not just duplicating isSecureOrLoopbackAuthTransport
+  // or isValid().
+  StubNetworkAccessManager nam;
+  NetworkAuthenticationClient client(nam);
+  const ServerProfile unvalidatedProfile =
+      ServerProfileTestSupport::unvalidated(
+          QUrl(QStringLiteral("http://localhost:9000")));
+  QVERIFY(unvalidatedProfile.isValid());
+  QVERIFY(!unvalidatedProfile.hasValidatedProvenance());
+
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            unvalidatedProfile,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+  QCOMPARE(nam.requests().size(), 0);
+
+  // whoAmI() enforces the same guard.
+  const auto whoAmIResult = runAndWait<CurrentUser>(
+      [&](std::function<void(AuthResult<CurrentUser>)> cb) {
+        return client.whoAmI(unvalidatedProfile, QStringLiteral("some-token"),
+                             std::move(cb));
+      });
+  QVERIFY(whoAmIResult.has_value());
+  QCOMPARE(whoAmIResult->outcome, AuthOutcome::InvalidInput);
+  QCOMPARE(nam.requests().size(), 0);
 }
 
 void AuthClientTests::httpsPermittedForAnyHost() {
@@ -598,16 +669,59 @@ void AuthClientTests::httpsPermittedForAnyHost() {
 }
 
 void AuthClientTests::httpWithUserInfoRejectedEvenForLoopback() {
-  // ServerProfile always strips userinfo (UrlValidator rejects it at
-  // creation, and the legacy raw-QUrl constructor strips it too), so this
-  // exercises the isSecureOrLoopbackAuthTransport() predicate itself --
-  // the same production function NetworkAuthenticationClient calls -- with
-  // a synthetic QUrl to prove the userinfo guard is not dead code.
+  // End-to-end through the actual public API: ServerProfile has no public
+  // constructor that can carry userinfo -- UrlValidator::validateCustomUrl()
+  // (invoked by custom()) rejects it with CredentialsPresent before a
+  // profile is ever produced, so this URL can never become
+  // auth-sendable, even though its host is the exact canonical loopback
+  // spelling that the http exception would otherwise permit.
+  const auto profileResult =
+      ServerProfile::custom(QStringLiteral("Test Server"),
+                            QStringLiteral("http://user:pass@localhost:9000"));
+  QVERIFY(!profileResult.has_value());
+
+  // custom() collapses UrlValidationError down to a plain QString message
+  // (see ValueOrError<T>::error()), so assert the precise UrlErrorCode via
+  // validateCustomUrl() directly -- the same function custom() calls --
+  // to prove this is specifically CredentialsPresent, not merely "some"
+  // rejection that could coincidentally also be produced by a different
+  // (and less meaningful) check.
+  const auto urlResult =
+      validateCustomUrl(QStringLiteral("http://user:pass@localhost:9000"));
+  QVERIFY(!urlResult.has_value());
+  QCOMPARE(urlResult.error().code, UrlErrorCode::CredentialsPresent);
+
+  // Defense-in-depth: isSecureOrLoopbackAuthTransport() -- the same
+  // production predicate NetworkAuthenticationClient calls -- also
+  // independently rejects a userinfo-bearing QUrl, proving the guard is
+  // not dead code even if it were ever reached via another path.
   QUrl withUserInfo(QStringLiteral("http://user:pass@localhost:9000/whoami"));
   QVERIFY(!isSecureOrLoopbackAuthTransport(withUserInfo));
 
   QUrl withoutUserInfo(QStringLiteral("http://localhost:9000/whoami"));
   QVERIFY(isSecureOrLoopbackAuthTransport(withoutUserInfo));
+
+  // Defense-in-depth: even a profile that bypassed validateCustomUrl()
+  // entirely (reproducible only via the friend-only
+  // ServerProfileTestSupport test seam, never via public API) is still
+  // rejected by NetworkAuthenticationClient itself when it carries
+  // userinfo, and no request is ever built or sent.
+  StubNetworkAccessManager nam;
+  NetworkAuthenticationClient client(nam);
+  const ServerProfile unvalidatedProfile =
+      ServerProfileTestSupport::unvalidated(
+          QUrl(QStringLiteral("http://user:pass@localhost:9000")));
+  const auto authResult =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            unvalidatedProfile,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+  QVERIFY(authResult.has_value());
+  QCOMPARE(authResult->outcome, AuthOutcome::InvalidInput);
+  QCOMPARE(nam.requests().size(), 0);
 }
 
 void AuthClientTests::threeXxMapsToUnexpectedStatus() {
