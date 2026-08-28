@@ -143,7 +143,7 @@ jobs:
           # during packaging) so this proves what end users receive, not
           # merely what the build script intended to include.
           "./$appimage" --appimage-extract >/dev/null
-          extracted=squashfs-root
+          extracted="$(pwd)/squashfs-root"
 
           bundled_secret="$(find "$extracted" -name 'libsecret-1.so.0*' | head -n1)"
           [[ -n "$bundled_secret" ]] || {
@@ -151,6 +151,11 @@ jobs:
             exit 1
           }
           echo "Found bundled libsecret: $bundled_secret"
+          file "$bundled_secret" | grep -q 'ELF' || {
+            echo "Bundled libsecret-1.so.0 is not a valid ELF shared object:" >&2
+            file "$bundled_secret" >&2
+            exit 1
+          }
 
           keychain_lib="$(find "$extracted" -name 'libqt6keychain.so*' | head -n1)"
           [[ -n "$keychain_lib" ]] || {
@@ -158,35 +163,15 @@ jobs:
             exit 1
           }
 
-          # Prove the bundled libsecret actually resolves for the bundled
-          # QtKeychain library via the same library search path AppRun uses
-          # (usr/lib next to the executables), rather than merely being
-          # present but unresolved/orphaned in the image.
+          # libqt6keychain does NOT link libsecret-1 as an ELF DT_NEEDED
+          # dependency -- QtKeychain's libsecret.cpp loads it at runtime via
+          # QLibrary (dlopen()), so `ldd libqt6keychain.so` never lists it,
+          # bundled or not, and that check cannot be used to prove bundling.
+          # See packaging/verify_bundled_libsecret.py for the real dlopen()
+          # based proof this uses instead.
           apprun_libdir="$extracted/usr/lib"
-          ldd_output="$(LD_LIBRARY_PATH="$apprun_libdir" ldd "$keychain_lib")"
-          if echo "$ldd_output" | grep -q 'not found'; then
-            echo "libqt6keychain has unresolved dependencies inside the AppImage:" >&2
-            echo "$ldd_output" >&2
-            exit 1
-          fi
-
-          # A host copy must not be the one actually used: confirm the
-          # resolved libsecret-1.so.0 path points inside the bundled
-          # usr/lib, not a host system path such as
-          # /usr/lib/x86_64-linux-gnu/libsecret-1.so.0 (the runner has a
-          # host copy installed as a build dependency, so this genuinely
-          # exercises whether the bundled copy -- not the host's -- is
-          # what gets used).
-          resolved_secret_line="$(echo "$ldd_output" | grep 'libsecret-1\.so\.0' || true)"
-          [[ -n "$resolved_secret_line" ]] || {
-            echo "libsecret-1.so.0 did not appear in libqt6keychain's resolved dependencies." >&2
-            exit 1
-          }
-          echo "$resolved_secret_line" | grep -q -- "=> $apprun_libdir/" || {
-            echo "libqt6keychain resolved libsecret-1.so.0 from outside the bundled AppDir:" >&2
-            echo "$resolved_secret_line" >&2
-            exit 1
-          }
+          env LD_LIBRARY_PATH="$apprun_libdir" \
+            python3 packaging/verify_bundled_libsecret.py "$bundled_secret" "$apprun_libdir"
 
           license_path="$extracted/usr/share/doc/ArkhamHorror/third_party/qtkeychain/LICENSE"
           notice_path="$extracted/usr/share/doc/ArkhamHorror/third_party/qtkeychain/NOTICE.md"
