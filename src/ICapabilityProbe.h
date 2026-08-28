@@ -11,7 +11,6 @@ namespace Arkham {
 //
 // Concrete implementations:
 //   NetworkCapabilityProbe — production, backed by QNetworkAccessManager.
-//   (In tests) a local stub class that emits finished() synchronously.
 //
 // Typical usage:
 //   connect(probe, &ICapabilityProbe::finished, context, callback);

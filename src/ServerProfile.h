@@ -24,7 +24,6 @@ public:
 
   // Returns a profile for the canonical hosted service
   // (https://arkhamhorror.app).  Always carries the same deterministic ID.
-  // URL derived from contracts/asyncapi.yaml (production server host).
   [[nodiscard]] static ServerProfile hostedDefault();
 
   // Construct a custom (self-hosted or local) profile from a display name and
