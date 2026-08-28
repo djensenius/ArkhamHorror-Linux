@@ -9,7 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(QT_QML_GENERATE_QMLLS_INI ON)
 
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Quick QuickControls2 WebSockets)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Network Quick QuickControls2 WebSockets)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -22,15 +22,24 @@ add_library(arkham_foundation STATIC
     src/ContractPin.h
     src/ContractRevision.cpp
     src/ContractRevision.h
+    src/ICapabilityProbe.h
+    src/IProfileStore.h
+    src/NetworkCapabilityProbe.cpp
+    src/NetworkCapabilityProbe.h
+    src/ProbeResult.h
+    src/QSettingsProfileStore.cpp
+    src/QSettingsProfileStore.h
     src/ServerCapabilities.cpp
     src/ServerCapabilities.h
     src/ServerProfile.cpp
     src/ServerProfile.h
+    src/UrlValidator.cpp
+    src/UrlValidator.h
     src/ValueOrError.h
 )
 
 target_include_directories(arkham_foundation PUBLIC src)
-target_link_libraries(arkham_foundation PUBLIC Qt6::Core)
+target_link_libraries(arkham_foundation PUBLIC Qt6::Core Qt6::Network)
 
 qt_add_executable(arkham-horror
     src/main.cpp
@@ -79,4 +88,17 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME contract COMMAND arkham-contract-tests)
+
+    qt_add_executable(arkham-network-tests
+        tests/NetworkTests.cpp
+    )
+    target_compile_definitions(arkham-network-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-network-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME network COMMAND arkham-network-tests)
 endif()
