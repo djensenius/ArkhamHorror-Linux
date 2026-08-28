@@ -50,7 +50,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
@@ -68,7 +68,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
@@ -86,7 +86,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
@@ -109,7 +109,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
