@@ -75,6 +75,19 @@ QStringView extractRawAuthority(QStringView rawUrlText) {
   return rest.left(end);
 }
 
+// Returns true iff |text| is a syntactically valid port suffix: zero or
+// more ASCII digits (RFC 3986 port = *DIGIT; an empty port, e.g. "host:",
+// is valid and means "use the default port"). Rejects any non-digit
+// character, ruling out ":9000evil"-style garbage masquerading as a port.
+bool isValidPortSuffix(QStringView text) {
+  for (const QChar c : text) {
+    if (c.unicode() < u'0' || c.unicode() > u'9') {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Extracts the raw host substring from a raw authority substring (as
 // produced by extractRawAuthority), handling a bracketed IPv6 literal or a
 // bare host optionally followed by ":port". Returns an empty QStringView on
@@ -83,6 +96,18 @@ QStringView extractRawHostFromAuthority(QStringView authority) {
   if (authority.startsWith(u'[')) {
     const qsizetype closeIdx = authority.indexOf(u']');
     if (closeIdx < 0) {
+      return {};
+    }
+    // An IPv6-literal authority's closing bracket must be immediately
+    // followed by either nothing (no port) or ":" plus a syntactically
+    // valid port -- any other trailing text (e.g. "[::1]evil" or
+    // "[::1]:9000evil") is not a valid authority at all and must never be
+    // silently truncated into what looks like a safe, exact "::1" host.
+    // Rejecting it here (returning an empty view, which the caller treats
+    // as "fail closed") closes that bypass.
+    const QStringView remainder = authority.mid(closeIdx + 1);
+    if (!remainder.isEmpty() &&
+        (!remainder.startsWith(u':') || !isValidPortSuffix(remainder.mid(1)))) {
       return {};
     }
     return authority.mid(1, closeIdx - 1);

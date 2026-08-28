@@ -498,6 +498,8 @@ void TokenStoreTests::concurrentProfilesAreIsolated() {
   const auto readB = runOp([&](ITokenStore::ResultCallback cb) {
     store.readToken(profileB, std::move(cb));
   });
+  QVERIFY(readA.has_value());
+  QVERIFY(readB.has_value());
   QCOMPARE(readA->token, QStringLiteral("token-a"));
   QCOMPARE(readB->token, QStringLiteral("token-b"));
 }

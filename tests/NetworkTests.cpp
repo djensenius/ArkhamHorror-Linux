@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "AuthTransportSecurity.h"
 #include "ICapabilityProbe.h"
 #include "IProfileStore.h"
 #include "NetworkCapabilityProbe.h"
@@ -220,6 +221,7 @@ private slots:
   void urlRejectsInsecureTransport();
   void urlStrictLoopbackPolicy_data();
   void urlStrictLoopbackPolicy();
+  void rawIPv6BracketTrailingGarbageRejected();
 
   // ── ServerProfile factories and path construction ─────────────────────────
   void hostedDefaultProperties();
@@ -531,6 +533,46 @@ void NetworkTests::urlStrictLoopbackPolicy() {
   if (!expectAccepted) {
     QCOMPARE(static_cast<int>(r.error().code), expectedErrorCode);
   }
+}
+
+// Direct, production-function-level regression for a bracketed-IPv6-literal
+// parsing bug: extractRawHostFromAuthority() (the internal helper
+// isCleartextAuthAllowedForRawInput() uses to pull the raw host substring
+// out of a "[...]"-bracketed authority) used to return everything between
+// "[" and the first "]" with no check on what followed the closing
+// bracket, so a malformed raw authority like "[::1]evil" was silently
+// truncated into the exact string "::1" -- indistinguishable from a
+// genuinely safe, canonical "::1" loopback host.
+//
+// In the one production call site (UrlValidator::validateCustomUrl()),
+// QUrl's own StrictMode parsing already rejects "http://[::1]evil" as a
+// syntactically invalid URL before isCleartextAuthAllowedForRawInput() is
+// ever reached (confirmed: QUrl requires the bracket's "]" to be followed
+// immediately by either ":port" or the end of the authority). That
+// QUrl-level gate is an implementation detail of one caller, though, and
+// isCleartextAuthAllowedForRawInput() is itself a public function in
+// AuthTransportSecurity.h with its own documented "exactly '::1', optionally
+// followed by :port" contract -- so this test exercises it directly,
+// independent of QUrl's incidental gatekeeping, proving the fix holds on
+// its own merits and guarding against any future caller that invokes it
+// against text QUrl has not already validated.
+void NetworkTests::rawIPv6BracketTrailingGarbageRejected() {
+  // Malformed: trailing text immediately after "]" that is not ":port".
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]evil")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]evil:9000")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]:9000evil")));
+  // Also malformed: no closing bracket at all.
+  QVERIFY(!isCleartextAuthAllowedForRawInput(QStringLiteral("http"),
+                                             QStringLiteral("http://[::1")));
+
+  // Still correctly accepted: the legitimate forms this must not regress.
+  QVERIFY(isCleartextAuthAllowedForRawInput(QStringLiteral("http"),
+                                            QStringLiteral("http://[::1]")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]:9000")));
 }
 
 // ─── ServerProfile factories and path construction ────────────────────────

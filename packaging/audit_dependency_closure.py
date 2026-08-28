@@ -75,9 +75,11 @@ _NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[(?P<name>[^\]]+)\]")
 
 
 class ClosureAuditError(RuntimeError):
-    """Raised when readelf itself cannot be run or a bundled file cannot be
-    parsed as an ELF shared object -- distinct from a MISSING dependency,
-    which is a normal (if failing) audit outcome, not a tooling error."""
+    """Raised when readelf itself cannot be run, a bundled file cannot be
+    parsed as an ELF shared object, or a bundled SONAME symlink resolves
+    outside the AppDir lib directory being audited -- all distinct from a
+    MISSING dependency, which is a normal (if failing) audit outcome, not a
+    tooling/integrity error."""
 
 
 def _readelf_needed(path: Path) -> list[str]:
@@ -124,6 +126,7 @@ def audit_closure(
       useful error message pinpointing which dependency edge is broken).
     """
     index = _index_lib_dir(lib_dir)
+    lib_dir_resolved = lib_dir.resolve()
 
     bundled_closure: set[str] = set()
     missing: dict[str, list[str]] = {}
@@ -144,8 +147,29 @@ def audit_closure(
         bundled_closure.add(name)
         resolved_path = index[name]
         if resolved_path.is_symlink():
-            resolved_path = (lib_dir / resolved_path.readlink()).resolve()
-            if not resolved_path.exists():
+            # AppImage bundling always produces SONAME symlinks that point
+            # at a sibling file inside the same lib directory (e.g.
+            # "libfoo.so.1 -> libfoo.so.1.2.3"). A symlink resolving
+            # *outside* lib_dir -- whether via an absolute target or a
+            # "../" escape -- is never something legitimate bundling would
+            # produce. Tolerating it would let a library that merely
+            # happens to exist at that path on the machine running the
+            # audit (not inside the AppDir at all) be silently treated as
+            # "bundled", defeating this script's entire host-independence
+            # guarantee. Fail closed instead of following the symlink.
+            link_target = (lib_dir / resolved_path.readlink()).resolve()
+            if not link_target.is_relative_to(lib_dir_resolved):
+                raise ClosureAuditError(
+                    f"{name} in {lib_dir} is a symlink resolving outside "
+                    f"the AppDir lib directory (to {link_target}) -- "
+                    "refusing to follow it, since a library present at "
+                    "that path on the machine running this audit (rather "
+                    "than inside the AppDir) could otherwise be "
+                    "misidentified as bundled and silently pass."
+                )
+            if link_target.exists():
+                resolved_path = link_target
+            else:
                 resolved_path = index[name]
 
         for needed in _readelf_needed(resolved_path):

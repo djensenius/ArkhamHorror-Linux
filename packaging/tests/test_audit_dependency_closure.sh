@@ -111,6 +111,36 @@ echo "$output_4" | grep -q "libc.so.6" \
   && fail "case 4: libc.so.6 should never be reported as missing (it is ABI-allowlisted): $output_4"
 echo "PASS: ABI-allowlisted libc.so.6 is never treated as a missing dependency"
 
+# --- Case 6 (run before the mutating case 3 below, since it reuses the
+# original appdir's still-intact libtestleaf.so.1 as its escape target): a
+# bundled SONAME symlink that resolves *outside* the AppDir being audited
+# -- mirroring an accidental or maliciously crafted linuxdeploy output --
+# must be rejected outright, even though the escape target is a real,
+# valid, readelf-parseable library. Silently following it would let a
+# library that merely happens to exist elsewhere on the machine running
+# the audit be misidentified as "bundled", defeating the whole
+# host-independence guarantee this script exists to provide.
+escape_dir="$work_dir/appdir_escape"
+mkdir -p "$escape_dir"
+cp "$appdir/libtestroot.so.1" "$escape_dir/"
+cp "$appdir/libtestmid.so.1" "$escape_dir/"
+# Instead of bundling a real copy of libtestleaf.so.1 inside escape_dir,
+# plant a symlink escaping the AppDir entirely, pointing at the original
+# (still valid, still-present) copy over in $appdir.
+ln -s "$appdir/libtestleaf.so.1" "$escape_dir/libtestleaf.so.1"
+
+set +e
+output_6="$(python3 "$auditor" "$escape_dir" --root libtestroot.so.1 2>&1)"
+case6_status=$?
+set -e
+[[ $case6_status -ne 0 ]] \
+  || fail "case 6: expected non-zero exit for a SONAME symlink escaping the AppDir"
+echo "$output_6" | grep -qi "outside" \
+  || fail "case 6: failure output did not explain the symlink-escape rejection: $output_6"
+echo "$output_6" | grep -q "libtestleaf.so.1" \
+  || fail "case 6: failure output did not name the escaping library: $output_6"
+echo "PASS: a SONAME symlink resolving outside the AppDir is rejected, not silently followed"
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the
