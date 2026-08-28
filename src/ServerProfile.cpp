@@ -64,7 +64,7 @@ ServerProfile::customWithId(const QString &id, QString displayName,
   const QUuid parsed(id);
   if (parsed.isNull()) {
     return failure(
-        QStringLiteral("profile ID is not a valid UUID: \"%1\"").arg(id));
+        QStringLiteral("profile ID must be a non-null UUID: \"%1\"").arg(id));
   }
   // Canonicalize to WithoutBraces so stored IDs are always in the same form.
   const QString canonicalId = parsed.toString(QUuid::WithoutBraces);

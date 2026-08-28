@@ -169,7 +169,7 @@ ValueOrError<QString> QSettingsProfileStore::loadSelectedProfileId() const {
   const QUuid parsed(id);
   if (parsed.isNull()) {
     return failure(
-        QStringLiteral("selected profile ID is not a valid UUID: \"%1\"")
+        QStringLiteral("selected profile ID must be a non-null UUID: \"%1\"")
             .arg(id));
   }
   // Return canonical form (strip any braces that might exist in older data).
@@ -263,7 +263,7 @@ QSettingsProfileStore::saveSelectedProfileId(const QString &id) {
     const QUuid parsed(id);
     if (parsed.isNull()) {
       return failure(
-          QStringLiteral("selected profile ID is not a valid UUID: \"%1\"")
+          QStringLiteral("selected profile ID must be a non-null UUID: \"%1\"")
               .arg(id));
     }
     canonicalId = parsed.toString(QUuid::WithoutBraces);

@@ -20,8 +20,8 @@ namespace Arkham {
 //     persisted (first run / no selection).
 //   - loadSelectedProfileId() returns a failure when the backing store
 //     reports an AccessError or FormatError, or when a stored non-empty value
-//     is not a valid UUID.  It never interprets an unreadable store as
-//     "no selection".
+//     is malformed or the null UUID.  It never interprets an unreadable store
+//     as "no selection".
 //   - saveProfiles() returns a failure if any profile is invalid or missing
 //     an ID, if the backing store has a pre-existing error (sticky status),
 //     or if the underlying storage sync fails.  Storage is not touched when
@@ -39,8 +39,8 @@ public:
 
   // Returns empty QString (no selection) when nothing is persisted.
   // Returns a failure on AccessError/FormatError or when a stored non-empty
-  // value is not a valid UUID.  Never silently treats an unreadable store as
-  // "no selection".
+  // value is malformed or the null UUID.  Never silently treats an unreadable
+  // store as "no selection".
   [[nodiscard]] virtual ValueOrError<QString> loadSelectedProfileId() const = 0;
 
   // Validates each profile (non-empty ID, isValid(), no duplicate IDs).
