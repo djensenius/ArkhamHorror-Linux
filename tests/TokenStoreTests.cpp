@@ -286,7 +286,9 @@ void TokenStoreTests::saveThenReadRoundTrip() {
   });
   QVERIFY(readResult.has_value());
   QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
-  QCOMPARE(readResult->token, QStringLiteral("secret-token-abc"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(readResult->token == QStringLiteral("secret-token-abc"));
 }
 
 void TokenStoreTests::updateOverwritesPreviousToken() {
@@ -311,7 +313,9 @@ void TokenStoreTests::updateOverwritesPreviousToken() {
   });
   QVERIFY(readResult.has_value());
   QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
-  QCOMPARE(readResult->token, QStringLiteral("second-token"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(readResult->token == QStringLiteral("second-token"));
 }
 
 void TokenStoreTests::readMissingProfileIsNotFound() {
@@ -507,8 +511,10 @@ void TokenStoreTests::concurrentProfilesAreIsolated() {
   });
   QVERIFY(readA.has_value());
   QVERIFY(readB.has_value());
-  QCOMPARE(readA->token, QStringLiteral("token-a"));
-  QCOMPARE(readB->token, QStringLiteral("token-b"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(readA->token == QStringLiteral("token-a"));
+  QVERIFY(readB->token == QStringLiteral("token-b"));
 }
 
 void TokenStoreTests::destructionSuppressesPendingCallback() {

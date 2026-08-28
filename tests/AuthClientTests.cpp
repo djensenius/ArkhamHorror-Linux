@@ -248,7 +248,9 @@ void AuthClientTests::authenticateSendsExpectedRequest() {
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, AuthOutcome::Success);
   QVERIFY(result->value.has_value());
-  QCOMPARE(result->value->token, QStringLiteral("abc123"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(result->value->token == QStringLiteral("abc123"));
 
   QCOMPARE(nam.requests().size(), 1);
   const QNetworkRequest &req = nam.requests().first();
@@ -261,10 +263,12 @@ void AuthClientTests::authenticateSendsExpectedRequest() {
 
   const QJsonObject sentBody =
       QJsonDocument::fromJson(nam.bodies().first()).object();
-  QCOMPARE(sentBody.value(QStringLiteral("email")).toString(),
-           QStringLiteral("user@example.com"));
-  QCOMPARE(sentBody.value(QStringLiteral("password")).toString(),
-           QStringLiteral("hunter2"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual
+  // email/password value into test/CI logs.
+  QVERIFY(sentBody.value(QStringLiteral("email")).toString() ==
+          QStringLiteral("user@example.com"));
+  QVERIFY(sentBody.value(QStringLiteral("password")).toString() ==
+          QStringLiteral("hunter2"));
 }
 
 void AuthClientTests::authenticateNoAuthorizationHeader() {
@@ -299,7 +303,9 @@ void AuthClientTests::registerSendsExpectedRequest() {
 
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, AuthOutcome::Success);
-  QCOMPARE(result->value->token, QStringLiteral("reg-token"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(result->value->token == QStringLiteral("reg-token"));
   QCOMPARE(nam.requests().first().url().path(),
            QStringLiteral("/api/v1/register"));
   QVERIFY(nam.requests().first().rawHeader("Authorization").isEmpty());
@@ -331,9 +337,10 @@ void AuthClientTests::whoAmISendsExactAuthorizationHeader() {
   QCOMPARE(result->value->beta, true);
   QCOMPARE(result->value->admin, false);
 
-  QCOMPARE(
-      QString::fromLatin1(nam.requests().first().rawHeader("Authorization")),
-      QStringLiteral("Token my-jwt-token"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual
+  // Authorization header (which embeds the token) into test/CI logs.
+  QVERIFY(QString::fromLatin1(nam.requests().first().rawHeader(
+              "Authorization")) == QStringLiteral("Token my-jwt-token"));
   QCOMPARE(nam.requests().first().url().path(),
            QStringLiteral("/api/v1/whoami"));
   QVERIFY(nam.bodies().first().isEmpty());
@@ -781,7 +788,9 @@ void AuthClientTests::twoXxDecodesSuccessfully() {
 
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, AuthOutcome::Success);
-  QCOMPARE(result->value->token, QStringLiteral("created"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(result->value->token == QStringLiteral("created"));
 }
 
 void AuthClientTests::unauthorizedMapsTo401() {
@@ -973,8 +982,10 @@ void AuthClientTests::concurrentRequestsAreIndependent() {
   }
   QVERIFY(firstResult.has_value());
   QVERIFY(secondResult.has_value());
-  QCOMPARE(firstResult->value->token, QStringLiteral("first"));
-  QCOMPARE(secondResult->value->token, QStringLiteral("second"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(firstResult->value->token == QStringLiteral("first"));
+  QVERIFY(secondResult->value->token == QStringLiteral("second"));
 }
 
 void AuthClientTests::destructionAbortsOutstandingRequestsNoCallback() {

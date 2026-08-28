@@ -335,7 +335,9 @@ void QtKeychainKWalletHardeningTests::
   QVERIFY(waitForFinished(job));
 
   QCOMPARE(job.error(), QKeychain::NoError);
-  QCOMPARE(job.textData(), secret);
+  // QVERIFY (not QCOMPARE): a failure must never print the actual secret
+  // value into test/CI logs.
+  QVERIFY(job.textData() == secret);
 
   // Migration removes the plaintext entry synchronously (before
   // finished()), even though the follow-up KWallet write happens
