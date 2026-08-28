@@ -4,14 +4,21 @@
 #include "ContractPin.h"
 #include "ServerCapabilities.h"
 
+#include <QByteArray>
 #include <QJsonDocument>
+#include <QJsonParseError>
 #include <QMetaObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
+#include <QString>
 #include <QTimer>
+#include <QUrl>
+#include <QVariant>
 #include <QtAssert>
+#include <optional>
+#include <stdexcept>
 
 using namespace Qt::StringLiterals;
 
@@ -39,7 +46,11 @@ ProbeOutcome compatOutcomeToProbeOutcome(CompatibilityOutcome outcome) {
 NetworkCapabilityProbe::NetworkCapabilityProbe(
     QNetworkAccessManager &nam, std::chrono::milliseconds timeout,
     QObject *parent)
-    : ICapabilityProbe(parent), m_nam(nam), m_timeout(timeout) {}
+    : ICapabilityProbe(parent), m_nam(nam), m_timeout(timeout) {
+  if (timeout < std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("capability probe timeout cannot be negative");
+  }
+}
 
 NetworkCapabilityProbe::~NetworkCapabilityProbe() {
   for (auto it = m_pendingReplies.begin(); it != m_pendingReplies.end(); ++it) {

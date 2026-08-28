@@ -18,8 +18,10 @@
 #include <QTemporaryFile>
 #include <QtGlobal>
 #include <QtTest>
+#include <chrono>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 #include "ICapabilityProbe.h"
@@ -275,6 +277,8 @@ private slots:
   void probeNoCookies();
   void probeDestructionDeletesInFlightReply();
   void probeTimesOut();
+  void probeZeroTimeoutDisablesDeadline();
+  void probeRejectsNegativeTimeout();
   void probeRedirectPolicySet();
   void probeRedirectPolicyIgnoresManagerGlobal();
 
@@ -1336,6 +1340,37 @@ void NetworkTests::probeTimesOut() {
     QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
     QCOMPARE(emitCount, 1);
   }
+}
+
+void NetworkTests::probeZeroTimeoutDisablesDeadline() {
+  StubNetworkAccessManager nam;
+  nam.enqueueHanging();
+
+  int emitCount = 0;
+  {
+    NetworkCapabilityProbe probe(nam, std::chrono::milliseconds::zero());
+    QObject::connect(&probe, &ICapabilityProbe::finished,
+                     [&emitCount](const ProbeResult &) { ++emitCount; });
+    probe.probe(ServerProfile::hostedDefault());
+
+    QTest::qWait(100);
+    QCOMPARE(emitCount, 0);
+  }
+
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QCOMPARE(emitCount, 0);
+}
+
+void NetworkTests::probeRejectsNegativeTimeout() {
+  StubNetworkAccessManager nam;
+
+  bool rejected = false;
+  try {
+    NetworkCapabilityProbe probe(nam, std::chrono::milliseconds{-1});
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  QVERIFY(rejected);
 }
 
 void NetworkTests::probeRedirectPolicySet() {

@@ -26,6 +26,7 @@ namespace Arkham {
 // The optional |timeout| caps the wall-clock time to wait for each server
 // response.  Defaults to 30 s in production; inject a shorter value in tests.
 // Pass std::chrono::milliseconds(0) to disable per-reply deadlines.
+// Negative durations are rejected with std::invalid_argument.
 //
 // Outstanding replies are aborted and scheduled for deletion when the probe
 // is destroyed; per-reply timers are stopped before replies are aborted, so
@@ -53,7 +54,7 @@ private:
   QNetworkAccessManager &m_nam;
   std::chrono::milliseconds m_timeout;
   // Maps each in-flight reply to its per-reply deadline timer.  Timer pointer
-  // is nullptr when timeout was disabled (m_timeout == 0).
+  // is nullptr when timeout was explicitly disabled (m_timeout == 0).
   QHash<QNetworkReply *, QTimer *> m_pendingReplies;
 };
 
