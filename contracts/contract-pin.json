@@ -1,0 +1,9 @@
+{
+  "backendCommit": "2bf2935cde121498435744a06fcf63502a80ae43",
+  "sourceRef": "djensenius/ArkhamHorror#23",
+  "schemaRevision": "0.1.11",
+  "minimumServerSchemaRevision": "0.1.11",
+  "nativeClientMinimumRevision": "0.1.0",
+  "apiBasePath": "/api/v1",
+  "note": "Minimum metadata pinned from backend PR #23. Not a full manifest. See djensenius/ArkhamHorror contracts/ for the authoritative full contract."
+}

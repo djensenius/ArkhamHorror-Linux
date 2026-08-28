@@ -16,8 +16,17 @@ qt_standard_project_setup(REQUIRES 6.8)
 add_library(arkham_foundation STATIC
     src/AppCommand.cpp
     src/AppCommand.h
+    src/CompatibilityEvaluator.cpp
+    src/CompatibilityEvaluator.h
+    src/ContractPin.cpp
+    src/ContractPin.h
+    src/ContractRevision.cpp
+    src/ContractRevision.h
+    src/ServerCapabilities.cpp
+    src/ServerCapabilities.h
     src/ServerProfile.cpp
     src/ServerProfile.h
+    src/ValueOrError.h
 )
 
 target_include_directories(arkham_foundation PUBLIC src)
@@ -58,4 +67,16 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME foundation COMMAND arkham-foundation-tests)
+
+    qt_add_executable(arkham-contract-tests
+        tests/ContractTests.cpp
+    )
+    target_compile_definitions(arkham-contract-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-contract-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME contract COMMAND arkham-contract-tests)
 endif()
