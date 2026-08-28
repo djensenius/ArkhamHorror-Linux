@@ -11,6 +11,7 @@
 #include <QNetworkRequest>
 #include <QQueue>
 #include <QTemporaryFile>
+#include <QtGlobal>
 #include <QtTest>
 #include <cstring>
 
@@ -96,8 +97,9 @@ protected:
     m_lastUrl = req.url();
     m_lastAcceptHeader = QString::fromLatin1(req.rawHeader("Accept"));
     m_lastRequest = req;
-    Q_ASSERT_X(!m_queue.isEmpty(), "StubNetworkAccessManager",
-               "no canned response enqueued");
+    if (m_queue.isEmpty()) {
+      qFatal("StubNetworkAccessManager: no canned response enqueued");
+    }
     const auto [status, body, err] = m_queue.dequeue();
     auto *reply = new StubNetworkReply(status, std::move(body), err, this);
     reply->scheduleFinished();
