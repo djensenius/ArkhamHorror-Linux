@@ -498,6 +498,7 @@ private slots:
   void signInWhoAmIUnauthorizedDoesNotSaveAndReturnsSignedOut();
   void signInSaveFailureIsSecureStorageUnavailable();
   void signInNoOpWhenProfileNotYetUsable();
+  void signInAndRegisterNoOpDuringCredentialRestore();
   void registerAccountSuccessFlow();
 
   // Sign out
@@ -896,6 +897,46 @@ void SessionCoordinatorTests::signInNoOpWhenProfileNotYetUsable() {
   h.coordinator->signIn(QStringLiteral("a@example.test"), QStringLiteral("pw"));
   QCOMPARE(h.coordinator->state(), stateBefore);
   QCOMPARE(h.authClient.calls.size(), 0);
+}
+
+// Regression test for the reentrancy race fixed in this round: signIn()/
+// registerAccount() used to be gated on "profile usable" alone, which
+// remains true throughout RestoringCredential (it becomes true once the
+// probe succeeds and stays true afterwards). That let an interactive
+// signIn() call run concurrently with the automatic credential restore's
+// own /whoami validation; both flows share the single pending-auth-handle
+// slot, so the restore's issueWhoAmI() would silently cancel the
+// interactive request via cancelPendingAuthRequest(). Both entry points
+// must instead be gated on state() == SignedOut, which excludes
+// RestoringCredential.
+void SessionCoordinatorTests::signInAndRegisterNoOpDuringCredentialRestore() {
+  Harness h;
+  h.coordinator->start();
+  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  const QString profileId = h.coordinator->selectedProfileId();
+  pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::RestoringCredential);
+
+  h.coordinator->signIn(QStringLiteral("a@example.test"), QStringLiteral("pw"));
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::RestoringCredential);
+  QCOMPARE(h.authClient.calls.size(), 0);
+
+  h.coordinator->registerAccount(QStringLiteral("a@example.test"),
+                                 QStringLiteral("auser"), QStringLiteral("pw"));
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::RestoringCredential);
+  QCOMPARE(h.authClient.calls.size(), 0);
+
+  // The credential restore itself is unaffected by the rejected calls
+  // above and can still proceed to completion normally.
+  h.tokenStore.complete(profileId, notFoundResult());
+  pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  });
 }
 
 void SessionCoordinatorTests::registerAccountSuccessFlow() {

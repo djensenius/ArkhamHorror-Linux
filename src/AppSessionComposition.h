@@ -8,9 +8,9 @@
 #include "QtKeychainTokenStore.h"
 #include "SessionCoordinator.h"
 
-#include <memory>
+#include <QNetworkAccessManager>
 
-class QNetworkAccessManager;
+#include <memory>
 
 namespace Arkham {
 

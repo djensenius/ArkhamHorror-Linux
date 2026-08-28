@@ -28,8 +28,14 @@ namespace Arkham {
 // establishes the ordering guarantees a future UI can build on.
 //
 // Never exposes a password, token, or Authorization header through any
-// property, signal, QVariant, log, or debug operator. state()/diagnostic()
-// are always static, secret-free descriptions.
+// property, signal, QVariant, log, or debug operator. state() is always a
+// fixed, static description of the enum value. diagnostic() is secret-free
+// but not always static text: for transport/backend/malformed-payload
+// failures it forwards the typed, already-secret-free diagnostic produced
+// by IAuthenticationClient/ITokenStore/ICapabilityProbe (safe categories
+// and static messages only, per their own contracts), so its exact string
+// can vary with the underlying failure while never containing request/
+// response bodies, credentials, or low-level exception text.
 //
 // Threading/lifetime: every dependency is borrowed by reference and must
 // outlive this coordinator (see composeProductionSession() in
@@ -157,10 +163,13 @@ public slots:
   // capability probe for the new profile.
   void switchProfile(const QString &profileId);
 
-  // Issues POST /authenticate for the current profile. Only usable once the
-  // current profile's capability probe has completed with Compatible or
-  // LegacyFallback and no authentication request is already in flight; a
-  // call outside that window is a safe no-op. On a successful token
+  // Issues POST /authenticate for the current profile. Only usable while
+  // state() == SignedOut (i.e. the profile's capability probe has already
+  // completed with Compatible/LegacyFallback AND any credential restore has
+  // already finished); a call outside that window is a safe no-op. This
+  // is intentionally stricter than "profile usable" alone: running during
+  // RestoringCredential would race the restore's own /whoami validation,
+  // which cancels any in-flight auth request. On a successful token
   // response, validates the token with /whoami before persisting it via
   // ITokenStore; the coordinator becomes SignedIn only after both the
   // whoami validation and the secure save succeed. The password is never
@@ -168,8 +177,8 @@ public slots:
   void signIn(const QString &email, const QString &password);
 
   // Issues POST /register for the current profile, with the same
-  // usability guard, validate-then-persist ordering, and password-retention
-  // contract as signIn().
+  // SignedOut-only guard, validate-then-persist ordering, and
+  // password-retention contract as signIn().
   void registerAccount(const QString &email, const QString &username,
                        const QString &password);
 
@@ -215,6 +224,8 @@ private:
   void handleWhoAmIResult(quint64 generation, const QString &profileId,
                           const QString &token, WhoAmIPurpose purpose,
                           const AuthResult<CurrentUser> &result);
+  void deleteRestoredUnauthorizedToken(quint64 generation,
+                                       const QString &profileId);
 
   void handleFreshTokenResult(quint64 generation, const QString &profileId,
                               const AuthResult<AuthToken> &result);
@@ -250,11 +261,6 @@ private:
   QList<ServerProfile> m_profiles;
   QString m_selectedProfileId;
   std::optional<ServerProfile> m_currentProfile;
-  // True once the current profile's capability probe has completed with
-  // Compatible or LegacyFallback. Gates signIn()/registerAccount(): no
-  // authenticated or public auth request is ever issued before the probe
-  // for the currently selected profile has completed.
-  bool m_profileUsable{false};
 
   std::optional<CurrentUser> m_currentUser;
 

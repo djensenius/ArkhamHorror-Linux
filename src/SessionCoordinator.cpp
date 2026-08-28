@@ -174,7 +174,6 @@ void SessionCoordinator::start() {
   m_profiles = std::move(profiles);
   m_selectedProfileId = selectedId;
   m_currentProfile = selectedProfile;
-  m_profileUsable = false;
   emit selectedProfileChanged();
 
   startProbe();
@@ -214,7 +213,6 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
 
   m_selectedProfileId = profileId;
   m_currentProfile = *it;
-  m_profileUsable = false;
   emit selectedProfileChanged();
 
   startProbe();
@@ -224,7 +222,17 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
 
 void SessionCoordinator::startProbe() {
   m_probe.reset();
-  m_probe = m_probeFactory();
+  m_probe = m_probeFactory ? m_probeFactory() : nullptr;
+  if (!m_probe) {
+    // A misconfigured/empty ProbeFactory must never crash the coordinator:
+    // surface it as an explicit, retryable failure instead of dereferencing
+    // a null pointer below.
+    m_retryAction = [this] { startProbe(); };
+    setState(State::RecoverableFailure,
+             QStringLiteral(
+                 "The capability-probe factory did not produce a probe."));
+    return;
+  }
   const quint64 generation = m_generation;
   connect(m_probe.get(), &ICapabilityProbe::finished, this,
           [this, generation](ProbeResult result) {
@@ -242,7 +250,6 @@ void SessionCoordinator::onProbeFinished(quint64 generation,
   switch (result.outcome) {
   case ProbeOutcome::Compatible:
   case ProbeOutcome::LegacyFallback:
-    m_profileUsable = true;
     startCredentialRestore();
     return;
   case ProbeOutcome::Incompatible:
@@ -361,29 +368,14 @@ void SessionCoordinator::handleWhoAmIResult(
     if (purpose == WhoAmIPurpose::RestoreExisting) {
       // A restored token the server no longer accepts must be durably
       // deleted before the coordinator is allowed to claim signed out.
-      QPointer<SessionCoordinator> self(this);
-      enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
-                     [self, generation](TokenStoreResult deleteResult) {
-                       if (!self) {
-                         return;
-                       }
-                       if (generation != self->m_generation) {
-                         return;
-                       }
-                       if (deleteResult.outcome == TokenStoreOutcome::Success) {
-                         self->clearCurrentUser();
-                         self->setState(State::SignedOut);
-                       } else {
-                         self->setState(State::SecureStorageUnavailable,
-                                        deleteResult.diagnostic);
-                       }
-                     });
+      deleteRestoredUnauthorizedToken(generation, profileId);
     } else {
       // Nothing was ever saved for a freshly rejected token; just report
-      // signed out.
+      // signed out. This path is shared by signIn() and registerAccount(),
+      // so the diagnostic must not claim it was specifically a sign-in.
       clearCurrentUser();
       setState(State::SignedOut,
-               QStringLiteral("Sign-in was rejected by the server."));
+               QStringLiteral("The server rejected the freshly issued token."));
     }
     return;
   }
@@ -406,10 +398,52 @@ void SessionCoordinator::handleWhoAmIResult(
   }
 }
 
+// A restored token the server has rejected must be durably deleted before
+// the coordinator is allowed to claim signed out. Defined as a reusable,
+// generation-guarded step (rather than an inline lambda) so a deletion
+// failure can install a retry action that re-invokes exactly this same
+// step; without that, retry() would be a silent no-op while stuck in the
+// resulting SecureStorageUnavailable state.
+void SessionCoordinator::deleteRestoredUnauthorizedToken(
+    quint64 generation, const QString &profileId) {
+  if (generation != m_generation) {
+    return;
+  }
+  QPointer<SessionCoordinator> self(this);
+  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
+                 [self, generation, profileId](TokenStoreResult deleteResult) {
+                   if (!self) {
+                     return;
+                   }
+                   if (generation != self->m_generation) {
+                     return;
+                   }
+                   if (deleteResult.outcome == TokenStoreOutcome::Success) {
+                     self->clearCurrentUser();
+                     self->setState(State::SignedOut);
+                   } else {
+                     self->m_retryAction = [self, generation, profileId] {
+                       if (!self) {
+                         return;
+                       }
+                       self->deleteRestoredUnauthorizedToken(generation,
+                                                             profileId);
+                     };
+                     self->setState(State::SecureStorageUnavailable,
+                                    deleteResult.diagnostic);
+                   }
+                 });
+}
+
 // ─── Sign in / register ─────────────────────────────────────────────────
 
 void SessionCoordinator::signIn(const QString &email, const QString &password) {
-  if (!m_profileUsable || m_pendingAuthHandle.id != 0 ||
+  // Gated on state == SignedOut: signIn() must never run concurrently
+  // with an in-flight credential restore (state == RestoringCredential),
+  // since issueWhoAmI() for the restored token would cancel this
+  // interactive request via cancelPendingAuthRequest() and the two flows
+  // would race to set the final state.
+  if (m_state != State::SignedOut || m_pendingAuthHandle.id != 0 ||
       !m_currentProfile.has_value()) {
     return;
   }
@@ -437,7 +471,9 @@ void SessionCoordinator::signIn(const QString &email, const QString &password) {
 void SessionCoordinator::registerAccount(const QString &email,
                                          const QString &username,
                                          const QString &password) {
-  if (!m_profileUsable || m_pendingAuthHandle.id != 0 ||
+  // Same reentrancy guard as signIn(): must not run during
+  // RestoringCredential (or any other non-SignedOut state).
+  if (m_state != State::SignedOut || m_pendingAuthHandle.id != 0 ||
       !m_currentProfile.has_value()) {
     return;
   }
