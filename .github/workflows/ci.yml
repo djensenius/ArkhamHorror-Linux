@@ -255,21 +255,22 @@ jobs:
         # debian:bookworm-slim, an image that -- like the dependency-closure
         # check above -- never has libsecret-1-0 or its glib/gio/gobject
         # dependency stack preinstalled. Only fontconfig, a concrete font
-        # package, libxkbcommon0, and libgl1 are added on top (verified
-        # locally during development to pull in none of libsecret/glib/
-        # gobject/gio transitively) so Qt Quick's offscreen QPA platform
-        # plugin can actually initialize text layout and keymaps.
-        # QT_QUICK_BACKEND=software selects Qt Quick's raster scenegraph
-        # adaptation so no GPU/EGL context is ever created at runtime, but
-        # libgl1 (providing libGLX.so.0/libGL.so.1) is still required
-        # because Qt's Gui/OpenGL support libraries are ELF-linked
-        # (DT_NEEDED) against libGLX regardless of which backend is
-        # selected at runtime -- the dynamic loader resolves DT_NEEDED
+        # package, libxkbcommon0, libgl1, libopengl0, and libegl1 are added
+        # on top (verified locally during development to pull in none of
+        # libsecret/glib/gobject/gio transitively) so Qt Quick's offscreen
+        # QPA platform plugin can actually initialize text layout and
+        # keymaps. QT_QUICK_BACKEND=software selects Qt Quick's raster
+        # scenegraph adaptation so no GPU/EGL context is ever created at
+        # runtime, but libGLX.so.0/libGL.so.1/libOpenGL.so.0/libEGL.so.1
+        # are still required because Qt's Gui/OpenGL support libraries are
+        # ELF-linked (DT_NEEDED) against them regardless of which backend
+        # is selected at runtime -- the dynamic loader resolves DT_NEEDED
         # libraries at load time even for symbols never actually called,
-        # so omitting it fails AppRun's own dynamic linking before Qt code
-        # ever runs (confirmed locally: omitting libgl1 here reproduces the
-        # exact "libGLX.so.0: cannot open shared object file" error seen in
-        # CI without it). This both proves genuine Qt/QML/plugin startup
+        # so omitting any of them fails AppRun's own dynamic linking before
+        # Qt code ever runs (confirmed in CI iteration: omitting libgl1
+        # reproduced "libGLX.so.0: cannot open shared object file", and
+        # omitting libopengl0 then reproduced the equivalent error for
+        # libOpenGL.so.0). This both proves genuine Qt/QML/plugin startup
         # (not merely that the binary exists) and reinforces that the
         # bundled libsecret closure is what a real run actually resolves,
         # not a host fallback.
@@ -302,7 +303,8 @@ jobs:
               set -euo pipefail
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends \
-                fontconfig fonts-dejavu-core libxkbcommon0 libgl1 >/dev/null
+                fontconfig fonts-dejavu-core libxkbcommon0 libgl1 \
+                libopengl0 libegl1 >/dev/null
               timeout 60 /app/AppRun --smoke-test
             '
           echo "AppImage launched and created a QML root object successfully in a minimal headless container."
