@@ -18,6 +18,7 @@
 #include <QtGlobal>
 #include <QtTest>
 #include <cstring>
+#include <optional>
 #include <utility>
 
 #include "ICapabilityProbe.h"
@@ -27,6 +28,7 @@
 #include "QSettingsProfileStore.h"
 #include "ServerProfile.h"
 #include "UrlValidator.h"
+#include "ValueOrError.h"
 
 using namespace Arkham;
 

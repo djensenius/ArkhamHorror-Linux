@@ -42,8 +42,9 @@ public:
   customWithId(const QString &id, QString displayName,
                const QString &urlString);
 
-  // Stable, never-empty identifier.  Deterministic for HostedDefault;
-  // a UUID-based string for Custom profiles.
+  // Stable identifier for factory-created profiles: deterministic for
+  // HostedDefault and UUID-based for Custom. Empty only for the legacy
+  // QUrl constructor retained for tests.
   [[nodiscard]] const QString &profileId() const;
 
   [[nodiscard]] ServerProfileKind kind() const;
