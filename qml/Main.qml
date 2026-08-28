@@ -150,6 +150,21 @@ ApplicationWindow {
         }
 
         Label {
+            // sessionCoordinator is only registered as a context property
+            // during normal startup (see AppBootstrap.h / main.cpp); it is
+            // deliberately absent in --smoke-test, so this guards against
+            // referencing an undeclared identifier rather than assuming it
+            // always exists. Only ever shows non-secret state/server
+            // metadata: never a password, token, or Authorization header.
+            // qmllint disable unqualified
+            text: typeof sessionCoordinator !== "undefined" && sessionCoordinator ? qsTr("%1 — %2").arg(sessionCoordinator.stateDescription).arg(sessionCoordinator.selectedProfileDisplayName) : ""
+            // qmllint enable unqualified
+            visible: text.length > 0
+            color: root.gold
+            font.pixelSize: 16
+        }
+
+        Label {
             text: qsTr("Directional input moves focus | Enter / A selects | Escape / B returns")
             color: "#a9a189"
             font.pixelSize: 17

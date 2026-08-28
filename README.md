@@ -26,13 +26,25 @@ The current walking skeleton establishes:
   (`localhost` or a loopback IPv4/IPv6 literal) preserves local
   development/self-hosting without ever sending a password or bearer token
   over cleartext HTTP to a LAN or public host.
+- A `SessionCoordinator` that composes profile storage, capability probing,
+  secure token storage, and the authentication client into one
+  QML-observable, deterministic state machine: boot/first-run profile
+  seeding, capability probing before any secure-token read, credential
+  restore (including durable cleanup of a rejected token), sign-in/register/
+  sign-out, and profile switching with generation-based staleness
+  protection and per-profile FIFO token operations. Its properties/signals
+  never expose a password, token, or `Authorization` header. The production
+  composition (`AppSessionComposition`) and the hermetic `--smoke-test` gate
+  (`AppBootstrap`) ensure smoke-test runs never construct the coordinator or
+  touch QSettings/the network/the keychain.
 - Separate lint, test, build, and AppImage CI jobs.
 - A `mise` entry point for local and CI tasks.
 
-These are headless foundation pieces only: there is no account/sign-in UI,
-app-level session coordinator, or gameplay wiring yet. Gameplay, card
-assets, and official gaming mats are not implemented yet. Official artwork
-is not bundled in this repository.
+These are headless foundation pieces only: there is no final account/
+sign-in/server-management QML, WebSockets, password reset, account
+deletion, or gameplay wiring yet. Gameplay, card assets, and official
+gaming mats are not implemented yet. Official artwork is not bundled in
+this repository.
 
 Secret Service/KWallet usability inside SteamOS Gaming Mode has not been
 verified on real hardware; do not assume it works there. When a backend is

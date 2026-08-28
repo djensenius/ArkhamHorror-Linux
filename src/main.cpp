@@ -1,13 +1,17 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QGuiApplication>
+#include <QNetworkAccessManager>
 #include <QQmlApplicationEngine>
+#include <QQmlContext>
 #include <QQuickWindow>
 #include <QTimer>
 
 #include <cstdlib>
 #include <memory>
 
+#include "AppBootstrap.h"
+#include "AppSessionComposition.h"
 #include "ServerProfile.h"
 
 namespace {
@@ -48,18 +52,44 @@ int main(int argc, char *argv[]) {
   parser.addOption(smokeTestOption);
   parser.process(app);
 
+  const bool smokeTest = parser.isSet(smokeTestOption);
+
   const Arkham::ServerProfile profile = Arkham::ServerProfile::hostedDefault();
 
   QQmlApplicationEngine engine;
   engine.setInitialProperties(
       {{QStringLiteral("configuredServer"), profile.baseUrl().toString()}});
+
+  // The entire hermetic guarantee for --smoke-test lives in
+  // bootstrapSession(): composeProductionSession() (which touches
+  // QSettings, constructs a QNetworkAccessManager, and initializes the
+  // QtKeychain backend) and SessionCoordinator::start() (which begins real
+  // network/keychain I/O) are only ever reached through this callback, and
+  // only when |mode| is ProcessMode::Normal. See AppBootstrap.h and
+  // AppBootstrapTests.cpp.
+  std::unique_ptr<Arkham::ProductionSession> session;
+  const Arkham::ProcessMode mode =
+      smokeTest ? Arkham::ProcessMode::SmokeTest : Arkham::ProcessMode::Normal;
+  Arkham::bootstrapSession(mode, [&] {
+    session = Arkham::composeProductionSession();
+    engine.rootContext()->setContextProperty(
+        QStringLiteral("sessionCoordinator"), session->coordinator.get());
+  });
+
   engine.loadFromModule(QStringLiteral("ArkhamHorror"), QStringLiteral("Main"));
 
   if (engine.rootObjects().isEmpty()) {
     return EXIT_FAILURE;
   }
 
-  if (parser.isSet(smokeTestOption)) {
+  // Boot only after the QML root has loaded successfully, and only for a
+  // real (non-smoke-test) run: |session| is null whenever bootstrapSession
+  // did not invoke the composer above.
+  if (session) {
+    session->coordinator->start();
+  }
+
+  if (smokeTest) {
     // The QML root is an ApplicationWindow, i.e. a QQuickWindow; if that
     // ever stopped being true (e.g. a non-Window root component), fail
     // immediately rather than silently skip the frame-rendering proof.
