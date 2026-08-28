@@ -7,6 +7,7 @@
 #include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QEvent>
+#include <QEventLoop>
 #include <QFile>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
