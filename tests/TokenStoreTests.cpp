@@ -294,12 +294,17 @@ void TokenStoreTests::updateOverwritesPreviousToken() {
   QtKeychainTokenStore store(std::move(factory));
   const QString profileId = newProfileId();
 
-  runOp([&](ITokenStore::ResultCallback cb) {
+  const auto firstSaveResult = runOp([&](ITokenStore::ResultCallback cb) {
     store.saveToken(profileId, QStringLiteral("first-token"), std::move(cb));
   });
-  runOp([&](ITokenStore::ResultCallback cb) {
+  QVERIFY(firstSaveResult.has_value());
+  QCOMPARE(firstSaveResult->outcome, TokenStoreOutcome::Success);
+
+  const auto secondSaveResult = runOp([&](ITokenStore::ResultCallback cb) {
     store.saveToken(profileId, QStringLiteral("second-token"), std::move(cb));
   });
+  QVERIFY(secondSaveResult.has_value());
+  QCOMPARE(secondSaveResult->outcome, TokenStoreOutcome::Success);
 
   const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
     store.readToken(profileId, std::move(cb));
@@ -359,9 +364,11 @@ void TokenStoreTests::deleteRemovesToken() {
   QtKeychainTokenStore store(std::move(factory));
   const QString profileId = newProfileId();
 
-  runOp([&](ITokenStore::ResultCallback cb) {
+  const auto seedResult = runOp([&](ITokenStore::ResultCallback cb) {
     store.saveToken(profileId, QStringLiteral("some-token"), std::move(cb));
   });
+  QVERIFY(seedResult.has_value());
+  QCOMPARE(seedResult->outcome, TokenStoreOutcome::Success);
 
   const auto deleteResult = runOp([&](ITokenStore::ResultCallback cb) {
     store.deleteToken(profileId, std::move(cb));

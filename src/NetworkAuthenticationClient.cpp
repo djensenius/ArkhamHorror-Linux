@@ -92,7 +92,11 @@ AuthResult<T> classifyReply(QNetworkReply *reply, Decode decode) {
                          std::nullopt};
   }
 
-  return AuthResult<T>{AuthOutcome::Success, QString{}, status, *decoded};
+  // Move rather than copy: *decoded may carry secret-bearing fields (e.g.
+  // AuthToken::token), and decoded is a local about to go out of scope
+  // anyway, so there is no reason to leave a second live copy behind.
+  return AuthResult<T>{AuthOutcome::Success, QString{}, status,
+                       std::move(*decoded)};
 }
 
 // Returns the request attributes/headers common to every authentication
