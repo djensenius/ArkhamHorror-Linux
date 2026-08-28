@@ -75,6 +75,14 @@ install -Dm644 "$repo_root/third_party/qtkeychain/NOTICE.md" \
 
 export QML_SOURCES_PATHS="$repo_root/qml"
 export LINUXDEPLOY_PLUGIN_QT="$qt_plugin"
+# linuxdeploy-plugin-qt only bundles the "xcb" platform plugin by
+# default. Bundling "offscreen" too (via its EXTRA_PLATFORM_PLUGINS
+# hook) lets the exact same shipped AppImage be launched headlessly
+# with QT_QPA_PLATFORM=offscreen -- this is how CI's AppImage smoke
+# test actually proves the packaged app starts, and it may also help on
+# headless SteamOS/CI-like environments -- without changing anything
+# about normal interactive use, which still defaults to "xcb".
+export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
 "$linuxdeploy" \
   --appdir "$app_dir" \
   --desktop-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.desktop" \
