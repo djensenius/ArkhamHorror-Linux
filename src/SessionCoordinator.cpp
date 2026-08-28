@@ -322,10 +322,16 @@ void SessionCoordinator::issueWhoAmI(quint64 generation,
         if (!self) {
           return;
         }
-        self->m_pendingAuthHandle = AuthRequestHandle{};
+        // Check generation BEFORE clearing m_pendingAuthHandle: a stale
+        // completion (e.g. the Cancelled result delivered after
+        // cancelPendingAuthRequest()) must never clobber the handle of a
+        // newer, still-in-flight request that a later signIn()/
+        // registerAccount()/credential-restore call may have already
+        // installed under the bumped generation.
         if (generation != self->m_generation) {
           return;
         }
+        self->m_pendingAuthHandle = AuthRequestHandle{};
         self->handleWhoAmIResult(generation, profileId, token, purpose, result);
       });
 }
@@ -481,10 +487,13 @@ void SessionCoordinator::signIn(const QString &email, const QString &password) {
         if (!self) {
           return;
         }
-        self->m_pendingAuthHandle = AuthRequestHandle{};
+        // See issueWhoAmI()'s callback: check generation before clearing
+        // m_pendingAuthHandle so a stale (e.g. cancelled) completion never
+        // clobbers a newer in-flight request's handle.
         if (generation != self->m_generation) {
           return;
         }
+        self->m_pendingAuthHandle = AuthRequestHandle{};
         self->handleFreshTokenResult(generation, profileId, result);
       });
   // password/email are never retained in a member: they are only used to
@@ -511,10 +520,13 @@ void SessionCoordinator::registerAccount(const QString &email,
         if (!self) {
           return;
         }
-        self->m_pendingAuthHandle = AuthRequestHandle{};
+        // See issueWhoAmI()'s callback: check generation before clearing
+        // m_pendingAuthHandle so a stale (e.g. cancelled) completion never
+        // clobbers a newer in-flight request's handle.
         if (generation != self->m_generation) {
           return;
         }
+        self->m_pendingAuthHandle = AuthRequestHandle{};
         self->handleFreshTokenResult(generation, profileId, result);
       });
 }
