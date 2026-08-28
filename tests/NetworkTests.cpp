@@ -24,12 +24,14 @@
 #include <stdexcept>
 #include <utility>
 
+#include "AuthTransportSecurity.h"
 #include "ICapabilityProbe.h"
 #include "IProfileStore.h"
 #include "NetworkCapabilityProbe.h"
 #include "ProbeResult.h"
 #include "QSettingsProfileStore.h"
 #include "ServerProfile.h"
+#include "StrictLoopbackUrlTable.h"
 #include "UrlValidator.h"
 #include "ValueOrError.h"
 
@@ -206,6 +208,7 @@ private slots:
   void urlAcceptsPathPrefix();
   void urlStripsTrailingSlash();
   void urlTrimsSurroundingWhitespace();
+  void urlRejectsControlCharactersAtEdges();
   void urlRejectsEmpty();
   void urlRejectsNonHttpScheme();
   void urlRejectsMissingHost();
@@ -217,6 +220,12 @@ private slots:
   void urlRejectsDuplicateApiPathInfix();    // /proxy/api/v1
   void urlRejectsDuplicateApiPathInfixSub(); // /proxy/api/v1/foo
   void urlAcceptsApiV10();                   // /api/v10 is valid
+  void urlRejectsInsecureTransport();
+  void urlStrictLoopbackPolicy_data();
+  void urlStrictLoopbackPolicy();
+  void rawIPv6BracketTrailingGarbageRejected();
+  void rawPortValidationRejectsMalformedAndOutOfRangePorts();
+  void nonHttpSchemeFailsClosed();
 
   // ── ServerProfile factories and path construction ─────────────────────────
   void hostedDefaultProperties();
@@ -297,20 +306,20 @@ void NetworkTests::urlAcceptsHttps() {
 }
 
 void NetworkTests::urlAcceptsHttp() {
-  const auto r = validateCustomUrl(QStringLiteral("http://deck.local"));
+  const auto r = validateCustomUrl(QStringLiteral("http://localhost"));
   QVERIFY(r.has_value());
   QCOMPARE(r->scheme(), QStringLiteral("http"));
 }
 
 void NetworkTests::urlAcceptsNonDefaultPort() {
-  const auto r = validateCustomUrl(QStringLiteral("http://deck.local:3000"));
+  const auto r = validateCustomUrl(QStringLiteral("http://localhost:3000"));
   QVERIFY(r.has_value());
   QCOMPARE(r->port(), 3000);
 }
 
 void NetworkTests::urlAcceptsPathPrefix() {
-  const auto r =
-      validateCustomUrl(QStringLiteral("http://192.168.1.100:8080/selfhosted"));
+  const auto r = validateCustomUrl(
+      QStringLiteral("https://192.168.1.100:8080/selfhosted"));
   QVERIFY(r.has_value());
   QCOMPARE(r->path(), QStringLiteral("/selfhosted"));
   QCOMPARE(r->port(), 8080);
@@ -324,10 +333,47 @@ void NetworkTests::urlStripsTrailingSlash() {
 }
 
 void NetworkTests::urlTrimsSurroundingWhitespace() {
+  // This exercises plain ASCII space (U+0020), which QString::trimmed()
+  // strips. trimmed() also silently strips other QChar::isSpace() code
+  // points that are NOT control characters -- e.g. Unicode space
+  // separators such as NBSP (U+00A0) or EM SPACE (U+2003) -- and that is
+  // fine: those are ordinary whitespace, not a policy concern here (see
+  // the containsControlCharacter() comment in UrlValidator.cpp). What is
+  // rejected outright, before trimming even runs, is any Unicode "control"
+  // character (category Cc: tab, newline, CR, and similar), anywhere in
+  // the original input -- including purely leading or trailing ones (see
+  // UrlErrorCode::ControlCharacterPresent and
+  // urlStrictLoopbackPolicy_data()'s "-trailing-tab-"/"-trailing-newline"
+  // rows), precisely so a trailing control character cannot be silently
+  // laundered into a clean-looking, accepted URL.
   const auto r =
-      validateCustomUrl(QStringLiteral(" \nhttps://example.com/prefix\t "));
+      validateCustomUrl(QStringLiteral("  https://example.com/prefix  "));
   QVERIFY(r.has_value());
   QCOMPARE(*r, QUrl(QStringLiteral("https://example.com/prefix")));
+}
+
+// Complements urlTrimsSurroundingWhitespace(): proves a control character
+// at either edge of the ORIGINAL input is rejected outright, for an
+// ordinary https URL (not merely the http-loopback-specific rows in
+// urlStrictLoopbackPolicy_data()) -- i.e. this is not a loopback-only
+// policy but applies to validateCustomUrl()'s input handling universally,
+// before QString::trimmed() (which would otherwise silently strip a
+// leading/trailing tab or newline, same as plain space) ever runs.
+void NetworkTests::urlRejectsControlCharactersAtEdges() {
+  const auto leading =
+      validateCustomUrl(QStringLiteral("\thttps://example.com"));
+  QVERIFY(!leading.has_value());
+  QCOMPARE(leading.error().code, UrlErrorCode::ControlCharacterPresent);
+
+  const auto trailing =
+      validateCustomUrl(QStringLiteral("https://example.com\n"));
+  QVERIFY(!trailing.has_value());
+  QCOMPARE(trailing.error().code, UrlErrorCode::ControlCharacterPresent);
+
+  const auto embedded =
+      validateCustomUrl(QStringLiteral("https://exa\rmple.com"));
+  QVERIFY(!embedded.has_value());
+  QCOMPARE(embedded.error().code, UrlErrorCode::ControlCharacterPresent);
 }
 
 void NetworkTests::urlRejectsEmpty() {
@@ -411,6 +457,164 @@ void NetworkTests::urlAcceptsApiV10() {
   QCOMPARE(r->path(), QStringLiteral("/api/v10"));
 }
 
+void NetworkTests::urlRejectsInsecureTransport() {
+  const auto r = validateCustomUrl(QStringLiteral("http://example.com"));
+  QVERIFY(!r.has_value());
+  QCOMPARE(r.error().code, UrlErrorCode::InsecureTransport);
+}
+
+void NetworkTests::urlStrictLoopbackPolicy_data() {
+  QTest::addColumn<QString>("urlString");
+  QTest::addColumn<bool>("expectAccepted");
+  // Meaningful only when expectAccepted is false: the exact UrlErrorCode
+  // (stored as int; UrlErrorCode is not a registered QMetaType) every
+  // rejected row must produce. Asserting the precise code per row (rather
+  // than accepting either InsecureTransport or CredentialsPresent for
+  // every row) ensures a regression that misclassifies one row under the
+  // wrong error code is still caught.
+  QTest::addColumn<int>("expectedErrorCode");
+
+  // The full table is shared with tests/AuthClientTests.cpp (see
+  // tests/StrictLoopbackUrlTable.h), which drives every one of these same
+  // rows through the full public ServerProfile::custom() ->
+  // NetworkAuthenticationClient request-construction boundary instead of
+  // validateCustomUrl() alone.
+  for (const auto &row : Arkham::Test::strictLoopbackUrlRows()) {
+    QTest::newRow(row.name)
+        << row.urlString << row.expectAccepted << row.expectedErrorCode;
+  }
+}
+
+void NetworkTests::urlStrictLoopbackPolicy() {
+  QFETCH(QString, urlString);
+  QFETCH(bool, expectAccepted);
+  QFETCH(int, expectedErrorCode);
+
+  const auto r = validateCustomUrl(urlString);
+  QCOMPARE(r.has_value(), expectAccepted);
+  if (!expectAccepted) {
+    QCOMPARE(static_cast<int>(r.error().code), expectedErrorCode);
+  }
+}
+
+// Direct, production-function-level regression for a bracketed-IPv6-literal
+// parsing bug: extractRawHostFromAuthority() (the internal helper
+// isCleartextAuthAllowedForRawInput() uses to pull the raw host substring
+// out of a "[...]"-bracketed authority) used to return everything between
+// "[" and the first "]" with no check on what followed the closing
+// bracket, so a malformed raw authority like "[::1]evil" was silently
+// truncated into the exact string "::1" -- indistinguishable from a
+// genuinely safe, canonical "::1" loopback host.
+//
+// In the one production call site (UrlValidator::validateCustomUrl()),
+// QUrl's own StrictMode parsing already rejects "http://[::1]evil" as a
+// syntactically invalid URL before isCleartextAuthAllowedForRawInput() is
+// ever reached (confirmed: QUrl requires the bracket's "]" to be followed
+// immediately by either ":port" or the end of the authority). That
+// QUrl-level gate is an implementation detail of one caller, though, and
+// isCleartextAuthAllowedForRawInput() is itself a public function in
+// AuthTransportSecurity.h with its own documented "exactly '::1', optionally
+// followed by :port" contract -- so this test exercises it directly,
+// independent of QUrl's incidental gatekeeping, proving the fix holds on
+// its own merits and guarding against any future caller that invokes it
+// against text QUrl has not already validated.
+void NetworkTests::rawIPv6BracketTrailingGarbageRejected() {
+  // Malformed: trailing text immediately after "]" that is not ":port".
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]evil")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]evil:9000")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]:9000evil")));
+  // Also malformed: no closing bracket at all.
+  QVERIFY(!isCleartextAuthAllowedForRawInput(QStringLiteral("http"),
+                                             QStringLiteral("http://[::1")));
+
+  // Still correctly accepted: the legitimate forms this must not regress.
+  QVERIFY(isCleartextAuthAllowedForRawInput(QStringLiteral("http"),
+                                            QStringLiteral("http://[::1]")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]:9000")));
+}
+
+// Direct, production-function-level regression proving
+// isCleartextAuthAllowedForRawInput()'s own raw-authority port parsing
+// rejects malformed, empty, or out-of-range ports on its own merits -- not
+// merely because QUrl happens to already reject the same text as an
+// unparseable URL in the one real caller (UrlValidator::validateCustomUrl).
+// Exercising the function directly here means a future caller that invokes
+// it against text QUrl has not already validated (or a change to QUrl's
+// own parsing leniency) cannot silently reintroduce these bypasses.
+void NetworkTests::rawPortValidationRejectsMalformedAndOutOfRangePorts() {
+  // Empty port after a bare host's ":" or a bracketed literal's "]:".
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(QStringLiteral("http"),
+                                             QStringLiteral("http://[::1]:")));
+
+  // Non-numeric / percent-escaped / control-bearing port suffixes.
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:evil")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:%39")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:9000\t")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]:evil")));
+
+  // Malformed multiple separators.
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost::9000")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:9000:9000")));
+
+  // Zero, negative, and overflow ports (out of the required 1..65535
+  // range; zero and (via non-digit "-") negative are only reachable
+  // through this function's own range/digit check since QUrl already
+  // treats them as syntactically fine except where a literal "-" makes
+  // the whole URL unparseable).
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:0")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:99999")));
+
+  // Still correctly accepted: valid in-range ports at both boundaries.
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:1")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:65535")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost")));
+}
+
+// Direct, production-function-level regression proving
+// isCleartextAuthAllowedForRawInput() fails closed (returns false) for any
+// scheme other than "http"/"https", rather than falling through to the
+// same unconditional "true" branch used for "https". The one real call
+// site (UrlValidator::validateCustomUrl()) already rejects any
+// non-http/https scheme before this function is ever reached, so this
+// path is not exercised through that caller today -- this test exists so
+// a future caller of this public AuthTransportSecurity.h helper cannot
+// silently receive "cleartext allowed" for a scheme this policy was never
+// designed to classify.
+void NetworkTests::nonHttpSchemeFailsClosed() {
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("ftp"), QStringLiteral("ftp://localhost")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(QStringLiteral(""),
+                                             QStringLiteral("localhost")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("HTTP"), QStringLiteral("HTTP://localhost")));
+
+  // Still correctly accepted/rejected on their own merits: the two schemes
+  // this function actually classifies.
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("https"), QStringLiteral("https://example.com")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://example.com")));
+}
+
 // ─── ServerProfile factories and path construction ────────────────────────
 
 void NetworkTests::hostedDefaultProperties() {
@@ -478,8 +682,8 @@ void NetworkTests::customProfileHasUniqueIds() {
 }
 
 void NetworkTests::customProfileWithNonDefaultPort() {
-  const auto r = ServerProfile::custom(
-      QStringLiteral("Local"), QStringLiteral("http://deck.local:3000"));
+  const auto r = ServerProfile::custom(QStringLiteral("Local"),
+                                       QStringLiteral("http://localhost:3000"));
   QVERIFY2(r.has_value(), qPrintable(r.error()));
   QCOMPARE(r->kind(), ServerProfileKind::Custom);
   QCOMPARE(r->displayName(), QStringLiteral("Local"));
@@ -495,12 +699,13 @@ void NetworkTests::customProfileWithPathPrefix() {
 }
 
 void NetworkTests::customProfileApiUrlWithPrefix() {
-  const auto r = ServerProfile::custom(
-      QStringLiteral("Self"), QStringLiteral("http://192.168.1.5:8080/prefix"));
+  const auto r =
+      ServerProfile::custom(QStringLiteral("Self"),
+                            QStringLiteral("https://192.168.1.5:8080/prefix"));
   QVERIFY2(r.has_value(), qPrintable(r.error()));
   const QUrl api = r->apiUrl(u"capabilities");
   QCOMPARE(api, QUrl(QStringLiteral(
-                    "http://192.168.1.5:8080/prefix/api/v1/capabilities")));
+                    "https://192.168.1.5:8080/prefix/api/v1/capabilities")));
 }
 
 void NetworkTests::customProfileWebsocketUrlWithPrefix() {
@@ -578,8 +783,8 @@ void NetworkTests::storeRoundTripCustom() {
   QVERIFY(tmp.open());
   tmp.close();
 
-  const auto p = ServerProfile::custom(
-      QStringLiteral("My Server"), QStringLiteral("http://deck.local:3000"));
+  const auto p = ServerProfile::custom(QStringLiteral("My Server"),
+                                       QStringLiteral("http://localhost:3000"));
   QVERIFY(p.has_value());
 
   QSettingsProfileStore store(tmp.fileName());
@@ -811,13 +1016,15 @@ void NetworkTests::storeSaveRejectsProfileWithoutId() {
   QVERIFY(tmp.open());
   tmp.close();
 
-  // ServerProfile(QUrl) constructor leaves profileId() empty.
-  const ServerProfile legacyProfile(
-      QUrl(QStringLiteral("https://example.com")));
-  QVERIFY(legacyProfile.profileId().isEmpty());
+  // A default-constructed profile has no ID; this is the only public
+  // constructor ServerProfile exposes besides the validated factories
+  // (hostedDefault()/custom()/customWithId()), all of which always set a
+  // stable ID.
+  const ServerProfile blankProfile;
+  QVERIFY(blankProfile.profileId().isEmpty());
 
   QSettingsProfileStore store(tmp.fileName());
-  const auto result = store.saveProfiles({legacyProfile});
+  const auto result = store.saveProfiles({blankProfile});
   QVERIFY(!result.has_value());
   QVERIFY(result.error().contains(QStringLiteral("ID")));
 }
@@ -1223,8 +1430,10 @@ void NetworkTests::probeTransportFailure() {
 }
 
 void NetworkTests::probeRejectsInvalidProfile() {
-  // An unsupported scheme produces an invalid custom profile.
-  const ServerProfile bad(QUrl(QStringLiteral("ftp://bad")));
+  // A default-constructed profile (no scheme, no host) is always invalid;
+  // this is the only public constructor ServerProfile exposes besides the
+  // validated factories.
+  const ServerProfile bad;
   QVERIFY(!bad.isValid());
 
   StubNetworkAccessManager nam; // no request should be issued

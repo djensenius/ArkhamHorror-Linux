@@ -50,8 +50,10 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
+      - name: Install QtKeychain build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - run: mise run lint
 
   test:
@@ -66,8 +68,12 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
+      - name: Install QtKeychain and D-Bus build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config dbus # dbus is required by kwallet_hardening test's fake KWallet service
       - run: mise run test
 
   build:
@@ -82,8 +88,10 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
+      - name: Install QtKeychain build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - run: mise run build
 
   appimage-smoke:
@@ -103,26 +111,425 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
+      - name: Install QtKeychain build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Test libsecret discovery fallback logic
+        # Exercises find_bundled_libsecret() (used by build-appimage.sh
+        # below) against ldconfig-absent, ldconfig-failing,
+        # ldconfig-succeeding, and nothing-found cases with fakes, so a
+        # regression that reintroduces an unguarded pipeline aborting the
+        # script under `set -euo pipefail` is caught here deterministically,
+        # rather than only by this runner happening to have a working
+        # ldconfig.
+        run: bash packaging/tests/test_find_bundled_libsecret.sh
+      - name: Test dependency-closure auditor against a synthetic ELF chain
+        # Builds a small local three-library chain (root -> mid -> leaf)
+        # with `cc`, then proves audit_dependency_closure.py: resolves a
+        # complete closure, agrees between --list-only and human-readable
+        # modes, fails and names the exact missing library/requester when
+        # a real transitive dependency is deleted, never treats an
+        # ABI-allowlisted library (libc.so.6) as missing even though it is
+        # never present, and rejects a nonexistent root. This is hermetic
+        # (no apt-get/network) and independent of the real
+        # libsecret/libgpg-error closure exercised further below.
+        run: bash packaging/tests/test_audit_dependency_closure.sh
       - name: Download packaging tools
+        # Downloaded into $RUNNER_TEMP (outside the repository working
+        # directory that "*.AppImage" globs below and in the upload step
+        # match) so these tool executables can never be picked up by
+        # those globs or bundled into the uploaded artifact alongside the
+        # actual application AppImage.
         run: |
-          curl --fail --location --retry 3 --output linuxdeploy-x86_64.AppImage \
+          mkdir -p "$RUNNER_TEMP/linuxdeploy-tools"
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/linuxdeploy-tools/linuxdeploy-x86_64.AppImage" \
             https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
-          echo "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  linuxdeploy-x86_64.AppImage" \
+          echo "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  $RUNNER_TEMP/linuxdeploy-tools/linuxdeploy-x86_64.AppImage" \
             | sha256sum --check
-          curl --fail --location --retry 3 --output linuxdeploy-plugin-qt-x86_64.AppImage \
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/linuxdeploy-tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
             https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-qt-x86_64.AppImage
-          echo "15106be885c1c48a021198e7e1e9a48ce9d02a86dd0a1848f00bdbf3c1c92724  linuxdeploy-plugin-qt-x86_64.AppImage" \
+          echo "15106be885c1c48a021198e7e1e9a48ce9d02a86dd0a1848f00bdbf3c1c92724  $RUNNER_TEMP/linuxdeploy-tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
             | sha256sum --check
-          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/linuxdeploy-tools/linuxdeploy-x86_64.AppImage" \
+            "$RUNNER_TEMP/linuxdeploy-tools/linuxdeploy-plugin-qt-x86_64.AppImage"
       - name: Package
         env:
-          LINUXDEPLOY: ${{ github.workspace }}/linuxdeploy-x86_64.AppImage
-          LINUXDEPLOY_PLUGIN_QT: ${{ github.workspace }}/linuxdeploy-plugin-qt-x86_64.AppImage
+          LINUXDEPLOY: ${{ runner.temp }}/linuxdeploy-tools/linuxdeploy-x86_64.AppImage
+          LINUXDEPLOY_PLUGIN_QT: ${{ runner.temp }}/linuxdeploy-tools/linuxdeploy-plugin-qt-x86_64.AppImage
         run: |
           mise run build
           mise run package:appimage
+      - name: Verify exactly one application AppImage was produced
+        # Now that the linuxdeploy tool executables are downloaded outside
+        # the repository directory (see "Download packaging tools" above),
+        # the only file this glob can ever match is the actual application
+        # AppImage build-appimage.sh produced -- this assertion makes that
+        # invariant explicit and catches any future regression (e.g. a tool
+        # accidentally downloaded back into the repo root) before it could
+        # silently bloat or alter the uploaded artifact's contents.
+        run: |
+          set -euo pipefail
+          mapfile -t appimages < <(find . -maxdepth 1 -name '*.AppImage' -print)
+          echo "Found ${#appimages[@]} AppImage(s) in the repository root:"
+          printf '  %s\n' "${appimages[@]}"
+          [[ ${#appimages[@]} -eq 1 ]] || {
+            echo "Expected exactly one AppImage to upload, found ${#appimages[@]}." >&2
+            exit 1
+          }
+          case "${appimages[0]}" in
+            *linuxdeploy*)
+              echo "The produced AppImage looks like a linuxdeploy tool, not the application: ${appimages[0]}" >&2
+              exit 1
+              ;;
+          esac
+      - name: Verify libsecret and attribution files are bundled
+        run: |
+          set -euo pipefail
+          appimage="$(ls -1 ./*.AppImage | head -n1)"
+          [[ -n "$appimage" ]] || { echo "No AppImage produced." >&2; exit 1; }
+          chmod +x "$appimage"
+          # Extract the actual produced artifact (not just the AppDir staged
+          # during packaging) so this proves what end users receive, not
+          # merely what the build script intended to include.
+          "./$appimage" --appimage-extract >/dev/null
+          extracted="$(pwd)/squashfs-root"
+
+          # Defense-in-depth alongside the repo-root "exactly one AppImage"
+          # assertion above: also prove the packaged AppDir itself never
+          # embedded a linuxdeploy *tool executable* (e.g. via an accidental
+          # future copy step), not just that one wasn't uploaded alongside
+          # it. This must not flag `apprun-hooks/linuxdeploy-plugin-qt-
+          # hook.sh`, a legitimate runtime hook script that linuxdeploy-
+          # plugin-qt installs into every AppImage it produces (it sets up
+          # Qt's own plugin/QML env vars at launch) -- it is named after the
+          # plugin but is not the plugin/tool binary itself, so only ELF/
+          # AppImage *binaries* matching the name are treated as a finding;
+          # shell-script hooks are explicitly excluded.
+          embedded_linuxdeploy=""
+          while IFS= read -r -d '' candidate; do
+            if file "$candidate" | grep -qE 'ELF|AppImage'; then
+              embedded_linuxdeploy="$candidate"
+              break
+            fi
+          done < <(find "$extracted" -iname '*linuxdeploy*' -type f -print0)
+          [[ -z "$embedded_linuxdeploy" ]] || {
+            echo "A linuxdeploy tool executable was embedded inside the AppImage: $embedded_linuxdeploy" >&2
+            exit 1
+          }
+
+          bundled_secret="$(find "$extracted" -name 'libsecret-1.so.0*' | head -n1)"
+          [[ -n "$bundled_secret" ]] || {
+            echo "libsecret-1.so.0 was not bundled into the AppImage." >&2
+            exit 1
+          }
+          echo "Found bundled libsecret: $bundled_secret"
+          file "$bundled_secret" | grep -q 'ELF' || {
+            echo "Bundled libsecret-1.so.0 is not a valid ELF shared object:" >&2
+            file "$bundled_secret" >&2
+            exit 1
+          }
+
+          keychain_lib="$(find "$extracted" -name 'libqt6keychain.so*' | head -n1)"
+          [[ -n "$keychain_lib" ]] || {
+            echo "libqt6keychain was not found inside the AppImage." >&2
+            exit 1
+          }
+
+          # libqt6keychain does NOT link libsecret-1 as an ELF DT_NEEDED
+          # dependency -- QtKeychain's libsecret.cpp loads it at runtime via
+          # QLibrary (dlopen()), so `ldd libqt6keychain.so` never lists it,
+          # bundled or not, and that check cannot be used to prove bundling.
+          # See packaging/verify_bundled_libsecret.py for the real dlopen()
+          # based proof this uses instead (it manages LD_LIBRARY_PATH
+          # itself; no caller-side environment setup needed).
+          python3 packaging/verify_bundled_libsecret.py "$bundled_secret"
+
+          license_path="$extracted/usr/share/doc/ArkhamHorror/third_party/qtkeychain/LICENSE"
+          notice_path="$extracted/usr/share/doc/ArkhamHorror/third_party/qtkeychain/NOTICE.md"
+          [[ -s "$license_path" ]] || {
+            echo "QtKeychain LICENSE was not bundled at $license_path" >&2
+            exit 1
+          }
+          [[ -s "$notice_path" ]] || {
+            echo "QtKeychain NOTICE.md was not bundled at $notice_path" >&2
+            exit 1
+          }
+          # The upstream QtKeychain LICENSE text is the classic BSD-3-Clause
+          # license but never contains the literal word "BSD"; match its
+          # actual distinguishing clauses instead.
+          grep -q "Redistribution and use in source and binary forms" "$license_path" \
+            && grep -q "endorse or promote products derived from this software" "$license_path" || {
+            echo "Bundled LICENSE does not look like the expected BSD-3-Clause text." >&2
+            exit 1
+          }
+          echo "libsecret, libqt6keychain, and attribution files verified inside the AppImage."
+      - name: Recursive DT_NEEDED closure audit (with mutation regressions)
+        # A static, purely file-based proof (packaging/audit_dependency_closure.py)
+        # that every non-ABI transitive dependency of the bundled libsecret
+        # (and libqt6keychain) closure is actually present inside the
+        # AppImage's own AppDir lib directory, or is one of the small,
+        # explicitly documented ABI_ALLOWLIST entries (the dynamic loader
+        # and core glibc component libraries every glibc-based x86_64 Linux
+        # host is guaranteed to already provide). Unlike a dlopen()-based
+        # check (see the next step), this reads each bundled ELF's
+        # DT_NEEDED entries via `readelf` and resolves them purely from the
+        # filesystem, so it cannot be fooled into a false pass by whatever
+        # shared libraries happen to already be installed/preloaded in
+        # whatever environment runs it -- it is host-independent by
+        # construction, not merely by container choice.
+        #
+        # This is exactly the check that would have caught this item's own
+        # root cause (bundled libgcrypt.so.20 transitively requiring
+        # libgpg-error.so.0, which linuxdeploy's default blacklist excludes
+        # from automatic bundling): the mutation regressions below prove it
+        # is not vacuously passing regardless of AppDir contents by
+        # deleting real, representative non-ABI members of the actual
+        # bundled closure (not a synthetic stand-in) and requiring the
+        # audit to fail for each one.
+        #
+        # Mutation victims are chosen as: (1) libffi and (2) libgpg-error,
+        # by explicit SONAME-prefix pattern (never a fixed exact version,
+        # so a distro bump to e.g. libffi.so.9 is still matched) --
+        # required by name because they are this item's own two concretely
+        # documented real-world gaps (python:3.12-slim's own preloaded
+        # libffi could otherwise mask a genuinely missing bundled copy, and
+        # libgpg-error.so.0 was the actual missing dependency this whole
+        # audit step was added to catch) -- plus (3) one further
+        # representative non-ABI member chosen by a content-derived hash
+        # index into the remaining closure members, not by taking the
+        # alphabetically-first N entries (a "head -3" proxy would silently
+        # keep re-testing the same few early-alphabet names forever and
+        # never exercise the rest of the closure as it changes over time).
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          bundled_secret="$(find "$extracted" -name 'libsecret-1.so.0*' | head -n1)"
+          [[ -n "$bundled_secret" ]] || {
+            echo "libsecret-1.so.0 not found in the extracted AppImage." >&2
+            exit 1
+          }
+          lib_dir="$(dirname "$bundled_secret")"
+          keychain_name="$(find "$lib_dir" -maxdepth 1 -name 'libqt6keychain.so*' -printf '%f\n' | head -n1)"
+          [[ -n "$keychain_name" ]] || {
+            echo "libqt6keychain was not found alongside the bundled libsecret." >&2
+            exit 1
+          }
+
+          echo "Auditing the real bundled closure..."
+          python3 packaging/audit_dependency_closure.py "$lib_dir" \
+            --root libsecret-1.so.0 --root "$keychain_name"
+
+          # Enumerate the real closure members (excluding the two roots
+          # above, which the audit script itself already requires to be
+          # present) so the mutation targets below are always genuine,
+          # currently-bundled, non-ABI dependencies -- never a hardcoded
+          # filename that could silently stop matching after an unrelated
+          # package version bump on the runner image.
+          mapfile -t closure_members < <(
+            python3 packaging/audit_dependency_closure.py "$lib_dir" \
+              --root libsecret-1.so.0 --root "$keychain_name" --list-only \
+              | grep -v -e '^libsecret-1\.so\.0$' -e "^${keychain_name}\$"
+          )
+          [[ ${#closure_members[@]} -ge 2 ]] || {
+            echo "Expected at least two non-root closure members to mutate-test against, found ${#closure_members[@]}." >&2
+            exit 1
+          }
+          echo "Real non-root closure members available for mutation testing: ${closure_members[*]}"
+
+          # (1) and (2): libffi and libgpg-error MUST be present in the
+          # real bundled closure and MUST be individually mutation-tested
+          # by name -- these are this item's own two named, previously
+          # under-tested (or, for libgpg-error, previously entirely
+          # missing) dependencies. Matched by SONAME prefix, not an exact
+          # pinned version string, so a future distro package bump (e.g.
+          # libffi.so.8 -> libffi.so.9) is still matched and tested.
+          libffi_name=""
+          libgpgerror_name=""
+          for member in "${closure_members[@]}"; do
+            if [[ -z "$libffi_name" && "$member" == libffi.so.* ]]; then
+              libffi_name="$member"
+            fi
+            if [[ -z "$libgpgerror_name" && "$member" == libgpg-error.so.* ]]; then
+              libgpgerror_name="$member"
+            fi
+          done
+          [[ -n "$libffi_name" ]] || {
+            echo "Expected 'libffi.so.*' in the real bundled closure but did not find it: ${closure_members[*]}" >&2
+            exit 1
+          }
+          [[ -n "$libgpgerror_name" ]] || {
+            echo "Expected 'libgpg-error.so.*' in the real bundled closure but did not find it: ${closure_members[*]}" >&2
+            exit 1
+          }
+          echo "Confirmed required mutation targets present: libffi='$libffi_name', libgpg-error='$libgpgerror_name'"
+
+          # (3): one further representative non-ABI member, chosen by a
+          # content-derived hash index into the remaining closure members
+          # (i.e. excluding the two already covered above and the roots),
+          # not by always picking the same alphabetically-early entries.
+          # This selection shifts automatically whenever the underlying
+          # dependency graph changes (e.g. a transitive dependency is
+          # added, removed, or renamed across a distro/package update),
+          # giving broader coverage over time than a fixed "head -N" proxy
+          # while remaining fully deterministic for a given closure.
+          remaining_members=()
+          for member in "${closure_members[@]}"; do
+            if [[ "$member" != "$libffi_name" && "$member" != "$libgpgerror_name" ]]; then
+              remaining_members+=("$member")
+            fi
+          done
+          extra_victim=""
+          if [[ ${#remaining_members[@]} -gt 0 ]]; then
+            hash_hex="$(printf '%s\n' "${remaining_members[@]}" | sha256sum | cut -c1-8)"
+            extra_idx=$(( 16#$hash_hex % ${#remaining_members[@]} ))
+            extra_victim="${remaining_members[$extra_idx]}"
+            echo "Additional dynamically-selected mutation target: '$extra_victim' (index $extra_idx of ${#remaining_members[@]})"
+          else
+            echo "No further non-ABI closure members remain beyond libffi/libgpg-error; skipping the additional representative-member mutation."
+          fi
+
+          victims=("$libffi_name" "$libgpgerror_name")
+          [[ -n "$extra_victim" ]] && victims+=("$extra_victim")
+
+          scratch="$(mktemp -d)"
+          audit_output="$(mktemp)"
+          trap 'rm -rf "$scratch" "$audit_output"' EXIT
+          for victim in "${victims[@]}"; do
+            rm -rf "${scratch:?}"/*
+            cp -a "$lib_dir/." "$scratch/"
+            rm -f "$scratch/$victim"
+            if python3 packaging/audit_dependency_closure.py "$scratch" \
+              --root libsecret-1.so.0 --root "$keychain_name" >"$audit_output" 2>&1; then
+              echo "Expected the closure audit to fail after removing '$victim', but it passed:" >&2
+              cat "$audit_output" >&2
+              exit 1
+            fi
+            grep -q -- "$victim" "$audit_output" || {
+              echo "Closure audit failed after removing '$victim' as expected, but did not name it as missing:" >&2
+              cat "$audit_output" >&2
+              exit 1
+            }
+            echo "Confirmed: removing bundled '$victim' correctly fails the closure audit."
+          done
+      - name: Verify bundled libsecret dependency closure has no host fallback
+        # The static recursive closure audit above is the primary,
+        # host-independent proof that every non-ABI transitive dependency
+        # is actually bundled. This step is a complementary, secondary
+        # proof that the *dynamic* resolution mechanism (dlopen(), as
+        # QtKeychain's libsecret backend actually uses at runtime) also
+        # resolves everything from the bundled copies when scoped via
+        # LD_LIBRARY_PATH -- but note its own limitation honestly: the
+        # python:3.12-slim-bookworm image below does not have
+        # libsecret-1-0 itself installed, yet may still ship some of the
+        # same transitive libraries the CPython interpreter itself links
+        # against (e.g. libffi, zlib), so a broken bundling could in
+        # principle still partially resolve via the container image's own
+        # libraries rather than the mounted AppDir. The static audit above
+        # does not share this limitation (it never depends on what the
+        # auditing environment itself happens to already have installed),
+        # which is why it -- not this step -- is treated as the
+        # authoritative proof of full closure completeness; this step adds
+        # confidence that the bundled files are also genuinely loadable via
+        # the real dlopen() code path, not merely present as inert files.
+        #
+        # This step re-runs the exact same production dlopen check
+        # (packaging/verify_bundled_libsecret.py, unmodified) inside a
+        # container built from python:3.12-slim-bookworm. Only the
+        # extracted AppImage's usr/lib directory is mounted in (read-only)
+        # and LD_LIBRARY_PATH is set at container-start (i.e. from process
+        # start, matching the requirement documented in
+        # verify_bundled_libsecret.py's docstring), so the dynamic linker
+        # is directed to the mounted AppDir copy first. This was verified
+        # locally during development by deliberately removing a bundled
+        # transitive dependency from a synthetic AppDir and confirming this
+        # exact check then fails with an explicit "cannot open shared
+        # object file" error rather than passing.
+        #
+        # The image is pinned by digest, per repo policy of pinning
+        # external dependencies precisely.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          bundled_secret="$(find "$extracted" -name 'libsecret-1.so.0*' | head -n1)"
+          [[ -n "$bundled_secret" ]] || {
+            echo "libsecret-1.so.0 not found in the extracted AppImage." >&2
+            exit 1
+          }
+          lib_dir="$(dirname "$bundled_secret")"
+          docker run --rm \
+            --volume "$lib_dir:/appdir-lib:ro" \
+            --volume "$(pwd)/packaging/verify_bundled_libsecret.py:/verify.py:ro" \
+            python@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579 \
+            python3 /verify.py "/appdir-lib/$(basename "$bundled_secret")"
+      - name: Launch the packaged AppImage headlessly to verify real startup
+        # Runs the extracted AppRun (with the app's own --smoke-test flag,
+        # see src/main.cpp) inside a container built from
+        # debian:bookworm-slim, an image that -- like the dependency-closure
+        # check above -- never has libsecret-1-0 or its glib/gio/gobject
+        # dependency stack preinstalled. Only fontconfig, a concrete font
+        # package, libxkbcommon0, libgl1, libopengl0, and libegl1 are added
+        # on top (verified locally during development to pull in none of
+        # libsecret/glib/gobject/gio transitively) so Qt Quick's offscreen
+        # QPA platform plugin can actually initialize text layout and
+        # keymaps. QT_QUICK_BACKEND=software selects Qt Quick's raster
+        # scenegraph adaptation so no GPU/EGL context is ever created at
+        # runtime, but libGLX.so.0/libGL.so.1/libOpenGL.so.0/libEGL.so.1
+        # are still required because Qt's Gui/OpenGL support libraries are
+        # ELF-linked (DT_NEEDED) against them regardless of which backend
+        # is selected at runtime -- the dynamic loader resolves DT_NEEDED
+        # libraries at load time even for symbols never actually called,
+        # so omitting any of them fails AppRun's own dynamic linking before
+        # Qt code ever runs (confirmed in CI iteration: omitting libgl1
+        # reproduced "libGLX.so.0: cannot open shared object file", and
+        # omitting libopengl0 then reproduced the equivalent error for
+        # libOpenGL.so.0). This both proves genuine Qt/QML/plugin startup
+        # (not merely that the binary exists) and reinforces that the
+        # bundled libsecret closure is what a real run actually resolves,
+        # not a host fallback.
+        #
+        # --smoke-test runs full, unmodified QGuiApplication /
+        # QQmlApplicationEngine / plugin initialization and the existing
+        # rootObjects().isEmpty() failure check, then enters the real Qt
+        # event loop (app.exec()) and exits 0 only once the root
+        # QQuickWindow has actually rendered and swapped its first
+        # scenegraph frame (QQuickWindow::frameSwapped()); an internal
+        # 20-second deadline (src/main.cpp's kSmokeTestDeadlineMs) exits
+        # non-zero if no frame renders in time. A QML/plugin/rendering
+        # failure or hang therefore always causes a non-zero exit from
+        # this process itself -- CI never has to infer success from an
+        # external timeout. The `timeout 60` below is only a defensive
+        # backstop against something outside the app's own control (e.g.
+        # a container/runtime hang); a timeout's non-zero (124) exit still
+        # fails the step under `set -euo pipefail` like any other error --
+        # it is never treated as a substitute for the app's own real
+        # first-frame success signal.
+        #
+        # The image is pinned by digest, per repo policy of pinning
+        # external dependencies precisely.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          [[ -x "$extracted/AppRun" ]] || {
+            echo "AppRun not found or not executable in the extracted AppImage." >&2
+            exit 1
+          }
+          docker run --rm \
+            --env QT_QPA_PLATFORM=offscreen \
+            --env QT_QUICK_BACKEND=software \
+            --volume "$extracted:/app:ro" \
+            debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                fontconfig fonts-dejavu-core libxkbcommon0 libgl1 \
+                libopengl0 libegl1 >/dev/null
+              timeout 60 /app/AppRun --smoke-test
+            '
+          echo "AppImage launched, entered the event loop, and rendered its first QML frame successfully in a minimal headless container."
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ArkhamHorror-Linux-AppImage

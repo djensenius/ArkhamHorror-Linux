@@ -1,0 +1,57 @@
+--- a/qtkeychain/keychain_unix.cpp
++++ b/qtkeychain/keychain_unix.cpp
+@@ -353,7 +353,12 @@
+
+     PlainTextStore plainTextStore(q->service(), q->settings());
+
+-    if (plainTextStore.contains(key)) {
++    // ArkhamHorror-Linux hardening: never read or migrate a legacy plaintext
++    // entry when the caller has disabled the insecure fallback. Upstream
++    // otherwise reads/migrates it unconditionally here even when
++    // insecureFallback() is false, which can return an insecurely stored
++    // token from a caller that explicitly opted out of the plaintext store.
++    if (q->insecureFallback() && plainTextStore.contains(key)) {
+         // We previously stored data in the insecure QSettings, but now have KWallet available.
+         // Do the migration
+
+@@ -615,18 +620,29 @@
+
+ void JobPrivate::kwalletFinished(QDBusPendingCallWatcher *watcher)
+ {
+-    if (!watcher->isError()) {
+-        if (mode == Binary) {
+-            QDBusPendingReply<QByteArray> reply = *watcher;
+-            if (reply.isValid()) {
+-                data = reply.value();
+-            }
+-        } else {
+-            QDBusPendingReply<QString> reply = *watcher;
+-            if (reply.isValid()) {
+-                data = reply.value().toUtf8();
+-            }
++    // ArkhamHorror-Linux hardening: upstream previously called
++    // q->emitFinished() unconditionally here, so a failed final KWallet
++    // D-Bus reply (write/delete) was reported as success. Map it to an
++    // explicit failure instead.
++    if (watcher->isError()) {
++        const auto err = watcher->error();
++        q->emitFinishedWithError(
++                OtherError,
++                tr("Could not complete wallet operation: %1; %2")
++                        .arg(QDBusError::errorString(err.type()), err.message()));
++        return;
++    }
++
++    if (mode == Binary) {
++        QDBusPendingReply<QByteArray> reply = *watcher;
++        if (reply.isValid()) {
++            data = reply.value();
+         }
++    } else {
++        QDBusPendingReply<QString> reply = *watcher;
++        if (reply.isValid()) {
++            data = reply.value().toUtf8();
++        }
+     }
+
+     q->emitFinished();
