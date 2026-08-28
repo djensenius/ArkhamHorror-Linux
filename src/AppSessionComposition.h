@@ -20,11 +20,11 @@ namespace Arkham {
 // production constructor), a QSettingsProfileStore, a QtKeychainTokenStore,
 // a NetworkAuthenticationClient, and the SessionCoordinator itself.
 //
-// Field declaration order is deliberate and load-bearing: members are
-// destroyed in reverse declaration order, and SessionCoordinator only
+// Field declaration order is deliberate and load-bearing: C++ destroys
+// members in REVERSE declaration order, and SessionCoordinator only
 // borrows references to everything above it, so it must be destroyed
-// before any of them -- hence it is declared (and therefore destroyed)
-// last.
+// before any of them -- hence it is declared LAST, which means it is
+// destroyed FIRST.
 struct ProductionSession {
   std::unique_ptr<QNetworkAccessManager> capabilityNam;
   std::unique_ptr<QSettingsProfileStore> profileStore;

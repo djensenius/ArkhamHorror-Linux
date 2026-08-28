@@ -33,7 +33,8 @@ namespace Arkham {
 //
 // Threading/lifetime: every dependency is borrowed by reference and must
 // outlive this coordinator (see composeProductionSession() in
-// AppBootstrap.h for the production ownership order that guarantees this).
+// AppSessionComposition.h for the production ownership order that
+// guarantees this).
 // Construction performs no I/O; start() must be called explicitly to begin
 // loading profiles and probing the selected server. Destroying the
 // coordinator cancels the outstanding authentication request (if any) and

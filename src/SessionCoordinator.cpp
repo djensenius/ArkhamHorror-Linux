@@ -167,9 +167,13 @@ void SessionCoordinator::start() {
     return;
   }
 
+  // Copy the matched profile out before moving |profiles| into m_profiles:
+  // std::move()-ing the container invalidates iterators into it, so |it|
+  // must never be dereferenced after the move below.
+  const ServerProfile selectedProfile = *it;
   m_profiles = std::move(profiles);
   m_selectedProfileId = selectedId;
-  m_currentProfile = *it;
+  m_currentProfile = selectedProfile;
   m_profileUsable = false;
   emit selectedProfileChanged();
 

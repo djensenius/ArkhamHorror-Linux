@@ -432,8 +432,9 @@ AuthResult<CurrentUser> userTransport() {
 // ─── Test harness ─────────────────────────────────────────────────────────
 //
 // Field order matters exactly as it does in production
-// (AppSessionComposition.h): coordinator is declared/destroyed last so it
-// never outlives the fakes it only borrows references to.
+// (AppSessionComposition.h): coordinator is declared LAST, so C++'s
+// reverse-declaration-order destruction destroys it FIRST -- it never
+// outlives the fakes it only borrows references to.
 struct Harness {
   FakeProfileStore profileStore;
   FakeProbeFactory probeFactory;

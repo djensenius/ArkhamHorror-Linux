@@ -1,6 +1,10 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QGuiApplication>
+// Not referenced directly in this file, but required: AppSessionComposition.h
+// only forward-declares QNetworkAccessManager, and ProductionSession (owned
+// here via std::unique_ptr) is only ever destroyed here, so this file must
+// provide the complete type for std::unique_ptr's implicit destructor.
 #include <QNetworkAccessManager>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
