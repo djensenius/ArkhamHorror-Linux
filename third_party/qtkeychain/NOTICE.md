@@ -24,10 +24,17 @@ not modified from upstream.
 
 On Linux, QtKeychain's Secret Service backend depends on `libsecret-1` and
 `Qt6::DBus` at runtime; `libsecret-1-dev` and `pkg-config` are required at
-build time (see `.github/workflows/ci.yml`). The AppImage packaging step
-(`packaging/build-appimage.sh`) bundles `libqt6keychain` and its shared
-library dependencies (including `libsecret-1`) via `linuxdeploy`'s automatic
-`ldd`-based dependency resolution.
+build time (see `.github/workflows/ci.yml`). QtKeychain loads
+`libsecret-1.so.0` at runtime via `QLibrary` (`dlopen`), not as a linked
+(`DT_NEEDED`) dependency of `libqt6keychain` -- so it is *not* discovered by
+generic `ldd`-based dependency bundling. The AppImage packaging step
+(`packaging/build-appimage.sh`) therefore locates the system
+`libsecret-1.so.0` explicitly and passes it to `linuxdeploy` via
+`--library`, which bundles it (and its own transitive shared-library
+dependencies, e.g. glib/gobject/gio) into the AppImage so the backend
+remains usable without a host-provided copy. CI's `appimage-smoke` job
+extracts the produced AppImage and asserts `libsecret-1.so.0` is present
+and resolvable within it.
 
 ## No insecure fallback
 
@@ -39,10 +46,25 @@ defaults to `false` upstream. This project never enables it:
 unsupported secure-storage backend always surfaces as a typed
 `TokenStoreOutcome::Unavailable` failure -- never a silent plaintext write.
 
+Additionally, a small downstream patch
+(`third_party/qtkeychain/patches/0001-disable-insecure-kwallet-fallback-and-error-mapping.patch`,
+applied automatically via CMake `FetchContent`'s `PATCH_COMMAND`, on top of
+the unmodified pinned commit) closes two upstream KWallet-backend gaps:
+the read path unconditionally consulted/migrated legacy plaintext even when
+`insecureFallback()` was `false`, and the final KWallet D-Bus
+read/write/delete completion handler ignored transport-level D-Bus errors
+and reported success regardless. Both are fixed to respect
+`insecureFallback(false)` and to surface D-Bus failures as explicit
+QtKeychain errors, matching the no-plaintext-fallback and no-false-success
+requirements above.
+
 ## License scope
 
 This NOTICE and the accompanying `LICENSE` file document QtKeychain's own
 BSD-3-Clause terms for attribution purposes only. ArkhamHorror-Linux itself
 remains unlicensed (see the repository root); this file does not grant, and
 must not be read as granting, any license to ArkhamHorror-Linux's own source
-code.
+code. Both files are also installed into the distributed AppImage at
+`usr/share/doc/ArkhamHorror/third_party/qtkeychain/` (see
+`packaging/build-appimage.sh`) so end users receive this attribution
+without a network round-trip to this repository.

@@ -21,7 +21,11 @@ The current walking skeleton establishes:
   never QSettings, a file, an environment variable, or plaintext.
 - An injectable, redirect-safe authentication HTTP client
   (`IAuthenticationClient` / `NetworkAuthenticationClient`) for the backend's
-  `/authenticate`, `/register`, and `/whoami` endpoints.
+  `/authenticate`, `/register`, and `/whoami` endpoints. HTTPS is required
+  for any host; a narrow, explicitly tested loopback-only HTTP exception
+  (`localhost` or a loopback IPv4/IPv6 literal) preserves local
+  development/self-hosting without ever sending a password or bearer token
+  over cleartext HTTP to a LAN or public host.
 - Separate lint, test, build, and AppImage CI jobs.
 - A `mise` entry point for local and CI tasks.
 
@@ -46,7 +50,13 @@ typed failure rather than silently falling back to an insecure store.
   QtKeychain itself is fetched reproducibly via CMake `FetchContent`, pinned
   to an exact upstream commit (see `CMakeLists.txt` and
   `third_party/qtkeychain/NOTICE.md`); it is not vendored in this
-  repository.
+  repository. A small, reviewable downstream patch closes two upstream
+  KWallet-backend gaps (an unconditional legacy-plaintext read/migration
+  path, and a completion handler that ignored failed D-Bus replies) -- see
+  `third_party/qtkeychain/patches/` and `third_party/qtkeychain/NOTICE.md`.
+  The AppImage explicitly bundles `libsecret-1.so.0`, since QtKeychain loads
+  it at runtime via `QLibrary` rather than as a linked dependency (see
+  `packaging/build-appimage.sh`).
 
 On macOS, `mise run setup:macos` installs the Homebrew dependencies. On Linux,
 install the equivalent Qt development packages or use CI as the reference. CI

@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "AuthModels.h"
+#include "AuthTransportSecurity.h"
 #include "IAuthenticationClient.h"
 #include "NetworkAuthenticationClient.h"
 #include "ServerProfile.h"
@@ -167,6 +168,15 @@ private slots:
   void whoAmIRejectsEmptyToken();
   void requestsDisableCookiesAndAuthReuse();
   void requestsSetManualRedirectPolicy();
+  void requestsSetCacheBypassAttributes();
+  void productionConstructorOwnsDedicatedManager();
+  void httpToNonLoopbackHostRejectedBeforeRequest();
+  void httpLoopbackHostnamePermitted();
+  void httpLoopbackIPv4Permitted();
+  void httpLoopbackIPv6Permitted();
+  void httpLookalikeLoopbackHostRejected();
+  void httpsPermittedForAnyHost();
+  void httpWithUserInfoRejectedEvenForLoopback();
   void threeXxMapsToUnexpectedStatus();
   void twoXxDecodesSuccessfully();
   void unauthorizedMapsTo401();
@@ -347,6 +357,208 @@ void AuthClientTests::requestsSetManualRedirectPolicy() {
                .attribute(QNetworkRequest::RedirectPolicyAttribute)
                .toInt(),
            static_cast<int>(QNetworkRequest::ManualRedirectPolicy));
+}
+
+void AuthClientTests::requestsSetCacheBypassAttributes() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "t"})"));
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "t"})"));
+  nam.enqueue(
+      200,
+      QByteArrayLiteral(
+          R"({"username":"u","email":"e@x.com","beta":false,"admin":false})"));
+  NetworkAuthenticationClient client(nam);
+
+  runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+    return client.authenticate(
+        ServerProfile::hostedDefault(),
+        AuthenticateRequest{QStringLiteral("a@b.com"), QStringLiteral("pw")},
+        std::move(cb));
+  });
+  runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+    return client.registerAccount(ServerProfile::hostedDefault(),
+                                  RegisterRequest{QStringLiteral("a@b.com"),
+                                                  QStringLiteral("user"),
+                                                  QStringLiteral("pw")},
+                                  std::move(cb));
+  });
+  runAndWait<CurrentUser>([&](std::function<void(AuthResult<CurrentUser>)> cb) {
+    return client.whoAmI(ServerProfile::hostedDefault(), QStringLiteral("tok"),
+                         std::move(cb));
+  });
+
+  QCOMPARE(nam.requests().size(), 3);
+  for (const QNetworkRequest &req : nam.requests()) {
+    QCOMPARE(req.attribute(QNetworkRequest::CacheLoadControlAttribute).toInt(),
+             static_cast<int>(QNetworkRequest::AlwaysNetwork));
+    QCOMPARE(req.attribute(QNetworkRequest::CacheSaveControlAttribute).toBool(),
+             false);
+  }
+}
+
+void AuthClientTests::productionConstructorOwnsDedicatedManager() {
+  // Uses the production (owning) constructor with no externally supplied
+  // QNetworkAccessManager. Exercises only the pre-request validation path
+  // (an invalid profile), so no real network I/O ever occurs, while still
+  // proving the owning constructor yields a fully functional client backed
+  // by its own internal manager.
+  NetworkAuthenticationClient client(std::chrono::milliseconds(50));
+
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            ServerProfile{}, // legacy ctor: invalid
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+}
+
+void AuthClientTests::httpToNonLoopbackHostRejectedBeforeRequest() {
+  StubNetworkAccessManager nam;
+  NetworkAuthenticationClient client(nam);
+
+  const ServerProfile profile =
+      customProfile(QStringLiteral("http://example.com"));
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            profile,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+  QCOMPARE(nam.requests().size(), 0); // rejected before the request was built
+}
+
+void AuthClientTests::httpLoopbackHostnamePermitted() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "loopback-ok"})"));
+  NetworkAuthenticationClient client(nam);
+
+  const ServerProfile profile =
+      customProfile(QStringLiteral("http://localhost:9000"));
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            profile,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Success);
+  QCOMPARE(nam.requests().size(), 1);
+}
+
+void AuthClientTests::httpLoopbackIPv4Permitted() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "loopback-ok"})"));
+  NetworkAuthenticationClient client(nam);
+
+  const ServerProfile profile =
+      customProfile(QStringLiteral("http://127.0.0.1:9000"));
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            profile,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Success);
+  QCOMPARE(nam.requests().size(), 1);
+}
+
+void AuthClientTests::httpLoopbackIPv6Permitted() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "loopback-ok"})"));
+  NetworkAuthenticationClient client(nam);
+
+  const ServerProfile profile =
+      customProfile(QStringLiteral("http://[::1]:9000"));
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            profile,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Success);
+  QCOMPARE(nam.requests().size(), 1);
+}
+
+void AuthClientTests::httpLookalikeLoopbackHostRejected() {
+  const QStringList lookalikes = {
+      QStringLiteral("http://localhost.evil.example"),
+      QStringLiteral("http://127.0.0.1.evil.example"),
+      QStringLiteral("http://notlocalhost"),
+  };
+
+  for (const QString &urlString : lookalikes) {
+    StubNetworkAccessManager nam;
+    NetworkAuthenticationClient client(nam);
+    const ServerProfile profile = customProfile(urlString);
+
+    const auto result = runAndWait<AuthToken>(
+        [&](std::function<void(AuthResult<AuthToken>)> cb) {
+          return client.authenticate(
+              profile,
+              AuthenticateRequest{QStringLiteral("a@b.com"),
+                                  QStringLiteral("pw")},
+              std::move(cb));
+        });
+
+    QVERIFY(result.has_value());
+    QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+    QCOMPARE(nam.requests().size(), 0);
+  }
+}
+
+void AuthClientTests::httpsPermittedForAnyHost() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "https-ok"})"));
+  NetworkAuthenticationClient client(nam);
+
+  const ServerProfile profile =
+      customProfile(QStringLiteral("https://example.com"));
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            profile,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Success);
+  QCOMPARE(nam.requests().size(), 1);
+}
+
+void AuthClientTests::httpWithUserInfoRejectedEvenForLoopback() {
+  // ServerProfile always strips userinfo (UrlValidator rejects it at
+  // creation, and the legacy raw-QUrl constructor strips it too), so this
+  // exercises the isSecureOrLoopbackAuthTransport() predicate itself --
+  // the same production function NetworkAuthenticationClient calls -- with
+  // a synthetic QUrl to prove the userinfo guard is not dead code.
+  QUrl withUserInfo(QStringLiteral("http://user:pass@localhost:9000/whoami"));
+  QVERIFY(!isSecureOrLoopbackAuthTransport(withUserInfo));
+
+  QUrl withoutUserInfo(QStringLiteral("http://localhost:9000/whoami"));
+  QVERIFY(isSecureOrLoopbackAuthTransport(withoutUserInfo));
 }
 
 void AuthClientTests::threeXxMapsToUnexpectedStatus() {

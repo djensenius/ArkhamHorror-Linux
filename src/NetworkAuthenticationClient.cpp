@@ -1,5 +1,7 @@
 #include "NetworkAuthenticationClient.h"
 
+#include "AuthTransportSecurity.h"
+
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QMetaObject>
@@ -93,9 +95,11 @@ AuthResult<T> classifyReply(QNetworkReply *reply, Decode decode) {
   return AuthResult<T>{AuthOutcome::Success, QString{}, status, *decoded};
 }
 
-// Applies the request attributes/headers common to every authentication
-// request: no cookie load/save, no cached-authorization reuse, and a manual
-// redirect policy so no 3xx is ever auto-followed.
+// Returns the request attributes/headers common to every authentication
+// request: no cookie load/save, no cached-authorization reuse, a manual
+// redirect policy so no 3xx is ever auto-followed, and cache bypass on
+// both read and write so a cached response/credential is never reused or
+// persisted to disk.
 void applyCommonRequestSettings(QNetworkRequest &request) {
   request.setRawHeader("Accept", "application/json");
   request.setAttribute(QNetworkRequest::CookieLoadControlAttribute,
@@ -106,14 +110,28 @@ void applyCommonRequestSettings(QNetworkRequest &request) {
                        QNetworkRequest::Manual);
   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                        QNetworkRequest::ManualRedirectPolicy);
+  request.setAttribute(QNetworkRequest::CacheLoadControlAttribute,
+                       QNetworkRequest::AlwaysNetwork);
+  request.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);
 }
 
 } // namespace
 
 NetworkAuthenticationClient::NetworkAuthenticationClient(
+    std::chrono::milliseconds timeout, QObject *parent)
+    : NetworkAuthenticationClient(std::make_unique<QNetworkAccessManager>(),
+                                  nullptr, timeout, parent) {}
+
+NetworkAuthenticationClient::NetworkAuthenticationClient(
     QNetworkAccessManager &nam, std::chrono::milliseconds timeout,
     QObject *parent)
-    : QObject(parent), m_nam(nam), m_timeout(timeout) {
+    : NetworkAuthenticationClient(nullptr, &nam, timeout, parent) {}
+
+NetworkAuthenticationClient::NetworkAuthenticationClient(
+    std::unique_ptr<QNetworkAccessManager> ownedNam, QNetworkAccessManager *nam,
+    std::chrono::milliseconds timeout, QObject *parent)
+    : QObject(parent), m_ownedNam(std::move(ownedNam)),
+      m_nam(m_ownedNam ? *m_ownedNam : *nam), m_timeout(timeout) {
   if (timeout < std::chrono::milliseconds::zero()) {
     throw std::invalid_argument(
         "authentication client timeout cannot be negative");
@@ -150,13 +168,14 @@ NetworkAuthenticationClient::~NetworkAuthenticationClient() {
 
 template <typename T>
 void NetworkAuthenticationClient::emitAsync(
-    const std::function<void(AuthResult<T>)> &callback, AuthResult<T> result) {
+    std::function<void(AuthResult<T>)> callback, AuthResult<T> result) {
   QPointer<NetworkAuthenticationClient> self(this);
   QMetaObject::invokeMethod(
       this,
-      [self, callback, result = std::move(result)]() {
+      [self, callback = std::move(callback),
+       result = std::move(result)]() mutable {
         if (self) {
-          callback(result);
+          std::move(callback)(std::move(result));
         }
       },
       Qt::QueuedConnection);
@@ -165,8 +184,9 @@ void NetworkAuthenticationClient::emitAsync(
 template <typename T>
 AuthRequestHandle NetworkAuthenticationClient::rejectInvalidInput(
     std::function<void(AuthResult<T>)> callback, QString diagnostic) {
-  emitAsync<T>(callback, AuthResult<T>{AuthOutcome::InvalidInput,
-                                       std::move(diagnostic), 0, std::nullopt});
+  emitAsync<T>(std::move(callback),
+               AuthResult<T>{AuthOutcome::InvalidInput, std::move(diagnostic),
+                             0, std::nullopt});
   return AuthRequestHandle{};
 }
 
@@ -179,7 +199,15 @@ AuthRequestHandle NetworkAuthenticationClient::issueTokenRequest(
         QStringLiteral("server profile is invalid; cannot issue request"));
   }
 
-  QNetworkRequest request(profile.apiUrl(path));
+  const QUrl url = profile.apiUrl(path);
+  if (!isSecureOrLoopbackAuthTransport(url)) {
+    return rejectInvalidInput<AuthToken>(
+        std::move(callback),
+        QStringLiteral("cleartext HTTP is only permitted to a loopback "
+                       "host; use HTTPS for any other server"));
+  }
+
+  QNetworkRequest request(url);
   applyCommonRequestSettings(request);
   request.setHeader(QNetworkRequest::ContentTypeHeader,
                     QStringLiteral("application/json"));
@@ -197,16 +225,17 @@ AuthRequestHandle NetworkAuthenticationClient::issueTokenRequest(
       if (it == m_pendingTokenRequests.end()) {
         return; // already handled before the timer fired
       }
-      auto cb = it.value().callback;
+      auto cb = std::move(it.value().callback);
       QObject::disconnect(reply, nullptr, this, nullptr);
       m_pendingTokenRequests.erase(it);
       timer->deleteLater();
       reply->abort();
       reply->deleteLater();
       emitAsync<AuthToken>(
-          cb, AuthResult<AuthToken>{AuthOutcome::Transport,
-                                    QStringLiteral("request timed out"), 0,
-                                    std::nullopt});
+          std::move(cb),
+          AuthResult<AuthToken>{AuthOutcome::Transport,
+                                QStringLiteral("request timed out"), 0,
+                                std::nullopt});
     });
   }
 
@@ -222,12 +251,12 @@ AuthRequestHandle NetworkAuthenticationClient::issueTokenRequest(
       t->stop();
       t->deleteLater();
     }
-    auto cb = it.value().callback;
+    auto cb = std::move(it.value().callback);
     m_pendingTokenRequests.erase(it);
     reply->deleteLater();
     AuthResult<AuthToken> result =
         classifyReply<AuthToken>(reply, &AuthToken::fromJson);
-    emitAsync<AuthToken>(cb, std::move(result));
+    emitAsync<AuthToken>(std::move(cb), std::move(result));
   });
 
   if (timer) {
@@ -268,7 +297,15 @@ NetworkAuthenticationClient::whoAmI(const ServerProfile &profile,
         QStringLiteral("token must not be empty or whitespace-only"));
   }
 
-  QNetworkRequest request(profile.apiUrl(u"whoami"));
+  const QUrl url = profile.apiUrl(u"whoami");
+  if (!isSecureOrLoopbackAuthTransport(url)) {
+    return rejectInvalidInput<CurrentUser>(
+        std::move(callback),
+        QStringLiteral("cleartext HTTP is only permitted to a loopback "
+                       "host; use HTTPS for any other server"));
+  }
+
+  QNetworkRequest request(url);
   applyCommonRequestSettings(request);
   request.setRawHeader("Authorization", ("Token " + token).toUtf8());
 
@@ -284,16 +321,17 @@ NetworkAuthenticationClient::whoAmI(const ServerProfile &profile,
       if (it == m_pendingUserRequests.end()) {
         return;
       }
-      auto cb = it.value().callback;
+      auto cb = std::move(it.value().callback);
       QObject::disconnect(reply, nullptr, this, nullptr);
       m_pendingUserRequests.erase(it);
       timer->deleteLater();
       reply->abort();
       reply->deleteLater();
       emitAsync<CurrentUser>(
-          cb, AuthResult<CurrentUser>{AuthOutcome::Transport,
-                                      QStringLiteral("request timed out"), 0,
-                                      std::nullopt});
+          std::move(cb),
+          AuthResult<CurrentUser>{AuthOutcome::Transport,
+                                  QStringLiteral("request timed out"), 0,
+                                  std::nullopt});
     });
   }
 
@@ -309,12 +347,12 @@ NetworkAuthenticationClient::whoAmI(const ServerProfile &profile,
       t->stop();
       t->deleteLater();
     }
-    auto cb = it.value().callback;
+    auto cb = std::move(it.value().callback);
     m_pendingUserRequests.erase(it);
     reply->deleteLater();
     AuthResult<CurrentUser> result =
         classifyReply<CurrentUser>(reply, &CurrentUser::fromJson);
-    emitAsync<CurrentUser>(cb, std::move(result));
+    emitAsync<CurrentUser>(std::move(cb), std::move(result));
   });
 
   if (timer) {
@@ -336,15 +374,16 @@ void NetworkAuthenticationClient::cancel(AuthRequestHandle handle) {
       timer->deleteLater();
     }
     QNetworkReply *reply = it.value().reply;
-    auto cb = it.value().callback;
+    auto cb = std::move(it.value().callback);
     QObject::disconnect(reply, nullptr, this, nullptr);
     m_pendingTokenRequests.erase(it);
     reply->abort();
     reply->deleteLater();
     emitAsync<AuthToken>(
-        cb, AuthResult<AuthToken>{AuthOutcome::Cancelled,
-                                  QStringLiteral("request was cancelled"), 0,
-                                  std::nullopt});
+        std::move(cb),
+        AuthResult<AuthToken>{AuthOutcome::Cancelled,
+                              QStringLiteral("request was cancelled"), 0,
+                              std::nullopt});
     return;
   }
 
@@ -355,15 +394,16 @@ void NetworkAuthenticationClient::cancel(AuthRequestHandle handle) {
       timer->deleteLater();
     }
     QNetworkReply *reply = it.value().reply;
-    auto cb = it.value().callback;
+    auto cb = std::move(it.value().callback);
     QObject::disconnect(reply, nullptr, this, nullptr);
     m_pendingUserRequests.erase(it);
     reply->abort();
     reply->deleteLater();
     emitAsync<CurrentUser>(
-        cb, AuthResult<CurrentUser>{AuthOutcome::Cancelled,
-                                    QStringLiteral("request was cancelled"), 0,
-                                    std::nullopt});
+        std::move(cb),
+        AuthResult<CurrentUser>{AuthOutcome::Cancelled,
+                                QStringLiteral("request was cancelled"), 0,
+                                std::nullopt});
     return;
   }
   // Stale or already-completed handle: safe no-op.

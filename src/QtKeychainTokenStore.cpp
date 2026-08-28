@@ -144,9 +144,10 @@ void QtKeychainTokenStore::emitAsync(ResultCallback callback,
   QPointer<QtKeychainTokenStore> self(this);
   QMetaObject::invokeMethod(
       this,
-      [self, callback = std::move(callback), result = std::move(result)]() {
+      [self, callback = std::move(callback),
+       result = std::move(result)]() mutable {
         if (self) {
-          callback(result);
+          std::move(callback)(std::move(result));
         }
       },
       Qt::QueuedConnection);
@@ -179,7 +180,7 @@ void QtKeychainTokenStore::readToken(const QString &profileId,
     if (it == m_pendingReads.end()) {
       return; // already handled (defensive; should not happen)
     }
-    ResultCallback cb = it->second.callback;
+    ResultCallback cb = std::move(it->second.callback);
     const QKeychain::Error err = jobPtr->error();
     QString token;
     const TokenStoreOutcome outcome = mapReadError(err);
@@ -188,8 +189,8 @@ void QtKeychainTokenStore::readToken(const QString &profileId,
     }
     it->second.job.release()->deleteLater();
     m_pendingReads.erase(it);
-    emitAsync(std::move(cb),
-              TokenStoreResult{outcome, diagnosticFor(outcome), token});
+    emitAsync(std::move(cb), TokenStoreResult{outcome, diagnosticFor(outcome),
+                                              std::move(token)});
   });
 
   jobPtr->start();
@@ -223,7 +224,7 @@ void QtKeychainTokenStore::saveToken(const QString &profileId,
     if (it == m_pendingWrites.end()) {
       return;
     }
-    ResultCallback cb = it->second.callback;
+    ResultCallback cb = std::move(it->second.callback);
     const TokenStoreOutcome outcome = mapWriteError(jobPtr->error());
     it->second.job.release()->deleteLater();
     m_pendingWrites.erase(it);
@@ -254,7 +255,7 @@ void QtKeychainTokenStore::deleteToken(const QString &profileId,
     if (it == m_pendingDeletes.end()) {
       return;
     }
-    ResultCallback cb = it->second.callback;
+    ResultCallback cb = std::move(it->second.callback);
     const TokenStoreOutcome outcome = mapDeleteError(jobPtr->error());
     it->second.job.release()->deleteLater();
     m_pendingDeletes.erase(it);

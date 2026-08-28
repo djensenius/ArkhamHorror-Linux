@@ -67,11 +67,11 @@ signals:
   void finished();
 };
 
-// Creates jobs bound to a fixed service name (see QtKeychainTokenStore).
-// Each create*Job() call returns a freshly constructed, unparented job ready
-// to have its key set by the caller (job classes take the key via the
-// service/key pair passed at creation, matching QtKeychain's own
-// service+key addressing) and then start()ed.
+// Each create*Job() call receives both the service name and the key
+// explicitly and returns a freshly constructed, unparented job already bound
+// to that exact service/key pair (matching QtKeychain's own service+key
+// addressing), ready to be start()ed (write jobs also need setTextData()
+// first). No service or key is fixed by or stored in the factory itself.
 class IKeychainJobFactory {
 public:
   virtual ~IKeychainJobFactory() = default;

@@ -26,11 +26,27 @@ include(CTest)
 # plaintext fallback is never enabled by this project -- see
 # QtKeychainJobFactory, which explicitly calls setInsecureFallback(false) on
 # every job it creates.
+#
+# A small downstream hardening patch is applied on top of the pinned commit
+# (the GIT_TAG below still names the exact unmodified upstream commit; the
+# patch is a separate, reviewable diff applied after checkout, not a
+# different pin). See
+# third_party/qtkeychain/patches/0001-disable-insecure-kwallet-fallback-and-error-mapping.patch
+# for the full rationale; in short, upstream's KWallet backend at this pin
+# (a) unconditionally reads/migrates a legacy plaintext QSettings entry on
+# open even when insecureFallback() is false, and (b) reports a failed final
+# KWallet write/delete D-Bus reply as success. Both are closed by the patch.
 include(FetchContent)
 FetchContent_Declare(
     qtkeychain
     GIT_REPOSITORY https://github.com/frankosterfeld/qtkeychain.git
     GIT_TAG 875f77d9f61bd97fd84cca47ce3bc71186dfbd09 # v0.17.0
+    UPDATE_DISCONNECTED TRUE # already pinned to an exact commit; skip the
+        # update step on every reconfigure so the one-time PATCH_COMMAND
+        # below is never re-run (and re-applied) against an already-patched
+        # working tree.
+    PATCH_COMMAND git apply --whitespace=fix
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/qtkeychain/patches/0001-disable-insecure-kwallet-fallback-and-error-mapping.patch"
 )
 
 # Force QtKeychain's own build options before it configures: Qt 6 only, no
@@ -62,6 +78,8 @@ add_library(arkham_foundation STATIC
     src/AppCommand.h
     src/AuthModels.cpp
     src/AuthModels.h
+    src/AuthTransportSecurity.cpp
+    src/AuthTransportSecurity.h
     src/CompatibilityEvaluator.cpp
     src/CompatibilityEvaluator.h
     src/ContractPin.cpp
@@ -179,4 +197,32 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME auth_client COMMAND arkham-auth-client-tests)
+
+    # QtKeychain's kwallet5 backend (the two downstream hardening patches'
+    # target) only exists in keychain_unix.cpp, compiled solely for
+    # Unix-like, non-Apple platforms, and this test requires a session D-Bus
+    # bus, so it is Linux-only and run under dbus-run-session.
+    if(UNIX AND NOT APPLE)
+        find_package(Qt6 6.8 REQUIRED COMPONENTS DBus)
+        qt_add_executable(arkham-kwallet-hardening-tests
+            tests/QtKeychainKWalletHardeningTests.cpp
+        )
+        target_link_libraries(arkham-kwallet-hardening-tests PRIVATE
+            arkham_foundation
+            Qt6Keychain::Qt6Keychain
+            Qt6::DBus
+            Qt6::Test
+        )
+        find_program(DBUS_RUN_SESSION_EXECUTABLE dbus-run-session)
+        if(DBUS_RUN_SESSION_EXECUTABLE)
+            add_test(NAME kwallet_hardening
+                COMMAND "${DBUS_RUN_SESSION_EXECUTABLE}" --
+                        "$<TARGET_FILE:arkham-kwallet-hardening-tests>")
+        else()
+            message(WARNING
+                "dbus-run-session not found; the kwallet_hardening test "
+                "will be built but not registered with CTest. Install the "
+                "'dbus' package to enable it (expected to be present in CI).")
+        endif()
+    endif()
 endif()

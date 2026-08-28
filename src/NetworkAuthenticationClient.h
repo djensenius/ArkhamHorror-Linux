@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QObject>
 #include <chrono>
+#include <memory>
 
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -16,19 +17,36 @@ namespace Arkham {
 
 // Production IAuthenticationClient backed by QNetworkAccessManager.
 //
-// The |nam| reference is borrowed; the caller must ensure it outlives this
-// client. It must be an isolated QNetworkAccessManager dedicated to
-// authentication traffic -- never the shared manager also used by
-// NetworkCapabilityProbe or any other capability -- so cookies, cached
-// authorization, and connection state from one use can never leak into or
-// out of authentication requests.
+// The production constructor creates and owns a dedicated
+// QNetworkAccessManager (destroyed together with this client), so
+// authentication traffic is isolated from any other manager (e.g.
+// NetworkCapabilityProbe's) without depending on caller convention. A
+// second constructor borrows an externally-owned manager instead, for tests
+// that need to inject a fake QNetworkAccessManager subclass; that manager
+// must still be isolated and must outlive this client.
 //
 // Every request explicitly disables cookie load/save and cached
-// Authorization reuse, and sets QNetworkRequest::ManualRedirectPolicy so no
-// 3xx response is ever auto-followed; every 3xx is reported as
-// AuthOutcome::UnexpectedStatus. authenticate()/registerAccount() never add
-// an Authorization header; whoAmI() adds exactly
-// "Authorization: Token <token>".
+// Authorization reuse, forces cache-bypassing load control
+// (CacheLoadControlAttribute = AlwaysNetwork) and disables cache writes
+// (CacheSaveControlAttribute = false), and sets
+// QNetworkRequest::ManualRedirectPolicy so no 3xx response is ever
+// auto-followed; every 3xx is reported as AuthOutcome::UnexpectedStatus.
+// authenticate()/registerAccount() never add an Authorization header;
+// whoAmI() adds exactly "Authorization: Token <token>".
+//
+// Every request is also rejected before it is built/sent unless its
+// resolved URL is either https, or http restricted to a loopback host
+// (exactly "localhost", or an address QHostAddress recognises as a loopback
+// IPv4/IPv6 literal, in any numeric encoding it accepts) -- see
+// isSecureOrLoopbackAuthTransport() in AuthTransportSecurity.h/.cpp. This
+// preserves local development/self-hosting over plain HTTP without ever
+// allowing a LAN or public host to receive a password or bearer token in
+// cleartext. A hostname that merely resembles a loopback address without
+// being one (e.g. "localhost.evil.com", "127.0.0.1.evil.com") is a
+// different DNS name and is never treated as loopback; userinfo in the URL
+// is rejected unconditionally. Because 3xx is never followed, this
+// exception can never be leveraged to redirect a loopback request to an
+// insecure remote origin.
 //
 // The optional |timeout| caps the wall-clock time to wait for each response.
 // Defaults to 30 s in production; inject a shorter value in tests. Pass
@@ -45,6 +63,13 @@ class NetworkAuthenticationClient final : public QObject,
 public:
   static constexpr std::chrono::seconds kDefaultTimeout{30};
 
+  // Production constructor: owns a dedicated QNetworkAccessManager.
+  explicit NetworkAuthenticationClient(
+      std::chrono::milliseconds timeout = kDefaultTimeout,
+      QObject *parent = nullptr);
+
+  // Test/advanced constructor: borrows |nam| (see class comment above; must
+  // be isolated and must outlive this client).
   explicit NetworkAuthenticationClient(
       QNetworkAccessManager &nam,
       std::chrono::milliseconds timeout = kDefaultTimeout,
@@ -68,10 +93,21 @@ private:
     std::function<void(AuthResult<T>)> callback;
   };
 
+  // Shared implementation constructor. |ownedNam| is non-null only when the
+  // production (owning) constructor delegates here, in which case |nam| is
+  // ignored; otherwise |nam| is the externally-owned, caller-borrowed
+  // manager.
+  NetworkAuthenticationClient(std::unique_ptr<QNetworkAccessManager> ownedNam,
+                              QNetworkAccessManager *nam,
+                              std::chrono::milliseconds timeout,
+                              QObject *parent);
+
   // Emits |result| to |callback| exactly once, asynchronously, guarded by a
   // QPointer so a callback is never invoked after this client is destroyed.
+  // Takes both by value and moves them into the queued invocation so the
+  // secret-bearing AuthResult<T> (and the callback itself) are never copied.
   template <typename T>
-  void emitAsync(const std::function<void(AuthResult<T>)> &callback,
+  void emitAsync(std::function<void(AuthResult<T>)> callback,
                  AuthResult<T> result);
 
   template <typename T>
@@ -83,6 +119,7 @@ private:
                                       QStringView path, const QJsonObject &body,
                                       AuthTokenCallback callback);
 
+  std::unique_ptr<QNetworkAccessManager> m_ownedNam; // null when borrowing
   QNetworkAccessManager &m_nam;
   std::chrono::milliseconds m_timeout;
   quint64 m_nextHandle{1};
