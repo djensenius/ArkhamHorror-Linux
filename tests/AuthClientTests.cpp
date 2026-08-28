@@ -701,6 +701,16 @@ void AuthClientTests::httpWithUserInfoRejectedEvenForLoopback() {
   QUrl withoutUserInfo(QStringLiteral("http://localhost:9000/whoami"));
   QVERIFY(isSecureOrLoopbackAuthTransport(withoutUserInfo));
 
+  // Defense-in-depth: a hostless URL (e.g. "https:///missing-host") must
+  // never be reported as secure regardless of scheme -- this is a public
+  // transport-safety predicate, not merely an internal helper for
+  // already-validated ServerProfile URLs, so it must fail closed on a URL
+  // that does not actually identify a host at all.
+  QUrl hostlessHttps(QStringLiteral("https:///missing-host"));
+  QVERIFY(!isSecureOrLoopbackAuthTransport(hostlessHttps));
+  QUrl hostlessHttp(QStringLiteral("http:///missing-host"));
+  QVERIFY(!isSecureOrLoopbackAuthTransport(hostlessHttp));
+
   // Defense-in-depth: even a profile that bypassed validateCustomUrl()
   // entirely (reproducible only via the friend-only
   // ServerProfileTestSupport test seam, never via public API) is still

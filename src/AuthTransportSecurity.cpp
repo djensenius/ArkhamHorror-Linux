@@ -156,6 +156,14 @@ bool isSecureOrLoopbackAuthTransport(const QUrl &url) {
   if (!url.userInfo().isEmpty()) {
     return false;
   }
+  // Fail closed on a missing host regardless of scheme (e.g.
+  // "https:///missing-host"): this is a public transport-safety
+  // predicate, not merely an internal helper for already-validated
+  // ServerProfile URLs, so it must not report "secure" for a URL that
+  // does not actually identify a host at all.
+  if (url.host().isEmpty()) {
+    return false;
+  }
   if (url.scheme() == "https"_L1) {
     return true;
   }
