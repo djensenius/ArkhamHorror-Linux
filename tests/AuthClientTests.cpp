@@ -446,22 +446,34 @@ void AuthClientTests::productionConstructorOwnsDedicatedManager() {
 }
 
 void AuthClientTests::httpToNonLoopbackHostRejectedBeforeRequest() {
+  // The authoritative rejection now happens at ServerProfile construction
+  // time (UrlValidator::validateCustomUrl), which is earlier than -- and a
+  // superset of -- "before the request is built": a profile pointing at a
+  // non-loopback host over http can never even be constructed, so no
+  // NetworkAuthenticationClient call, request, or network I/O is possible.
+  const auto result = ServerProfile::custom(
+      QStringLiteral("Test Server"), QStringLiteral("http://example.com"));
+  QVERIFY(!result.has_value());
+
+  // Defense-in-depth: NetworkAuthenticationClient's own request-time check
+  // (isSecureOrLoopbackAuthTransport) still independently rejects the same
+  // host if a profile ever reaches it via a path that bypasses
+  // validateCustomUrl (e.g. the legacy raw-QUrl ServerProfile constructor,
+  // retained for existing unit tests only).
   StubNetworkAccessManager nam;
   NetworkAuthenticationClient client(nam);
-
-  const ServerProfile profile =
-      customProfile(QStringLiteral("http://example.com"));
-  const auto result =
+  const ServerProfile legacyProfile(QUrl(QStringLiteral("http://example.com")));
+  const auto requestResult =
       runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
         return client.authenticate(
-            profile,
+            legacyProfile,
             AuthenticateRequest{QStringLiteral("a@b.com"),
                                 QStringLiteral("pw")},
             std::move(cb));
       });
 
-  QVERIFY(result.has_value());
-  QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+  QVERIFY(requestResult.has_value());
+  QCOMPARE(requestResult->outcome, AuthOutcome::InvalidInput);
   QCOMPARE(nam.requests().size(), 0); // rejected before the request was built
 }
 
@@ -536,14 +548,23 @@ void AuthClientTests::httpLookalikeLoopbackHostRejected() {
   };
 
   for (const QString &urlString : lookalikes) {
+    // Rejected at ServerProfile construction time (the earliest possible
+    // point): no client, request, or network I/O is ever involved.
+    const auto profileResult =
+        ServerProfile::custom(QStringLiteral("Test Server"), urlString);
+    QVERIFY(!profileResult.has_value());
+
+    // Defense-in-depth: the same host is also rejected by
+    // NetworkAuthenticationClient's own request-time check when a profile
+    // reaches it via a path that bypasses validateCustomUrl.
     StubNetworkAccessManager nam;
     NetworkAuthenticationClient client(nam);
-    const ServerProfile profile = customProfile(urlString);
+    const ServerProfile legacyProfile{QUrl(urlString)};
 
     const auto result = runAndWait<AuthToken>(
         [&](std::function<void(AuthResult<AuthToken>)> cb) {
           return client.authenticate(
-              profile,
+              legacyProfile,
               AuthenticateRequest{QStringLiteral("a@b.com"),
                                   QStringLiteral("pw")},
               std::move(cb));

@@ -200,6 +200,103 @@ jobs:
             exit 1
           }
           echo "libsecret, libqt6keychain, and attribution files verified inside the AppImage."
+      - name: Verify bundled libsecret dependency closure has no host fallback
+        # The previous step's dlopen check runs directly on this
+        # ubuntu-22.04 runner, which -- like any environment used to build
+        # QtKeychain -- has libsecret-1-dev (and its glib/gio/gobject/
+        # gcrypt/pcre2/... dependency stack) installed as a system package
+        # (see "Install QtKeychain build dependencies" above). That means a
+        # *broken* bundling (e.g. a missing transitive dependency inside
+        # AppDir) could still silently resolve via the runner's own system
+        # libraries, so passing there does not by itself prove the
+        # AppImage is self-sufficient.
+        #
+        # This step re-runs the exact same production dlopen check
+        # (packaging/verify_bundled_libsecret.py, unmodified) inside a
+        # container built from python:3.12-slim-bookworm, an image that
+        # never has libsecret-1-0 or any of its glib/gio/gobject/gcrypt/
+        # pcre2/... dependency stack installed and ships only glibc plus
+        # the CPython runtime. Only the extracted AppImage's usr/lib
+        # directory is mounted in (read-only) and LD_LIBRARY_PATH is set at
+        # container-start (i.e. from process start, matching the
+        # requirement documented in verify_bundled_libsecret.py's
+        # docstring), so the dynamic linker can only satisfy libsecret's
+        # transitive shared library dependencies from that mounted AppDir
+        # copy or from the small glibc/ld-linux baseline every Linux
+        # container ships with -- there is no host libsecret/glib fallback
+        # available at all inside this container. If any non-ABI
+        # transitive dependency (glib, gobject, gio, gcrypt, pcre2, ffi,
+        # ...) were missing from AppDir, dlopen() fails outright here with
+        # no possibility of a silent host fallback -- this was verified
+        # locally during development by deliberately removing a bundled
+        # transitive dependency from a synthetic AppDir and confirming this
+        # exact check then fails with an explicit "cannot open shared
+        # object file" error rather than passing.
+        #
+        # The image is pinned by digest, per repo policy of pinning
+        # external dependencies precisely.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          bundled_secret="$(find "$extracted" -name 'libsecret-1.so.0*' | head -n1)"
+          [[ -n "$bundled_secret" ]] || {
+            echo "libsecret-1.so.0 not found in the extracted AppImage." >&2
+            exit 1
+          }
+          lib_dir="$(dirname "$bundled_secret")"
+          docker run --rm \
+            --volume "$lib_dir:/appdir-lib:ro" \
+            --volume "$(pwd)/packaging/verify_bundled_libsecret.py:/verify.py:ro" \
+            python@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579 \
+            python3 /verify.py "/appdir-lib/$(basename "$bundled_secret")"
+      - name: Launch the packaged AppImage headlessly to verify real startup
+        # Runs the extracted AppRun (with the app's own --smoke-test flag,
+        # see src/main.cpp) inside a container built from
+        # debian:bookworm-slim, an image that -- like the dependency-closure
+        # check above -- never has libsecret-1-0 or its glib/gio/gobject
+        # dependency stack preinstalled. Only fontconfig, a concrete font
+        # package, and libxkbcommon0 are added on top (verified locally
+        # during development to pull in none of libsecret/glib/gobject/gio
+        # transitively) so Qt Quick's offscreen QPA platform plugin can
+        # actually initialize text layout and keymaps; QT_QUICK_BACKEND is
+        # forced to the software rasterizer so no GPU/EGL/Mesa stack is
+        # required either. This both proves genuine Qt/QML/plugin startup
+        # (not merely that the binary exists) and reinforces that the
+        # bundled libsecret closure is what a real run actually resolves,
+        # not a host fallback.
+        #
+        # --smoke-test runs full, unmodified QGuiApplication /
+        # QQmlApplicationEngine / plugin initialization and the existing
+        # rootObjects().isEmpty() failure check, only skipping app.exec();
+        # it exits 0 solely once a QML root object was actually created. A
+        # QML/plugin/startup error therefore causes a non-zero exit and
+        # this step to fail. `timeout` is used only as a defensive backstop
+        # against an unrelated hang; a timeout's non-zero (124) exit still
+        # fails the step under `set -euo pipefail` like any other error --
+        # it is never treated as a substitute for success.
+        #
+        # The image is pinned by digest, per repo policy of pinning
+        # external dependencies precisely.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          [[ -x "$extracted/AppRun" ]] || {
+            echo "AppRun not found or not executable in the extracted AppImage." >&2
+            exit 1
+          }
+          docker run --rm \
+            --env QT_QPA_PLATFORM=offscreen \
+            --env QT_QUICK_BACKEND=software \
+            --volume "$extracted:/app:ro" \
+            debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                fontconfig fonts-dejavu-core libxkbcommon0 >/dev/null
+              timeout 60 /app/AppRun --smoke-test
+            '
+          echo "AppImage launched and created a QML root object successfully in a minimal headless container."
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ArkhamHorror-Linux-AppImage

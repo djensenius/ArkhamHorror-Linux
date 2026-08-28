@@ -217,6 +217,9 @@ private slots:
   void urlRejectsDuplicateApiPathInfix();    // /proxy/api/v1
   void urlRejectsDuplicateApiPathInfixSub(); // /proxy/api/v1/foo
   void urlAcceptsApiV10();                   // /api/v10 is valid
+  void urlRejectsInsecureTransport();
+  void urlStrictLoopbackPolicy_data();
+  void urlStrictLoopbackPolicy();
 
   // ── ServerProfile factories and path construction ─────────────────────────
   void hostedDefaultProperties();
@@ -297,20 +300,20 @@ void NetworkTests::urlAcceptsHttps() {
 }
 
 void NetworkTests::urlAcceptsHttp() {
-  const auto r = validateCustomUrl(QStringLiteral("http://deck.local"));
+  const auto r = validateCustomUrl(QStringLiteral("http://localhost"));
   QVERIFY(r.has_value());
   QCOMPARE(r->scheme(), QStringLiteral("http"));
 }
 
 void NetworkTests::urlAcceptsNonDefaultPort() {
-  const auto r = validateCustomUrl(QStringLiteral("http://deck.local:3000"));
+  const auto r = validateCustomUrl(QStringLiteral("http://localhost:3000"));
   QVERIFY(r.has_value());
   QCOMPARE(r->port(), 3000);
 }
 
 void NetworkTests::urlAcceptsPathPrefix() {
-  const auto r =
-      validateCustomUrl(QStringLiteral("http://192.168.1.100:8080/selfhosted"));
+  const auto r = validateCustomUrl(
+      QStringLiteral("https://192.168.1.100:8080/selfhosted"));
   QVERIFY(r.has_value());
   QCOMPARE(r->path(), QStringLiteral("/selfhosted"));
   QCOMPARE(r->port(), 8080);
@@ -411,6 +414,97 @@ void NetworkTests::urlAcceptsApiV10() {
   QCOMPARE(r->path(), QStringLiteral("/api/v10"));
 }
 
+void NetworkTests::urlRejectsInsecureTransport() {
+  const auto r = validateCustomUrl(QStringLiteral("http://example.com"));
+  QVERIFY(!r.has_value());
+  QCOMPARE(r.error().code, UrlErrorCode::InsecureTransport);
+}
+
+void NetworkTests::urlStrictLoopbackPolicy_data() {
+  QTest::addColumn<QString>("urlString");
+  QTest::addColumn<bool>("expectAccepted");
+
+  // ── Accepted: exact canonical loopback spellings over http ─────────────
+  QTest::newRow("http-localhost") << QStringLiteral("http://localhost") << true;
+  QTest::newRow("http-localhost-port")
+      << QStringLiteral("http://localhost:9000") << true;
+  QTest::newRow("http-localhost-path")
+      << QStringLiteral("http://localhost/selfhosted") << true;
+  QTest::newRow("http-127.0.0.1") << QStringLiteral("http://127.0.0.1") << true;
+  QTest::newRow("http-127.0.0.1-port-path")
+      << QStringLiteral("http://127.0.0.1:9000/selfhosted") << true;
+  QTest::newRow("http-bracketed-::1") << QStringLiteral("http://[::1]") << true;
+  QTest::newRow("http-bracketed-::1-port")
+      << QStringLiteral("http://[::1]:9000") << true;
+
+  // ── Accepted: https for any host, including odd literals and base paths ─
+  QTest::newRow("https-any-host")
+      << QStringLiteral("https://example.com") << true;
+  QTest::newRow("https-lan-ip")
+      << QStringLiteral("https://192.168.1.100:8080/selfhosted") << true;
+  QTest::newRow("https-127.1-unrestricted")
+      << QStringLiteral("https://127.1") << true;
+  QTest::newRow("https-localhost-lookalike")
+      << QStringLiteral("https://localhost.evil.example") << true;
+  QTest::newRow("https-base-path")
+      << QStringLiteral("https://example.com/arkham") << true;
+
+  // ── Rejected: ambiguous/non-canonical numeric loopback spellings ────────
+  QTest::newRow("http-127.1") << QStringLiteral("http://127.1") << false;
+  QTest::newRow("http-single-integer")
+      << QStringLiteral("http://2130706433") << false;
+  QTest::newRow("http-octal-looking")
+      << QStringLiteral("http://0177.0.0.1") << false;
+  QTest::newRow("http-hex-looking")
+      << QStringLiteral("http://0x7f.0.0.1") << false;
+  QTest::newRow("http-octal-single-integer")
+      << QStringLiteral("http://017700000001") << false;
+  QTest::newRow("http-leading-zero-full")
+      << QStringLiteral("http://127.000.000.001") << false;
+  QTest::newRow("http-leading-zero-last-octet")
+      << QStringLiteral("http://127.0.0.01") << false;
+  QTest::newRow("http-shortened-form")
+      << QStringLiteral("http://127.0.1") << false;
+
+  // ── Rejected: IPv4-mapped / expanded / alternate IPv6 spellings ─────────
+  QTest::newRow("http-ipv4-mapped-ipv6")
+      << QStringLiteral("http://[::ffff:127.0.0.1]") << false;
+  QTest::newRow("http-ipv6-expanded")
+      << QStringLiteral("http://[0:0:0:0:0:0:0:1]") << false;
+  QTest::newRow("http-ipv6-alternate-shortened")
+      << QStringLiteral("http://[::0:1]") << false;
+  QTest::newRow("http-ipv6-zone-id")
+      << QStringLiteral("http://[::1%25eth0]") << false;
+
+  // ── Rejected: trailing-dot / subdomain / lookalike localhost forms ──────
+  QTest::newRow("http-localhost-trailing-dot")
+      << QStringLiteral("http://localhost.") << false;
+  QTest::newRow("http-localhost-subdomain")
+      << QStringLiteral("http://localhost.evil.example") << false;
+  QTest::newRow("http-127-lookalike-subdomain")
+      << QStringLiteral("http://127.0.0.1.evil.example") << false;
+  QTest::newRow("http-notlocalhost")
+      << QStringLiteral("http://notlocalhost") << false;
+
+  // ── Rejected: userinfo, malformed, LAN/public addresses over http ───────
+  QTest::newRow("http-lan-ip")
+      << QStringLiteral("http://192.168.1.100") << false;
+  QTest::newRow("http-public-host")
+      << QStringLiteral("http://example.com") << false;
+}
+
+void NetworkTests::urlStrictLoopbackPolicy() {
+  QFETCH(QString, urlString);
+  QFETCH(bool, expectAccepted);
+
+  const auto r = validateCustomUrl(urlString);
+  QCOMPARE(r.has_value(), expectAccepted);
+  if (!expectAccepted) {
+    QVERIFY(r.error().code == UrlErrorCode::InsecureTransport ||
+            r.error().code == UrlErrorCode::CredentialsPresent);
+  }
+}
+
 // ─── ServerProfile factories and path construction ────────────────────────
 
 void NetworkTests::hostedDefaultProperties() {
@@ -478,8 +572,8 @@ void NetworkTests::customProfileHasUniqueIds() {
 }
 
 void NetworkTests::customProfileWithNonDefaultPort() {
-  const auto r = ServerProfile::custom(
-      QStringLiteral("Local"), QStringLiteral("http://deck.local:3000"));
+  const auto r = ServerProfile::custom(QStringLiteral("Local"),
+                                       QStringLiteral("http://localhost:3000"));
   QVERIFY2(r.has_value(), qPrintable(r.error()));
   QCOMPARE(r->kind(), ServerProfileKind::Custom);
   QCOMPARE(r->displayName(), QStringLiteral("Local"));
@@ -495,12 +589,13 @@ void NetworkTests::customProfileWithPathPrefix() {
 }
 
 void NetworkTests::customProfileApiUrlWithPrefix() {
-  const auto r = ServerProfile::custom(
-      QStringLiteral("Self"), QStringLiteral("http://192.168.1.5:8080/prefix"));
+  const auto r =
+      ServerProfile::custom(QStringLiteral("Self"),
+                            QStringLiteral("https://192.168.1.5:8080/prefix"));
   QVERIFY2(r.has_value(), qPrintable(r.error()));
   const QUrl api = r->apiUrl(u"capabilities");
   QCOMPARE(api, QUrl(QStringLiteral(
-                    "http://192.168.1.5:8080/prefix/api/v1/capabilities")));
+                    "https://192.168.1.5:8080/prefix/api/v1/capabilities")));
 }
 
 void NetworkTests::customProfileWebsocketUrlWithPrefix() {
@@ -578,8 +673,8 @@ void NetworkTests::storeRoundTripCustom() {
   QVERIFY(tmp.open());
   tmp.close();
 
-  const auto p = ServerProfile::custom(
-      QStringLiteral("My Server"), QStringLiteral("http://deck.local:3000"));
+  const auto p = ServerProfile::custom(QStringLiteral("My Server"),
+                                       QStringLiteral("http://localhost:3000"));
   QVERIFY(p.has_value());
 
   QSettingsProfileStore store(tmp.fileName());

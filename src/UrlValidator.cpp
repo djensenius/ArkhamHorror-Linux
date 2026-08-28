@@ -1,5 +1,6 @@
 #include "UrlValidator.h"
 
+#include "AuthTransportSecurity.h"
 #include "ContractPin.h"
 
 using namespace Qt::StringLiterals;
@@ -84,6 +85,24 @@ UrlValidationResult validateCustomUrl(const QString &input) {
     return UrlValidationError{
         UrlErrorCode::QueryPresent,
         QStringLiteral("URL must not contain a query string (?...)"),
+    };
+  }
+
+  // http is only permitted to an exact canonical loopback spelling. This
+  // check MUST run against the raw, not-yet-normalised trimmedInput text --
+  // not url.host() -- because QUrl itself silently canonicalises ambiguous
+  // numeric loopback encodings (e.g. "127.1", octal/hex octets, a bare
+  // 32-bit integer) into "127.0.0.1" at parse time, before any later check
+  // could tell the difference. See AuthTransportSecurity.h for details.
+  //
+  // Placed after credentials/fragment/query so those more fundamental
+  // input-hygiene failures are reported first when they also apply.
+  if (!isCleartextAuthAllowedForRawInput(scheme, trimmedInput)) {
+    return UrlValidationError{
+        UrlErrorCode::InsecureTransport,
+        QStringLiteral("http is only permitted to an exact loopback host "
+                       "(\"localhost\", canonical dotted-decimal 127.x.y.z, or "
+                       "\"::1\"); use https for any other host"),
     };
   }
 

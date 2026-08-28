@@ -1,22 +1,131 @@
 #include "AuthTransportSecurity.h"
 
-#include <QHostAddress>
-
 using namespace Qt::StringLiterals;
 
 namespace Arkham {
 
 namespace {
 
-bool isLoopbackHost(const QString &host) {
-  if (host.compare(QLatin1String("localhost"), Qt::CaseInsensitive) == 0) {
-    return true;
+// Matches a single strict decimal octet: 0-255, no leading zero (except the
+// literal single-character "0"), no sign, no non-digit characters.
+bool isStrictDecimalOctet(QStringView text) {
+  if (text.isEmpty() || text.size() > 3) {
+    return false;
   }
-  QHostAddress address;
-  return address.setAddress(host) && address.isLoopback();
+  // Ascii-only digits: reject unicode digit look-alikes that QString::toInt
+  // might otherwise accept.
+  for (const QChar c : text) {
+    if (c.unicode() < u'0' || c.unicode() > u'9') {
+      return false;
+    }
+  }
+  if (text.size() > 1 && text[0] == u'0') {
+    return false; // Leading zero, e.g. "01", "007".
+  }
+  bool ok = false;
+  const int value = text.toString().toInt(&ok);
+  return ok && value >= 0 && value <= 255;
+}
+
+// Matches exactly "127.A.B.C" where A, B, C are each strict decimal octets
+// (see isStrictDecimalOctet) -- i.e. the canonical, unambiguous dotted-
+// decimal spelling of a 127.0.0.0/8 loopback address, and nothing else
+// (no shortened forms, no octal/hex, no extra components).
+bool isCanonicalLoopbackIPv4Text(QStringView text) {
+  static constexpr QStringView kPrefix = u"127.";
+  if (!text.startsWith(kPrefix)) {
+    return false;
+  }
+  const QStringView rest = text.mid(kPrefix.size());
+  const qsizetype firstDot = rest.indexOf(u'.');
+  if (firstDot < 0) {
+    return false;
+  }
+  const QStringView octetB = rest.left(firstDot);
+  const QStringView afterB = rest.mid(firstDot + 1);
+  const qsizetype secondDot = afterB.indexOf(u'.');
+  if (secondDot < 0) {
+    return false;
+  }
+  const QStringView octetC = afterB.left(secondDot);
+  const QStringView octetD = afterB.mid(secondDot + 1);
+  return isStrictDecimalOctet(octetB) && isStrictDecimalOctet(octetC) &&
+         isStrictDecimalOctet(octetD);
+}
+
+// Extracts the raw authority substring (userinfo@host:port, as literally
+// spelled in the input, before any QUrl normalisation) from a "scheme://..."
+// URL string, stopping at the first path/query/fragment delimiter. Returns
+// an empty, default-constructed QStringView if no "://" separator is found.
+QStringView extractRawAuthority(QStringView rawUrlText) {
+  static constexpr QStringView kSeparator = u"://";
+  const qsizetype sepIdx = rawUrlText.indexOf(kSeparator);
+  if (sepIdx < 0) {
+    return {};
+  }
+  const qsizetype authorityStart = sepIdx + kSeparator.size();
+  QStringView rest = rawUrlText.mid(authorityStart);
+  qsizetype end = rest.size();
+  for (const QChar delim : {u'/', u'?', u'#'}) {
+    const qsizetype idx = rest.indexOf(delim);
+    if (idx >= 0 && idx < end) {
+      end = idx;
+    }
+  }
+  return rest.left(end);
+}
+
+// Extracts the raw host substring from a raw authority substring (as
+// produced by extractRawAuthority), handling a bracketed IPv6 literal or a
+// bare host optionally followed by ":port". Returns an empty QStringView on
+// any ambiguity (e.g. an unterminated "[").
+QStringView extractRawHostFromAuthority(QStringView authority) {
+  if (authority.startsWith(u'[')) {
+    const qsizetype closeIdx = authority.indexOf(u']');
+    if (closeIdx < 0) {
+      return {};
+    }
+    return authority.mid(1, closeIdx - 1);
+  }
+  const qsizetype colonIdx = authority.indexOf(u':');
+  return colonIdx < 0 ? authority : authority.left(colonIdx);
 }
 
 } // namespace
+
+bool isCanonicalLoopbackHostText(const QStringView hostText) {
+  if (hostText.compare(u"localhost", Qt::CaseInsensitive) == 0) {
+    return true;
+  }
+  if (isCanonicalLoopbackIPv4Text(hostText)) {
+    return true;
+  }
+  return hostText.compare(u"::1", Qt::CaseSensitive) == 0;
+}
+
+bool isCleartextAuthAllowedForRawInput(const QString &scheme,
+                                       const QString &rawUrlText) {
+  if (scheme != "http"_L1) {
+    // https (or any other already-rejected-elsewhere scheme): no cleartext
+    // loopback restriction applies here.
+    return true;
+  }
+  const QStringView authority = extractRawAuthority(rawUrlText);
+  if (authority.isEmpty()) {
+    return false; // Could not identify an authority; fail closed.
+  }
+  if (authority.contains(u'@')) {
+    // A userinfo-like construct is present in the raw text. Regardless of
+    // how QUrl itself would later parse userinfo vs. host, fail closed:
+    // this policy never lets userinfo influence which host is checked.
+    return false;
+  }
+  const QStringView hostText = extractRawHostFromAuthority(authority);
+  if (hostText.isEmpty()) {
+    return false;
+  }
+  return isCanonicalLoopbackHostText(hostText);
+}
 
 bool isSecureOrLoopbackAuthTransport(const QUrl &url) {
   if (!url.userInfo().isEmpty()) {
@@ -26,7 +135,7 @@ bool isSecureOrLoopbackAuthTransport(const QUrl &url) {
     return true;
   }
   if (url.scheme() == "http"_L1) {
-    return isLoopbackHost(url.host());
+    return isCanonicalLoopbackHostText(url.host());
   }
   return false;
 }
