@@ -139,10 +139,55 @@ QStringView extractRawHostFromAuthority(QStringView authority) {
   return authority.left(colonIdx);
 }
 
+// Returns true iff every code unit in |text| is a plain 7-bit ASCII
+// character (U+0000-U+007F). Used to guard the "localhost" comparison
+// below: Qt::CaseInsensitive performs full Unicode case folding, which can
+// equate a non-ASCII look-alike letter with an ASCII one (see
+// isAsciiCaseInsensitiveLocalhost() below), so any hostText containing a
+// non-ASCII code point must be rejected before that comparison is even
+// attempted.
+bool isAsciiOnly(QStringView text) {
+  for (const QChar c : text) {
+    if (c.unicode() > 0x7F) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Returns true iff |text| is EXACTLY the ASCII string "localhost", using
+// ASCII-only case folding (plain 'A'-'Z' <-> 'a'-'z') rather than
+// QString::compare(..., Qt::CaseInsensitive). Qt's case-insensitive
+// comparison performs full Unicode case folding, which equates code
+// points well beyond ASCII with their lowercase counterparts -- most
+// notably U+017F LATIN SMALL LETTER LONG S ("ſ"), which case-folds to
+// plain ASCII 's', so the raw text "localhoſt" would otherwise compare
+// equal to "localhost" under Qt::CaseInsensitive (confirmed empirically).
+// Rejecting any non-ASCII code point outright, before any letter-case
+// comparison, closes that bypass and any similar one (fullwidth forms,
+// other Unicode case-fold collisions, etc.) at the source, rather than
+// enumerating look-alikes one at a time.
+bool isAsciiCaseInsensitiveLocalhost(QStringView text) {
+  static constexpr QStringView kLocalhost = u"localhost";
+  if (text.size() != kLocalhost.size() || !isAsciiOnly(text)) {
+    return false;
+  }
+  for (qsizetype i = 0; i < text.size(); ++i) {
+    ushort c = text[i].unicode();
+    if (c >= u'A' && c <= u'Z') {
+      c = static_cast<ushort>(c + (u'a' - u'A'));
+    }
+    if (c != kLocalhost[i].unicode()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 bool isCanonicalLoopbackHostText(const QStringView hostText) {
-  if (hostText.compare(u"localhost", Qt::CaseInsensitive) == 0) {
+  if (isAsciiCaseInsensitiveLocalhost(hostText)) {
     return true;
   }
   if (isCanonicalLoopbackIPv4Text(hostText)) {

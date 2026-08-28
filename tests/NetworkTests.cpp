@@ -31,6 +31,7 @@
 #include "ProbeResult.h"
 #include "QSettingsProfileStore.h"
 #include "ServerProfile.h"
+#include "StrictLoopbackUrlTable.h"
 #include "UrlValidator.h"
 #include "ValueOrError.h"
 
@@ -473,147 +474,15 @@ void NetworkTests::urlStrictLoopbackPolicy_data() {
   // wrong error code is still caught.
   QTest::addColumn<int>("expectedErrorCode");
 
-  const int invalidUrl = static_cast<int>(UrlErrorCode::InvalidUrl);
-  const int controlCharacterPresent =
-      static_cast<int>(UrlErrorCode::ControlCharacterPresent);
-  const int insecureTransport =
-      static_cast<int>(UrlErrorCode::InsecureTransport);
-  const int credentialsPresent =
-      static_cast<int>(UrlErrorCode::CredentialsPresent);
-
-  // ── Accepted: exact canonical loopback spellings over http ─────────────
-  QTest::newRow("http-localhost")
-      << QStringLiteral("http://localhost") << true << 0;
-  QTest::newRow("http-localhost-port")
-      << QStringLiteral("http://localhost:9000") << true << 0;
-  QTest::newRow("http-localhost-path")
-      << QStringLiteral("http://localhost/selfhosted") << true << 0;
-  QTest::newRow("http-127.0.0.1")
-      << QStringLiteral("http://127.0.0.1") << true << 0;
-  QTest::newRow("http-127.0.0.1-port-path")
-      << QStringLiteral("http://127.0.0.1:9000/selfhosted") << true << 0;
-  QTest::newRow("http-bracketed-::1")
-      << QStringLiteral("http://[::1]") << true << 0;
-  QTest::newRow("http-bracketed-::1-port")
-      << QStringLiteral("http://[::1]:9000") << true << 0;
-  QTest::newRow("http-localhost-port-min")
-      << QStringLiteral("http://localhost:1") << true << 0;
-  QTest::newRow("http-localhost-port-max")
-      << QStringLiteral("http://localhost:65535") << true << 0;
-
-  // ── Accepted: https for any host, including odd literals and base paths ─
-  QTest::newRow("https-any-host")
-      << QStringLiteral("https://example.com") << true << 0;
-  QTest::newRow("https-lan-ip")
-      << QStringLiteral("https://192.168.1.100:8080/selfhosted") << true << 0;
-  QTest::newRow("https-127.1-unrestricted")
-      << QStringLiteral("https://127.1") << true << 0;
-  QTest::newRow("https-localhost-lookalike")
-      << QStringLiteral("https://localhost.evil.example") << true << 0;
-  QTest::newRow("https-base-path")
-      << QStringLiteral("https://example.com/arkham") << true << 0;
-
-  // ── Rejected: ambiguous/non-canonical numeric loopback spellings ────────
-  QTest::newRow("http-127.1")
-      << QStringLiteral("http://127.1") << false << insecureTransport;
-  QTest::newRow("http-single-integer")
-      << QStringLiteral("http://2130706433") << false << insecureTransport;
-  QTest::newRow("http-octal-looking")
-      << QStringLiteral("http://0177.0.0.1") << false << insecureTransport;
-  QTest::newRow("http-hex-looking")
-      << QStringLiteral("http://0x7f.0.0.1") << false << insecureTransport;
-  QTest::newRow("http-octal-single-integer")
-      << QStringLiteral("http://017700000001") << false << insecureTransport;
-  QTest::newRow("http-leading-zero-full")
-      << QStringLiteral("http://127.000.000.001") << false << insecureTransport;
-  QTest::newRow("http-leading-zero-last-octet")
-      << QStringLiteral("http://127.0.0.01") << false << insecureTransport;
-  QTest::newRow("http-shortened-form")
-      << QStringLiteral("http://127.0.1") << false << insecureTransport;
-
-  // ── Rejected: IPv4-mapped / expanded / alternate IPv6 spellings ─────────
-  QTest::newRow("http-ipv4-mapped-ipv6")
-      << QStringLiteral("http://[::ffff:127.0.0.1]") << false
-      << insecureTransport;
-  QTest::newRow("http-ipv6-expanded")
-      << QStringLiteral("http://[0:0:0:0:0:0:0:1]") << false
-      << insecureTransport;
-  QTest::newRow("http-ipv6-alternate-shortened")
-      << QStringLiteral("http://[::0:1]") << false << insecureTransport;
-  QTest::newRow("http-ipv6-zone-id")
-      << QStringLiteral("http://[::1%25eth0]") << false << insecureTransport;
-
-  // ── Rejected: trailing-dot / subdomain / lookalike localhost forms ──────
-  QTest::newRow("http-localhost-trailing-dot")
-      << QStringLiteral("http://localhost.") << false << insecureTransport;
-  QTest::newRow("http-localhost-subdomain")
-      << QStringLiteral("http://localhost.evil.example") << false
-      << insecureTransport;
-  QTest::newRow("http-127-lookalike-subdomain")
-      << QStringLiteral("http://127.0.0.1.evil.example") << false
-      << insecureTransport;
-  QTest::newRow("http-notlocalhost")
-      << QStringLiteral("http://notlocalhost") << false << insecureTransport;
-
-  // ── Rejected: userinfo, malformed, LAN/public addresses over http ───────
-  // Userinfo is rejected unconditionally (CredentialsPresent), even for an
-  // otherwise-canonical loopback host, and is checked before the
-  // http/loopback policy itself (see UrlValidator::validateCustomUrl()'s
-  // ordering), so this row must produce CredentialsPresent, not
-  // InsecureTransport.
-  QTest::newRow("http-userinfo-on-loopback")
-      << QStringLiteral("http://user:pass@localhost:9000") << false
-      << credentialsPresent;
-  QTest::newRow("http-lan-ip")
-      << QStringLiteral("http://192.168.1.100") << false << insecureTransport;
-  QTest::newRow("http-public-host")
-      << QStringLiteral("http://example.com") << false << insecureTransport;
-
-  // ── Rejected: malformed/absent/out-of-range ports on an otherwise-exact
-  //    loopback host or bracketed IPv6 literal. QUrl's own StrictMode
-  //    parsing already rejects most malformed port syntax (non-digit
-  //    garbage, percent-escapes, double colons, negative, >65535) as an
-  //    unparseable URL entirely (UrlErrorCode::InvalidUrl) before this
-  //    function's raw-authority port check is ever reached; the remaining
-  //    two forms QUrl treats as syntactically valid -- an empty port
-  //    ("host:") and port 0 -- are only caught by this function's own
-  //    stricter, in-range (1..65535), non-empty port rule
-  //    (UrlErrorCode::InsecureTransport, since the raw-text loopback policy
-  //    check is what actually rejects them). Both groups are asserted here
-  //    through the real public path so a regression in either QUrl's
-  //    parsing assumptions or this function's own port rule is caught.
-  QTest::newRow("http-localhost-empty-port")
-      << QStringLiteral("http://localhost:") << false << insecureTransport;
-  QTest::newRow("http-localhost-zero-port")
-      << QStringLiteral("http://localhost:0") << false << insecureTransport;
-  QTest::newRow("http-bracketed-::1-empty-port")
-      << QStringLiteral("http://[::1]:") << false << insecureTransport;
-  QTest::newRow("http-localhost-non-numeric-port")
-      << QStringLiteral("http://localhost:evil") << false << invalidUrl;
-  QTest::newRow("http-localhost-percent-escaped-port")
-      << QStringLiteral("http://localhost:%39") << false << invalidUrl;
-  QTest::newRow("http-localhost-double-colon-port")
-      << QStringLiteral("http://localhost::9000") << false << invalidUrl;
-  QTest::newRow("http-localhost-multiple-port-segments")
-      << QStringLiteral("http://localhost:9000:9000") << false << invalidUrl;
-  QTest::newRow("http-bracketed-::1-non-numeric-port")
-      << QStringLiteral("http://[::1]:evil") << false << invalidUrl;
-  QTest::newRow("http-localhost-port-overflow")
-      << QStringLiteral("http://localhost:99999") << false << invalidUrl;
-  QTest::newRow("http-localhost-port-negative")
-      << QStringLiteral("http://localhost:-1") << false << invalidUrl;
-
-  // ── Rejected: control characters in the ORIGINAL input, which must not
-  //    be laundered away by trimmed() before this policy ever sees them.
-  QTest::newRow("http-localhost-trailing-tab-after-port")
-      << QStringLiteral("http://localhost:9000\t") << false
-      << controlCharacterPresent;
-  QTest::newRow("http-localhost-tab-before-colon")
-      << QStringLiteral("http://localhost\t:9000") << false
-      << controlCharacterPresent;
-  QTest::newRow("http-localhost-trailing-newline")
-      << QStringLiteral("http://localhost\n") << false
-      << controlCharacterPresent;
+  // The full table is shared with tests/AuthClientTests.cpp (see
+  // tests/StrictLoopbackUrlTable.h), which drives every one of these same
+  // rows through the full public ServerProfile::custom() ->
+  // NetworkAuthenticationClient request-construction boundary instead of
+  // validateCustomUrl() alone.
+  for (const auto &row : Arkham::Test::strictLoopbackUrlRows()) {
+    QTest::newRow(row.name)
+        << row.urlString << row.expectAccepted << row.expectedErrorCode;
+  }
 }
 
 void NetworkTests::urlStrictLoopbackPolicy() {

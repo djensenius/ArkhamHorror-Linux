@@ -27,6 +27,7 @@
 #include "IAuthenticationClient.h"
 #include "NetworkAuthenticationClient.h"
 #include "ServerProfile.h"
+#include "StrictLoopbackUrlTable.h"
 #include "UrlValidator.h"
 
 using namespace Arkham;
@@ -229,6 +230,8 @@ private slots:
   void callbacksAreExactlyOnceOnTimeout();
   void diagnosticsNeverContainSecrets();
   void profilePrefixIsPreserved();
+  void authBoundaryEnforcesStrictLoopbackPolicy_data();
+  void authBoundaryEnforcesStrictLoopbackPolicy();
 };
 
 void AuthClientTests::authenticateSendsExpectedRequest() {
@@ -1107,6 +1110,67 @@ void AuthClientTests::profilePrefixIsPreserved() {
   QCOMPARE(
       nam.requests().first().url().toString(),
       QStringLiteral("https://example.com/selfhosted/api/v1/authenticate"));
+}
+
+// Drives every row of the shared strict raw-URL / http-loopback policy
+// table (tests/StrictLoopbackUrlTable.h -- the SAME table
+// tests/NetworkTests.cpp exercises against validateCustomUrl() alone)
+// through the full PUBLIC ServerProfile::custom() ->
+// NetworkAuthenticationClient request-construction boundary. This is the
+// boundary an actual caller (e.g. a future "add custom server" UI) would
+// use, so it proves the raw input itself -- not a hand-picked shortlist of
+// lookalikes, and not a forged/unvalidated-provenance profile (see
+// httpLookalikeLoopbackHostRejected()'s separate, narrower defense-in-
+// depth test above) -- is what determines whether any request can ever be
+// built and sent.
+void AuthClientTests::authBoundaryEnforcesStrictLoopbackPolicy_data() {
+  QTest::addColumn<QString>("urlString");
+  QTest::addColumn<bool>("expectAccepted");
+  for (const auto &row : Arkham::Test::strictLoopbackUrlRows()) {
+    QTest::newRow(row.name) << row.urlString << row.expectAccepted;
+  }
+}
+
+void AuthClientTests::authBoundaryEnforcesStrictLoopbackPolicy() {
+  QFETCH(QString, urlString);
+  QFETCH(bool, expectAccepted);
+
+  const auto profileResult =
+      ServerProfile::custom(QStringLiteral("Test Server"), urlString);
+
+  if (!expectAccepted) {
+    // Rejected at the earliest possible point -- ServerProfile
+    // construction itself -- so no client, request, or network I/O is
+    // ever involved; there is no forged/unvalidated-provenance profile
+    // anywhere in this path.
+    QVERIFY(!profileResult.has_value());
+    return;
+  }
+
+  QVERIFY2(profileResult.has_value(), qPrintable(profileResult.error()));
+
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "boundary-ok"})"));
+  NetworkAuthenticationClient client(nam);
+
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            *profileResult,
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Success);
+  // Exactly one request, sent to exactly the URL this profile's own
+  // apiUrl() deterministically produces -- proving the accepted profile is
+  // not merely "constructible" but genuinely sendable, and to precisely
+  // the expected endpoint (not e.g. some default/hosted fallback).
+  QCOMPARE(nam.requests().size(), 1);
+  QCOMPARE(nam.requests().first().url(),
+           profileResult->apiUrl(u"authenticate"));
 }
 
 QTEST_GUILESS_MAIN(AuthClientTests)

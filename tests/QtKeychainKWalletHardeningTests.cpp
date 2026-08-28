@@ -293,8 +293,10 @@ void QtKeychainKWalletHardeningTests::
   // no migration, no removal.
   QSettings settings(service);
   QVERIFY(settings.contains(key + QLatin1String("/data")));
-  QCOMPARE(settings.value(key + QLatin1String("/data")).toByteArray(),
-           secret.toUtf8());
+  // QVERIFY (not QCOMPARE): a failure must never print the actual secret
+  // value into test/CI logs.
+  QVERIFY(settings.value(key + QLatin1String("/data")).toByteArray() ==
+          secret.toUtf8());
 }
 
 void QtKeychainKWalletHardeningTests::

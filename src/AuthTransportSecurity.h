@@ -9,7 +9,8 @@ namespace Arkham {
 // Returns true iff |hostText|, taken verbatim with no QUrl-style host
 // normalisation applied, is EXACTLY one of the three canonical loopback
 // spellings this policy recognises:
-//   - "localhost" (case-insensitive; no trailing dot, no subdomain);
+//   - "localhost" (ASCII-only case-insensitive; no trailing dot, no
+//     subdomain -- see the ASCII-only-comparison note below);
 //   - a canonical four-component dotted-decimal IPv4 literal whose first
 //     component is the literal text "127" and whose remaining three
 //     components are each a plain decimal 0-255 with no leading zero, no
@@ -23,6 +24,23 @@ namespace Arkham {
 // even if an address library would resolve it to the same loopback address
 // (e.g. "127.1", "0177.0.0.1", "0x7f.0.0.1", "2130706433", "127.000.000.001",
 // "0:0:0:0:0:0:0:1", "::ffff:127.0.0.1", "::1%eth0" are all rejected).
+//
+// The "localhost" comparison is deliberately ASCII-only, not
+// QString::compare(..., Qt::CaseInsensitive): Qt's case-insensitive
+// comparison performs full Unicode case folding, which equates code points
+// well beyond plain ASCII 'A'-'Z' with their ASCII lowercase counterparts
+// -- most notably U+017F LATIN SMALL LETTER LONG S ("ſ"), which Unicode
+// case-folds to plain ASCII 's', making the raw text "localhoſt" compare
+// equal to "localhost" under Qt::CaseInsensitive (confirmed empirically).
+// Any hostText containing a code point outside 7-bit ASCII is therefore
+// rejected outright before any letter-case comparison is attempted, so no
+// Unicode look-alike, fullwidth form, or other case-folding trick can ever
+// reach (let alone pass) the "localhost" branch. The IPv4 and "::1"
+// branches are unaffected by this class of bug on their own merits: the
+// IPv4 octet parser already rejects any non-ASCII-digit code point
+// (isStrictDecimalOctet), and the "::1" comparison already uses
+// Qt::CaseSensitive (an exact code-unit comparison with no folding at
+// all), so neither one needs the same guard to stay strictly ASCII.
 [[nodiscard]] bool isCanonicalLoopbackHostText(QStringView hostText);
 
 // Returns true if cleartext HTTP traffic that may carry a password or bearer
