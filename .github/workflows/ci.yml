@@ -199,9 +199,22 @@ jobs:
 
           # Defense-in-depth alongside the repo-root "exactly one AppImage"
           # assertion above: also prove the packaged AppDir itself never
-          # embedded a linuxdeploy tool executable (e.g. via an accidental
-          # future copy step), not just that one wasn't uploaded alongside it.
-          embedded_linuxdeploy="$(find "$extracted" -iname '*linuxdeploy*' -print -quit)"
+          # embedded a linuxdeploy *tool executable* (e.g. via an accidental
+          # future copy step), not just that one wasn't uploaded alongside
+          # it. This must not flag `apprun-hooks/linuxdeploy-plugin-qt-
+          # hook.sh`, a legitimate runtime hook script that linuxdeploy-
+          # plugin-qt installs into every AppImage it produces (it sets up
+          # Qt's own plugin/QML env vars at launch) -- it is named after the
+          # plugin but is not the plugin/tool binary itself, so only ELF/
+          # AppImage *binaries* matching the name are treated as a finding;
+          # shell-script hooks are explicitly excluded.
+          embedded_linuxdeploy=""
+          while IFS= read -r -d '' candidate; do
+            if file "$candidate" | grep -qE 'ELF|AppImage'; then
+              embedded_linuxdeploy="$candidate"
+              break
+            fi
+          done < <(find "$extracted" -iname '*linuxdeploy*' -type f -print0)
           [[ -z "$embedded_linuxdeploy" ]] || {
             echo "A linuxdeploy tool executable was embedded inside the AppImage: $embedded_linuxdeploy" >&2
             exit 1
