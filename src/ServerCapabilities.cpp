@@ -2,6 +2,7 @@
 
 #include <QJsonArray>
 #include <QJsonValue>
+#include <algorithm>
 
 using namespace Qt::StringLiterals;
 
@@ -122,7 +123,10 @@ ServerCapabilities ServerCapabilities::legacyFallback() {
 }
 
 bool ServerCapabilities::hasCapability(const QStringView name) const {
-  return capabilities.contains(name.toString());
+  return std::any_of(capabilities.cbegin(), capabilities.cend(),
+                     [name](const QString &capability) {
+                       return QStringView(capability) == name;
+                     });
 }
 
 } // namespace Arkham

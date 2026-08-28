@@ -120,8 +120,9 @@ void ContractTests::versionEquality() {
 }
 
 void ContractTests::versionToString() {
-  QCOMPARE(ContractRevision::parse(u"0.1.11")->toString(),
-           QStringLiteral("0.1.11"));
+  const auto parsed = ContractRevision::parse(u"0.1.11");
+  QVERIFY(parsed.has_value());
+  QCOMPARE(parsed->toString(), QStringLiteral("0.1.11"));
   QCOMPARE((ContractRevision{1, 0, 0}.toString()), QStringLiteral("1.0.0"));
   QCOMPARE((ContractRevision{0, 1, 0}.toString()), QStringLiteral("0.1.0"));
 }
