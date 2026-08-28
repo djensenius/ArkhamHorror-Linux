@@ -54,12 +54,11 @@ static QJsonObject parseJson(QLatin1StringView text) {
 // Returns the raw bytes of a vendored contract file or an error string.
 // relPath must start with '/'.  QFAIL must be called at the test-method level,
 // not inside a lambda, so callers check .has_value() and QFAIL themselves.
-static std::expected<QByteArray, QString>
-openContractFile(const QString &relPath) {
+static ValueOrError<QByteArray> openContractFile(const QString &relPath) {
   const QString path = QStringLiteral(ARKHAM_TEST_CONTRACTS_DIR) + relPath;
   QFile f(path);
   if (!f.open(QIODevice::ReadOnly))
-    return std::unexpected(
+    return failure(
         QStringLiteral("cannot open %1: %2").arg(path, f.errorString()));
   return f.readAll();
 }

@@ -1,11 +1,11 @@
 #pragma once
 
 #include "ContractRevision.h"
+#include "ValueOrError.h"
 
 #include <QJsonObject>
 #include <QString>
 #include <QStringList>
-#include <expected>
 
 namespace Arkham {
 
@@ -29,7 +29,7 @@ struct ServerCapabilities {
 
   // Decode from a parsed JSON object.  Returns an actionable error string on
   // any structural or type mismatch so the caller can log or surface it.
-  [[nodiscard]] static std::expected<ServerCapabilities, QString>
+  [[nodiscard]] static ValueOrError<ServerCapabilities>
   fromJson(const QJsonObject &obj);
 
   // Conservative fallback used when the capabilities endpoint returns 404

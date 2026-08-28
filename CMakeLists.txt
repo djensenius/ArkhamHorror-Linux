@@ -26,6 +26,7 @@ add_library(arkham_foundation STATIC
     src/ServerCapabilities.h
     src/ServerProfile.cpp
     src/ServerProfile.h
+    src/ValueOrError.h
 )
 
 target_include_directories(arkham_foundation PUBLIC src)

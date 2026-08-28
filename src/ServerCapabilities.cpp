@@ -31,76 +31,73 @@ QString jsonTypeName(const QJsonValue &v) {
 }
 
 // Helper: require a string field; return parse error on any mismatch.
-std::expected<QString, QString> requireString(const QJsonObject &obj,
-                                              QLatin1StringView key) {
+ValueOrError<QString> requireString(const QJsonObject &obj,
+                                    QLatin1StringView key) {
   const QJsonValue v = obj.value(key);
   if (!v.isString()) {
-    return std::unexpected(QStringLiteral("%1: expected string, got %2")
-                               .arg(key, jsonTypeName(v)));
+    return failure(QStringLiteral("%1: expected string, got %2")
+                       .arg(key, jsonTypeName(v)));
   }
   return v.toString();
 }
 
 } // namespace
 
-std::expected<ServerCapabilities, QString>
+ValueOrError<ServerCapabilities>
 ServerCapabilities::fromJson(const QJsonObject &obj) {
   ServerCapabilities caps;
 
   // schemaRevision — required, must parse as ContractRevision.
   auto schemaRevStr = requireString(obj, "schemaRevision"_L1);
   if (!schemaRevStr) {
-    return std::unexpected(schemaRevStr.error());
+    return failure(schemaRevStr.error());
   }
   auto schemaRev = ContractRevision::parse(*schemaRevStr);
   if (!schemaRev) {
-    return std::unexpected(
-        QStringLiteral("schemaRevision: %1").arg(schemaRev.error()));
+    return failure(QStringLiteral("schemaRevision: %1").arg(schemaRev.error()));
   }
   caps.schemaRevision = *schemaRev;
 
   // status — required open string; any string value is valid.
   auto statusStr = requireString(obj, "status"_L1);
   if (!statusStr) {
-    return std::unexpected(statusStr.error());
+    return failure(statusStr.error());
   }
   caps.status = *statusStr;
 
   // apiBasePath — required string.
   auto apiStr = requireString(obj, "apiBasePath"_L1);
   if (!apiStr) {
-    return std::unexpected(apiStr.error());
+    return failure(apiStr.error());
   }
   caps.apiBasePath = *apiStr;
 
   // nativeClientMinimumRevision — required, must parse as ContractRevision.
   auto nativeRevStr = requireString(obj, "nativeClientMinimumRevision"_L1);
   if (!nativeRevStr) {
-    return std::unexpected(nativeRevStr.error());
+    return failure(nativeRevStr.error());
   }
   auto nativeRev = ContractRevision::parse(*nativeRevStr);
   if (!nativeRev) {
-    return std::unexpected(QStringLiteral("nativeClientMinimumRevision: %1")
-                               .arg(nativeRev.error()));
+    return failure(QStringLiteral("nativeClientMinimumRevision: %1")
+                       .arg(nativeRev.error()));
   }
   caps.nativeClientMinimumRevision = *nativeRev;
 
   // capabilities — required array of strings; duplicates are preserved.
   const QJsonValue capsVal = obj.value("capabilities"_L1);
   if (!capsVal.isArray()) {
-    return std::unexpected(
-        QStringLiteral("capabilities: expected array, got %1")
-            .arg(jsonTypeName(capsVal)));
+    return failure(QStringLiteral("capabilities: expected array, got %1")
+                       .arg(jsonTypeName(capsVal)));
   }
   const QJsonArray capsArr = capsVal.toArray();
   caps.capabilities.reserve(static_cast<qsizetype>(capsArr.size()));
   for (qsizetype i = 0; i < capsArr.size(); ++i) {
     const QJsonValue elem = capsArr[i];
     if (!elem.isString()) {
-      return std::unexpected(
-          QStringLiteral("capabilities[%1]: expected string, got %2")
-              .arg(i)
-              .arg(jsonTypeName(elem)));
+      return failure(QStringLiteral("capabilities[%1]: expected string, got %2")
+                         .arg(i)
+                         .arg(jsonTypeName(elem)));
     }
     caps.capabilities.append(elem.toString());
   }

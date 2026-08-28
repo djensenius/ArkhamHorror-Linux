@@ -1,7 +1,8 @@
 #pragma once
 
+#include "ValueOrError.h"
+
 #include <QString>
-#include <expected>
 
 namespace Arkham {
 
@@ -14,8 +15,7 @@ struct ContractRevision {
   int minor{0};
   int patch{0};
 
-  [[nodiscard]] static std::expected<ContractRevision, QString>
-  parse(QStringView str);
+  [[nodiscard]] static ValueOrError<ContractRevision> parse(QStringView str);
   [[nodiscard]] QString toString() const;
 
   auto operator<=>(const ContractRevision &) const = default;
