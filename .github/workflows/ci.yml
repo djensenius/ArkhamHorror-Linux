@@ -183,7 +183,11 @@ jobs:
             echo "QtKeychain NOTICE.md was not bundled at $notice_path" >&2
             exit 1
           }
-          grep -q "BSD" "$license_path" || {
+          # The upstream QtKeychain LICENSE text is the classic BSD-3-Clause
+          # license but never contains the literal word "BSD"; match its
+          # actual distinguishing clauses instead.
+          grep -q "Redistribution and use in source and binary forms" "$license_path" \
+            && grep -q "endorse or promote products derived from this software" "$license_path" || {
             echo "Bundled LICENSE does not look like the expected BSD-3-Clause text." >&2
             exit 1
           }
