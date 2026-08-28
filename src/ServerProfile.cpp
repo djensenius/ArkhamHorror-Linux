@@ -60,7 +60,7 @@ ValueOrError<ServerProfile> ServerProfile::custom(QString displayName,
 ValueOrError<ServerProfile>
 ServerProfile::customWithId(const QString &id, QString displayName,
                             const QString &urlString) {
-  // Parse and validate the UUID — null means unparseable.
+  // Reject unparseable UUIDs and the all-zero UUID.
   const QUuid parsed(id);
   if (parsed.isNull()) {
     return failure(

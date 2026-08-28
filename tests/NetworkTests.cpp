@@ -5,6 +5,7 @@
 // QCoreApplication event loop, but these tests do not need a GUI application.
 
 #include <QCoreApplication>
+#include <QDeadlineTimer>
 #include <QEvent>
 #include <QFile>
 #include <QNetworkAccessManager>
@@ -16,6 +17,7 @@
 #include <QtGlobal>
 #include <QtTest>
 #include <cstring>
+#include <utility>
 
 #include "ICapabilityProbe.h"
 #include "IProfileStore.h"
@@ -1185,7 +1187,7 @@ void NetworkTests::probeTransportFailure() {
 }
 
 void NetworkTests::probeRejectsInvalidProfile() {
-  // ServerProfile(QUrl("http://")) has an empty host — isValid() == false.
+  // An unsupported scheme produces an invalid custom profile.
   const ServerProfile bad(QUrl(QStringLiteral("ftp://bad")));
   QVERIFY(!bad.isValid());
 
