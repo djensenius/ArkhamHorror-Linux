@@ -123,7 +123,19 @@ void NetworkCapabilityProbe::handleReply(QNetworkReply *reply) {
 
   // 2xx, no error — decode the JSON body.
   const QByteArray body = reply->readAll();
-  const QJsonDocument doc = QJsonDocument::fromJson(body);
+  QJsonParseError parseError;
+  const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
+  if (parseError.error != QJsonParseError::NoError) {
+    emit finished(ProbeResult{
+        ProbeOutcome::MalformedJson,
+        QStringLiteral("invalid JSON at offset %1: %2")
+            .arg(parseError.offset)
+            .arg(parseError.errorString()),
+        std::nullopt,
+        status,
+    });
+    return;
+  }
   if (!doc.isObject()) {
     emit finished(ProbeResult{
         ProbeOutcome::MalformedJson,

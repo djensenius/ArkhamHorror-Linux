@@ -9,6 +9,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QQueue>
 #include <QTemporaryFile>
 #include <QtTest>
 #include <cstring>
@@ -228,6 +229,7 @@ private slots:
   void probeSendsAcceptHeader();
   void probeCompatibleViaFixture();
   void probe404LegacyFallback();
+  void probeMalformedJsonSyntax();
   void probeMalformedJsonNotObject();
   void probeMalformedJsonBadSchema();
   void probeNonSuccessStatus();
@@ -1071,6 +1073,20 @@ void NetworkTests::probeMalformedJsonNotObject() {
   const auto r = runProbe(probe, ServerProfile::hostedDefault());
   QVERIFY2(r.has_value(), qPrintable(r.error()));
   QCOMPARE(r->outcome, ProbeOutcome::MalformedJson);
+  QCOMPARE(r->httpStatus, 200);
+}
+
+void NetworkTests::probeMalformedJsonSyntax() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"schemaRevision":)"));
+
+  NetworkCapabilityProbe probe(nam);
+  const auto r = runProbe(probe, ServerProfile::hostedDefault());
+  QVERIFY2(r.has_value(), qPrintable(r.error()));
+  QCOMPARE(r->outcome, ProbeOutcome::MalformedJson);
+  QVERIFY(r->diagnostic.startsWith(QStringLiteral("invalid JSON at offset ")));
+  QVERIFY(r->diagnostic !=
+          QStringLiteral("response body is not a JSON object"));
   QCOMPARE(r->httpStatus, 200);
 }
 
