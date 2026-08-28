@@ -137,4 +137,50 @@ result_6="$(PATH="$restricted_path" find_bundled_libgpgerror "$fake_root_6")"
   || fail "case 6 (libgpgerror find fallback): expected '$expected_6', got '$result_6'"
 echo "PASS: find_bundled_libgpgerror find() fallback locates only its own library"
 
-echo "All find_bundled_libsecret()/find_bundled_libgpgerror() regression cases passed."
+# --- Case 7: find_bundled_libgccs()/find_bundled_libstdcxx()/
+# find_bundled_libz() are further thin wrappers over the same generic
+# helper, added to force-bundle libgcc_s.so.1, libstdc++.so.6, and
+# libz.so.1 -- all three excluded from linuxdeploy's automatic bundling
+# by its own default blacklist, discovered missing from a real produced
+# AppImage by the recursive closure audit. Proves each resolves its own
+# library via ldconfig without cross-matching either of the others or
+# libsecret/libgpg-error.
+install_fake_ldconfig 0 "$(cat <<'LDCONFIG_EOF'
+libgcc_s.so.1 (libc6,x86-64) => /opt/fake/libgcc_s.so.1
+libstdc++.so.6 (libc6,x86-64) => /opt/fake/libstdc++.so.6.0.32
+libz.so.1 (libc6,x86-64) => /opt/fake/libz.so.1.3.1
+LDCONFIG_EOF
+)"
+result_7a="$(PATH="$restricted_path" find_bundled_libgccs "$work_dir/does-not-exist")"
+[[ "$result_7a" == "/opt/fake/libgcc_s.so.1" ]] \
+  || fail "case 7a (libgccs via ldconfig): expected '/opt/fake/libgcc_s.so.1', got '$result_7a'"
+result_7b="$(PATH="$restricted_path" find_bundled_libstdcxx "$work_dir/does-not-exist")"
+[[ "$result_7b" == "/opt/fake/libstdc++.so.6.0.32" ]] \
+  || fail "case 7b (libstdcxx via ldconfig): expected '/opt/fake/libstdc++.so.6.0.32', got '$result_7b'"
+result_7c="$(PATH="$restricted_path" find_bundled_libz "$work_dir/does-not-exist")"
+[[ "$result_7c" == "/opt/fake/libz.so.1.3.1" ]] \
+  || fail "case 7c (libz via ldconfig): expected '/opt/fake/libz.so.1.3.1', got '$result_7c'"
+echo "PASS: find_bundled_libgccs/find_bundled_libstdcxx/find_bundled_libz resolve via ldconfig"
+
+# --- Case 8: the same three wrappers fall back to find() when ldconfig
+# is absent, each locating only its own file among several co-located
+# candidates.
+remove_fake_ldconfig
+fake_root_8="$work_dir/root8/lib"
+mkdir -p "$fake_root_8"
+: > "$fake_root_8/libgcc_s.so.1"
+: > "$fake_root_8/libstdc++.so.6"
+: > "$fake_root_8/libz.so.1"
+: > "$fake_root_8/libsecret-1.so.0"
+result_8a="$(PATH="$restricted_path" find_bundled_libgccs "$fake_root_8")"
+[[ "$result_8a" == "$fake_root_8/libgcc_s.so.1" ]] \
+  || fail "case 8a (libgccs find fallback): expected '$fake_root_8/libgcc_s.so.1', got '$result_8a'"
+result_8b="$(PATH="$restricted_path" find_bundled_libstdcxx "$fake_root_8")"
+[[ "$result_8b" == "$fake_root_8/libstdc++.so.6" ]] \
+  || fail "case 8b (libstdcxx find fallback): expected '$fake_root_8/libstdc++.so.6', got '$result_8b'"
+result_8c="$(PATH="$restricted_path" find_bundled_libz "$fake_root_8")"
+[[ "$result_8c" == "$fake_root_8/libz.so.1" ]] \
+  || fail "case 8c (libz find fallback): expected '$fake_root_8/libz.so.1', got '$result_8c'"
+echo "PASS: find_bundled_libgccs/find_bundled_libstdcxx/find_bundled_libz find() fallback works"
+
+echo "All find_bundled_libsecret()/find_bundled_libgpgerror()/find_bundled_libgccs()/find_bundled_libstdcxx()/find_bundled_libz() regression cases passed."

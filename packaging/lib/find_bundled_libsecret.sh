@@ -95,3 +95,44 @@ find_bundled_libsecret() {
 find_bundled_libgpgerror() {
   find_bundled_library 'libgpg-error.so.0*' "$@"
 }
+
+# find_bundled_libgccs [search_root...]
+#
+# Thin wrapper over find_bundled_library for libgcc_s.so.1. Like
+# libgpg-error above, linuxdeploy's own default blacklist excludes
+# libgcc_s (and libstdc++, below) from automatic bundling on the
+# assumption a compatible copy is always already present on the target
+# host -- but libgcc_s/libstdc++'s C++ ABI is not guaranteed compatible
+# across distros/ages the way glibc's C ABI is (this is a well-known
+# class of AppImage portability bug: an AppImage built against a newer
+# GCC failing on an older host with "version `GCC_x.y` not found" or
+# similar), which is exactly the failure mode a portable AppImage
+# targeting arbitrary/older host distros (including SteamOS) must avoid.
+# Force-bundling it here, rather than relying on ABI_ALLOWLIST to excuse
+# it, keeps the recursive closure audit's own allowlist narrowly limited
+# to the dynamic loader and true core-glibc libraries only.
+find_bundled_libgccs() {
+  find_bundled_library 'libgcc_s.so.1*' "$@"
+}
+
+# find_bundled_libstdcxx [search_root...]
+#
+# Thin wrapper over find_bundled_library for libstdc++.so.6. See
+# find_bundled_libgccs() above for why this must be force-bundled rather
+# than allowlisted: C++ standard library ABI compatibility across distros
+# is not guaranteed the same way glibc's C ABI is.
+find_bundled_libstdcxx() {
+  find_bundled_library 'libstdc++.so.6*' "$@"
+}
+
+# find_bundled_libz [search_root...]
+#
+# Thin wrapper over find_bundled_library for libz.so.1 (zlib). Required
+# transitively by both bundled Qt (libQt6Core.so.6) and bundled libsecret's
+# own closure (libgio-2.0.so.0), but -- like libgcc_s/libstdc++ above --
+# excluded from linuxdeploy's automatic bundling by its own default
+# blacklist, again on the (for a portable AppImage, incorrect) assumption
+# that a compatible system copy is always already present.
+find_bundled_libz() {
+  find_bundled_library 'libz.so.1*' "$@"
+}

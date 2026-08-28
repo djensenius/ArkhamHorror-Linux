@@ -83,6 +83,38 @@ libgpgerror_so="$(find_bundled_libgpgerror)"
   exit 2
 }
 
+# libgcc_s, libstdc++, and zlib are all excluded from linuxdeploy's
+# automatic bundling by its own default blacklist (it treats them as
+# "always present on the target system"), but that assumption is unsafe
+# for a portable AppImage: libgcc_s/libstdc++'s C++ ABI is not guaranteed
+# compatible across distros/ages the way glibc's C ABI is (a well-known
+# AppImage portability failure mode), and zlib -- required transitively
+# by both bundled Qt and bundled libsecret's own closure -- is not part
+# of glibc either. Bundling all three explicitly here, rather than
+# excusing them via the recursive closure audit's ABI_ALLOWLIST, keeps
+# that allowlist narrowly limited to the dynamic loader and true
+# core-glibc libraries only, matching this project's own documented
+# policy.
+# shellcheck disable=SC2119
+libgccs_so="$(find_bundled_libgccs)"
+[[ -n "$libgccs_so" && -e "$libgccs_so" ]] || {
+  echo "Could not locate libgcc_s.so.1 to bundle into the AppImage." >&2
+  exit 2
+}
+# shellcheck disable=SC2119
+libstdcxx_so="$(find_bundled_libstdcxx)"
+[[ -n "$libstdcxx_so" && -e "$libstdcxx_so" ]] || {
+  echo "Could not locate libstdc++.so.6 to bundle into the AppImage." >&2
+  exit 2
+}
+# shellcheck disable=SC2119
+libz_so="$(find_bundled_libz)"
+[[ -n "$libz_so" && -e "$libz_so" ]] || {
+  echo "Could not locate libz.so.1 to bundle into the AppImage." \
+    "Install zlib1g (runtime) or zlib1g-dev." >&2
+  exit 2
+}
+
 
 # Package the third-party attribution files (QtKeychain's BSD-3-Clause
 # LICENSE and this project's own NOTICE.md) into the distributed AppImage
@@ -110,5 +142,8 @@ export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
   --icon-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.svg" \
   --library "$libsecret_so" \
   --library "$libgpgerror_so" \
+  --library "$libgccs_so" \
+  --library "$libstdcxx_so" \
+  --library "$libz_so" \
   --plugin qt \
   --output appimage
