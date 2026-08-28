@@ -289,6 +289,20 @@ jobs:
         # deleting real, representative non-ABI members of the actual
         # bundled closure (not a synthetic stand-in) and requiring the
         # audit to fail for each one.
+        #
+        # Mutation victims are chosen as: (1) libffi and (2) libgpg-error,
+        # by explicit SONAME-prefix pattern (never a fixed exact version,
+        # so a distro bump to e.g. libffi.so.9 is still matched) --
+        # required by name because they are this item's own two concretely
+        # documented real-world gaps (python:3.12-slim's own preloaded
+        # libffi could otherwise mask a genuinely missing bundled copy, and
+        # libgpg-error.so.0 was the actual missing dependency this whole
+        # audit step was added to catch) -- plus (3) one further
+        # representative non-ABI member chosen by a content-derived hash
+        # index into the remaining closure members, not by taking the
+        # alphabetically-first N entries (a "head -3" proxy would silently
+        # keep re-testing the same few early-alphabet names forever and
+        # never exercise the rest of the closure as it changes over time).
         run: |
           set -euo pipefail
           extracted="$(pwd)/squashfs-root"
@@ -325,17 +339,65 @@ jobs:
           }
           echo "Real non-root closure members available for mutation testing: ${closure_members[*]}"
 
+          # (1) and (2): libffi and libgpg-error MUST be present in the
+          # real bundled closure and MUST be individually mutation-tested
+          # by name -- these are this item's own two named, previously
+          # under-tested (or, for libgpg-error, previously entirely
+          # missing) dependencies. Matched by SONAME prefix, not an exact
+          # pinned version string, so a future distro package bump (e.g.
+          # libffi.so.8 -> libffi.so.9) is still matched and tested.
+          libffi_name=""
+          libgpgerror_name=""
+          for member in "${closure_members[@]}"; do
+            if [[ -z "$libffi_name" && "$member" == libffi.so.* ]]; then
+              libffi_name="$member"
+            fi
+            if [[ -z "$libgpgerror_name" && "$member" == libgpg-error.so.* ]]; then
+              libgpgerror_name="$member"
+            fi
+          done
+          [[ -n "$libffi_name" ]] || {
+            echo "Expected 'libffi.so.*' in the real bundled closure but did not find it: ${closure_members[*]}" >&2
+            exit 1
+          }
+          [[ -n "$libgpgerror_name" ]] || {
+            echo "Expected 'libgpg-error.so.*' in the real bundled closure but did not find it: ${closure_members[*]}" >&2
+            exit 1
+          }
+          echo "Confirmed required mutation targets present: libffi='$libffi_name', libgpg-error='$libgpgerror_name'"
+
+          # (3): one further representative non-ABI member, chosen by a
+          # content-derived hash index into the remaining closure members
+          # (i.e. excluding the two already covered above and the roots),
+          # not by always picking the same alphabetically-early entries.
+          # This selection shifts automatically whenever the underlying
+          # dependency graph changes (e.g. a transitive dependency is
+          # added, removed, or renamed across a distro/package update),
+          # giving broader coverage over time than a fixed "head -N" proxy
+          # while remaining fully deterministic for a given closure.
+          remaining_members=()
+          for member in "${closure_members[@]}"; do
+            if [[ "$member" != "$libffi_name" && "$member" != "$libgpgerror_name" ]]; then
+              remaining_members+=("$member")
+            fi
+          done
+          extra_victim=""
+          if [[ ${#remaining_members[@]} -gt 0 ]]; then
+            hash_hex="$(printf '%s\n' "${remaining_members[@]}" | sha256sum | cut -c1-8)"
+            extra_idx=$(( 16#$hash_hex % ${#remaining_members[@]} ))
+            extra_victim="${remaining_members[$extra_idx]}"
+            echo "Additional dynamically-selected mutation target: '$extra_victim' (index $extra_idx of ${#remaining_members[@]})"
+          else
+            echo "No further non-ABI closure members remain beyond libffi/libgpg-error; skipping the additional representative-member mutation."
+          fi
+
+          victims=("$libffi_name" "$libgpgerror_name")
+          [[ -n "$extra_victim" ]] && victims+=("$extra_victim")
+
           scratch="$(mktemp -d)"
           audit_output="$(mktemp)"
           trap 'rm -rf "$scratch" "$audit_output"' EXIT
-          # Test up to three representative victims (or all of them, if
-          # fewer are present) so this stays fast without losing coverage
-          # of "deleting any one non-ABI dependency is caught", per this
-          # item's explicit ask.
-          victim_count=${#closure_members[@]}
-          [[ $victim_count -gt 3 ]] && victim_count=3
-          for ((i = 0; i < victim_count; i++)); do
-            victim="${closure_members[$i]}"
+          for victim in "${victims[@]}"; do
             rm -rf "${scratch:?}"/*
             cp -a "$lib_dir/." "$scratch/"
             rm -f "$scratch/$victim"

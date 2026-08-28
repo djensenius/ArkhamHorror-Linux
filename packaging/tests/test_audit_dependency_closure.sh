@@ -141,6 +141,105 @@ echo "$output_6" | grep -q "libtestleaf.so.1" \
   || fail "case 6: failure output did not name the escaping library: $output_6"
 echo "PASS: a SONAME symlink resolving outside the AppDir is rejected, not silently followed"
 
+# A persistent standalone copy of the leaf library, used as the "outside
+# the AppDir" escape target for every symlink-escape case below. Kept
+# separate from $appdir/libtestleaf.so.1 (case 6's escape target) because
+# that file is deleted by the mutating case 3 further down, and these
+# cases must all run before case 3 too.
+outside_dir="$work_dir/outside_target"
+mkdir -p "$outside_dir"
+cp "$appdir/libtestleaf.so.1" "$outside_dir/libtestleaf.so.1"
+
+# --- Case 7: RELATIVE-path symlink escape. Unlike case 6 (an absolute
+# target path), the on-disk symlink here is stored as a "../"-relative
+# path string -- proving the auditor's escape check is based on actually
+# resolving the path, not on a textual check for a leading "/" that a
+# relative escape would trivially bypass.
+escape_dir_rel="$work_dir/appdir_escape_relative"
+mkdir -p "$escape_dir_rel"
+cp "$appdir/libtestroot.so.1" "$escape_dir_rel/"
+cp "$appdir/libtestmid.so.1" "$escape_dir_rel/"
+ln -s "../outside_target/libtestleaf.so.1" "$escape_dir_rel/libtestleaf.so.1"
+
+set +e
+output_7="$(python3 "$auditor" "$escape_dir_rel" --root libtestroot.so.1 2>&1)"
+case7_status=$?
+set -e
+[[ $case7_status -ne 0 ]] \
+  || fail "case 7: expected non-zero exit for a relative-path SONAME symlink escaping the AppDir"
+echo "$output_7" | grep -qi "outside" \
+  || fail "case 7: failure output did not explain the symlink-escape rejection: $output_7"
+echo "$output_7" | grep -q "libtestleaf.so.1" \
+  || fail "case 7: failure output did not name the escaping library: $output_7"
+echo "PASS: a relative-path SONAME symlink resolving outside the AppDir is rejected"
+
+# --- Case 8: MULTI-HOP escape. The SONAME entry itself is a symlink to a
+# bare sibling filename ("hop.so.1") that -- read in isolation -- looks
+# like it stays inside the audited directory; only that second symlink
+# actually escapes outside via a "../" target. This proves the auditor
+# fully resolves the whole symlink chain (Path.resolve() does this) rather
+# than only inspecting the first hop's immediate readlink() target.
+escape_dir_hop="$work_dir/appdir_escape_multihop"
+mkdir -p "$escape_dir_hop"
+cp "$appdir/libtestroot.so.1" "$escape_dir_hop/"
+cp "$appdir/libtestmid.so.1" "$escape_dir_hop/"
+ln -s "hop.so.1" "$escape_dir_hop/libtestleaf.so.1"
+ln -s "../outside_target/libtestleaf.so.1" "$escape_dir_hop/hop.so.1"
+
+set +e
+output_8="$(python3 "$auditor" "$escape_dir_hop" --root libtestroot.so.1 2>&1)"
+case8_status=$?
+set -e
+[[ $case8_status -ne 0 ]] \
+  || fail "case 8: expected non-zero exit for a multi-hop SONAME symlink chain escaping the AppDir"
+echo "$output_8" | grep -qi "outside" \
+  || fail "case 8: failure output did not explain the symlink-escape rejection: $output_8"
+echo "PASS: a multi-hop SONAME symlink chain ultimately escaping the AppDir is rejected"
+
+# --- Case 9: DANGLING symlink. The SONAME entry is a symlink to a sibling
+# filename that was never created at all -- a broken link, not an escape
+# -- and must still fail the audit (as a tooling error or an unresolved
+# dependency, either way non-zero exit) rather than being silently
+# skipped or misreported as present.
+escape_dir_dangling="$work_dir/appdir_dangling"
+mkdir -p "$escape_dir_dangling"
+cp "$appdir/libtestroot.so.1" "$escape_dir_dangling/"
+cp "$appdir/libtestmid.so.1" "$escape_dir_dangling/"
+ln -s "libtestleaf-does-not-exist.so.1" "$escape_dir_dangling/libtestleaf.so.1"
+
+set +e
+output_9="$(python3 "$auditor" "$escape_dir_dangling" --root libtestroot.so.1 2>&1)"
+case9_status=$?
+set -e
+[[ $case9_status -ne 0 ]] \
+  || fail "case 9: expected non-zero exit for a dangling SONAME symlink"
+echo "PASS: a dangling SONAME symlink is rejected, not silently treated as present"
+
+# --- Case 10: IN-TREE-TO-OUTSIDE chain. The SONAME entry is a symlink
+# into a legitimate subdirectory *inside* the audited lib_dir (a hop that,
+# taken alone, clearly stays in-tree), but the file that first hop lands
+# on is itself a further symlink that escapes outside via a deeper
+# relative "../../" reference. This differs from case 8 (a flat two-hop
+# chain within the same directory) by nesting the escape one directory
+# level deeper, proving the resolver's containment check is not fooled by
+# an in-tree waypoint before the eventual escape.
+escape_dir_nested="$work_dir/appdir_escape_nested"
+mkdir -p "$escape_dir_nested/subdir"
+cp "$appdir/libtestroot.so.1" "$escape_dir_nested/"
+cp "$appdir/libtestmid.so.1" "$escape_dir_nested/"
+ln -s "subdir/inner.so.1" "$escape_dir_nested/libtestleaf.so.1"
+ln -s "../../outside_target/libtestleaf.so.1" "$escape_dir_nested/subdir/inner.so.1"
+
+set +e
+output_10="$(python3 "$auditor" "$escape_dir_nested" --root libtestroot.so.1 2>&1)"
+case10_status=$?
+set -e
+[[ $case10_status -ne 0 ]] \
+  || fail "case 10: expected non-zero exit for an in-tree-to-outside symlink chain"
+echo "$output_10" | grep -qi "outside" \
+  || fail "case 10: failure output did not explain the symlink-escape rejection: $output_10"
+echo "PASS: an in-tree waypoint symlink chain that ultimately escapes the AppDir is rejected"
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the

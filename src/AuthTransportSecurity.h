@@ -36,6 +36,15 @@ namespace Arkham {
 //   userinfo-like construct in the raw authority (an '@' present) causes an
 //   unconditional false, independent of how QUrl itself would later parse
 //   userinfo/host.
+// - If the raw authority contains a ":" after the host (or after a
+//   bracketed IPv6 literal's closing "]"), everything following that ":"
+//   must be a syntactically valid, in-range port: one or more ASCII
+//   digits only (no sign, no percent-escapes, no further ":" separators,
+//   no control characters), with a decimal value in 1..65535. An empty
+//   port (e.g. "localhost:", "[::1]:") or port 0 (e.g. "localhost:0") is
+//   rejected even though QUrl itself treats both as syntactically valid --
+//   an empty or all-zero port is never a meaningful destination and must
+//   not be silently treated the same as "no port specified".
 //
 // Why this must run against the RAW pre-QUrl text: QUrl itself silently
 // canonicalises many alternate, ambiguous numeric encodings of the loopback

@@ -207,6 +207,7 @@ private slots:
   void urlAcceptsPathPrefix();
   void urlStripsTrailingSlash();
   void urlTrimsSurroundingWhitespace();
+  void urlRejectsControlCharactersAtEdges();
   void urlRejectsEmpty();
   void urlRejectsNonHttpScheme();
   void urlRejectsMissingHost();
@@ -222,6 +223,7 @@ private slots:
   void urlStrictLoopbackPolicy_data();
   void urlStrictLoopbackPolicy();
   void rawIPv6BracketTrailingGarbageRejected();
+  void rawPortValidationRejectsMalformedAndOutOfRangePorts();
 
   // ── ServerProfile factories and path construction ─────────────────────────
   void hostedDefaultProperties();
@@ -329,10 +331,41 @@ void NetworkTests::urlStripsTrailingSlash() {
 }
 
 void NetworkTests::urlTrimsSurroundingWhitespace() {
+  // Only plain ASCII space (U+0020) is trimmed; tab/newline/other control
+  // characters anywhere in the original input -- including purely leading
+  // or trailing ones -- are rejected outright before trimming even runs
+  // (see UrlErrorCode::ControlCharacterPresent and
+  // urlStrictLoopbackPolicy_data()'s "-trailing-tab-"/"-trailing-newline"
+  // rows), precisely so a trailing control character cannot be silently
+  // laundered into a clean-looking, accepted URL.
   const auto r =
-      validateCustomUrl(QStringLiteral(" \nhttps://example.com/prefix\t "));
+      validateCustomUrl(QStringLiteral("  https://example.com/prefix  "));
   QVERIFY(r.has_value());
   QCOMPARE(*r, QUrl(QStringLiteral("https://example.com/prefix")));
+}
+
+// Complements urlTrimsSurroundingWhitespace(): proves a control character
+// at either edge of the ORIGINAL input is rejected outright, for an
+// ordinary https URL (not merely the http-loopback-specific rows in
+// urlStrictLoopbackPolicy_data()) -- i.e. this is not a loopback-only
+// policy but applies to validateCustomUrl()'s input handling universally,
+// before QString::trimmed() (which would otherwise silently strip a
+// leading/trailing tab or newline, same as plain space) ever runs.
+void NetworkTests::urlRejectsControlCharactersAtEdges() {
+  const auto leading =
+      validateCustomUrl(QStringLiteral("\thttps://example.com"));
+  QVERIFY(!leading.has_value());
+  QCOMPARE(leading.error().code, UrlErrorCode::ControlCharacterPresent);
+
+  const auto trailing =
+      validateCustomUrl(QStringLiteral("https://example.com\n"));
+  QVERIFY(!trailing.has_value());
+  QCOMPARE(trailing.error().code, UrlErrorCode::ControlCharacterPresent);
+
+  const auto embedded =
+      validateCustomUrl(QStringLiteral("https://exa\rmple.com"));
+  QVERIFY(!embedded.has_value());
+  QCOMPARE(embedded.error().code, UrlErrorCode::ControlCharacterPresent);
 }
 
 void NetworkTests::urlRejectsEmpty() {
@@ -433,6 +466,9 @@ void NetworkTests::urlStrictLoopbackPolicy_data() {
   // wrong error code is still caught.
   QTest::addColumn<int>("expectedErrorCode");
 
+  const int invalidUrl = static_cast<int>(UrlErrorCode::InvalidUrl);
+  const int controlCharacterPresent =
+      static_cast<int>(UrlErrorCode::ControlCharacterPresent);
   const int insecureTransport =
       static_cast<int>(UrlErrorCode::InsecureTransport);
   const int credentialsPresent =
@@ -453,6 +489,10 @@ void NetworkTests::urlStrictLoopbackPolicy_data() {
       << QStringLiteral("http://[::1]") << true << 0;
   QTest::newRow("http-bracketed-::1-port")
       << QStringLiteral("http://[::1]:9000") << true << 0;
+  QTest::newRow("http-localhost-port-min")
+      << QStringLiteral("http://localhost:1") << true << 0;
+  QTest::newRow("http-localhost-port-max")
+      << QStringLiteral("http://localhost:65535") << true << 0;
 
   // ── Accepted: https for any host, including odd literals and base paths ─
   QTest::newRow("https-any-host")
@@ -521,6 +561,52 @@ void NetworkTests::urlStrictLoopbackPolicy_data() {
       << QStringLiteral("http://192.168.1.100") << false << insecureTransport;
   QTest::newRow("http-public-host")
       << QStringLiteral("http://example.com") << false << insecureTransport;
+
+  // ── Rejected: malformed/absent/out-of-range ports on an otherwise-exact
+  //    loopback host or bracketed IPv6 literal. QUrl's own StrictMode
+  //    parsing already rejects most malformed port syntax (non-digit
+  //    garbage, percent-escapes, double colons, negative, >65535) as an
+  //    unparseable URL entirely (UrlErrorCode::InvalidUrl) before this
+  //    function's raw-authority port check is ever reached; the remaining
+  //    two forms QUrl treats as syntactically valid -- an empty port
+  //    ("host:") and port 0 -- are only caught by this function's own
+  //    stricter, in-range (1..65535), non-empty port rule
+  //    (UrlErrorCode::InsecureTransport, since the raw-text loopback policy
+  //    check is what actually rejects them). Both groups are asserted here
+  //    through the real public path so a regression in either QUrl's
+  //    parsing assumptions or this function's own port rule is caught.
+  QTest::newRow("http-localhost-empty-port")
+      << QStringLiteral("http://localhost:") << false << insecureTransport;
+  QTest::newRow("http-localhost-zero-port")
+      << QStringLiteral("http://localhost:0") << false << insecureTransport;
+  QTest::newRow("http-bracketed-::1-empty-port")
+      << QStringLiteral("http://[::1]:") << false << insecureTransport;
+  QTest::newRow("http-localhost-non-numeric-port")
+      << QStringLiteral("http://localhost:evil") << false << invalidUrl;
+  QTest::newRow("http-localhost-percent-escaped-port")
+      << QStringLiteral("http://localhost:%39") << false << invalidUrl;
+  QTest::newRow("http-localhost-double-colon-port")
+      << QStringLiteral("http://localhost::9000") << false << invalidUrl;
+  QTest::newRow("http-localhost-multiple-port-segments")
+      << QStringLiteral("http://localhost:9000:9000") << false << invalidUrl;
+  QTest::newRow("http-bracketed-::1-non-numeric-port")
+      << QStringLiteral("http://[::1]:evil") << false << invalidUrl;
+  QTest::newRow("http-localhost-port-overflow")
+      << QStringLiteral("http://localhost:99999") << false << invalidUrl;
+  QTest::newRow("http-localhost-port-negative")
+      << QStringLiteral("http://localhost:-1") << false << invalidUrl;
+
+  // ── Rejected: control characters in the ORIGINAL input, which must not
+  //    be laundered away by trimmed() before this policy ever sees them.
+  QTest::newRow("http-localhost-trailing-tab-after-port")
+      << QStringLiteral("http://localhost:9000\t") << false
+      << controlCharacterPresent;
+  QTest::newRow("http-localhost-tab-before-colon")
+      << QStringLiteral("http://localhost\t:9000") << false
+      << controlCharacterPresent;
+  QTest::newRow("http-localhost-trailing-newline")
+      << QStringLiteral("http://localhost\n") << false
+      << controlCharacterPresent;
 }
 
 void NetworkTests::urlStrictLoopbackPolicy() {
@@ -573,6 +659,56 @@ void NetworkTests::rawIPv6BracketTrailingGarbageRejected() {
                                             QStringLiteral("http://[::1]")));
   QVERIFY(isCleartextAuthAllowedForRawInput(
       QStringLiteral("http"), QStringLiteral("http://[::1]:9000")));
+}
+
+// Direct, production-function-level regression proving
+// isCleartextAuthAllowedForRawInput()'s own raw-authority port parsing
+// rejects malformed, empty, or out-of-range ports on its own merits -- not
+// merely because QUrl happens to already reject the same text as an
+// unparseable URL in the one real caller (UrlValidator::validateCustomUrl).
+// Exercising the function directly here means a future caller that invokes
+// it against text QUrl has not already validated (or a change to QUrl's
+// own parsing leniency) cannot silently reintroduce these bypasses.
+void NetworkTests::rawPortValidationRejectsMalformedAndOutOfRangePorts() {
+  // Empty port after a bare host's ":" or a bracketed literal's "]:".
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(QStringLiteral("http"),
+                                             QStringLiteral("http://[::1]:")));
+
+  // Non-numeric / percent-escaped / control-bearing port suffixes.
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:evil")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:%39")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:9000\t")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://[::1]:evil")));
+
+  // Malformed multiple separators.
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost::9000")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:9000:9000")));
+
+  // Zero, negative, and overflow ports (out of the required 1..65535
+  // range; zero and (via non-digit "-") negative are only reachable
+  // through this function's own range/digit check since QUrl already
+  // treats them as syntactically fine except where a literal "-" makes
+  // the whole URL unparseable).
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:0")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:99999")));
+
+  // Still correctly accepted: valid in-range ports at both boundaries.
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:1")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost:65535")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost")));
 }
 
 // ─── ServerProfile factories and path construction ────────────────────────
