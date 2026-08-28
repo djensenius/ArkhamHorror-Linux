@@ -70,10 +70,10 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
-      - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
-      - name: Install D-Bus (required by kwallet_hardening test's fake KWallet service)
-        run: sudo apt-get update && sudo apt-get install -y dbus
+      - name: Install QtKeychain and D-Bus build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config dbus # dbus is required by kwallet_hardening test's fake KWallet service
       - run: mise run test
 
   build:
@@ -168,10 +168,9 @@ jobs:
           # QLibrary (dlopen()), so `ldd libqt6keychain.so` never lists it,
           # bundled or not, and that check cannot be used to prove bundling.
           # See packaging/verify_bundled_libsecret.py for the real dlopen()
-          # based proof this uses instead.
-          apprun_libdir="$extracted/usr/lib"
-          env LD_LIBRARY_PATH="$apprun_libdir" \
-            python3 packaging/verify_bundled_libsecret.py "$bundled_secret" "$apprun_libdir"
+          # based proof this uses instead (it manages LD_LIBRARY_PATH
+          # itself; no caller-side environment setup needed).
+          python3 packaging/verify_bundled_libsecret.py "$bundled_secret"
 
           license_path="$extracted/usr/share/doc/ArkhamHorror/third_party/qtkeychain/LICENSE"
           notice_path="$extracted/usr/share/doc/ArkhamHorror/third_party/qtkeychain/NOTICE.md"

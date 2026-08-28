@@ -17,8 +17,11 @@ dependency of the ArkhamHorror-Linux client:
 
 QtKeychain is fetched reproducibly at build time via CMake `FetchContent`,
 pinned to the exact commit above (see the top-level `CMakeLists.txt`). It is
-built as a static/shared dependency of the `arkham_foundation` library and is
-not modified from upstream.
+built as a static/shared dependency of the `arkham_foundation` library. Its
+upstream source is otherwise unmodified except for one small, reviewable
+downstream security patch (see "No insecure fallback" below), applied
+automatically and reproducibly via CMake's `PATCH_COMMAND` on top of the
+pinned commit -- it is not a general fork or ad-hoc local edit.
 
 ## Runtime backend requirements
 
