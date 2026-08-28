@@ -115,6 +115,15 @@ jobs:
           cache: true
       - name: Install QtKeychain build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Test libsecret discovery fallback logic
+        # Exercises find_bundled_libsecret() (used by build-appimage.sh
+        # below) against ldconfig-absent, ldconfig-failing,
+        # ldconfig-succeeding, and nothing-found cases with fakes, so a
+        # regression that reintroduces an unguarded pipeline aborting the
+        # script under `set -euo pipefail` is caught here deterministically,
+        # rather than only by this runner happening to have a working
+        # ldconfig.
+        run: bash packaging/tests/test_find_bundled_libsecret.sh
       - name: Download packaging tools
         run: |
           curl --fail --location --retry 3 --output linuxdeploy-x86_64.AppImage \

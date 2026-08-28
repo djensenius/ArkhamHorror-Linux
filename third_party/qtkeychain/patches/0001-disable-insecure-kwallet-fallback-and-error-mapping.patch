@@ -1,9 +1,9 @@
 --- a/qtkeychain/keychain_unix.cpp
 +++ b/qtkeychain/keychain_unix.cpp
 @@ -353,7 +353,12 @@
- 
+
      PlainTextStore plainTextStore(q->service(), q->settings());
- 
+
 -    if (plainTextStore.contains(key)) {
 +    // ArkhamHorror-Linux hardening: never read or migrate a legacy plaintext
 +    // entry when the caller has disabled the insecure fallback. Upstream
@@ -13,9 +13,9 @@
 +    if (q->insecureFallback() && plainTextStore.contains(key)) {
          // We previously stored data in the insecure QSettings, but now have KWallet available.
          // Do the migration
- 
+
 @@ -615,18 +620,29 @@
- 
+
  void JobPrivate::kwalletFinished(QDBusPendingCallWatcher *watcher)
  {
 -    if (!watcher->isError()) {
@@ -53,5 +53,5 @@
 +            data = reply.value().toUtf8();
 +        }
      }
- 
+
      q->emitFinished();

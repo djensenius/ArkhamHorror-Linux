@@ -45,7 +45,7 @@ FetchContent_Declare(
         # update step on every reconfigure so the one-time PATCH_COMMAND
         # below is never re-run (and re-applied) against an already-patched
         # working tree.
-    PATCH_COMMAND git apply --whitespace=fix
+    PATCH_COMMAND git apply --whitespace=error
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/qtkeychain/patches/0001-disable-insecure-kwallet-fallback-and-error-mapping.patch"
 )
 

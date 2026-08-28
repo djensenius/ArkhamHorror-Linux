@@ -5,6 +5,9 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${1:-$repo_root/build}"
 app_dir="$repo_root/AppDir"
 
+# shellcheck source=packaging/lib/find_bundled_libsecret.sh
+source "$repo_root/packaging/lib/find_bundled_libsecret.sh"
+
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "AppImage packaging requires x86_64 Linux." >&2
   exit 2
@@ -44,11 +47,16 @@ command -v "$qt_plugin" >/dev/null 2>&1 || {
 # AppDir and its own transitive shared-library dependencies (glib,
 # gobject, gio, ...) are resolved and bundled the same way as any other
 # linked library.
-libsecret_so="$(ldconfig -p 2>/dev/null | awk '/libsecret-1\.so\.0/ {print $NF; exit}')"
-if [[ -z "$libsecret_so" ]]; then
-  libsecret_so="$(find /usr/lib /usr/lib/x86_64-linux-gnu /lib -maxdepth 3 \
-    -name 'libsecret-1.so.0*' 2>/dev/null | head -n1)"
-fi
+#
+# Discovery itself lives in find_bundled_libsecret() (see
+# packaging/lib/find_bundled_libsecret.sh) so it is unit-testable in
+# isolation -- see packaging/tests/test_find_bundled_libsecret.sh, which
+# exercises the ldconfig-unavailable/failing fallback path deterministically
+# rather than relying on this runner's own environment happening to lack
+# ldconfig.
+# shellcheck disable=SC2119 # intentionally called with no args: this
+# script's own $1 (build_dir) must not be forwarded as a search root.
+libsecret_so="$(find_bundled_libsecret)"
 [[ -n "$libsecret_so" && -e "$libsecret_so" ]] || {
   echo "Could not locate libsecret-1.so.0 to bundle into the AppImage." \
     "Install libsecret-1-0 (runtime) or libsecret-1-dev." >&2
