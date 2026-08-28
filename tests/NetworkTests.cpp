@@ -500,8 +500,13 @@ void NetworkTests::urlStrictLoopbackPolicy() {
   const auto r = validateCustomUrl(urlString);
   QCOMPARE(r.has_value(), expectAccepted);
   if (!expectAccepted) {
-    QVERIFY(r.error().code == UrlErrorCode::InsecureTransport ||
-            r.error().code == UrlErrorCode::CredentialsPresent);
+    // None of the rejected rows above contain userinfo ('@'), so every
+    // rejection here must be attributed specifically to the insecure
+    // http-transport policy; asserting the exact code (rather than also
+    // accepting CredentialsPresent) ensures a regression that
+    // mis-classifies one of these rows under a different error code is
+    // still caught rather than silently accepted.
+    QCOMPARE(r.error().code, UrlErrorCode::InsecureTransport);
   }
 }
 

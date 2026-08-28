@@ -183,13 +183,30 @@ void QtKeychainTokenStore::readToken(const QString &profileId,
     ResultCallback cb = std::move(it->second.callback);
     const QKeychain::Error err = jobPtr->error();
     QString token;
-    const TokenStoreOutcome outcome = mapReadError(err);
+    TokenStoreOutcome outcome = mapReadError(err);
+    QString diagnostic;
     if (outcome == TokenStoreOutcome::Success) {
       token = jobPtr->textData();
+      if (token.trimmed().isEmpty()) {
+        // saveToken() never persists an empty/whitespace-only token, so a
+        // backend that nonetheless returns one alongside a success status
+        // indicates a corrupt/tampered entry (e.g. manually edited outside
+        // this application), not a usable session. Surfacing this as
+        // Success would let a caller believe it is signed in with an
+        // unusable blank token; map it to BackendError and drop the value
+        // instead.
+        outcome = TokenStoreOutcome::BackendError;
+        token.clear();
+        diagnostic = QStringLiteral(
+            "secure storage returned an empty or whitespace-only token");
+      }
+    }
+    if (diagnostic.isEmpty()) {
+      diagnostic = diagnosticFor(outcome);
     }
     it->second.job.release()->deleteLater();
     m_pendingReads.erase(it);
-    emitAsync(std::move(cb), TokenStoreResult{outcome, diagnosticFor(outcome),
+    emitAsync(std::move(cb), TokenStoreResult{outcome, std::move(diagnostic),
                                               std::move(token)});
   });
 

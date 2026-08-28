@@ -35,18 +35,30 @@ namespace Arkham {
 // whoAmI() adds exactly "Authorization: Token <token>".
 //
 // Every request is also rejected before it is built/sent unless its
-// resolved URL is either https, or http restricted to a loopback host
-// (exactly "localhost", or an address QHostAddress recognises as a loopback
-// IPv4/IPv6 literal, in any numeric encoding it accepts) -- see
+// resolved URL is either https, or http restricted to a loopback host --
+// exactly the case-insensitive hostname "localhost" (no suffix/trailing
+// dot/userinfo), canonical four-component dotted-decimal "127.x.y.z" (no
+// leading zeros, octal/hex/shortened forms, or out-of-range components),
+// or the exact literal "::1" -- see isCanonicalLoopbackHostText() and
 // isSecureOrLoopbackAuthTransport() in AuthTransportSecurity.h/.cpp. This
-// preserves local development/self-hosting over plain HTTP without ever
-// allowing a LAN or public host to receive a password or bearer token in
-// cleartext. A hostname that merely resembles a loopback address without
-// being one (e.g. "localhost.evil.com", "127.0.0.1.evil.com") is a
-// different DNS name and is never treated as loopback; userinfo in the URL
-// is rejected unconditionally. Because 3xx is never followed, this
-// exception can never be leveraged to redirect a loopback request to an
-// insecure remote origin.
+// is deliberately a strict lexical allow-list rather than delegating to
+// QHostAddress::setAddress(), because QHostAddress (like QUrl itself)
+// treats many ambiguous/non-canonical numeric spellings (e.g. "127.1",
+// octal/hex/single-integer IPv4, IPv4-mapped or expanded IPv6) as
+// equivalent to a canonical loopback address; the authoritative rejection
+// of such spellings actually happens earlier still, in
+// UrlValidator::validateCustomUrl() against the raw pre-QUrl input text,
+// before QUrl can canonicalize an unsafe spelling into an accepted one --
+// this check here is retained purely as request-time defense-in-depth
+// (e.g. for the legacy raw-QUrl ServerProfile constructor, which bypasses
+// UrlValidator). This preserves local development/self-hosting over plain
+// HTTP without ever allowing a LAN or public host to receive a password or
+// bearer token in cleartext. A hostname that merely resembles a loopback
+// address without being one (e.g. "localhost.evil.com",
+// "127.0.0.1.evil.com") is a different DNS name and is never treated as
+// loopback; userinfo in the URL is rejected unconditionally. Because 3xx
+// is never followed, this exception can never be leveraged to redirect a
+// loopback request to an insecure remote origin.
 //
 // The optional |timeout| caps the wall-clock time to wait for each response.
 // Defaults to 30 s in production; inject a shorter value in tests. Pass

@@ -136,6 +136,16 @@ public:
   // then reverts to normal in-memory-map behaviour.
   void injectNextError(QKeychain::Error err) { m_injectedError = err; }
   void useHangingReadJob(bool hang) { m_hangNextRead = hang; }
+  // Directly seeds the in-memory store with |value| for (service, key),
+  // bypassing QtKeychainTokenStore::saveToken()'s own empty/whitespace
+  // validation entirely. This simulates a corrupt or externally-tampered
+  // keyring entry (production saveToken() never persists a blank token
+  // itself), so tests can prove readToken() defends against a backend that
+  // nonetheless returns one.
+  void seedStoredToken(const QString &service, const QString &key,
+                       const QString &value) {
+    m_store.insert({service, key}, value);
+  }
 
   [[nodiscard]] std::unique_ptr<IKeychainReadJob>
   createReadJob(const QString &service, const QString &key) override {
@@ -241,6 +251,8 @@ private slots:
   void saveThenReadRoundTrip();
   void updateOverwritesPreviousToken();
   void readMissingProfileIsNotFound();
+  void readBlankStoredTokenIsBackendError_data();
+  void readBlankStoredTokenIsBackendError();
   void deleteRemovesToken();
   void deleteMissingProfileIsIdempotentSuccess();
   void backendUnavailableIsTypedFailure();
@@ -307,6 +319,39 @@ void TokenStoreTests::readMissingProfileIsNotFound() {
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::NotFound);
   QVERIFY(result->token.isEmpty());
+}
+
+void TokenStoreTests::readBlankStoredTokenIsBackendError() {
+  // saveToken() rejects empty/whitespace-only tokens outright (see
+  // emptyTokenRejectedOnSave/whitespaceTokenRejectedOnSave below), so a
+  // successfully-read blank token can only happen via a corrupt or
+  // externally-tampered keyring entry. readToken() must not surface that
+  // as a usable Success -- production code that treats Success as "signed
+  // in" must never receive an empty token string.
+  QFETCH(QString, storedValue);
+
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  auto *rawFactory = factory.get();
+  const QString profileId = newProfileId();
+  rawFactory->seedStoredToken(QtKeychainTokenStore::serviceName(), profileId,
+                              storedValue);
+  QtKeychainTokenStore store(std::move(factory));
+
+  const auto result = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, std::move(cb));
+  });
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, TokenStoreOutcome::BackendError);
+  QVERIFY(result->token.isEmpty());
+  QCOMPARE(result->diagnostic,
+           QStringLiteral(
+               "secure storage returned an empty or whitespace-only token"));
+}
+
+void TokenStoreTests::readBlankStoredTokenIsBackendError_data() {
+  QTest::addColumn<QString>("storedValue");
+  QTest::newRow("empty") << QString();
+  QTest::newRow("whitespace-only") << QStringLiteral("   \t  ");
 }
 
 void TokenStoreTests::deleteRemovesToken() {
