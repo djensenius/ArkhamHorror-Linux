@@ -329,8 +329,10 @@ void AuthClientTests::registerSendsExpectedRequest() {
 
   const QJsonObject sentBody =
       QJsonDocument::fromJson(nam.bodies().first()).object();
-  QCOMPARE(sentBody.value(QStringLiteral("username")).toString(),
-           expectedUsername);
+  // QVERIFY (not QCOMPARE): a failure must never print the submitted
+  // username value into test/CI logs.
+  QVERIFY(sentBody.value(QStringLiteral("username")).toString() ==
+          expectedUsername);
 }
 
 void AuthClientTests::whoAmISendsExactAuthorizationHeader() {
@@ -341,12 +343,15 @@ void AuthClientTests::whoAmISendsExactAuthorizationHeader() {
   const QString expectedToken = QStringLiteral("my-jwt-token");
   const QString expectedAuthorizationHeader =
       QStringLiteral("Token ") + expectedToken;
+  const QString expectedUsername = QStringLiteral("alice");
+  const QString expectedEmail = QStringLiteral("a@b.com");
 
   StubNetworkAccessManager nam;
-  nam.enqueue(
-      200,
-      QByteArrayLiteral(
-          R"({"username":"alice","email":"a@b.com","beta":true,"admin":false})"));
+  nam.enqueue(200,
+              QStringLiteral(R"({"username":"%1","email":"%2","beta":true,)"
+                             R"("admin":false})")
+                  .arg(expectedUsername, expectedEmail)
+                  .toUtf8());
   NetworkAuthenticationClient client(nam);
 
   const auto result = runAndWait<CurrentUser>(
@@ -357,8 +362,10 @@ void AuthClientTests::whoAmISendsExactAuthorizationHeader() {
 
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, AuthOutcome::Success);
-  QCOMPARE(result->value->username, QStringLiteral("alice"));
-  QCOMPARE(result->value->email, QStringLiteral("a@b.com"));
+  // QVERIFY (not QCOMPARE): a failure must never print the actual
+  // username/email identity values into test/CI logs.
+  QVERIFY(result->value->username == expectedUsername);
+  QVERIFY(result->value->email == expectedEmail);
   QCOMPARE(result->value->beta, true);
   QCOMPARE(result->value->admin, false);
 
