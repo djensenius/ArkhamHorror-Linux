@@ -985,7 +985,12 @@ void NetworkTests::storeLoadRejectsWrongHostedId() {
   QSettingsProfileStore store(tmp.fileName());
   const auto profiles = store.loadProfiles();
   QVERIFY(!profiles.has_value());
-  QVERIFY(profiles.error().contains(QStringLiteral("wrong ID")));
+  const QString error = profiles.error();
+  QVERIFY(error.contains(QStringLiteral("wrong ID")));
+  QVERIFY(
+      error.contains(QStringLiteral("12345678-1234-1234-1234-123456789abc")));
+  QVERIFY(error.contains(ServerProfile::hostedDefault().profileId()));
+  QVERIFY(!error.contains(QStringLiteral("%3")));
 }
 
 void NetworkTests::storeSaveSelectedInvalidUuid() {

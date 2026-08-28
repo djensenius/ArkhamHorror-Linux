@@ -76,7 +76,8 @@ ValueOrError<QList<ServerProfile>> QSettingsProfileStore::loadProfiles() const {
                 "profile[%1]: hosted profile has wrong ID \"%2\"; expected "
                 "\"%3\"")
                 .arg(i)
-                .arg(id, hostedId);
+                .arg(id)
+                .arg(hostedId);
         break;
       }
       profiles.append(ServerProfile::hostedDefault());
