@@ -72,7 +72,7 @@ if(BUILD_TESTING)
         tests/ContractTests.cpp
     )
     target_compile_definitions(arkham-contract-tests PRIVATE
-        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_SOURCE_DIR}/contracts"
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
     )
     target_link_libraries(arkham-contract-tests PRIVATE
         arkham_foundation

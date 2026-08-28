@@ -56,6 +56,10 @@ static QJsonObject parseJson(QLatin1StringView text) {
 // relPath must start with '/'.  QFAIL must be called at the test-method level,
 // not inside a lambda, so callers check .has_value() and QFAIL themselves.
 static ValueOrError<QByteArray> openContractFile(const QString &relPath) {
+  if (!relPath.startsWith(QLatin1Char('/')))
+    return failure(
+        QStringLiteral("contract path must start with '/': %1").arg(relPath));
+
   const QString path = QStringLiteral(ARKHAM_TEST_CONTRACTS_DIR) + relPath;
   QFile f(path);
   if (!f.open(QIODevice::ReadOnly))
