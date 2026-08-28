@@ -95,4 +95,3 @@ find_bundled_libsecret() {
 find_bundled_libgpgerror() {
   find_bundled_library 'libgpg-error.so.0*' "$@"
 }
-

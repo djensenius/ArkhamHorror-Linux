@@ -138,4 +138,3 @@ result_6="$(PATH="$restricted_path" find_bundled_libgpgerror "$fake_root_6")"
 echo "PASS: find_bundled_libgpgerror find() fallback locates only its own library"
 
 echo "All find_bundled_libsecret()/find_bundled_libgpgerror() regression cases passed."
-
