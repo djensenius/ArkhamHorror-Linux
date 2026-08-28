@@ -49,10 +49,11 @@ private:
 
 // Validate and normalise a custom server base URL string.
 //
-// Accepted: https:// (any host) and http:// URLs with a non-empty host.
-//           http is permitted only to an exact canonical loopback spelling
-//           ("localhost", canonical dotted-decimal 127.x.y.z, or "::1") --
-//           see isCleartextAuthAllowedForRawInput() in AuthTransportSecurity
+// Accepted: https:// URLs with any non-empty host, and http:// URLs but
+//           ONLY to an exact canonical loopback spelling ("localhost",
+//           canonical dotted-decimal 127.x.y.z, or "::1") -- never any
+//           other http host, LAN or public. See
+//           isCleartextAuthAllowedForRawInput() in AuthTransportSecurity
 //           for the precise, lexically-strict rule and why it must run
 //           against the raw pre-QUrl input text.
 //           Non-default ports (e.g. :3000) are preserved.
