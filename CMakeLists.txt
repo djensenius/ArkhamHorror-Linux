@@ -13,22 +13,77 @@ find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Network Quick QuickControls2 W
 
 qt_standard_project_setup(REQUIRES 6.8)
 
+# include(CTest) establishes the real BUILD_TESTING cache value (default ON)
+# before the QtKeychain FetchContent block below temporarily forces it off,
+# so the save/restore around that block is well-defined regardless of
+# inclusion order.
+include(CTest)
+
+# --- QtKeychain (BSD-3-Clause; see third_party/qtkeychain/) ----------------
+# Pinned to the exact 0.17.0 release commit for reproducible builds. Used by
+# QtKeychainTokenStore for secure per-profile authentication-token storage
+# (Secret Service/libsecret or KWallet on Linux). QtKeychain's own insecure
+# plaintext fallback is never enabled by this project -- see
+# QtKeychainJobFactory, which explicitly calls setInsecureFallback(false) on
+# every job it creates.
+include(FetchContent)
+FetchContent_Declare(
+    qtkeychain
+    GIT_REPOSITORY https://github.com/frankosterfeld/qtkeychain.git
+    GIT_TAG 875f77d9f61bd97fd84cca47ce3bc71186dfbd09 # v0.17.0
+)
+
+# Force QtKeychain's own build options before it configures: Qt 6 only, no
+# CLI/QtQuick demo apps, no translations, and libsecret support enabled (the
+# Linux/Secret Service backend). BUILD_TESTING is saved and forced off only
+# for this subproject so QtKeychain's own autotest suite is never built,
+# independent of this project's own BUILD_TESTING setting.
+set(BUILD_WITH_QT5 OFF CACHE BOOL "" FORCE)
+set(BUILD_TEST_APPLICATION OFF CACHE BOOL "" FORCE)
+set(BUILD_QTQUICK_DEMO OFF CACHE BOOL "" FORCE)
+set(BUILD_TRANSLATIONS OFF CACHE BOOL "" FORCE)
+set(LIBSECRET_SUPPORT ON CACHE BOOL "" FORCE)
+set(_arkham_saved_build_testing "${BUILD_TESTING}")
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(qtkeychain)
+set(BUILD_TESTING "${_arkham_saved_build_testing}" CACHE BOOL "" FORCE)
+unset(_arkham_saved_build_testing)
+
+# FetchContent builds qtkeychain via add_subdirectory(), so the namespaced
+# alias normally created by the installed QtKeychainConfig.cmake does not
+# exist; create it ourselves so downstream target_link_libraries() calls are
+# identical to what a system-installed QtKeychain package would provide.
+if(NOT TARGET Qt6Keychain::Qt6Keychain)
+    add_library(Qt6Keychain::Qt6Keychain ALIAS qt6keychain)
+endif()
+
 add_library(arkham_foundation STATIC
     src/AppCommand.cpp
     src/AppCommand.h
+    src/AuthModels.cpp
+    src/AuthModels.h
     src/CompatibilityEvaluator.cpp
     src/CompatibilityEvaluator.h
     src/ContractPin.cpp
     src/ContractPin.h
     src/ContractRevision.cpp
     src/ContractRevision.h
+    src/IAuthenticationClient.h
     src/ICapabilityProbe.h
+    src/IKeychainJobFactory.h
     src/IProfileStore.h
+    src/ITokenStore.h
+    src/NetworkAuthenticationClient.cpp
+    src/NetworkAuthenticationClient.h
     src/NetworkCapabilityProbe.cpp
     src/NetworkCapabilityProbe.h
     src/ProbeResult.h
     src/QSettingsProfileStore.cpp
     src/QSettingsProfileStore.h
+    src/QtKeychainJobFactory.cpp
+    src/QtKeychainJobFactory.h
+    src/QtKeychainTokenStore.cpp
+    src/QtKeychainTokenStore.h
     src/ServerCapabilities.cpp
     src/ServerCapabilities.h
     src/ServerProfile.cpp
@@ -39,7 +94,11 @@ add_library(arkham_foundation STATIC
 )
 
 target_include_directories(arkham_foundation PUBLIC src)
-target_link_libraries(arkham_foundation PUBLIC Qt6::Core Qt6::Network)
+target_link_libraries(arkham_foundation PUBLIC
+    Qt6::Core
+    Qt6::Network
+    Qt6Keychain::Qt6Keychain
+)
 
 qt_add_executable(arkham-horror
     src/main.cpp
@@ -65,7 +124,6 @@ install(TARGETS arkham-horror
     RUNTIME DESTINATION bin
 )
 
-include(CTest)
 if(BUILD_TESTING)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
     qt_add_executable(arkham-foundation-tests
@@ -101,4 +159,24 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME network COMMAND arkham-network-tests)
+
+    qt_add_executable(arkham-token-store-tests
+        tests/TokenStoreTests.cpp
+    )
+    target_link_libraries(arkham-token-store-tests PRIVATE
+        arkham_foundation
+        Qt6Keychain::Qt6Keychain
+        Qt6::Test
+    )
+    add_test(NAME token_store COMMAND arkham-token-store-tests)
+
+    qt_add_executable(arkham-auth-client-tests
+        tests/AuthClientTests.cpp
+    )
+    target_link_libraries(arkham-auth-client-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME auth_client COMMAND arkham-auth-client-tests)
 endif()

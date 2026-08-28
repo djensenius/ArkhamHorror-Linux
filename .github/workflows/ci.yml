@@ -50,8 +50,10 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
           cache: true
+      - name: Install QtKeychain build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - run: mise run lint
 
   test:
@@ -66,8 +68,10 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
           cache: true
+      - name: Install QtKeychain build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - run: mise run test
 
   build:
@@ -82,8 +86,10 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
           cache: true
+      - name: Install QtKeychain build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - run: mise run build
 
   appimage-smoke:
@@ -103,8 +109,10 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          modules: qtwebsockets qtdbus # Qt Quick and QuickControls2 ship in the base archive; qtdbus is required by QtKeychain's Linux Secret Service backend.
           cache: true
+      - name: Install QtKeychain build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - name: Download packaging tools
         run: |
           curl --fail --location --retry 3 --output linuxdeploy-x86_64.AppImage \
