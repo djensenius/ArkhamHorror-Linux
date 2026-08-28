@@ -5,10 +5,12 @@
 // QCoreApplication event loop, but these tests do not need a GUI application.
 
 #include <QCoreApplication>
+#include <QEvent>
 #include <QFile>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QPointer>
 #include <QQueue>
 #include <QTemporaryFile>
 #include <QtGlobal>
@@ -88,6 +90,7 @@ public:
 
   QUrl lastUrl() const { return m_lastUrl; }
   QString lastAcceptHeader() const { return m_lastAcceptHeader; }
+  QPointer<QNetworkReply> lastReply() const { return m_lastReply; }
   // Returns the full last request so callers can inspect any attribute/header.
   const QNetworkRequest &lastRequest() const { return m_lastRequest; }
 
@@ -102,6 +105,7 @@ protected:
     }
     const auto [status, body, err] = m_queue.dequeue();
     auto *reply = new StubNetworkReply(status, std::move(body), err, this);
+    m_lastReply = reply;
     reply->scheduleFinished();
     return reply;
   }
@@ -116,6 +120,7 @@ private:
   QUrl m_lastUrl;
   QString m_lastAcceptHeader;
   QNetworkRequest m_lastRequest;
+  QPointer<QNetworkReply> m_lastReply;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -217,6 +222,7 @@ private slots:
   void storeEmptySelectedProfileIdIsNoSelection();
   void storeSaveRejectsProfileWithoutId();
   void storeSaveRejectsDuplicateIds();
+  void storeSaveRemovesDeletedProfileKeys();
   void storeSaveChecksStatusAfterSync();
   void storeLoadBalancesBeginEndArray();
   void storeLoadRejectsDuplicateIds();
@@ -241,6 +247,7 @@ private slots:
   void probe2xxWithReplyError();
   void probeNoAuthHeader();
   void probeNoCookies();
+  void probeDestructionDeletesInFlightReply();
 
   // ── Fixture helper ────────────────────────────────────────────────────────
   void fixtureHelperRequiresLeadingSlash();
@@ -795,6 +802,38 @@ void NetworkTests::storeSaveRejectsDuplicateIds() {
   QVERIFY(result.error().contains(QStringLiteral("duplicate")));
 }
 
+void NetworkTests::storeSaveRemovesDeletedProfileKeys() {
+  QTemporaryFile tmp;
+  QVERIFY(tmp.open());
+  tmp.close();
+
+  const auto first = ServerProfile::custom(
+      QStringLiteral("First"), QStringLiteral("https://first.example.com"));
+  const auto second = ServerProfile::custom(
+      QStringLiteral("Second"), QStringLiteral("https://second.example.com"));
+  const auto third = ServerProfile::custom(
+      QStringLiteral("Third"), QStringLiteral("https://third.example.com"));
+  QVERIFY(first.has_value() && second.has_value() && third.has_value());
+
+  QSettingsProfileStore store(tmp.fileName());
+  QVERIFY(store.saveProfiles({*first, *second, *third}).has_value());
+  QVERIFY(store.saveProfiles({*first}).has_value());
+
+  {
+    QSettings raw(tmp.fileName(), QSettings::IniFormat);
+    const QStringList keys = raw.allKeys();
+    QVERIFY(!keys.contains(QStringLiteral("Profiles/2/id")));
+    QVERIFY(!keys.contains(QStringLiteral("Profiles/3/id")));
+  }
+
+  QVERIFY(store.saveProfiles({}).has_value());
+  QSettings raw(tmp.fileName(), QSettings::IniFormat);
+  for (const QString &key : raw.allKeys()) {
+    QVERIFY2(key == QStringLiteral("Profiles/size"),
+             qPrintable(QStringLiteral("stale profile key: %1").arg(key)));
+  }
+}
+
 void NetworkTests::storeSaveChecksStatusAfterSync() {
   // Use an existing regular file as the "parent directory" of the QSettings
   // path.  On POSIX, a regular file cannot contain child entries (ENOTDIR),
@@ -1189,6 +1228,10 @@ void NetworkTests::probeNoAuthHeader() {
   // The capabilities endpoint is unauthenticated; no Authorization header must
   // be sent even when a shared QNAM has credentials configured.
   QVERIFY(nam.lastRequest().rawHeader("Authorization").isEmpty());
+  QCOMPARE(nam.lastRequest()
+               .attribute(QNetworkRequest::AuthenticationReuseAttribute)
+               .toInt(),
+           static_cast<int>(QNetworkRequest::Manual));
 }
 
 void NetworkTests::probeNoCookies() {
@@ -1215,6 +1258,22 @@ void NetworkTests::probeNoCookies() {
                .attribute(QNetworkRequest::CookieSaveControlAttribute)
                .toInt(),
            static_cast<int>(QNetworkRequest::Manual));
+}
+
+void NetworkTests::probeDestructionDeletesInFlightReply() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral("{}"));
+
+  QPointer<QNetworkReply> reply;
+  {
+    NetworkCapabilityProbe probe(nam);
+    probe.probe(ServerProfile::hostedDefault());
+    reply = nam.lastReply();
+    QVERIFY(!reply.isNull());
+  }
+
+  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+  QVERIFY(reply.isNull());
 }
 
 // ─── Fixture helper ───────────────────────────────────────────────────────

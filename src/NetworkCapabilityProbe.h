@@ -2,6 +2,8 @@
 
 #include "ICapabilityProbe.h"
 
+#include <QSet>
+
 class QNetworkAccessManager;
 class QNetworkReply;
 
@@ -16,14 +18,15 @@ namespace Arkham {
 //
 // The |nam| reference is borrowed; the caller must ensure it outlives this
 // probe.  A reference (not pointer) makes null impossible.
-// Using |this| as the connection context means outstanding reply lambdas are
-// automatically invalidated when the probe is destroyed, preventing dangling
-// captures in flight.
+// Outstanding replies are aborted and scheduled for deletion when the probe
+// is destroyed; |this| remains the connection context so response handlers
+// cannot outlive the probe.
 class NetworkCapabilityProbe : public ICapabilityProbe {
   Q_OBJECT
 public:
   explicit NetworkCapabilityProbe(QNetworkAccessManager &nam,
                                   QObject *parent = nullptr);
+  ~NetworkCapabilityProbe() override;
 
   // If |profile| is not valid, emits finished(InvalidProfile) immediately
   // without issuing a network request.
@@ -33,6 +36,7 @@ private:
   void handleReply(QNetworkReply *reply);
 
   QNetworkAccessManager &m_nam;
+  QSet<QNetworkReply *> m_replies;
 };
 
 } // namespace Arkham

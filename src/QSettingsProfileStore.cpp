@@ -234,6 +234,7 @@ QSettingsProfileStore::saveProfiles(const QList<ServerProfile> &profiles) {
             .arg(settingsStatusMessage(m_settings->status())));
   }
 
+  m_settings->remove("Profiles"_L1);
   m_settings->beginWriteArray("Profiles"_L1, static_cast<int>(profiles.size()));
   for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
     m_settings->setArrayIndex(i);

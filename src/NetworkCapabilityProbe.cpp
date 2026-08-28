@@ -36,6 +36,14 @@ NetworkCapabilityProbe::NetworkCapabilityProbe(QNetworkAccessManager &nam,
                                                QObject *parent)
     : ICapabilityProbe(parent), m_nam(nam) {}
 
+NetworkCapabilityProbe::~NetworkCapabilityProbe() {
+  for (QNetworkReply *reply : m_replies) {
+    QObject::disconnect(reply, nullptr, this, nullptr);
+    reply->abort();
+    reply->deleteLater();
+  }
+}
+
 void NetworkCapabilityProbe::probe(const ServerProfile &profile) {
   // Guard: reject an invalid profile before issuing any network request.
   if (!profile.isValid()) {
@@ -55,14 +63,18 @@ void NetworkCapabilityProbe::probe(const ServerProfile &profile) {
                        QNetworkRequest::Manual);
   request.setAttribute(QNetworkRequest::CookieSaveControlAttribute,
                        QNetworkRequest::Manual);
+  request.setAttribute(QNetworkRequest::AuthenticationReuseAttribute,
+                       QNetworkRequest::Manual);
   // No Authorization header — the capabilities endpoint is public.
 
   QNetworkReply *reply = m_nam.get(request);
+  m_replies.insert(reply);
 
-  // Use |this| as the connection context: the lambda is never called after
-  // this probe object is destroyed, preventing use of a dangling |this|.
+  connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
+  connect(reply, &QObject::destroyed, this,
+          [this, reply]() { m_replies.remove(reply); });
   connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-    reply->deleteLater();
+    m_replies.remove(reply);
     handleReply(reply);
   });
 }
