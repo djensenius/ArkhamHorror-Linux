@@ -331,10 +331,16 @@ void NetworkTests::urlStripsTrailingSlash() {
 }
 
 void NetworkTests::urlTrimsSurroundingWhitespace() {
-  // Only plain ASCII space (U+0020) is trimmed; tab/newline/other control
-  // characters anywhere in the original input -- including purely leading
-  // or trailing ones -- are rejected outright before trimming even runs
-  // (see UrlErrorCode::ControlCharacterPresent and
+  // This exercises plain ASCII space (U+0020), which QString::trimmed()
+  // strips. trimmed() also silently strips other QChar::isSpace() code
+  // points that are NOT control characters -- e.g. Unicode space
+  // separators such as NBSP (U+00A0) or EM SPACE (U+2003) -- and that is
+  // fine: those are ordinary whitespace, not a policy concern here (see
+  // the containsControlCharacter() comment in UrlValidator.cpp). What is
+  // rejected outright, before trimming even runs, is any Unicode "control"
+  // character (category Cc: tab, newline, CR, and similar), anywhere in
+  // the original input -- including purely leading or trailing ones (see
+  // UrlErrorCode::ControlCharacterPresent and
   // urlStrictLoopbackPolicy_data()'s "-trailing-tab-"/"-trailing-newline"
   // rows), precisely so a trailing control character cannot be silently
   // laundered into a clean-looking, accepted URL.

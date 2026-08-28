@@ -41,9 +41,17 @@ fail() {
   exit 1
 }
 
-# A PATH containing only coreutils-equivalent tools plus whatever fake
-# binaries a given test case installs into fake_bin_dir -- deliberately
-# excludes any real system ldconfig.
+# A PATH containing $fake_bin_dir (first, so any fake ldconfig a test case
+# installs there takes priority) plus /usr/bin and /bin for the real
+# coreutils/awk/find this function and this test script need. This
+# deliberately omits /sbin and /usr/sbin, where ldconfig itself actually
+# lives on Debian/Ubuntu-based systems (including the GitHub Actions
+# runner and typical AppImage build hosts this packaging script targets)
+# -- so unless a test case installs its own fake ldconfig into
+# fake_bin_dir, `command -v ldconfig` genuinely finds nothing here. This
+# is not an absolute guarantee on every possible distro layout (some
+# non-Debian-family systems place ldconfig under /usr/bin), only that it
+# matches the target deployment environment this test is guarding.
 fake_bin_dir="$work_dir/bin"
 mkdir -p "$fake_bin_dir"
 restricted_path="$fake_bin_dir:/usr/bin:/bin"

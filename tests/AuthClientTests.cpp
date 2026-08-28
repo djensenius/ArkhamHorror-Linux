@@ -140,6 +140,17 @@ private:
 
 ServerProfile customProfile(const QString &url) {
   auto result = ServerProfile::custom(QStringLiteral("Test Server"), url);
+  // Every call site passes a URL expected to validate successfully; a
+  // failure here means the test itself is wrong (or a validation-policy
+  // regression made a previously-accepted URL invalid), not a runtime
+  // condition to tolerate. qFatal() gives that a readable diagnostic
+  // (including the rejection reason) and a clean abort, instead of
+  // dereferencing the empty ValueOrError via operator* and hitting
+  // undefined behavior / an unreadable crash.
+  if (!result.has_value()) {
+    qFatal("customProfile(%s) failed: %s", qUtf8Printable(url),
+           qUtf8Printable(result.error()));
+  }
   return *result;
 }
 
