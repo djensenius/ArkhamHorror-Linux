@@ -1,29 +1,23 @@
 #include "UrlValidator.h"
 
+#include "ContractPin.h"
+
 using namespace Qt::StringLiterals;
 
 namespace Arkham {
 
 namespace {
 
-// Returns true if |path| contains "/api/v1" as a complete path-segment
-// boundary (i.e. followed by '/' or end of string).  This catches:
-//   /api/v1          — exact
-//   /api/v1/whoami   — prefix
-//   /proxy/api/v1    — infix at end
-//   /proxy/api/v1/x  — infix with trailing segment
-// But not:
-//   /api/v10         — different segment ("v10" != "v1")
-//   /api/v1foo       — no boundary after "v1"
-bool containsApiV1Segment(const QString &path) {
-  constexpr QLatin1StringView needle{"/api/v1"};
+// Finds the pin's API base path at a complete segment boundary, including
+// behind a reverse-proxy prefix, while rejecting partial-segment matches.
+bool containsApiBasePath(const QString &path, const QString &apiBasePath) {
   qsizetype pos = 0;
   while (pos < path.size()) {
-    const qsizetype idx = path.indexOf(needle, pos);
+    const qsizetype idx = path.indexOf(apiBasePath, pos);
     if (idx == -1) {
       break;
     }
-    const qsizetype after = idx + needle.size();
+    const qsizetype after = idx + apiBasePath.size();
     if (after == path.size() || path[after] == QLatin1Char('/')) {
       return true;
     }
@@ -35,14 +29,15 @@ bool containsApiV1Segment(const QString &path) {
 } // namespace
 
 UrlValidationResult validateCustomUrl(const QString &input) {
-  if (input.trimmed().isEmpty()) {
+  const QString trimmedInput = input.trimmed();
+  if (trimmedInput.isEmpty()) {
     return UrlValidationError{
         UrlErrorCode::InvalidUrl,
         QStringLiteral("URL must not be empty"),
     };
   }
 
-  const QUrl url(input, QUrl::StrictMode);
+  const QUrl url(trimmedInput, QUrl::StrictMode);
   if (!url.isValid()) {
     return UrlValidationError{
         UrlErrorCode::InvalidUrl,
@@ -92,16 +87,14 @@ UrlValidationResult validateCustomUrl(const QString &input) {
     };
   }
 
-  // Reject paths that contain /api/v1 as a complete segment boundary to
-  // prevent duplication when apiUrl() appends "/api/v1" later.  The check
-  // covers /api/v1 at the start, in the middle (/proxy/api/v1), and as a
-  // prefix (/api/v1/foo), while leaving /api/v10 valid.
   const QString path = url.path();
-  if (containsApiV1Segment(path)) {
+  const QString apiBasePath = currentPin().expectedApiBasePath;
+  if (containsApiBasePath(path, apiBasePath)) {
     return UrlValidationError{
         UrlErrorCode::DuplicateApiPath,
-        QStringLiteral("URL path already contains /api/v1; provide the base "
-                       "URL without the API suffix"),
+        QStringLiteral("URL path already contains %1; provide the base URL "
+                       "without the API suffix")
+            .arg(apiBasePath),
     };
   }
 

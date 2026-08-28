@@ -1,8 +1,8 @@
 // Tests for: URL validation, ServerProfile factories, QSettingsProfileStore,
 // and NetworkCapabilityProbe (via a stub QNetworkAccessManager).
 //
-// Uses QTEST_MAIN (not QTEST_APPLESS_MAIN) because QCoreApplication is
-// required for queued-connection delivery in probe tests.
+// Uses QTEST_GUILESS_MAIN because queued probe delivery needs a
+// QCoreApplication event loop, but these tests do not need a GUI application.
 
 #include <QCoreApplication>
 #include <QFile>
@@ -135,10 +135,8 @@ static ValueOrError<QByteArray> loadContractFixture(const QString &relPath) {
 
 // Runs an async probe and returns ValueOrError<ProbeResult>.
 //
-// Safety: uses an explicit QMetaObject::Connection that is disconnected on
-// timeout.  After disconnect no dangling captures can occur — the lambda
-// captures captured/conn by reference which live in this frame, and conn is
-// disconnected before we return.
+// Disconnect before returning so the lambda cannot access the captured stack
+// variable after its lifetime ends.
 static ValueOrError<ProbeResult> runProbe(NetworkCapabilityProbe &probe,
                                           const ServerProfile &profile) {
   std::optional<ProbeResult> captured;
@@ -171,6 +169,7 @@ private slots:
   void urlAcceptsNonDefaultPort();
   void urlAcceptsPathPrefix();
   void urlStripsTrailingSlash();
+  void urlTrimsSurroundingWhitespace();
   void urlRejectsEmpty();
   void urlRejectsNonHttpScheme();
   void urlRejectsMissingHost();
@@ -278,6 +277,13 @@ void NetworkTests::urlStripsTrailingSlash() {
       validateCustomUrl(QStringLiteral("https://example.com/prefix/"));
   QVERIFY(r.has_value());
   QCOMPARE(r->path(), QStringLiteral("/prefix"));
+}
+
+void NetworkTests::urlTrimsSurroundingWhitespace() {
+  const auto r =
+      validateCustomUrl(QStringLiteral(" \nhttps://example.com/prefix\t "));
+  QVERIFY(r.has_value());
+  QCOMPARE(*r, QUrl(QStringLiteral("https://example.com/prefix")));
 }
 
 void NetworkTests::urlRejectsEmpty() {
@@ -1209,6 +1215,6 @@ void NetworkTests::fixtureHelperFailsOnMissingFile() {
   QVERIFY(!r.error().isEmpty());
 }
 
-QTEST_MAIN(NetworkTests)
+QTEST_GUILESS_MAIN(NetworkTests)
 
 #include "NetworkTests.moc"

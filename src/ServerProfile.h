@@ -30,7 +30,7 @@ public:
   // Construct a custom (self-hosted or local) profile from a display name and
   // URL string.  displayName is trimmed; a blank/whitespace-only name is
   // rejected.  The URL is validated: HTTPS and HTTP accepted; credentials,
-  // fragments, query strings, and /api/v1 path duplication rejected;
+  // fragments, query strings, and pinned API-path duplication rejected;
   // non-default ports and path prefixes preserved.  A new UUID is generated
   // for the profile.  Returns a typed error on any validation failure.
   [[nodiscard]] static ValueOrError<ServerProfile>
@@ -53,7 +53,7 @@ public:
 
   // Returns the full URL for a REST endpoint at |path| relative to the API
   // root.  Any stored path prefix (set by custom()) is prepended before
-  // /api/v1 so the construction is prefix + /api/v1 + path.
+  // the API base path from currentPin().
   [[nodiscard]] QUrl apiUrl(QStringView path) const;
   [[nodiscard]] QUrl websocketUrl(QStringView path) const;
   [[nodiscard]] bool isValid() const;

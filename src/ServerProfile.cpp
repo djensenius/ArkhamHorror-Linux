@@ -1,5 +1,6 @@
 #include "ServerProfile.h"
 
+#include "ContractPin.h"
 #include "UrlValidator.h"
 
 #include <QUuid>
@@ -120,7 +121,7 @@ QUrl ServerProfile::apiUrl(const QStringView path) const {
   const QString normalizedPath = pathString.startsWith(QLatin1Char('/'))
                                      ? pathString
                                      : QStringLiteral("/") + pathString;
-  result.setPath(basePath + QStringLiteral("/api/v1") + normalizedPath);
+  result.setPath(basePath + currentPin().expectedApiBasePath + normalizedPath);
   return result;
 }
 

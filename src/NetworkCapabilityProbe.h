@@ -9,7 +9,8 @@ namespace Arkham {
 
 // Production capability probe backed by QNetworkAccessManager.
 //
-// Issues GET /api/v1/capabilities with Accept: application/json.
+// Issues GET <currentPin().expectedApiBasePath>/capabilities with
+// Accept: application/json.
 // No authentication is added — the endpoint is public.
 // TLS certificate validation is never bypassed.
 //

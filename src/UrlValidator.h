@@ -1,9 +1,9 @@
 #pragma once
 
-#include "ValueOrError.h"
-
+#include <QString>
 #include <QUrl>
 #include <optional>
+#include <utility>
 
 namespace Arkham {
 
@@ -17,12 +17,12 @@ enum class UrlErrorCode {
   CredentialsPresent, ///< User-info (username or password) is present.
   FragmentPresent,    ///< A fragment component (#...) is present.
   QueryPresent,       ///< A query string (?...) is present.
-  DuplicateApiPath,   ///< Path already starts with /api/v1.
+  DuplicateApiPath,   ///< Path already contains the pinned API base path.
 };
 
 // Typed error returned by validateCustomUrl() on validation failure.
 struct UrlValidationError {
-  UrlErrorCode code;
+  UrlErrorCode code{UrlErrorCode::InvalidUrl};
   QString message;
 };
 
@@ -38,11 +38,11 @@ public:
   [[nodiscard]] explicit operator bool() const noexcept { return has_value(); }
   [[nodiscard]] const QUrl &operator*() const { return *m_url; }
   [[nodiscard]] const QUrl *operator->() const { return &*m_url; }
-  [[nodiscard]] const UrlValidationError &error() const { return *m_error; }
+  [[nodiscard]] const UrlValidationError &error() const { return m_error; }
 
 private:
   std::optional<QUrl> m_url;
-  std::optional<UrlValidationError> m_error;
+  UrlValidationError m_error;
 };
 
 // Validate and normalise a custom server base URL string.
@@ -52,7 +52,7 @@ private:
 //           Non-empty, non-root path prefixes (e.g. /prefix) are kept.
 // Rejected: empty input, unparseable input, non-http/https scheme,
 //           missing host, credentials, fragments, query strings, and
-//           paths that already contain /api/v1 (prevents duplication).
+//           paths that already contain the pinned API base path.
 //
 // On success returns a normalised QUrl (scheme + host + optional port +
 // optional clean path prefix, no trailing slash, no other components).
