@@ -1193,10 +1193,16 @@ void NetworkTests::probeRejectsInvalidProfile() {
 
   StubNetworkAccessManager nam; // no request should be issued
   NetworkCapabilityProbe probe(nam);
-  const auto r = runProbe(probe, bad);
-  QVERIFY2(r.has_value(), qPrintable(r.error()));
-  QCOMPARE(r->outcome, ProbeOutcome::InvalidProfile);
-  QVERIFY(!r->diagnostic.isEmpty());
+  std::optional<ProbeResult> result;
+  QObject::connect(&probe, &ICapabilityProbe::finished,
+                   [&result](ProbeResult value) { result = std::move(value); });
+
+  probe.probe(bad);
+  // Even preflight failures complete asynchronously.
+  QVERIFY(!result.has_value());
+  QTRY_VERIFY_WITH_TIMEOUT(result.has_value(), 2000);
+  QCOMPARE(result->outcome, ProbeOutcome::InvalidProfile);
+  QVERIFY(!result->diagnostic.isEmpty());
 }
 
 void NetworkTests::probe2xxWithReplyError() {

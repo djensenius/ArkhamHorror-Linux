@@ -5,6 +5,7 @@
 #include "ServerCapabilities.h"
 
 #include <QJsonDocument>
+#include <QMetaObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -47,10 +48,13 @@ NetworkCapabilityProbe::~NetworkCapabilityProbe() {
 void NetworkCapabilityProbe::probe(const ServerProfile &profile) {
   // Guard: reject an invalid profile before issuing any network request.
   if (!profile.isValid()) {
-    emit finished(ProbeResult{
+    const ProbeResult result{
         ProbeOutcome::InvalidProfile,
         QStringLiteral("server profile is invalid; cannot issue probe"),
-    });
+    };
+    QMetaObject::invokeMethod(
+        this, [this, result]() { emit finished(result); },
+        Qt::QueuedConnection);
     return;
   }
 

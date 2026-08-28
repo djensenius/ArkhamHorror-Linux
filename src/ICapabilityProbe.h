@@ -16,8 +16,7 @@ namespace Arkham {
 // Typical usage:
 //   connect(probe, &ICapabilityProbe::finished, context, callback);
 //   probe->probe(profile);
-//   // finished() emitted once per probe() call, asynchronously or (in stubs)
-//   // synchronously.
+//   // finished() is emitted asynchronously after probe() returns.
 class ICapabilityProbe : public QObject {
   Q_OBJECT
 public:
@@ -25,7 +24,8 @@ public:
   ~ICapabilityProbe() override = default;
 
   // Issue an asynchronous capability probe against the given server profile.
-  // Emits finished() exactly once when the probe completes or fails.
+  // Emits finished() exactly once after this method returns, whether preflight
+  // validation or the network request completes the probe.
   virtual void probe(const ServerProfile &profile) = 0;
 
 signals:
