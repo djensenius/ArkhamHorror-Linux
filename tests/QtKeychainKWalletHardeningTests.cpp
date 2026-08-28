@@ -11,6 +11,23 @@
 //      KWallet read/write/delete D-Bus replies) must map a failed final
 //      D-Bus reply to an explicit error instead of reporting success.
 //
+// Running these tests against the real production QtKeychainJobFactory also
+// caught a third, more severe bug in src/QtKeychainJobFactory.cpp itself
+// (fixed alongside this test file, not in the upstream/patched QtKeychain
+// source): QKeychain::Job defaults to autoDelete(true) and calls
+// this->deleteLater() from emitFinished(), but RealReadJob/RealWriteJob/
+// RealDeleteJob each hold their real QKeychain job as a plain member
+// subobject, not a heap allocation. Left at the default, the very first
+// real job completion posted a deferred-delete event against a non-heap
+// address, corrupting the heap ("double free or corruption") on every real
+// save/read/delete -- a production bug that no prior test caught because
+// existing token-store tests use a fake IKeychainJobFactory and never
+// construct a real QKeychain job. RealReadJob/RealWriteJob/RealDeleteJob
+// now call setAutoDelete(false) on their member job (see
+// src/QtKeychainJobFactory.cpp); this test file failing with exactly that
+// crash before the fix, and passing after it, is this bug's regression
+// coverage.
+//
 // These tests exercise the real, production-used Arkham::QtKeychainJobFactory
 // -- which constructs real QKeychain::ReadPasswordJob / WritePasswordJob /
 // DeletePasswordJob instances with insecureFallback(false), exactly as
@@ -71,6 +88,13 @@ enum KWalletEntryType {
 // exactly the condition the second hardening patch guards against.
 class FakeKWalletService : public QObject, protected QDBusContext {
   Q_OBJECT
+  // Required for QDBusConnection::registerObject(..., ExportAllSlots) to
+  // actually expose this object under the org.kde.KWallet interface name:
+  // without it, Qt's D-Bus dispatch has no interface name to match against
+  // QtKeychain's generated kwallet_interface.cpp client proxy (which calls
+  // methods scoped to "org.kde.KWallet" specifically), and every call fails
+  // with "No such interface 'org.kde.KWallet'".
+  Q_CLASSINFO("D-Bus Interface", "org.kde.KWallet")
 
 public:
   explicit FakeKWalletService(QObject *parent = nullptr) : QObject(parent) {}
@@ -301,6 +325,13 @@ void QtKeychainKWalletHardeningTests::
   QKeychain::ReadPasswordJob job(service);
   job.setKey(key);
   job.setInsecureFallback(true);
+  // job is a local stack variable, not heap-allocated, but QKeychain::Job
+  // defaults to autoDelete(true) and calls this->deleteLater() from
+  // emitFinished() -- without disabling it here, the deferred-delete event
+  // fires against this non-heap address once the job completes, corrupting
+  // the heap (see RealReadJob's own setAutoDelete(false) in
+  // src/QtKeychainJobFactory.cpp for the equivalent production-code fix).
+  job.setAutoDelete(false);
   QVERIFY(waitForFinished(job));
 
   QCOMPARE(job.error(), QKeychain::NoError);
