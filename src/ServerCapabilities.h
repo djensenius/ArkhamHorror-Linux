@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QString>
 #include <QStringList>
+#include <QStringView>
 
 namespace Arkham {
 

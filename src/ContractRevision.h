@@ -3,6 +3,7 @@
 #include "ValueOrError.h"
 
 #include <QString>
+#include <QStringView>
 
 namespace Arkham {
 
