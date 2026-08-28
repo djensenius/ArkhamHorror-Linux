@@ -270,13 +270,18 @@ private slots:
 };
 
 void TokenStoreTests::saveThenReadRoundTrip() {
+  // See tests/AuthClientTests.cpp's authenticateSendsExpectedRequest() for
+  // why this is bound to a named variable before use in the QVERIFY
+  // expression below: Qt's QVERIFY/QCOMPARE macros always log the
+  // literal, stringified "#statement" expression text on failure.
+  const QString expectedToken = QStringLiteral("secret-token-abc");
+
   auto factory = std::make_unique<FakeKeychainJobFactory>();
   QtKeychainTokenStore store(std::move(factory));
   const QString profileId = newProfileId();
 
   const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, QStringLiteral("secret-token-abc"),
-                    std::move(cb));
+    store.saveToken(profileId, expectedToken, std::move(cb));
   });
   QVERIFY(saveResult.has_value());
   QCOMPARE(saveResult->outcome, TokenStoreOutcome::Success);
@@ -288,22 +293,27 @@ void TokenStoreTests::saveThenReadRoundTrip() {
   QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
   // QVERIFY (not QCOMPARE): a failure must never print the actual token
   // value into test/CI logs.
-  QVERIFY(readResult->token == QStringLiteral("secret-token-abc"));
+  QVERIFY(readResult->token == expectedToken);
 }
 
 void TokenStoreTests::updateOverwritesPreviousToken() {
+  // See saveThenReadRoundTrip() above for why these are bound to named
+  // variables before use in the QVERIFY expressions below.
+  const QString firstToken = QStringLiteral("first-token");
+  const QString secondToken = QStringLiteral("second-token");
+
   auto factory = std::make_unique<FakeKeychainJobFactory>();
   QtKeychainTokenStore store(std::move(factory));
   const QString profileId = newProfileId();
 
   const auto firstSaveResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, QStringLiteral("first-token"), std::move(cb));
+    store.saveToken(profileId, firstToken, std::move(cb));
   });
   QVERIFY(firstSaveResult.has_value());
   QCOMPARE(firstSaveResult->outcome, TokenStoreOutcome::Success);
 
   const auto secondSaveResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, QStringLiteral("second-token"), std::move(cb));
+    store.saveToken(profileId, secondToken, std::move(cb));
   });
   QVERIFY(secondSaveResult.has_value());
   QCOMPARE(secondSaveResult->outcome, TokenStoreOutcome::Success);
@@ -315,7 +325,7 @@ void TokenStoreTests::updateOverwritesPreviousToken() {
   QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
   // QVERIFY (not QCOMPARE): a failure must never print the actual token
   // value into test/CI logs.
-  QVERIFY(readResult->token == QStringLiteral("second-token"));
+  QVERIFY(readResult->token == secondToken);
 }
 
 void TokenStoreTests::readMissingProfileIsNotFound() {
@@ -481,6 +491,11 @@ void TokenStoreTests::whitespaceTokenRejectedOnSave() {
 }
 
 void TokenStoreTests::concurrentProfilesAreIsolated() {
+  // See saveThenReadRoundTrip() above for why these are bound to named
+  // variables before use in the QVERIFY expressions below.
+  const QString tokenA = QStringLiteral("token-a");
+  const QString tokenB = QStringLiteral("token-b");
+
   auto factory = std::make_unique<FakeKeychainJobFactory>();
   QtKeychainTokenStore store(std::move(factory));
   const QString profileA = newProfileId();
@@ -488,9 +503,9 @@ void TokenStoreTests::concurrentProfilesAreIsolated() {
 
   std::optional<TokenStoreResult> resultA;
   std::optional<TokenStoreResult> resultB;
-  store.saveToken(profileA, QStringLiteral("token-a"),
+  store.saveToken(profileA, tokenA,
                   [&resultA](TokenStoreResult r) { resultA = std::move(r); });
-  store.saveToken(profileB, QStringLiteral("token-b"),
+  store.saveToken(profileB, tokenB,
                   [&resultB](TokenStoreResult r) { resultB = std::move(r); });
 
   const QDeadlineTimer deadline(2000);
@@ -513,8 +528,8 @@ void TokenStoreTests::concurrentProfilesAreIsolated() {
   QVERIFY(readB.has_value());
   // QVERIFY (not QCOMPARE): a failure must never print the actual token
   // value into test/CI logs.
-  QVERIFY(readA->token == QStringLiteral("token-a"));
-  QVERIFY(readB->token == QStringLiteral("token-b"));
+  QVERIFY(readA->token == tokenA);
+  QVERIFY(readB->token == tokenB);
 }
 
 void TokenStoreTests::destructionSuppressesPendingCallback() {

@@ -235,6 +235,17 @@ private slots:
 };
 
 void AuthClientTests::authenticateSendsExpectedRequest() {
+  // Bound to named local variables (rather than inlined into the QVERIFY
+  // expressions below) because Qt's QVERIFY/QCOMPARE macros always log the
+  // literal, stringified "#statement" expression text on failure --
+  // regardless of the runtime operand values -- so a fixture literal
+  // embedded directly inside the assertion expression itself would still
+  // appear in test/CI logs on failure, even though the actual token/
+  // password/email value being compared never would.
+  const QString expectedEmail = QStringLiteral("user@example.com");
+  const QString expectedPassword = QStringLiteral("hunter2");
+  const QString expectedToken = QStringLiteral("abc123");
+
   StubNetworkAccessManager nam;
   nam.enqueue(200, QByteArrayLiteral(R"({"token": "abc123"})"));
   NetworkAuthenticationClient client(nam);
@@ -243,8 +254,7 @@ void AuthClientTests::authenticateSendsExpectedRequest() {
       runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
         return client.authenticate(
             ServerProfile::hostedDefault(),
-            AuthenticateRequest{QStringLiteral("user@example.com"),
-                                QStringLiteral("hunter2")},
+            AuthenticateRequest{expectedEmail, expectedPassword},
             std::move(cb));
       });
 
@@ -253,7 +263,7 @@ void AuthClientTests::authenticateSendsExpectedRequest() {
   QVERIFY(result->value.has_value());
   // QVERIFY (not QCOMPARE): a failure must never print the actual token
   // value into test/CI logs.
-  QVERIFY(result->value->token == QStringLiteral("abc123"));
+  QVERIFY(result->value->token == expectedToken);
 
   QCOMPARE(nam.requests().size(), 1);
   const QNetworkRequest &req = nam.requests().first();
@@ -268,10 +278,9 @@ void AuthClientTests::authenticateSendsExpectedRequest() {
       QJsonDocument::fromJson(nam.bodies().first()).object();
   // QVERIFY (not QCOMPARE): a failure must never print the actual
   // email/password value into test/CI logs.
-  QVERIFY(sentBody.value(QStringLiteral("email")).toString() ==
-          QStringLiteral("user@example.com"));
+  QVERIFY(sentBody.value(QStringLiteral("email")).toString() == expectedEmail);
   QVERIFY(sentBody.value(QStringLiteral("password")).toString() ==
-          QStringLiteral("hunter2"));
+          expectedPassword);
 }
 
 void AuthClientTests::authenticateNoAuthorizationHeader() {
@@ -290,6 +299,12 @@ void AuthClientTests::authenticateNoAuthorizationHeader() {
 }
 
 void AuthClientTests::registerSendsExpectedRequest() {
+  // See authenticateSendsExpectedRequest() above for why these fixture
+  // values are bound to named variables before being used inside a
+  // QVERIFY expression.
+  const QString expectedUsername = QStringLiteral("newuser");
+  const QString expectedToken = QStringLiteral("reg-token");
+
   StubNetworkAccessManager nam;
   nam.enqueue(200, QByteArrayLiteral(R"({"token": "reg-token"})"));
   NetworkAuthenticationClient client(nam);
@@ -298,8 +313,7 @@ void AuthClientTests::registerSendsExpectedRequest() {
       runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
         return client.registerAccount(
             ServerProfile::hostedDefault(),
-            RegisterRequest{QStringLiteral("new@example.com"),
-                            QStringLiteral("newuser"),
+            RegisterRequest{QStringLiteral("new@example.com"), expectedUsername,
                             QStringLiteral("s3cr3t")},
             std::move(cb));
       });
@@ -308,7 +322,7 @@ void AuthClientTests::registerSendsExpectedRequest() {
   QCOMPARE(result->outcome, AuthOutcome::Success);
   // QVERIFY (not QCOMPARE): a failure must never print the actual token
   // value into test/CI logs.
-  QVERIFY(result->value->token == QStringLiteral("reg-token"));
+  QVERIFY(result->value->token == expectedToken);
   QCOMPARE(nam.requests().first().url().path(),
            QStringLiteral("/api/v1/register"));
   QVERIFY(nam.requests().first().rawHeader("Authorization").isEmpty());
@@ -316,10 +330,18 @@ void AuthClientTests::registerSendsExpectedRequest() {
   const QJsonObject sentBody =
       QJsonDocument::fromJson(nam.bodies().first()).object();
   QCOMPARE(sentBody.value(QStringLiteral("username")).toString(),
-           QStringLiteral("newuser"));
+           expectedUsername);
 }
 
 void AuthClientTests::whoAmISendsExactAuthorizationHeader() {
+  // Bound to named local variables (not inlined into the assertion
+  // expressions below) per authenticateSendsExpectedRequest()'s rationale
+  // above: Qt's QVERIFY/QCOMPARE macros always log the literal,
+  // stringified "#statement" expression text on failure.
+  const QString expectedToken = QStringLiteral("my-jwt-token");
+  const QString expectedAuthorizationHeader =
+      QStringLiteral("Token ") + expectedToken;
+
   StubNetworkAccessManager nam;
   nam.enqueue(
       200,
@@ -329,8 +351,8 @@ void AuthClientTests::whoAmISendsExactAuthorizationHeader() {
 
   const auto result = runAndWait<CurrentUser>(
       [&](std::function<void(AuthResult<CurrentUser>)> cb) {
-        return client.whoAmI(ServerProfile::hostedDefault(),
-                             QStringLiteral("my-jwt-token"), std::move(cb));
+        return client.whoAmI(ServerProfile::hostedDefault(), expectedToken,
+                             std::move(cb));
       });
 
   QVERIFY(result.has_value());
@@ -342,8 +364,9 @@ void AuthClientTests::whoAmISendsExactAuthorizationHeader() {
 
   // QVERIFY (not QCOMPARE): a failure must never print the actual
   // Authorization header (which embeds the token) into test/CI logs.
-  QVERIFY(QString::fromLatin1(nam.requests().first().rawHeader(
-              "Authorization")) == QStringLiteral("Token my-jwt-token"));
+  const QString actualAuthorizationHeader =
+      QString::fromLatin1(nam.requests().first().rawHeader("Authorization"));
+  QVERIFY(actualAuthorizationHeader == expectedAuthorizationHeader);
   QCOMPARE(nam.requests().first().url().path(),
            QStringLiteral("/api/v1/whoami"));
   QVERIFY(nam.bodies().first().isEmpty());
@@ -372,8 +395,14 @@ void AuthClientTests::whoAmIRejectsTokenWithControlCharacters() {
   // inject an extra header (here, a forged "X-Injected" header) into the
   // request. This must be rejected before any request is constructed, not
   // silently sanitized/stripped.
-  const QString maliciousToken =
-      QStringLiteral("legit-token\r\nX-Injected: evil");
+  //
+  // The two fragments below are bound to named variables and reused (not
+  // re-typed as fresh literals) in the assertions further down, per
+  // authenticateSendsExpectedRequest()'s rationale above.
+  const QString tokenFragment = QStringLiteral("legit-token");
+  const QString injectedHeaderName = QStringLiteral("X-Injected");
+  const QString maliciousToken = tokenFragment + QStringLiteral("\r\n") +
+                                 injectedHeaderName + QStringLiteral(": evil");
 
   const auto result = runAndWait<CurrentUser>(
       [&](std::function<void(AuthResult<CurrentUser>)> cb) {
@@ -386,8 +415,8 @@ void AuthClientTests::whoAmIRejectsTokenWithControlCharacters() {
   // No request may ever be sent for a rejected input.
   QVERIFY(nam.requests().isEmpty());
   // The diagnostic must never echo the offending token/header value.
-  QVERIFY(!result->diagnostic.contains(QStringLiteral("legit-token")));
-  QVERIFY(!result->diagnostic.contains(QStringLiteral("X-Injected")));
+  QVERIFY(!result->diagnostic.contains(tokenFragment));
+  QVERIFY(!result->diagnostic.contains(injectedHeaderName));
 }
 
 void AuthClientTests::requestsDisableCookiesAndAuthReuse() {
@@ -776,6 +805,10 @@ void AuthClientTests::threeXxMapsToUnexpectedStatus() {
 }
 
 void AuthClientTests::twoXxDecodesSuccessfully() {
+  // See authenticateSendsExpectedRequest() above for why this is bound to
+  // a named variable before use in the QVERIFY expression below.
+  const QString expectedToken = QStringLiteral("created");
+
   StubNetworkAccessManager nam;
   nam.enqueue(201, QByteArrayLiteral(R"({"token": "created"})"));
   NetworkAuthenticationClient client(nam);
@@ -793,10 +826,14 @@ void AuthClientTests::twoXxDecodesSuccessfully() {
   QCOMPARE(result->outcome, AuthOutcome::Success);
   // QVERIFY (not QCOMPARE): a failure must never print the actual token
   // value into test/CI logs.
-  QVERIFY(result->value->token == QStringLiteral("created"));
+  QVERIFY(result->value->token == expectedToken);
 }
 
 void AuthClientTests::unauthorizedMapsTo401() {
+  // See authenticateSendsExpectedRequest() above for why this is bound to
+  // a named variable before use in the QVERIFY expression below.
+  const QString serverMessage = QStringLiteral("invalid credentials");
+
   StubNetworkAccessManager nam;
   nam.enqueue(401, QByteArrayLiteral(R"({"message":"invalid credentials"})"));
   NetworkAuthenticationClient client(nam);
@@ -813,7 +850,7 @@ void AuthClientTests::unauthorizedMapsTo401() {
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, AuthOutcome::Unauthorized);
   QCOMPARE(result->httpStatus, 401);
-  QVERIFY(!result->diagnostic.contains(QStringLiteral("invalid credentials")));
+  QVERIFY(!result->diagnostic.contains(serverMessage));
 }
 
 void AuthClientTests::malformedJsonMapsToMalformedPayload() {
@@ -958,6 +995,11 @@ void AuthClientTests::negativeTimeoutRejected() {
 }
 
 void AuthClientTests::concurrentRequestsAreIndependent() {
+  // See authenticateSendsExpectedRequest() above for why these are bound
+  // to named variables before use in the QVERIFY expressions below.
+  const QString expectedFirstToken = QStringLiteral("first");
+  const QString expectedSecondToken = QStringLiteral("second");
+
   StubNetworkAccessManager nam;
   nam.enqueue(200, QByteArrayLiteral(R"({"token": "first"})"));
   nam.enqueue(200, QByteArrayLiteral(R"({"token": "second"})"));
@@ -987,8 +1029,8 @@ void AuthClientTests::concurrentRequestsAreIndependent() {
   QVERIFY(secondResult.has_value());
   // QVERIFY (not QCOMPARE): a failure must never print the actual token
   // value into test/CI logs.
-  QVERIFY(firstResult->value->token == QStringLiteral("first"));
-  QVERIFY(secondResult->value->token == QStringLiteral("second"));
+  QVERIFY(firstResult->value->token == expectedFirstToken);
+  QVERIFY(secondResult->value->token == expectedSecondToken);
 }
 
 void AuthClientTests::destructionAbortsOutstandingRequestsNoCallback() {
@@ -1123,17 +1165,34 @@ void AuthClientTests::profilePrefixIsPreserved() {
 // httpLookalikeLoopbackHostRejected()'s separate, narrower defense-in-
 // depth test above) -- is what determines whether any request can ever be
 // built and sent.
+//
+// The table has 55 data rows (54 from the prior round, plus one new
+// whitespace-trimming-accepted row added alongside this hardening pass);
+// Qt additionally reports two more *test invocations* per binary --
+// initTestCase()/cleanupTestCase() -- so a raw ctest/QTest pass count is
+// always the row count plus 2, not the row count itself.
 void AuthClientTests::authBoundaryEnforcesStrictLoopbackPolicy_data() {
   QTest::addColumn<QString>("urlString");
   QTest::addColumn<bool>("expectAccepted");
+  QTest::addColumn<QString>("expectedAuthenticateUrl");
   for (const auto &row : Arkham::Test::strictLoopbackUrlRows()) {
-    QTest::newRow(row.name) << row.urlString << row.expectAccepted;
+    QTest::newRow(row.name)
+        << row.urlString << row.expectAccepted << row.expectedAuthenticateUrl;
   }
 }
 
 void AuthClientTests::authBoundaryEnforcesStrictLoopbackPolicy() {
   QFETCH(QString, urlString);
   QFETCH(bool, expectAccepted);
+  QFETCH(QString, expectedAuthenticateUrl);
+
+  // Instantiated for BOTH branches (not only the accepted one) so a
+  // rejected row's assertion that no request was ever sent is a genuine,
+  // explicit observation of this fake network stack -- not merely an
+  // inference from the test having returned early.
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({"token": "boundary-ok"})"));
+  NetworkAuthenticationClient client(nam);
 
   const auto profileResult =
       ServerProfile::custom(QStringLiteral("Test Server"), urlString);
@@ -1144,14 +1203,14 @@ void AuthClientTests::authBoundaryEnforcesStrictLoopbackPolicy() {
     // ever involved; there is no forged/unvalidated-provenance profile
     // anywhere in this path.
     QVERIFY(!profileResult.has_value());
+    // Explicit, not merely implied by the early return: the production
+    // client is never even reachable without a valid profile, so the
+    // fake manager's request count must remain exactly zero.
+    QCOMPARE(nam.requests().size(), 0);
     return;
   }
 
   QVERIFY2(profileResult.has_value(), qPrintable(profileResult.error()));
-
-  StubNetworkAccessManager nam;
-  nam.enqueue(200, QByteArrayLiteral(R"({"token": "boundary-ok"})"));
-  NetworkAuthenticationClient client(nam);
 
   const auto result =
       runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
@@ -1164,13 +1223,14 @@ void AuthClientTests::authBoundaryEnforcesStrictLoopbackPolicy() {
 
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, AuthOutcome::Success);
-  // Exactly one request, sent to exactly the URL this profile's own
-  // apiUrl() deterministically produces -- proving the accepted profile is
-  // not merely "constructible" but genuinely sendable, and to precisely
-  // the expected endpoint (not e.g. some default/hosted fallback).
+  // Exactly one request, sent to exactly the row's independently-authored
+  // fixture URL (tests/StrictLoopbackUrlTable.h) -- NOT derived by calling
+  // this same profile's own apiUrl() -- so a bug in apiUrl() itself (a
+  // lost port, a mishandled base path, or a missed IPv4 canonicalisation
+  // like "127.1" -> "127.0.0.1") cannot make this assertion trivially
+  // self-confirm.
   QCOMPARE(nam.requests().size(), 1);
-  QCOMPARE(nam.requests().first().url(),
-           profileResult->apiUrl(u"authenticate"));
+  QCOMPARE(nam.requests().first().url().toString(), expectedAuthenticateUrl);
 }
 
 QTEST_GUILESS_MAIN(AuthClientTests)

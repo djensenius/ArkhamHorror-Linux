@@ -32,12 +32,29 @@ struct StrictLoopbackUrlRow {
   // QTest::addColumn<int>("expectedErrorCode") column without registering
   // UrlErrorCode as a QMetaType.
   int expectedErrorCode;
+  // Meaningful only when expectAccepted. The full expected /authenticate
+  // URL this row must produce when driven through the real
+  // ServerProfile::custom() -> NetworkAuthenticationClient boundary
+  // (tests/AuthClientTests.cpp's authBoundaryEnforcesStrictLoopbackPolicy()).
+  // Deliberately hand-written/independent of ServerProfile::apiUrl() --
+  // the same normalisation function the production request path itself
+  // calls -- so a bug in apiUrl() (e.g. losing a port, mishandling a base
+  // path, or failing to canonicalise "127.1" the way QUrl's own host
+  // parser does) cannot make the test trivially self-confirm. Left
+  // default-constructed (empty/null QString) for every rejected row: an
+  // accepted row's URL always has a non-empty scheme+host, so an empty
+  // QString unambiguously means "not applicable" without needing
+  // std::optional.
+  QString expectedAuthenticateUrl;
 };
 
 // Returns the full canonical strict raw-URL / http-loopback policy test
 // matrix: every row a caller of validateCustomUrl() / ServerProfile::
 // custom() must accept or reject, and (for rejected rows) the exact
-// UrlErrorCode it must produce.
+// UrlErrorCode it must produce. Table currently has 55 data rows (see
+// tests/AuthClientTests.cpp / tests/NetworkTests.cpp for the distinct
+// Qt-reported *test invocation* counts, which additionally include each
+// binary's own initTestCase()/cleanupTestCase() pseudo-tests).
 inline QVector<StrictLoopbackUrlRow> strictLoopbackUrlRows() {
   using Arkham::UrlErrorCode;
   const int invalidUrl = static_cast<int>(UrlErrorCode::InvalidUrl);
@@ -53,69 +70,85 @@ inline QVector<StrictLoopbackUrlRow> strictLoopbackUrlRows() {
 
   return QVector<StrictLoopbackUrlRow>{
       // ── Accepted: exact canonical loopback spellings over http ────────
-      {"http-localhost", QStringLiteral("http://localhost"), true, 0},
-      {"http-localhost-port", QStringLiteral("http://localhost:9000"), true, 0},
+      {"http-localhost", QStringLiteral("http://localhost"), true, 0,
+       QStringLiteral("http://localhost/api/v1/authenticate")},
+      {"http-localhost-port", QStringLiteral("http://localhost:9000"), true, 0,
+       QStringLiteral("http://localhost:9000/api/v1/authenticate")},
       {"http-localhost-path", QStringLiteral("http://localhost/selfhosted"),
-       true, 0},
-      {"http-127.0.0.1", QStringLiteral("http://127.0.0.1"), true, 0},
+       true, 0,
+       QStringLiteral("http://localhost/selfhosted/api/v1/authenticate")},
+      {"http-127.0.0.1", QStringLiteral("http://127.0.0.1"), true, 0,
+       QStringLiteral("http://127.0.0.1/api/v1/authenticate")},
       {"http-127.0.0.1-port-path",
-       QStringLiteral("http://127.0.0.1:9000/selfhosted"), true, 0},
-      {"http-bracketed-::1", QStringLiteral("http://[::1]"), true, 0},
-      {"http-bracketed-::1-port", QStringLiteral("http://[::1]:9000"), true, 0},
-      {"http-localhost-port-min", QStringLiteral("http://localhost:1"), true,
-       0},
+       QStringLiteral("http://127.0.0.1:9000/selfhosted"), true, 0,
+       QStringLiteral("http://127.0.0.1:9000/selfhosted/api/v1/authenticate")},
+      {"http-bracketed-::1", QStringLiteral("http://[::1]"), true, 0,
+       QStringLiteral("http://[::1]/api/v1/authenticate")},
+      {"http-bracketed-::1-port", QStringLiteral("http://[::1]:9000"), true, 0,
+       QStringLiteral("http://[::1]:9000/api/v1/authenticate")},
+      {"http-localhost-port-min", QStringLiteral("http://localhost:1"), true, 0,
+       QStringLiteral("http://localhost:1/api/v1/authenticate")},
       {"http-localhost-port-max", QStringLiteral("http://localhost:65535"),
-       true, 0},
+       true, 0, QStringLiteral("http://localhost:65535/api/v1/authenticate")},
+      {"http-localhost-whitespace-trimmed",
+       QStringLiteral("  http://localhost:9000  "), true, 0,
+       QStringLiteral("http://localhost:9000/api/v1/authenticate")},
 
       // ── Accepted: https for any host, including odd literals and base
       //    paths ──────────────────────────────────────────────────────
-      {"https-any-host", QStringLiteral("https://example.com"), true, 0},
+      {"https-any-host", QStringLiteral("https://example.com"), true, 0,
+       QStringLiteral("https://example.com/api/v1/authenticate")},
       {"https-lan-ip", QStringLiteral("https://192.168.1.100:8080/selfhosted"),
-       true, 0},
-      {"https-127.1-unrestricted", QStringLiteral("https://127.1"), true, 0},
+       true, 0,
+       QStringLiteral(
+           "https://192.168.1.100:8080/selfhosted/api/v1/authenticate")},
+      {"https-127.1-unrestricted", QStringLiteral("https://127.1"), true, 0,
+       QStringLiteral("https://127.0.0.1/api/v1/authenticate")},
       {"https-localhost-lookalike",
-       QStringLiteral("https://localhost.evil.example"), true, 0},
-      {"https-base-path", QStringLiteral("https://example.com/arkham"), true,
-       0},
+       QStringLiteral("https://localhost.evil.example"), true, 0,
+       QStringLiteral("https://localhost.evil.example/api/v1/authenticate")},
+      {"https-base-path", QStringLiteral("https://example.com/arkham"), true, 0,
+       QStringLiteral("https://example.com/arkham/api/v1/authenticate")},
 
       // ── Rejected: ambiguous/non-canonical numeric loopback spellings ───
-      {"http-127.1", QStringLiteral("http://127.1"), false, insecureTransport},
+      {"http-127.1", QStringLiteral("http://127.1"), false, insecureTransport,
+       QString()},
       {"http-single-integer", QStringLiteral("http://2130706433"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-octal-looking", QStringLiteral("http://0177.0.0.1"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-hex-looking", QStringLiteral("http://0x7f.0.0.1"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-octal-single-integer", QStringLiteral("http://017700000001"),
-       false, insecureTransport},
+       false, insecureTransport, QString()},
       {"http-leading-zero-full", QStringLiteral("http://127.000.000.001"),
-       false, insecureTransport},
+       false, insecureTransport, QString()},
       {"http-leading-zero-last-octet", QStringLiteral("http://127.0.0.01"),
-       false, insecureTransport},
+       false, insecureTransport, QString()},
       {"http-shortened-form", QStringLiteral("http://127.0.1"), false,
-       insecureTransport},
+       insecureTransport, QString()},
 
       // ── Rejected: IPv4-mapped / expanded / alternate IPv6 spellings ────
       {"http-ipv4-mapped-ipv6", QStringLiteral("http://[::ffff:127.0.0.1]"),
-       false, insecureTransport},
+       false, insecureTransport, QString()},
       {"http-ipv6-expanded", QStringLiteral("http://[0:0:0:0:0:0:0:1]"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-ipv6-alternate-shortened", QStringLiteral("http://[::0:1]"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-ipv6-zone-id", QStringLiteral("http://[::1%25eth0]"), false,
-       insecureTransport},
+       insecureTransport, QString()},
 
       // ── Rejected: trailing-dot / subdomain / lookalike localhost forms ─
       {"http-localhost-trailing-dot", QStringLiteral("http://localhost."),
-       false, insecureTransport},
+       false, insecureTransport, QString()},
       {"http-localhost-subdomain",
        QStringLiteral("http://localhost.evil.example"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-127-lookalike-subdomain",
        QStringLiteral("http://127.0.0.1.evil.example"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-notlocalhost", QStringLiteral("http://notlocalhost"), false,
-       insecureTransport},
+       insecureTransport, QString()},
 
       // ── Rejected: Unicode case-fold / homoglyph / IDNA / percent-encoded
       //    / mixed lookalikes of "localhost". All of these reach
@@ -126,33 +159,36 @@ inline QVector<StrictLoopbackUrlRow> strictLoopbackUrlRows() {
       //    so this table asserts the precise, empirically-confirmed
       //    UrlErrorCode for each, not merely "rejected somehow".
       {"http-localhost-long-s-unicode-casefold",
-       QString::fromUtf16(u"http://localho\u017Ft"), false,
-       insecureTransport}, // U+017F LATIN SMALL LETTER LONG S case-folds to
-                           // ASCII 's' under Qt::CaseInsensitive.
+       QString::fromUtf16(u"http://localho\u017Ft"), false, insecureTransport,
+       QString()}, // U+017F LATIN SMALL LETTER LONG S case-folds to
+                   // ASCII 's' under Qt::CaseInsensitive.
       {"http-localhost-cyrillic-o-homoglyph",
-       QString::fromUtf16(u"http://l\u043Ecalhost"), false,
-       insecureTransport}, // U+043E CYRILLIC SMALL LETTER O looks identical
-                           // to Latin 'o'.
+       QString::fromUtf16(u"http://l\u043Ecalhost"), false, insecureTransport,
+       QString()}, // U+043E CYRILLIC SMALL LETTER O looks identical
+                   // to Latin 'o'.
       {"http-localhost-fullwidth-idna",
        QString::fromUtf16(
            u"http://\uFF4C\uFF4F\uFF43\uFF41\uFF4C\uFF48\uFF4F\uFF53\uFF54"),
-       false, insecureTransport}, // Fullwidth Unicode forms of each Latin
-                                  // letter in "localhost"; QUrl even
-                                  // normalises url.host() to plain
-                                  // "localhost" for this input, which is
-                                  // exactly why the raw, pre-normalisation
-                                  // text (not url.host()) must be what this
-                                  // policy checks.
+       false, insecureTransport,
+       QString()}, // Fullwidth Unicode forms of each Latin
+                   // letter in "localhost"; QUrl even
+                   // normalises url.host() to plain
+                   // "localhost" for this input, which is
+                   // exactly why the raw, pre-normalisation
+                   // text (not url.host()) must be what this
+                   // policy checks.
       {"http-localhost-percent-encoded",
-       QStringLiteral("http://%6c%6f%63%61%6c%68%6f%73%74"), false,
-       invalidUrl}, // QUrl::StrictMode itself rejects percent-escapes in
-                    // the host as an invalid hostname, before the loopback
-                    // check is ever reached.
+       QStringLiteral("http://%6c%6f%63%61%6c%68%6f%73%74"), false, invalidUrl,
+       QString()}, // QUrl::StrictMode itself rejects percent-escapes in
+                   // the host as an invalid hostname, before the loopback
+                   // check is ever reached.
       {"http-localhost-mixed-homoglyph-and-casefold",
        QString::fromUtf16(u"http://l\u043Ecalho\u017Ft"), false,
-       insecureTransport}, // Cyrillic 'о' + long-s combined in one host.
+       insecureTransport,
+       QString()}, // Cyrillic 'о' + long-s combined in one host.
       {"http-localhost-explicit-punycode-ace",
-       QStringLiteral("http://xn--lcalhost-nbh"), false, insecureTransport},
+       QStringLiteral("http://xn--lcalhost-nbh"), false, insecureTransport,
+       QString()},
       // The literal ASCII-Compatible-Encoding (punycode) form QUrl itself
       // produces for the Cyrillic-o row above -- proves the raw-lexical
       // check also fails closed on an already-ACE-encoded lookalike, not
@@ -168,11 +204,11 @@ inline QVector<StrictLoopbackUrlRow> strictLoopbackUrlRows() {
        QStringLiteral("http://") + QStringLiteral("u") + QStringLiteral("ser") +
            QStringLiteral(":") + QStringLiteral("pass") +
            QStringLiteral("@localhost:9000"),
-       false, credentialsPresent},
+       false, credentialsPresent, QString()},
       {"http-lan-ip", QStringLiteral("http://192.168.1.100"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-public-host", QStringLiteral("http://example.com"), false,
-       insecureTransport},
+       insecureTransport, QString()},
 
       // ── Rejected: malformed/absent/out-of-range ports on an otherwise-
       //    exact loopback host or bracketed IPv6 literal. QUrl's own
@@ -189,45 +225,46 @@ inline QVector<StrictLoopbackUrlRow> strictLoopbackUrlRows() {
       //    regression in either QUrl's parsing assumptions or this
       //    function's own port rule is caught.
       {"http-localhost-empty-port", QStringLiteral("http://localhost:"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-localhost-zero-port", QStringLiteral("http://localhost:0"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-bracketed-::1-empty-port", QStringLiteral("http://[::1]:"), false,
-       insecureTransport},
+       insecureTransport, QString()},
       {"http-localhost-non-numeric-port",
-       QStringLiteral("http://localhost:evil"), false, invalidUrl},
+       QStringLiteral("http://localhost:evil"), false, invalidUrl, QString()},
       {"http-localhost-percent-escaped-port",
-       QStringLiteral("http://localhost:%39"), false, invalidUrl},
+       QStringLiteral("http://localhost:%39"), false, invalidUrl, QString()},
       {"http-localhost-double-colon-port",
-       QStringLiteral("http://localhost::9000"), false, invalidUrl},
+       QStringLiteral("http://localhost::9000"), false, invalidUrl, QString()},
       {"http-localhost-multiple-port-segments",
-       QStringLiteral("http://localhost:9000:9000"), false, invalidUrl},
+       QStringLiteral("http://localhost:9000:9000"), false, invalidUrl,
+       QString()},
       {"http-bracketed-::1-non-numeric-port",
-       QStringLiteral("http://[::1]:evil"), false, invalidUrl},
+       QStringLiteral("http://[::1]:evil"), false, invalidUrl, QString()},
       {"http-localhost-port-overflow", QStringLiteral("http://localhost:99999"),
-       false, invalidUrl},
+       false, invalidUrl, QString()},
       {"http-localhost-port-negative", QStringLiteral("http://localhost:-1"),
-       false, invalidUrl},
+       false, invalidUrl, QString()},
 
       // ── Rejected: control characters in the ORIGINAL input, which must
       //    not be laundered away by trimmed() before this policy ever
       //    sees them.
       {"http-localhost-trailing-tab-after-port",
        QStringLiteral("http://localhost:9000\t"), false,
-       controlCharacterPresent},
+       controlCharacterPresent, QString()},
       {"http-localhost-tab-before-colon",
        QStringLiteral("http://localhost\t:9000"), false,
-       controlCharacterPresent},
+       controlCharacterPresent, QString()},
       {"http-localhost-trailing-newline", QStringLiteral("http://localhost\n"),
-       false, controlCharacterPresent},
+       false, controlCharacterPresent, QString()},
 
       // ── Rejected: hostless and unexpected schemes, so this shared
       //    boundary table -- not merely validateCustomUrl()'s isolated
       //    tests -- also proves these fail before any request is built.
       {"https-hostless-scheme", QStringLiteral("https:///nohost"), false,
-       missingHost},
+       missingHost, QString()},
       {"ftp-unexpected-scheme", QStringLiteral("ftp://localhost"), false,
-       unsupportedScheme},
+       unsupportedScheme, QString()},
   };
 }
 
