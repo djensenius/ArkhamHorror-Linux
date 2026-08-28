@@ -36,6 +36,12 @@ namespace Arkham {
 //   userinfo-like construct in the raw authority (an '@' present) causes an
 //   unconditional false, independent of how QUrl itself would later parse
 //   userinfo/host.
+// - Any other scheme: false (fail closed). validateCustomUrl() only ever
+//   calls this after already validating the scheme is "http" or "https",
+//   so this case is not reachable through that call site today; it exists
+//   so a future caller of this public helper cannot accidentally get
+//   "allowed" back for a scheme this policy was never designed to
+//   classify.
 // - If the raw authority contains a ":" after the host (or after a
 //   bracketed IPv6 literal's closing "]"), everything following that ":"
 //   must be a syntactically valid, in-range port: one or more ASCII

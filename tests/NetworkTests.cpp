@@ -224,6 +224,7 @@ private slots:
   void urlStrictLoopbackPolicy();
   void rawIPv6BracketTrailingGarbageRejected();
   void rawPortValidationRejectsMalformedAndOutOfRangePorts();
+  void nonHttpSchemeFailsClosed();
 
   // ── ServerProfile factories and path construction ─────────────────────────
   void hostedDefaultProperties();
@@ -715,6 +716,34 @@ void NetworkTests::rawPortValidationRejectsMalformedAndOutOfRangePorts() {
       QStringLiteral("http"), QStringLiteral("http://localhost:65535")));
   QVERIFY(isCleartextAuthAllowedForRawInput(
       QStringLiteral("http"), QStringLiteral("http://localhost")));
+}
+
+// Direct, production-function-level regression proving
+// isCleartextAuthAllowedForRawInput() fails closed (returns false) for any
+// scheme other than "http"/"https", rather than falling through to the
+// same unconditional "true" branch used for "https". The one real call
+// site (UrlValidator::validateCustomUrl()) already rejects any
+// non-http/https scheme before this function is ever reached, so this
+// path is not exercised through that caller today -- this test exists so
+// a future caller of this public AuthTransportSecurity.h helper cannot
+// silently receive "cleartext allowed" for a scheme this policy was never
+// designed to classify.
+void NetworkTests::nonHttpSchemeFailsClosed() {
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("ftp"), QStringLiteral("ftp://localhost")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(QStringLiteral(""),
+                                             QStringLiteral("localhost")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("HTTP"), QStringLiteral("HTTP://localhost")));
+
+  // Still correctly accepted/rejected on their own merits: the two schemes
+  // this function actually classifies.
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("https"), QStringLiteral("https://example.com")));
+  QVERIFY(isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://localhost")));
+  QVERIFY(!isCleartextAuthAllowedForRawInput(
+      QStringLiteral("http"), QStringLiteral("http://example.com")));
 }
 
 // ─── ServerProfile factories and path construction ────────────────────────

@@ -153,10 +153,21 @@ bool isCanonicalLoopbackHostText(const QStringView hostText) {
 
 bool isCleartextAuthAllowedForRawInput(const QString &scheme,
                                        const QString &rawUrlText) {
-  if (scheme != "http"_L1) {
-    // https (or any other already-rejected-elsewhere scheme): no cleartext
-    // loopback restriction applies here.
+  if (scheme == "https"_L1) {
+    // https is never cleartext, regardless of host: no loopback
+    // restriction applies here.
     return true;
+  }
+  if (scheme != "http"_L1) {
+    // Any scheme other than "http"/"https" (e.g. a future caller passing
+    // an unvalidated or unexpected scheme) is not a cleartext HTTP
+    // transport this policy was designed to reason about at all -- fail
+    // closed rather than silently answering "allowed" for a case this
+    // function was never meant to classify. validateCustomUrl() itself
+    // already rejects any non-http/https scheme before this is ever
+    // called with one, so this is defense-in-depth for this public
+    // helper against future misuse, not a path exercised today.
+    return false;
   }
   const QStringView authority = extractRawAuthority(rawUrlText);
   if (authority.isEmpty()) {
