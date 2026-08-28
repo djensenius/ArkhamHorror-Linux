@@ -1,0 +1,12 @@
+{
+  "schemaRevision": "0.1.11",
+  "status": "baseline-incomplete",
+  "apiBasePath": "/api/v1",
+  "nativeClientMinimumRevision": "0.1.0",
+  "capabilities": [
+    "events.shared-state-versioning",
+    "games.step-probe",
+    "websockets.authorization-header",
+    "websockets.spectator-read-only"
+  ]
+}
