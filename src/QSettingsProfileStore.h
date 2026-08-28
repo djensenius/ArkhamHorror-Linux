@@ -1,8 +1,12 @@
 #pragma once
 
 #include "IProfileStore.h"
+#include "ServerProfile.h"
+#include "ValueOrError.h"
 
+#include <QList>
 #include <QSettings>
+#include <QString>
 #include <memory>
 
 namespace Arkham {

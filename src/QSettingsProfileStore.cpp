@@ -2,6 +2,7 @@
 
 #include <QSet>
 #include <QUuid>
+#include <QtAssert>
 
 using namespace Qt::StringLiterals;
 

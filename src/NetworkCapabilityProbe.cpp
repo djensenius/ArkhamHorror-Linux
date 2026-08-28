@@ -9,6 +9,9 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QPointer>
+#include <QTimer>
+#include <QtAssert>
 
 using namespace Qt::StringLiterals;
 
@@ -33,16 +36,22 @@ ProbeOutcome compatOutcomeToProbeOutcome(CompatibilityOutcome outcome) {
 
 } // namespace
 
-NetworkCapabilityProbe::NetworkCapabilityProbe(QNetworkAccessManager &nam,
-                                               QObject *parent)
-    : ICapabilityProbe(parent), m_nam(nam) {}
+NetworkCapabilityProbe::NetworkCapabilityProbe(
+    QNetworkAccessManager &nam, std::chrono::milliseconds timeout,
+    QObject *parent)
+    : ICapabilityProbe(parent), m_nam(nam), m_timeout(timeout) {}
 
 NetworkCapabilityProbe::~NetworkCapabilityProbe() {
-  for (QNetworkReply *reply : m_replies) {
+  for (auto it = m_pendingReplies.begin(); it != m_pendingReplies.end(); ++it) {
+    if (QTimer *timer = it.value()) {
+      timer->stop();
+    }
+    QNetworkReply *reply = it.key();
     QObject::disconnect(reply, nullptr, this, nullptr);
     reply->abort();
     reply->deleteLater();
   }
+  m_pendingReplies.clear();
 }
 
 void NetworkCapabilityProbe::probe(const ServerProfile &profile) {
@@ -52,8 +61,13 @@ void NetworkCapabilityProbe::probe(const ServerProfile &profile) {
         ProbeOutcome::InvalidProfile,
         QStringLiteral("server profile is invalid; cannot issue probe"),
     };
+    QPointer<NetworkCapabilityProbe> self(this);
     QMetaObject::invokeMethod(
-        this, [this, result]() { emit finished(result); },
+        this,
+        [self, result]() {
+          if (self)
+            emit self->finished(result);
+        },
         Qt::QueuedConnection);
     return;
   }
@@ -69,18 +83,60 @@ void NetworkCapabilityProbe::probe(const ServerProfile &profile) {
                        QNetworkRequest::Manual);
   request.setAttribute(QNetworkRequest::AuthenticationReuseAttribute,
                        QNetworkRequest::Manual);
-  // No Authorization header — the capabilities endpoint is public.
+  // Set redirect policy explicitly at request level so a manager-level global
+  // policy cannot override it.  Follow only same-origin redirects: the
+  // capabilities endpoint must not cross origin boundaries.
+  request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                       QNetworkRequest::SameOriginRedirectPolicy);
 
   QNetworkReply *reply = m_nam.get(request);
-  m_replies.insert(reply);
 
-  connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
-  connect(reply, &QObject::destroyed, this,
-          [this, reply]() { m_replies.remove(reply); });
+  // Set up a per-reply deadline timer when a non-zero timeout is configured.
+  QTimer *timer = nullptr;
+  if (m_timeout.count() > 0) {
+    timer = new QTimer(this);
+    timer->setSingleShot(true);
+    connect(timer, &QTimer::timeout, this, [this, reply, timer]() {
+      if (!m_pendingReplies.contains(reply))
+        return; // reply already handled before timer fired
+      // Disconnect our handler first so abort() cannot trigger it.
+      QObject::disconnect(reply, nullptr, this, nullptr);
+      m_pendingReplies.remove(reply);
+      timer->deleteLater();
+      reply->abort();
+      reply->deleteLater();
+      // Emit asynchronously to avoid re-entrancy during abort() completion.
+      // QPointer guards against the unlikely case where |this| is destroyed
+      // before the queued event is processed.
+      QPointer<NetworkCapabilityProbe> self(this);
+      QMetaObject::invokeMethod(
+          this,
+          [self]() {
+            if (self)
+              emit self->finished(ProbeResult{
+                  ProbeOutcome::NetworkError,
+                  QStringLiteral("capability probe timed out"),
+              });
+          },
+          Qt::QueuedConnection);
+    });
+  }
+  m_pendingReplies.insert(reply, timer);
+
   connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-    m_replies.remove(reply);
+    // Cancel the per-reply deadline before processing the response.
+    if (QTimer *t = m_pendingReplies.value(reply)) {
+      t->stop();
+      t->deleteLater();
+    }
+    m_pendingReplies.remove(reply);
+    reply->deleteLater();
     handleReply(reply);
   });
+
+  if (timer) {
+    timer->start(m_timeout);
+  }
 }
 
 void NetworkCapabilityProbe::handleReply(QNetworkReply *reply) {

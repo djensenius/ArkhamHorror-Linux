@@ -10,8 +10,7 @@ int main(int argc, char *argv[]) {
   QCoreApplication::setApplicationName(QStringLiteral("Arkham Horror"));
   QCoreApplication::setOrganizationName(QStringLiteral("djensenius"));
 
-  Arkham::ServerProfile profile(
-      QUrl(QStringLiteral("https://arkhamhorror.app")));
+  const Arkham::ServerProfile profile = Arkham::ServerProfile::hostedDefault();
 
   QQmlApplicationEngine engine;
   engine.setInitialProperties(

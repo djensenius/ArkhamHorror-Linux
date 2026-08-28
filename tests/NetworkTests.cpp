@@ -14,6 +14,7 @@
 #include <QNetworkRequest>
 #include <QPointer>
 #include <QQueue>
+#include <QSettings>
 #include <QTemporaryFile>
 #include <QtGlobal>
 #include <QtTest>
@@ -41,9 +42,12 @@ class StubNetworkReply final : public QNetworkReply {
   Q_OBJECT
 public:
   // Pass statusCode == 0 to simulate a transport failure (no HTTP attribute).
+  // Pass hanging == true for a reply that never finishes until abort() is
+  // called; used to test probe timeout behaviour.
   StubNetworkReply(int statusCode, QByteArray body,
-                   QNetworkReply::NetworkError netError, QObject *parent)
-      : QNetworkReply(parent), m_body(std::move(body)) {
+                   QNetworkReply::NetworkError netError, bool hanging,
+                   QObject *parent)
+      : QNetworkReply(parent), m_body(std::move(body)), m_hanging(hanging) {
     if (statusCode > 0) {
       setAttribute(QNetworkRequest::HttpStatusCodeAttribute, statusCode);
     }
@@ -53,7 +57,13 @@ public:
     setOpenMode(QIODevice::ReadOnly);
   }
 
-  void abort() override {}
+  void abort() override {
+    if (m_hanging) {
+      setError(QNetworkReply::OperationCanceledError,
+               QStringLiteral("aborted"));
+      scheduleFinished();
+    }
+  }
 
   void scheduleFinished() {
     QMetaObject::invokeMethod(this, &StubNetworkReply::emitFinished,
@@ -78,6 +88,7 @@ private slots:
 private:
   QByteArray m_body;
   qint64 m_offset{0};
+  bool m_hanging{false};
 };
 
 // ─── Stub QNetworkAccessManager ───────────────────────────────────────────
@@ -90,7 +101,13 @@ public:
 
   void enqueue(int statusCode, QByteArray body,
                QNetworkReply::NetworkError err = QNetworkReply::NoError) {
-    m_queue.enqueue({statusCode, std::move(body), err});
+    m_queue.enqueue({statusCode, std::move(body), err, false});
+  }
+
+  // Enqueue a reply that never emits finished() until abort() is called.
+  // Used to test probe timeout behaviour.
+  void enqueueHanging() {
+    m_queue.enqueue({0, {}, QNetworkReply::NoError, true});
   }
 
   QUrl lastUrl() const { return m_lastUrl; }
@@ -108,10 +125,13 @@ protected:
     if (m_queue.isEmpty()) {
       qFatal("StubNetworkAccessManager: no canned response enqueued");
     }
-    const auto [status, body, err] = m_queue.dequeue();
-    auto *reply = new StubNetworkReply(status, std::move(body), err, this);
+    const auto [status, body, err, hanging] = m_queue.dequeue();
+    auto *reply =
+        new StubNetworkReply(status, std::move(body), err, hanging, this);
     m_lastReply = reply;
-    reply->scheduleFinished();
+    if (!hanging) {
+      reply->scheduleFinished();
+    }
     return reply;
   }
 
@@ -120,6 +140,7 @@ private:
     int status;
     QByteArray body;
     QNetworkReply::NetworkError err;
+    bool hanging{false};
   };
   QQueue<Canned> m_queue;
   QUrl m_lastUrl;
@@ -253,6 +274,9 @@ private slots:
   void probeNoAuthHeader();
   void probeNoCookies();
   void probeDestructionDeletesInFlightReply();
+  void probeTimesOut();
+  void probeRedirectPolicySet();
+  void probeRedirectPolicyIgnoresManagerGlobal();
 
   // ── Fixture helper ────────────────────────────────────────────────────────
   void fixtureHelperRequiresLeadingSlash();
@@ -1285,6 +1309,78 @@ void NetworkTests::probeDestructionDeletesInFlightReply() {
 
   QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
   QVERIFY(reply.isNull());
+}
+
+void NetworkTests::probeTimesOut() {
+  // A hanging reply that never finishes: the probe must time out and emit
+  // exactly one NetworkError; no second emission must follow.
+  StubNetworkAccessManager nam;
+  nam.enqueueHanging();
+
+  int emitCount = 0;
+  ProbeResult lastResult;
+  {
+    NetworkCapabilityProbe probe(nam, std::chrono::milliseconds(50));
+    QObject::connect(&probe, &ICapabilityProbe::finished,
+                     [&emitCount, &lastResult](ProbeResult r) {
+                       ++emitCount;
+                       lastResult = std::move(r);
+                     });
+    probe.probe(ServerProfile::hostedDefault());
+
+    QTRY_COMPARE_WITH_TIMEOUT(emitCount, 1, 2000);
+    QCOMPARE(lastResult.outcome, ProbeOutcome::NetworkError);
+    QVERIFY(lastResult.diagnostic.contains(QStringLiteral("timed out")));
+
+    // Extra settling time: verify no second emission.
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
+    QCOMPARE(emitCount, 1);
+  }
+}
+
+void NetworkTests::probeRedirectPolicySet() {
+  // The probe must set SameOriginRedirectPolicy at request level so the
+  // capabilities endpoint never follows cross-origin redirects.
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, QByteArrayLiteral(R"({
+    "schemaRevision": "0.1.11",
+    "status": "baseline-incomplete",
+    "apiBasePath": "/api/v1",
+    "nativeClientMinimumRevision": "0.1.0",
+    "capabilities": []
+  })"));
+
+  NetworkCapabilityProbe probe(nam);
+  const auto r = runProbe(probe, ServerProfile::hostedDefault());
+  QVERIFY2(r.has_value(), qPrintable(r.error()));
+
+  QCOMPARE(nam.lastRequest()
+               .attribute(QNetworkRequest::RedirectPolicyAttribute)
+               .toInt(),
+           static_cast<int>(QNetworkRequest::SameOriginRedirectPolicy));
+}
+
+void NetworkTests::probeRedirectPolicyIgnoresManagerGlobal() {
+  // Even when the QNAM has a conflicting global redirect policy, the probe
+  // must still set SameOriginRedirectPolicy at the request level.
+  StubNetworkAccessManager nam;
+  nam.setRedirectPolicy(QNetworkRequest::NoLessSafeRedirectPolicy);
+  nam.enqueue(200, QByteArrayLiteral(R"({
+    "schemaRevision": "0.1.11",
+    "status": "baseline-incomplete",
+    "apiBasePath": "/api/v1",
+    "nativeClientMinimumRevision": "0.1.0",
+    "capabilities": []
+  })"));
+
+  NetworkCapabilityProbe probe(nam);
+  const auto r = runProbe(probe, ServerProfile::hostedDefault());
+  QVERIFY2(r.has_value(), qPrintable(r.error()));
+
+  QCOMPARE(nam.lastRequest()
+               .attribute(QNetworkRequest::RedirectPolicyAttribute)
+               .toInt(),
+           static_cast<int>(QNetworkRequest::SameOriginRedirectPolicy));
 }
 
 // ─── Fixture helper ───────────────────────────────────────────────────────

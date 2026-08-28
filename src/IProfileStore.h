@@ -4,6 +4,7 @@
 #include "ValueOrError.h"
 
 #include <QList>
+#include <QString>
 
 namespace Arkham {
 
