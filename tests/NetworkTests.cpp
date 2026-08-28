@@ -11,6 +11,7 @@
 #include <QNetworkRequest>
 #include <QTemporaryFile>
 #include <QtTest>
+#include <cstring>
 
 #include "ICapabilityProbe.h"
 #include "IProfileStore.h"
@@ -54,7 +55,7 @@ protected:
   qint64 readData(char *data, qint64 maxLen) override {
     const qint64 available = static_cast<qint64>(m_body.size()) - m_offset;
     if (available <= 0)
-      return -1;
+      return 0; // clean EOF; -1 would signal an I/O error
     const qint64 count = qMin(available, maxLen);
     std::memcpy(data, m_body.constData() + m_offset,
                 static_cast<size_t>(count));

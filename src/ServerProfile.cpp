@@ -13,11 +13,6 @@ namespace Arkham {
 static constexpr QLatin1StringView kHostedDefaultId{
     "00000000-0000-0000-0000-000000000001"};
 
-// Validate a UUID string: non-empty and parseable to a non-null QUuid.
-static bool isValidUuid(const QString &id) {
-  return !id.isEmpty() && !QUuid(id).isNull();
-}
-
 // Validate and normalise a display name: trim whitespace, reject blank.
 static ValueOrError<QString> validateDisplayName(QString name) {
   name = name.trimmed();

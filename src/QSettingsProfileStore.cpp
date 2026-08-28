@@ -1,5 +1,6 @@
 #include "QSettingsProfileStore.h"
 
+#include <QSet>
 #include <QUuid>
 
 using namespace Qt::StringLiterals;
