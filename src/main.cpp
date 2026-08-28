@@ -63,6 +63,16 @@ int main(int argc, char *argv[]) {
 
   const Arkham::ServerProfile profile = Arkham::ServerProfile::hostedDefault();
 
+  // Declared before |engine| so it is destroyed AFTER |engine| at scope
+  // exit (C++ destroys locals in reverse declaration order). |engine| owns
+  // the QML root objects, and sessionCoordinator is exposed to them as a
+  // raw context-property pointer into session->coordinator; if |session|
+  // were destroyed first, QML teardown could dereference a dangling
+  // sessionCoordinator pointer. This ordering also lets the engine cancel/
+  // ignore any in-flight QML bindings against the coordinator before it is
+  // torn down.
+  std::unique_ptr<Arkham::ProductionSession> session;
+
   QQmlApplicationEngine engine;
   engine.setInitialProperties(
       {{QStringLiteral("configuredServer"), profile.baseUrl().toString()}});
@@ -74,7 +84,6 @@ int main(int argc, char *argv[]) {
   // network/keychain I/O) are only ever reached through this callback, and
   // only when |mode| is ProcessMode::Normal. See AppBootstrap.h and
   // AppBootstrapTests.cpp.
-  std::unique_ptr<Arkham::ProductionSession> session;
   const Arkham::ProcessMode mode =
       smokeTest ? Arkham::ProcessMode::SmokeTest : Arkham::ProcessMode::Normal;
   Arkham::bootstrapSession(mode, [&] {

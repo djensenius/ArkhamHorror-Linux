@@ -752,6 +752,21 @@ void SessionCoordinatorTests::
   });
   // Never claim signed out while the token might still remain.
   QVERIFY(h.coordinator->state() != SessionCoordinator::State::SignedOut);
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+
+  // retry() must not be a silent no-op here: it re-attempts exactly the
+  // same durable deletion, and a successful retry completes the original
+  // "become signed out only after deletion succeeds" contract.
+  h.coordinator->retry();
+  pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, successWriteResult());
+  pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  });
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
 }
 
 void SessionCoordinatorTests::
@@ -888,6 +903,26 @@ void SessionCoordinatorTests::signInSaveFailureIsSecureStorageUnavailable() {
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
   });
+  // bootToSignedOut() already performed one "read" call; the failed save
+  // attempt above is the second call.
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+
+  // retry() must not be a silent no-op: the already-validated token is
+  // still available and only the durable save needs to be retried, so a
+  // successful retry completes sign-in without re-authenticating.
+  h.coordinator->retry();
+  pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("save"));
+  h.tokenStore.complete(profileId, successWriteResult());
+  pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  });
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedIn);
+  // No re-authentication occurred; the retry reused the already-validated
+  // token.
+  QCOMPARE(h.authClient.calls.size(), 2);
 }
 
 void SessionCoordinatorTests::signInNoOpWhenProfileNotYetUsable() {

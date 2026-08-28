@@ -345,22 +345,7 @@ void SessionCoordinator::handleWhoAmIResult(
     if (generation != m_generation) {
       return;
     }
-    QPointer<SessionCoordinator> self(this);
-    enqueueTokenOp(profileId, TokenOpKind::Save, token,
-                   [self, generation](TokenStoreResult saveResult) {
-                     if (!self) {
-                       return;
-                     }
-                     if (generation != self->m_generation) {
-                       return;
-                     }
-                     if (saveResult.outcome == TokenStoreOutcome::Success) {
-                       self->setState(State::SignedIn);
-                     } else {
-                       self->setState(State::SecureStorageUnavailable,
-                                      saveResult.diagnostic);
-                     }
-                   });
+    saveFreshlyObtainedToken(generation, profileId, token);
     return;
   }
 
@@ -396,6 +381,44 @@ void SessionCoordinator::handleWhoAmIResult(
     clearCurrentUser();
     setState(State::SignedOut, result.diagnostic);
   }
+}
+
+// A freshly obtained (validated by /whoami) token must be durably saved
+// before the coordinator declares itself signed in. Defined as a reusable,
+// generation-guarded step (rather than an inline lambda) so a save
+// failure can install a retry action that re-invokes exactly this same
+// step; without that, retry() would be a silent no-op while stuck in the
+// resulting SecureStorageUnavailable state, even though a validated token
+// is already available and only the durable write needs to be retried.
+void SessionCoordinator::saveFreshlyObtainedToken(quint64 generation,
+                                                  const QString &profileId,
+                                                  const QString &token) {
+  if (generation != m_generation) {
+    return;
+  }
+  QPointer<SessionCoordinator> self(this);
+  enqueueTokenOp(
+      profileId, TokenOpKind::Save, token,
+      [self, generation, profileId, token](TokenStoreResult saveResult) {
+        if (!self) {
+          return;
+        }
+        if (generation != self->m_generation) {
+          return;
+        }
+        if (saveResult.outcome == TokenStoreOutcome::Success) {
+          self->setState(State::SignedIn);
+        } else {
+          self->m_retryAction = [self, generation, profileId, token] {
+            if (!self) {
+              return;
+            }
+            self->saveFreshlyObtainedToken(generation, profileId, token);
+          };
+          self->setState(State::SecureStorageUnavailable,
+                         saveResult.diagnostic);
+        }
+      });
 }
 
 // A restored token the server has rejected must be durably deleted before

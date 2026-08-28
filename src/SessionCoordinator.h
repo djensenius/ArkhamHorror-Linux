@@ -226,6 +226,8 @@ private:
                           const AuthResult<CurrentUser> &result);
   void deleteRestoredUnauthorizedToken(quint64 generation,
                                        const QString &profileId);
+  void saveFreshlyObtainedToken(quint64 generation, const QString &profileId,
+                                const QString &token);
 
   void handleFreshTokenResult(quint64 generation, const QString &profileId,
                               const AuthResult<AuthToken> &result);
