@@ -6,6 +6,7 @@
 #include "ContractPin.h"
 #include "ContractRevision.h"
 #include "ServerCapabilities.h"
+#include "ValueOrError.h"
 
 using namespace Arkham;
 
