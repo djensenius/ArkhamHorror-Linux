@@ -115,6 +115,21 @@ void applyCommonRequestSettings(QNetworkRequest &request) {
   request.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);
 }
 
+// A bearer token is placed verbatim into a raw "Authorization: Token <...>"
+// header value. HTTP header field-values must not contain CR/LF (doing so
+// would allow header/request splitting or injection of extra headers) or
+// other control characters, so any such token must be rejected before a
+// request is ever constructed -- never sanitized/stripped, since that would
+// silently send a different token than the caller supplied.
+bool containsHeaderUnsafeCharacter(const QString &token) {
+  for (const QChar ch : token) {
+    if (ch.category() == QChar::Other_Control) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 NetworkAuthenticationClient::NetworkAuthenticationClient(
@@ -295,6 +310,12 @@ NetworkAuthenticationClient::whoAmI(const ServerProfile &profile,
     return rejectInvalidInput<CurrentUser>(
         std::move(callback),
         QStringLiteral("token must not be empty or whitespace-only"));
+  }
+  if (containsHeaderUnsafeCharacter(token)) {
+    return rejectInvalidInput<CurrentUser>(
+        std::move(callback),
+        QStringLiteral("token contains control characters and cannot be "
+                       "used in an HTTP header"));
   }
 
   const QUrl url = profile.apiUrl(u"whoami");

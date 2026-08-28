@@ -166,6 +166,7 @@ private slots:
   void registerSendsExpectedRequest();
   void whoAmISendsExactAuthorizationHeader();
   void whoAmIRejectsEmptyToken();
+  void whoAmIRejectsTokenWithControlCharacters();
   void requestsDisableCookiesAndAuthReuse();
   void requestsSetManualRedirectPolicy();
   void requestsSetCacheBypassAttributes();
@@ -317,6 +318,33 @@ void AuthClientTests::whoAmIRejectsEmptyToken() {
 
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+}
+
+void AuthClientTests::whoAmIRejectsTokenWithControlCharacters() {
+  StubNetworkAccessManager nam;
+  NetworkAuthenticationClient client(nam);
+
+  // A token embedding CR/LF is a header/request-splitting attempt: if
+  // placed verbatim into a raw "Authorization" header value it could
+  // inject an extra header (here, a forged "X-Injected" header) into the
+  // request. This must be rejected before any request is constructed, not
+  // silently sanitized/stripped.
+  const QString maliciousToken =
+      QStringLiteral("legit-token\r\nX-Injected: evil");
+
+  const auto result = runAndWait<CurrentUser>(
+      [&](std::function<void(AuthResult<CurrentUser>)> cb) {
+        return client.whoAmI(ServerProfile::hostedDefault(), maliciousToken,
+                             std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+  // No request may ever be sent for a rejected input.
+  QVERIFY(nam.requests().isEmpty());
+  // The diagnostic must never echo the offending token/header value.
+  QVERIFY(!result->diagnostic.contains(QStringLiteral("legit-token")));
+  QVERIFY(!result->diagnostic.contains(QStringLiteral("X-Injected")));
 }
 
 void AuthClientTests::requestsDisableCookiesAndAuthReuse() {
