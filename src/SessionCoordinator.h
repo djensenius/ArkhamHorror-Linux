@@ -71,11 +71,14 @@ class SessionCoordinator final : public QObject {
 public:
   // Explicit, non-overlapping states. Deliberately not a bool soup: every
   // stage that a QML view might need to distinguish (see class comment) has
-  // its own value. RecoverableFailure covers every retryable transport
-  // failure (capability-probe network/HTTP/malformed errors and restored-
-  // credential whoami transport errors); Incompatible and
-  // SecureStorageUnavailable and ProfileStorageFailure are kept distinct
-  // because their retry action and user-facing meaning differ.
+  // its own value. RecoverableFailure covers every retryable failure that
+  // is not one of the more specific states below: capability-probe
+  // configuration/network/HTTP/malformed-JSON errors (including a null/
+  // empty ProbeFactory) and restored-credential whoami transport/malformed/
+  // non-HTTP errors. It is not limited to network/transport problems.
+  // Incompatible and SecureStorageUnavailable and ProfileStorageFailure are
+  // kept distinct because their retry action and user-facing meaning
+  // differ.
   enum class State {
     Loading,                  ///< Initial boot: loading profiles/selection.
     ProbingCapabilities,      ///< Capability probe in flight for the current

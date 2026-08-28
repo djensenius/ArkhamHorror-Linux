@@ -53,7 +53,7 @@ QString SessionCoordinator::stateDescription() const {
   case State::ProfileStorageFailure:
     return QStringLiteral("Profile storage error");
   case State::RecoverableFailure:
-    return QStringLiteral("Connection problem");
+    return QStringLiteral("Temporary problem");
   }
   return QStringLiteral("Unknown");
 }
