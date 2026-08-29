@@ -353,7 +353,12 @@ void AssetRequestCoordinatorTests::cacheHitShortCircuitsNetworkEntirely() {
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
   AssetCache::CachedEntry preSeeded;
-  preSeeded.encodedBytes = QByteArrayLiteral("already-cached-bytes");
+  // Real, decodable PNG bytes: a memory-hit result now always goes
+  // through ensureDecoded() (see AssetRequestCoordinator.h), which
+  // decodes on demand whenever decodedImage is null -- unlike this test's
+  // opaque placeholder bytes of prior rounds, that decode must actually
+  // succeed for a genuine cache-hit outcome to be observed here.
+  preSeeded.encodedBytes = encodePng(4, 4);
   preSeeded.contentType = QStringLiteral("image/png");
   preSeeded.dimensions = QSize(4, 4);
   cache.store(cacheKey, preSeeded);
@@ -364,7 +369,8 @@ void AssetRequestCoordinatorTests::cacheHitShortCircuitsNetworkEntirely() {
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
 
   QVERIFY2(bool(*result), qPrintable(result->error().message));
-  QCOMPARE((**result).encodedBytes, QByteArrayLiteral("already-cached-bytes"));
+  QCOMPARE((**result).encodedBytes, preSeeded.encodedBytes);
+  QVERIFY(!(**result).decodedImage.isNull());
   QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 0);
 }
 
@@ -472,7 +478,7 @@ void AssetRequestCoordinatorTests::
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
   AssetCache::CachedEntry preSeeded;
-  preSeeded.encodedBytes = QByteArrayLiteral("stale-but-still-valid-bytes");
+  preSeeded.encodedBytes = encodePng(4, 4);
   preSeeded.contentType = QStringLiteral("image/png");
   preSeeded.dimensions = QSize(4, 4);
   preSeeded.etag = QStringLiteral("\"stale-etag\"");
@@ -489,8 +495,8 @@ void AssetRequestCoordinatorTests::
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
 
   QVERIFY2(bool(*result), qPrintable(result->error().message));
-  QCOMPARE((**result).encodedBytes,
-           QByteArrayLiteral("stale-but-still-valid-bytes"));
+  QCOMPARE((**result).encodedBytes, preSeeded.encodedBytes);
+  QVERIFY(!(**result).decodedImage.isNull());
   QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
   QCOMPARE(server.lastRequestHeaders(QStringLiteral("/cards/valid01.png"))
                .value("if-none-match"),
@@ -564,7 +570,7 @@ void AssetRequestCoordinatorTests::
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
   AssetCache::CachedEntry preSeeded;
-  preSeeded.encodedBytes = QByteArrayLiteral("still-served-despite-404");
+  preSeeded.encodedBytes = encodePng(4, 4);
   preSeeded.contentType = QStringLiteral("image/png");
   preSeeded.dimensions = QSize(4, 4);
   preSeeded.lastModified = QStringLiteral("Wed, 01 Jan 2020 00:00:00 GMT");
@@ -581,8 +587,8 @@ void AssetRequestCoordinatorTests::
   // candidate must never make already-cached, already-displayed art
   // disappear or error out.
   QVERIFY2(bool(*result), qPrintable(result->error().message));
-  QCOMPARE((**result).encodedBytes,
-           QByteArrayLiteral("still-served-despite-404"));
+  QCOMPARE((**result).encodedBytes, preSeeded.encodedBytes);
+  QVERIFY(!(**result).decodedImage.isNull());
 }
 
 void AssetRequestCoordinatorTests::
@@ -662,4 +668,111 @@ void AssetRequestCoordinatorTests::
   QVERIFY((**resultA).encodedBytes !=
           QByteArrayLiteral("old-bytes-now-outdated"));
   QCOMPARE((**resultA).encodedBytes, (**resultB).encodedBytes);
+}
+
+void AssetRequestCoordinatorTests::
+    diskHitAfterRestartDecodesOnDemandAndPublishesToMemory() {
+  // Regression for a review finding: AssetCache never persists a decoded
+  // QImage to disk (only encodedBytes/metadata are), so a CachedEntry
+  // served from a disk hit -- e.g. after a simulated process restart --
+  // always arrives with decodedImage null. Before ensureDecoded() existed,
+  // AssetRequestCoordinator handed such an entry straight to the caller as
+  // a SUCCESSFUL result, which would let AssetImageRequest reach
+  // Status::Ready with an empty QImage. This test proves the disk-hit (no
+  // validators) path now decodes on demand and never surfaces a null
+  // image, AND that the freshly-decoded image is published back into the
+  // memory cache so a subsequent lookupMemory() hit for the same key is
+  // already decoded too.
+  MockHttpServer server;
+  // No response registered: this request must be served entirely from
+  // the disk cache, with no network round trip at all.
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(6, 6);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(6, 6);
+  // No etag/lastModified: this is the plain disk-hit-no-validators path,
+  // not a revalidation.
+  cache.store(cacheKey, preSeeded);
+  // decodedImage is deliberately left null in the just-stored memory
+  // entry too, to exactly simulate a post-restart disk hit: store()
+  // itself never decodes, so the memory entry it just inserted also
+  // carries a null decodedImage until something decodes it on demand.
+
+  // A fresh AssetCache instance pointed at the same directory (empty
+  // memory) forces this request through the disk-hit path.
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QVERIFY2(!(**result).decodedImage.isNull(),
+           "a successful disk-hit result must never carry a null "
+           "decodedImage");
+  QCOMPARE((**result).decodedImage.size(), QSize(6, 6));
+  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 0);
+
+  // The decoded image must also have been published back into the memory
+  // cache, so a subsequent lookupMemory() hit is already decoded.
+  const auto memoryHit = restartedCache.lookupMemory(cacheKey);
+  QVERIFY(memoryHit.has_value());
+  QVERIFY2(!memoryHit->decodedImage.isNull(),
+           "the just-decoded image must be published back into the "
+           "memory cache");
+}
+
+void AssetRequestCoordinatorTests::
+    unsupportedCodecOnDecodeOnDemandSurfacesTypedError() {
+  // A disk hit whose stored bytes can no longer actually decode (e.g. the
+  // installed Qt build lost the relevant codec plugin since this entry
+  // was originally cached, or the bytes were corrupted in a way the
+  // sha256 payload check does not itself catch) must surface a typed
+  // AssetError from ensureDecoded()'s on-demand decode -- never silently
+  // complete with a null image, and never crash.
+  MockHttpServer server;
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  // Not real PNG bytes: on-demand decode must fail with a typed error
+  // rather than a null-image "success".
+  preSeeded.encodedBytes = QByteArrayLiteral("not-actually-a-png");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MagicBytesMismatch);
 }

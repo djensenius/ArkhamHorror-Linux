@@ -36,6 +36,8 @@ private slots:
   void diskHitRevalidationReplacesEntryOnFresh200();
   void diskHitRevalidationServesStaleOnAnyFailure();
   void diskHitRevalidationCoalescesConcurrentIdenticalRequests();
+  void diskHitAfterRestartDecodesOnDemandAndPublishesToMemory();
+  void unsupportedCodecOnDecodeOnDemandSurfacesTypedError();
 
 private:
   QString m_tempDirPath;

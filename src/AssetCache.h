@@ -121,6 +121,17 @@ public:
   void touchAfterNotModified(const QString &key, const QString &newEtag,
                              const QString &newLastModified);
 
+  // Patches an already memory-resident entry's decodedImage in place
+  // (recomputing its cost accordingly), if `key` still has one. A no-op if
+  // `key` is not currently in memory (e.g. it was evicted between the
+  // lookup that produced this decode and this call returning -- the next
+  // lookup will simply decode again, never wrongly). Used by
+  // AssetRequestCoordinator to publish a just-decoded image back into the
+  // memory cache for a disk hit that never carried a decoded QImage (only
+  // encodedBytes/metadata are ever persisted to disk), so a later
+  // lookupMemory() hit for the same key does not need to redecode.
+  void updateMemoryDecodedImage(const QString &key, const QImage &image);
+
   // Repairs orphan payloads, corrupt entries, and stray temp files, then
   // evicts oldest-access entries if disk usage exceeds the 90% high-water
   // mark, down to the 75% low-water mark. Called once from the

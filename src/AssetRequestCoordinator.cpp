@@ -94,7 +94,7 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
     if (auto hit = m_cache.lookupMemory(cacheKey)) {
       return registerImmediateCompletion(
           key, std::move(callback),
-          AssetOutcome<AssetCache::CachedEntry>(*hit));
+          ensureDecoded(std::move(*hit), key.format, cacheKey));
     }
 
     if (auto hit = m_cache.lookupDisk(cacheKey)) {
@@ -104,7 +104,7 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
         // exactly like a memory hit.
         return registerImmediateCompletion(
             key, std::move(callback),
-            AssetOutcome<AssetCache::CachedEntry>(std::move(entry)));
+            ensureDecoded(std::move(entry), key.format, cacheKey));
       }
 
       // A disk hit carrying validators is revalidated with a real
@@ -180,6 +180,25 @@ AssetRequestCoordinator::findInFlightOperation(const QString &opKey) const {
     }
   }
   return std::nullopt;
+}
+
+AssetOutcome<AssetCache::CachedEntry>
+AssetRequestCoordinator::ensureDecoded(AssetCache::CachedEntry entry,
+                                       AssetFormat format,
+                                       const QString &cacheKey) {
+  if (!entry.decodedImage.isNull()) {
+    return AssetOutcome<AssetCache::CachedEntry>(std::move(entry));
+  }
+
+  const AssetOutcome<QImage> decoded =
+      m_fetcher.decodeAndValidate(entry.encodedBytes, format);
+  if (!decoded) {
+    return AssetOutcome<AssetCache::CachedEntry>(decoded.error());
+  }
+
+  entry.decodedImage = *decoded;
+  m_cache.updateMemoryDecodedImage(cacheKey, entry.decodedImage);
+  return AssetOutcome<AssetCache::CachedEntry>(std::move(entry));
 }
 
 AssetRequestCoordinator::RequestHandle
@@ -312,8 +331,9 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         // a briefly-unreachable or since-changed origin can never make
         // previously cached, already-displayed art disappear.
         if (!result) {
-          self->completeOperation(operationId,
-                                  AssetOutcome<AssetCache::CachedEntry>(stale));
+          self->completeOperation(
+              operationId, self->ensureDecoded(stale, operation.key.format,
+                                               operation.revalidationCacheKey));
           return;
         }
 
@@ -322,16 +342,18 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
           // bytes are never touched), then serve the same stale entry.
           self->m_cache.touchAfterNotModified(operation.revalidationCacheKey,
                                               QString(), QString());
-          self->completeOperation(operationId,
-                                  AssetOutcome<AssetCache::CachedEntry>(stale));
+          self->completeOperation(
+              operationId, self->ensureDecoded(stale, operation.key.format,
+                                               operation.revalidationCacheKey));
           return;
         }
 
         if (!result->asset.has_value()) {
           // Defensive only: AssetNetworkFetcher never returns
           // notModified==false with an empty asset.
-          self->completeOperation(operationId,
-                                  AssetOutcome<AssetCache::CachedEntry>(stale));
+          self->completeOperation(
+              operationId, self->ensureDecoded(stale, operation.key.format,
+                                               operation.revalidationCacheKey));
           return;
         }
 

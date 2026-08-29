@@ -35,6 +35,22 @@ namespace Arkham {
 // stored validators at all (e.g. an origin that never sent either header)
 // is served immediately with no network round trip, exactly as before.
 //
+// Every one of the above cache-hit paths can hand back a CachedEntry
+// whose decodedImage is null (only encodedBytes/metadata are ever
+// persisted to disk, so any entry served from disk -- or from memory
+// after being promoted from disk -- never carries a decoded QImage until
+// something decodes it). ensureDecoded() (see the .cpp) is applied to
+// every one of these paths before a result is ever handed to a consumer,
+// so a successful outcome's decodedImage is never null: a fresh
+// AssetNetworkFetcher decode is performed on demand, through the exact
+// same validated codec/dimension path a live fetch uses, and the result
+// is published back into the memory cache (AssetCache::
+// updateMemoryDecodedImage()) so later hits for the same key need not
+// redecode. A decode failure here (e.g. the installed Qt build no longer
+// supports a codec that was available when this entry was originally
+// cached) is surfaced as the same typed AssetError a live fetch would
+// have produced -- never silently served as a null image.
+//
 // Concurrent identical requests (same canonicalized AssetKey -- every
 // field, including assetBase/category/identifier/side/locale/format,
 // compares equal; see canonicalOperationKey() in the .cpp) are coalesced:
@@ -131,6 +147,23 @@ private:
   // starting a redundant network operation. Returns nullopt if none.
   [[nodiscard]] std::optional<quint64>
   findInFlightOperation(const QString &opKey) const;
+  // A disk-served (or memory-promoted-from-disk) CachedEntry never
+  // carries a decoded QImage: only encodedBytes/metadata are ever
+  // persisted to disk (see AssetCache::store()/lookupDisk()). Every path
+  // that can hand such an entry to a consumer as a SUCCESSFUL outcome
+  // (memory hit, disk hit with no validators, and every "serve the stale
+  // entry" branch of a revalidation) must route it through this helper
+  // first, so a caller can never observe a successful result whose
+  // decodedImage is null. A no-op (returns `entry` unchanged) if it
+  // already carries a decoded image (the common case: freshly fetched
+  // entries, or an entry already patched by a prior call here via
+  // AssetCache::updateMemoryDecodedImage()). `cacheKey` is the exact
+  // AssetCache key `entry` was retrieved under, so the freshly-decoded
+  // image can be published back into the memory cache for subsequent
+  // lookupMemory() hits.
+  [[nodiscard]] AssetOutcome<AssetCache::CachedEntry>
+  ensureDecoded(AssetCache::CachedEntry entry, AssetFormat format,
+                const QString &cacheKey);
   void startCandidate(quint64 operationId);
   void startRevalidation(quint64 operationId);
   void completeOperation(quint64 operationId,

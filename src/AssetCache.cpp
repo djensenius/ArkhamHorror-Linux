@@ -317,6 +317,23 @@ void AssetCache::touchAfterNotModified(const QString &key,
   }
 }
 
+void AssetCache::updateMemoryDecodedImage(const QString &key,
+                                          const QImage &image) {
+  QMutexLocker locker(&m_mutex);
+  CachedEntry *existing = m_memory->object(key);
+  if (!existing) {
+    return; // evicted since the caller's lookup; a later lookup redecodes
+  }
+  // A full copy-then-reinsert (rather than mutating *existing in place)
+  // is required here, unlike touchAfterNotModified()'s in-place field
+  // updates: decodedImage directly affects costBytes(), and QCache's
+  // internal cost accounting is only ever updated via insert(), never by
+  // mutating an object it already owns.
+  auto *updated = new CachedEntry(*existing);
+  updated->decodedImage = image;
+  m_memory->insert(key, updated, static_cast<qsizetype>(updated->costBytes()));
+}
+
 void AssetCache::reapAndEnforceQuota() {
   QMutexLocker locker(&m_mutex);
 

@@ -418,85 +418,18 @@ void AssetNetworkFetcher::handleFinished(quint64 handle) {
     return;
   }
 
-  const std::optional<AssetFormat> sniffed = sniffMagicBytes(body);
-  if (!sniffed || *sniffed != pendingCopy.expectedFormat) {
-    emitResult(AssetError{
-        AssetErrorCode::MagicBytesMismatch,
-        QStringLiteral("response body's magic bytes do not match the "
-                       "expected asset format")});
-    return;
-  }
-
-  const QtCodecSupport codecSupport =
-      resolveQtCodecSupport(pendingCopy.expectedFormat);
-
-  if (!codecSupport.supported) {
-    emitResult(AssetError{
-        AssetErrorCode::UnsupportedCodec,
-        QStringLiteral("no installed Qt image plugin can decode this "
-                       "asset's format")});
-    return;
-  }
-
-  QBuffer buffer;
-  buffer.setData(body);
-  buffer.open(QIODevice::ReadOnly);
-  QImageReader reader(&buffer, codecSupport.formatHint);
-
-  const QSize declaredSize = reader.size();
-  if (!declaredSize.isValid() || declaredSize.width() <= 0 ||
-      declaredSize.height() <= 0) {
-    emitResult(AssetError{AssetErrorCode::MalformedImage,
-                          QStringLiteral("image header is malformed or "
-                                         "reports non-positive dimensions")});
-    return;
-  }
-  if (declaredSize.width() > m_limits.maxDimensionPixels ||
-      declaredSize.height() > m_limits.maxDimensionPixels) {
-    emitResult(AssetError{
-        AssetErrorCode::DimensionTooLarge,
-        QStringLiteral("image dimension %1x%2 exceeds the configured cap "
-                       "of %3 pixels per side")
-            .arg(declaredSize.width())
-            .arg(declaredSize.height())
-            .arg(m_limits.maxDimensionPixels)});
-    return;
-  }
-  // 64-bit multiplication: both operands are already bounded above by
-  // maxDimensionPixels (a configurable but always-small int), so this can
-  // never overflow even at the largest permitted configuration.
-  const qint64 totalPixels =
-      static_cast<qint64>(declaredSize.width()) * declaredSize.height();
-  if (totalPixels > m_limits.maxTotalPixels) {
-    emitResult(AssetError{
-        AssetErrorCode::PixelBudgetExceeded,
-        QStringLiteral("image totals %1 pixels, exceeding the configured "
-                       "cap of %2")
-            .arg(totalPixels)
-            .arg(m_limits.maxTotalPixels)});
-    return;
-  }
-
-  QImage decoded = reader.read();
-  if (decoded.isNull()) {
-    if (reader.error() == QImageReader::UnsupportedFormatError) {
-      emitResult(AssetError{
-          AssetErrorCode::UnsupportedCodec,
-          QStringLiteral("installed Qt image plugin declined to decode "
-                         "this asset")});
-    } else {
-      emitResult(AssetError{AssetErrorCode::MalformedImage,
-                            QStringLiteral("image body failed to decode: %1")
-                                .arg(reader.errorString())});
-    }
+  AssetOutcome<QImage> decodedOutcome =
+      decodeAndValidate(body, pendingCopy.expectedFormat);
+  if (!decodedOutcome) {
+    emitResult(decodedOutcome.error());
     return;
   }
 
   FetchedAsset asset;
   asset.encodedBytes = body;
   asset.contentType = declaredContentType;
-  asset.dimensions = declaredSize;
-  asset.decodedImage = std::move(decoded);
+  asset.dimensions = decodedOutcome->size();
+  asset.decodedImage = std::move(*decodedOutcome);
   asset.sha256Hex = QString::fromLatin1(
       QCryptographicHash::hash(body, QCryptographicHash::Sha256).toHex());
   asset.etag = QString::fromLatin1(reply->rawHeader("ETag"));
@@ -507,6 +440,79 @@ void AssetNetworkFetcher::handleFinished(quint64 handle) {
   result.notModified = false;
   result.asset = std::move(asset);
   emitResult(std::move(result));
+}
+
+AssetOutcome<QImage>
+AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
+                                       AssetFormat expectedFormat) const {
+  const std::optional<AssetFormat> sniffed = sniffMagicBytes(encodedBytes);
+  if (!sniffed || *sniffed != expectedFormat) {
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::MagicBytesMismatch,
+        QStringLiteral("body's magic bytes do not match the expected "
+                       "asset format")});
+  }
+
+  const QtCodecSupport codecSupport = resolveQtCodecSupport(expectedFormat);
+  if (!codecSupport.supported) {
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::UnsupportedCodec,
+        QStringLiteral("no installed Qt image plugin can decode this "
+                       "asset's format")});
+  }
+
+  QBuffer buffer;
+  buffer.setData(encodedBytes);
+  buffer.open(QIODevice::ReadOnly);
+  QImageReader reader(&buffer, codecSupport.formatHint);
+
+  const QSize declaredSize = reader.size();
+  if (!declaredSize.isValid() || declaredSize.width() <= 0 ||
+      declaredSize.height() <= 0) {
+    return AssetOutcome<QImage>(
+        AssetError{AssetErrorCode::MalformedImage,
+                   QStringLiteral("image header is malformed or reports "
+                                  "non-positive dimensions")});
+  }
+  if (declaredSize.width() > m_limits.maxDimensionPixels ||
+      declaredSize.height() > m_limits.maxDimensionPixels) {
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::DimensionTooLarge,
+        QStringLiteral("image dimension %1x%2 exceeds the configured cap "
+                       "of %3 pixels per side")
+            .arg(declaredSize.width())
+            .arg(declaredSize.height())
+            .arg(m_limits.maxDimensionPixels)});
+  }
+  // 64-bit multiplication: both operands are already bounded above by
+  // maxDimensionPixels (a configurable but always-small int), so this can
+  // never overflow even at the largest permitted configuration.
+  const qint64 totalPixels =
+      static_cast<qint64>(declaredSize.width()) * declaredSize.height();
+  if (totalPixels > m_limits.maxTotalPixels) {
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::PixelBudgetExceeded,
+        QStringLiteral("image totals %1 pixels, exceeding the configured "
+                       "cap of %2")
+            .arg(totalPixels)
+            .arg(m_limits.maxTotalPixels)});
+  }
+
+  QImage decoded = reader.read();
+  if (decoded.isNull()) {
+    if (reader.error() == QImageReader::UnsupportedFormatError) {
+      return AssetOutcome<QImage>(AssetError{
+          AssetErrorCode::UnsupportedCodec,
+          QStringLiteral("installed Qt image plugin declined to decode "
+                         "this asset")});
+    }
+    return AssetOutcome<QImage>(
+        AssetError{AssetErrorCode::MalformedImage,
+                   QStringLiteral("image body failed to decode: %1")
+                       .arg(reader.errorString())});
+  }
+
+  return AssetOutcome<QImage>(std::move(decoded));
 }
 
 void AssetNetworkFetcher::cancel(FetchHandle handle) {

@@ -153,6 +153,21 @@ public:
   // it is never invoked again afterwards for this handle.
   void cancel(FetchHandle handle);
 
+  // Validates and decodes already-downloaded, already-trusted encoded
+  // bytes against `expectedFormat`, applying the exact same magic-byte,
+  // codec-support, and dimension/pixel-budget checks (steps 2-4 of the
+  // class comment above) that a live network fetch uses -- WITHOUT the
+  // Content-Type header check (step 1), since there is no live HTTP
+  // response to check it against here. This lets a caller serving a
+  // disk-cache hit whose CachedEntry never carried a decoded QImage (only
+  // encodedBytes/metadata are ever persisted to disk; see
+  // AssetCache::store()/lookupDisk()) decode it on demand through the
+  // identical validated codec path a fresh fetch uses, rather than a
+  // second, divergent decode implementation.
+  [[nodiscard]] AssetOutcome<QImage>
+  decodeAndValidate(const QByteArray &encodedBytes,
+                    AssetFormat expectedFormat) const;
+
 private:
   struct Pending {
     QNetworkReply *reply{nullptr};
