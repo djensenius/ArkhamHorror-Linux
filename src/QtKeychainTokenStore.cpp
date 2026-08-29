@@ -225,7 +225,21 @@ void QtKeychainTokenStore::readToken(const QString &profileId,
             const TokenEnvelopeParseResult parsed = parseTokenEnvelope(raw);
             switch (parsed.outcome) {
             case TokenEnvelopeParseOutcome::Parsed:
-              if (parsed.endpointIdentity == expectedEndpointIdentity) {
+              if (parsed.token.trimmed().isEmpty()) {
+                // parseTokenEnvelope() only rejects a completely empty
+                // token portion (see TokenEnvelope.cpp); a structurally
+                // valid envelope whose token trims to nothing but is not
+                // literally empty (e.g. a tampered/corrupted entry with a
+                // whitespace-only token) would otherwise slip through as
+                // Parsed. saveToken() already refuses to persist such a
+                // value, so treat one found on read the same way this
+                // function treats a whitespace-only raw payload above:
+                // never surface it as a usable Success token.
+                outcome = TokenStoreOutcome::BackendError;
+                diagnostic = QStringLiteral(
+                    "secure storage returned an empty or whitespace-only "
+                    "token");
+              } else if (parsed.endpointIdentity == expectedEndpointIdentity) {
                 token = parsed.token;
               } else {
                 outcome = TokenStoreOutcome::BindingMismatch;

@@ -306,6 +306,7 @@ private slots:
   void readMalformedEnvelopeIsRejectedWithNoToken();
   void updatedEndpointBindingReplacesPreviousBinding();
   void diagnosticsNeverContainEndpointIdentityOrTokenForBindingOutcomes();
+  void readMatchedBindingWithWhitespaceOnlyTokenIsBackendErrorNotSuccess();
 
   // ─── TokenEnvelope free-function unit tests (bypassing async I/O) ───
 
@@ -818,6 +819,42 @@ void TokenStoreTests::readMalformedEnvelopeIsRejectedWithNoToken() {
   QVERIFY(readResult.has_value());
   QCOMPARE(readResult->outcome, TokenStoreOutcome::Malformed);
   QVERIFY(readResult->token.isEmpty());
+}
+
+void TokenStoreTests::
+    readMatchedBindingWithWhitespaceOnlyTokenIsBackendErrorNotSuccess() {
+  // Craft a structurally valid v1 envelope (correct magic prefix, version,
+  // and identity-length framing, with the expected endpoint identity) whose
+  // TOKEN portion is whitespace-only. serializeTokenEnvelope()/saveToken()
+  // never produce this themselves -- saveToken() rejects a whitespace-only
+  // token outright -- so this simulates a tampered/corrupted secure-store
+  // entry that nonetheless parses as TokenEnvelopeParseOutcome::Parsed.
+  const QString identity = endpointIdentityA();
+  const QString whitespaceToken = QStringLiteral("   \t  ");
+  const QString tampered = QStringLiteral("AHKV1:") +
+                           QString::number(identity.size()) + u':' + identity +
+                           whitespaceToken;
+
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(tampered);
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Parsed);
+  QVERIFY(parsed.token.trimmed().isEmpty());
+
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  auto *rawFactory = factory.get();
+  const QString profileId = newProfileId();
+  rawFactory->seedStoredToken(QtKeychainTokenStore::serviceName(), profileId,
+                              tampered);
+  QtKeychainTokenStore store(std::move(factory));
+
+  const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, identity, std::move(cb));
+  });
+  QVERIFY(readResult.has_value());
+  // Must NEVER surface Success with an unusable whitespace-only token, even
+  // though the envelope's endpoint-identity binding matched exactly.
+  QCOMPARE(readResult->outcome, TokenStoreOutcome::BackendError);
+  QVERIFY(readResult->token.isEmpty());
+  QVERIFY(!readResult->diagnostic.contains(whitespaceToken));
 }
 
 void TokenStoreTests::updatedEndpointBindingReplacesPreviousBinding() {
