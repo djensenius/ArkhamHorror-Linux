@@ -183,6 +183,23 @@ public:
   // coalesced-cancellation semantics. A stale/unknown handle is a no-op.
   void cancel(RequestHandle handle);
 
+  // Review item 9: true for exactly the ensureDecoded()/decodeAndValidate()
+  // failure codes that mean the CACHED BYTES THEMSELVES are now known bad
+  // against a fresh, current-limits re-check (wrong magic/content-type,
+  // failed decode, or exceeding the currently-configured dimension/pixel
+  // caps) -- as opposed to UnsupportedCodec, which means the bytes are
+  // still perfectly valid but this process currently has no installed
+  // decoder for them (e.g. libavif built without a usable AV1 codec
+  // backend); those valid bytes must never be quarantined/deleted, since
+  // a future process (or later in this same process's life) could still
+  // decode them successfully. Exposed publicly (it is a pure, stateless
+  // classification with no side effects) specifically so this exact
+  // classification can be tested directly and deterministically,
+  // independent of whatever byte sequence would be needed to organically
+  // provoke each AssetErrorCode through a real decode attempt -- see
+  // AssetRequestCoordinatorTests::unsupportedCodecIsNeverQuarantineWorthy().
+  [[nodiscard]] static bool isQuarantineWorthy(AssetErrorCode code);
+
   [[nodiscard]] int inFlightOperationCountForTesting() const {
     return m_operations.size();
   }
@@ -264,17 +281,6 @@ private:
   [[nodiscard]] AssetOutcome<AssetCache::CachedEntry>
   ensureDecoded(AssetCache::CachedEntry entry, AssetFormat format,
                 const QString &cacheKey);
-  // Review item 9: true for exactly the ensureDecoded()/decodeAndValidate()
-  // failure codes that mean the CACHED BYTES THEMSELVES are now known bad
-  // against a fresh, current-limits re-check (wrong magic/content-type,
-  // failed decode, or exceeding the currently-configured dimension/pixel
-  // caps) -- as opposed to UnsupportedCodec, which means the bytes are
-  // still perfectly valid but this process currently has no installed
-  // decoder for them (e.g. an AVIF plugin not present); those valid bytes
-  // must never be quarantined/deleted, since a future process (or later
-  // in this same process's life, if plugins are ever discovered late)
-  // could still decode them successfully.
-  [[nodiscard]] static bool isQuarantineWorthy(AssetErrorCode code);
   // Shared by every code path that hands a CACHE-SOURCED entry (never a
   // freshly-fetched one, which always already carries a decoded image --
   // see ensureDecoded()'s comment) to a consumer: runs ensureDecoded(),

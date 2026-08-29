@@ -116,6 +116,22 @@ libz_so="$(find_bundled_libz)"
 }
 
 
+# AVIF card art (djensenius/ArkhamHorror-Linux#17) is decoded directly
+# against libavif's own C API (see src/AssetAvifDecoder.cpp), linked as an
+# ordinary ELF DT_NEEDED dependency of arkham_foundation/arkham-horror --
+# unlike libsecret above (loaded via dlopen()/QLibrary at runtime, which
+# linuxdeploy's ldd-based automatic bundling can never discover on its
+# own), libavif.so and its own transitive AV1 codec-backend dependencies
+# (dav1d and/or aom) are ordinary linked libraries that linuxdeploy's
+# default ldd-based dependency resolution follows and bundles
+# automatically, exactly like Qt's own dependencies -- no explicit
+# --library flag is needed or added for it here. CI's recursive
+# DT_NEEDED closure audit (packaging/audit_dependency_closure.py) and
+# offline bundled-only round-trip smoke
+# (packaging/tests/avif_bundled_roundtrip_smoke.c) verify this
+# expectation against the real produced AppImage rather than merely
+# assuming it.
+
 # Package the third-party attribution files (QtKeychain's BSD-3-Clause
 # LICENSE and this project's own NOTICE.md) into the distributed AppImage
 # so end users receive accurate attribution without this unlicensed

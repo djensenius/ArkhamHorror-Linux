@@ -52,8 +52,8 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
-      - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Install QtKeychain and libavif build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev # libavif-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...) needs this even for the configure-only lint job.
       - run: mise run lint
 
   test:
@@ -68,12 +68,12 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. NOTE: Qt has no official AVIF plugin at all (upstream qtimageformats does not include one; a working plugin would require the separate third-party novomesk/qt-avif-image-plugin, out of scope here) -- the asset cache's AssetNetworkFetcher therefore returns a typed UnsupportedCodec error for AVIF assets on this runner, exactly as it does in local development, and the codec-support tests branch on QImageReader::supportedImageFormats().contains("avif") accordingly.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. AVIF card art is decoded directly against libavif's own C API (see src/AssetAvifDecoder.cpp), never through Qt's plugin registry -- Qt has no official AVIF plugin at all (upstream qtimageformats does not include one) -- so the codec-support tests exercise the real libavif-backed decode path unconditionally rather than branching on QImageReader::supportedImageFormats().
           cache: true
-      - name: Install QtKeychain and D-Bus build dependencies
+      - name: Install QtKeychain, D-Bus and libavif build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config dbus # dbus is required by kwallet_hardening test's fake KWallet service
+          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev provides the mandatory AVIF decode dependency (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)).
       - run: mise run test
 
   build:
@@ -90,8 +90,8 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
-      - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Install QtKeychain and libavif build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev
       - run: mise run build
 
   appimage-smoke:
@@ -111,10 +111,10 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; see the "Unit tests" job's Qt step above for why AVIF is not available here either.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; AVIF is decoded directly against a bundled libavif (see src/AssetAvifDecoder.cpp) rather than through any Qt image-format plugin, so no Qt AVIF module is needed here either.
           cache: true
-      - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+      - name: Install QtKeychain and libavif build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev
       - name: Test libsecret discovery fallback logic
         # Exercises find_bundled_libsecret() (used by build-appimage.sh
         # below) against ldconfig-absent, ldconfig-failing,
@@ -135,6 +135,15 @@ jobs:
         # (no apt-get/network) and independent of the real
         # libsecret/libgpg-error closure exercised further below.
         run: bash packaging/tests/test_audit_dependency_closure.sh
+      - name: Test the AVIF bundled round-trip smoke program in isolation
+        # Hermetic (no AppImage/container/network dependency) proof that
+        # packaging/tests/avif_bundled_roundtrip_smoke.c -- used later in
+        # this job to prove the real packaged AppImage's bundled libavif
+        # decodes with no host fallback -- is itself a correct,
+        # deterministic encode/decode round trip against whatever libavif
+        # this runner already has installed, before it is ever trusted
+        # against the real produced AppImage.
+        run: bash packaging/tests/test_avif_bundled_roundtrip_smoke.sh
       - name: Download packaging tools
         # Downloaded into $RUNNER_TEMP (outside the repository working
         # directory that "*.AppImage" globs below and in the upload step
@@ -286,11 +295,16 @@ jobs:
         # AVIF has no official Qt plugin at all as of this Qt release
         # (upstream qtimageformats does not ship one; a working plugin
         # would require the separate third-party
-        # novomesk/qt-avif-image-plugin, out of scope here), so
-        # AssetNetworkFetcher's typed UnsupportedCodec path -- not a
-        # bundled AVIF plugin -- is the actual, permanent behavior for
-        # AVIF assets on every target this AppImage runs on today; there
-        # is deliberately no AVIF plugin check here to assert against.
+        # novomesk/qt-avif-image-plugin, out of scope here) -- but unlike
+        # the earlier permanent-gap approach, this is not a problem: AVIF
+        # card art is decoded directly against a bundled libavif via its
+        # own C API (src/AssetAvifDecoder.cpp), bypassing Qt's plugin
+        # registry (QImageReader/QFactoryLoader) entirely, so there is
+        # deliberately no Qt AVIF *plugin* check here to assert against.
+        # See the "Verify libavif and its codec backend closure are
+        # bundled" and "Verify the bundled libavif decodes AVIF images
+        # with no host codec fallback" steps below for the actual AVIF
+        # proof.
         run: |
           set -euo pipefail
           extracted="$(pwd)/squashfs-root"
@@ -305,6 +319,74 @@ jobs:
             file "$jpeg_plugin" >&2
             exit 1
           }
+      - name: Verify libavif and its codec backend closure are bundled
+        # AVIF card art (djensenius/ArkhamHorror-Linux#17) is decoded
+        # directly against libavif's own C API (src/AssetAvifDecoder.cpp),
+        # linked as an ordinary ELF DT_NEEDED dependency -- unlike
+        # libsecret (loaded via dlopen()), linuxdeploy's default ldd-based
+        # automatic bundling is expected to have picked up libavif.so and
+        # its own transitive AV1 codec-backend dependencies (dav1d and/or
+        # aom) on its own, with no explicit --library flag needed in
+        # build-appimage.sh. This step proves that expectation against
+        # the real produced AppImage rather than merely assuming it,
+        # reusing the exact same host-independent recursive DT_NEEDED
+        # closure auditor already proven against the libsecret closure
+        # below (packaging/audit_dependency_closure.py), rooted at the
+        # bundled libavif instead.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          avif_lib="$(find "$extracted" -name 'libavif.so*' | head -n1)"
+          [[ -n "$avif_lib" ]] || {
+            echo "libavif.so was not bundled into the AppImage." >&2
+            exit 1
+          }
+          echo "Found bundled libavif: $avif_lib"
+          file "$avif_lib" | grep -q 'ELF' || {
+            echo "Bundled libavif.so is not a valid ELF shared object:" >&2
+            file "$avif_lib" >&2
+            exit 1
+          }
+          avif_lib_dir="$(dirname "$avif_lib")"
+          avif_name="$(basename "$avif_lib")"
+          echo "Auditing the real bundled libavif closure (codec backends included)..."
+          python3 packaging/audit_dependency_closure.py "$avif_lib_dir" --root "$avif_name"
+      - name: Verify the bundled libavif decodes AVIF images with no host codec fallback
+        # Complementary to the static closure audit above (mirroring the
+        # libsecret dlopen() no-host-fallback proof further below): builds
+        # packaging/tests/avif_bundled_roundtrip_smoke.c -- a small,
+        # self-contained program that encodes then decodes a tiny
+        # synthetic (never official card art) in-memory AVIF image using
+        # libavif's own C API, linked (`-lavif`) the same ordinary
+        # ELF-dependency way the real application is -- then runs the
+        # compiled binary inside a container built from
+        # debian:bookworm-slim (pinned by digest, matching this repo's
+        # policy of pinning external dependencies precisely; Debian
+        # bookworm's own default package set does not include any libavif
+        # package), mounting only the AppImage's extracted lib directory
+        # (read-only) and setting LD_LIBRARY_PATH at container-start so
+        # the dynamic linker is directed to the mounted bundled copy
+        # first. A successful encode+decode round trip is only possible
+        # if every one of libavif's own runtime dependencies -- the AV1
+        # codec backend included -- was actually bundled and is genuinely
+        # loadable, not merely present as an inert file.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          avif_lib="$(find "$extracted" -name 'libavif.so*' | head -n1)"
+          [[ -n "$avif_lib" ]] || {
+            echo "libavif.so not found in the extracted AppImage." >&2
+            exit 1
+          }
+          avif_lib_dir="$(dirname "$avif_lib")"
+          cc packaging/tests/avif_bundled_roundtrip_smoke.c -o "$RUNNER_TEMP/avif_bundled_roundtrip_smoke" \
+            $(pkg-config --cflags --libs libavif)
+          docker run --rm \
+            --env LD_LIBRARY_PATH=/appdir-lib \
+            --volume "$avif_lib_dir:/appdir-lib:ro" \
+            --volume "$RUNNER_TEMP/avif_bundled_roundtrip_smoke:/avif_bundled_roundtrip_smoke:ro" \
+            debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
+            /avif_bundled_roundtrip_smoke
       - name: Recursive DT_NEEDED closure audit (with mutation regressions)
         # A static, purely file-based proof (packaging/audit_dependency_closure.py)
         # that every non-ABI transitive dependency of the bundled libsecret

@@ -10,6 +10,7 @@
 #include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QTest>
+#include <avif/avif.h>
 #include <cstring>
 #include <optional>
 
@@ -38,6 +39,116 @@ QByteArray encodeImage(int width, int height, const char *format) {
 }
 
 using Outcome = AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult>;
+
+// Encodes a tiny, genuinely valid, original (never-shipped) AVIF fixture
+// at test-runtime via libavif's own encoder API -- exactly mirroring
+// encodeImage()'s convention of generating JPEG/PNG fixtures on the fly
+// via QImage::save() above, rather than committing any binary image
+// blob to the repository. Used both to prove the real decode path
+// (AssetAvifDecoder.cpp) succeeds on genuine input, and as the base for
+// the "dimension bomb" test below (patchAvifIspeBoxDimensions()), which
+// mutates a copy of this same real, tiny encoded payload's declared
+// container dimensions without touching its actual (still-tiny) AV1
+// pixel payload.
+QByteArray encodeAvifFixture(int width, int height) {
+  avifImage *image = avifImageCreate(static_cast<uint32_t>(width),
+                                     static_cast<uint32_t>(height),
+                                     /*depth=*/8, AVIF_PIXEL_FORMAT_YUV420);
+  if (image == nullptr) {
+    qFatal("encodeAvifFixture() failed to allocate an avifImage");
+  }
+
+  avifRGBImage rgb;
+  avifRGBImageSetDefaults(&rgb, image);
+  rgb.format = AVIF_RGB_FORMAT_RGBA;
+  rgb.depth = 8;
+  if (avifRGBImageAllocatePixels(&rgb) != AVIF_RESULT_OK) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifFixture() failed to allocate RGB pixels");
+  }
+  // Fill with a flat, non-black colour: solid black is a degenerate input
+  // some encoders special-case, and this fixture should exercise a
+  // normal encode/decode round trip.
+  for (uint32_t row = 0; row < rgb.height; ++row) {
+    uint8_t *line = rgb.pixels + static_cast<size_t>(row) * rgb.rowBytes;
+    for (uint32_t col = 0; col < rgb.width; ++col) {
+      uint8_t *pixel = line + static_cast<size_t>(col) * 4;
+      pixel[0] = 0x40;
+      pixel[1] = 0x80;
+      pixel[2] = 0xC0;
+      pixel[3] = 0xFF;
+    }
+  }
+
+  const avifResult toYuvResult = avifImageRGBToYUV(image, &rgb);
+  avifRGBImageFreePixels(&rgb);
+  if (toYuvResult != AVIF_RESULT_OK) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifFixture() failed to convert RGB to YUV: %s",
+           avifResultToString(toYuvResult));
+  }
+
+  avifEncoder *encoder = avifEncoderCreate();
+  if (encoder == nullptr) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifFixture() failed to allocate an avifEncoder");
+  }
+  encoder->speed = AVIF_SPEED_FASTEST;
+
+  avifRWData output = AVIF_DATA_EMPTY;
+  const avifResult writeResult = avifEncoderWrite(encoder, image, &output);
+  avifEncoderDestroy(encoder);
+  avifImageDestroy(image);
+  if (writeResult != AVIF_RESULT_OK) {
+    qFatal("encodeAvifFixture() failed to encode: %s",
+           avifResultToString(writeResult));
+  }
+
+  QByteArray bytes(reinterpret_cast<const char *>(output.data),
+                   static_cast<int>(output.size));
+  avifRWDataFree(&output);
+  return bytes;
+}
+
+// Returns a copy of `original` (a real, validly-encoded AVIF produced by
+// encodeAvifFixture()) with its ISOBMFF `ispe` ("Image Spatial Extents")
+// box's declared width/height fields overwritten to `width`/`height`,
+// leaving the actual (still-tiny) AV1 pixel payload completely
+// untouched. This lets a test assert that a declared-dimension check
+// runs (and rejects the input) BEFORE any real pixel decode/allocation
+// is attempted -- see AssetAvifDecoder.cpp's decodeAvifImage(), which
+// checks decoder->image->width/height immediately after
+// avifDecoderParse() (metadata only) and before ever calling
+// avifDecoderNextImage() (full AV1 decode + pixel buffer allocation) --
+// without needing to actually encode a real multi-billion-pixel image.
+// The `ispe` box layout (ISO/IEC 14496-12 + ISO/IEC 23008-12 Annex B):
+// size(4) + "ispe"(4) + version_and_flags(4) + width(4) + height(4), all
+// big-endian.
+QByteArray patchAvifIspeBoxDimensions(const QByteArray &original, quint32 width,
+                                      quint32 height) {
+  const char *needle = "ispe";
+  const int needleIndex = original.indexOf(needle);
+  if (needleIndex < 0) {
+    qFatal("patchAvifIspeBoxDimensions() could not find an 'ispe' box in "
+           "the supplied fixture bytes");
+  }
+  QByteArray patched = original;
+  const int widthOffset = needleIndex + 4 /* "ispe" */ + 4 /* version+flags */;
+  const int heightOffset = widthOffset + 4;
+  if (heightOffset + 4 > patched.size()) {
+    qFatal("patchAvifIspeBoxDimensions() found an 'ispe' box too close to "
+           "the end of the buffer to hold width+height fields");
+  }
+  auto writeBigEndianU32 = [&patched](int offset, quint32 value) {
+    patched[offset + 0] = static_cast<char>((value >> 24) & 0xFF);
+    patched[offset + 1] = static_cast<char>((value >> 16) & 0xFF);
+    patched[offset + 2] = static_cast<char>((value >> 8) & 0xFF);
+    patched[offset + 3] = static_cast<char>(value & 0xFF);
+  };
+  writeBigEndianU32(widthOffset, width);
+  writeBigEndianU32(heightOffset, height);
+  return patched;
+}
 
 // Fetches synchronously (from the test's point of view) by pumping the
 // event loop until the callback fires or `timeoutMs` elapses. A timeout
@@ -569,36 +680,19 @@ void AssetNetworkFetcherTests::
   QCOMPARE((**result).asset->dimensions, QSize(48, 48));
 }
 
-void AssetNetworkFetcherTests::avifCodecSupportIsEnvironmentAdaptive() {
-  const bool avifSupported =
-      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));
-
+void AssetNetworkFetcherTests::avifRealFixtureAlwaysDecodesViaLibavif() {
+  // Review item 4 (PR #18 cumulative review): AVIF decode is no longer
+  // "environment adaptive" (dependent on whatever Qt image plugins a
+  // given build happens to have registered) -- it is always routed
+  // directly through libavif's own C API (AssetAvifDecoder.cpp), which
+  // is now a hard, required build dependency (see CMakeLists.txt's
+  // pkg_check_modules(LIBAVIF REQUIRED ...)). A genuine, validly-encoded
+  // AVIF fixture must therefore ALWAYS decode successfully here,
+  // regardless of what QImageReader::supportedImageFormats() reports.
   MockHttpServer server;
   MockHttpServer::Response response;
   response.contentType = "image/avif";
-
-  QByteArray body;
-  if (avifSupported) {
-    QImage image(32, 32, QImage::Format_Mono);
-    image.fill(0);
-    QBuffer buffer(&body);
-    buffer.open(QIODevice::WriteOnly);
-    if (!image.save(&buffer, "avif")) {
-      QSKIP("installed Qt build reports AVIF read support but cannot "
-            "encode a fixture image; skipping environment-specific case");
-    }
-  } else {
-    // A minimal ISOBMFF "ftyp" box whose major brand is "avif": enough to
-    // pass this class's independent magic-byte sniff, but with no actual
-    // decodable AV1 payload -- exactly modelling "bytes are structurally
-    // plausible but this Qt build has no plugin to decode them."
-    body = QByteArrayLiteral("\x00\x00\x00\x14"
-                             "ftyp"
-                             "avif"
-                             "\x00\x00\x00\x00"
-                             "avif");
-  }
-  response.body = body;
+  response.body = encodeAvifFixture(32, 24);
   server.setResponse(QStringLiteral("/image.avif"), response);
 
   QNetworkAccessManager nam;
@@ -608,12 +702,79 @@ void AssetNetworkFetcherTests::avifCodecSupportIsEnvironmentAdaptive() {
                    AssetFormat::Avif);
 
   QVERIFY(result.has_value());
-  if (avifSupported) {
-    QVERIFY2(bool(*result), qPrintable(result->error().message));
-  } else {
-    QVERIFY(!bool(*result));
-    QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
-  }
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).asset->dimensions, QSize(32, 24));
+  QVERIFY(!(**result).asset->decodedImage.isNull());
+}
+
+void AssetNetworkFetcherTests::
+    avifMalformedContainerIsReportedAsMalformedImage() {
+  // A body whose magic bytes/major_brand genuinely identify it as AVIF
+  // (so it passes the independent magic-byte sniff) but which has no
+  // meta/mdat box at all -- i.e. no image content whatsoever -- must be
+  // rejected by libavif's own parse step as a structurally invalid
+  // container. This is a genuine integrity failure (MalformedImage), NOT
+  // AssetErrorCode::UnsupportedCodec: the distinction matters because
+  // review item 9's quarantine logic treats them completely differently
+  // (MalformedImage quarantines and retries as a network miss;
+  // UnsupportedCodec never does, because the bytes are still valid).
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  response.body = QByteArrayLiteral("\x00\x00\x00\x14"
+                                    "ftyp"
+                                    "avif"
+                                    "\x00\x00\x00\x00"
+                                    "avif");
+  server.setResponse(QStringLiteral("/no-content.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/no-content.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::
+    avifDimensionBombIsRejectedBeforeAnyPixelDecodeOrAllocation() {
+  // A REAL, validly-encoded (tiny) AVIF whose `ispe` box has been
+  // byte-patched to declare an enormous width/height -- while its actual
+  // AV1 pixel payload remains genuinely tiny -- must be rejected with
+  // DimensionTooLarge purely from avifDecoderParse()'s (metadata-only)
+  // output, without libavif ever being asked to allocate/decode a full
+  // pixel buffer for the (fictitious) huge declared size. This directly
+  // exercises AssetAvifDecoder.cpp's "check decoder->image->width/height
+  // immediately after avifDecoderParse(), before ever calling
+  // avifDecoderNextImage()" design -- if that ordering were ever
+  // accidentally reversed, this test would hang/OOM instead of failing
+  // fast with a clean error.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  // 20000x100: both libavif's OWN built-in defaults (32768 per-dimension,
+  // 16384*16384 total) and this image's actual (tiny) AV1 payload are
+  // fine with this shape, so avifDecoderParse() itself succeeds -- it is
+  // AssetAvifDecoder.cpp's OWN post-parse width check (configured
+  // maxDimensionPixels, default 8192) that must reject this, not
+  // libavif's internal defaults or a parse-level failure.
+  response.body = patchAvifIspeBoxDimensions(encodeAvifFixture(8, 8),
+                                             /*width=*/20000,
+                                             /*height=*/100);
+  server.setResponse(QStringLiteral("/dimension-bomb.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/dimension-bomb.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::DimensionTooLarge);
 }
 
 void AssetNetworkFetcherTests::
@@ -623,16 +784,10 @@ void AssetNetworkFetcherTests::
   // whose `ftyp` box declares size 0 is still a spec-valid AVIF signature
   // and must be accepted by the independent magic-byte sniff (never
   // rejected as AssetErrorCode::MagicBytesMismatch). This synthetic body
-  // is a bare `ftyp` box only (no meta/mdat), so it is never a real
-  // decodable image; whether an AVIF-capable Qt build can decode a real
-  // file is already covered by avifCodecSupportIsEnvironmentAdaptive()
-  // above, so a build that DOES have codec support is a real image
-  // decode attempt against garbage bytes here -- MalformedImage is an
-  // acceptable outcome in that (currently never exercised) case, but
-  // MagicBytesMismatch is never acceptable regardless of codec support.
-  const bool avifSupported =
-      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));
-
+  // is a bare `ftyp` box only (no meta/mdat), so libavif's own parse
+  // step correctly rejects it as a structurally invalid container
+  // (MalformedImage) once past the sniff -- AVIF decode is unconditional
+  // now (review item 4), so this is no longer environment-dependent.
   MockHttpServer server;
   MockHttpServer::Response response;
   response.contentType = "image/avif";
@@ -650,12 +805,9 @@ void AssetNetworkFetcherTests::
       AssetFormat::Avif);
 
   QVERIFY(result.has_value());
-  if (!bool(*result)) {
-    QVERIFY(result->error().code != AssetErrorCode::MagicBytesMismatch);
-    if (!avifSupported) {
-      QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
-    }
-  }
+  QVERIFY(!bool(*result));
+  QVERIFY(result->error().code != AssetErrorCode::MagicBytesMismatch);
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
 }
 
 void AssetNetworkFetcherTests::
@@ -781,9 +933,6 @@ void AssetNetworkFetcherTests::
       buildLargeFtypBox(1 * 1024 * 1024, "QQQQ", /*matchBrand=*/"avif");
   server.setResponse(QStringLiteral("/large-last-slot.avif"), response);
 
-  const bool avifSupported =
-      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));
-
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
   const auto result = fetchAndWait(
@@ -791,15 +940,13 @@ void AssetNetworkFetcherTests::
       AssetFormat::Avif);
 
   QVERIFY(result.has_value());
-  if (!bool(*result)) {
-    // The signature matched (that is what this test is proving); this
-    // body is not a real decodable image, so any failure past that
-    // point must never be MagicBytesMismatch.
-    QVERIFY(result->error().code != AssetErrorCode::MagicBytesMismatch);
-    if (!avifSupported) {
-      QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
-    }
-  }
+  // The signature matched (that is what this test is proving); this
+  // body has no meta/mdat box (only ftyp compatible_brands padding), so
+  // libavif's own parse step rejects it as a structurally invalid
+  // container -- MalformedImage, never MagicBytesMismatch.
+  QVERIFY(!bool(*result));
+  QVERIFY(result->error().code != AssetErrorCode::MagicBytesMismatch);
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
 }
 
 void AssetNetworkFetcherTests::

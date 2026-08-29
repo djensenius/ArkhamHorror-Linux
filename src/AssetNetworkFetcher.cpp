@@ -1,5 +1,7 @@
 #include "AssetNetworkFetcher.h"
 
+#include "AssetAvifDecoder.h"
+
 #include <QBuffer>
 #include <QCryptographicHash>
 #include <QImageReader>
@@ -227,19 +229,27 @@ QString normalizeContentType(const QString &raw) {
 // decode, since QImageReader's format hint is matched by exact plugin key.
 // JPEG is checked/hinted under both of Qt's registered plugin keys
 // ("jpeg" and "jpg" -- both are advertised by the stock qjpeg plugin, but
-// a build could plausibly register only one). AVIF/PNG have exactly one
-// Qt key each.
+// a build could plausibly register only one). PNG has exactly one Qt key.
+//
+// AVIF is deliberately NEVER routed through this function (see
+// decodeAndValidate() and AssetAvifDecoder.h) -- it is decoded directly
+// against libavif's own C API, independent of whatever Qt image plugins
+// this build happens to have registered, so this function's answer for
+// AVIF would never actually be consulted.
 struct QtCodecSupport {
   bool supported{false};
   QByteArray formatHint;
 };
 
 QtCodecSupport resolveQtCodecSupport(AssetFormat format) {
+  Q_ASSERT(format != AssetFormat::Avif);
   const QList<QByteArray> supported = QImageReader::supportedImageFormats();
   switch (format) {
   case AssetFormat::Avif:
-    return {supported.contains(QByteArrayLiteral("avif")),
-            QByteArrayLiteral("avif")};
+    // Unreachable per the Q_ASSERT above in a debug build; in a release
+    // build, fail closed rather than silently reporting support this
+    // function never actually checked for AVIF.
+    return {false, QByteArrayLiteral("avif")};
   case AssetFormat::Jpeg:
     if (supported.contains(QByteArrayLiteral("jpeg"))) {
       return {true, QByteArrayLiteral("jpeg")};
@@ -668,6 +678,17 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
         AssetErrorCode::MalformedImage,
         QStringLiteral("JPEG body has no genuine End-Of-Image marker "
                        "(response was likely truncated in transit)")});
+  }
+
+  // AVIF is decoded directly against libavif's own C API (see
+  // AssetAvifDecoder.h/.cpp) -- never through QImageReader/Qt's plugin
+  // registry, so it never depends on whether this build happens to have a
+  // Qt AVIF plugin registered (review item 4: Qt has no official AVIF
+  // plugin at all, and card art defaults to AVIF, so a permanent
+  // UnsupportedCodec here is not acceptable).
+  if (expectedFormat == AssetFormat::Avif) {
+    return decodeAvifImage(encodedBytes, m_limits.maxDimensionPixels,
+                           m_limits.maxTotalPixels);
   }
 
   const QtCodecSupport codecSupport = resolveQtCodecSupport(expectedFormat);

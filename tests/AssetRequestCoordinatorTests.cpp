@@ -41,13 +41,14 @@ QByteArray encodePng(int width, int height) {
 // identify these bytes as AVIF (see sniffMagicBytes() in
 // AssetNetworkFetcher.cpp), without needing a full, real, pixel-encoded
 // AVIF image. This is deliberately used only to exercise the pipeline up
-// to (and no further than) the Qt-codec-support gate: this build/CI
-// environment has no Qt AVIF decode plugin installed (see issue #17
-// review item 4, not yet implemented), so a genuine Card/HomebrewCard
-// fetch of real bytes is expected to end in AssetErrorCode::UnsupportedCodec
-// here, not a successful decode -- proving every earlier gate (correct
-// candidate URL requested, Content-Type match, magic-byte match) passed
-// for real AVIF-shaped bytes.
+// to (and no further than) the magic-byte sniff gate: since AVIF decode
+// is now unconditional (real libavif, not an optional Qt plugin -- see
+// review item 4), a genuine Card/HomebrewCard fetch of these bytes ends
+// in AssetErrorCode::MalformedImage (libavif's own parse step correctly
+// rejects a bare ftyp box with no meta/mdat as a structurally invalid
+// container), not a successful decode -- proving every earlier gate
+// (correct candidate URL requested, Content-Type match, magic-byte
+// match) passed for real AVIF-shaped bytes.
 QByteArray minimalAvifFtypBox() {
   QByteArray bytes;
   bytes.append(char(0));
@@ -456,19 +457,20 @@ void AssetRequestCoordinatorTests::advancesToNextCandidateOnlyOnNotFound() {
   coordinator.request(key, [&](Result r) { result = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
 
-  // No Qt AVIF decode plugin is installed in this build/CI environment
-  // (see issue #17 review item 4, not yet implemented): the FINAL typed
-  // outcome for genuinely AVIF-shaped bytes is UnsupportedCodec, not a
+  // minimalAvifFtypBox() is a bare "ftyp" box only (no meta/mdat), so
+  // libavif's own parse step rejects it as a structurally invalid
+  // container once past magic-byte sniffing: the FINAL typed outcome for
+  // this genuinely AVIF-shaped-but-empty body is MalformedImage, not a
   // successful decode. That is expected and, combined with the two
   // requestCount assertions below, still fully proves the fallback
   // mechanism itself: the coordinator correctly advanced past the
   // English candidate's definitive 404 to the alternate-front candidate,
   // requested exactly the right URL there, and got far enough into
   // validating that response (past Content-Type and magic-byte checks)
-  // to reach the codec-support gate -- it did not stop early, retry the
+  // to reach the real decode attempt -- it did not stop early, retry the
   // same candidate, or skip straight past validation.
   QVERIFY(!bool(*result));
-  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
   QCOMPARE(
       server.requestCount(QStringLiteral("/img/arkham/cards/valid01.avif")), 1);
   QCOMPARE(
@@ -610,13 +612,14 @@ void AssetRequestCoordinatorTests::
       1);
   // Proof the pre-cached English entry was never even consulted over the
   // network for this same reason it was never served either: the final
-  // outcome is this environment's expected UnsupportedCodec (no Qt AVIF
-  // decode plugin -- see minimalAvifFtypBox()'s comment), NOT a success
-  // carrying the pre-seeded English bytes. If the coordinator had
-  // (incorrectly) shortcut straight to the cached English entry, this
-  // would instead be a success whose encodedBytes equal preSeededEnglish.
+  // outcome is MalformedImage (minimalAvifFtypBox() is a bare, content-
+  // less "ftyp" box that libavif's own parse step rejects once past
+  // magic-byte sniffing), NOT a success carrying the pre-seeded English
+  // bytes. If the coordinator had (incorrectly) shortcut straight to the
+  // cached English entry, this would instead be a success whose
+  // encodedBytes equal preSeededEnglish.
   QVERIFY(!bool(*result));
-  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
   QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
            0);
 }
@@ -654,15 +657,15 @@ void AssetRequestCoordinatorTests::
   std::optional<Result> firstResult;
   coordinator.request(key, [&](Result r) { firstResult = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return firstResult.has_value(); }, 5000));
-  // English is genuinely AVIF-shaped but undecodable in this environment
-  // (no Qt AVIF plugin): UnsupportedCodec, not a success -- deterministic
-  // and, crucially, never stored in the cache (only a successful outcome
-  // is ever cache-stored), so a second identical request cannot shortcut
-  // via an English cache hit either -- it can ONLY shortcut via the
-  // localized candidate's negative-404 record, which is exactly what this
-  // test proves.
+  // English is genuinely AVIF-shaped but has no actual image content
+  // (minimalAvifFtypBox() is a bare "ftyp" box): MalformedImage, not a
+  // success -- deterministic and, crucially, never stored in the cache
+  // (only a successful outcome is ever cache-stored), so a second
+  // identical request cannot shortcut via an English cache hit either --
+  // it can ONLY shortcut via the localized candidate's negative-404
+  // record, which is exactly what this test proves.
   QVERIFY(!bool(*firstResult));
-  QCOMPARE(firstResult->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(firstResult->error().code, AssetErrorCode::MalformedImage);
   QCOMPARE(
       server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
       1);
@@ -674,11 +677,11 @@ void AssetRequestCoordinatorTests::
   QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 5000));
 
   QVERIFY(!bool(*secondResult));
-  QCOMPARE(secondResult->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(secondResult->error().code, AssetErrorCode::MalformedImage);
   // The localized candidate's confirmed negative-404 record authorized
   // skipping it entirely on this second request: its request count did
   // NOT increase, while English (genuinely re-tried, since its own
-  // UnsupportedCodec outcome left no cache entry or negative record) did.
+  // MalformedImage outcome left no cache entry or negative record) did.
   QCOMPARE(
       server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
       1);
@@ -1176,12 +1179,12 @@ void AssetRequestCoordinatorTests::
 
   // The 404'd English candidate was evicted (never resurrected via
   // stale-if-error) and the request genuinely advanced to (and
-  // requested) the alt-front-fallback candidate: its own outcome is this
-  // environment's expected UnsupportedCodec (no Qt AVIF decode plugin),
+  // requested) the alt-front-fallback candidate: its own outcome is
+  // MalformedImage (minimalAvifFtypBox() has no actual image content),
   // proving real advancement rather than a hang or a false stale
   // success.
   QVERIFY(!bool(*result));
-  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
   QCOMPARE(
       server.requestCount(QStringLiteral("/img/arkham/cards/valid01.avif")), 1);
   QCOMPARE(
@@ -1705,51 +1708,45 @@ void AssetRequestCoordinatorTests::
   QCOMPARE(server.requestCount(path), 2);
 }
 
-void AssetRequestCoordinatorTests::
-    unsupportedCodecDecodeFailureNeverQuarantinesValidBytes() {
+void AssetRequestCoordinatorTests::unsupportedCodecIsNeverQuarantineWorthy() {
   // Review item 9's explicit carve-out: AssetErrorCode::UnsupportedCodec
-  // means the cached bytes are still perfectly valid -- this process
-  // simply has no installed decoder for them right now (this build/CI
-  // environment has no Qt AVIF plugin; see minimalAvifFtypBox()'s
-  // comment) -- so, unlike a genuine integrity/format/limits failure,
-  // this must NEVER evict the entry or trigger a network retry.
-  MockHttpServer server;
+  // means cached bytes are still perfectly valid -- this process simply
+  // has no installed decoder for them right now -- so, unlike a genuine
+  // integrity/format/limits failure, it must never evict the entry or
+  // trigger a network retry. This directly and deterministically tests
+  // isQuarantineWorthy()'s classification for every AssetErrorCode value
+  // that ensureDecoded()/decodeAndValidate() can actually produce, rather
+  // than relying on some specific crafted byte sequence to organically
+  // provoke each code through a real decode attempt: since AVIF decode is
+  // now unconditional (real libavif, not an optional Qt plugin -- see
+  // review item 4), UnsupportedCodec for AVIF can now only arise from a
+  // genuinely broken/incomplete libavif build (missing AV1 codec backend
+  // entirely), which is not something a portable, deterministic test
+  // fixture can reliably provoke -- but the classification itself is
+  // pure, stateless, and fully specified, so it is tested directly here.
+  QVERIFY(!AssetRequestCoordinator::isQuarantineWorthy(
+      AssetErrorCode::UnsupportedCodec));
 
-  QNetworkAccessManager nam;
-  AssetNetworkFetcher fetcher(nam);
-  AssetCache::Config cacheConfig;
-  cacheConfig.directory = m_tempDirPath;
-  AssetCache cache(cacheConfig);
+  // Every genuine integrity/format/limits failure IS quarantine-worthy:
+  // the cached bytes themselves are now known bad against a fresh,
+  // current-limits re-check.
+  QVERIFY(AssetRequestCoordinator::isQuarantineWorthy(
+      AssetErrorCode::MagicBytesMismatch));
+  QVERIFY(AssetRequestCoordinator::isQuarantineWorthy(
+      AssetErrorCode::MalformedImage));
+  QVERIFY(AssetRequestCoordinator::isQuarantineWorthy(
+      AssetErrorCode::DimensionTooLarge));
+  QVERIFY(AssetRequestCoordinator::isQuarantineWorthy(
+      AssetErrorCode::PixelBudgetExceeded));
+  QVERIFY(AssetRequestCoordinator::isQuarantineWorthy(
+      AssetErrorCode::CacheCorrupt));
 
-  const AssetKey key =
-      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
-  const auto candidates = AssetLocator::resolveCandidates(key);
-  QVERIFY(bool(candidates));
-  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
-
-  AssetCache::CachedEntry preSeeded;
-  // Genuinely AVIF-shaped (passes magic-byte sniffing) but undecodable in
-  // this environment -- NOT malformed/corrupt bytes.
-  preSeeded.encodedBytes = minimalAvifFtypBox();
-  preSeeded.contentType = QStringLiteral("image/avif");
-  preSeeded.dimensions = QSize(4, 4);
-  cache.store(cacheKey, preSeeded);
-
-  AssetCache restartedCache(cacheConfig);
-  AssetRequestCoordinator coordinator(restartedCache, fetcher);
-
-  std::optional<Result> result;
-  coordinator.request(key, [&](Result r) { result = std::move(r); });
-  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
-
-  QVERIFY(!bool(*result));
-  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
-  // No network round trip at all: the cache hit's own decode failure was
-  // never treated as grounds for a retry.
-  QCOMPARE(
-      server.requestCount(QStringLiteral("/img/arkham/cards/valid01.avif")), 0);
-  // The still-valid bytes were never evicted.
-  const auto onDisk = restartedCache.lookupDisk(cacheKey);
-  QVERIFY(onDisk.has_value());
-  QCOMPARE(onDisk->encodedBytes, preSeeded.encodedBytes);
+  // Transport-class codes are neither reachable from ensureDecoded() nor
+  // quarantine-worthy: a cache-sourced entry that fails to decode never
+  // surfaces these, but the classification must still fail closed (never
+  // quarantine) for any code it was not explicitly designed for.
+  QVERIFY(
+      !AssetRequestCoordinator::isQuarantineWorthy(AssetErrorCode::Transport));
+  QVERIFY(!AssetRequestCoordinator::isQuarantineWorthy(
+      AssetErrorCode::ContentTypeMismatch));
 }

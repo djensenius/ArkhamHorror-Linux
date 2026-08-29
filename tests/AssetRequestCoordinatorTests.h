@@ -71,7 +71,7 @@ private slots:
   void diskHitAfterRestartDecodesOnDemandAndPublishesToMemory();
   void malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork();
   void quarantineRefetchFailureSurfacesFreshErrorWithoutLooping();
-  void unsupportedCodecDecodeFailureNeverQuarantinesValidBytes();
+  void unsupportedCodecIsNeverQuarantineWorthy();
   void
   delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry();
   void

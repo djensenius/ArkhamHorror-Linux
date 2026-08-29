@@ -40,7 +40,9 @@ private slots:
   void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected_data();
   void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected();
   void jpegWithStuffedFFBytesInScanDataStillDecodesWhenComplete();
-  void avifCodecSupportIsEnvironmentAdaptive();
+  void avifRealFixtureAlwaysDecodesViaLibavif();
+  void avifMalformedContainerIsReportedAsMalformedImage();
+  void avifDimensionBombIsRejectedBeforeAnyPixelDecodeOrAllocation();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void avifFtypMinorVersionIsNeverMisreadAsCompatibleBrand();
   void avifFtypTruncatedBoxSizeNeverReadsPastDeclaredBoundary();

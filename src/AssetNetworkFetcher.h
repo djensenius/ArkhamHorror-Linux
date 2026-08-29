@@ -52,15 +52,21 @@ namespace Arkham {
 //      (AssetErrorCode::MagicBytesMismatch otherwise) -- a server lying
 //      about Content-Type is caught even if declared correctly by
 //      coincidence, and vice versa.
-//   3. QImageReader::size() is inspected BEFORE any decode is attempted;
-//      each dimension is capped at `limits.maxDimensionPixels` and
+//   3. QImageReader::size() is inspected BEFORE any decode is attempted
+//      for JPEG/PNG (AVIF's equivalent dimension check happens inside
+//      AssetAvifDecoder.cpp, against parsed-but-not-yet-decoded container
+//      metadata -- see decodeAndValidate()'s AVIF branch below); each
+//      dimension is capped at `limits.maxDimensionPixels` and
 //      width*height (computed in 64-bit, never overflowing) is capped at
 //      `limits.maxTotalPixels`, rejecting a dimension/pixel bomb before a
 //      single pixel is decoded.
-//   4. Only then is the image actually decoded. If the installed Qt build
-//      has no plugin capable of decoding `expectedFormat` at all, this is
-//      reported as the distinct AssetErrorCode::UnsupportedCodec rather
-//      than the generic AssetErrorCode::MalformedImage used for a
+//   4. Only then is the image actually decoded: AVIF goes directly
+//      through libavif's own C API (AssetAvifDecoder.h), a required
+//      build/runtime dependency, never through Qt's plugin registry.
+//      JPEG/PNG still go through QImageReader; if the installed Qt build
+//      has no plugin capable of decoding one of those two formats, this
+//      is reported as the distinct AssetErrorCode::UnsupportedCodec
+//      rather than the generic AssetErrorCode::MalformedImage used for a
 //      truncated/corrupt body of an otherwise-supported format.
 //
 // Every async callback is guarded by a QPointer and an exact per-request

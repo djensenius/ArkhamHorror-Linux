@@ -13,6 +13,21 @@ find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Network Quick QuickControls2 W
 
 qt_standard_project_setup(REQUIRES 6.8)
 
+# --- libavif (BSD-2-Clause; https://github.com/AOMediaCodec/libavif) -------
+# Review item 4 (PR #18 cumulative review): Qt has no official AVIF plugin
+# (upstream qtimageformats does not ship one), and card art defaults to
+# AVIF -- a permanent AssetErrorCode::UnsupportedCodec for every card asset
+# is not acceptable. AssetAvifDecoder.cpp decodes AVIF directly against
+# libavif's C API instead, so this is a REQUIRED build dependency (not an
+# optional, best-effort one like WrapVulkanHeaders below) -- a configure
+# that cannot find libavif fails loudly rather than silently shipping a
+# build with no AVIF support at all. See mise.toml's setup:macos task and
+# .github/workflows/ci.yml for how each environment installs it, and
+# packaging/build-appimage.sh for how its own shared-library closure is
+# bundled into the AppImage.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBAVIF REQUIRED IMPORTED_TARGET libavif)
+
 # include(CTest) establishes the real BUILD_TESTING cache value (default ON)
 # before the QtKeychain FetchContent block below temporarily forces it off,
 # so the save/restore around that block is well-defined regardless of
@@ -79,6 +94,8 @@ add_library(arkham_foundation STATIC
     src/AppCommand.h
     src/AppSessionComposition.cpp
     src/AppSessionComposition.h
+    src/AssetAvifDecoder.cpp
+    src/AssetAvifDecoder.h
     src/AssetCache.cpp
     src/AssetCache.h
     src/AssetImageRequest.cpp
@@ -140,6 +157,7 @@ target_link_libraries(arkham_foundation PUBLIC
     Qt6::Gui
     Qt6::Network
     Qt6Keychain::Qt6Keychain
+    PkgConfig::LIBAVIF
 )
 
 qt_add_executable(arkham-horror

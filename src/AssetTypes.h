@@ -84,8 +84,11 @@ enum class AssetErrorCode {
   MagicBytesMismatch,  // Content-Type claimed a format the bytes are not.
   DimensionTooLarge,   // A single dimension exceeded the configured cap.
   PixelBudgetExceeded, // width*height exceeded the configured cap.
-  UnsupportedCodec,    // Bytes are valid but no installed Qt plugin decodes
-                       // this format (e.g. AVIF plugin missing).
+  UnsupportedCodec,    // Bytes are valid but this build cannot decode this
+                       // format (e.g. an installed Qt plugin declined a
+                       // JPEG/PNG, or libavif's own decode backend
+                       // structurally cannot handle these particular AVIF
+                       // bytes -- see AssetAvifDecoder.cpp).
   MalformedImage,      // Bytes passed magic-byte sniffing but failed to
                        // decode (truncated/corrupt).
   Cancelled,           // Caller cancelled, or the last consumer went away.
