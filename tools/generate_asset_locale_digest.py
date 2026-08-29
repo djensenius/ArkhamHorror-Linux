@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -159,6 +161,31 @@ def render_header(source_bytes: bytes, data: dict) -> str:
     return "\n".join(lines)
 
 
+def _clang_format(rendered: str) -> str:
+    """Runs the rendered header text through clang-format so this script's
+    own output is byte-identical to what `mise run format:check`
+    validates against src/*.h -- without this, every fresh regeneration
+    would need a manual `clang-format -i` pass, and --check would keep
+    reporting the checked-in (already clang-formatted) header as "stale"
+    purely due to line-wrapping differences, never actual data drift.
+    Falls back to the unformatted text (rather than failing outright) if
+    clang-format isn't on PATH, since --check's real drift signal is the
+    embedded SHA-256, and CI's separate format:check job independently
+    enforces formatting regardless.
+    """
+    clang_format = shutil.which("clang-format")
+    if clang_format is None:
+        return rendered
+    result = subprocess.run(
+        [clang_format, "--assume-filename=AssetLocaleDigestData.generated.h"],
+        input=rendered,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -171,7 +198,7 @@ def main(argv: list[str]) -> int:
 
     source_bytes = SOURCE_JSON.read_bytes()
     data = json.loads(source_bytes)
-    rendered = render_header(source_bytes, data)
+    rendered = _clang_format(render_header(source_bytes, data))
 
     if args.check:
         current = (
