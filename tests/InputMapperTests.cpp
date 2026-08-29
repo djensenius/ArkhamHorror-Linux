@@ -71,10 +71,12 @@ void InputMapperTests::reservedKeysAreFixedAndCannotBeRemapped() {
 
   const auto backResult =
       mapper.remap(key(Qt::Key_Back), SemanticCommand::Undo);
+  QVERIFY(backResult.has_value());
   QCOMPARE(*backResult, RemapError::ReservedKey);
 
   const auto menuResult =
       mapper.remap(key(Qt::Key_Menu), SemanticCommand::Undo);
+  QVERIFY(menuResult.has_value());
   QCOMPARE(*menuResult, RemapError::ReservedKey);
 }
 

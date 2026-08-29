@@ -26,10 +26,13 @@ namespace Arkham {
 //  - uninstall() removes the filter and is always safe to call, including
 //    when nothing is installed, and including more than once.
 //  - If the installed target is destroyed without uninstall() being
-//    called first, this router notices (via QPointer/destroyed()) and
-//    quietly reverts to "nothing installed" -- it never dispatches a
-//    stale/queued event that arrives after that point, and never
-//    dereferences the destroyed target.
+//    called first, this router notices: installedTarget_ is a
+//    QPointer<QObject>, which automatically nulls itself the moment the
+//    target is destroyed (no explicit destroyed() connection is used or
+//    needed). eventFilter() re-checks installedTarget_.isNull() on every
+//    call, so it quietly reverts to "nothing installed" -- it never
+//    dispatches a stale/queued event that arrives after that point, and
+//    never dereferences the destroyed target.
 //  - Destroying the router itself uninstalls it first: no further
 //    eventFilter() call (e.g. from an event already queued at the moment
 //    of destruction) can ever run any dispatch logic afterwards.

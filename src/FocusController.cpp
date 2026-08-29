@@ -156,7 +156,12 @@ bool FocusController::cycleZone(const bool forward) {
       currentFocusId_.isEmpty() ? QString() : zoneOf(currentFocusId_);
   qsizetype idx = activeZones.indexOf(currentZone);
   if (idx < 0) {
-    idx = 0;
+    // No current zone (e.g. no current focus, or the current zone is no
+    // longer active): position just before the first zone for a forward
+    // cycle, and just after the last zone for a backward cycle, so the
+    // very first cycle deterministically lands on a real first/last
+    // zone instead of skipping over one.
+    idx = forward ? -1 : activeZones.size();
   }
   const qsizetype size = activeZones.size();
   const qsizetype nextIdx =

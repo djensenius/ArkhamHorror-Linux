@@ -49,6 +49,7 @@ private slots:
   void reregisteringANodeIsATieResolvedByLastWriteWins();
   void cyclesZonesInRegistrationOrderAndRemembersLastFocused();
   void cycleZoneIsNoOpWithFewerThanTwoPopulatedZones();
+  void cycleZoneWithNoCurrentFocusLandsOnARealFirstOrLastZone();
   void modalPushAndPopReturnsToExactPriorFocus();
   void nestedModalsUnwindInReverseOrder();
   void removingCurrentlyFocusedNodeFallsBackToExplicitFallback();
@@ -168,6 +169,31 @@ void FocusControllerTests::cycleZoneIsNoOpWithFewerThanTwoPopulatedZones() {
 
   QVERIFY(!controller.cycleZone(true));
   QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+}
+
+void FocusControllerTests::
+    cycleZoneWithNoCurrentFocusLandsOnARealFirstOrLastZone() {
+  // Regression test: with no current focus at all, cycleZone(true) must
+  // land on the very first registered zone's node (never skip over it
+  // to the second zone), and cycleZone(false) must land on the very
+  // last registered zone's node.
+  FocusController forwardController;
+  registerBoardZone(forwardController); // zone "board", registered first
+  forwardController.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  QVERIFY(forwardController.currentFocusId().isEmpty());
+
+  QVERIFY(forwardController.cycleZone(true));
+  QCOMPARE(forwardController.currentFocusId(), QStringLiteral("board.nw"));
+
+  FocusController backwardController;
+  registerBoardZone(backwardController);
+  backwardController.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  QVERIFY(backwardController.currentFocusId().isEmpty());
+
+  QVERIFY(backwardController.cycleZone(false));
+  QCOMPARE(backwardController.currentFocusId(), QStringLiteral("hand.card1"));
 }
 
 void FocusControllerTests::modalPushAndPopReturnsToExactPriorFocus() {
