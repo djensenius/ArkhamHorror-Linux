@@ -82,7 +82,16 @@ enum class UltimatumOrBoon {
   UltimatumOfMalevolence,
 };
 
-// One entry of gameDetails.investigators/otherInvestigators.
+// One entry of gameDetails.investigators/otherInvestigators. `id` is
+// game-list.schema.json's plain, unconstrained `investigator.id` string --
+// but the backend's actual InvestigatorDetails.id field (Api.Arkham.Types.
+// Game, backend commit 6a1befbd7b) is typed Arkham.Id.InvestigatorId, a
+// newtype directly wrapping (and `deriving newtype` its ToJSON/FromJSON
+// from) Arkham.Card.CardCode -- so every value on the wire is genuinely
+// "c"-prefixed despite the schema not encoding that pattern. CardCode here
+// reflects the real backend guarantee, not an invented client-side
+// restriction; see CampaignSummary below for the contrasting case where the
+// backend type really is unconstrained Text.
 struct InvestigatorSummary {
   CardCode id;
   ClassSymbol classSymbol;
@@ -97,7 +106,13 @@ struct InvestigatorSummary {
 
 // gameDetails.scenario (null for a campaign game between scenarios, or
 // absent entirely for a from-scratch campaign that has not started its
-// first scenario).
+// first scenario). `id` is game-list.schema.json's plain, unconstrained
+// `scenario.id` string -- but the backend's actual ScenarioDetails.id field
+// is typed Arkham.Id.ScenarioId, a newtype directly wrapping (and
+// `deriving newtype` its ToJSON/FromJSON from) Arkham.Card.CardCode, same
+// as InvestigatorSummary.id above -- so CardCode here is likewise the real
+// backend guarantee, not over-validation relative to the pinned contract
+// commit.
 struct ScenarioSummary {
   CardCode id;
   Difficulty difficulty{};
@@ -113,10 +128,12 @@ struct ScenarioSummary {
 };
 
 // gameDetails.campaign (null for a standalone scenario game). Unlike
-// ScenarioSummary/InvestigatorSummary's `id` (backend type CardCode,
-// serialized "c"-prefixed), CampaignDetails.id is backend type Text --
-// e.g. the fixture's campaign id "06" is never "c"-prefixed -- so it stays
-// the permissive CampaignId rather than the strict CardCode.
+// ScenarioSummary/InvestigatorSummary's `id` (backend type
+// Arkham.Id.ScenarioId/InvestigatorId, both wrapping CardCode, serialized
+// "c"-prefixed), CampaignDetails.id is backend type Arkham.Id.CampaignId, a
+// newtype wrapping unconstrained Text -- e.g. the fixture's campaign id
+// "06" is never "c"-prefixed -- so it stays the permissive CampaignId
+// rather than the strict CardCode.
 struct CampaignSummary {
   CampaignId id;
   Difficulty difficulty{};
