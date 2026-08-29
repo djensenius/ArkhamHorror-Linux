@@ -193,6 +193,14 @@ jobs:
         # never present, and rejects a nonexistent root. This is hermetic
         # (no apt-get/network) and independent of the real
         # libsecret/libgpg-error closure exercised further below.
+        #
+        # Also covers --auto-roots (a synthetic nested plugin's own
+        # dependency is invisible to a hand-picked --root list but is
+        # discovered and resolved once auto-rooted -- and its deletion is
+        # then correctly caught), --allow-x11-desktop-stack (a stub
+        # libxcb.so.1 dependency is reported missing by default and only
+        # resolves once the flag is explicitly given), and the recursive
+        # index's ambiguous-duplicate-basename rejection.
         run: bash packaging/tests/test_audit_dependency_closure.sh
       - name: Test the AVIF bundled round-trip smoke program in isolation
         # Hermetic (no AppImage/container/network dependency) proof that
@@ -664,6 +672,63 @@ jobs:
             }
             echo "Confirmed: removing bundled '$victim' correctly fails the closure audit."
           done
+      - name: Exhaustive recursive DT_NEEDED closure audit (every bundled ELF as root)
+        # Review round-4/item 11: the closure audit above (and the AVIF/
+        # libavif-rooted audit further above) only ever starts from a
+        # small, hand-picked --root list (libsecret-1.so.0,
+        # libqt6keychain.so, libavif.so). Neither the app's own executable
+        # nor any Qt plugin (e.g. the xcb platform plugin,
+        # usr/lib/plugins/platforms/libqxcb.so) or QML module is
+        # transitively reachable from those roots at all, so a missing
+        # bundled dependency needed only by one of *them* (concretely:
+        # base libxcb.so.1, needed by libqxcb.so, which linuxdeploy's own
+        # default blacklist does not auto-bundle) was invisible to every
+        # existing closure-audit step. Compounding this, the existing
+        # "Launch the packaged AppImage headlessly" smoke test below uses
+        # QT_QPA_PLATFORM=offscreen, which loads libqoffscreen.so instead
+        # of libqxcb.so, so the real xcb platform-plugin load path (and
+        # its need for libxcb.so.1) was never actually exercised at
+        # runtime either -- offscreen smoke masked the gap.
+        #
+        # This step closes both gaps statically: --auto-roots recursively
+        # discovers and roots the walk at literally every real ELF file
+        # under the whole extracted usr/ tree (the app executable in
+        # usr/bin, every already-verified library in usr/lib, every Qt
+        # plugin under usr/lib/plugins/**, and every QML module under
+        # usr/qml/**), so nothing bundled can have an unaudited
+        # dependency purely because no hand-picked --root list happened to
+        # reach it.
+        #
+        # Base X11/xcb/xkbcommon/GL-EGL client libraries are the one
+        # deliberate, explicitly documented exception
+        # (X11_DESKTOP_ABI_ALLOWLIST in audit_dependency_closure.py,
+        # opted into here via --allow-x11-desktop-stack): matching
+        # linuxdeploy's own default blacklist convention (verified via
+        # linuxdeploy's public documentation: base X11/xcb libraries are
+        # treated as "always already present on the target", the same
+        # category as glibc, precisely because bundling a
+        # possibly-mismatched xcb/X11 stack alongside a *different* host
+        # X server/XWayland compositor -- including SteamOS's Gamescope --
+        # can break in the opposite, non-obvious direction: protocol/ABI
+        # skew between client and server), these are intentionally NOT
+        # bundled and are asserted, by exact name, to be host-provided.
+        # This was previously an unstated, inconsistent assumption (this
+        # same workflow already `apt-get install`s libxkbcommon0/libgl1/
+        # libopengl0/libegl1 into the offscreen-smoke container below
+        # specifically because they are assumed host-provided) -- this
+        # step makes it complete and auditable in one explicit place
+        # rather than leaving new gaps in the same category undetected.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          usr_root="$extracted/usr"
+          [[ -d "$usr_root" ]] || {
+            echo "Expected extracted AppImage usr/ directory not found: $usr_root" >&2
+            exit 1
+          }
+          echo "Auditing the exhaustive closure of every real bundled ELF under $usr_root ..."
+          python3 packaging/audit_dependency_closure.py "$usr_root" \
+            --auto-roots "$usr_root" --allow-x11-desktop-stack
       - name: Verify bundled libsecret dependency closure has no host fallback
         # The static recursive closure audit above is the primary,
         # host-independent proof that every non-ABI transitive dependency
@@ -780,6 +845,77 @@ jobs:
               timeout 60 /app/AppRun --smoke-test
             '
           echo "AppImage launched, entered the event loop, and rendered its first QML frame successfully in a minimal headless container."
+      - name: Launch the packaged AppImage under a real xcb display (Gaming Mode startup smoke)
+        # Review round-4/item 11: the offscreen smoke test above proves
+        # genuine Qt/QML startup, but QT_QPA_PLATFORM=offscreen loads
+        # libqoffscreen.so, never libqxcb.so -- so it never actually
+        # exercises the real xcb platform-plugin path a genuine desktop
+        # session (including SteamOS's Gamescope, an XWayland-backed
+        # compositor Qt's xcb plugin connects to exactly like any other
+        # X11 display) uses at runtime, and could not have caught a
+        # missing base-libxcb-style gap by itself.
+        #
+        # This step launches the same unmodified AppRun --smoke-test
+        # binary with QT_QPA_PLATFORM=xcb against a genuine (virtual) X11
+        # server (Xvfb), inside the same kind of intentionally
+        # libsecret/glib-less debian:bookworm-slim container used above --
+        # "without host leakage" here means this container never has the
+        # bundled Qt/app libraries themselves preinstalled (so a real
+        # startup failure cannot be masked by a host copy silently
+        # substituting for a broken bundle), while the base X11/xcb/GL
+        # client libraries it does install are the one deliberate,
+        # explicitly-documented exception (X11_DESKTOP_ABI_ALLOWLIST in
+        # audit_dependency_closure.py): this project's own policy is that
+        # those specific libraries are always host/session-provided, never
+        # bundled, so installing them here to provide a genuine X11
+        # session is the correct simulation of a real target host/Gamescope
+        # session, not a leak that could hide a real defect in anything
+        # this project actually bundles.
+        #
+        # QT_QUICK_BACKEND is deliberately left unset here (unlike the
+        # offscreen step above): a real xcb session is expected to
+        # negotiate a real GL context via the bundled libGL/libEGL
+        # dispatch libraries against the container's host-provided GL
+        # implementation (Mesa's software llvmpipe rasterizer, installed
+        # below), proving the actual production startup path end users
+        # will exercise, not an alternate raster-only code path.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          [[ -x "$extracted/AppRun" ]] || {
+            echo "AppRun not found or not executable in the extracted AppImage." >&2
+            exit 1
+          }
+          docker run --rm \
+            --volume "$extracted:/app:ro" \
+            debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                xvfb xauth \
+                libxcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+                libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+                libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
+                libx11-xcb1 libxkbcommon0 libxkbcommon-x11-0 \
+                fontconfig fonts-dejavu-core \
+                libgl1 libopengl0 libegl1 libgl1-mesa-dri >/dev/null
+              Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
+              xvfb_pid=$!
+              trap "kill $xvfb_pid 2>/dev/null || true" EXIT
+              for _ in $(seq 1 50); do
+                [[ -e /tmp/.X11-unix/X99 ]] && break
+                sleep 0.1
+              done
+              [[ -e /tmp/.X11-unix/X99 ]] || {
+                echo "Xvfb did not create its display socket in time." >&2
+                exit 1
+              }
+              export DISPLAY=:99
+              export QT_QPA_PLATFORM=xcb
+              timeout 60 /app/AppRun --smoke-test
+            '
+          echo "AppImage launched under the real xcb platform plugin against a genuine (virtual) X11 display and rendered its first QML frame successfully."
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ArkhamHorror-Linux-AppImage

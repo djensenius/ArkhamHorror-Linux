@@ -240,6 +240,145 @@ echo "$output_10" | grep -qi "outside" \
   || fail "case 10: failure output did not explain the symlink-escape rejection: $output_10"
 echo "PASS: an in-tree waypoint symlink chain that ultimately escapes the AppDir is rejected"
 
+# --- Case 11/12: --auto-roots. Builds a small synthetic AppDir/usr-style
+# tree with a "plugin" ELF nested two directories deep (mirroring a real
+# usr/lib/plugins/imageformats/libqjpeg.so-style layout) that NEEDs a
+# library which is bundled elsewhere in the tree (usr/lib), and which is
+# NOT transitively reachable from any of the existing --root chain above
+# at all. This is exactly the class of gap the review item this flag
+# addresses identified: a hand-picked --root list can prove the libsecret
+# closure complete while never noticing a *different* bundled ELF (a Qt
+# plugin, or the app's own executable) requires something never bundled.
+auto_root_tree="$work_dir/usr_auto_roots"
+mkdir -p "$auto_root_tree/lib" "$auto_root_tree/lib/plugins/imageformats" "$auto_root_tree/bin"
+
+cat > pluginleaf.c <<'EOF'
+int test_pluginleaf(void) { return 1; }
+EOF
+cat > plugin.c <<'EOF'
+int test_pluginleaf(void);
+int test_plugin_entry(void) { return test_pluginleaf(); }
+EOF
+cat > appexe.c <<'EOF'
+int main(void) { return 0; }
+EOF
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libpluginleaf.so.1 \
+  -o "$auto_root_tree/lib/libpluginleaf.so.1" pluginleaf.c
+ln -s libpluginleaf.so.1 "$auto_root_tree/lib/libpluginleaf.so"
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libqtestplugin.so \
+  -o "$auto_root_tree/lib/plugins/imageformats/libqtestplugin.so" plugin.c \
+  -L"$auto_root_tree/lib" -l:libpluginleaf.so.1
+
+"$cc_bin" -o "$auto_root_tree/bin/testapp" appexe.c
+
+# Without --auto-roots, only explicitly-named roots are walked, so the
+# nested plugin's own dependency on libpluginleaf.so.1 is never even
+# considered -- the audit reports success (0 required libraries) despite
+# the plugin's real dependency existing, unaudited, elsewhere in the tree.
+# This first assertion documents the exact gap being closed, not merely
+# that the new flag works in isolation.
+output_11_before="$(python3 "$auditor" "$auto_root_tree" --root testapp --list-only 2>&1)" \
+  || fail "case 11 (baseline): expected exit 0 auditing only the app executable's own (empty) closure"
+echo "$output_11_before" | grep -q "libpluginleaf" \
+  && fail "case 11 (baseline): did not expect the unreachable plugin's dependency to be audited without --auto-roots: $output_11_before"
+echo "PASS: without --auto-roots, a plugin's own dependency outside any --root chain is not audited (documents the gap)"
+
+# With --auto-roots pointed at the whole tree, every real ELF (the app
+# executable, the nested plugin, and the library it needs) is discovered
+# and rooted, so the plugin's dependency on libpluginleaf.so.1 is now
+# actually walked and resolved.
+result_11="$(python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" --list-only)"
+echo "$result_11" | grep -q "^libpluginleaf.so.1$" \
+  || fail "case 11: expected --auto-roots to discover and resolve the nested plugin's own dependency, got: $result_11"
+echo "$result_11" | grep -q "^libqtestplugin.so$" \
+  || fail "case 11: expected --auto-roots to include the nested plugin itself as a discovered root, got: $result_11"
+echo "PASS: --auto-roots discovers every real ELF (nested plugin + app executable) and resolves their dependencies"
+
+# Case 12: deleting the plugin's own dependency must now be caught by
+# --auto-roots (proving this is a real, load-bearing check, not a
+# vacuous pass), even though it would have gone completely unnoticed by
+# the --root testapp-only baseline above.
+rm "$auto_root_tree/lib/libpluginleaf.so.1" "$auto_root_tree/lib/libpluginleaf.so"
+set +e
+output_12="$(python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" 2>&1)"
+case12_status=$?
+set -e
+[[ $case12_status -ne 0 ]] \
+  || fail "case 12: expected non-zero exit after deleting the auto-rooted plugin's own dependency"
+echo "$output_12" | grep -q "libpluginleaf.so.1" \
+  || fail "case 12: failure output did not name the missing plugin dependency: $output_12"
+echo "PASS: --auto-roots catches a missing dependency of a plugin/executable no hand-picked --root list named"
+
+# --- Case 13: --allow-x11-desktop-stack. Builds a root that NEEDs a
+# stub library sharing an exact X11_DESKTOP_ABI_ALLOWLIST SONAME
+# (libxcb.so.1) -- never a real system libxcb, just a same-named stub
+# compiled locally -- then removes it from the AppDir entirely (as real
+# packaging deliberately does not bundle base X11/xcb libraries) and
+# proves the audit fails by default (the flag is not silently on) but
+# passes once --allow-x11-desktop-stack is explicitly given.
+x11_dir="$work_dir/appdir_x11"
+mkdir -p "$x11_dir"
+cat > x11root.c <<'EOF'
+int test_x11_stub(void);
+int test_x11_root(void) { return test_x11_stub(); }
+EOF
+cat > x11stub.c <<'EOF'
+int test_x11_stub(void) { return 1; }
+EOF
+"$cc_bin" -shared -fPIC -Wl,-soname,libxcb.so.1 \
+  -o "$work_dir/libxcb.so.1.tmp" x11stub.c
+cp "$work_dir/libxcb.so.1.tmp" "$x11_dir/libxcb.so.1"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestx11root.so.1 \
+  -o "$x11_dir/libtestx11root.so.1" x11root.c -L"$x11_dir" -l:libxcb.so.1
+# Remove the stub itself -- only the NEEDED entry naming it remains --
+# simulating linuxdeploy correctly refusing to bundle base X11/xcb.
+rm "$x11_dir/libxcb.so.1"
+
+set +e
+output_13_default="$(python3 "$auditor" "$x11_dir" --root libtestx11root.so.1 2>&1)"
+case13_default_status=$?
+set -e
+[[ $case13_default_status -ne 0 ]] \
+  || fail "case 13 (default): expected non-zero exit for missing libxcb.so.1 without --allow-x11-desktop-stack"
+echo "$output_13_default" | grep -q "libxcb.so.1" \
+  || fail "case 13 (default): failure output did not name libxcb.so.1: $output_13_default"
+echo "PASS: libxcb.so.1 is reported missing by default (the X11 desktop-stack allowlist is opt-in, never implicit)"
+
+python3 "$auditor" "$x11_dir" --root libtestx11root.so.1 --allow-x11-desktop-stack >/dev/null \
+  || fail "case 13 (--allow-x11-desktop-stack): expected exit 0 once the flag is explicitly given"
+echo "PASS: --allow-x11-desktop-stack explicitly permits libxcb.so.1 to resolve from the host"
+
+# --- Case 14: ambiguous duplicate basename. Two different files (proven
+# different by distinct real content, not merely different paths) sharing
+# the exact same basename in two different subdirectories of the same
+# audited tree must be rejected outright -- silently picking one could
+# resolve a NEEDED entry to the wrong file with different real content,
+# masking a substitution risk the recursive (rglob) index introduced by
+# --auto-roots makes newly possible (a flat, single-directory index could
+# never have two entries with the same basename at all).
+dup_tree="$work_dir/appdir_dup_basename"
+mkdir -p "$dup_tree/a" "$dup_tree/b"
+cat > dupa.c <<'EOF'
+int test_dup_a(void) { return 1; }
+EOF
+cat > dupb.c <<'EOF'
+int test_dup_b(void) { return 2; }
+EOF
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 -o "$dup_tree/a/libdup.so.1" dupa.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 -o "$dup_tree/b/libdup.so.1" dupb.c
+
+set +e
+output_14="$(python3 "$auditor" "$dup_tree" --root libdup.so.1 2>&1)"
+case14_status=$?
+set -e
+[[ $case14_status -ne 0 ]] \
+  || fail "case 14: expected non-zero exit for an ambiguous duplicate basename with different real content"
+echo "$output_14" | grep -qi "ambiguous" \
+  || fail "case 14: failure output did not explain the ambiguous-duplicate rejection: $output_14"
+echo "PASS: an ambiguous duplicate basename with genuinely different content is rejected, not silently resolved"
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the
