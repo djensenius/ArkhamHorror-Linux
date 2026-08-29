@@ -37,6 +37,18 @@ namespace Arkham {
 // This class dispatches exactly one thing -- a (SemanticCommand,
 // CommandPhase) pair via commandDispatched() -- and contains no Arkham
 // rules and no virtual-cursor/pointer emulation of any kind.
+//
+// Event consumption: a key event whose physical key is bound in |mapper|
+// (including the three permanently reserved keys) is always consumed
+// (this filter returns true), even on a transition InputMapper::
+// processKey() suppresses via its dedup rules (a stray duplicate press,
+// an auto-repeat before any press, or a stray release) -- letting such a
+// transition fall through to default Qt key handling could re-trigger a
+// side effect (e.g. Qt's own Tab-key focus-chain handling) for a key this
+// router already owns, even though no new command is dispatched for it.
+// A key event whose physical key is not bound at all is never consumed,
+// so ordinary text input and any other default key handling keep
+// working normally.
 class InputRouter final : public QObject {
   Q_OBJECT
 

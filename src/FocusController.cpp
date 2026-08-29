@@ -89,10 +89,14 @@ bool FocusController::setInitialFocus(const QString &id) {
 }
 
 bool FocusController::moveFocus(const FocusDirection direction) {
-  if (currentFocusId_.isEmpty() || !nodes_.contains(currentFocusId_)) {
+  if (currentFocusId_.isEmpty()) {
     return false;
   }
-  const Node &current = nodes_[currentFocusId_];
+  const auto currentIt = nodes_.constFind(currentFocusId_);
+  if (currentIt == nodes_.constEnd()) {
+    return false;
+  }
+  const Node &current = currentIt.value();
 
   const auto neighborIt = current.neighbors.constFind(direction);
   if (neighborIt != current.neighbors.constEnd() &&

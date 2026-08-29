@@ -68,10 +68,20 @@ bool InputRouter::eventFilter(QObject *watched, QEvent *event) {
                                 keyEvent->modifiers()};
   const bool isPress = event->type() == QEvent::KeyPress;
 
+  // Known ahead of calling processKey() so a dedup-suppressed transition
+  // (a stray duplicate press, an auto-repeat before any press, or a
+  // stray release) can still be consumed below: those transitions belong
+  // to a physical key this router already owns, and letting them fall
+  // through to default Qt key handling could re-trigger a side effect
+  // (e.g. Qt's own Tab-key focus-chain handling) for a key our own
+  // dedup state machine has already accounted for via a different
+  // phase.
+  const bool isBoundKey = mapper_.commandFor(physicalKey).has_value();
+
   const std::optional<DispatchedCommand> dispatched =
       mapper_.processKey(physicalKey, isPress, keyEvent->isAutoRepeat());
   if (!dispatched.has_value()) {
-    return false;
+    return isBoundKey;
   }
 
   emit commandDispatched(dispatched->command, dispatched->phase);

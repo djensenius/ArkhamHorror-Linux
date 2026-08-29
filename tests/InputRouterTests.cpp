@@ -19,11 +19,13 @@ namespace {
 // Builds and delivers a real QKeyEvent synchronously through |target|'s
 // installed event filters (InputRouter included), exactly like a real
 // platform key event would be, rather than calling InputMapper directly.
-void sendKey(QObject *target, const QEvent::Type type, const Qt::Key key,
+// Returns whether the event was consumed (i.e. some filter, such as an
+// installed InputRouter, returned true for it).
+bool sendKey(QObject *target, const QEvent::Type type, const Qt::Key key,
              const bool autoRepeat = false,
              const Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
   QKeyEvent event(type, key, modifiers, QString(), autoRepeat);
-  QCoreApplication::sendEvent(target, &event);
+  return QCoreApplication::sendEvent(target, &event);
 }
 
 } // namespace
@@ -41,6 +43,8 @@ private slots:
   void destroyingTheRouterUninstallsAndNeverDispatchesAfterwards();
   void installAcrossThreadsIsRejected();
   void onlyKeyEventsOnTheInstalledTargetAreConsidered();
+  void suppressedDedupTransitionsAreStillConsumedForABoundKey();
+  void keyEventsForAnUnboundKeyAreNeverConsumed();
 };
 
 void InputRouterTests::dispatchesACommandForARealKeyPress() {
@@ -179,6 +183,49 @@ void InputRouterTests::onlyKeyEventsOnTheInstalledTargetAreConsidered() {
   // Non-key events on the installed target must also be ignored.
   QEvent timerEvent(QEvent::Timer);
   QCoreApplication::sendEvent(&target, &timerEvent);
+  QCOMPARE(spy.count(), 0);
+}
+
+void InputRouterTests::
+    suppressedDedupTransitionsAreStillConsumedForABoundKey() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 1);
+
+  // A stray duplicate press (no intervening release) is suppressed by
+  // InputMapper's dedup rules, so no second command is dispatched --
+  // but Qt::Key_Up is bound, so the event must still be consumed rather
+  // than falling through to default Qt key handling.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 1);
+
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_Up));
+  QCOMPARE(spy.count(), 2);
+
+  // A stray release (the key is no longer held) is likewise suppressed
+  // but still consumed.
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_Up));
+  QCOMPARE(spy.count(), 2);
+}
+
+void InputRouterTests::keyEventsForAnUnboundKeyAreNeverConsumed() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+  // Qt::Key_F13 has no default binding, so it must never be consumed --
+  // ordinary default key handling for unrelated keys must keep working.
+  QVERIFY(!sendKey(&target, QEvent::KeyPress, Qt::Key_F13));
+  QCOMPARE(spy.count(), 0);
+  QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_F13));
   QCOMPARE(spy.count(), 0);
 }
 
