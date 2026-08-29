@@ -80,6 +80,14 @@ private slots:
   void memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry();
   void failedEvictionDeletionLeavesEntryCountedAsStillOccupyingSpace();
 
+  // Round-6 item 5: root/owned-subtree symlink-during-creation escape
+  // prevention -- see AssetCache::AssetCache()'s and
+  // openDirectoryChainNoFollow()'s comments in AssetCache.cpp.
+  void
+  ownedSuffixComponentThatIsASymlinkIsRejectedEvenWhenTrustedAnchorIsPlain();
+  void ownedSuffixOfPlainDirectoriesUnderTrustedAnchorResolvesSuccessfully();
+  void crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted();
+
 private:
   QString m_tempDirPath;
   std::unique_ptr<QTemporaryDir> m_tempDir;

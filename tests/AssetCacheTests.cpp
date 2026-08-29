@@ -9,6 +9,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QTest>
 
@@ -1612,4 +1613,117 @@ void AssetCacheTests::
            "an entry whose deletion failed must remain fully resident, "
            "never counted as freed");
   QVERIFY(tightCache.lookupDisk(oldestKey).has_value());
+}
+
+void AssetCacheTests::
+    ownedSuffixComponentThatIsASymlinkIsRejectedEvenWhenTrustedAnchorIsPlain() {
+  // Round-6 review item 5: a component-by-component, no-follow open of
+  // this cache's own reserved sub-path (the "owned suffix" -- e.g.
+  // "assets/v1" beneath an OS-provided cache base) must reject an
+  // attacker pre-planting ANY of those components as a symlink, even
+  // though the trusted anchor directory ABOVE it is perfectly ordinary
+  // and was never itself under attacker control. This is exactly the
+  // realistic attack the finding describes: a symlink placed at
+  // <anchor>/assets pointing somewhere else, well before this process
+  // ever runs.
+  const QString anchorDir = m_tempDirPath + QStringLiteral("/anchor");
+  QVERIFY(QDir().mkpath(anchorDir));
+  const QString elsewhereDir = m_tempDirPath + QStringLiteral("/elsewhere");
+  QVERIFY(QDir().mkpath(elsewhereDir));
+
+  QVERIFY(QFile::link(elsewhereDir, anchorDir + QStringLiteral("/assets")));
+  QVERIFY(QFileInfo(anchorDir + QStringLiteral("/assets")).isSymLink());
+
+  QVERIFY(!AssetCache::directoryChainResolvesNoFollowForTesting(
+      anchorDir, {QStringLiteral("assets"), QStringLiteral("v1")}));
+
+  // The symlink itself must be left completely alone -- this check is a
+  // pure read-only reject, never a "helpfully clean it up" mutation.
+  QVERIFY(QFileInfo(anchorDir + QStringLiteral("/assets")).isSymLink());
+}
+
+void AssetCacheTests::
+    ownedSuffixOfPlainDirectoriesUnderTrustedAnchorResolvesSuccessfully() {
+  // Negative control for the test above: an ordinary, non-symlinked
+  // owned-suffix chain (whether pre-existing or freshly created by
+  // mkpath, both are exercised identically by this helper) must still
+  // resolve -- the no-follow check must not be so strict it breaks the
+  // overwhelmingly common, non-hostile case.
+  const QString anchorDir = m_tempDirPath + QStringLiteral("/anchor2");
+  QVERIFY(QDir().mkpath(anchorDir + QStringLiteral("/assets/v1")));
+
+  QVERIFY(AssetCache::directoryChainResolvesNoFollowForTesting(
+      anchorDir, {QStringLiteral("assets"), QStringLiteral("v1")}));
+}
+
+void AssetCacheTests::
+    crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted() {
+  // Round-6 review item 5's second half: a same-device bind mount
+  // planted inside this cache's exclusively-owned directory must be
+  // treated exactly like a different-device mount (never descended
+  // into, never deleted, its bytes still counted so quota accounting
+  // cannot be starved by an undeletable/unreadable entry). A bind mount
+  // shares its host filesystem's st_dev, so this specifically exercises
+  // the STATX_MNT_ID-based mountIdentityMatches() check rather than the
+  // pre-existing (and separately-tested-by-construction) st_dev-only
+  // comparison. Creating a real mount needs privilege this environment
+  // may not grant (e.g. this local macOS dev machine has no Linux-style
+  // bind mounts at all, and a CI runner might lack passwordless sudo),
+  // so this test fails closed by skipping rather than failing when that
+  // privilege is unavailable -- the reviewer's own explicit allowance
+  // ("mount tests where CI permits/fail-closed otherwise").
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString decoyMountPoint =
+      m_tempDirPath + QStringLiteral("/decoy-mount");
+  QVERIFY(QDir().mkpath(decoyMountPoint));
+  const QString bindSource = m_tempDirPath + QStringLiteral("/bind-source");
+  QVERIFY(QDir().mkpath(bindSource));
+  {
+    QFile sentinel(bindSource + QStringLiteral("/sentinel.bin"));
+    QVERIFY(sentinel.open(QIODevice::WriteOnly));
+    sentinel.write(QByteArray(2048, 's'));
+  }
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, decoyMountPoint});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{decoyMountPoint};
+
+  AssetCache cache(configFor(m_tempDirPath));
+
+  // The cross-mount directory can never be descended into, so its
+  // CONTENTS (the 2048-byte sentinel living on the other side of the
+  // mount) are deliberately NOT what gets counted here -- but its own
+  // directory-entry size must still be added as an irreducible
+  // placeholder rather than silently vanishing from the total (see
+  // sumUsageRelative()'s comment), so usage must be nonzero.
+  QVERIFY(cache.diskUsageBytes() > qint64(0));
+
+  cache.reapAndEnforceQuota();
+
+  // The mount point directory itself, and the sentinel file behind it,
+  // must both survive untouched -- the cross-mount guard must refuse to
+  // recurse into or unlink it even though it looks exactly like an
+  // ordinary stray directory the reap sweep would otherwise remove.
+  QVERIFY(QFileInfo::exists(decoyMountPoint));
+  QVERIFY(QFileInfo::exists(bindSource + QStringLiteral("/sentinel.bin")));
+#endif
 }

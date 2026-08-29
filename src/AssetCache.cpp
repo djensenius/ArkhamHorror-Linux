@@ -24,6 +24,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+// statx()/struct statx/STATX_MNT_ID are declared by glibc's own
+// <sys/stat.h> when new enough (STATX_MNT_ID itself requires glibc
+// with kernel-5.8-era constants). Guarded entirely behind
+// `#if defined(STATX_MNT_ID)` below -- see MountIdentity's comment --
+// so this degrades to the pre-existing st_dev-only behaviour at compile
+// time on any older glibc/kernel header set, and at RUN time on any
+// older kernel that doesn't actually populate STATX_MNT_ID even if the
+// headers declare it.
+#include <sys/syscall.h>
+#endif
 
 using namespace Qt::StringLiterals;
 
@@ -143,15 +154,112 @@ bool fstatRelativeNoFollow(int dirFd, const char *name, struct stat &outSt) {
   return fstatat(dirFd, name, &outSt, AT_SYMLINK_NOFOLLOW) == 0;
 }
 
+// Round-6 item 5: identifies a mounted filesystem more precisely than
+// st_dev alone can. A bind mount of some OTHER directory onto a path
+// underneath the cache root shares the exact same st_dev as its source
+// filesystem -- bind mounts don't create a new block device, they just
+// add another mount-table entry pointing at an already-mounted
+// filesystem -- so an st_dev-only comparison (the pre-round-6 policy
+// throughout this file) cannot distinguish "the cache root's own
+// subtree" from "an unrelated directory bind-mounted into it from the
+// SAME underlying filesystem". Linux 5.8+'s statx() STATX_MNT_ID field
+// reports the kernel's actual per-mount identifier, which a same-device
+// bind mount does NOT share with its host mount, closing that gap.
+// `hasMountId` is false wherever this can't be determined (older
+// kernel, older glibc without the STATX_MNT_ID constant, or a
+// non-Linux platform) -- every comparison below falls back to the
+// pre-existing st_dev-only policy in that case, which is a strictly
+// weaker but still safe (fails closed on genuine device changes)
+// guarantee than the full mount-id check.
+struct MountIdentity {
+  quint64 device{0};
+  quint64 mountId{0};
+  bool hasMountId{false};
+};
+
+#if defined(__linux__) && defined(STATX_MNT_ID)
+std::optional<quint64> mountIdViaStatx(int dirFd, const char *name,
+                                       int extraFlags) {
+  struct statx buf {};
+  if (statx(dirFd, name, extraFlags, STATX_MNT_ID, &buf) != 0) {
+    return std::nullopt;
+  }
+  if ((buf.stx_mask & STATX_MNT_ID) == 0) {
+    return std::nullopt; // kernel too old to actually populate this field
+  }
+  return buf.stx_mnt_id;
+}
+#endif
+
+// MountIdentity for the entry named `name` directly under `dirFd`,
+// given its already-obtained fstatat(..., AT_SYMLINK_NOFOLLOW) result
+// `st` (used for the device number) -- makes an ADDITIONAL statx() call
+// (also AT_SYMLINK_NOFOLLOW, also relative to `dirFd`, never a
+// path re-resolved from the filesystem root) to recover the mount id
+// when this platform/kernel supports it.
+MountIdentity mountIdentityRelative(int dirFd, const char *name,
+                                    const struct stat &st) {
+  MountIdentity identity;
+  identity.device = static_cast<quint64>(st.st_dev);
+#if defined(__linux__) && defined(STATX_MNT_ID)
+  if (const auto mountId = mountIdViaStatx(dirFd, name, AT_SYMLINK_NOFOLLOW)) {
+    identity.mountId = *mountId;
+    identity.hasMountId = true;
+  }
+#else
+  Q_UNUSED(dirFd);
+  Q_UNUSED(name);
+#endif
+  return identity;
+}
+
+// MountIdentity for an already-open file descriptor `fd` (an object
+// that has ALREADY been opened -- e.g. via openat(..., O_NOFOLLOW) --
+// so no further symlink-following risk applies here; this purely reads
+// back what that descriptor refers to).
+MountIdentity mountIdentityForFd(int fd) {
+  MountIdentity identity;
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    return identity;
+  }
+  identity.device = static_cast<quint64>(st.st_dev);
+#if defined(__linux__) && defined(STATX_MNT_ID)
+  if (const auto mountId = mountIdViaStatx(fd, "", AT_EMPTY_PATH)) {
+    identity.mountId = *mountId;
+    identity.hasMountId = true;
+  }
+#endif
+  return identity;
+}
+
+// True iff `actual` names the same mount as `expected`: st_dev must
+// always match; when BOTH sides have a kernel mount id recorded, that
+// must match too (closing the same-device-bind-mount gap described
+// above). When either side lacks a mount id (older kernel/platform),
+// this degrades to the st_dev-only comparison -- see MountIdentity's
+// comment for why that is a documented, narrower guarantee on such
+// platforms rather than a silent full bypass.
+bool mountIdentityMatches(const MountIdentity &actual,
+                          const MountIdentity &expected) {
+  if (actual.device != expected.device) {
+    return false;
+  }
+  if (actual.hasMountId && expected.hasMountId) {
+    return actual.mountId == expected.mountId;
+  }
+  return true;
+}
+
 // Opens `name` relative to `dirFd` for reading, verifying (via fstat on
 // the RESULTING DESCRIPTOR -- never a second path-based stat) that what
-// was actually opened is a regular file living on the SAME device as
-// `expectedDevice`. O_NOFOLLOW means a symlink node is refused outright
-// (ELOOP) rather than silently followed; the device check rejects a
+// was actually opened is a regular file on the SAME mount as
+// `expectedMount`. O_NOFOLLOW means a symlink node is refused outright
+// (ELOOP) rather than silently followed; the mount check rejects a
 // child that resolves onto a different mounted filesystem than the
 // cache root itself. Returns -1 (with no fd left open) on any failure.
 int openRegularNoFollowRelative(int dirFd, const QByteArray &nameUtf8,
-                                quint64 expectedDevice) {
+                                const MountIdentity &expectedMount) {
   const int fd =
       openat(dirFd, nameUtf8.constData(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) {
@@ -159,7 +267,7 @@ int openRegularNoFollowRelative(int dirFd, const QByteArray &nameUtf8,
   }
   struct stat st {};
   if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-      static_cast<quint64>(st.st_dev) != expectedDevice) {
+      !mountIdentityMatches(mountIdentityForFd(fd), expectedMount)) {
     ::close(fd);
     return -1;
   }
@@ -238,11 +346,11 @@ bool writeFileAtomicRelative(int dirFd, const QString &finalName,
 // count exceeds `maxBytes`. Used for manifest/metadata reads, where the
 // exact expected size isn't known ahead of time -- only a sane upper
 // bound.
-std::optional<QByteArray> readBoundedRelative(int dirFd, quint64 expectedDevice,
-                                              const QString &name,
-                                              qint64 maxBytes) {
+std::optional<QByteArray>
+readBoundedRelative(int dirFd, const MountIdentity &expectedMount,
+                    const QString &name, qint64 maxBytes) {
   const QByteArray nameUtf8 = name.toUtf8();
-  const int fd = openRegularNoFollowRelative(dirFd, nameUtf8, expectedDevice);
+  const int fd = openRegularNoFollowRelative(dirFd, nameUtf8, expectedMount);
   if (fd < 0) {
     return std::nullopt;
   }
@@ -279,16 +387,15 @@ std::optional<QByteArray> readBoundedRelative(int dirFd, quint64 expectedDevice,
 // file that grew past `expectedSize` between an earlier stat and this
 // read is rejected by the resulting byte count, never trusted based on
 // a stale size() alone).
-std::optional<QByteArray> readExactSizeVerifiedRelative(int dirFd,
-                                                        quint64 expectedDevice,
-                                                        const QString &name,
-                                                        qint64 expectedSize,
-                                                        qint64 hardCap) {
+std::optional<QByteArray>
+readExactSizeVerifiedRelative(int dirFd, const MountIdentity &expectedMount,
+                              const QString &name, qint64 expectedSize,
+                              qint64 hardCap) {
   if (expectedSize < 0 || expectedSize > hardCap) {
     return std::nullopt;
   }
   const std::optional<QByteArray> bytes =
-      readBoundedRelative(dirFd, expectedDevice, name, expectedSize + 1);
+      readBoundedRelative(dirFd, expectedMount, name, expectedSize + 1);
   if (!bytes || bytes->size() != expectedSize) {
     return std::nullopt;
   }
@@ -463,11 +570,76 @@ bool isValidKey(const QString &key) {
   return validKeyPattern().match(key).hasMatch();
 }
 
-QString defaultCacheDirectory() {
-  const QString base =
-      QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-  return base + QStringLiteral("/assets/v1");
+// (defaultCacheDirectory() previously lived here, returning
+// QStandardPaths::writableLocation(CacheLocation) + "/assets/v1" as a
+// single opaque string. Round-6 item 5's AssetCache::AssetCache() needs
+// the OS-provided base and this application's own "assets"/"v1" suffix
+// as SEPARATE values -- see its comment -- so that logic is now inlined
+// there directly instead.)
+
+#if defined(Q_OS_UNIX)
+// Round-6 item 5: opens `trustedAnchorPath` via ordinary, O_NOFOLLOW-on-
+// the-leaf-only resolution (exactly the pre-round-6 root-open policy),
+// then walks every component of `ownedSuffixComponents` on top of it
+// one path segment at a time via fstatat(AT_SYMLINK_NOFOLLOW) +
+// openat(O_NOFOLLOW), rejecting the WHOLE resolution if ANY of those
+// suffix components turns out to be a symlink.
+//
+// The split between "trusted anchor" and "owned suffix" is deliberate
+// and load-bearing: `trustedAnchorPath` is always either (a) the
+// OS/desktop-environment-provided cache base directory
+// (QStandardPaths::CacheLocation) when this cache uses its default
+// location, or (b) an entire caller-supplied Config::directory when one
+// is explicitly configured -- in both cases, a path this application
+// did not itself invent and whose provenance is a configuration input,
+// not local-attacker-writable surface, exactly like the pre-round-6
+// policy already trusted (avoids re-litigating long-standing,
+// legitimately-symlinked OS conventions this application has no part
+// in creating and does not own, e.g. macOS's classic `/var` ->
+// `/private/var`, or a Linux distribution's /usr-merge symlinks --
+// which caused genuine regressions in an earlier version of this fix
+// that instead walked no-follow from the filesystem root). Anything
+// named in `ownedSuffixComponents`, by contrast (the "assets/v1"
+// this class itself appends to the OS cache base, in the default-
+// location case), is a subtree this application EXCLUSIVELY owns and
+// creates; nothing else should ever legitimately place a symlink there,
+// so every component of it is verified no-follow regardless of whether
+// it happens to already exist or was just created by QDir::mkpath()
+// (which itself has no symlink-awareness at all -- it is the
+// equivalent of `mkdir -p`, and would otherwise silently create
+// whatever trailing components don't yet exist THROUGH an
+// attacker-planted symlink for an ancestor one or more levels above the
+// final leaf, producing a perfectly ordinary, non-symlink leaf
+// directory that a single final O_NOFOLLOW open could never detect).
+std::optional<int>
+openDirectoryChainNoFollow(const QString &trustedAnchorPath,
+                           const QStringList &ownedSuffixComponents) {
+  const QByteArray anchorUtf8 = QFile::encodeName(trustedAnchorPath);
+  int currentFd = ::open(anchorUtf8.constData(),
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (currentFd < 0) {
+    return std::nullopt;
+  }
+  for (const QString &component : ownedSuffixComponents) {
+    const QByteArray componentUtf8 = component.toUtf8();
+    struct stat st {};
+    if (fstatat(currentFd, componentUtf8.constData(), &st,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISDIR(st.st_mode)) {
+      ::close(currentFd);
+      return std::nullopt;
+    }
+    const int nextFd = openat(currentFd, componentUtf8.constData(),
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    ::close(currentFd);
+    if (nextFd < 0) {
+      return std::nullopt;
+    }
+    currentFd = nextFd;
+  }
+  return currentFd;
 }
+#endif
 
 #if defined(Q_OS_UNIX)
 // Descriptor-relative, no-follow recursive delete (review item 7): every
@@ -489,9 +661,11 @@ QString defaultCacheDirectory() {
 // through, or touched in any way. A hard-linked regular file is just an
 // ordinary directory entry here: unlinkat() drops only that one link,
 // never recursing into or otherwise treating a hardlink specially.
-bool safeRemoveEntryAt(int parentFd, const char *name, quint64 expectedDevice);
+bool safeRemoveEntryAt(int parentFd, const char *name,
+                       const MountIdentity &expectedMount);
 
-bool safeRemoveDirectoryContentsAt(int dirFd, quint64 expectedDevice) {
+bool safeRemoveDirectoryContentsAt(int dirFd,
+                                   const MountIdentity &expectedMount) {
   DIR *dirStream = fdopendir(dirFd);
   if (!dirStream) {
     ::close(dirFd);
@@ -503,7 +677,7 @@ bool safeRemoveDirectoryContentsAt(int dirFd, quint64 expectedDevice) {
     if (qstrcmp(entry->d_name, ".") == 0 || qstrcmp(entry->d_name, "..") == 0) {
       continue;
     }
-    if (!safeRemoveEntryAt(dirFd, entry->d_name, expectedDevice)) {
+    if (!safeRemoveEntryAt(dirFd, entry->d_name, expectedMount)) {
       allOk = false;
     }
     errno = 0;
@@ -512,23 +686,28 @@ bool safeRemoveDirectoryContentsAt(int dirFd, quint64 expectedDevice) {
   return allOk;
 }
 
-bool safeRemoveEntryAt(int parentFd, const char *name, quint64 expectedDevice) {
+bool safeRemoveEntryAt(int parentFd, const char *name,
+                       const MountIdentity &expectedMount) {
   struct stat st {};
   if (fstatat(parentFd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
     return errno == ENOENT; // already gone: nothing left to do
   }
   if (S_ISDIR(st.st_mode)) {
-    // Round-4/5 review item 9: refuse to descend into (let alone
-    // delete) a subdirectory that resolves onto a DIFFERENT mounted
-    // filesystem than the cache root -- a stray bind mount planted
-    // under this cache's exclusively-owned directory must never be
-    // recursed into or unlinked; its contents live on a filesystem this
-    // cache does not own at all. This is checked from the PARENT'S
-    // stat (both before and, again, after actually opening it below),
-    // never assumed from the listing alone.
-    if (static_cast<quint64>(st.st_dev) != expectedDevice) {
+    // Round-4/5 review item 9 (and round-6 item 5's mount-id
+    // strengthening): refuse to descend into (let alone delete) a
+    // subdirectory that resolves onto a DIFFERENT mount than the cache
+    // root -- a stray bind mount planted under this cache's
+    // exclusively-owned directory must never be recursed into or
+    // unlinked; its contents live on a filesystem this cache does not
+    // own at all. This is checked from the PARENT'S stat (both before
+    // and, again, after actually opening it below), never assumed from
+    // the listing alone, and now also compares the kernel mount id when
+    // available -- not just st_dev -- so a same-device bind mount is
+    // caught too (see MountIdentity's comment).
+    if (!mountIdentityMatches(mountIdentityRelative(parentFd, name, st),
+                              expectedMount)) {
       qWarning() << "AssetCache: refusing to descend into" << name
-                 << "-- different device than cache root (mount escape "
+                 << "-- different mount than cache root (mount escape "
                     "guard)";
       return false;
     }
@@ -541,17 +720,17 @@ bool safeRemoveEntryAt(int parentFd, const char *name, quint64 expectedDevice) {
       // guessing.
       return false;
     }
-    // Re-verify the device on the ACTUAL DESCRIPTOR just opened (never
+    // Re-verify the mount on the ACTUAL DESCRIPTOR just opened (never
     // trusting the fstatat() above alone): closes the TOCTOU window
-    // where the entry could have been replaced by a different-device
-    // mount between that check and this open.
+    // where the entry could have been replaced by a different-mount
+    // entry between that check and this open.
     struct stat openedSt {};
     if (::fstat(childFd, &openedSt) != 0 || !S_ISDIR(openedSt.st_mode) ||
-        static_cast<quint64>(openedSt.st_dev) != expectedDevice) {
+        !mountIdentityMatches(mountIdentityForFd(childFd), expectedMount)) {
       ::close(childFd);
       return false;
     }
-    if (!safeRemoveDirectoryContentsAt(childFd, expectedDevice)) {
+    if (!safeRemoveDirectoryContentsAt(childFd, expectedMount)) {
       return false;
     }
     return unlinkat(parentFd, name, AT_REMOVEDIR) == 0 || errno == ENOENT;
@@ -560,22 +739,22 @@ bool safeRemoveEntryAt(int parentFd, const char *name, quint64 expectedDevice) {
   // without AT_REMOVEDIR removes the directory ENTRY, never resolving or
   // following it even when it names a symlink. A regular file cannot
   // itself BE a different mount (only a directory can be a mount
-  // point), so no device check applies here.
+  // point), so no mount check applies here.
   return unlinkat(parentFd, name, 0) == 0 || errno == ENOENT;
 }
 #endif
 
 // Removes `name` (expected to be a directory relative to `parentFd`)
-// and everything under it, using the no-follow, device-checked
+// and everything under it, using the no-follow, mount-checked
 // descriptor-relative primitives above. Refuses outright (a safe no-op,
 // returning false) if `name` is a symlink, is not a directory, does not
-// exist, or resolves onto a different device than `expectedDevice` --
-// see safeRemoveEntryAt()'s comment for the full rationale. On a
+// exist, or resolves onto a different mount than `expectedMount` -- see
+// safeRemoveEntryAt()'s comment for the full rationale. On a
 // hypothetical platform with no such primitives available, this is a
 // safe no-op rather than risking a follow-through-symlink recursive
 // delete.
 bool safeRemoveTreeRelative(int parentFd, const QString &name,
-                            quint64 expectedDevice) {
+                            const MountIdentity &expectedMount) {
 #if defined(Q_OS_UNIX)
   const QByteArray nameUtf8 = name.toUtf8();
   const int fd = openat(parentFd, nameUtf8.constData(),
@@ -585,11 +764,11 @@ bool safeRemoveTreeRelative(int parentFd, const QString &name,
   }
   struct stat st {};
   if (::fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
-      static_cast<quint64>(st.st_dev) != expectedDevice) {
+      !mountIdentityMatches(mountIdentityForFd(fd), expectedMount)) {
     ::close(fd);
     return false;
   }
-  const bool contentsOk = safeRemoveDirectoryContentsAt(fd, expectedDevice);
+  const bool contentsOk = safeRemoveDirectoryContentsAt(fd, expectedMount);
   const bool rmOk =
       unlinkat(parentFd, nameUtf8.constData(), AT_REMOVEDIR) == 0 ||
       errno == ENOENT;
@@ -597,7 +776,7 @@ bool safeRemoveTreeRelative(int parentFd, const QString &name,
 #else
   Q_UNUSED(parentFd);
   Q_UNUSED(name);
-  Q_UNUSED(expectedDevice);
+  Q_UNUSED(expectedMount);
   return false;
 #endif
 }
@@ -614,8 +793,29 @@ bool safeRemoveTreeRelative(int parentFd, const QString &name,
 AssetCache::AssetCache(Config config)
     : m_config(std::move(config)),
       m_memory(new QCache<QString, CachedEntry>()) {
-  m_directory = m_config.directory.isEmpty() ? defaultCacheDirectory()
-                                             : m_config.directory;
+  // Round-6 item 5: the trusted anchor / owned-suffix split (see
+  // openDirectoryChainNoFollow()'s comment) is decided here, BEFORE
+  // anything else touches the filesystem. In the default-location case
+  // (the common, production path), the OS/desktop-environment-provided
+  // cache base is the trusted anchor and "assets"/"v1" -- the two path
+  // segments this class itself appends -- are the owned suffix, always
+  // verified no-follow regardless of whether QDir::mkpath() below ends
+  // up creating them fresh or they already existed. A caller-supplied
+  // Config::directory is, in its entirety, the trusted anchor instead
+  // (an explicit configuration input, not local-attacker-writable
+  // surface) with an empty owned suffix -- preserving the exact
+  // pre-round-6 leaf-only O_NOFOLLOW guarantee for that case.
+  QString trustedAnchorPath;
+  QStringList ownedSuffixComponents;
+  if (m_config.directory.isEmpty()) {
+    trustedAnchorPath =
+        QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    ownedSuffixComponents = {QStringLiteral("assets"), QStringLiteral("v1")};
+    m_directory = trustedAnchorPath + QStringLiteral("/assets/v1");
+  } else {
+    trustedAnchorPath = m_config.directory;
+    m_directory = m_config.directory;
+  }
   // Review item 7: if the configured cache directory ALREADY exists as a
   // symlink, refuse to use it at all -- never mkpath() through it (which
   // would silently follow the symlink and start writing at whatever it
@@ -647,19 +847,29 @@ AssetCache::AssetCache(Config config)
   // operating against a different object than the one this instance
   // was constructed against.
   if (!m_diskCacheDisabled) {
-    const QByteArray dirUtf8 = QFile::encodeName(m_directory);
-    const int fd = ::open(dirUtf8.constData(),
-                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    // Round-6 item 5: resolved via a trusted anchor plus an explicitly
+    // no-follow-verified owned suffix (see
+    // openDirectoryChainNoFollow()'s comment) rather than a single
+    // `::open(path, O_NOFOLLOW)` -- the latter only refuses a symlink
+    // at the FINAL path component; an attacker-planted symlink for an
+    // ancestor this application exclusively owns (one or more levels
+    // above the final leaf) would still be silently followed by
+    // QDir::mkpath() above and then by ordinary path resolution here.
+    const std::optional<int> chainFd =
+        openDirectoryChainNoFollow(trustedAnchorPath, ownedSuffixComponents);
     struct stat st {};
-    if (fd < 0 || ::fstat(fd, &st) != 0) {
-      if (fd >= 0) {
-        ::close(fd);
+    if (!chainFd || ::fstat(*chainFd, &st) != 0) {
+      if (chainFd) {
+        ::close(*chainFd);
       }
       m_diskCacheDisabled = true;
     } else {
-      m_rootFd = fd;
+      m_rootFd = *chainFd;
       m_rootDevice = static_cast<quint64>(st.st_dev);
       m_rootInode = static_cast<quint64>(st.st_ino);
+      const MountIdentity rootMount = mountIdentityForFd(m_rootFd);
+      m_rootMountId = rootMount.mountId;
+      m_rootHasMountId = rootMount.hasMountId;
     }
   }
 #endif
@@ -847,24 +1057,26 @@ QString AssetCache::mintGenerationIdLocked(quint64 accessSequence) {
 
 #if defined(Q_OS_UNIX)
 namespace {
-// Recursive, descriptor-relative, no-follow, device-bounded byte-usage
-// walker (review round-4/5 items 3, 9, 11): sums the on-disk size of
-// every regular file/symlink-node entry found anywhere under `dirFd`
-// (which must be open for exactly one call -- this function always
-// closes it), recursing into subdirectories ONLY while they remain on
-// `expectedDevice`; a same-device directory's OWN entry size is never
+// Recursive, descriptor-relative, no-follow, mount-bounded byte-usage
+// walker (review round-4/5 items 3, 9, 11; round-6 item 5's mount-id
+// strengthening): sums the on-disk size of every regular
+// file/symlink-node entry found anywhere under `dirFd` (which must be
+// open for exactly one call -- this function always closes it),
+// recursing into subdirectories ONLY while they remain on
+// `expectedMount`; a same-mount directory's OWN entry size is never
 // counted (only the files found underneath it), matching this walker's
 // historical QDir::Files-equivalent semantics. A subdirectory found to
-// be a different mounted filesystem (a stray bind mount planted under
-// this cache's exclusively-owned directory) is never descended into --
-// but its OWN directory-entry size IS added in that one case, so it can
-// never simply vanish from the total the way silently skipping it
-// would; quota enforcement must see it as real, non-reclaimable usage
-// (see safeRemoveEntryAt()'s matching refusal to ever delete across
-// that same boundary) rather than falsely reporting the cache as
-// "under budget" while genuinely undeletable/unaccounted bytes remain
-// resident.
-qint64 sumUsageRelative(int dirFd, quint64 expectedDevice) {
+// be a different mount (a stray bind mount planted under this cache's
+// exclusively-owned directory -- including a SAME-DEVICE bind mount,
+// which mountIdentityMatches() now also detects) is never descended
+// into -- but its OWN directory-entry size IS added in that one case,
+// so it can never simply vanish from the total the way silently
+// skipping it would; quota enforcement must see it as real,
+// non-reclaimable usage (see safeRemoveEntryAt()'s matching refusal to
+// ever delete across that same boundary) rather than falsely reporting
+// the cache as "under budget" while genuinely undeletable/unaccounted
+// bytes remain resident.
+qint64 sumUsageRelative(int dirFd, const MountIdentity &expectedMount) {
   qint64 total = 0;
   DIR *dirStream = fdopendir(dirFd);
   if (!dirStream) {
@@ -883,14 +1095,15 @@ qint64 sumUsageRelative(int dirFd, quint64 expectedDevice) {
       continue;
     }
     if (S_ISDIR(st.st_mode)) {
-      if (static_cast<quint64>(st.st_dev) != expectedDevice) {
-        // Cross-device mount encountered: this directory can never be
+      if (!mountIdentityMatches(mountIdentityRelative(dirFd, entry->d_name, st),
+                                expectedMount)) {
+        // Cross-mount entry encountered: this directory can never be
         // descended into or deleted (see safeRemoveEntryAt()'s matching
         // refusal), so its own directory-entry size is counted here as
         // an irreducible placeholder -- otherwise it would simply
         // vanish from the total, letting quota enforcement falsely
         // believe the cache is under budget while genuinely
-        // undeletable/unaccounted bytes remain resident. A same-device
+        // undeletable/unaccounted bytes remain resident. A same-mount
         // directory is never counted this way (matching this walker's
         // historical QDir::Files-equivalent semantics): only the
         // regular files found underneath it contribute bytes.
@@ -902,7 +1115,7 @@ qint64 sumUsageRelative(int dirFd, quint64 expectedDevice) {
           openat(dirFd, entry->d_name,
                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (childFd >= 0) {
-        total += sumUsageRelative(childFd, expectedDevice); // closes childFd
+        total += sumUsageRelative(childFd, expectedMount); // closes childFd
       }
     } else {
       total += st.st_size;
@@ -935,7 +1148,9 @@ qint64 AssetCache::diskUsageBytesLocked() const {
   if (freshFd < 0) {
     return 0;
   }
-  return sumUsageRelative(freshFd, m_rootDevice); // closes freshFd
+  return sumUsageRelative(freshFd,
+                          MountIdentity{m_rootDevice, m_rootMountId,
+                                        m_rootHasMountId}); // closes freshFd
 #else
   return 0;
 #endif
@@ -1013,7 +1228,8 @@ AssetCache::readManifestGeneration(const QString &key) const {
     return std::nullopt;
   }
   const std::optional<QByteArray> raw = readBoundedRelative(
-      m_rootFd, m_rootDevice, manifestPath(key), kMaxMetadataBytesOnDisk);
+      m_rootFd, MountIdentity{m_rootDevice, m_rootMountId, m_rootHasMountId},
+      manifestPath(key), kMaxMetadataBytesOnDisk);
   if (!raw) {
     return std::nullopt;
   }
@@ -1056,7 +1272,8 @@ AssetCache::readMetadata(const QString &metadataFilePath,
   // corrupted/locally-planted file has actually become by the time this
   // read runs.
   const std::optional<QByteArray> rawOpt = readBoundedRelative(
-      m_rootFd, m_rootDevice, metadataFilePath, kMaxMetadataBytesOnDisk);
+      m_rootFd, MountIdentity{m_rootDevice, m_rootMountId, m_rootHasMountId},
+      metadataFilePath, kMaxMetadataBytesOnDisk);
   if (!rawOpt) {
     return std::nullopt;
   }
@@ -1232,8 +1449,10 @@ AssetCache::lookupDisk(const QString &key) {
   const std::optional<QByteArray> verifiedBytes =
       m_rootFd >= 0
           ? readExactSizeVerifiedRelative(
-                m_rootFd, m_rootDevice, generationPayloadPath(key, *generation),
-                metadata->encodedSize, kMaxSinglePayloadBytesOnDisk)
+                m_rootFd,
+                MountIdentity{m_rootDevice, m_rootMountId, m_rootHasMountId},
+                generationPayloadPath(key, *generation), metadata->encodedSize,
+                kMaxSinglePayloadBytesOnDisk)
           : std::nullopt;
 #else
   const std::optional<QByteArray> verifiedBytes = std::nullopt;
@@ -1679,7 +1898,9 @@ void AssetCache::reapAndEnforceQuota() {
       continue;
     }
     if (entry.isDirectory) {
-      safeRemoveTreeRelative(m_rootFd, entry.name, m_rootDevice);
+      safeRemoveTreeRelative(
+          m_rootFd, entry.name,
+          MountIdentity{m_rootDevice, m_rootMountId, m_rootHasMountId});
       continue;
     }
     allFiles.append(entry.name);
@@ -1793,10 +2014,13 @@ void AssetCache::reapAndEnforceQuota() {
         readMetadata(genMetadataPath, key);
 #if defined(Q_OS_UNIX)
     const std::optional<QByteArray> verifiedBytes =
-        metadata ? readExactSizeVerifiedRelative(
-                       m_rootFd, m_rootDevice, genPayloadPath,
-                       metadata->encodedSize, kMaxSinglePayloadBytesOnDisk)
-                 : std::nullopt;
+        metadata
+            ? readExactSizeVerifiedRelative(
+                  m_rootFd,
+                  MountIdentity{m_rootDevice, m_rootMountId, m_rootHasMountId},
+                  genPayloadPath, metadata->encodedSize,
+                  kMaxSinglePayloadBytesOnDisk)
+            : std::nullopt;
 #else
     const std::optional<QByteArray> verifiedBytes = std::nullopt;
 #endif
@@ -2002,6 +2226,23 @@ AssetCache::currentGenerationForTesting(const QString &key) const {
     return std::nullopt;
   }
   return readManifestGeneration(key);
+}
+
+bool AssetCache::directoryChainResolvesNoFollowForTesting(
+    const QString &trustedAnchorPath,
+    const QStringList &ownedSuffixComponents) {
+#if defined(Q_OS_UNIX)
+  const std::optional<int> fd =
+      openDirectoryChainNoFollow(trustedAnchorPath, ownedSuffixComponents);
+  if (fd) {
+    ::close(*fd);
+  }
+  return fd.has_value();
+#else
+  Q_UNUSED(trustedAnchorPath);
+  Q_UNUSED(ownedSuffixComponents);
+  return false;
+#endif
 }
 
 } // namespace Arkham

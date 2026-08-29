@@ -272,6 +272,23 @@ public:
   [[nodiscard]] std::optional<QString>
   currentGenerationForTesting(const QString &key) const;
 
+  // Test-only exposure of the exact no-follow, trusted-anchor +
+  // owned-suffix directory chain resolution the constructor uses
+  // internally (round-6 item 5 -- see AssetCache::AssetCache()'s and
+  // openDirectoryChainNoFollow()'s comments in AssetCache.cpp), without
+  // needing a full AssetCache construction against this process's real
+  // OS-provided cache directory (which an empty Config::directory would
+  // otherwise always resolve to). Returns true iff every component of
+  // `ownedSuffixComponents`, walked one at a time from
+  // `trustedAnchorPath`, resolved to a genuine, non-symlink directory
+  // (false on any failure, including `trustedAnchorPath` itself being
+  // unopenable or a symlink). A no-op stub returning false on any
+  // non-POSIX platform (this protection is POSIX-only, matching the
+  // production code path it tests).
+  [[nodiscard]] static bool directoryChainResolvesNoFollowForTesting(
+      const QString &trustedAnchorPath,
+      const QStringList &ownedSuffixComponents);
+
 private:
   struct DiskMetadata {
     QString key;
@@ -439,6 +456,20 @@ private:
   mutable int m_rootFd{-1};
   mutable quint64 m_rootDevice{0};
   mutable quint64 m_rootInode{0};
+  // Review round-6 item 5: the kernel mount identifier (statx()'s
+  // STATX_MNT_ID, Linux 5.8+) for `m_rootFd`'s mount, when the running
+  // kernel/libc support reporting it. st_dev alone is NOT sufficient to
+  // detect every cross-mount escape: a bind mount of some other
+  // directory onto a path underneath the cache root shares the SAME
+  // st_dev as its source filesystem (bind mounts don't create a new
+  // block device), so an st_dev-only comparison can miss precisely that
+  // case. m_rootHasMountId is false (and this field unused) on
+  // platforms/kernels where STATX_MNT_ID isn't available; every check
+  // that uses this falls back to the pre-existing st_dev-only
+  // comparison in that case -- see MountIdentity's comment for the
+  // documented limitation this implies on such platforms.
+  mutable quint64 m_rootMountId{0};
+  mutable bool m_rootHasMountId{false};
   // Review item 11: guarded by m_mutex; recovered in the constructor (via
   // reapAndEnforceQuota()'s directory scan) and re-validated (monotonic,
   // never decreasing) on every subsequent reapAndEnforceQuota() call, so
