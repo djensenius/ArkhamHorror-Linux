@@ -687,9 +687,18 @@ public:
   // AST (see RawJson.h) for CreateGameRequest::fromRawJson.
   [[nodiscard]] static ValueOrError<CampaignOrScenario>
   fromJson(const Json::Value &requestObj, QStringView path);
-  // Inserts this request's resolved "campaignId"/"scenarioId" keys (each
-  // either the real id or explicit JSON null) into `obj`, matching the
-  // fixture's own encoding (both keys always present).
+  // QJsonObject convenience fragment-insertion, for display/log/debug or
+  // a QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes. Inserts this request's resolved
+  // "campaignId"/"scenarioId" keys (each either the real id or explicit
+  // JSON null) into `obj`, matching the fixture's own encoding (both keys
+  // always present), but embeds each id via a raw, unvalidated
+  // QJsonValue(QString) construction with no lone/mismatched UTF-16
+  // surrogate check -- see insertRawInto() below for the always-lossless,
+  // always-validated equivalent CreateGameRequest::toRawJson() actually
+  // composes through; CreateGameRequest::toJson() no longer calls this
+  // method (it derives its QJsonObject view from toRawJson() instead), so
+  // this remains solely a fragment-comparison convenience for tests.
   void insertInto(QJsonObject &obj) const;
   // Canonical byte-level equivalent of insertInto() (round-10-cumulative-
   // review item 2): appends the same two keys, built directly as
@@ -815,10 +824,23 @@ struct ChooseDeckRequest {
   // patch deckList back in from the raw tree" implementation.
   [[nodiscard]] static ValueOrError<ChooseDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  // See Decks.h's DeckListInput::toJson() doc comment: fails (rather
-  // than silently rounding) whenever a present deckList's `id` cannot be
-  // exactly represented as a QJsonValue.
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h) rather than embedding investigatorId/deckUrl via raw,
+  // unvalidated QJsonValue construction, so a lone/mismatched UTF-16
+  // surrogate anywhere in this request (including nested inside a
+  // present deckList) is a typed failure here too, and a present
+  // deckList's `id` being a Number literal that cannot be exactly
+  // represented is likewise rejected -- see DeckListInput::toJson()'s
+  // doc comment.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST fragment for this request body (see
+  // RawJson.h); used by toJson() and toJsonBytes() below so both share
+  // one encode.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   // Precision-preserving equivalent of toJson(); see
   // DeckListInput::toJsonBytes().
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
@@ -842,7 +864,16 @@ struct ClaimSeatRequest {
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<ClaimSeatRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h), rather than embedding investigatorId via a raw,
+  // unvalidated QJsonValue(QString) construction, so a lone/mismatched
+  // UTF-16 surrogate is a typed failure here too, matching toJsonBytes()
+  // instead of ever emitting a normal-looking-but-invalid QJsonObject.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode (round-10-cumulative-review item 2):
   // composes the lossless AST directly (see RawJson.h) -- investigatorId
   // is an unconstrained (non-empty) QString a caller can set to anything,

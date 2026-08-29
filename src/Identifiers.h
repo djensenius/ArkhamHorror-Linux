@@ -56,6 +56,27 @@ public:
 
   friend bool operator==(const TypedId &, const TypedId &) = default;
 
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_value
+  // is a plain QString, and QString's move constructor/assignment leaves
+  // the moved-from string empty, which would silently turn a moved-from
+  // TypedId into one whose value() is an empty string -- even though
+  // this class's whole reason for existing is to make "a validated
+  // non-null uuid" a structural invariant every live TypedId instance
+  // upholds (parse()/fromJson() are its only construction paths). A
+  // user-declared copy constructor/assignment here means there is no
+  // user-declared move constructor/assignment for the compiler to
+  // implicitly generate, so std::move(id) instead binds to this copy
+  // constructor (an rvalue can bind to `const TypedId&`), leaving the
+  // moved-from source completely unchanged and still valid -- QString's
+  // copy constructor is noexcept and O(1) (implicit sharing: a refcount
+  // increment, never a deep copy), so this costs nothing relative to a
+  // "real" move while making an invariant-violating moved-from TypedId
+  // structurally impossible to observe, including through a container
+  // (QList/QMap/std::optional) that relocates/moves its elements.
+  TypedId(const TypedId &) = default;
+  TypedId &operator=(const TypedId &) = default;
+
 private:
   explicit TypedId(QString canonical) : m_value(std::move(canonical)) {}
   QString m_value;
@@ -99,6 +120,16 @@ public:
 
   friend bool operator==(const NonEmptyString &,
                          const NonEmptyString &) = default;
+
+  // See TypedId's identically-reasoned copy constructor/assignment above:
+  // m_value is a plain QString, whose implicit move would leave a
+  // moved-from NonEmptyString holding an empty (invariant-violating)
+  // string despite parse()/fromJson() being its only construction paths.
+  // Declaring these explicitly suppresses the compiler's implicit move
+  // constructor/assignment, so std::move() falls back to this (noexcept,
+  // O(1) due to QString's implicit sharing) copy instead.
+  NonEmptyString(const NonEmptyString &) = default;
+  NonEmptyString &operator=(const NonEmptyString &) = default;
 
 private:
   explicit NonEmptyString(QString v) : m_value(std::move(v)) {}
@@ -160,6 +191,17 @@ public:
                                       const CardCode &b) noexcept {
     return a.m_value < b.m_value;
   }
+
+  // See TypedId's identically-reasoned copy constructor/assignment above:
+  // m_value is a plain QString backing this class's "starts with 'c',
+  // non-empty payload" invariant (parse()/fromJson() are its only
+  // construction paths), which an implicit move would silently violate
+  // for the moved-from source. Declaring these explicitly suppresses the
+  // compiler's implicit move constructor/assignment, so std::move()
+  // falls back to this (noexcept, O(1) due to QString's implicit
+  // sharing) copy instead.
+  CardCode(const CardCode &) = default;
+  CardCode &operator=(const CardCode &) = default;
 
 private:
   explicit CardCode(QString v) : m_value(std::move(v)) {}

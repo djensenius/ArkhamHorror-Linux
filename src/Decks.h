@@ -180,9 +180,16 @@ struct DeckListInput {
   // QJsonObject convenience conversion, for display/log/debug or a
   // QJsonObject-typed test assertion -- NEVER for building outbound
   // request bytes; see toJsonBytes() below for the canonical, always-
-  // lossless equivalent. Fails (rather than silently rounding) whenever
-  // `id` is a Number literal that cannot be exactly represented as a
-  // QJsonValue -- see ExternalDeckId::toJson()'s doc comment.
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h) rather than hand-inserting fields into a QJsonObject, so
+  // this can never expose weaker validation than toJsonBytes() -- a lone
+  // /mismatched UTF-16 surrogate anywhere in this request (e.g.
+  // investigatorCode, url, meta, name, or a value nested inside
+  // sideSlots) is a typed failure here too, not merely at the byte
+  // encoder, and `id` being a Number literal that cannot be exactly
+  // represented is likewise rejected -- see ExternalDeckId::toJson()'s
+  // doc comment.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // The lossless Json::Value AST fragment for this request body (see
   // RawJson.h); used by toJsonBytes() below and by any enclosing request
@@ -288,10 +295,20 @@ struct CreateDeckRequest {
   // above; see DeckListInput::fromRawBytes().
   [[nodiscard]] static ValueOrError<CreateDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  // See DeckListInput::toJson()'s doc comment: fails (rather than
-  // silently rounding) whenever the nested deckList's `id` cannot be
-  // exactly represented as a QJsonValue.
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h), so this can never expose weaker validation than
+  // toJsonBytes() -- a lone/mismatched UTF-16 surrogate anywhere in this
+  // request (deckId/deckName/deckUrl or anything nested inside deckList)
+  // is a typed failure here too, not just at the byte encoder.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST fragment for this request body (see
+  // RawJson.h); used by toJson() and toJsonBytes() below so both share
+  // one encode of deckList/deckId/deckName/deckUrl.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   // Precision-preserving equivalent of toJson(); see
   // DeckListInput::toJsonBytes().
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
@@ -317,11 +334,18 @@ struct FetchDeckRequest {
   // above.
   [[nodiscard]] static ValueOrError<FetchDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h) rather than embedding `url` via a raw, unvalidated
+  // QJsonValue(QString) construction, so a lone/mismatched UTF-16
+  // surrogate in `url` is a typed failure here too, not only at
+  // toJsonBytes().
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Precision-preserving/canonical equivalent of toJson()
-  // (round-10-cumulative-review item 2): unlike toJson() -- a QJsonObject
-  // convenience whose `url` is embedded via a raw QJsonValue(QString)
-  // construction with no validation -- this composes a Json::Value AST
+  // (round-10-cumulative-review item 2): composes a Json::Value AST
   // directly and serializes it via Value::toJsonBytes(), which rejects a
   // lone/mismatched UTF-16 surrogate in `url` with a typed failure rather
   // than ever emitting invalid UTF-8 (see RawJson.h's

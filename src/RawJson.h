@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QByteArrayView>
 #include <QHash>
+#include <QJsonObject>
 #include <QJsonValue>
 #include <QLatin1StringView>
 #include <QList>
@@ -133,6 +134,28 @@ public:
   // default, a parsed literal, or fromInt64()'s output -- is consistently
   // valid and round-trips through toJsonBytes() without exception.
   RawNumber() : m_intDigits(QStringLiteral("0")) {}
+
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: this
+  // class's state is entirely QString members, and QString's move
+  // constructor/assignment leaves the moved-from string empty, which
+  // would silently turn a moved-from RawNumber's m_intDigits empty --
+  // exactly the "unrepresentable digit-less coefficient" state this
+  // class's default constructor above was written to make unreachable
+  // in the first place (toExactInt64()'s all-zero loop would then
+  // vacuously return 0 for a value that literal()/toJsonBytes() reject
+  // as invalid). Declaring the copy constructor/assignment here means
+  // there is no user-declared move constructor/assignment for the
+  // compiler to implicitly generate, so std::move(number) instead binds
+  // to this copy constructor (an rvalue can bind to `const RawNumber&`),
+  // leaving the moved-from source completely unchanged -- QString's copy
+  // constructor is noexcept and O(1) (implicit sharing: a refcount
+  // increment, never a deep copy), so this costs nothing relative to a
+  // "real" move while making a moved-from RawNumber structurally
+  // impossible to observe as invalid, including through a container
+  // (QList/QMap/std::optional) that relocates/moves its elements.
+  RawNumber(const RawNumber &) = default;
+  RawNumber &operator=(const RawNumber &) = default;
 
   [[nodiscard]] bool isNegative() const noexcept { return m_negative; }
   [[nodiscard]] bool hasFraction() const noexcept {
@@ -293,6 +316,21 @@ public:
   // QJsonValue tree. Still prefer toJsonBytes()/the raw AST directly
   // whenever the canonical wire representation is what actually matters.
   [[nodiscard]] ValueOrError<QJsonValue> toExactQJson() const;
+
+  // toExactQJson() above, narrowed to the (overwhelmingly common) case
+  // where *this is already known to be an Object -- exactly the shape
+  // every outbound request's toJson() convenience composes via
+  // toRawJson(). A typed failure (never Q_ASSERT/Q_UNREACHABLE) if kind()
+  // is not Kind::Object, so a future caller that accidentally calls this
+  // on a non-object Value gets a clear error instead of undefined
+  // behavior from an unchecked toObject() cast. This is the one encoder
+  // every request-facing toJson() should call after building its own
+  // toRawJson() AST, so a QJsonObject convenience view can never expose
+  // weaker validation (lone UTF-16 surrogates, duplicate keys, a nested
+  // Kind::Undefined, or a size/depth/node-count past
+  // ParseLimits::production()) than the canonical toJsonBytes() path --
+  // see e.g. FetchDeckRequest::toJson()'s doc comment in Decks.h.
+  [[nodiscard]] ValueOrError<QJsonObject> toExactQJsonObject() const;
 
   friend bool operator==(const Value &, const Value &) = default;
 

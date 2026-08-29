@@ -207,6 +207,37 @@ private slots:
   void createGameRequestToJsonRejectsOutOfRangeUltimatumOrBoonInArray();
   void campaignOptionKnownOptionFactoryRejectsOutOfRangeEnumValue();
   void campaignOptionRequestKnownOptionFactoryRejectsOutOfRangeEnumValue();
+
+  // Round-14 item 1 companions: CampaignOptionRequest/ChooseDeckRequest/
+  // ClaimSeatRequest/CreateGameRequest's toJson() previously embedded a
+  // string field via raw, unvalidated QJsonValue(QString) construction
+  // (or, for CampaignOptionRequest's Kind::Variant, m_text), so a lone/
+  // mismatched UTF-16 surrogate there would have silently produced a
+  // normal-looking-but-invalid QJsonObject even though toJsonBytes()
+  // correctly rejected the identical input. Each now composes
+  // toRawJson() + Value::toExactQJsonObject() instead, so toJson() must
+  // reject these exactly like toJsonBytes() already does (see
+  // createGameRequestToJsonBytesRejectsLoneSurrogateInCampaignName()/
+  // claimSeatRequestToJsonBytesRejectsLoneSurrogateInInvestigatorId()
+  // above for the pre-existing toJsonBytes()-only companions).
+  void campaignOptionRequestToJsonRejectsLoneSurrogateInVariantText();
+  void chooseDeckRequestToJsonRejectsLoneSurrogateInInvestigatorId();
+  void claimSeatRequestToJsonRejectsLoneSurrogateInInvestigatorId();
+  void createGameRequestToJsonRejectsLoneSurrogateInCampaignName();
+
+  // Round-14 items 2/3: NonEmptyString<Tag>-backed InvestigatorRef and
+  // UUID-backed CampaignId/ScenarioId used to rely on an implicit move
+  // constructor/assignment that emptied/nulled the moved-from instance's
+  // underlying value while its type still nominally claimed to hold a
+  // validated (non-empty/non-null) value. Each now explicitly declares a
+  // copy constructor/assignment (see Identifiers.h), suppressing the
+  // compiler's implicit move so std::move() falls back to a full copy --
+  // the moved-from source must remain completely valid and reusable,
+  // including through the actual enclosing request encoder the reviewer
+  // cited (ClaimSeatRequest{source}.toJsonBytes()).
+  void investigatorRefMoveConstructLeavesSourceValidAndReusableInClaimSeat();
+  void campaignIdMoveConstructLeavesSourceValidAndReusableInCreateGame();
+  void scenarioIdMoveConstructLeavesSourceValidAndReusableInCreateGame();
 };
 
 namespace {
@@ -1079,7 +1110,10 @@ void GamesTests::decodesClaimSeatFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->investigatorId.value(), QStringLiteral("01001"));
-  QCOMPARE(result->toJson(), withoutKey(v.toObject(), "unknownField"_L1));
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, withoutKey(v.toObject(), "unknownField"_L1));
 }
 
 void GamesTests::chooseDeckMissingInvestigatorIdRejected() {
@@ -1778,7 +1812,10 @@ void GamesTests::additiveUnknownFieldsIgnoredInClaimSeat() {
   const auto result = ClaimSeatRequest::fromJson(obj, u"claimSeat");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QVERIFY(!result->toJson().contains(QStringLiteral("aFutureField")));
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY(!encoded->contains(QStringLiteral("aFutureField")));
 }
 
 void GamesTests::chooseDeckWithDeckListRoundTrips() {
@@ -1882,8 +1919,11 @@ void GamesTests::chooseDeckRequestToJsonRejectsSideSlotsWithNestedUndefined() {
 void GamesTests::claimSeatRoundTrips() {
   const ClaimSeatRequest request{
       .investigatorId = *InvestigatorRef::parse(QStringLiteral("c01001"))};
-  QCOMPARE(request.toJson(), (QJsonObject{{QStringLiteral("investigatorId"),
-                                           QStringLiteral("c01001")}}));
+  const auto encoded = request.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, (QJsonObject{{QStringLiteral("investigatorId"),
+                                   QStringLiteral("c01001")}}));
 }
 
 void GamesTests::claimSeatRequestFromRawBytesMatchesFromJsonOnSameFixture() {
@@ -2052,6 +2092,141 @@ void GamesTests::
   const auto result =
       CampaignOptionRequest::knownOption(static_cast<KnownCampaignOption>(999));
   QVERIFY(!result.has_value());
+}
+
+void GamesTests::
+    campaignOptionRequestToJsonRejectsLoneSurrogateInVariantText() {
+  // Companion to CampaignOptionRequest::toJsonBytes()'s pre-existing
+  // surrogate rejection (see round-10-cumulative-review item 2's doc
+  // comment on toRawJson() in Games.h): toJson() now composes the same
+  // toRawJson()/toExactQJsonObject() machinery, so it must reject a
+  // Kind::Variant's contents string identically rather than embedding it
+  // via unvalidated QJsonValue(QString) construction.
+  QString lone;
+  lone += QChar(0xD800);
+  const CampaignOptionRequest request =
+      CampaignOptionRequest::variantOption(lone);
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
+void GamesTests::chooseDeckRequestToJsonRejectsLoneSurrogateInInvestigatorId() {
+  QString lone;
+  lone += QChar(0xDC00);
+  const ChooseDeckRequest request{.investigatorId =
+                                      *InvestigatorRef::parse(lone)};
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
+void GamesTests::claimSeatRequestToJsonRejectsLoneSurrogateInInvestigatorId() {
+  // Companion to
+  // claimSeatRequestToJsonBytesRejectsLoneSurrogateInInvestigatorId()
+  // above: ClaimSeatRequest::toJson() used to embed investigatorId via
+  // raw, unvalidated QJsonValue(QString) construction (unlike
+  // toJsonBytes()); it now composes toRawJson() + toExactQJsonObject()
+  // and must reject identically.
+  QString lone;
+  lone += QChar(0xD800);
+  const ClaimSeatRequest request{.investigatorId =
+                                     *InvestigatorRef::parse(lone)};
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
+void GamesTests::createGameRequestToJsonRejectsLoneSurrogateInCampaignName() {
+  // Companion to
+  // createGameRequestToJsonBytesRejectsLoneSurrogateInCampaignName()
+  // above: CreateGameRequest::toJson() used to embed campaignName via raw,
+  // unvalidated QJsonValue(QString) construction; it now composes
+  // toRawJson() + toExactQJsonObject() and must reject identically.
+  auto request = minimalCreateGameRequest();
+  QString lone;
+  lone += QChar(0xD800);
+  request.campaignName = lone;
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
+void GamesTests::
+    investigatorRefMoveConstructLeavesSourceValidAndReusableInClaimSeat() {
+  // The reviewer's exact scenario: source = *InvestigatorRef::parse(...);
+  // moved = std::move(source); ClaimSeatRequest{source}.toJsonBytes()
+  // must not emit an empty minLength-violating investigatorId. Both the
+  // moved-from source and the moved-to destination must independently
+  // still encode the identical, correct investigatorId.
+  auto parsed = InvestigatorRef::parse(QStringLiteral("01001"));
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  InvestigatorRef source = *parsed;
+  InvestigatorRef moved(std::move(source));
+
+  const ClaimSeatRequest fromSource{.investigatorId = source};
+  const ClaimSeatRequest fromMoved{.investigatorId = moved};
+  const auto sourceBytes = fromSource.toJsonBytes();
+  const auto movedBytes = fromMoved.toJsonBytes();
+  if (!sourceBytes)
+    QFAIL(qPrintable(sourceBytes.error()));
+  if (!movedBytes)
+    QFAIL(qPrintable(movedBytes.error()));
+  QCOMPARE(*sourceBytes, *movedBytes);
+  QVERIFY(sourceBytes->contains("01001"));
+}
+
+void GamesTests::
+    campaignIdMoveConstructLeavesSourceValidAndReusableInCreateGame() {
+  // CampaignId (NonEmptyString<Tag>) is reused here through
+  // CreateGameRequest's actual campaignOrScenario field -- the same
+  // move-safety concern (implicit move emptying the moved-from source's
+  // underlying QString) applies to it exactly as to InvestigatorRef.
+  auto parsed = CampaignId::parse(QStringLiteral("06"));
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  CampaignId source = *parsed;
+  CampaignId moved(std::move(source));
+
+  auto fromSource = minimalCreateGameRequest();
+  fromSource.campaignOrScenario = CampaignOrScenario::campaign(source);
+  auto fromMoved = minimalCreateGameRequest();
+  fromMoved.campaignOrScenario = CampaignOrScenario::campaign(moved);
+  const auto sourceBytes = fromSource.toJsonBytes();
+  const auto movedBytes = fromMoved.toJsonBytes();
+  if (!sourceBytes)
+    QFAIL(qPrintable(sourceBytes.error()));
+  if (!movedBytes)
+    QFAIL(qPrintable(movedBytes.error()));
+  QCOMPARE(*sourceBytes, *movedBytes);
+  QVERIFY(sourceBytes->contains("\"campaignId\":\"06\""));
+}
+
+void GamesTests::
+    scenarioIdMoveConstructLeavesSourceValidAndReusableInCreateGame() {
+  auto parsed = ScenarioId::parse(QStringLiteral("01104"));
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  ScenarioId source = *parsed;
+  ScenarioId moved(std::move(source));
+
+  auto fromSource = minimalCreateGameRequest();
+  fromSource.campaignOrScenario = CampaignOrScenario::scenario(source);
+  auto fromMoved = minimalCreateGameRequest();
+  fromMoved.campaignOrScenario = CampaignOrScenario::scenario(moved);
+  const auto sourceBytes = fromSource.toJsonBytes();
+  const auto movedBytes = fromMoved.toJsonBytes();
+  if (!sourceBytes)
+    QFAIL(qPrintable(sourceBytes.error()));
+  if (!movedBytes)
+    QFAIL(qPrintable(movedBytes.error()));
+  QCOMPARE(*sourceBytes, *movedBytes);
+  QVERIFY(sourceBytes->contains("\"scenarioId\":\"01104\""));
 }
 
 QTEST_APPLESS_MAIN(GamesTests)

@@ -1,5 +1,7 @@
 #include "RawJson.h"
 
+#include "JsonDecode.h"
+
 #include <QAnyStringView>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -726,6 +728,21 @@ ValueOrError<QJsonValue> Value::toExactQJson() const {
   return toExactQJsonInner(ParseLimits::production(), 0, totalNodes);
 }
 
+ValueOrError<QJsonObject> Value::toExactQJsonObject() const {
+  if (m_kind != Kind::Object)
+    return failure(
+        QStringLiteral("Value::toExactQJsonObject: expected an object, got %1")
+            .arg(typeName(*this)));
+  auto exact = toExactQJson();
+  if (!exact)
+    return failure(exact.error());
+  // Kind::Object above guarantees toExactQJsonInner's Object branch ran,
+  // which only ever returns QJsonValue(QJsonObject) or a typed failure --
+  // never any other QJsonValue::Type -- so this is a lossless view, not a
+  // narrowing/defensive fallback.
+  return exact->toObject();
+}
+
 Value Value::makeNull() {
   Value v;
   v.m_kind = Kind::Null;
@@ -1079,6 +1096,12 @@ QString RawNumber::literal() const {
 std::optional<qint64> RawNumber::toInt64() const {
   if (hasFraction() || hasExponent())
     return std::nullopt;
+  // No separate "empty coefficient" guard is needed here the way
+  // toExactInt64() below needs one: an empty m_intDigits makes `text`
+  // either empty or the lone sign character "-", and
+  // QString::toLongLong() already fails (returns ok=false) on both,
+  // rather than vacuously succeeding the way an all-zero-digit loop
+  // would.
   QString text = (m_negative ? QStringLiteral("-") : QString()) + m_intDigits;
   bool ok = false;
   qint64 value = text.toLongLong(&ok);
@@ -1120,6 +1143,22 @@ std::optional<quint64> parseMagnitudeDigits(QStringView digits, bool negative) {
 } // namespace
 
 std::optional<qint64> RawNumber::toExactInt64() const {
+  // A syntactically valid JSON number (RFC 8259: `-? int frac? exp?`)
+  // always has a non-empty `int` part -- the friend Parser never produces
+  // one otherwise, and this class's default constructor/fromInt64()
+  // above never leave it empty either, and (see the explicitly-declared
+  // copy constructor/assignment above) a moved-from RawNumber no longer
+  // can either. Reject an empty m_intDigits explicitly here, before the
+  // all-zero shortcut below, as defense in depth regardless: an empty
+  // digit string would otherwise vacuously satisfy that loop's "every
+  // digit is zero" check (there are no digits to fail it) and silently
+  // answer 0 for a value that literal()/toJsonBytes() correctly treat as
+  // an unrepresentable digit-less coefficient -- this keeps
+  // toExactInt64() consistent with that rejection instead of answering
+  // "0" for something that could never actually serialize.
+  if (m_intDigits.isEmpty())
+    return std::nullopt;
+
   // Concatenate integer+fraction digits into one unsigned digit string;
   // the decimal point conceptually sits at position m_intDigits.size() in
   // that string, then is shifted further by the exponent (a positive

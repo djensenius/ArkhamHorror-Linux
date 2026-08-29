@@ -160,6 +160,28 @@ private slots:
   void toExactQJsonRejectsDepthExceedingLimitOnProgrammaticAst();
   void toExactQJsonRejectsArrayExceedingMaxArrayElements();
   void toExactQJsonAcceptsValidNestedAstAndPreservesExactInt64();
+
+  // Round-14 item 1 companion: toExactQJsonObject() is the new helper
+  // every request-facing toJson() composes with toRawJson() (see
+  // Decks.cpp/Games.cpp), narrowing toExactQJson() to the Object case
+  // every one of those callers is already guaranteed to produce.
+  void toExactQJsonObjectConvertsObjectSuccessfully();
+  void toExactQJsonObjectRejectsNonObjectValue();
+  void toExactQJsonObjectRejectsSameInvariantViolationsAsToExactQJson();
+
+  // Round-14 items 2/3: RawNumber's implicit move constructor/assignment
+  // used to move (empty) its QString digit members, leaving a moved-from
+  // RawNumber with an invalid empty coefficient that toExactInt64()'s
+  // all-zero shortcut would then vacuously (and incorrectly) treat as
+  // exact 0. RawNumber now explicitly declares a copy constructor/
+  // assignment, suppressing the compiler's implicit move so std::move()
+  // falls back to a full (cheap, QString-implicit-sharing) copy instead --
+  // a moved-from RawNumber must remain fully valid and reusable.
+  void rawNumberMoveConstructLeavesSourceValidAndReusable();
+  void rawNumberMoveAssignLeavesSourceValidAndReusable();
+  void rawNumberSelfMoveAssignmentLeavesValueUnchanged();
+  void rawNumberMovedFromRemainsValidForZeroNegativeAndHugeExponentCases();
+  void rawNumberSurvivesQListRelocation();
 };
 
 namespace {
@@ -1251,6 +1273,147 @@ void RawJsonTests::toExactQJsonAcceptsValidNestedAstAndPreservesExactInt64() {
            QStringLiteral("hello"));
   QVERIFY(array.at(1).isNull());
   QCOMPARE(array.at(2).toBool(), false);
+}
+
+void RawJsonTests::toExactQJsonObjectConvertsObjectSuccessfully() {
+  const Value obj = Value::makeObject(
+      {{QStringLiteral("a"), Value::makeNumber(RawNumber::fromInt64(1))},
+       {QStringLiteral("b"), Value::makeString(QStringLiteral("x"))}});
+  auto result = obj.toExactQJsonObject();
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->value(QStringLiteral("a")).toInteger(), 1);
+  QCOMPARE(result->value(QStringLiteral("b")).toString(), QStringLiteral("x"));
+}
+
+void RawJsonTests::toExactQJsonObjectRejectsNonObjectValue() {
+  // Every scoped request's toJson() composes toRawJson() (always an
+  // Object) with this helper; a typed failure here (rather than an
+  // unchecked toObject() on a non-object Kind) is what makes a future
+  // caller's mistake safe rather than undefined behavior.
+  const auto arrayResult = Value::makeArray({}).toExactQJsonObject();
+  QVERIFY(!arrayResult.has_value());
+  QVERIFY2(arrayResult.error().contains(QStringLiteral("expected an object")),
+           qPrintable(arrayResult.error()));
+
+  const auto stringResult =
+      Value::makeString(QStringLiteral("x")).toExactQJsonObject();
+  QVERIFY(!stringResult.has_value());
+
+  const auto nullResult = Value::makeNull().toExactQJsonObject();
+  QVERIFY(!nullResult.has_value());
+}
+
+void RawJsonTests::
+    toExactQJsonObjectRejectsSameInvariantViolationsAsToExactQJson() {
+  // toExactQJsonObject() must never be weaker than toExactQJson(): every
+  // invariant the latter enforces (lone surrogate, nested Undefined,
+  // depth) must still reject when reached through the former.
+  QString lone;
+  lone += QChar(0xD800);
+  const Value withLoneSurrogate =
+      Value::makeObject({{QStringLiteral("s"), Value::makeString(lone)}});
+  QVERIFY(!withLoneSurrogate.toExactQJsonObject().has_value());
+
+  const Value withNestedUndefined =
+      Value::makeObject({{QStringLiteral("present"), Value::makeBool(true)},
+                         {QStringLiteral("vanishes"), Value{}}});
+  QVERIFY(!withNestedUndefined.toExactQJsonObject().has_value());
+
+  Value deeplyNested = Value::makeNumber(RawNumber::fromInt64(1));
+  for (int i = 0; i < ParseLimits::production().maxDepth + 8; ++i)
+    deeplyNested = Value::makeArray({deeplyNested});
+  const Value objWithDeepArray =
+      Value::makeObject({{QStringLiteral("nested"), deeplyNested}});
+  QVERIFY(!objWithDeepArray.toExactQJsonObject().has_value());
+}
+
+void RawJsonTests::rawNumberMoveConstructLeavesSourceValidAndReusable() {
+  auto parsed = Value::parse("12345", u"n");
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  RawNumber source = parsed->toRawNumber();
+  QCOMPARE(source.literal(), QStringLiteral("12345"));
+
+  // std::move() on a RawNumber now binds the explicitly-declared copy
+  // constructor (see RawJson.h) rather than an implicit move, so `source`
+  // below must remain fully intact -- not emptied -- after this call.
+  RawNumber moved(std::move(source));
+  QCOMPARE(moved.literal(), QStringLiteral("12345"));
+  QCOMPARE(moved.toExactInt64(), std::optional<qint64>(12345));
+
+  // The moved-from source must still be independently valid and usable:
+  // reused here both directly and spliced into a fresh request-shaped
+  // aggregate, matching the reviewer's "reuse both source and
+  // destination" scenario.
+  QCOMPARE(source.literal(), QStringLiteral("12345"));
+  QCOMPARE(source.toExactInt64(), std::optional<qint64>(12345));
+  const Value reencoded =
+      Value::makeObject({{QStringLiteral("id"), Value::makeNumber(source)}});
+  auto bytes = reencoded.toJsonBytes();
+  if (!bytes)
+    QFAIL(qPrintable(bytes.error()));
+  QCOMPARE(*bytes, QByteArray(R"({"id":12345})"));
+}
+
+void RawJsonTests::rawNumberMoveAssignLeavesSourceValidAndReusable() {
+  auto parsed = Value::parse("-42", u"n");
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  RawNumber source = parsed->toRawNumber();
+  RawNumber destination = RawNumber::fromInt64(0);
+  destination = std::move(source);
+
+  QCOMPARE(destination.literal(), QStringLiteral("-42"));
+  QCOMPARE(destination.toExactInt64(), std::optional<qint64>(-42));
+  // Move-assignment (falling back to copy-assignment) must leave `source`
+  // just as valid/reusable as move-construction does above.
+  QCOMPARE(source.literal(), QStringLiteral("-42"));
+  QCOMPARE(source.toExactInt64(), std::optional<qint64>(-42));
+}
+
+void RawJsonTests::rawNumberSelfMoveAssignmentLeavesValueUnchanged() {
+  RawNumber number = RawNumber::fromInt64(777);
+  RawNumber &selfRef = number;
+  number = std::move(selfRef);
+  QCOMPARE(number.literal(), QStringLiteral("777"));
+  QCOMPARE(number.toExactInt64(), std::optional<qint64>(777));
+}
+
+void RawJsonTests::
+    rawNumberMovedFromRemainsValidForZeroNegativeAndHugeExponentCases() {
+  // Reviewer-requested coverage: positive (above), negative (above),
+  // zero, and huge exponent, each surviving a move intact.
+  RawNumber zero = RawNumber::fromInt64(0);
+  RawNumber zeroMoved(std::move(zero));
+  QCOMPARE(zeroMoved.toExactInt64(), std::optional<qint64>(0));
+  QCOMPARE(zero.toExactInt64(), std::optional<qint64>(0));
+
+  auto hugeExponentParsed = Value::parse("0e9223372036854775807", u"n");
+  if (!hugeExponentParsed)
+    QFAIL(qPrintable(hugeExponentParsed.error()));
+  RawNumber hugeExponent = hugeExponentParsed->toRawNumber();
+  RawNumber hugeExponentMoved(std::move(hugeExponent));
+  QCOMPARE(hugeExponentMoved.toExactInt64(), std::optional<qint64>(0));
+  // The moved-from source's literal() must still be the original,
+  // syntactically valid spelling -- never emptied.
+  QCOMPARE(hugeExponent.literal(), QStringLiteral("0e9223372036854775807"));
+  QCOMPARE(hugeExponent.toExactInt64(), std::optional<qint64>(0));
+}
+
+void RawJsonTests::rawNumberSurvivesQListRelocation() {
+  // Force at least one growth-triggered relocation; with no user-declared
+  // move constructor, QList relocates elements via copy rather than move,
+  // so every element -- old and new -- must retain its exact original
+  // literal after growth.
+  QList<RawNumber> numbers;
+  for (int i = 0; i < 64; ++i)
+    numbers.append(RawNumber::fromInt64(i));
+  QCOMPARE(numbers.size(), 64);
+  for (int i = 0; i < 64; ++i) {
+    QCOMPARE(numbers.at(i).literal(), QString::number(i));
+    QCOMPARE(numbers.at(i).toExactInt64(), std::optional<qint64>(i));
+  }
 }
 
 QTEST_APPLESS_MAIN(RawJsonTests)

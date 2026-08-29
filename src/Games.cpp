@@ -1256,20 +1256,20 @@ CampaignOptionRequest::fromValueImpl(const V &v, QStringView path) {
 }
 
 ValueOrError<QJsonObject> CampaignOptionRequest::toJson() const {
-  switch (m_kind) {
-  case Kind::Known: {
-    auto encoded = Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable);
-    if (!encoded)
-      return failure(QStringLiteral("CampaignOptionRequest::toJson: %1")
-                         .arg(encoded.error()));
-    return QJsonObject{{QStringLiteral("tag"), *encoded}};
-  }
-  case Kind::Variant:
-    return QJsonObject{
-        {QStringLiteral("tag"), QStringLiteral("CampaignVariant")},
-        {QStringLiteral("contents"), m_text}};
-  }
-  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
+  // Composes toRawJson() below and its own bounded exact QJsonObject
+  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
+  // hand-building a QJsonObject: the previous implementation embedded
+  // Kind::Variant's `m_text` (an unconstrained caller-supplied string)
+  // via a raw QJsonValue(QString) construction with zero validation, so a
+  // lone/mismatched UTF-16 surrogate there would have silently produced a
+  // normal-looking-but-invalid QJsonObject even though toJsonBytes()
+  // correctly rejected the identical input. toRawJson()'s own error
+  // already identifies itself, so it is propagated verbatim rather than
+  // re-wrapped.
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> CampaignOptionRequest::toRawJson() const {
@@ -1539,59 +1539,20 @@ CreateGameRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QJsonObject> CreateGameRequest::toJson() const {
-  QJsonObject obj;
-  QJsonArray deckIdsArr;
-  for (qsizetype i = 0; i < deckIds.size(); ++i) {
-    const auto &id = deckIds.at(i);
-    if (id && id->isNull())
-      return failure(
-          QStringLiteral("deckIds[%1]: must not be the null uuid").arg(i));
-    deckIdsArr.append(id ? QJsonValue(id->toString(QUuid::WithoutBraces))
-                         : QJsonValue(QJsonValue::Null));
-  }
-  obj.insert(QStringLiteral("deckIds"), deckIdsArr);
-  obj.insert(QStringLiteral("playerCount"), playerCount);
-  campaignOrScenario.insertInto(obj);
-  auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
-  if (!difficultyEncoded)
-    return failure(
-        QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
-  obj.insert(QStringLiteral("difficulty"), *difficultyEncoded);
-  obj.insert(QStringLiteral("campaignName"), campaignName);
-  auto multiplayerVariantEncoded =
-      Json::encodeClosedEnum(multiplayerVariant, kMultiplayerVariantTable);
-  if (!multiplayerVariantEncoded)
-    return failure(QStringLiteral("multiplayerVariant: %1")
-                       .arg(multiplayerVariantEncoded.error()));
-  obj.insert(QStringLiteral("multiplayerVariant"), *multiplayerVariantEncoded);
-  obj.insert(QStringLiteral("includeTarotReadings"), includeTarotReadings);
-  QJsonArray optionsArr;
-  for (qsizetype i = 0; i < options.size(); ++i) {
-    auto encoded = options.at(i).toJson();
-    if (!encoded)
-      return failure(
-          QStringLiteral("options[%1]: %2").arg(i).arg(encoded.error()));
-    optionsArr.append(*encoded);
-  }
-  obj.insert(QStringLiteral("options"), optionsArr);
-  if (strictAsIfAt)
-    obj.insert(QStringLiteral("strictAsIfAt"), *strictAsIfAt);
-  if (asIfRuling) {
-    auto asIfRulingEncoded =
-        Json::encodeClosedEnum(*asIfRuling, kAsIfRulingTable);
-    if (!asIfRulingEncoded)
-      return failure(
-          QStringLiteral("asIfRuling: %1").arg(asIfRulingEncoded.error()));
-    obj.insert(QStringLiteral("asIfRuling"), *asIfRulingEncoded);
-  }
-  auto ultimatumsAndBoonsEncoded =
-      encodeEnumArray(ultimatumsAndBoons, kUltimatumOrBoonTable);
-  if (!ultimatumsAndBoonsEncoded)
-    return failure(QStringLiteral("ultimatumsAndBoons: %1")
-                       .arg(ultimatumsAndBoonsEncoded.error()));
-  obj.insert(QStringLiteral("ultimatumsAndBoons"), *ultimatumsAndBoonsEncoded);
-  obj.insert(QStringLiteral("achievementsEnabled"), achievementsEnabled);
-  return obj;
+  // Composes toRawJson() below and its own bounded exact QJsonObject
+  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
+  // hand-building a QJsonObject: the previous implementation embedded
+  // campaignName via a raw QJsonValue(QString) construction with zero
+  // validation (and, transitively via CampaignOrScenario::insertInto(),
+  // campaignId/scenarioId the same way), so a lone/mismatched UTF-16
+  // surrogate there would have silently produced a normal-looking-but-
+  // invalid QJsonObject even though toJsonBytes() correctly rejected the
+  // identical input. toRawJson() already validates deckIds' null-uuid
+  // invariant, so that check is not duplicated here.
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> CreateGameRequest::toRawJson() const {
@@ -1753,18 +1714,35 @@ ValueOrError<ChooseDeckRequest> ChooseDeckRequest::fromJson(const QJsonValue &v,
   return decodeChooseDeckRequest(*objResult, path);
 }
 
-ValueOrError<QJsonObject> ChooseDeckRequest::toJson() const {
-  QJsonObject obj;
-  obj.insert(QStringLiteral("investigatorId"), investigatorId.toJson());
+ValueOrError<Json::Value> ChooseDeckRequest::toRawJson() const {
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("investigatorId"),
+       Json::Value::makeString(investigatorId.value())},
+  };
   if (deckUrl)
-    obj.insert(QStringLiteral("deckUrl"), *deckUrl);
+    members.append(
+        {QStringLiteral("deckUrl"), Json::Value::makeString(*deckUrl)});
   if (deckList) {
-    auto deckListJson = deckList->toJson();
-    if (!deckListJson)
-      return failure(deckListJson.error());
-    obj.insert(QStringLiteral("deckList"), *deckListJson);
+    auto deckListRaw = deckList->toRawJson();
+    if (!deckListRaw)
+      return failure(deckListRaw.error());
+    members.append({QStringLiteral("deckList"), *deckListRaw});
   }
-  return obj;
+  return Json::Value::makeObject(std::move(members));
+}
+
+ValueOrError<QJsonObject> ChooseDeckRequest::toJson() const {
+  // Composes toRawJson() above and its own bounded exact QJsonObject
+  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
+  // hand-building a QJsonObject: the previous implementation embedded
+  // investigatorId/deckUrl via raw, unvalidated QJsonValue construction
+  // with zero validation, so a lone/mismatched UTF-16 surrogate there
+  // would have silently produced a normal-looking-but-invalid QJsonObject
+  // even though toJsonBytes() correctly rejected the identical input.
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<ChooseDeckRequest>
@@ -1784,26 +1762,10 @@ ChooseDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QByteArray> ChooseDeckRequest::toJsonBytes() const {
-  // investigatorId is a NonEmptyString-backed id, so toJson() always
-  // yields a QJsonValue::String -- fromQJson() can only fail on a
-  // non-finite/unconvertible Double, which this branch never is -- but
-  // the error is still propagated rather than assumed away.
-  auto investigatorIdValue = Json::Value::fromQJson(investigatorId.toJson());
-  if (!investigatorIdValue)
-    return failure(investigatorIdValue.error());
-  QList<std::pair<QString, Json::Value>> members{
-      {QStringLiteral("investigatorId"), *investigatorIdValue},
-  };
-  if (deckUrl)
-    members.append(
-        {QStringLiteral("deckUrl"), Json::Value::makeString(*deckUrl)});
-  if (deckList) {
-    auto deckListRaw = deckList->toRawJson();
-    if (!deckListRaw)
-      return failure(deckListRaw.error());
-    members.append({QStringLiteral("deckList"), *deckListRaw});
-  }
-  return Json::Value::makeObject(std::move(members)).toJsonBytes();
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
 }
 
 // Shared decode body for ClaimSeatRequest::fromJson()/fromRawJson(): Obj is
@@ -1831,9 +1793,16 @@ ValueOrError<ClaimSeatRequest> ClaimSeatRequest::fromJson(const QJsonValue &v,
   return decodeClaimSeatRequest(*objResult, path);
 }
 
-QJsonObject ClaimSeatRequest::toJson() const {
-  return QJsonObject{
-      {QStringLiteral("investigatorId"), investigatorId.toJson()}};
+ValueOrError<QJsonObject> ClaimSeatRequest::toJson() const {
+  // Composes toRawJson() below and its own bounded exact QJsonObject
+  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
+  // embedding investigatorId via a raw, unvalidated QJsonValue(QString)
+  // construction, so a lone/mismatched UTF-16 surrogate is a typed
+  // failure here too, matching toJsonBytes().
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<ClaimSeatRequest>

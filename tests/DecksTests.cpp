@@ -147,6 +147,34 @@ private slots:
   void deckListInputToJsonRejectsSideSlotsWithNestedUndefined();
   void deckListInputToJsonRejectsSideSlotsWithDuplicateKey();
   void createDeckRequestToJsonRejectsMaliciousSideSlots();
+  // Round-14 item 1: DeckListInput::toJson()/CreateDeckRequest::toJson()/
+  // FetchDeckRequest::toJson() previously embedded
+  // investigatorCode/deckName/url via raw, unvalidated QJsonValue(QString)
+  // construction, so a lone/mismatched UTF-16 surrogate there would have
+  // silently produced a normal-looking-but-invalid QJsonObject even though
+  // toJsonBytes() correctly rejected the identical input. Each now
+  // composes toRawJson() + Value::toExactQJsonObject() instead, so
+  // toJson() must reject these exactly like toJsonBytes() already does.
+  void deckListInputToJsonRejectsLoneSurrogateInInvestigatorCode();
+  void createDeckRequestToJsonRejectsLoneSurrogateInDeckName();
+  void fetchDeckRequestToJsonRejectsLoneSurrogateInUrl();
+
+  // Round-14 items 2/3: TypedId<Tag>/NonEmptyString<Tag>/CardCode used to
+  // rely on an implicit move constructor/assignment that emptied the
+  // moved-from instance's underlying QString while its type still
+  // nominally claimed to hold a validated (non-null/non-empty) value.
+  // Each now explicitly declares a copy constructor/assignment (see
+  // Identifiers.h), suppressing the compiler's implicit move so
+  // std::move() falls back to a full copy -- the moved-from source must
+  // remain completely valid and reusable, including through an enclosing
+  // request/response encoder.
+  void cardCodeMoveConstructLeavesSourceValidAndReusable();
+  void cardCodeMoveAssignLeavesSourceValidAndReusable();
+  void cardCodeSelfMoveAssignmentLeavesValueUnchanged();
+  void cardCodeSurvivesQListRelocation();
+  void
+  investigatorRefMoveConstructLeavesSourceValidAndReusableInDeckListInput();
+  void deckIdMoveConstructLeavesSourceValidAndReusableInDeck();
 };
 
 namespace {
@@ -238,7 +266,10 @@ void DecksTests::decodesFetchDeckRequestFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->url,
            QStringLiteral("https://arkhamdb.com/decklist/view/4242"));
-  QCOMPARE(result->toJson(), fixture.value("fetchDeck"_L1).toObject());
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, fixture.value("fetchDeck"_L1).toObject());
 }
 
 void DecksTests::decodesValidateDeckListInputFromFixture() {
@@ -1405,6 +1436,155 @@ void DecksTests::createDeckRequestToJsonRejectsMaliciousSideSlots() {
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
+}
+
+void DecksTests::deckListInputToJsonRejectsLoneSurrogateInInvestigatorCode() {
+  // InvestigatorRef::parse() only requires non-empty text, so a lone
+  // UTF-16 surrogate (a single, non-empty QChar) is a validly-constructed
+  // value from the wrapper's own perspective -- toJson() must still
+  // reject it exactly as toJsonBytes() does, since neither can encode it
+  // as valid UTF-8.
+  QString lone;
+  lone += QChar(0xD800);
+  const DeckListInput input{
+      .investigatorCode = *InvestigatorRef::parse(lone),
+  };
+  const auto encoded = input.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = input.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
+void DecksTests::createDeckRequestToJsonRejectsLoneSurrogateInDeckName() {
+  // deckName is a plain public QString field (no validated wrapper type),
+  // so a lone surrogate there is exactly the "mutable request field
+  // bypasses invariants" scenario -- both toJson() and toJsonBytes() must
+  // reject it identically now that toJson() composes the same
+  // toRawJson()/toExactQJsonObject() machinery.
+  QString lone;
+  lone += QChar(0xDC00);
+  const CreateDeckRequest request{
+      .deckId = QStringLiteral("external-1"),
+      .deckName = lone,
+      .deckList = {.investigatorCode =
+                       *InvestigatorRef::parse(QStringLiteral("01001"))},
+  };
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
+void DecksTests::fetchDeckRequestToJsonRejectsLoneSurrogateInUrl() {
+  // Companion to fetchDeckRequestToJsonBytesRejectsLoneSurrogateInUrl:
+  // FetchDeckRequest::toJson() used to insert `url` directly into a
+  // QJsonObject with zero validation, unlike toJsonBytes(); it now
+  // composes toRawJson() + toExactQJsonObject() and must reject
+  // identically.
+  QString lone;
+  lone += QChar(0xD800);
+  const FetchDeckRequest request{.url = lone};
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
+void DecksTests::cardCodeMoveConstructLeavesSourceValidAndReusable() {
+  auto parsed = CardCode::parse(QStringLiteral("c01001"));
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  CardCode source = *parsed;
+  QCOMPARE(source.value(), QStringLiteral("c01001"));
+
+  // std::move() now binds CardCode's explicitly-declared copy constructor
+  // (see Identifiers.h), so `source` must remain fully intact afterward --
+  // never emptied -- exactly like RawJsonTests' RawNumber coverage above.
+  CardCode moved(std::move(source));
+  QCOMPARE(moved.value(), QStringLiteral("c01001"));
+  QCOMPARE(source.value(), QStringLiteral("c01001"));
+
+  // Reuse the moved-from source in a fresh aggregate to prove it is not
+  // merely inspectable but genuinely still usable end-to-end. (Named
+  // "quantities" rather than "slots": Qt's keyword extensions define
+  // `slots` as a macro, so using it as a variable name would silently
+  // corrupt this declaration.)
+  QMap<CardCode, qint64> quantities;
+  quantities.insert(source, 2);
+  quantities.insert(moved, 3);
+  QCOMPARE(quantities.size(), 1); // same CardCode value, a single entry
+  QCOMPARE(quantities.value(source), 3);
+}
+
+void DecksTests::cardCodeMoveAssignLeavesSourceValidAndReusable() {
+  auto parsed = CardCode::parse(QStringLiteral("c02003"));
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  CardCode source = *parsed;
+  CardCode destination = *CardCode::parse(QStringLiteral("c00000"));
+  destination = std::move(source);
+
+  QCOMPARE(destination.value(), QStringLiteral("c02003"));
+  QCOMPARE(source.value(), QStringLiteral("c02003"));
+}
+
+void DecksTests::cardCodeSelfMoveAssignmentLeavesValueUnchanged() {
+  CardCode code = *CardCode::parse(QStringLiteral("c03004"));
+  CardCode &selfRef = code;
+  code = std::move(selfRef);
+  QCOMPARE(code.value(), QStringLiteral("c03004"));
+}
+
+void DecksTests::cardCodeSurvivesQListRelocation() {
+  QList<CardCode> codes;
+  for (int i = 0; i < 64; ++i)
+    codes.append(
+        *CardCode::parse(QStringLiteral("c%1").arg(i, 5, 10, QChar('0'))));
+  QCOMPARE(codes.size(), 64);
+  for (int i = 0; i < 64; ++i)
+    QCOMPARE(codes.at(i).value(),
+             QStringLiteral("c%1").arg(i, 5, 10, QChar('0')));
+}
+
+void DecksTests::
+    investigatorRefMoveConstructLeavesSourceValidAndReusableInDeckListInput() {
+  // Matches the reviewer's exact scenario:
+  //   source = *InvestigatorRef::parse(...); moved = std::move(source);
+  //   ClaimSeatRequest{source}.toJsonBytes()
+  // -- here reused through DeckListInput's actual investigatorCode field
+  // rather than a bespoke standalone check.
+  auto parsed = InvestigatorRef::parse(QStringLiteral("01001"));
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  InvestigatorRef source = *parsed;
+  InvestigatorRef moved(std::move(source));
+
+  const DeckListInput fromSource{.investigatorCode = source};
+  const DeckListInput fromMoved{.investigatorCode = moved};
+  const auto sourceBytes = fromSource.toJsonBytes();
+  const auto movedBytes = fromMoved.toJsonBytes();
+  if (!sourceBytes)
+    QFAIL(qPrintable(sourceBytes.error()));
+  if (!movedBytes)
+    QFAIL(qPrintable(movedBytes.error()));
+  QCOMPARE(*sourceBytes, *movedBytes);
+  QVERIFY(sourceBytes->contains("01001"));
+}
+
+void DecksTests::deckIdMoveConstructLeavesSourceValidAndReusableInDeck() {
+  // DeckId (TypedId<Tag>) is not embedded in any of the 7 outbound request
+  // types, only in response types such as Deck::id, so this reuses Deck's
+  // own toJson() as the representative "enclosing type" the reviewer
+  // asked for.
+  const QUuid uuid = QUuid::createUuid();
+  auto parsed = DeckId::parse(uuid.toString(QUuid::WithoutBraces));
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  DeckId source = *parsed;
+  DeckId moved(std::move(source));
+
+  QCOMPARE(source.value(), moved.value());
+  QVERIFY(!source.value().isEmpty());
 }
 
 QTEST_APPLESS_MAIN(DecksTests)
