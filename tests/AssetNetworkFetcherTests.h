@@ -45,6 +45,12 @@ private slots:
   void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected();
   void jpegWithStuffedFFBytesInScanDataStillDecodesWhenComplete();
   void jpegTrailingDataAfterGenuineEoiIsRejected();
+  void jpegTruncatedEntropyDataWithForgedGenuineEoiIsRejected();
+  void pngWithCorruptChunkCrcIsRejected();
+  void pngWithApngAnimationChunksIsRejected_data();
+  void pngWithApngAnimationChunksIsRejected();
+  void pngWithTrailingBytesAfterIendIsRejected();
+  void pngWithMultipleIhdrChunksIsRejected();
   void avifRealFixtureAlwaysDecodesViaLibavif();
   void avifImageSequenceIsRejectedAsMalformedImage();
   void avifMalformedContainerIsReportedAsMalformedImage();

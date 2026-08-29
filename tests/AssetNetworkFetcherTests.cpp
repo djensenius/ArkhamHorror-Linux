@@ -11,6 +11,7 @@
 #include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QTest>
+#include <array>
 #include <avif/avif.h>
 #include <cstring>
 #include <optional>
@@ -962,6 +963,222 @@ void AssetNetworkFetcherTests::jpegTrailingDataAfterGenuineEoiIsRejected() {
     QVERIFY(result.has_value());
     QVERIFY2(bool(*result), qPrintable(result->error().message));
   }
+}
+
+void AssetNetworkFetcherTests::
+    jpegTruncatedEntropyDataWithForgedGenuineEoiIsRejected() {
+  // Round-4 review item 8: jpegCodestreamHasGenuineEoi() (review item 10)
+  // proves the marker STRUCTURE ends in a genuine EOI, but it cannot
+  // detect a truncated entropy-coded SCAN with a forged EOI appended
+  // directly after the cut -- from the marker scanner's point of view,
+  // "truncate mid-scan, then append a real 0xFF 0xD9" looks identical to
+  // "the scan legitimately ended here": the very next 0xFF byte after the
+  // cut point is treated as terminating the scan, and it happens to
+  // actually be 0xD9. This is precisely the "truncate entropy then append
+  // EOI" attack this review item requires rejecting -- proven here by
+  // confirming the OLD scanner-only check alone would have accepted this
+  // fixture, then confirming the full decode path (which additionally
+  // requires the ScopedJpegDecodeWarningDetector to observe no
+  // libjpeg-plugin message) rejects it.
+  const bool jpegSupported =
+      QImageReader::supportedImageFormats().contains(
+          QByteArrayLiteral("jpeg")) ||
+      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
+  if (!jpegSupported) {
+    QSKIP("this Qt build has no JPEG decode plugin under either key");
+  }
+
+  const QByteArray validJpeg = encodeImage(64, 64, "JPG");
+  QVERIFY(validJpeg.size() > 200);
+  // Cut well into the entropy-coded scan data (past SOI/APPn/DQT/SOF/DHT/
+  // SOS headers for a 64x64 fixture), then append a genuine top-level EOI
+  // marker directly -- no attempt is made to keep the truncated entropy
+  // bytes self-consistent; libjpeg's own entropy decoder recovering from
+  // this (by synthesising the rest of the image and warning, rather than
+  // erroring) is exactly the behaviour under test.
+  QByteArray forged = validJpeg.left(validJpeg.size() * 6 / 10);
+  forged.append(static_cast<char>(0xFF));
+  forged.append(static_cast<char>(0xD9));
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/jpeg";
+  response.body = forged;
+  server.setResponse(QStringLiteral("/forged-eoi.jpg"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/forged-eoi.jpg")),
+      AssetFormat::Jpeg);
+
+  QVERIFY(result.has_value());
+  QVERIFY2(!bool(*result),
+           "a truncated entropy stream with a forged trailing EOI must "
+           "never be accepted as a successfully-decoded image");
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::pngWithCorruptChunkCrcIsRejected() {
+  // Round-4 review item 8: a PNG whose IDAT payload was tampered with
+  // (leaving its declared length and the surrounding chunk structure
+  // otherwise perfectly well-formed, but invalidating the stored CRC-32)
+  // must be rejected before ever reaching QImageReader, rather than
+  // relying on libpng's own leniency (or strictness) around CRC errors.
+  QByteArray body = encodeImage(16, 16, "png");
+  // Locate an IDAT chunk and flip one bit inside its data, well clear of
+  // the length/type/CRC fields.
+  const qsizetype idatTypeOffset = body.indexOf("IDAT");
+  QVERIFY(idatTypeOffset > 4);
+  const qsizetype flipOffset = idatTypeOffset + 4 + 1; // inside IDAT data
+  QVERIFY(flipOffset < body.size());
+  body[static_cast<int>(flipOffset)] = static_cast<char>(
+      static_cast<unsigned char>(body[static_cast<int>(flipOffset)]) ^ 0xFF);
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = body;
+  server.setResponse(QStringLiteral("/corrupt-crc.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/corrupt-crc.png")),
+      AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::pngWithApngAnimationChunksIsRejected_data() {
+  QTest::addColumn<QByteArray>("chunkType");
+  QTest::newRow("acTL") << QByteArray("acTL");
+  QTest::newRow("fcTL") << QByteArray("fcTL");
+  QTest::newRow("fdAT") << QByteArray("fdAT");
+}
+
+void AssetNetworkFetcherTests::pngWithApngAnimationChunksIsRejected() {
+  // Round-4 review item 8: an APNG (animated PNG) is a "multiple image"
+  // in the same sense the AVIF imageCount!=1 case is -- QImageReader can
+  // plausibly decode just the base IDAT frame while silently ignoring the
+  // animation frames declared by acTL/fcTL/fdAT, which is exactly the
+  // kind of accept-a-subset-of-the-payload behaviour this review item
+  // requires rejecting outright rather than tolerating.
+  QFETCH(QByteArray, chunkType);
+  QVERIFY(chunkType.size() == 4);
+
+  QByteArray body = encodeImage(16, 16, "png");
+  const qsizetype ihdrTypeOffset = body.indexOf("IHDR");
+  QVERIFY(ihdrTypeOffset > 4);
+  // Insert the animation chunk immediately after IHDR (a structurally
+  // valid, well-formed, correctly-CRC'd chunk with an empty payload is
+  // sufficient to exercise the rejection -- its contents are never
+  // otherwise interpreted).
+  const qsizetype insertPos = ihdrTypeOffset + 4 + 13 + 4; // past IHDR+CRC
+  QVERIFY(insertPos <= body.size());
+  QByteArray animationChunk;
+  animationChunk.append(char(0), 4); // length = 0, big-endian
+  animationChunk.append(chunkType);
+  const quint32 crc = [&]() {
+    // Mirror pngCrc32()'s zlib/ISO-3309 polynomial by computing the CRC
+    // with the same table-driven algorithm, so the test fixture's
+    // injected chunk has a valid CRC and the test exercises the
+    // chunk-TYPE rejection specifically, not an incidental CRC failure.
+    static const auto table = [] {
+      std::array<quint32, 256> t{};
+      for (quint32 n = 0; n < 256; ++n) {
+        quint32 c = n;
+        for (int k = 0; k < 8; ++k) {
+          c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        t[n] = c;
+      }
+      return t;
+    }();
+    quint32 crcAcc = 0xFFFFFFFFu;
+    for (unsigned char byte : chunkType) {
+      crcAcc = table[(crcAcc ^ byte) & 0xFFu] ^ (crcAcc >> 8);
+    }
+    return crcAcc ^ 0xFFFFFFFFu;
+  }();
+  animationChunk.append(static_cast<char>((crc >> 24) & 0xFF));
+  animationChunk.append(static_cast<char>((crc >> 16) & 0xFF));
+  animationChunk.append(static_cast<char>((crc >> 8) & 0xFF));
+  animationChunk.append(static_cast<char>(crc & 0xFF));
+  body.insert(insertPos, animationChunk);
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = body;
+  server.setResponse(QStringLiteral("/apng.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/apng.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::pngWithTrailingBytesAfterIendIsRejected() {
+  // Round-4 review item 8: any byte after IEND (padding, or a second
+  // concatenated PNG stream) must be rejected -- mirroring the JPEG
+  // trailing-data policy (jpegTrailingDataAfterGenuineEoiIsRejected()).
+  const QByteArray validPng = encodeImage(16, 16, "png");
+  QByteArray withTrailer = validPng + validPng;
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = withTrailer;
+  server.setResponse(QStringLiteral("/trailing.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/trailing.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::pngWithMultipleIhdrChunksIsRejected() {
+  // Round-4 review item 8: more than one IHDR chunk is never valid in a
+  // single bare (non-animated) PNG stream.
+  QByteArray body = encodeImage(16, 16, "png");
+  const qsizetype ihdrTypeOffset = body.indexOf("IHDR");
+  QVERIFY(ihdrTypeOffset > 4);
+  const qsizetype ihdrChunkStart = ihdrTypeOffset - 4; // include length field
+  const qsizetype ihdrChunkEnd = ihdrTypeOffset + 4 + 13 + 4; // + data + CRC
+  QVERIFY(ihdrChunkEnd <= body.size());
+  const QByteArray ihdrChunk =
+      body.mid(ihdrChunkStart, ihdrChunkEnd - ihdrChunkStart);
+  // Duplicate the well-formed IHDR chunk immediately after itself.
+  body.insert(ihdrChunkEnd, ihdrChunk);
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = body;
+  server.setResponse(QStringLiteral("/dup-ihdr.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/dup-ihdr.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
 }
 
 void AssetNetworkFetcherTests::avifRealFixtureAlwaysDecodesViaLibavif() {

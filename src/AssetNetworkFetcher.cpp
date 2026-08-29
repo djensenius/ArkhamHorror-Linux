@@ -8,6 +8,8 @@
 #include <QCryptographicHash>
 #include <QImageReader>
 #include <QMetaObject>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
 #include <QNetworkReply>
@@ -17,6 +19,8 @@
 #include <QUrl>
 #include <QVariant>
 #include <QtAssert>
+#include <array>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -256,6 +260,281 @@ bool jpegCodestreamHasGenuineEoi(const QByteArray &bytes) {
     }
   }
   return false; // exhausted the buffer without ever finding a genuine EOI
+}
+
+// Round-4 review item 8 (PR #18 cumulative review): the structural EOI
+// scan above (jpegCodestreamHasGenuineEoi()) proves the marker STRUCTURE
+// of the supplied bytes is well-formed and ends in a genuine EOI -- but it
+// cannot detect a truncated/corrupt *entropy-coded scan* (the
+// Huffman-coded DCT data between SOS and EOI), because verifying THAT
+// requires actually running the entropy decoder, which only libjpeg
+// itself does. Qt's bundled qjpeg plugin already runs libjpeg's real
+// entropy decoder, and libjpeg has its own long-standing, well-defined
+// behaviour for exactly this case: when the entropy-coded data ends
+// prematurely, libjpeg's default source manager (qt_fill_input_buffer()
+// in qjpeghandler.cpp) synthesises a fake EOI marker "as per jpeglib
+// recommendation" and libjpeg emits a WARNING-class message ("Corrupt
+// JPEG data: premature end of data segment" from jdmarker.c's
+// WARNMS/JWRN_JPEG_EOF path) rather than a fatal error -- decode continues
+// to completion with the remainder of the image filled in from whatever
+// state the decoder was last in, and QImageReader::read() returns a
+// non-null QImage with no error at all. This is exactly the "silent
+// recovery" this review item requires this project to reject outright:
+// an attacker-truncated entropy stream with a forged EOI appended must
+// not decode "successfully".
+//
+// Rather than vendoring/linking libjpeg directly and reimplementing
+// QImageReader's decode call, this hooks Qt's own already-integrated
+// libjpeg pipeline at its existing, stable seam: every libjpeg
+// warning/error message the qjpeg plugin emits is routed through the
+// public, documented Qt logging category "qt.gui.imageio.jpeg"
+// (Q_LOGGING_CATEGORY(lcJpeg, "qt.gui.imageio.jpeg") in qjpeghandler.cpp;
+// both the fatal-error path or non-fatal WARNMS-class messages funnel
+// through the same qCWarning(lcJpeg, ...) call). A scoped message handler
+// installed only for the duration of a single JPEG reader.read() call
+// observes whether ANY message was logged under that exact category --
+// matched by category name, never by message text, so this does not
+// depend on libjpeg's exact wording being stable across Qt/libjpeg
+// versions -- and if so, the decode is treated as having required silent
+// recovery and is rejected regardless of whether QImageReader itself
+// returned a seemingly-valid, non-null QImage. This deliberately also
+// rejects the qjpeg plugin's one other, unrelated qCWarning(lcJpeg, ...)
+// call site (a malformed EXIF orientation tag): a well-formed CDN-served
+// JPEG has no reason to carry a malformed EXIF orientation tag either, and
+// this project's "do not bless partial recovery" policy is intentionally
+// strict rather than trying to enumerate which specific warning classes
+// are "safe" to ignore.
+//
+// Every other Qt message logged during the scoped window (from this
+// category or any other) is forwarded, unmodified, to whatever handler
+// was previously installed (or Qt's default handler if none was) --
+// nothing is ever swallowed. A QMutex guards the small amount of shared
+// state (previous handler pointer + "warning seen" flag) purely as a
+// defensive measure against a future regression that decodes JPEGs from
+// more than one thread; this project has no QThread usage today; see
+// AssetNetworkFetcher.h's class-level threading note in the header.
+class ScopedJpegDecodeWarningDetector {
+public:
+  ScopedJpegDecodeWarningDetector() {
+    QMutexLocker locker(&s_mutex);
+    s_previousHandler = qInstallMessageHandler(&forwardingHandler);
+    s_active = true;
+    s_sawJpegPluginMessage = false;
+  }
+
+  ~ScopedJpegDecodeWarningDetector() {
+    QMutexLocker locker(&s_mutex);
+    qInstallMessageHandler(s_previousHandler);
+    s_active = false;
+    s_previousHandler = nullptr;
+  }
+
+  ScopedJpegDecodeWarningDetector(const ScopedJpegDecodeWarningDetector &) =
+      delete;
+  ScopedJpegDecodeWarningDetector &
+  operator=(const ScopedJpegDecodeWarningDetector &) = delete;
+
+  [[nodiscard]] bool sawJpegPluginMessage() const {
+    QMutexLocker locker(&s_mutex);
+    return s_sawJpegPluginMessage;
+  }
+
+private:
+  static void forwardingHandler(QtMsgType type,
+                                const QMessageLogContext &context,
+                                const QString &msg) {
+    QtMessageHandler previous = nullptr;
+    {
+      QMutexLocker locker(&s_mutex);
+      if (s_active && context.category &&
+          std::strcmp(context.category, "qt.gui.imageio.jpeg") == 0) {
+        s_sawJpegPluginMessage = true;
+      }
+      previous = s_previousHandler;
+    }
+    if (previous) {
+      previous(type, context, msg);
+    } else {
+      // No prior custom handler was installed (Qt's own built-in default
+      // handler was in effect): there is no public API to invoke that
+      // default handler directly, so approximate its stderr-printing
+      // behaviour closely enough that messages are never silently
+      // dropped just because this scope happened to be the first
+      // handler ever installed by this process.
+      fprintf(stderr, "%s: %s\n",
+              context.category ? context.category : "default", qPrintable(msg));
+    }
+  }
+
+  static inline QMutex s_mutex;
+  static inline QtMessageHandler s_previousHandler = nullptr;
+  static inline bool s_active = false;
+  static inline bool s_sawJpegPluginMessage = false;
+};
+
+// Round-4 review item 8: an independent, deterministic CRC-32 (ISO 3309 /
+// zlib / PNG-standard polynomial 0xEDB88320) implementation. Qt's own
+// qChecksum() deliberately does NOT compute this -- despite its
+// Qt::ChecksumIso3309 enumerator name, it returns a 16-bit CRC-16 result
+// (quint16), never the 32-bit value the PNG spec requires for chunk
+// integrity -- so this is implemented directly rather than mis-using that
+// unrelated function.
+quint32 pngCrc32(const unsigned char *data, qint64 length) {
+  static const auto table = [] {
+    std::array<quint32, 256> t{};
+    for (quint32 n = 0; n < 256; ++n) {
+      quint32 c = n;
+      for (int k = 0; k < 8; ++k) {
+        c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      }
+      t[n] = c;
+    }
+    return t;
+  }();
+  quint32 crc = 0xFFFFFFFFu;
+  for (qint64 i = 0; i < length; ++i) {
+    crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+  }
+  return crc ^ 0xFFFFFFFFu;
+}
+
+// Round-4 review item 8: an independent, deterministic PNG structural
+// validator that walks the ENTIRE chunk sequence of a PNG body (the
+// signature has already been confirmed by sniffMagicBytes()) and rejects
+// anything QImageReader's underlying libpng-based decoder might otherwise
+// tolerate or silently ignore:
+//   - any chunk whose declared length or position would run past the end
+//     of the supplied buffer (bounds safety, overflow-free: lengths are
+//     capped to the PNG spec's own 31-bit limit before use in arithmetic);
+//   - any chunk whose stored CRC-32 does not match the actual bytes (a
+//     corrupt/tampered chunk is rejected outright rather than silently
+//     accepted by a lenient decoder);
+//   - any chunk type whose four bytes are not all ASCII letters (the only
+//     structurally valid PNG chunk-type alphabet);
+//   - a first chunk that is not exactly IHDR with a 13-byte payload;
+//   - more than one IHDR chunk (multi-image is never valid in a single
+//     bare PNG stream);
+//   - any of the APNG-defining chunk types (acTL/fcTL/fdAT) -- an animated
+//     PNG is a "multiple image" in the same sense the review item's AVIF
+//     imageCount!=1 case is: this project only ever wants exactly one
+//     still frame, and QImageReader can plausibly decode just the base
+//     IDAT frame of an APNG while silently ignoring its animation frames,
+//     which is exactly the kind of accept-a-subset-of-the-payload
+//     behaviour this review item requires rejecting;
+//   - a missing IDAT chunk (no image data at all);
+//   - an IEND chunk that is not the exact final chunk of the buffer (IEND
+//     must have zero-length data, and its CRC's last byte must be the
+//     very last byte of the entire supplied body -- any trailing bytes
+//     after IEND, whether padding, a second concatenated PNG, or anything
+//     else, are rejected).
+//
+// This runs strictly BEFORE QImageReader ever sees the bytes; a body that
+// fails this check never reaches the decoder at all. It does not replace
+// magic-byte sniffing or the dimension/pixel-budget checks below -- a
+// body that passes this check still goes through those unchanged.
+bool pngChunksAreStrictlyValid(const QByteArray &bytes) {
+  static constexpr qint64 kSignatureSize = 8;
+  static constexpr qint64 kLengthFieldSize = 4;
+  static constexpr qint64 kTypeFieldSize = 4;
+  static constexpr qint64 kCrcFieldSize = 4;
+  // The PNG spec restricts chunk data length to a 31-bit unsigned value
+  // (the top bit of the 4-byte length field is reserved/must be zero);
+  // enforcing that here means every length used below fits comfortably in
+  // a qint64 with no overflow risk, however it is combined with the
+  // buffer's own (also qint64) size.
+  static constexpr qint64 kMaxChunkDataLength = 0x7FFFFFFF;
+
+  const qint64 size = bytes.size();
+  if (size < kSignatureSize) {
+    return false; // sniffMagicBytes() already checked this, but be safe
+  }
+  const auto *const data =
+      reinterpret_cast<const unsigned char *>(bytes.constData());
+
+  auto isChunkTypeByte = [](unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+  };
+
+  qint64 pos = kSignatureSize;
+  bool sawIhdr = false;
+  bool sawIdat = false;
+  bool sawIend = false;
+  bool isFirstChunk = true;
+
+  while (pos < size) {
+    if (sawIend) {
+      // IEND must be the final chunk; reaching here means more bytes
+      // follow it.
+      return false;
+    }
+    if (pos + kLengthFieldSize + kTypeFieldSize > size) {
+      return false; // truncated chunk header
+    }
+    const quint32 declaredLength = (static_cast<quint32>(data[pos]) << 24) |
+                                   (static_cast<quint32>(data[pos + 1]) << 16) |
+                                   (static_cast<quint32>(data[pos + 2]) << 8) |
+                                   static_cast<quint32>(data[pos + 3]);
+    if (declaredLength > static_cast<quint32>(kMaxChunkDataLength)) {
+      return false; // top bit set: not a spec-legal PNG chunk length
+    }
+    const qint64 length = static_cast<qint64>(declaredLength);
+    const qint64 typeStart = pos + kLengthFieldSize;
+    const unsigned char typeBytes[4] = {data[typeStart], data[typeStart + 1],
+                                        data[typeStart + 2],
+                                        data[typeStart + 3]};
+    for (unsigned char typeByte : typeBytes) {
+      if (!isChunkTypeByte(typeByte)) {
+        return false; // not a structurally valid chunk-type alphabet
+      }
+    }
+    const qint64 dataStart = typeStart + kTypeFieldSize;
+    if (dataStart + length + kCrcFieldSize > size) {
+      return false; // declared length runs past the available bytes
+    }
+    const quint32 storedCrc =
+        (static_cast<quint32>(data[dataStart + length]) << 24) |
+        (static_cast<quint32>(data[dataStart + length + 1]) << 16) |
+        (static_cast<quint32>(data[dataStart + length + 2]) << 8) |
+        static_cast<quint32>(data[dataStart + length + 3]);
+    // CRC-32 (ISO 3309 / zlib) is computed over the type field followed by
+    // the chunk data, exactly as PNG requires. See pngCrc32()'s doc
+    // comment above for why Qt's own qChecksum() cannot be used here.
+    const quint32 computedCrc =
+        pngCrc32(&data[typeStart], kTypeFieldSize + length);
+    if (storedCrc != computedCrc) {
+      return false; // corrupt or tampered chunk
+    }
+
+    const QByteArrayView typeView(reinterpret_cast<const char *>(typeBytes), 4);
+    if (isFirstChunk) {
+      if (typeView != "IHDR"_ba || length != 13) {
+        return false; // the very first chunk must be a well-formed IHDR
+      }
+      isFirstChunk = false;
+    }
+    if (typeView == "IHDR"_ba) {
+      if (sawIhdr) {
+        return false; // more than one IHDR: not a single still image
+      }
+      sawIhdr = true;
+    } else if (typeView == "IDAT"_ba) {
+      sawIdat = true;
+    } else if (typeView == "IEND"_ba) {
+      if (length != 0) {
+        return false; // IEND must carry no data
+      }
+      sawIend = true;
+    } else if (typeView == "acTL"_ba || typeView == "fcTL"_ba ||
+               typeView == "fdAT"_ba) {
+      // APNG animation chunks: this project only ever wants exactly one
+      // still frame (see this function's doc comment above).
+      return false;
+    }
+
+    pos = dataStart + length + kCrcFieldSize;
+  }
+
+  return sawIhdr && sawIdat && sawIend;
 }
 
 // Normalises a Content-Type header value to a bare, lowercase media type
@@ -850,6 +1129,14 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
         QStringLiteral("JPEG body has no genuine End-Of-Image marker "
                        "(response was likely truncated in transit)")});
   }
+  if (expectedFormat == AssetFormat::Png &&
+      !pngChunksAreStrictlyValid(encodedBytes)) {
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::MalformedImage,
+        QStringLiteral("PNG chunk structure is malformed, contains a "
+                       "checksum mismatch, carries animation data, or has "
+                       "trailing bytes after IEND")});
+  }
 
   // AVIF is decoded directly against libavif's own C API (see
   // AssetAvifDecoder.h/.cpp) -- never through QImageReader/Qt's plugin
@@ -907,7 +1194,28 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
             .arg(m_limits.maxTotalPixels)});
   }
 
+  // Round-4 review item 8: for JPEG specifically, the actual decode call
+  // is wrapped in a scoped detector (see ScopedJpegDecodeWarningDetector's
+  // doc comment above) that observes whether Qt's bundled libjpeg-based
+  // plugin needed to log ANY message under its "qt.gui.imageio.jpeg"
+  // category while decoding -- which happens precisely when libjpeg had
+  // to synthesise a fake EOI and/or otherwise recover from corrupt/
+  // incomplete data rather than genuinely completing every MCU of the
+  // entropy-coded scan. A "successful", non-null QImage obtained this way
+  // is exactly the silent-recovery case this review item requires
+  // rejecting outright, so it is treated as a decode failure regardless
+  // of what QImageReader itself reports.
+  std::optional<ScopedJpegDecodeWarningDetector> jpegDetector;
+  if (expectedFormat == AssetFormat::Jpeg) {
+    jpegDetector.emplace();
+  }
   QImage decoded = reader.read();
+  if (jpegDetector && jpegDetector->sawJpegPluginMessage()) {
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::MalformedImage,
+        QStringLiteral("JPEG decode required libjpeg to recover from "
+                       "corrupt or incomplete entropy-coded data")});
+  }
   if (decoded.isNull()) {
     if (reader.error() == QImageReader::UnsupportedFormatError) {
       return AssetOutcome<QImage>(AssetError{
