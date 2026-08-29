@@ -439,7 +439,10 @@ private:
 // so campaign-only and campaign-with-starting-scenario are both valid.
 // Only when `campaignId` is absent does `scenarioId` become required (a
 // standalone scenario); "neither set" is the sole invalid combination
-// (`error "missing either a campign id or a scenario id"` on the backend).
+// (`error "missing either a campign id or a scenario id"` [sic] on the
+// backend -- this is a verbatim quotation of the backend's own typo'd
+// error string at Api/Handler/Arkham/Games.hs:160, not a mistake in this
+// comment).
 // The private constructor makes that one invalid (neither-set) state
 // unrepresentable -- campaign()/campaignWithStartingScenario()/scenario()
 // are the only ways to build an instance, and fromJson rejects a wire

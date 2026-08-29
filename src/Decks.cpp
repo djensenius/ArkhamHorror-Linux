@@ -226,6 +226,21 @@ QByteArray DeckListInput::toJsonBytes() const {
   QJsonObject obj = toJson();
   if (id.tag != ExternalDeckIdTag::Number)
     return QJsonDocument(obj).toJson(QJsonDocument::Compact);
+  // ExternalDeckId::numberLiteral is a public field, so nothing prevents a
+  // caller from setting it to something other than a valid JSON number
+  // literal (accidentally or otherwise) before reaching here. Splicing
+  // that text into the output bytes unvalidated could produce malformed
+  // JSON or, worse, inject extra tokens/keys past the intended numeric
+  // value. Validate it against the same strict RFC 8259 grammar used to
+  // parse incoming numbers before splicing; if it fails (or somehow
+  // parses as something other than a bare number), fall back to the
+  // ordinary QJsonDocument-based encoding above -- lossy for this one
+  // field, but always syntactically valid -- rather than emitting bytes
+  // built from unchecked, potentially attacker-controlled text.
+  const auto parsedLiteral =
+      Json::Value::parse(id.toJsonLiteral().toUtf8(), u"id");
+  if (!parsedLiteral || !parsedLiteral->isNumber())
+    return QJsonDocument(obj).toJson(QJsonDocument::Compact);
   // toJson() above already inserted a lossy double-based "id"; replace it
   // with the exact literal via byte-level splicing (see
   // ExternalDeckId::numberLiteral's doc comment).

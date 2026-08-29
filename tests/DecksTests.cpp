@@ -42,6 +42,8 @@ private slots:
   void externalIdFromRawBytesPreservesLongDecimalExactly();
   void externalIdFromRawBytesPreservesHugeExponentExactly();
   void externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly();
+  void toJsonBytesRejectsInvalidNumberLiteralInsteadOfSplicingItRaw();
+  void toJsonBytesRejectsInjectionAttemptInNumberLiteral();
   void createDeckRequestFromRawBytesPreservesEveryIdVariantExactly();
 
   // sideSlots malformed/absent behavior ──────────────────────────────────────
@@ -391,6 +393,50 @@ void DecksTests::externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly() {
   QVERIFY(reparsed->value("id"_L1).isNumber());
   QCOMPARE(reparsed->value("id"_L1).toRawNumber().literal(),
            QStringLiteral("9007199254740993"));
+}
+
+void DecksTests::
+    toJsonBytesRejectsInvalidNumberLiteralInsteadOfSplicingItRaw() {
+  // ExternalDeckId::numberLiteral is a public field; nothing at the type
+  // level stops a caller from setting it to non-number text. toJsonBytes()
+  // must not splice that text into the output verbatim -- it must fall
+  // back to the ordinary (lossy but always valid) QJsonDocument-based
+  // encoding instead of producing malformed JSON.
+  DeckListInput input{
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+      .id = ExternalDeckId{.tag = ExternalDeckIdTag::Number,
+                           .numberLiteral = QStringLiteral("not-a-number")},
+  };
+  const QByteArray reencoded = input.toJsonBytes();
+  auto reparsed = Json::Value::parse(reencoded, u"reencoded");
+  if (!reparsed)
+    QFAIL(qPrintable(QStringLiteral("toJsonBytes() produced invalid JSON: %1")
+                         .arg(reparsed.error())));
+  QVERIFY(reparsed->isObject());
+  // The fallback path never spliced the literal text in at all -- the
+  // invalid string must not appear anywhere in the output bytes.
+  QVERIFY(!reencoded.contains("not-a-number"));
+}
+
+void DecksTests::toJsonBytesRejectsInjectionAttemptInNumberLiteral() {
+  // A numberLiteral crafted to look like "a number followed by extra JSON
+  // tokens" must not be able to inject an additional key into the
+  // spliced output -- it must be rejected as invalid (it is not, in
+  // isolation, a single valid JSON number document) and fall back to the
+  // safe encoding instead.
+  DeckListInput input{
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+      .id = ExternalDeckId{.tag = ExternalDeckIdTag::Number,
+                           .numberLiteral = QStringLiteral("1,\"evil\":true")},
+  };
+  const QByteArray reencoded = input.toJsonBytes();
+  auto reparsed = Json::Value::parse(reencoded, u"reencoded");
+  if (!reparsed)
+    QFAIL(qPrintable(QStringLiteral("toJsonBytes() produced invalid JSON: %1")
+                         .arg(reparsed.error())));
+  QVERIFY(reparsed->isObject());
+  QVERIFY(!reparsed->contains("evil"_L1));
+  QVERIFY(!reencoded.contains("evil"));
 }
 
 void DecksTests::createDeckRequestFromRawBytesPreservesEveryIdVariantExactly() {
