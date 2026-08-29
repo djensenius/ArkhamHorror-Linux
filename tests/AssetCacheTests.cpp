@@ -39,6 +39,16 @@ makeEntry(const QByteArray &bytes,
   return entry;
 }
 
+// Removes `path` when this guard goes out of scope, including via an
+// early QVERIFY-triggered return from within the test body -- used by
+// the path-traversal test below so a would-be escape file is always
+// cleaned up even if the fix under test regresses and the file actually
+// gets created outside the managed QTemporaryDir.
+struct ScopedFileRemoval {
+  QString path;
+  ~ScopedFileRemoval() { QFile::remove(path); }
+};
+
 } // namespace
 
 void AssetCacheTests::storeThenLookupMemoryAndDiskRoundTrips() {
@@ -287,4 +297,52 @@ void AssetCacheTests::
   QVERIFY(!QFile::exists(payloadPath));
   QVERIFY(!QFile::exists(metadataPath));
   QVERIFY(!freshCache.lookupDisk(key).has_value());
+}
+
+void AssetCacheTests::
+    malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir() {
+  // AssetCache is a public API: nothing in the type system stops a
+  // caller from forwarding an arbitrary string as `key`, and every
+  // disk-touching entry point (lookupDisk(), store(),
+  // touchAfterNotModified()) turns `key` directly into a filesystem path
+  // via payloadPath()/metadataPath() ("<dir>/<key>.bin",
+  // "<dir>/<key>.meta.json"). This test uses a key crafted with "../"
+  // segments to escape the cache directory entirely and confirms none of
+  // the three entry points ever creates, reads, or deletes anything
+  // outside the cache directory -- nor anything unexpected inside it.
+  const QString maliciousKey =
+      QStringLiteral("../asset-cache-traversal-canary");
+
+  // Compute exactly where the (would-be) escaped payload/metadata paths
+  // resolve to, the same way AssetCache itself builds them internally,
+  // so the assertions below check the real physical location rather
+  // than guessing. The escape target lands one directory above the
+  // managed QTemporaryDir (still within the OS temp hierarchy, never a
+  // real user path), and ScopedFileRemoval guarantees cleanup even if
+  // this test fails because the fix under test regressed.
+  const QString escapedPayloadPath = QDir::cleanPath(
+      m_tempDirPath + u'/' + maliciousKey + QStringLiteral(".bin"));
+  const QString escapedMetadataPath = QDir::cleanPath(
+      m_tempDirPath + u'/' + maliciousKey + QStringLiteral(".meta.json"));
+  QVERIFY(!escapedPayloadPath.startsWith(m_tempDirPath));
+  QVERIFY(!escapedMetadataPath.startsWith(m_tempDirPath));
+  const ScopedFileRemoval payloadGuard{escapedPayloadPath};
+  const ScopedFileRemoval metadataGuard{escapedMetadataPath};
+
+  AssetCache cache(configFor(m_tempDirPath));
+
+  cache.store(maliciousKey, makeEntry(QByteArrayLiteral("traversal-payload")));
+  QVERIFY(!QFile::exists(escapedPayloadPath));
+  QVERIFY(!QFile::exists(escapedMetadataPath));
+
+  QVERIFY(!cache.lookupDisk(maliciousKey).has_value());
+
+  cache.touchAfterNotModified(maliciousKey, QStringLiteral("etag"), QString());
+  QVERIFY(!QFile::exists(escapedPayloadPath));
+  QVERIFY(!QFile::exists(escapedMetadataPath));
+
+  // A rejected key must be a complete no-op, not a partial write under
+  // some sanitized-but-still-wrong path inside the cache directory.
+  QDir cacheDir(m_tempDirPath);
+  QVERIFY(cacheDir.entryList(QDir::Files).isEmpty());
 }

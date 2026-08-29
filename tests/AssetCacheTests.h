@@ -28,6 +28,7 @@ private slots:
   void touchAfterNotModifiedRefreshesLastAccessAndHeaders();
   void restartingWithSameDirectorySeesPriorEntries();
   void oversizedSelfConsistentPayloadBeyondAbsoluteCapIsRejected();
+  void malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir();
 
 private:
   QString m_tempDirPath;

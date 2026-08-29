@@ -62,6 +62,21 @@ const QRegularExpression &validKeyPattern() {
   return re;
 }
 
+// All disk-touching public entry points (lookupDisk(), store(),
+// touchAfterNotModified()) accept a caller-supplied key and use it,
+// unescaped, to form filesystem paths via payloadPath()/metadataPath().
+// AssetCache's own callers always pass a key produced by cacheKeyFor()
+// (a SHA-256 hex digest), which can never contain a path separator or
+// "..", but this is a public API -- nothing in the type system prevents
+// a future or misbehaving caller from forwarding an arbitrary string.
+// Rejecting anything that doesn't match the exact expected shape here,
+// at every entry point that turns a key into a path, closes that off
+// completely rather than relying on every call site to keep passing
+// keys that happen to be safe.
+bool isValidKey(const QString &key) {
+  return validKeyPattern().match(key).hasMatch();
+}
+
 QString defaultCacheDirectory() {
   const QString base =
       QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
@@ -180,6 +195,12 @@ AssetCache::lookupDisk(const QString &key) {
     return memoryHit;
   }
 
+  if (!isValidKey(key)) {
+    // Never let a malformed key (path separators, "..", etc.) reach
+    // payloadPath()/metadataPath() below -- see isValidKey()'s comment.
+    return std::nullopt;
+  }
+
   QMutexLocker locker(&m_mutex);
 
   const std::optional<DiskMetadata> metadata = readMetadata(key);
@@ -259,6 +280,16 @@ AssetCache::lookupDisk(const QString &key) {
 }
 
 void AssetCache::store(const QString &key, CachedEntry entry) {
+  if (!isValidKey(key)) {
+    // Never let a malformed key reach payloadPath()/metadataPath() below
+    // -- see isValidKey()'s comment. Rejecting the whole store() as a
+    // no-op (rather than, say, still inserting into the memory cache
+    // under an untrusted key) keeps the invariant simple: an entry only
+    // ever exists, in memory or on disk, under a key this cache itself
+    // considers well-formed.
+    return;
+  }
+
   const qint64 now = QDateTime::currentMSecsSinceEpoch();
   if (entry.insertedAtMsecsSinceEpoch == 0) {
     entry.insertedAtMsecsSinceEpoch = now;
@@ -326,6 +357,11 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
 void AssetCache::touchAfterNotModified(const QString &key,
                                        const QString &newEtag,
                                        const QString &newLastModified) {
+  if (!isValidKey(key)) {
+    // Never let a malformed key reach payloadPath()/metadataPath() below
+    // -- see isValidKey()'s comment.
+    return;
+  }
   QMutexLocker locker(&m_mutex);
   const std::optional<DiskMetadata> metadata = readMetadata(key);
   if (!metadata) {
