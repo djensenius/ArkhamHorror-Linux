@@ -303,6 +303,20 @@ private:
     // reporting on the op that is actually still at the head of the
     // queue, rather than a later one that has since replaced it.
     quint64 opId{0};
+    // Only meaningful for Read and Save. For Read, this is the endpoint
+    // identity (see ServerProfile::credentialEndpointIdentity()) the
+    // dispatched ITokenStore::readToken() call expects the durable
+    // envelope to be bound to; ITokenStore itself verifies this before
+    // ever returning a token (see ITokenStore.h), so a stale envelope
+    // bound to a different endpoint is never trusted regardless of any
+    // in-memory epoch state. For Save, this is the endpoint identity the
+    // freshly obtained token is durably bound to when persisted. Left
+    // empty (unused) for Delete, which is endpoint-agnostic. Deliberately
+    // distinct from admissionEndpointEpoch above: that counter exists
+    // purely to gate an in-PROCESS rebind race (see its own comment);
+    // this field is the durable, cross-process, cross-restart identity
+    // that ITokenStore itself authoritatively enforces.
+    QString endpointIdentity;
   };
 
   // Per-profile bookkeeping for the single ITokenStore operation (if any)
@@ -429,8 +443,8 @@ private:
   void handleWhoAmIResult(quint64 generation, const QString &profileId,
                           const QString &token, WhoAmIPurpose purpose,
                           const AuthResult<CurrentUser> &result);
-  void deleteRestoredUnauthorizedToken(quint64 generation,
-                                       const QString &profileId);
+  void deleteUntrustedRestoredToken(quint64 generation,
+                                    const QString &profileId);
   void saveFreshlyObtainedToken(quint64 generation, const QString &profileId,
                                 const QString &token);
 
@@ -470,6 +484,7 @@ private:
   // the same op fails again after the profile was switched away from and
   // back (or start() restarted) in between.
   void enqueueTokenOp(const QString &profileId, TokenOpKind kind, QString token,
+                      QString endpointIdentity,
                       ITokenStore::ResultCallback onComplete);
   void startFrontTokenOp(const QString &profileId);
   void retryStuckProfileTokenOp(const QString &profileId);
@@ -520,6 +535,38 @@ private:
   // a FRESH Read for the new endpoint is enqueued strictly behind this
   // Delete instead of ever rebinding the orphaned one.
   void invalidateProfileCredentialForEndpointChange(const QString &profileId);
+
+  // Called from start() immediately before the freshly loaded profile
+  // list replaces |previousProfiles| (the OLD m_profiles from the prior
+  // start()), for EVERY retained/removed profile ID other than
+  // |selectedId| (whose own endpoint-change detection and cleanup is
+  // handled exclusively by mutateSelectedProfile(), via the very same
+  // invalidateProfileCredentialForEndpointChange() this function also
+  // uses -- calling it a second time here for the selected ID would
+  // double-bump its epoch and reserve a redundant second required
+  // Delete).
+  //
+  // This closes the credential-scope gap that purely selected-profile,
+  // in-memory epoch tracking cannot: an UNselected profile's persisted
+  // endpoint can change (or the profile can be removed entirely) without
+  // ever being selected in this process run, so nothing else would ever
+  // invalidate or clean up its potentially stale, old-endpoint-bound
+  // secure-store entry. For every retained ID whose endpoint actually
+  // changed (per ServerProfile::hasEquivalentEndpoint()), and for every
+  // ID present in |previousProfiles| but absent from |newProfiles|
+  // (removed from persisted storage -- its entry, if any, is now
+  // unreachable through the ordinary selected-profile restore flow and
+  // would otherwise be orphaned forever), this reserves the exact same
+  // required-Delete cleanup that an endpoint change on the SELECTED
+  // profile gets. A name-only change, or no prior record at all (a
+  // brand-new or re-added ID), triggers no cleanup here -- a re-added ID
+  // relies purely on ITokenStore's own durable envelope-binding check
+  // (see ITokenStore.h) the next time it is actually selected and read,
+  // since there is no in-memory "old" record to meaningfully compare it
+  // against.
+  void reconcileOtherProfileCredentialsOnReload(
+      const QList<ServerProfile> &previousProfiles,
+      const QList<ServerProfile> &newProfiles, const QString &selectedId);
 
   // Assigns the coherent (state, cleared-user) snapshot via
   // mutateState()/mutateCurrentUser() (so every field that changes as

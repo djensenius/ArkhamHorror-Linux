@@ -168,6 +168,60 @@ follows the same durably-retryable, per-profile-serialized semantics as
 other required deletes (see the point above); until it succeeds, later
 reads/saves/sign-ins for that profile remain blocked and retryable.
 
+### Durable, endpoint-bound credential envelopes (secure-store format v1)
+
+In-memory credential-endpoint epochs (described above) only ever protect
+the profile that is *currently selected* within *one running process*: an
+unselected profile's persisted endpoint can change, be removed, or be
+re-added with the same stable UUID entirely while this process is not
+running (or without that profile ever being selected in this run), and
+none of that would be visible to purely in-memory state. To close this
+gap, `QtKeychainTokenStore` no longer stores a raw token string; every
+saved entry is a small versioned, length-prefixed envelope
+(`AHKV1:<identityLength>:<endpointIdentity><token>`, see `TokenEnvelope.h`)
+that durably binds the token to the canonical credential-endpoint identity
+(`ServerProfile::credentialEndpointIdentity()` -- lower-cased scheme/host,
+canonical IP form where applicable, effective normalized port, and
+case-sensitive normalized path, with no userinfo/query/fragment) it was
+saved under. `ITokenStore::readToken()` takes the caller's *expected*
+endpoint identity and verifies it against the stored envelope itself,
+before ever returning a token: a structurally valid entry bound to a
+*different* identity is reported as `BindingMismatch`; a raw value with no
+recognizable envelope prefix at all (i.e. a token saved by a version of
+this application that predates envelope binding) is reported as
+`LegacyUnbound`; and an envelope-prefixed-but-structurally-corrupt entry
+(bad version, corrupt length digits, truncated content, or an empty
+trailing token) is reported as `Malformed`. All three are treated
+identically by `SessionCoordinator`: the token is never exposed to
+calling code, never trusted for a `/whoami` call, and never silently
+migrated (its true origin cannot be proven), and a required deletion is
+reserved ahead of any later read/auth/save for that profile, exactly like
+an ordinary credential-endpoint change. This means any pre-v1 installation
+is safely signed out of its restored session exactly once on upgrade, with
+no plaintext fallback at any point.
+
+This durable, per-entry binding check is complementary to (not a
+replacement for) the in-process credential-endpoint epoch described
+above: the epoch specifically guards against an in-process *race* where a
+restore read already in flight under an old endpoint could otherwise be
+incorrectly rebound to a newer continuation before its required deletion
+runs, which a purely at-rest binding check alone cannot prevent, since
+both mechanisms address different threat windows.
+
+Finally, on every profile-store reload, `SessionCoordinator` compares the
+OLD and NEW records for *every* retained profile UUID -- not only the
+selected one -- via `reconcileOtherProfileCredentialsOnReload()`. Any
+retained profile whose credential-endpoint identity changed, and any
+profile present before the reload but absent afterward (removed from
+persisted storage), has its credential epoch invalidated and a required
+deletion reserved immediately, so an unselected profile's stale,
+old-endpoint-bound (or now-orphaned) secure-store entry is proactively
+cleaned up rather than left reachable only if and when that profile is
+later selected. A name-only change to an unselected profile triggers no
+such cleanup. The selected profile's own endpoint-change detection
+remains the sole responsibility of `mutateSelectedProfile()`, so it is
+never invalidated twice for the same reload.
+
 ## Prerequisites
 
 - [mise](https://mise.jdx.dev/)

@@ -1,6 +1,7 @@
 #include "SessionCoordinator.h"
 
 #include <QPointer>
+#include <QSet>
 
 #include <algorithm>
 #include <utility>
@@ -294,6 +295,14 @@ void SessionCoordinator::start() {
   // std::move()-ing the container invalidates iterators into it, so |it|
   // must never be dereferenced after the move below.
   const ServerProfile selectedProfile = *it;
+  // Reconcile every OTHER profile's credential against this reload BEFORE
+  // m_profiles is overwritten below, while the OLD records are still
+  // available for comparison via the current value of m_profiles itself.
+  // The selected profile's own endpoint-change detection/cleanup is
+  // handled exclusively by mutateSelectedProfile() just below (see
+  // reconcileOtherProfileCredentialsOnReload()'s own doc comment for why
+  // running both for the same ID would double-invalidate it).
+  reconcileOtherProfileCredentialsOnReload(m_profiles, profiles, selectedId);
   m_profiles = std::move(profiles);
   mutateSelectedProfile(selectedId, selectedProfile);
   if (!publishDirtyProperties(self)) {
@@ -456,6 +465,8 @@ void SessionCoordinator::startCredentialRestore() {
   // itself just completed.
   const quint64 generation = m_generation;
   const QString profileId = m_currentProfile->profileId();
+  const QString expectedEndpointIdentity =
+      m_currentProfile->credentialEndpointIdentity();
   const bool stalled = m_profileFifoStalled.contains(profileId);
   QPointer<SessionCoordinator> self(this);
   setState(stalled ? State::SecureStorageUnavailable
@@ -543,7 +554,7 @@ void SessionCoordinator::startCredentialRestore() {
     }
   }
   enqueueTokenOp(profileId, TokenOpKind::Read, QString(),
-                 std::move(onComplete));
+                 expectedEndpointIdentity, std::move(onComplete));
 }
 
 void SessionCoordinator::handleRestoreReadResult(
@@ -556,6 +567,21 @@ void SessionCoordinator::handleRestoreReadResult(
   case TokenStoreOutcome::Success:
     issueWhoAmI(generation, profileId, result.token,
                 WhoAmIPurpose::RestoreExisting);
+    return;
+  case TokenStoreOutcome::BindingMismatch:
+  case TokenStoreOutcome::LegacyUnbound:
+  case TokenStoreOutcome::Malformed:
+    // The entry that was read cannot be trusted for this profile's
+    // CURRENT endpoint: either it is durably bound to a different one
+    // (BindingMismatch, e.g. this profileId() was reused or its
+    // persisted URL changed since the credential was saved), it predates
+    // endpoint binding entirely (LegacyUnbound), or it failed strict
+    // structural parsing (Malformed). In every case its origin cannot be
+    // proven, so it is never used, never auto-migrated, and never
+    // exposed as a token -- it is durably deleted and this profile is
+    // settled to SignedOut on success, exactly like an unauthorized
+    // restored token (see deleteUntrustedRestoredToken()).
+    deleteUntrustedRestoredToken(generation, profileId);
     return;
   case TokenStoreOutcome::AccessDenied:
   case TokenStoreOutcome::Unavailable:
@@ -625,7 +651,7 @@ void SessionCoordinator::handleWhoAmIResult(
     if (purpose == WhoAmIPurpose::RestoreExisting) {
       // A restored token the server no longer accepts must be durably
       // deleted before the coordinator is allowed to claim signed out.
-      deleteRestoredUnauthorizedToken(generation, profileId);
+      deleteUntrustedRestoredToken(generation, profileId);
     } else {
       // Nothing was ever saved for a freshly rejected token; just report
       // signed out. This path is shared by signIn() and registerAccount(),
@@ -668,9 +694,18 @@ void SessionCoordinator::saveFreshlyObtainedToken(quint64 generation,
   if (generation != m_generation) {
     return;
   }
+  // Safe to compute here (rather than threading a new parameter through
+  // issueWhoAmI()/handleWhoAmIResult() above): |generation| still matching
+  // m_generation at this point implies m_currentProfile is the SAME
+  // profile object that was active throughout this entire sign-in/
+  // register call chain, since only start()/switchProfile() ever change
+  // m_currentProfile, and both unconditionally bump m_generation when
+  // they do.
+  const QString endpointIdentity =
+      m_currentProfile->credentialEndpointIdentity();
   QPointer<SessionCoordinator> self(this);
   enqueueTokenOp(
-      profileId, TokenOpKind::Save, token,
+      profileId, TokenOpKind::Save, token, endpointIdentity,
       [self, generation, profileId, token](TokenStoreResult saveResult) {
         if (!self) {
           return;
@@ -693,19 +728,23 @@ void SessionCoordinator::saveFreshlyObtainedToken(quint64 generation,
       });
 }
 
-// A restored token the server has rejected must be durably deleted before
-// the coordinator is allowed to claim signed out. Defined as a reusable,
+// A restored/freshly-authenticated token that cannot be trusted -- rejected
+// by the server (AuthOutcome::Unauthorized) or, since PR #17, found by
+// ITokenStore to be bound to a different endpoint, pre-envelope legacy, or
+// structurally malformed (TokenStoreOutcome::BindingMismatch /
+// LegacyUnbound / Malformed) -- must be durably deleted before the
+// coordinator is allowed to claim signed out. Defined as a reusable,
 // generation-guarded step (rather than an inline lambda) so a deletion
 // failure can install a retry action that re-invokes exactly this same
 // step; without that, retry() would be a silent no-op while stuck in the
 // resulting SecureStorageUnavailable state.
-void SessionCoordinator::deleteRestoredUnauthorizedToken(
+void SessionCoordinator::deleteUntrustedRestoredToken(
     quint64 generation, const QString &profileId) {
   if (generation != m_generation) {
     return;
   }
   QPointer<SessionCoordinator> self(this);
-  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
+  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(), QString(),
                  [self, generation, profileId](TokenStoreResult deleteResult) {
                    if (!self) {
                      return;
@@ -868,7 +907,7 @@ void SessionCoordinator::signOut() {
   // emitted alongside; the required-delete failure path itself is also no
   // longer generation-gated (see startFrontTokenOp()'s central retry
   // reinstatement), so this obligation remains actionable regardless.
-  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
+  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(), QString(),
                  [self, generation, profileId](TokenStoreResult result) {
                    if (!self) {
                      return;
@@ -940,13 +979,14 @@ void SessionCoordinator::cancelPendingAuthRequest() {
 
 void SessionCoordinator::enqueueTokenOp(
     const QString &profileId, TokenOpKind kind, QString token,
-    ITokenStore::ResultCallback onComplete) {
+    QString endpointIdentity, ITokenStore::ResultCallback onComplete) {
   auto &queue = m_tokenQueues[profileId];
   const bool wasEmpty = queue.isEmpty();
   TokenOp op{kind, std::move(token), std::move(onComplete)};
   op.admissionEpoch = profileCredentialEpoch(profileId);
   op.admissionEndpointEpoch = profileEndpointEpoch(profileId);
   op.opId = m_nextTokenOpId++;
+  op.endpointIdentity = std::move(endpointIdentity);
   queue.enqueue(std::move(op));
   if (wasEmpty) {
     startFrontTokenOp(profileId);
@@ -1004,6 +1044,7 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
 
   const TokenOpKind kind = op.kind;
   const QString token = op.token;
+  const QString endpointIdentity = op.endpointIdentity;
   const quint64 opId = op.opId;
   const quint64 attemptId = m_nextTokenAttemptId++;
   dispatch.inFlight = true;
@@ -1149,10 +1190,11 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
 
   switch (kind) {
   case TokenOpKind::Read:
-    m_tokenStore.readToken(profileId, std::move(onResult));
+    m_tokenStore.readToken(profileId, endpointIdentity, std::move(onResult));
     break;
   case TokenOpKind::Save:
-    m_tokenStore.saveToken(profileId, token, std::move(onResult));
+    m_tokenStore.saveToken(profileId, token, endpointIdentity,
+                           std::move(onResult));
     break;
   case TokenOpKind::Delete:
     m_tokenStore.deleteToken(profileId, std::move(onResult));
@@ -1201,7 +1243,7 @@ void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
   // compensating Delete behind it now, before any later same-profile
   // auth/save can be enqueued, so that FIFO ordering alone guarantees the
   // cleanup always runs after whatever the in-flight Save ends up doing.
-  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
+  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(), QString(),
                  [](TokenStoreResult) {
                    // No profile-specific reaction needed here: this
                    // compensating cleanup exists purely to remove a
@@ -1253,7 +1295,7 @@ void SessionCoordinator::invalidateProfileCredentialForEndpointChange(
   // required-delete-failure retry path, see startFrontTokenOp() -- BEFORE
   // any later-enqueued restore Read or auth Save for this profile,
   // regardless of what (if anything) is already queued ahead of it.
-  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
+  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(), QString(),
                  [](TokenStoreResult) {
                    // No profile-specific reaction needed: this exists
                    // purely to guarantee no token from the old endpoint
@@ -1265,6 +1307,56 @@ void SessionCoordinator::invalidateProfileCredentialForEndpointChange(
                    // durably stalled and is surfaced/retried exactly like
                    // any other required delete.
                  });
+}
+
+void SessionCoordinator::reconcileOtherProfileCredentialsOnReload(
+    const QList<ServerProfile> &previousProfiles,
+    const QList<ServerProfile> &newProfiles, const QString &selectedId) {
+  QHash<QString, ServerProfile> previousById;
+  previousById.reserve(previousProfiles.size());
+  for (const ServerProfile &previous : previousProfiles) {
+    previousById.insert(previous.profileId(), previous);
+  }
+
+  QSet<QString> newIds;
+  newIds.reserve(newProfiles.size());
+  for (const ServerProfile &fresh : newProfiles) {
+    const QString id = fresh.profileId();
+    newIds.insert(id);
+    if (id == selectedId) {
+      // The selected profile's own endpoint-change detection and cleanup
+      // is handled exclusively by mutateSelectedProfile(), called right
+      // after this function returns (see start()); invalidating it here
+      // too would double-bump its endpoint epoch and reserve a redundant
+      // second required Delete for the very same stale token.
+      continue;
+    }
+    const auto previousIt = previousById.constFind(id);
+    if (previousIt == previousById.constEnd()) {
+      // Brand-new or re-added ID: no prior in-memory record exists to
+      // compare against, so there is nothing here to invalidate. A
+      // re-added ID whose UUID was previously used for a different
+      // endpoint relies purely on ITokenStore's own durable
+      // envelope-binding check (see ITokenStore.h) the next time it is
+      // actually selected and its credential is read.
+      continue;
+    }
+    if (!previousIt->hasEquivalentEndpoint(fresh)) {
+      invalidateProfileCredentialForEndpointChange(id);
+    }
+  }
+
+  for (const ServerProfile &previous : previousProfiles) {
+    const QString id = previous.profileId();
+    if (id == selectedId || newIds.contains(id)) {
+      continue;
+    }
+    // Removed from persisted storage entirely: its secure-store entry (if
+    // any) is now unreachable through the ordinary selected-profile
+    // restore flow and would otherwise be orphaned forever, so it is
+    // durably cleaned up here exactly like a detected endpoint change.
+    invalidateProfileCredentialForEndpointChange(id);
+  }
 }
 
 bool SessionCoordinator::publishDirtyProperties(

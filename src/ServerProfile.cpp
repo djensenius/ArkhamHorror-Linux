@@ -3,6 +3,7 @@
 #include "ContractPin.h"
 #include "UrlValidator.h"
 
+#include <QHostAddress>
 #include <QUuid>
 #include <utility>
 
@@ -123,13 +124,30 @@ int effectivePort(const QUrl &url) {
   }
   return -1;
 }
+
+// Canonical host form used by credentialEndpointIdentity(): the
+// fully-encoded (ACE/punycode) host, lower-cased, then further
+// canonicalised through QHostAddress when it happens to be a literal IP
+// address. See ServerProfile::credentialEndpointIdentity()'s header
+// comment for why both steps matter.
+QString canonicalCredentialHost(const QUrl &url) {
+  const QString encoded = url.host(QUrl::FullyEncoded).toLower();
+  QHostAddress address;
+  if (address.setAddress(encoded)) {
+    return address.toString();
+  }
+  return encoded;
+}
 } // namespace
 
+QString ServerProfile::credentialEndpointIdentity() const {
+  return m_baseUrl.scheme().toLower() + u'|' +
+         canonicalCredentialHost(m_baseUrl) + u'|' +
+         QString::number(effectivePort(m_baseUrl)) + u'|' + m_baseUrl.path();
+}
+
 bool ServerProfile::hasEquivalentEndpoint(const ServerProfile &other) const {
-  return m_baseUrl.scheme() == other.m_baseUrl.scheme() &&
-         m_baseUrl.host() == other.m_baseUrl.host() &&
-         effectivePort(m_baseUrl) == effectivePort(other.m_baseUrl) &&
-         m_baseUrl.path() == other.m_baseUrl.path();
+  return credentialEndpointIdentity() == other.credentialEndpointIdentity();
 }
 
 QUrl ServerProfile::apiUrl(const QStringView path) const {

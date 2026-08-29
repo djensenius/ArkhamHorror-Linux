@@ -23,6 +23,7 @@
 #include "ITokenStore.h"
 #include "QtKeychainJobFactory.h"
 #include "QtKeychainTokenStore.h"
+#include "TokenEnvelope.h"
 
 using namespace Arkham;
 
@@ -147,6 +148,20 @@ public:
     m_store.insert({service, key}, value);
   }
 
+  // Returns the exact opaque raw string currently stored for (service,
+  // key), or std::nullopt if nothing is stored. Test-only: lets a test
+  // inspect the serialized envelope format (e.g. its "AHKV1:" prefix and
+  // framed identity) directly, distinct from merely round-tripping it back
+  // through readToken(). Never used by production code.
+  [[nodiscard]] std::optional<QString>
+  rawStoredValue(const QString &service, const QString &key) const {
+    const auto it = m_store.constFind({service, key});
+    if (it == m_store.constEnd()) {
+      return std::nullopt;
+    }
+    return it.value();
+  }
+
   [[nodiscard]] std::unique_ptr<IKeychainReadJob>
   createReadJob(const QString &service, const QString &key) override {
     lastService = service;
@@ -227,6 +242,17 @@ QString newProfileId() {
   return QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
+// Arbitrary, distinct opaque endpoint-identity strings. QtKeychainTokenStore
+// never interprets this string's structure itself (see
+// ServerProfile::credentialEndpointIdentity(), which is the real production
+// source of these values) -- it is only ever compared for exact equality --
+// so a plain literal is sufficient here to exercise the store's own binding
+// logic in isolation.
+QString endpointIdentityA() { return QStringLiteral("https|example.com|443|"); }
+QString endpointIdentityB() {
+  return QStringLiteral("https|other-example.com|443|");
+}
+
 // Runs an async token-store operation and returns its result, or fails the
 // calling test (via the returned optional being empty) if no callback fires
 // within the deadline.
@@ -262,11 +288,34 @@ private slots:
   void nilProfileIdRejected();
   void emptyTokenRejectedOnSave();
   void whitespaceTokenRejectedOnSave();
+  void emptyEndpointIdentityRejectedOnSave();
+  void emptyEndpointIdentityRejectedOnRead();
   void concurrentProfilesAreIsolated();
   void destructionSuppressesPendingCallback();
   void callbacksAreAsynchronous();
   void diagnosticsNeverContainToken();
   void productionConstructorLinksAndConstructs();
+
+  // ─── Endpoint-bound envelope (durable credential binding) ───────────
+
+  void saveWritesVersionedEndpointBoundEnvelope();
+  void readMatchedEndpointBindingSucceeds();
+  void readMismatchedEndpointBindingIsRejectedWithNoToken();
+  void readLegacyUnboundRawTokenIsRejectedWithNoToken();
+  void readMalformedEnvelopeIsRejectedWithNoToken_data();
+  void readMalformedEnvelopeIsRejectedWithNoToken();
+  void updatedEndpointBindingReplacesPreviousBinding();
+  void diagnosticsNeverContainEndpointIdentityOrTokenForBindingOutcomes();
+
+  // ─── TokenEnvelope free-function unit tests (bypassing async I/O) ───
+
+  void envelopeRoundTripsIdentityAndToken();
+  void envelopeRoundTripsContentContainingDelimiterCharacters();
+  void envelopeParseRejectsLegacyRawText();
+  void envelopeParseRejectsUnsupportedVersion();
+  void envelopeParseRejectsTruncatedIdentityLength();
+  void envelopeParseRejectsEmptyToken();
+  void envelopeParseRejectsPrefixWithNoVersionDigits();
 };
 
 void TokenStoreTests::saveThenReadRoundTrip() {
@@ -281,13 +330,14 @@ void TokenStoreTests::saveThenReadRoundTrip() {
   const QString profileId = newProfileId();
 
   const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, expectedToken, std::move(cb));
+    store.saveToken(profileId, expectedToken, endpointIdentityA(),
+                    std::move(cb));
   });
   QVERIFY(saveResult.has_value());
   QCOMPARE(saveResult->outcome, TokenStoreOutcome::Success);
 
   const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(profileId, std::move(cb));
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(readResult.has_value());
   QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
@@ -307,19 +357,19 @@ void TokenStoreTests::updateOverwritesPreviousToken() {
   const QString profileId = newProfileId();
 
   const auto firstSaveResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, firstToken, std::move(cb));
+    store.saveToken(profileId, firstToken, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(firstSaveResult.has_value());
   QCOMPARE(firstSaveResult->outcome, TokenStoreOutcome::Success);
 
   const auto secondSaveResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, secondToken, std::move(cb));
+    store.saveToken(profileId, secondToken, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(secondSaveResult.has_value());
   QCOMPARE(secondSaveResult->outcome, TokenStoreOutcome::Success);
 
   const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(profileId, std::move(cb));
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(readResult.has_value());
   QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
@@ -333,7 +383,7 @@ void TokenStoreTests::readMissingProfileIsNotFound() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(newProfileId(), std::move(cb));
+    store.readToken(newProfileId(), endpointIdentityA(), std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::NotFound);
@@ -357,7 +407,7 @@ void TokenStoreTests::readBlankStoredTokenIsBackendError() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(profileId, std::move(cb));
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::BackendError);
@@ -379,7 +429,8 @@ void TokenStoreTests::deleteRemovesToken() {
   const QString profileId = newProfileId();
 
   const auto seedResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, QStringLiteral("some-token"), std::move(cb));
+    store.saveToken(profileId, QStringLiteral("some-token"),
+                    endpointIdentityA(), std::move(cb));
   });
   QVERIFY(seedResult.has_value());
   QCOMPARE(seedResult->outcome, TokenStoreOutcome::Success);
@@ -391,7 +442,7 @@ void TokenStoreTests::deleteRemovesToken() {
   QCOMPARE(deleteResult->outcome, TokenStoreOutcome::Success);
 
   const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(profileId, std::move(cb));
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(readResult.has_value());
   QCOMPARE(readResult->outcome, TokenStoreOutcome::NotFound);
@@ -414,7 +465,7 @@ void TokenStoreTests::backendUnavailableIsTypedFailure() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(newProfileId(), std::move(cb));
+    store.readToken(newProfileId(), endpointIdentityA(), std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::Unavailable);
@@ -427,7 +478,8 @@ void TokenStoreTests::accessDeniedIsTypedFailure() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(newProfileId(), QStringLiteral("token"), std::move(cb));
+    store.saveToken(newProfileId(), QStringLiteral("token"),
+                    endpointIdentityA(), std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::AccessDenied);
@@ -439,7 +491,7 @@ void TokenStoreTests::otherBackendErrorIsTypedFailure() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(newProfileId(), std::move(cb));
+    store.readToken(newProfileId(), endpointIdentityA(), std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::BackendError);
@@ -450,7 +502,8 @@ void TokenStoreTests::invalidProfileIdRejected() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(QStringLiteral("not-a-uuid"), std::move(cb));
+    store.readToken(QStringLiteral("not-a-uuid"), endpointIdentityA(),
+                    std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::InvalidInput);
@@ -462,7 +515,7 @@ void TokenStoreTests::nilProfileIdRejected() {
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
     store.readToken(QStringLiteral("00000000-0000-0000-0000-000000000000"),
-                    std::move(cb));
+                    endpointIdentityA(), std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::InvalidInput);
@@ -473,7 +526,8 @@ void TokenStoreTests::emptyTokenRejectedOnSave() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(newProfileId(), QString{}, std::move(cb));
+    store.saveToken(newProfileId(), QString{}, endpointIdentityA(),
+                    std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::InvalidInput);
@@ -484,7 +538,31 @@ void TokenStoreTests::whitespaceTokenRejectedOnSave() {
   QtKeychainTokenStore store(std::move(factory));
 
   const auto result = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(newProfileId(), QStringLiteral("   \t  "), std::move(cb));
+    store.saveToken(newProfileId(), QStringLiteral("   \t  "),
+                    endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, TokenStoreOutcome::InvalidInput);
+}
+
+void TokenStoreTests::emptyEndpointIdentityRejectedOnSave() {
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  QtKeychainTokenStore store(std::move(factory));
+
+  const auto result = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(newProfileId(), QStringLiteral("some-token"), QString{},
+                    std::move(cb));
+  });
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, TokenStoreOutcome::InvalidInput);
+}
+
+void TokenStoreTests::emptyEndpointIdentityRejectedOnRead() {
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  QtKeychainTokenStore store(std::move(factory));
+
+  const auto result = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(newProfileId(), QString{}, std::move(cb));
   });
   QVERIFY(result.has_value());
   QCOMPARE(result->outcome, TokenStoreOutcome::InvalidInput);
@@ -503,9 +581,9 @@ void TokenStoreTests::concurrentProfilesAreIsolated() {
 
   std::optional<TokenStoreResult> resultA;
   std::optional<TokenStoreResult> resultB;
-  store.saveToken(profileA, tokenA,
+  store.saveToken(profileA, tokenA, endpointIdentityA(),
                   [&resultA](TokenStoreResult r) { resultA = std::move(r); });
-  store.saveToken(profileB, tokenB,
+  store.saveToken(profileB, tokenB, endpointIdentityA(),
                   [&resultB](TokenStoreResult r) { resultB = std::move(r); });
 
   const QDeadlineTimer deadline(2000);
@@ -519,10 +597,10 @@ void TokenStoreTests::concurrentProfilesAreIsolated() {
   QCOMPARE(resultB->outcome, TokenStoreOutcome::Success);
 
   const auto readA = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(profileA, std::move(cb));
+    store.readToken(profileA, endpointIdentityA(), std::move(cb));
   });
   const auto readB = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(profileB, std::move(cb));
+    store.readToken(profileB, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(readA.has_value());
   QVERIFY(readB.has_value());
@@ -539,7 +617,7 @@ void TokenStoreTests::destructionSuppressesPendingCallback() {
   int callCount = 0;
   {
     QtKeychainTokenStore store(std::move(factory));
-    store.readToken(newProfileId(),
+    store.readToken(newProfileId(), endpointIdentityA(),
                     [&callCount](TokenStoreResult) { ++callCount; });
     // The store is destroyed here while the (hanging) job is still pending.
   }
@@ -554,7 +632,7 @@ void TokenStoreTests::callbacksAreAsynchronous() {
   QtKeychainTokenStore store(std::move(factory));
 
   bool calledBack = false;
-  store.saveToken(newProfileId(), QStringLiteral("token"),
+  store.saveToken(newProfileId(), QStringLiteral("token"), endpointIdentityA(),
                   [&calledBack](TokenStoreResult) { calledBack = true; });
   // saveToken() must return without having already invoked the callback.
   QVERIFY(!calledBack);
@@ -573,13 +651,14 @@ void TokenStoreTests::diagnosticsNeverContainToken() {
   const QString profileId = newProfileId();
 
   const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.saveToken(profileId, sentinelToken, std::move(cb));
+    store.saveToken(profileId, sentinelToken, endpointIdentityA(),
+                    std::move(cb));
   });
   QVERIFY(saveResult.has_value());
   QVERIFY(!saveResult->diagnostic.contains(sentinelToken));
 
   const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
-    store.readToken(profileId, std::move(cb));
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(readResult.has_value());
   // The token itself is expected in TokenStoreResult::token, but never in
@@ -597,6 +676,291 @@ void TokenStoreTests::productionConstructorLinksAndConstructs() {
   QVERIFY(store != nullptr);
   QCOMPARE(QtKeychainTokenStore::serviceName(),
            QStringLiteral("app.arkhamhorror.auth.token"));
+}
+
+// ─── Endpoint-bound envelope (durable credential binding) ────────────────
+//
+// These exercise QtKeychainTokenStore's own envelope serialize/verify
+// sequencing end-to-end (through the fake job factory's real in-memory
+// map), distinct from the direct TokenEnvelope free-function unit tests
+// below, which bypass the async keychain plumbing entirely.
+
+void TokenStoreTests::saveWritesVersionedEndpointBoundEnvelope() {
+  const QString sentinelToken = QStringLiteral("sentinel-secret-envelope-1");
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  auto *rawFactory = factory.get();
+  QtKeychainTokenStore store(std::move(factory));
+  const QString profileId = newProfileId();
+
+  const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(profileId, sentinelToken, endpointIdentityA(),
+                    std::move(cb));
+  });
+  QVERIFY(saveResult.has_value());
+  QCOMPARE(saveResult->outcome, TokenStoreOutcome::Success);
+
+  const auto raw = rawFactory->rawStoredValue(
+      QtKeychainTokenStore::serviceName(), profileId);
+  QVERIFY(raw.has_value());
+  // The persisted payload must be the versioned envelope -- never the bare
+  // token -- and must carry both the endpoint identity and the token
+  // somewhere inside it (parseTokenEnvelope() below proves the EXACT
+  // framing; this proves the raw persisted bytes are not simply the plain
+  // token).
+  QVERIFY(raw->startsWith(QStringLiteral("AHKV1:")));
+  QVERIFY(raw->contains(endpointIdentityA()));
+  QVERIFY(raw->contains(sentinelToken));
+  QVERIFY(*raw != sentinelToken);
+
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(*raw);
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Parsed);
+  QCOMPARE(parsed.endpointIdentity, endpointIdentityA());
+  QVERIFY(parsed.token == sentinelToken);
+}
+
+void TokenStoreTests::readMatchedEndpointBindingSucceeds() {
+  const QString expectedToken = QStringLiteral("matched-binding-token");
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  QtKeychainTokenStore store(std::move(factory));
+  const QString profileId = newProfileId();
+
+  const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(profileId, expectedToken, endpointIdentityA(),
+                    std::move(cb));
+  });
+  QVERIFY(saveResult.has_value());
+  QCOMPARE(saveResult->outcome, TokenStoreOutcome::Success);
+
+  const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(readResult.has_value());
+  QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
+  QVERIFY(readResult->token == expectedToken);
+}
+
+void TokenStoreTests::readMismatchedEndpointBindingIsRejectedWithNoToken() {
+  const QString savedToken = QStringLiteral("bound-to-endpoint-a-token");
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  QtKeychainTokenStore store(std::move(factory));
+  const QString profileId = newProfileId();
+
+  const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(profileId, savedToken, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(saveResult.has_value());
+  QCOMPARE(saveResult->outcome, TokenStoreOutcome::Success);
+
+  // Read back expecting a DIFFERENT endpoint identity than the one this
+  // token was actually saved for -- simulating the same profileId() now
+  // being associated with a different server (persisted URL changed, or
+  // the UUID was reused by a different profile).
+  const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityB(), std::move(cb));
+  });
+  QVERIFY(readResult.has_value());
+  QCOMPARE(readResult->outcome, TokenStoreOutcome::BindingMismatch);
+  QVERIFY(readResult->token.isEmpty());
+  // The diagnostic must never leak WHICH identity was expected/found nor
+  // the token itself; see
+  // diagnosticsNeverContainEndpointIdentityOrTokenForBindingOutcomes().
+  QVERIFY(!readResult->diagnostic.contains(savedToken));
+}
+
+void TokenStoreTests::readLegacyUnboundRawTokenIsRejectedWithNoToken() {
+  // Seeds a plain, pre-envelope raw token directly into the backing map --
+  // exactly what a token saved by a release predating endpoint binding
+  // would look like -- bypassing saveToken()'s own envelope wrapping
+  // entirely.
+  const QString legacyRawToken = QStringLiteral("legacy-pre-envelope-token");
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  auto *rawFactory = factory.get();
+  const QString profileId = newProfileId();
+  rawFactory->seedStoredToken(QtKeychainTokenStore::serviceName(), profileId,
+                              legacyRawToken);
+  QtKeychainTokenStore store(std::move(factory));
+
+  const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(readResult.has_value());
+  QCOMPARE(readResult->outcome, TokenStoreOutcome::LegacyUnbound);
+  QVERIFY(readResult->token.isEmpty());
+  QVERIFY(!readResult->diagnostic.contains(legacyRawToken));
+}
+
+void TokenStoreTests::readMalformedEnvelopeIsRejectedWithNoToken_data() {
+  QTest::addColumn<QString>("storedValue");
+  QTest::newRow("unsupported-version")
+      << QStringLiteral("AHKV2:5:hosta") + QStringLiteral("token-abc");
+  QTest::newRow("truncated-identity-length")
+      << QStringLiteral("AHKV1:999:tooshort");
+  QTest::newRow("non-digit-length")
+      << QStringLiteral("AHKV1:abc:identitytoken");
+  QTest::newRow("no-version-terminator")
+      << QStringLiteral("AHKV1identitytoken");
+  QTest::newRow("empty-token-remainder") << QStringLiteral("AHKV1:5:hosta");
+}
+
+void TokenStoreTests::readMalformedEnvelopeIsRejectedWithNoToken() {
+  QFETCH(QString, storedValue);
+
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  auto *rawFactory = factory.get();
+  const QString profileId = newProfileId();
+  rawFactory->seedStoredToken(QtKeychainTokenStore::serviceName(), profileId,
+                              storedValue);
+  QtKeychainTokenStore store(std::move(factory));
+
+  const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(readResult.has_value());
+  QCOMPARE(readResult->outcome, TokenStoreOutcome::Malformed);
+  QVERIFY(readResult->token.isEmpty());
+}
+
+void TokenStoreTests::updatedEndpointBindingReplacesPreviousBinding() {
+  // A profile whose endpoint changes and is re-saved (e.g. after the
+  // coordinator's required delete-then-fresh-auth sequence) must bind the
+  // NEW token to the NEW identity only -- reading with the OLD identity
+  // must no longer succeed, and reading with the NEW identity must.
+  const QString firstToken = QStringLiteral("token-for-endpoint-a");
+  const QString secondToken = QStringLiteral("token-for-endpoint-b");
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  QtKeychainTokenStore store(std::move(factory));
+  const QString profileId = newProfileId();
+
+  const auto firstSave = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(profileId, firstToken, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(firstSave.has_value());
+  QCOMPARE(firstSave->outcome, TokenStoreOutcome::Success);
+
+  const auto secondSave = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(profileId, secondToken, endpointIdentityB(), std::move(cb));
+  });
+  QVERIFY(secondSave.has_value());
+  QCOMPARE(secondSave->outcome, TokenStoreOutcome::Success);
+
+  const auto readOld = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(readOld.has_value());
+  QCOMPARE(readOld->outcome, TokenStoreOutcome::BindingMismatch);
+  QVERIFY(readOld->token.isEmpty());
+
+  const auto readNew = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityB(), std::move(cb));
+  });
+  QVERIFY(readNew.has_value());
+  QCOMPARE(readNew->outcome, TokenStoreOutcome::Success);
+  QVERIFY(readNew->token == secondToken);
+}
+
+void TokenStoreTests::
+    diagnosticsNeverContainEndpointIdentityOrTokenForBindingOutcomes() {
+  const QString sentinelToken = QStringLiteral("sentinel-binding-secret-42");
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  QtKeychainTokenStore store(std::move(factory));
+  const QString profileId = newProfileId();
+
+  const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(profileId, sentinelToken, endpointIdentityA(),
+                    std::move(cb));
+  });
+  QVERIFY(saveResult.has_value());
+
+  const auto mismatchResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityB(), std::move(cb));
+  });
+  QVERIFY(mismatchResult.has_value());
+  QVERIFY(!mismatchResult->diagnostic.contains(sentinelToken));
+  QVERIFY(!mismatchResult->diagnostic.contains(endpointIdentityA()));
+  QVERIFY(!mismatchResult->diagnostic.contains(endpointIdentityB()));
+}
+
+// ─── TokenEnvelope free-function unit tests ──────────────────────────────
+//
+// These call serializeTokenEnvelope()/parseTokenEnvelope() directly,
+// bypassing the async keychain job plumbing entirely, for fast, isolated
+// coverage of the wire format itself.
+
+void TokenStoreTests::envelopeRoundTripsIdentityAndToken() {
+  const QString identity = QStringLiteral("https|example.com|443|/api");
+  const QString token = QStringLiteral("a-normal-looking-token-value");
+
+  const QString serialized = serializeTokenEnvelope(identity, token);
+  QVERIFY(serialized.startsWith(QStringLiteral("AHKV1:")));
+
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(serialized);
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Parsed);
+  QCOMPARE(parsed.endpointIdentity, identity);
+  QVERIFY(parsed.token == token);
+}
+
+void TokenStoreTests::envelopeRoundTripsContentContainingDelimiterCharacters() {
+  // The identity string itself uses '|' internally, and a token is an
+  // opaque backend-issued string that could in principle contain any
+  // character including ':'. Both must still round-trip exactly, proving
+  // the explicit-length framing never misreads either field's own content
+  // as a boundary.
+  const QString identity =
+      QStringLiteral("https|host:extra|443|/weird:path|with|pipes");
+  const QString token = QStringLiteral("token:with:colons|and|pipes");
+
+  const QString serialized = serializeTokenEnvelope(identity, token);
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(serialized);
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Parsed);
+  QCOMPARE(parsed.endpointIdentity, identity);
+  QVERIFY(parsed.token == token);
+}
+
+void TokenStoreTests::envelopeParseRejectsLegacyRawText() {
+  const TokenEnvelopeParseResult parsed =
+      parseTokenEnvelope(QStringLiteral("just-a-plain-legacy-token"));
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::LegacyUnbound);
+  QVERIFY(parsed.token.isEmpty());
+  QVERIFY(parsed.endpointIdentity.isEmpty());
+}
+
+void TokenStoreTests::envelopeParseRejectsUnsupportedVersion() {
+  const QString serialized =
+      serializeTokenEnvelope(QStringLiteral("host"), QStringLiteral("tok"));
+  // serializeTokenEnvelope() always writes version 1; splice in an
+  // unsupported version number instead.
+  QString tampered = serialized;
+  tampered.replace(QStringLiteral("AHKV1:"), QStringLiteral("AHKV2:"));
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(tampered);
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
+  QVERIFY(parsed.token.isEmpty());
+}
+
+void TokenStoreTests::envelopeParseRejectsTruncatedIdentityLength() {
+  // Declares an identity length far longer than the actual remaining
+  // payload.
+  const TokenEnvelopeParseResult parsed =
+      parseTokenEnvelope(QStringLiteral("AHKV1:9999:short"));
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
+  QVERIFY(parsed.token.isEmpty());
+}
+
+void TokenStoreTests::envelopeParseRejectsEmptyToken() {
+  // A well-formed length prefix whose declared identity consumes the
+  // ENTIRE remainder, leaving nothing for the token.
+  const QString identity = QStringLiteral("host");
+  const QString serialized =
+      QStringLiteral("AHKV1:%1:%2").arg(identity.size()).arg(identity);
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(serialized);
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
+  QVERIFY(parsed.token.isEmpty());
+}
+
+void TokenStoreTests::envelopeParseRejectsPrefixWithNoVersionDigits() {
+  const TokenEnvelopeParseResult parsed =
+      parseTokenEnvelope(QStringLiteral("AHKV:5:hostatoken"));
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
+  QVERIFY(parsed.token.isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TokenStoreTests)

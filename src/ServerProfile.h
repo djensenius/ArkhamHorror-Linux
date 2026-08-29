@@ -59,19 +59,37 @@ public:
   [[nodiscard]] const QString &displayName() const;
   [[nodiscard]] const QUrl &baseUrl() const;
 
+  // Canonical credential-endpoint identity string for this profile: the
+  // single source of truth for "does a secure-store credential belong to
+  // this server", shared between hasEquivalentEndpoint() (in-process
+  // comparisons) and the durable version-1 token envelope persisted by
+  // QtKeychainTokenStore (see TokenEnvelope.h) -- so an on-disk credential
+  // saved in one process run can be correctly matched or rejected in any
+  // later run, independent of any in-memory epoch bookkeeping.
+  //
+  // Composed as "scheme|host|port|path" where:
+  //  - scheme is lower-cased (defence in depth; UrlValidator already
+  //    lower-cases it during parsing);
+  //  - host is the fully-encoded (ACE/punycode) form, lower-cased, and
+  //    additionally canonicalised through QHostAddress when it parses as a
+  //    literal IPv4/IPv6 address. This closes two bypasses a plain
+  //    QString host comparison would not: an internationalised domain
+  //    name written using a different Unicode normalisation form still
+  //    ToASCII-encodes to the identical punycode label, and an IPv6
+  //    literal written in a different (but equivalent) shorthand still
+  //    canonicalises to the identical textual form via QHostAddress;
+  //  - port is the EFFECTIVE port (explicit, or the scheme's implied
+  //    default -- 443 for https, 80 for http -- when none was given), so
+  //    "https://host" and "https://host:443" produce the same identity;
+  //  - path is the stored path prefix, compared CASE-SENSITIVELY (URL
+  //    paths are case-sensitive, so "/foo" and "/Foo" genuinely select
+  //    different routes on the server and must never be conflated).
+  [[nodiscard]] QString credentialEndpointIdentity() const;
+
   // Returns true iff |other| designates the SAME network endpoint as this
-  // profile: identical scheme, identical host, identical EFFECTIVE port
-  // (an explicit port, or the scheme's implied default port -- 443 for
-  // https, 80 for http -- when none was given, so "https://host" and
-  // "https://host:443" compare equal despite QUrl::port() returning -1 for
-  // the former and 443 for the latter), and an identical stored path
-  // prefix compared CASE-SENSITIVELY (URL paths are case-sensitive, so
-  // "/foo" and "/Foo" genuinely select different routes on the server).
-  // Scheme and host are compared with plain QString equality because
-  // UrlValidator::validateCustomUrl() already normalises both via QUrl's
-  // own parsing (which lowercases them) before either is ever stored in
-  // m_baseUrl, so no further case-folding is needed -- or wanted, since
-  // that would risk silently masking a genuine host difference.
+  // profile, i.e. iff their credentialEndpointIdentity() strings are
+  // equal. See credentialEndpointIdentity() for exactly what is and is
+  // not folded together.
   //
   // Two profiles with the same profileId() but a false result here refer
   // to different endpoints even though they share a stable ID (stable IDs
@@ -79,7 +97,8 @@ public:
   // reload that changed the underlying URL); any credential previously
   // stored for that profileId() was scoped to the OLD endpoint and must
   // never be used against the new one -- see
-  // SessionCoordinator::mutateSelectedProfile().
+  // SessionCoordinator::mutateSelectedProfile() and
+  // SessionCoordinator::invalidateProfileCredentialForEndpointChange().
   [[nodiscard]] bool hasEquivalentEndpoint(const ServerProfile &other) const;
 
   // Returns the full URL for a REST endpoint at |path| relative to the API

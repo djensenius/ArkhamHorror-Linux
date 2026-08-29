@@ -111,6 +111,8 @@ add_library(arkham_foundation STATIC
     src/ServerProfile.h
     src/SessionCoordinator.cpp
     src/SessionCoordinator.h
+    src/TokenEnvelope.cpp
+    src/TokenEnvelope.h
     src/UrlValidator.cpp
     src/UrlValidator.h
     src/ValueOrError.h
