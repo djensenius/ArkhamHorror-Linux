@@ -10,6 +10,7 @@
 
 #include <QHash>
 #include <QObject>
+#include <QPointer>
 #include <QQueue>
 #include <QString>
 #include <functional>
@@ -384,26 +385,41 @@ private:
   // ITokenStore.
   void invalidateProfileCredential(const QString &profileId);
 
-  // Emits currentUserChanged() (if needed, via clearCurrentUser()) and
-  // then setState(state, diagnostic), but only if |generation| is still
-  // current both before and after the (possibly reentrancy-triggering)
-  // currentUserChanged() emission. clearCurrentUser()/setState() are
-  // synchronous Qt signal emissions; a directly-connected handler could
-  // reentrantly call switchProfile(), start(), signOut(), or destroy the
-  // coordinator while either is being delivered. Returns false (having
-  // made no further visible change) if superseded at either point.
+  // Emits stateChanged() and then, IF the coordinator actually had a
+  // current user beforehand, currentUserChanged() -- but ONLY IF
+  // |generation| is still current after EACH emission. The caller must
+  // have already assigned m_state/m_diagnostic and cleared m_currentUser
+  // BEFORE calling this (see clearCurrentUserAndSetStateIfCurrent() and
+  // start()/switchProfile()'s use of it): both fields are therefore
+  // already coherent together at the moment of the FIRST notification, so
+  // a directly-connected handler reentrantly calling switchProfile(),
+  // start(), signOut(), or destroying the coordinator during EITHER
+  // signal never observes a hybrid snapshot (e.g. the new/cleared state
+  // together with the old identity, or vice versa) -- only the complete
+  // new transition snapshot, or (if superseded) nothing further at all.
+  // Returns false (having made no further visible change) if superseded
+  // or destroyed at either point.
+  bool publishClearedUserState(QPointer<SessionCoordinator> &self,
+                               quint64 generation, bool hadUser);
+
+  // Assigns the coherent (state, cleared-user) snapshot and then publishes
+  // it via publishClearedUserState() above, but only if |generation| is
+  // still current at the moment of the call. Every field that changes as
+  // part of this transition is assigned BEFORE either signal is emitted.
   bool clearCurrentUserAndSetStateIfCurrent(quint64 generation, State state,
                                             QString diagnostic = {});
 
   // Same reentrancy-safety contract as clearCurrentUserAndSetStateIfCurrent
   // above, but for the "apply a freshly-known user, then transition to
-  // SignedIn" pattern (credential restore's whoami success path).
+  // SignedIn" pattern (credential restore's whoami success path): the new
+  // user and the new state are both assigned before stateChanged() is
+  // emitted, and currentUserChanged() is only emitted (and only if
+  // |generation| is still current) afterward.
   bool applyCurrentUserAndSetStateIfCurrent(quint64 generation,
                                             const CurrentUser &user,
                                             State state);
 
   void applyCurrentUser(const CurrentUser &user);
-  void clearCurrentUser();
 
   IProfileStore &m_profileStore;
   ProbeFactory m_probeFactory;

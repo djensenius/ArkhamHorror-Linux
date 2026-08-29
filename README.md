@@ -57,17 +57,28 @@ The current walking skeleton establishes:
   reentrant observer of that transition can never cause the deletion
   itself to be dropped; once published, a reentrant or ordinary duplicate
   `signOut()` call while one is already in flight is a safe no-op rather
-  than a second enqueued deletion. `switchProfile()` similarly publishes a
-  coherent non-`SignedIn` transitional snapshot (cleared identity, before
-  the profile itself changes) so a reentrant observer of
-  `selectedProfileChanged()` can never see the new profile's identity
-  paired with the old session's stale `SignedIn` state. Every emission
-  that can reenter the coordinator (`stateChanged`, `currentUserChanged`,
+  than a second enqueued deletion (this holds even if the reserved delete
+  resolves synchronously, reentering from inside `signOut()` itself).
+  `start()` and `switchProfile()` assign every observable field of the new
+  transition snapshot -- transitional (non-`SignedIn`) state, cleared
+  identity, and, for `switchProfile()`, the new selected profile itself
+  (persisted to storage first) -- together, BEFORE emitting any of
+  `stateChanged()`/`currentUserChanged()`/`selectedProfileChanged()`, with
+  a lifetime/generation checkpoint after each individual emission. A
+  directly-connected reentrant observer of any of these signals therefore
+  only ever sees one complete, coherent snapshot (either the full old one,
+  if reentered before the transition began, or the full new one) and never
+  a hybrid -- e.g. never the new profile's identity paired with the old
+  session's stale `SignedIn` state, and never a persisted selection that
+  has diverged from the in-memory one because a reentrant call superseded
+  the transition partway through. Every emission that can reenter the
+  coordinator (`stateChanged`, `currentUserChanged`,
   `selectedProfileChanged`) is guarded so a directly-connected reentrant
   `switchProfile()`/`start()`/`signOut()`/destruction during that emission
   can never dispatch a request for an abandoned profile, dereference a
-  stale/destroyed probe, or resurrect a superseded state. Its properties/
-  signals never expose a password, token, or `Authorization` header. The
+  stale/destroyed probe, delete the wrong profile's token, or resurrect a
+  superseded state. Its properties/signals never expose a password,
+  token, or `Authorization` header. The
   production composition (`AppSessionComposition`) and the hermetic
   `--smoke-test` gate (`AppBootstrap`) ensure smoke-test runs never
   construct the coordinator or touch QSettings/the network/the keychain.

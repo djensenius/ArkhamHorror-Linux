@@ -95,14 +95,6 @@ void SessionCoordinator::applyCurrentUser(const CurrentUser &user) {
   emit currentUserChanged();
 }
 
-void SessionCoordinator::clearCurrentUser() {
-  if (!m_currentUser.has_value()) {
-    return;
-  }
-  m_currentUser.reset();
-  emit currentUserChanged();
-}
-
 // ─── Boot / profile loading ─────────────────────────────────────────────
 
 void SessionCoordinator::start() {
@@ -123,23 +115,23 @@ void SessionCoordinator::start() {
   const quint64 generation = m_generation;
   m_retryAction = nullptr;
 
+  // Assign the complete new (Loading, cleared-identity) snapshot together
+  // BEFORE either notification is emitted below (see
+  // publishClearedUserState()'s contract): a directly-connected handler
+  // reentrantly calling switchProfile()/start()/signOut() from either
+  // emission must see state()==Loading and currentUser()==nil already
+  // coherent together, never a stale SignedIn alongside an already-
+  // cleared identity (which previously let a reentrant signOut() during
+  // this exact window proceed as if the session were still fully signed
+  // in).
+  const bool hadUser = m_currentUser.has_value();
+  m_currentUser.reset();
+  m_state = State::Loading;
+  m_diagnostic.clear();
+
   QPointer<SessionCoordinator> self(this);
-  clearCurrentUser();
-  if (!self || generation != self->m_generation) {
-    // A directly-connected currentUserChanged() handler reentrantly called
-    // start()/switchProfile()/signOut(), or destroyed the coordinator,
-    // while clearCurrentUser()'s emission was being delivered: `this` may
-    // already be dangling and |generation| is no longer current, so
-    // setState() below must never run.
-    return;
-  }
-  setState(State::Loading);
-  if (!self || generation != self->m_generation) {
-    // Same check again for setState()'s own stateChanged() emission: a
-    // handler reentrantly triggered by *this* emission could equally
-    // destroy the coordinator or supersede |generation| before the
-    // remainder of start() runs below.
-    return;
+  if (!publishClearedUserState(self, generation, hadUser)) {
+    return; // superseded or destroyed while either signal was delivered
   }
 
   const auto profilesResult = m_profileStore.loadProfiles();
@@ -256,31 +248,39 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
   const quint64 generation = m_generation;
   m_retryAction = nullptr;
 
-  QPointer<SessionCoordinator> self(this);
-  clearCurrentUser();
-  if (!self || generation != self->m_generation) {
-    return; // superseded while currentUserChanged() was being delivered
-  }
-
-  // Publish a coherent non-SignedIn transitional snapshot (cleared
-  // identity, Loading state) BEFORE the selected profile itself changes
-  // below. Without this, a reentrant observer of the selectedProfileChanged()
-  // emission further down could see the NEW profile while state() still
-  // reported the OLD session's SignedIn (setState() was previously only
-  // reached later, inside startProbe()) -- letting e.g. a directly
-  // connected selectedProfileChanged()/currentUserChanged() handler that
-  // calls signOut() delete the NEW profile's token while believing it was
-  // still authenticated as the profile being left. Every subsequent
-  // notification below re-checks self/generation, so a reentrant handler
-  // observes either the complete old snapshot or this complete transition
-  // snapshot -- never a hybrid of the two.
-  setState(State::Loading);
-  if (!self || generation != self->m_generation) {
-    return; // superseded while stateChanged() was being delivered
-  }
-
+  // Assign the ENTIRE new observable snapshot -- transitional (non-
+  // SignedIn) state, cleared identity, AND the new selected profile --
+  // together, BEFORE any notification is emitted below. A previous
+  // version of this function assigned these in three separate steps
+  // (clear identity -> emit; set state -> emit; reassign profile ->
+  // emit), which meant a directly-connected handler reentrantly observing
+  // an EARLY emission (e.g. currentUserChanged()) could still see the OLD
+  // profile alongside the already-cleared identity/still-SignedIn state
+  // -- and if that handler called signOut(), it could bump the generation
+  // and abort the rest of this function AFTER the new selection had
+  // already been persisted to storage above, leaving the persisted
+  // selection (the new profile) permanently split from the in-memory
+  // selection (reverted to the old profile). With every field already
+  // assigned here, EVERY notification below -- selectedProfileChanged(),
+  // stateChanged(), and currentUserChanged() -- carries the complete new
+  // snapshot from the very first one: a reentrant observer of any of them
+  // sees state()==Loading, currentUser()==nil, and selectedProfileId()
+  // already the NEW profile, all together. signOut() (which requires
+  // state()==SignedIn) can therefore never fire reentrantly from within
+  // this transition at all, so it can never observe -- or act on -- a
+  // hybrid of old and new identity.
+  const bool hadUser = m_currentUser.has_value();
+  m_currentUser.reset();
+  m_state = State::Loading;
+  m_diagnostic.clear();
   m_selectedProfileId = profileId;
   m_currentProfile = *it;
+
+  QPointer<SessionCoordinator> self(this);
+  if (!publishClearedUserState(self, generation, hadUser)) {
+    return; // superseded or destroyed while either signal was delivered
+  }
+
   emit selectedProfileChanged();
   if (!self || generation != self->m_generation) {
     return; // superseded while selectedProfileChanged() was being delivered
@@ -692,7 +692,13 @@ void SessionCoordinator::signOut() {
     // transition's stateChanged() emission) or a merely duplicate call
     // sees m_state != SignedIn here and is rejected as a safe, idempotent
     // no-op -- it can never bump the generation again or enqueue a second
-    // deletion.
+    // deletion. This also covers a pathological synchronously-completing
+    // ITokenStore (see below): clearCurrentUserAndSetStateIfCurrent()
+    // assigns the target state (e.g. SignedOut) and clears identity
+    // TOGETHER before emitting anything, so even a reentrant call from
+    // within that nested completion's own currentUserChanged() emission
+    // observes state() already != SignedIn -- never a stale SignedIn
+    // alongside an already-cleared identity -- and is rejected here too.
     return;
   }
   cancelPendingAuthRequest();
@@ -733,10 +739,13 @@ void SessionCoordinator::signOut() {
   // already have invoked the callback above and moved m_state past
   // SignedIn (e.g. straight to SignedOut on immediate success, or to
   // SecureStorageUnavailable via the central FIFO dispatcher on immediate
-  // failure) before this line ever runs. Only publish the SigningOut
-  // transition if that has not happened, so this call can never clobber
-  // an already-correct, more-current state with a stale "still signing
-  // out" label.
+  // failure) before this line ever runs -- see
+  // clearCurrentUserAndSetStateIfCurrent()'s coherent-snapshot guarantee,
+  // which is exactly what makes this safe: nothing observable ever shows
+  // a stale SigningOut/SignedIn once that has happened. Only publish the
+  // SigningOut transition if that has not happened, so this call can
+  // never clobber an already-correct, more-current state with a stale
+  // "still signing out" label.
   if (!self || generation != self->m_generation ||
       self->m_state != State::SignedIn) {
     return;
@@ -1049,18 +1058,44 @@ void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
                  });
 }
 
+bool SessionCoordinator::publishClearedUserState(
+    QPointer<SessionCoordinator> &self, quint64 generation, bool hadUser) {
+  // Precondition (enforced by every caller): m_state/m_diagnostic and the
+  // cleared m_currentUser have ALREADY been assigned before this runs, so
+  // the very first signal emitted below already carries the complete,
+  // coherent new snapshot -- never the old state/identity paired with the
+  // other field's new value.
+  emit stateChanged();
+  if (!self || generation != self->m_generation) {
+    return false; // superseded while stateChanged() was being delivered
+  }
+  if (hadUser) {
+    emit currentUserChanged();
+    if (!self || generation != self->m_generation) {
+      return false; // superseded while currentUserChanged() was delivered
+    }
+  }
+  return true;
+}
+
 bool SessionCoordinator::clearCurrentUserAndSetStateIfCurrent(
     quint64 generation, State state, QString diagnostic) {
   if (generation != m_generation) {
     return false;
   }
+  // Assign the complete new (state, cleared-identity) snapshot together,
+  // BEFORE either signal is emitted: see publishClearedUserState()'s
+  // contract. This is what makes a synchronously-completing ITokenStore
+  // (see signOut()'s deletion path) safe -- a reentrant handler observing
+  // either emission below sees the target state (e.g. SignedOut) and the
+  // cleared identity together, never a stale SignedIn alongside an
+  // already-cleared identity.
+  const bool hadUser = m_currentUser.has_value();
+  m_currentUser.reset();
+  m_state = state;
+  m_diagnostic = std::move(diagnostic);
   QPointer<SessionCoordinator> self(this);
-  clearCurrentUser();
-  if (!self || generation != self->m_generation) {
-    return false; // superseded while currentUserChanged() was delivered
-  }
-  self->setState(state, std::move(diagnostic));
-  return !self.isNull() && generation == self->m_generation;
+  return publishClearedUserState(self, generation, hadUser);
 }
 
 bool SessionCoordinator::applyCurrentUserAndSetStateIfCurrent(
@@ -1068,12 +1103,18 @@ bool SessionCoordinator::applyCurrentUserAndSetStateIfCurrent(
   if (generation != m_generation) {
     return false;
   }
+  // Assign the complete new (state, identity) snapshot together, BEFORE
+  // either signal is emitted, for the same coherence reason as
+  // clearCurrentUserAndSetStateIfCurrent() above.
+  m_currentUser = user;
+  m_state = state;
+  m_diagnostic.clear();
   QPointer<SessionCoordinator> self(this);
-  applyCurrentUser(user);
+  emit stateChanged();
   if (!self || generation != self->m_generation) {
-    return false; // superseded while currentUserChanged() was delivered
+    return false; // superseded while stateChanged() was being delivered
   }
-  self->setState(state);
+  emit currentUserChanged();
   return !self.isNull() && generation == self->m_generation;
 }
 
