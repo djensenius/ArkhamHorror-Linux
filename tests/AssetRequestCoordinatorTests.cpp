@@ -153,8 +153,17 @@ void AssetRequestCoordinatorTests::
   AssetKey keyB = keyA;
   // Embeds the historical separator character plus digits chosen to look
   // like a plausible (but different) trailing field, exercising exactly
-  // the collision shape the finding describes.
-  keyB.locale = QStringLiteral("de\x1f2");
+  // the collision shape the finding describes. The literal is split into
+  // two adjacent string-literal pieces ("...\x1f" followed by "2")
+  // rather than written as a single "...\x1f2" literal: `\x` hex escapes
+  // are variable-width and greedily consume ALL following hex digits, so
+  // a single literal would parse "\x1f2" as one code unit (hex 0x1F2)
+  // instead of the intended separator (0x1F) immediately followed by the
+  // literal digit '2'. Adjacent string literals are concatenated only
+  // AFTER each literal's own escape sequences are fully resolved, so
+  // splitting at the literal boundary is what actually produces the
+  // separator+digit shape this test is trying to exercise.
+  keyB.locale = QStringLiteral("de\x1f") + QStringLiteral("2");
 
   QVERIFY(!(keyA == keyB));
 
