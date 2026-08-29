@@ -626,6 +626,7 @@ private slots:
   directSelectedProfileChangedReentrancySignOutCannotDeleteWrongProfileDuringSwitch();
   void
   directCurrentUserChangedReentrancyDuringSwitchSignsOutOldProfileNotNewProfile();
+  void coordinatorDestructionDuringRequiredDeleteFailureStateChangedIsSafe();
 
   // Secret-free diagnostics
   void diagnosticsAndStateNeverContainSecrets();
@@ -2590,6 +2591,53 @@ void SessionCoordinatorTests::
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
   }));
   QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+}
+
+void SessionCoordinatorTests::
+    coordinatorDestructionDuringRequiredDeleteFailureStateChangedIsSafe() {
+  // Exact regression from review: on a required-delete failure, the
+  // central FIFO dispatcher copies the head op's onComplete callback,
+  // then calls setState(SecureStorageUnavailable, ...) (a synchronous
+  // stateChanged() emission), then invokes the copied callback. A
+  // directly-connected stateChanged() handler observing that transition
+  // can destroy the coordinator entirely; the dispatcher must re-check
+  // `self` after setState() and never dereference the (now invalidated)
+  // token-queue iterator or `self` itself again -- only the
+  // already-copied callback value, and only if `self` is still alive.
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::stateChanged,
+      h.coordinator.get(),
+      [&h, &handled] {
+        if (handled ||
+            h.coordinator->state() !=
+                SessionCoordinator::State::SecureStorageUnavailable) {
+          return;
+        }
+        handled = true;
+        // Destroy the coordinator from inside the very stateChanged()
+        // emission that the deleteFailed branch triggers. This must not
+        // crash/UB even though the dispatcher still has an iterator into
+        // (and a raw `self`/`this` pointer to) the coordinator being
+        // destroyed.
+        h.coordinator.reset();
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->signOut();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, backendErrorResult());
+  QVERIFY(pumpEventsUntil([&handled] { return handled; }));
+
+  QVERIFY(handled);
+  QVERIFY(h.coordinator == nullptr);
+  // Reaching this line at all (no crash/UB from dereferencing an iterator
+  // into a destroyed coordinator's token-queue map) is the assertion.
 }
 
 // ─── Secret-free diagnostics ──────────────────────────────────────────────

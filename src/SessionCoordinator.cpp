@@ -876,6 +876,15 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
               : result.diagnostic;
       self->m_profileFifoStalled.insert(profileId, stallDiagnostic);
 
+      // Copy the head op's continuation BEFORE any signal emission below:
+      // setState() emits stateChanged() synchronously, and a directly-
+      // connected handler could destroy this coordinator entirely, which
+      // would invalidate `self->m_tokenQueues` (and therefore `it`, an
+      // iterator into it) out from under us. Everything this branch still
+      // needs from the queue is captured here, up front, while `self` and
+      // `it` are both still known-good.
+      const ITokenStore::ResultCallback onComplete = it->head().onComplete;
+
       // Retryability for a required delete must derive from this durable
       // per-profile FIFO/stalled state, not from whatever UI generation
       // originally enqueued the op: an op's onComplete continuation below
@@ -903,11 +912,18 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
         self->setState(State::SecureStorageUnavailable, stallDiagnostic);
       }
 
+      // setState() above may have reentrantly destroyed the coordinator
+      // (or superseded this profile in some other way); re-check `self`
+      // before touching it any further. `onComplete` was already safely
+      // copied above and does not depend on `self`/`it` remaining valid.
+      if (!self) {
+        return;
+      }
+
       // The original per-call onComplete may still react to this failure
       // for its own generation-gated purposes (e.g. identity handling);
       // it must never be relied upon as the sole source of truth for
       // whether a retry action exists (see above).
-      const ITokenStore::ResultCallback &onComplete = it->head().onComplete;
       if (onComplete) {
         onComplete(result);
       }
