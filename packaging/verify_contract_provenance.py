@@ -371,6 +371,21 @@ def verify(
                 f"(st_mode={oct(local_stat.st_mode)})"
             )
             continue
+        # _EXPECTED_BLOB_MODE ("100644") is a plain, non-executable blob;
+        # the backend mode/type check above only inspects the pinned git
+        # tree, so a locally-chmod'd +x contracts/*.json would otherwise
+        # slip through byte-identical even though it no longer matches the
+        # "mode/type-identical to the backend" guarantee this script
+        # advertises. Reject any of the local owner/group/other execute
+        # bits explicitly.
+        if local_stat.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            failures.append(
+                f"{relative_path}: vendored file is locally executable "
+                f"(st_mode={oct(stat.S_IMODE(local_stat.st_mode))}), but the "
+                f"pinned backend blob is a non-executable "
+                f"{_EXPECTED_BLOB_MODE} file"
+            )
+            continue
 
         local_bytes = local_path.read_bytes()
         if local_bytes != backend_bytes:

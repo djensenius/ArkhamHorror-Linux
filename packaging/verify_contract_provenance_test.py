@@ -169,6 +169,21 @@ class VerifyTests(unittest.TestCase):
         failures = vcp.verify(tree, self._scratch)
         self.assertTrue(any("expected a plain non-executable blob" in f for f in failures))
 
+    def test_locally_executable_file_rejected_even_if_bytes_match(self):
+        # Byte-identical is not enough: the backend blob is a plain
+        # non-executable 100644 file, so a locally-chmod'd +x copy must be
+        # rejected even though verify() never inspected the local mode bit
+        # via git (there is no local git object -- only a real filesystem
+        # file whose st_mode must be checked directly).
+        tree = FakeTree(_baseline_blobs())
+        target = self._scratch / "contracts/fixtures/catalog.json"
+        target.chmod(0o755)
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(
+            any("locally executable" in f for f in failures),
+            f"expected a locally-executable failure, got: {failures}",
+        )
+
     def test_added_unregistered_governed_file_detected(self):
         tree = FakeTree(_baseline_blobs())
         extra = self._scratch / "contracts/schemas/mystery.schema.json"

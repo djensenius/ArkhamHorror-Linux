@@ -82,23 +82,34 @@ ValueOrError<qint64> requireIntValue(const QJsonValue &v, QStringView path) {
     return failure(
         QStringLiteral("%1: expected integer, got non-integral number")
             .arg(path));
-  // 2^63 is exactly representable as a double (unlike 2^63-1, qint64's
-  // actual max, which rounds up to 2^63) -- comparing against that exact
-  // boundary, rather than a cast of qint64::max()/min() through double,
-  // avoids the classic off-by-one this class of range check is prone to.
-  constexpr double kInt64MinExact = -9223372036854775808.0;     // -2^63, exact
-  constexpr double kInt64MaxBoundExact = 9223372036854775808.0; // 2^63, exact
-  if (d < kInt64MinExact || d >= kInt64MaxBoundExact)
+  // Deliberately NOT range-checked by comparing `d` against a qint64
+  // boundary: `d` is a double approximation of whatever this QJsonValue's
+  // underlying storage actually is, and for a value at/near the qint64
+  // boundary that approximation can itself already be wrong. Concretely,
+  // qint64::max() (9223372036854775807) is not exactly representable as a
+  // double and rounds UP to 2^63 -- so a naive `d >= 2^63` check rejects a
+  // perfectly valid boundary value.
+  //
+  // QJsonValue::toInteger() is documented to read the value's underlying
+  // storage directly and return the *exact* qint64 when the value fits
+  // (this holds both for a QJsonValue built via the qint64 constructor --
+  // see RawJson.h's Value::toQJson() -- and for one parsed by Qt's own
+  // QJsonDocument::fromJson() from a bare integer literal), and to return
+  // the default value (0) when it does not fit. Re-widening that result
+  // back to double and comparing against `d` -- rather than trusting the
+  // sentinel 0 outright, which could theoretically collide with a
+  // genuine zero -- distinguishes "exact value recovered" from "value
+  // didn't fit": a faithfully-recovered integer always re-widens to the
+  // same double Qt already computed for `d` (by the same round-to-nearest
+  // rule both conversions follow), while the out-of-range sentinel does
+  // not (unless `d` is genuinely 0, which trivially matches).
+  const qint64 candidate = v.toInteger();
+  if (static_cast<double>(candidate) != d)
     return failure(
         QStringLiteral("%1: integer %2 is out of range for a 64-bit integer")
             .arg(path)
             .arg(d, 0, 'f', 0));
-  // v.toInteger() reads Qt's underlying QCborValue-backed storage exactly
-  // when this QJsonValue was constructed via the qint64 overload (see
-  // RawJson.h's Value::toQJson()); for a value built directly from a
-  // double it returns the nearest exact integer to that double, which is
-  // the most fidelity such a value could ever carry.
-  return v.toInteger();
+  return candidate;
 }
 
 ValueOrError<bool> requireBoolValue(const QJsonValue &v, QStringView path) {

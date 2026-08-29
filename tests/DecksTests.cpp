@@ -60,6 +60,12 @@ private slots:
   void normalizedQuantityMapRequiresCardCodeKeys();
   void normalizedQuantityMapRejectsMalformedCardCodeKey();
 
+  // Json::requireIntValue qint64 boundary (used by quantity/taboo_id
+  // decoding) ────────────────────────────────────────────────────────────
+  void requireIntValueAcceptsExactInt64Max();
+  void requireIntValueAcceptsExactInt64Min();
+  void requireIntValueRejectsOneBeyondInt64Max();
+
   // Nullable metadata/url/taboo fields ────────────────────────────────────────
   void nullableFieldsRoundTripAsExplicitNull();
   void normalizedDeckListMissingRequiredKeyRejected();
@@ -706,6 +712,43 @@ void DecksTests::normalizedQuantityMapRejectsMalformedCardCodeKey() {
   const auto result = DeckList::fromJson(obj, u"deckList");
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("slots")),
+           qPrintable(result.error()));
+}
+
+void DecksTests::requireIntValueAcceptsExactInt64Max() {
+  // qint64::max() (2^63-1) is not exactly representable as a double and
+  // rounds UP to 2^63 -- a naive `toDouble() >= 2^63` boundary check
+  // incorrectly rejects this value. QJsonValue(qint64) is the same
+  // constructor RawJson::Value::toQJson() uses for contract-domain
+  // integers, so this exercises the exact storage path production code
+  // relies on.
+  constexpr qint64 kMax = std::numeric_limits<qint64>::max();
+  const QJsonValue v(kMax);
+  const auto result = Json::requireIntValue(v, u"x");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(*result, kMax);
+}
+
+void DecksTests::requireIntValueAcceptsExactInt64Min() {
+  constexpr qint64 kMin = std::numeric_limits<qint64>::min();
+  const QJsonValue v(kMin);
+  const auto result = Json::requireIntValue(v, u"x");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(*result, kMin);
+}
+
+void DecksTests::requireIntValueRejectsOneBeyondInt64Max() {
+  // 2^63 itself (one past qint64::max()) must still be rejected as
+  // out-of-range -- the fix for the INT64_MAX false-rejection must not
+  // regress into accepting genuinely out-of-range values instead.
+  const auto doc =
+      QJsonDocument::fromJson(QByteArrayLiteral("{\"x\":9223372036854775808}"));
+  const auto result =
+      Json::requireIntValue(doc.object().value(QStringLiteral("x")), u"x");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("out of range")),
            qPrintable(result.error()));
 }
 

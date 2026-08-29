@@ -1,5 +1,7 @@
 #include <QtTest>
 
+#include <limits>
+
 #include "RawJson.h"
 
 using Arkham::Failure;
