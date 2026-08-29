@@ -405,14 +405,22 @@ void AssetNetworkFetcher::handleFinished(quint64 handle) {
     return;
   }
 
-  // Drain any final buffered bytes not yet delivered via readyRead.
-  pendingCopy.buffer.append(reply->readAll());
-  if (pendingCopy.buffer.size() > m_limits.maxEncodedBytes) {
+  // Drain any final buffered bytes not yet delivered via readyRead, using
+  // the same bounded-read-plus-one-overflow-byte technique as
+  // handleReadyRead(): calling readAll() unconditionally and checking the
+  // size afterward would let pendingCopy.buffer briefly grow past
+  // m_limits.maxEncodedBytes before this check runs, contradicting the
+  // "buffer never exceeds the cap" hard bound the class comment promises.
+  const qint64 remainingBudget =
+      m_limits.maxEncodedBytes - pendingCopy.buffer.size();
+  const QByteArray tail = reply->read(remainingBudget + 1);
+  if (tail.size() > remainingBudget) {
     emitResult(AssetError{AssetErrorCode::ResponseTooLarge,
                           QStringLiteral("response body exceeded the "
                                          "configured encoded-size limit")});
     return;
   }
+  pendingCopy.buffer.append(tail);
 
   const QByteArray &body = pendingCopy.buffer;
 

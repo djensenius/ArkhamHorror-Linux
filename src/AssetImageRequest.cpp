@@ -81,8 +81,15 @@ void AssetImageRequest::load(const AssetKey &key,
   setStatus(Status::Loading);
   m_progress = 0.0;
   emit progressChanged();
-  m_errorString.clear();
-  m_errorCode = 0;
+  // Clearing the error state is itself a state change QML bindings to
+  // errorString()/errorCode() must observe: without emitting
+  // errorChanged() here, a binding would keep showing the previous
+  // load()'s error message throughout the new Loading phase.
+  if (!m_errorString.isEmpty() || m_errorCode != 0) {
+    m_errorString.clear();
+    m_errorCode = 0;
+    emit errorChanged();
+  }
   // Clear any previously-loaded image immediately: otherwise a caller
   // that reuses one AssetImageRequest across two different keys (e.g. a
   // QML Image binding that switches source identifiers) would keep

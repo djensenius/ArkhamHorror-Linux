@@ -23,6 +23,7 @@ private slots:
   void notFoundMapsToNotFoundError();
   void serverErrorMapsToUnexpectedStatus();
   void incrementalByteCapAbortsBeforeFullBodyArrives();
+  void finalDrainNeverExceedsByteCapForAFastNonIncrementalResponse();
   void contentTypeMismatchIsRejected();
   void magicBytesMismatchIsRejected();
   void dimensionBombIsRejected();

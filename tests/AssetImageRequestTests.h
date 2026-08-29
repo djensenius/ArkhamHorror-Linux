@@ -30,6 +30,7 @@ private slots:
   void destructionMidFlightNeverEmitsAfterDestruction();
   void destructionImmediatelyAfterImmediateCompletionNeverCrashes();
   void reloadingWithNewKeyClearsPreviousImageDuringLoading();
+  void reloadingAfterErrorEmitsErrorChangedWhenClearingStaleError();
 
 private:
   QString m_tempDirPath;

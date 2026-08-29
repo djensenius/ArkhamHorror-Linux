@@ -181,6 +181,44 @@ void AssetNetworkFetcherTests::incrementalByteCapAbortsBeforeFullBodyArrives() {
                           .arg(response.body.size())));
 }
 
+void AssetNetworkFetcherTests::
+    finalDrainNeverExceedsByteCapForAFastNonIncrementalResponse() {
+  // incrementalByteCapAbortsBeforeFullBodyArrives() above exercises the
+  // readyRead-time abort path (a slow-drip body far larger than the cap,
+  // caught mid-stream). This test targets the OTHER place the cap must
+  // be enforced: handleFinished()'s drain of any bytes Qt already
+  // buffered but never delivered via a readyRead signal before the
+  // connection finished. A body sent all at once (no artificial delay),
+  // only modestly larger than the cap, is the shape most likely to
+  // arrive as a single burst with little or no intervening readyRead --
+  // exactly the case the drain step alone must catch. The drain must
+  // read with the same bounded "remaining budget plus one overflow byte"
+  // technique as handleReadyRead(), never QNetworkReply::readAll(), so
+  // the buffer can never transiently hold more than maxEncodedBytes + 1
+  // bytes while still correctly surfacing ResponseTooLarge.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  QByteArray body(4096 + 64, Qt::Uninitialized);
+  for (int i = 0; i < body.size(); ++i) {
+    body[i] = static_cast<char>((i * 2654435761u) & 0xFF);
+  }
+  response.body = body;
+  server.setResponse(QStringLiteral("/tail-overflow.png"), response);
+
+  AssetNetworkFetcher::Limits limits;
+  limits.maxEncodedBytes = 4096;
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam, limits);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/tail-overflow.png")),
+      AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::ResponseTooLarge);
+}
+
 void AssetNetworkFetcherTests::contentTypeMismatchIsRejected() {
   MockHttpServer server;
   MockHttpServer::Response response;

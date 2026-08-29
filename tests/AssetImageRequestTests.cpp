@@ -297,3 +297,51 @@ void AssetImageRequestTests::
       5000));
   QVERIFY(!request.image().isNull());
 }
+
+void AssetImageRequestTests::
+    reloadingAfterErrorEmitsErrorChangedWhenClearingStaleError() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(16, 16);
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  AssetImageRequest request(coordinator);
+
+  // First load fails synchronously (before any network I/O): "UPPER01"
+  // fails AssetLocator's identifier grammar, exercising the
+  // InvalidIdentifier -> Error path and populating errorString/errorCode.
+  request.load(
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
+              QStringLiteral("UPPER01")));
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Error; },
+      5000));
+  QVERIFY(!request.errorString().isEmpty());
+  QVERIFY(request.errorCode() != 0);
+
+  QSignalSpy errorSpy(&request, &AssetImageRequest::errorChanged);
+
+  // Second load reuses the same object with a valid identifier. Clearing
+  // the stale error state at the start of load() must itself emit
+  // errorChanged() -- a QML binding to errorString()/errorCode() must
+  // never keep showing the first load's error throughout the second
+  // load's Loading phase.
+  request.load(
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))));
+  QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
+  QVERIFY(request.errorString().isEmpty());
+  QCOMPARE(request.errorCode(), 0);
+  QVERIFY(errorSpy.count() >= 1);
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Ready; },
+      5000));
+  QVERIFY(!request.image().isNull());
+}
