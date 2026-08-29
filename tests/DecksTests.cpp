@@ -1,9 +1,13 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QtTest>
+#include <array>
+#include <cmath>
+#include <limits>
 
 #include "Decks.h"
 #include "JsonDecode.h"
+#include "RawJson.h"
 
 using namespace Arkham;
 using namespace Qt::StringLiterals;
@@ -30,6 +34,16 @@ private slots:
   void externalIdDecimalPreserved();
   void externalIdWrongTypeRejected();
 
+  // ExternalDeckId via the raw-byte parser: genuine precision preservation
+  // (HIGH #3) -- no double-rounding at all, unlike the QJsonValue-based
+  // fromJson()/fromObject() path above, which can only preserve whatever
+  // precision Qt's own parser already left intact.
+  void externalIdFromRawBytesPreservesLargeIntegerExactly();
+  void externalIdFromRawBytesPreservesLongDecimalExactly();
+  void externalIdFromRawBytesPreservesHugeExponentExactly();
+  void externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly();
+  void createDeckRequestFromRawBytesPreservesEveryIdVariantExactly();
+
   // sideSlots malformed/absent behavior ──────────────────────────────────────
   void sideSlotsAbsentStaysUndefinedNotEmptyMap();
   void sideSlotsMalformedArrayPreservedVerbatim();
@@ -48,9 +62,13 @@ private slots:
   // DeckValidationError / empty success ─────────────────────────────────────
   void unimplementedCardTagRequired();
   void emptyArrayIsValidationSuccess();
+  void deckValidationResultErrorsFactoryRejectsEmptyList();
+  void deckValidationResultSuccessAndErrorsAreDistinctKinds();
 
   // scientificShow (backend Aeson Scientific Show semantics) ────────────────
   void scientificShowMatchesKnownBackendFormatting();
+  void scientificShowRejectsNonFiniteRatherThanCrashing();
+  void externalIdOverflowingToInfinityRejectedNotCrashed();
 
   // Wrong types / malformed ──────────────────────────────────────────────────
   void wrongTypeForInvestigatorCodeRejected();
@@ -98,7 +116,13 @@ void DecksTests::decodesCreateDeckRequestFromFixture() {
   QCOMPARE(result->deckList.cardSlots.value(QStringLiteral("01016")), 2);
   QCOMPARE(result->deckList.investigatorCode.value(), QStringLiteral("01001"));
   QCOMPARE(result->deckList.id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->deckList.id.number, 4242.0);
+  // Decoded via fromJson(), so Qt's own QJsonDocument::fromJson() has
+  // already rounded the fixture's literal "id": 4242 through a double
+  // before this type ever saw it -- numberLiteral is the best-effort
+  // reconstruction of that (already-lossy) double; see
+  // decodesCreateDeckRequestFromFixtureBytesPreservesExactIdPrecision()
+  // below for the genuinely lossless entry point.
+  QCOMPARE(result->deckList.id.numberLiteral, QStringLiteral("4242.0"));
   // sideSlots is `[]` on the wire -- a malformed/legacy shape, preserved
   // verbatim rather than coerced into an already-normalized empty map.
   QVERIFY(result->deckList.sideSlots.isArray());
@@ -137,7 +161,7 @@ void DecksTests::decodesValidateDeckListInputFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.number, 4242.0);
+  QCOMPARE(result->id.numberLiteral, QStringLiteral("4242.0"));
   // "externalField" is present in the fixture but not modeled -- must decode
   // safely and never reappear on re-encode. "taboo_id" is present as an
   // explicit JSON null in the fixture; DeckListInput collapses absent/null
@@ -187,22 +211,27 @@ void DecksTests::decodesDeckFromFixture() {
 void DecksTests::decodesValidationErrorsFromFixture() {
   const QJsonObject fixture = decksFixture();
   const QJsonValue v = fixture.value("validationErrors"_L1);
-  const auto result = decodeDeckValidationResult(v, u"validationErrors");
+  const auto result = DeckValidationResult::fromJson(v, u"validationErrors");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->size(), 1);
-  QCOMPARE(result->at(0).cardCode.value(), QStringLiteral("c99999"));
-  QCOMPARE(encodeDeckValidationResult(*result), v.toArray());
+  QCOMPARE(result->kind(), DeckValidationResult::Kind::Errors);
+  QVERIFY(!result->isSuccess());
+  QCOMPARE(result->errorList().size(), 1);
+  QCOMPARE(result->errorList().at(0).cardCode.value(),
+           QStringLiteral("c99999"));
+  QCOMPARE(result->toJson(), v.toArray());
 }
 
 void DecksTests::decodesValidationSuccessFromFixture() {
   const QJsonObject fixture = decksFixture();
   const QJsonValue v = fixture.value("validationSuccess"_L1);
-  const auto result = decodeDeckValidationResult(v, u"validationSuccess");
+  const auto result = DeckValidationResult::fromJson(v, u"validationSuccess");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QVERIFY(result->isEmpty());
-  QCOMPARE(encodeDeckValidationResult(*result), v.toArray());
+  QCOMPARE(result->kind(), DeckValidationResult::Kind::Success);
+  QVERIFY(result->isSuccess());
+  QVERIFY(result->errorList().isEmpty());
+  QCOMPARE(result->toJson(), v.toArray());
 }
 
 void DecksTests::decodesOperationErrorFromFixture() {
@@ -261,7 +290,10 @@ void DecksTests::externalIdLargeIntegerPreservedWithoutPrecisionLoss() {
   // (Qt's JSON storage) -- this proves the client preserves whatever value
   // Qt's parser itself already gave it (no *additional* client-side
   // precision loss on top of what Qt's JSON layer already does), rather
-  // than rounding again via e.g. an intermediate int64 conversion.
+  // than rounding again via e.g. an intermediate int64 conversion. This
+  // exercises fromJson() specifically -- see
+  // externalIdFromRawBytesPreservesLargeIntegerExactly() below for the
+  // entry point that avoids the double-rounding altogether.
   const double large = 9007199254740992.0; // 2^53, exactly representable.
   const QJsonObject obj{
       {QStringLiteral("slots"), QJsonObject{}},
@@ -272,7 +304,7 @@ void DecksTests::externalIdLargeIntegerPreservedWithoutPrecisionLoss() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.number, large);
+  QCOMPARE(result->id.numberLiteral, *Json::scientificShow(large, u"test"));
   QCOMPARE(result->toJson().value(QStringLiteral("id")).toDouble(), large);
 }
 
@@ -286,7 +318,7 @@ void DecksTests::externalIdDecimalPreserved() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.number, 42.5);
+  QCOMPARE(result->id.numberLiteral, *Json::scientificShow(42.5, u"test"));
   QCOMPARE(result->toJson().value(QStringLiteral("id")).toDouble(), 42.5);
 }
 
@@ -300,6 +332,106 @@ void DecksTests::externalIdWrongTypeRejected() {
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("id")),
            qPrintable(result.error()));
+}
+
+void DecksTests::externalIdFromRawBytesPreservesLargeIntegerExactly() {
+  // 9007199254740993 == 2^53 + 1, the smallest positive integer a double
+  // cannot represent exactly -- ArkhamDB is known to hand out deck ids in
+  // this range. fromJson()/fromObject() cannot recover this precision
+  // (QJsonDocument has already rounded it through a double by the time
+  // either sees it); fromRawBytes() parses the original bytes through the
+  // canonical RawJson parser (see RawJson.h) instead, so the literal
+  // survives untouched. The literal bytes below are parsed directly --
+  // never constructed via a double -- per the issue's requirement that
+  // these tests prove genuine byte-level fidelity.
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001","id":9007199254740993})",
+      u"deckList");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
+  QCOMPARE(result->id.numberLiteral, QStringLiteral("9007199254740993"));
+}
+
+void DecksTests::externalIdFromRawBytesPreservesLongDecimalExactly() {
+  const auto result =
+      DeckListInput::fromRawBytes(R"({"slots":{},"investigator_code":"01001",)"
+                                  R"("id":1.123456789012345678901234567890})",
+                                  u"deckList");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
+  QCOMPARE(result->id.numberLiteral,
+           QStringLiteral("1.123456789012345678901234567890"));
+}
+
+void DecksTests::externalIdFromRawBytesPreservesHugeExponentExactly() {
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001","id":1e128})", u"deckList");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
+  QCOMPARE(result->id.numberLiteral, QStringLiteral("1e128"));
+}
+
+void DecksTests::externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly() {
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001","id":9007199254740993})",
+      u"deckList");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  const QByteArray reencoded = result->toJsonBytes();
+  // Byte-level splice must have written the exact literal, not a
+  // double-rounded approximation -- re-parsing it through the same
+  // canonical parser must recover the identical literal.
+  auto reparsed = Json::Value::parse(reencoded, u"reencoded");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QVERIFY(reparsed->isObject());
+  QVERIFY(reparsed->value("id"_L1).isNumber());
+  QCOMPARE(reparsed->value("id"_L1).toRawNumber().literal(),
+           QStringLiteral("9007199254740993"));
+}
+
+void DecksTests::createDeckRequestFromRawBytesPreservesEveryIdVariantExactly() {
+  struct Case {
+    QByteArray bytes;
+    ExternalDeckIdTag tag;
+    QString expectedNumberLiteral;
+    QString expectedText;
+  };
+  const std::array<Case, 4> cases{
+      Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
+           R"("investigator_code":"01001","id":9007199254740993}})",
+           ExternalDeckIdTag::Number,
+           QStringLiteral("9007199254740993"),
+           {}},
+      Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
+           R"("investigator_code":"01001","id":42.5}})",
+           ExternalDeckIdTag::Number,
+           QStringLiteral("42.5"),
+           {}},
+      Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
+           R"("investigator_code":"01001","id":"external-9999"}})",
+           ExternalDeckIdTag::Text,
+           {},
+           QStringLiteral("external-9999")},
+      Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
+           R"("investigator_code":"01001","id":null}})",
+           ExternalDeckIdTag::Null,
+           {},
+           {}},
+  };
+  for (const Case &c : cases) {
+    const auto result = CreateDeckRequest::fromRawBytes(c.bytes, u"createDeck");
+    if (!result)
+      QFAIL(qPrintable(result.error()));
+    QCOMPARE(result->deckList.id.tag, c.tag);
+    if (c.tag == ExternalDeckIdTag::Number)
+      QCOMPARE(result->deckList.id.numberLiteral, c.expectedNumberLiteral);
+    if (c.tag == ExternalDeckIdTag::Text)
+      QCOMPARE(result->deckList.id.text, c.expectedText);
+  }
 }
 
 void DecksTests::sideSlotsAbsentStaysUndefinedNotEmptyMap() {
@@ -460,20 +592,76 @@ void DecksTests::unimplementedCardTagRequired() {
 
 void DecksTests::emptyArrayIsValidationSuccess() {
   const auto result =
-      decodeDeckValidationResult(QJsonArray{}, u"validationResult");
+      DeckValidationResult::fromJson(QJsonArray{}, u"validationResult");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QVERIFY(result->isEmpty());
+  QVERIFY(result->isSuccess());
+  QVERIFY(result->errorList().isEmpty());
+}
+
+void DecksTests::deckValidationResultErrorsFactoryRejectsEmptyList() {
+  // deckValidationErrors requires minItems:1 -- an empty list is not a
+  // valid alternate spelling of success at the type level, so the
+  // errors() factory itself must refuse to construct one.
+  const auto result = DeckValidationResult::errors({});
+  QVERIFY(!result.has_value());
+}
+
+void DecksTests::deckValidationResultSuccessAndErrorsAreDistinctKinds() {
+  const auto success = DeckValidationResult::success();
+  const auto errorsResult = DeckValidationResult::errors(
+      {DeckValidationError{.cardCode = *CardCode::parse(u"c99999"_s)}});
+  if (!errorsResult)
+    QFAIL(qPrintable(errorsResult.error()));
+  QVERIFY(success != *errorsResult);
+  QCOMPARE(success.toJson(), QJsonArray{});
+  QCOMPARE(errorsResult->toJson(),
+           (QJsonArray{QJsonObject{
+               {QStringLiteral("tag"), QStringLiteral("UnimplementedCard")},
+               {QStringLiteral("contents"), QStringLiteral("c99999")}}}));
 }
 
 void DecksTests::scientificShowMatchesKnownBackendFormatting() {
   // Matches Data.Scientific's Show instance: fixed-point with a mandatory
   // ".0" for 0.1 <= |x| < 1e7, scientific notation otherwise.
-  QCOMPARE(Json::scientificShow(4242.0), QStringLiteral("4242.0"));
-  QCOMPARE(Json::scientificShow(0.0), QStringLiteral("0.0"));
-  QCOMPARE(Json::scientificShow(42.5), QStringLiteral("42.5"));
-  QCOMPARE(Json::scientificShow(-4242.0), QStringLiteral("-4242.0"));
-  QCOMPARE(Json::scientificShow(1.0e7), QStringLiteral("1.0e7"));
+  QCOMPARE(*Json::scientificShow(4242.0, u"test"), QStringLiteral("4242.0"));
+  QCOMPARE(*Json::scientificShow(0.0, u"test"), QStringLiteral("0.0"));
+  QCOMPARE(*Json::scientificShow(42.5, u"test"), QStringLiteral("42.5"));
+  QCOMPARE(*Json::scientificShow(-4242.0, u"test"), QStringLiteral("-4242.0"));
+  QCOMPARE(*Json::scientificShow(1.0e7, u"test"), QStringLiteral("1.0e7"));
+}
+
+void DecksTests::scientificShowRejectsNonFiniteRatherThanCrashing() {
+  // A syntactically valid JSON number can overflow to +/-Infinity once
+  // Qt's JSON parser has already narrowed it to a double (e.g. the huge
+  // exponent "1e400" would); scientificShow() must reject this explicitly
+  // rather than asserting/crashing on std::to_chars's non-scientific
+  // "inf"/"nan" textual output, which has no exponent to extract.
+  const double huge = 1.0e308 * 10.0; // overflows to +Infinity.
+  QVERIFY(std::isinf(huge));
+  const auto result = Json::scientificShow(huge, u"deckList.id");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("deckList.id")));
+
+  const auto negResult = Json::scientificShow(-huge, u"deckList.id");
+  QVERIFY(!negResult.has_value());
+
+  const auto nanResult = Json::scientificShow(
+      std::numeric_limits<double>::quiet_NaN(), u"deckList.id");
+  QVERIFY(!nanResult.has_value());
+}
+
+void DecksTests::externalIdOverflowingToInfinityRejectedNotCrashed() {
+  // A deck id with an astronomically large exponent is syntactically a
+  // valid JSON number but overflows to +Infinity once parsed as a double;
+  // this must be a clean decode failure, never a crash.
+  const QJsonObject obj{
+      {QStringLiteral("slots"), QJsonObject{}},
+      {QStringLiteral("investigator_code"), QStringLiteral("01001")},
+      {QStringLiteral("id"), 1.0e308 * 10.0},
+  };
+  const auto result = DeckListInput::fromJson(obj, u"deckList");
+  QVERIFY(!result.has_value());
 }
 
 void DecksTests::wrongTypeForInvestigatorCodeRejected() {

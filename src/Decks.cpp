@@ -3,6 +3,7 @@
 #include "JsonDecode.h"
 
 #include <QJsonArray>
+#include <QJsonDocument>
 
 using namespace Qt::StringLiterals;
 
@@ -84,11 +85,35 @@ ValueOrError<ExternalDeckId> ExternalDeckId::fromObject(const QJsonObject &obj,
   const QString idPath = Json::joinPath(path, u"id");
   if (v.isString())
     return ExternalDeckId{.tag = ExternalDeckIdTag::Text, .text = v.toString()};
-  if (v.isDouble())
+  if (v.isDouble()) {
+    auto literal = Json::scientificShow(v.toDouble(), idPath);
+    if (!literal)
+      return failure(literal.error());
     return ExternalDeckId{.tag = ExternalDeckIdTag::Number,
-                          .number = v.toDouble()};
+                          .numberLiteral = *literal};
+  }
   return failure(QStringLiteral("%1: expected string, number, or null, got %2")
                      .arg(idPath, Json::typeName(v)));
+}
+
+ValueOrError<ExternalDeckId>
+ExternalDeckId::fromRawObject(const Json::Value &obj, QStringView path) {
+  if (!obj.isObject())
+    return failure(QStringLiteral("%1: expected an object, got %2")
+                       .arg(path, Json::typeName(obj.toQJson())));
+  if (!obj.contains("id"_L1))
+    return ExternalDeckId{.tag = ExternalDeckIdTag::Absent};
+  const Json::Value v = obj.value("id"_L1);
+  const QString idPath = Json::joinPath(path, u"id");
+  if (v.isNull())
+    return ExternalDeckId{.tag = ExternalDeckIdTag::Null};
+  if (v.isString())
+    return ExternalDeckId{.tag = ExternalDeckIdTag::Text, .text = v.toString()};
+  if (v.isNumber())
+    return ExternalDeckId{.tag = ExternalDeckIdTag::Number,
+                          .numberLiteral = v.toRawNumber().literal()};
+  return failure(QStringLiteral("%1: expected string, number, or null, got %2")
+                     .arg(idPath, Json::typeName(v.toQJson())));
 }
 
 QJsonValue ExternalDeckId::toJson() const {
@@ -100,7 +125,7 @@ QJsonValue ExternalDeckId::toJson() const {
   case ExternalDeckIdTag::Text:
     return QJsonValue(text);
   case ExternalDeckIdTag::Number:
-    return QJsonValue(number);
+    return QJsonValue(numberLiteral.toDouble());
   }
   Q_UNREACHABLE_RETURN(QJsonValue());
 }
@@ -159,6 +184,22 @@ ValueOrError<DeckListInput> DeckListInput::fromJson(const QJsonValue &v,
   };
 }
 
+ValueOrError<DeckListInput> DeckListInput::fromRawBytes(QByteArrayView bytes,
+                                                        QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  auto decoded = fromJson(raw->toQJson(), path);
+  if (!decoded)
+    return failure(decoded.error());
+  if (raw->isObject()) {
+    const Json::Value idValue = raw->value("id"_L1);
+    if (idValue.isNumber())
+      decoded->id.numberLiteral = idValue.toRawNumber().literal();
+  }
+  return *decoded;
+}
+
 QJsonObject DeckListInput::toJson() const {
   QJsonObject obj;
   obj.insert(QStringLiteral("slots"), encodeCardQuantityMapInput(cardSlots));
@@ -179,6 +220,17 @@ QJsonObject DeckListInput::toJson() const {
   if (name)
     obj.insert(QStringLiteral("name"), *name);
   return obj;
+}
+
+QByteArray DeckListInput::toJsonBytes() const {
+  QJsonObject obj = toJson();
+  if (id.tag != ExternalDeckIdTag::Number)
+    return QJsonDocument(obj).toJson(QJsonDocument::Compact);
+  // toJson() above already inserted a lossy double-based "id"; replace it
+  // with the exact literal via byte-level splicing (see
+  // ExternalDeckId::numberLiteral's doc comment).
+  obj.remove(QStringLiteral("id"));
+  return Json::spliceRawJsonMember(obj, "id"_L1, id.toJsonLiteral().toUtf8());
 }
 
 ValueOrError<DeckList> DeckList::fromJson(const QJsonValue &v,
@@ -337,6 +389,25 @@ ValueOrError<CreateDeckRequest> CreateDeckRequest::fromJson(const QJsonValue &v,
   };
 }
 
+ValueOrError<CreateDeckRequest>
+CreateDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  auto decoded = fromJson(raw->toQJson(), path);
+  if (!decoded)
+    return failure(decoded.error());
+  if (raw->isObject()) {
+    const Json::Value deckListRaw = raw->value("deckList"_L1);
+    if (deckListRaw.isObject()) {
+      const Json::Value idValue = deckListRaw.value("id"_L1);
+      if (idValue.isNumber())
+        decoded->deckList.id.numberLiteral = idValue.toRawNumber().literal();
+    }
+  }
+  return *decoded;
+}
+
 QJsonObject CreateDeckRequest::toJson() const {
   QJsonObject obj{
       {QStringLiteral("deckId"), deckId},
@@ -346,6 +417,14 @@ QJsonObject CreateDeckRequest::toJson() const {
   if (deckUrl)
     obj.insert(QStringLiteral("deckUrl"), *deckUrl);
   return obj;
+}
+
+QByteArray CreateDeckRequest::toJsonBytes() const {
+  QJsonObject obj = toJson();
+  if (deckList.id.tag != ExternalDeckIdTag::Number)
+    return QJsonDocument(obj).toJson(QJsonDocument::Compact);
+  obj.remove(QStringLiteral("deckList"));
+  return Json::spliceRawJsonMember(obj, "deckList"_L1, deckList.toJsonBytes());
 }
 
 ValueOrError<FetchDeckRequest> FetchDeckRequest::fromJson(const QJsonValue &v,
@@ -391,8 +470,8 @@ QJsonObject DeckValidationError::toJson() const {
   };
 }
 
-ValueOrError<QList<DeckValidationError>>
-decodeDeckValidationResult(const QJsonValue &v, QStringView path) {
+static ValueOrError<QList<DeckValidationError>>
+decodeDeckValidationResultItems(const QJsonValue &v, QStringView path) {
   auto arrResult = Json::requireArray(v, path);
   if (!arrResult)
     return failure(arrResult.error());
@@ -408,10 +487,37 @@ decodeDeckValidationResult(const QJsonValue &v, QStringView path) {
   return result;
 }
 
-QJsonArray
-encodeDeckValidationResult(const QList<DeckValidationError> &errors) {
+DeckValidationResult DeckValidationResult::success() {
+  DeckValidationResult result;
+  result.m_kind = Kind::Success;
+  return result;
+}
+
+ValueOrError<DeckValidationResult>
+DeckValidationResult::errors(QList<DeckValidationError> errors) {
+  if (errors.isEmpty())
+    return failure(QStringLiteral(
+        "DeckValidationResult::errors: errors must not be empty -- an "
+        "empty list is deckValidationSuccess, not deckValidationErrors"));
+  DeckValidationResult result;
+  result.m_kind = Kind::Errors;
+  result.m_errors = std::move(errors);
+  return result;
+}
+
+ValueOrError<DeckValidationResult>
+DeckValidationResult::fromJson(const QJsonValue &v, QStringView path) {
+  auto items = decodeDeckValidationResultItems(v, path);
+  if (!items)
+    return failure(items.error());
+  if (items->isEmpty())
+    return DeckValidationResult::success();
+  return DeckValidationResult::errors(*items);
+}
+
+QJsonArray DeckValidationResult::toJson() const {
   QJsonArray arr;
-  for (const DeckValidationError &error : errors)
+  for (const DeckValidationError &error : m_errors)
     arr.append(error.toJson());
   return arr;
 }

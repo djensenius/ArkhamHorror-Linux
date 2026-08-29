@@ -1,8 +1,11 @@
 #pragma once
 
 #include "Identifiers.h"
+#include "RawJson.h"
 #include "ValueOrError.h"
 
+#include <QByteArray>
+#include <QByteArrayView>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -25,18 +28,36 @@ struct ExternalDeckId {
   ExternalDeckIdTag tag{ExternalDeckIdTag::Absent};
   // Populated only when tag == Text.
   QString text;
-  // Populated only when tag == Number. Stored as the double QJsonValue
-  // already gave us; see JsonDecode.h's scientificShow() doc comment for why
-  // Qt cannot preserve more precision than this for a JSON number.
-  double number{0.0};
+  // Populated only when tag == Number: the number's exact JSON literal
+  // text (sign/digits/fraction/exponent verbatim, never rounded through a
+  // double). ArkhamDB is known to hand out deck ids past double's
+  // exact-integer range (2^53), so fromObject()/toJson() below -- which
+  // must operate on an already-parsed QJsonValue/QJsonObject and therefore
+  // cannot recover precision QJsonDocument has already destroyed -- are
+  // only a best-effort fallback; fromRawBytes()/toJsonBytes() are this
+  // type's genuinely lossless entry points and should be preferred by any
+  // caller that has the original bytes.
+  QString numberLiteral;
 
   // Reads the "id" key directly from obj (needs the whole object, not just
-  // a value, to distinguish an absent key from an explicit null).
+  // a value, to distinguish an absent key from an explicit null). Lossy
+  // for tag == Number: see numberLiteral's doc comment.
   [[nodiscard]] static ValueOrError<ExternalDeckId>
   fromObject(const QJsonObject &obj, QStringView path);
+  // Precision-preserving equivalent of fromObject(), reading "id" from a
+  // Json::Value object already produced by the canonical raw-byte parser
+  // (see RawJson.h) instead of QJsonObject.
+  [[nodiscard]] static ValueOrError<ExternalDeckId>
+  fromRawObject(const Json::Value &obj, QStringView path);
   // Undefined when tag == Absent, so callers can omit the key entirely; a
-  // real QJsonValue::Null/String/Double otherwise.
+  // real QJsonValue::Null/String/Double otherwise. Lossy for tag ==
+  // Number: see numberLiteral's doc comment; toJsonLiteral() below is
+  // the lossless equivalent for that case.
   [[nodiscard]] QJsonValue toJson() const;
+  // The exact JSON literal to splice into a byte-level encode for this id
+  // (used by DeckListInput::toJsonBytes()); only meaningful for tag ==
+  // Number, where it returns numberLiteral verbatim.
+  [[nodiscard]] const QString &toJsonLiteral() const { return numberLiteral; }
 
   friend bool operator==(const ExternalDeckId &,
                          const ExternalDeckId &) = default;
@@ -70,7 +91,19 @@ struct DeckListInput {
 
   [[nodiscard]] static ValueOrError<DeckListInput> fromJson(const QJsonValue &v,
                                                             QStringView path);
+  // Precision-preserving equivalent of fromJson(): every field decodes
+  // identically, except `id`'s numeric variant keeps its exact source
+  // literal (see ExternalDeckId::numberLiteral) instead of being rounded
+  // through a double by QJsonDocument before this type ever sees it.
+  // Callers with the original request/response bytes should prefer this
+  // over fromJson().
+  [[nodiscard]] static ValueOrError<DeckListInput>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Precision-preserving equivalent of toJson(): identical bytes except
+  // `id`'s numeric variant is spliced in verbatim from its exact source
+  // literal rather than re-encoded through a double.
+  [[nodiscard]] QByteArray toJsonBytes() const;
 
   friend bool operator==(const DeckListInput &,
                          const DeckListInput &) = default;
@@ -126,7 +159,14 @@ struct CreateDeckRequest {
 
   [[nodiscard]] static ValueOrError<CreateDeckRequest>
   fromJson(const QJsonValue &v, QStringView path);
+  // Precision-preserving equivalent of fromJson(); see
+  // DeckListInput::fromRawBytes().
+  [[nodiscard]] static ValueOrError<CreateDeckRequest>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Precision-preserving equivalent of toJson(); see
+  // DeckListInput::toJsonBytes().
+  [[nodiscard]] QByteArray toJsonBytes() const;
 
   friend bool operator==(const CreateDeckRequest &,
                          const CreateDeckRequest &) = default;
@@ -157,14 +197,52 @@ struct DeckValidationError {
                          const DeckValidationError &) = default;
 };
 
-// Decodes a deck-validation result array: an empty array is
-// deckValidationSuccess, a non-empty array is deckValidationErrors. Both
-// share one wire shape (a JSON array of the same element schema), so one
-// decode function covers both without a separate "success" type.
-[[nodiscard]] ValueOrError<QList<DeckValidationError>>
-decodeDeckValidationResult(const QJsonValue &v, QStringView path);
-[[nodiscard]] QJsonArray
-encodeDeckValidationResult(const QList<DeckValidationError> &errors);
+// The result of validating a deck's slots: `deckValidationSuccess` (schema:
+// `{"type": "array", "maxItems": 0}` -- exactly the empty array, never
+// anything else) and `deckValidationErrors` (schema: `{"type": "array",
+// "minItems": 1, ...}` -- one or more DeckValidationError entries) are two
+// distinct, mutually exclusive schema shapes that happen to share the same
+// element type, not one ambiguous "maybe empty" list. Modeling them as a
+// single QList<DeckValidationError> would let an accidentally-empty
+// "errors" value masquerade as success (or vice versa) purely by
+// construction, with no way for the type system to catch it. This class
+// makes that impossible: Kind::Errors can only be constructed via
+// errors(), which itself fails for an empty list, and Kind::Success never
+// carries any entries, so `kind() == Kind::Errors` and
+// `!errorList().isEmpty()` are always equivalent -- there is no "empty
+// errors" state to accidentally produce or observe.
+class DeckValidationResult {
+public:
+  enum class Kind { Success, Errors };
+
+  [[nodiscard]] static DeckValidationResult success();
+  // Fails if `errors` is empty -- deckValidationErrors requires minItems:1,
+  // so an empty error list is not a valid alternate spelling of success.
+  [[nodiscard]] static ValueOrError<DeckValidationResult>
+  errors(QList<DeckValidationError> errors);
+
+  [[nodiscard]] static ValueOrError<DeckValidationResult>
+  fromJson(const QJsonValue &v, QStringView path);
+  [[nodiscard]] QJsonArray toJson() const;
+
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  [[nodiscard]] bool isSuccess() const noexcept {
+    return m_kind == Kind::Success;
+  }
+  // Empty for Kind::Success; guaranteed non-empty for Kind::Errors.
+  [[nodiscard]] const QList<DeckValidationError> &errorList() const noexcept {
+    return m_errors;
+  }
+
+  friend bool operator==(const DeckValidationResult &,
+                         const DeckValidationResult &) = default;
+
+private:
+  DeckValidationResult() = default;
+
+  Kind m_kind{Kind::Success};
+  QList<DeckValidationError> m_errors;
+};
 
 // A generic deck-operation failure envelope (e.g. deck creation/sync).
 struct DeckOperationError {

@@ -150,29 +150,58 @@ struct CampaignSummary {
 // game-state.schema.json's GameState, decoded forward-compatibly: the four
 // known tags are exhaustive as of schema revision 0.1.12, but this is a
 // live state machine a future backend release can extend, so an unrecognized
-// tag decodes to Kind::Unknown (preserving its wire spelling) rather than
-// failing the whole containing GameListRow.
-struct GameState {
+// tag decodes to Kind::Unknown (preserving its wire spelling and complete
+// raw "contents") rather than failing the whole containing GameListRow.
+// The private constructor makes every inconsistent state (a payload on
+// Active/Over, or a Pending/ChooseDecks player list containing the
+// all-zero/null uuid -- a seat can never genuinely be owed to "no one")
+// unrepresentable: pending()/chooseDecks()/active()/over() are the only
+// ways to build a known-kind instance, and Kind::Unknown has no public
+// factory at all (decoder-only, exactly like CampaignOption's own
+// unknown-tag handling), so production code can never fabricate one.
+class GameState {
+public:
   enum class Kind { Pending, ChooseDecks, Active, Over, Unknown };
 
-  Kind kind{Kind::Unknown};
-  // Only meaningful for Pending/ChooseDecks: the seats still owed a deck.
-  QList<QUuid> playerIds;
-  // Only meaningful for Unknown: the tag string as received, so a decoded
-  // value that could not be interpreted can still be logged/displayed and
-  // re-encoded without inventing a tag.
-  QString unknownTag;
-  // Unknown only: the raw "contents" value the unrecognized tag object
-  // carried, if any (Undefined if it had none), preserved verbatim -- like
-  // CampaignOption's own unknown-tag handling -- so re-encoding an unknown
-  // state can never silently drop part of what the server sent.
-  QJsonValue unknownContents{QJsonValue::Undefined};
+  // Fails if any id in `playerIds` is the null (all-zero) uuid.
+  [[nodiscard]] static ValueOrError<GameState> pending(QList<QUuid> playerIds);
+  [[nodiscard]] static ValueOrError<GameState>
+  chooseDecks(QList<QUuid> playerIds);
+  [[nodiscard]] static GameState active();
+  [[nodiscard]] static GameState over();
 
   [[nodiscard]] static ValueOrError<GameState> fromJson(const QJsonValue &v,
                                                         QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  // Only meaningful for Pending/ChooseDecks: the seats still owed a deck.
+  [[nodiscard]] const QList<QUuid> &playerIds() const noexcept {
+    return m_playerIds;
+  }
+  // Only meaningful for Unknown: the tag string as received, so a decoded
+  // value that could not be interpreted can still be logged/displayed and
+  // re-encoded without inventing a tag.
+  [[nodiscard]] const QString &unknownTag() const noexcept {
+    return m_unknownTag;
+  }
+  // Unknown only: the raw "contents" value the unrecognized tag object
+  // carried, if any (Undefined if it had none), preserved verbatim -- like
+  // CampaignOption's own unknown-tag handling -- so re-encoding an unknown
+  // state can never silently drop part of what the server sent.
+  [[nodiscard]] const QJsonValue &unknownContents() const noexcept {
+    return m_unknownContents;
+  }
+
   friend bool operator==(const GameState &, const GameState &) = default;
+
+private:
+  GameState() = default;
+
+  Kind m_kind{Kind::Unknown};
+  QList<QUuid> m_playerIds;
+  QString m_unknownTag;
+  QJsonValue m_unknownContents{QJsonValue::Undefined};
 };
 
 // One row of the top-level game-list.json array: either a gameDetails
@@ -316,6 +345,8 @@ enum class KnownCampaignOption {
 // there is no public factory that lets calling code fabricate one -- so an
 // option this client itself composes for a createGameRequest can never be
 // silently treated as if the server already understood it.
+class CampaignOptionRequest;
+
 class CampaignOption {
 public:
   enum class Kind { Known, Variant, Unknown };
@@ -342,6 +373,13 @@ public:
     return m_unknownContents;
   }
 
+  // Narrows this decoded (possibly Kind::Unknown) option down to the closed
+  // CampaignOptionRequest a createGameRequest may actually submit. Fails
+  // for Kind::Unknown: an option this client could not interpret must
+  // never be silently resubmitted as if the server already understood it.
+  [[nodiscard]] ValueOrError<CampaignOptionRequest>
+  toRequestOption(QStringView path) const;
+
   friend bool operator==(const CampaignOption &,
                          const CampaignOption &) = default;
 
@@ -354,23 +392,70 @@ private:
   QJsonValue m_unknownContents{QJsonValue::Undefined};
 };
 
-// The campaignId-xor-scenarioId invariant createGameRequest's schema
-// expresses via `anyOf`: creating a game is either continuing a campaign or
-// starting a standalone scenario, never both, never neither. The private
-// constructor makes an invalid (both-set or neither-set) instance
-// unrepresentable -- campaign()/scenario() are the only ways to build one,
-// and fromJson rejects a wire object satisfying neither (or, defensively,
-// both).
+// createGameRequest.options's actual element type. Unlike CampaignOption
+// (which also has to represent whatever an already-decoded GameListRow's
+// campaign happened to carry, including a tag this client cannot
+// interpret), a request this client itself composes can only ever contain
+// options the client understands: there is deliberately no Kind::Unknown
+// here and no public factory that could fabricate one, so "an unknown
+// option cannot be submitted" is a property of the type, not a runtime
+// check callers might skip.
+class CampaignOptionRequest {
+public:
+  enum class Kind { Known, Variant };
+
+  [[nodiscard]] static CampaignOptionRequest
+  knownOption(KnownCampaignOption option);
+  [[nodiscard]] static CampaignOptionRequest variantOption(QString contents);
+
+  // Fails on any tag this client does not recognize (including
+  // "CampaignVariant" with a non-string contents) -- there is no
+  // forward-compatible fallback for a request-bound value.
+  [[nodiscard]] static ValueOrError<CampaignOptionRequest>
+  fromJson(const QJsonValue &v, QStringView path);
+  [[nodiscard]] QJsonObject toJson() const;
+
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  [[nodiscard]] std::optional<KnownCampaignOption> known() const noexcept {
+    return m_known;
+  }
+  [[nodiscard]] const QString &text() const noexcept { return m_text; }
+
+  friend bool operator==(const CampaignOptionRequest &,
+                         const CampaignOptionRequest &) = default;
+
+private:
+  CampaignOptionRequest() = default;
+
+  Kind m_kind{Kind::Known};
+  std::optional<KnownCampaignOption> m_known;
+  QString m_text;
+};
+
+// createGameRequest's real invariant, per the backend's own dispatch
+// (Api/Handler/Arkham/Games.hs postApiV1ArkhamGamesR): `campaignId` set
+// dispatches to `newCampaign cid scenarioId ...` regardless of whether
+// `scenarioId` is also set (a campaign may start at a specific scenario),
+// so campaign-only and campaign-with-starting-scenario are both valid.
+// Only when `campaignId` is absent does `scenarioId` become required (a
+// standalone scenario); "neither set" is the sole invalid combination
+// (`error "missing either a campign id or a scenario id"` on the backend).
+// The private constructor makes that one invalid (neither-set) state
+// unrepresentable -- campaign()/campaignWithStartingScenario()/scenario()
+// are the only ways to build an instance, and fromJson rejects a wire
+// object satisfying neither.
 class CampaignOrScenario {
 public:
   [[nodiscard]] static CampaignOrScenario campaign(CampaignId id);
+  [[nodiscard]] static CampaignOrScenario
+  campaignWithStartingScenario(CampaignId campaignId, ScenarioId scenarioId);
   [[nodiscard]] static CampaignOrScenario scenario(ScenarioId id);
 
   [[nodiscard]] static ValueOrError<CampaignOrScenario>
   fromJson(const QJsonObject &requestObj, QStringView path);
-  // Inserts this request's resolved "campaignId"/"scenarioId" keys (one
-  // real, the other explicit JSON null) into `obj`, matching the fixture's
-  // own encoding (both keys always present).
+  // Inserts this request's resolved "campaignId"/"scenarioId" keys (each
+  // either the real id or explicit JSON null) into `obj`, matching the
+  // fixture's own encoding (both keys always present).
   void insertInto(QJsonObject &obj) const;
 
   [[nodiscard]] bool isCampaign() const noexcept {
@@ -410,7 +495,7 @@ struct CreateGameRequest {
   QString campaignName;
   MultiplayerVariant multiplayerVariant{};
   bool includeTarotReadings{};
-  QList<CampaignOption> options;
+  QList<CampaignOptionRequest> options;
   std::optional<bool> strictAsIfAt;
   std::optional<AsIfRulingValue> asIfRuling;
   QList<UltimatumOrBoon> ultimatumsAndBoons;
@@ -436,7 +521,14 @@ struct ChooseDeckRequest {
 
   [[nodiscard]] static ValueOrError<ChooseDeckRequest>
   fromJson(const QJsonValue &v, QStringView path);
+  // Precision-preserving equivalent of fromJson(); see
+  // DeckListInput::fromRawBytes().
+  [[nodiscard]] static ValueOrError<ChooseDeckRequest>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Precision-preserving equivalent of toJson(); see
+  // DeckListInput::toJsonBytes().
+  [[nodiscard]] QByteArray toJsonBytes() const;
 
   friend bool operator==(const ChooseDeckRequest &,
                          const ChooseDeckRequest &) = default;

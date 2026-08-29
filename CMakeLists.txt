@@ -115,6 +115,8 @@ add_library(arkham_foundation STATIC
     src/QtKeychainJobFactory.h
     src/QtKeychainTokenStore.cpp
     src/QtKeychainTokenStore.h
+    src/RawJson.cpp
+    src/RawJson.h
     src/ServerCapabilities.cpp
     src/ServerCapabilities.h
     src/ServerProfile.cpp
@@ -231,6 +233,15 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME games COMMAND arkham-games-tests)
+
+    qt_add_executable(arkham-raw-json-tests
+        tests/RawJsonTests.cpp
+    )
+    target_link_libraries(arkham-raw-json-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME raw_json COMMAND arkham-raw-json-tests)
 
     qt_add_executable(arkham-network-tests
         tests/NetworkTests.cpp

@@ -3,6 +3,7 @@
 #include "JsonDecode.h"
 
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <array>
 #include <utility>
 
@@ -337,6 +338,40 @@ QJsonObject CampaignSummary::toJson() const {
   };
 }
 
+ValueOrError<GameState> GameState::pending(QList<QUuid> playerIds) {
+  for (const QUuid &id : playerIds)
+    if (id.isNull())
+      return failure(QStringLiteral(
+          "GameState::pending: playerIds must not contain a null uuid"));
+  GameState result;
+  result.m_kind = Kind::Pending;
+  result.m_playerIds = std::move(playerIds);
+  return result;
+}
+
+ValueOrError<GameState> GameState::chooseDecks(QList<QUuid> playerIds) {
+  for (const QUuid &id : playerIds)
+    if (id.isNull())
+      return failure(QStringLiteral(
+          "GameState::chooseDecks: playerIds must not contain a null uuid"));
+  GameState result;
+  result.m_kind = Kind::ChooseDecks;
+  result.m_playerIds = std::move(playerIds);
+  return result;
+}
+
+GameState GameState::active() {
+  GameState result;
+  result.m_kind = Kind::Active;
+  return result;
+}
+
+GameState GameState::over() {
+  GameState result;
+  result.m_kind = Kind::Over;
+  return result;
+}
+
 ValueOrError<GameState> GameState::fromJson(const QJsonValue &v,
                                             QStringView path) {
   auto objResult = Json::requireObject(v, path);
@@ -358,37 +393,54 @@ ValueOrError<GameState> GameState::fromJson(const QJsonValue &v,
     auto ids = decodeUuidArray(*arrResult, contentsPath);
     if (!ids)
       return failure(ids.error());
-    return GameState{.kind = tag == "IsPending"_L1 ? Kind::Pending
-                                                   : Kind::ChooseDecks,
-                     .playerIds = *ids};
+    // decodeUuidArray already rejects a null uuid per element (see
+    // Json::decodeUuid), so pending()/chooseDecks()'s own validation below
+    // can never actually fail here -- but routing through the same
+    // validated factory used by hand-constructed callers keeps the
+    // invariant defined in exactly one place rather than duplicated.
+    auto state = tag == "IsPending"_L1 ? GameState::pending(*ids)
+                                       : GameState::chooseDecks(*ids);
+    if (!state)
+      return failure(QStringLiteral("%1: %2").arg(path, state.error()));
+    return state;
   }
-  if (tag == "IsActive"_L1)
-    return GameState{.kind = Kind::Active};
-  if (tag == "IsOver"_L1)
-    return GameState{.kind = Kind::Over};
-  return GameState{.kind = Kind::Unknown,
-                   .unknownTag = tag,
-                   .unknownContents = obj.value("contents"_L1)};
+  if (tag == "IsActive"_L1 || tag == "IsOver"_L1) {
+    // Known nullary tags reject any "contents" presence -- even an
+    // explicit null -- rather than silently ignoring an unexpected
+    // payload.
+    if (obj.contains("contents"_L1))
+      return failure(QStringLiteral("%1: \"%2\" must not have \"contents\"")
+                         .arg(path, tag));
+    return tag == "IsActive"_L1 ? GameState::active() : GameState::over();
+  }
+
+  // An unrecognized tag is preserved verbatim rather than rejected: this is
+  // a live state machine a future backend release can extend.
+  GameState result;
+  result.m_kind = Kind::Unknown;
+  result.m_unknownTag = tag;
+  result.m_unknownContents = obj.value("contents"_L1);
+  return result;
 }
 
 QJsonObject GameState::toJson() const {
-  switch (kind) {
+  switch (m_kind) {
   case Kind::Pending:
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("IsPending")},
-        {QStringLiteral("contents"), encodeUuidArray(playerIds)}};
+        {QStringLiteral("contents"), encodeUuidArray(m_playerIds)}};
   case Kind::ChooseDecks:
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("IsChooseDecks")},
-        {QStringLiteral("contents"), encodeUuidArray(playerIds)}};
+        {QStringLiteral("contents"), encodeUuidArray(m_playerIds)}};
   case Kind::Active:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsActive")}};
   case Kind::Over:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsOver")}};
   case Kind::Unknown: {
-    QJsonObject obj{{QStringLiteral("tag"), unknownTag}};
-    if (!unknownContents.isUndefined())
-      obj.insert(QStringLiteral("contents"), unknownContents);
+    QJsonObject obj{{QStringLiteral("tag"), m_unknownTag}};
+    if (!m_unknownContents.isUndefined())
+      obj.insert(QStringLiteral("contents"), m_unknownContents);
     return obj;
   }
   }
@@ -433,9 +485,20 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
 
   // Disambiguated by shape, not an explicit tag: the backend's hand-written
   // GameDetailsEntry ToJSON encodes a failure as a bare `{"error": message}`
-  // object and a success as the raw gameDetails object, so a top-level
-  // "error" key is the only reliable discriminator.
+  // object and a success as the raw gameDetails object. Per the schema,
+  // failedGameDetails is `additionalProperties: false` with "error" as its
+  // *only* allowed key, so an object carrying "error" alongside any other
+  // key (a success key or otherwise) matches neither def -- it is a
+  // malformed row, not an automatic failure that happens to have "extra"
+  // data attached. Propagate that as a decode error instead of silently
+  // discarding the other keys and declaring victory as Kind::Failure.
   if (obj.contains("error"_L1)) {
+    if (obj.size() != 1)
+      return failure(
+          QStringLiteral("%1: a failure row's \"error\" must be its only "
+                         "key (found %2 keys)")
+              .arg(path)
+              .arg(obj.size()));
     auto error =
         Json::requireString(obj, "error"_L1, Json::joinPath(path, u"error"));
     if (!error)
@@ -519,11 +582,12 @@ QJsonObject GameListRow::toJson() const {
   if (m_kind == Kind::Failure)
     return QJsonObject{{QStringLiteral("error"), m_error}};
 
-  // Unlike the qFatal()-guarded toJson() implementations elsewhere in this
-  // file, no invariant check is needed here: success() is the only way to
-  // build a Kind::Success instance, and it always populates
-  // id/gameState/multiplayerVariant together, so they are guaranteed
-  // present by construction.
+  // No invariant check is needed here: success() is the only way to build
+  // a Kind::Success instance, and it always populates id/gameState/
+  // multiplayerVariant together, so they are guaranteed present by
+  // construction -- there is no qFatal()/Q_ASSERT()-guarded fallback
+  // anywhere in this file; every tagged/sum-type toJson() in this
+  // codebase is unconditionally safe by construction instead.
   QJsonObject obj;
   obj.insert(QStringLiteral("id"), m_id->toJson());
   obj.insert(QStringLiteral("scenario"), m_scenario
@@ -647,9 +711,93 @@ QJsonObject CampaignOption::toJson() const {
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
 
+ValueOrError<CampaignOptionRequest>
+CampaignOption::toRequestOption(QStringView path) const {
+  switch (m_kind) {
+  case Kind::Known:
+    return CampaignOptionRequest::knownOption(*m_known);
+  case Kind::Variant:
+    return CampaignOptionRequest::variantOption(m_text);
+  case Kind::Unknown:
+    return failure(QStringLiteral("%1: cannot submit unrecognized campaign "
+                                  "option \"%2\" in a request")
+                       .arg(path, m_text));
+  }
+  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
+}
+
+CampaignOptionRequest
+CampaignOptionRequest::knownOption(KnownCampaignOption option) {
+  CampaignOptionRequest result;
+  result.m_kind = Kind::Known;
+  result.m_known = option;
+  return result;
+}
+
+CampaignOptionRequest CampaignOptionRequest::variantOption(QString contents) {
+  CampaignOptionRequest result;
+  result.m_kind = Kind::Variant;
+  result.m_text = std::move(contents);
+  return result;
+}
+
+ValueOrError<CampaignOptionRequest>
+CampaignOptionRequest::fromJson(const QJsonValue &v, QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const QJsonObject &obj = *objResult;
+
+  auto tagResult =
+      Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
+  if (!tagResult)
+    return failure(tagResult.error());
+  const QString &tag = *tagResult;
+
+  if (tag == "CampaignVariant"_L1) {
+    auto contents = Json::requireString(obj, "contents"_L1,
+                                        Json::joinPath(path, u"contents"));
+    if (!contents)
+      return failure(contents.error());
+    return CampaignOptionRequest::variantOption(*contents);
+  }
+
+  for (const auto &[wire, option] : kKnownCampaignOptionTable)
+    if (tag == wire)
+      return CampaignOptionRequest::knownOption(option);
+
+  // Unlike CampaignOption, a request-bound value has no forward-compatible
+  // fallback: an unrecognized tag is a hard decode failure here.
+  return failure(QStringLiteral("%1: unrecognized campaign option tag \"%2\"")
+                     .arg(path, tag));
+}
+
+QJsonObject CampaignOptionRequest::toJson() const {
+  switch (m_kind) {
+  case Kind::Known:
+    return QJsonObject{
+        {QStringLiteral("tag"),
+         Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable)}};
+  case Kind::Variant:
+    return QJsonObject{
+        {QStringLiteral("tag"), QStringLiteral("CampaignVariant")},
+        {QStringLiteral("contents"), m_text}};
+  }
+  Q_UNREACHABLE_RETURN(QJsonObject{});
+}
+
 CampaignOrScenario CampaignOrScenario::campaign(CampaignId id) {
   CampaignOrScenario result;
   result.m_campaignId = std::move(id);
+  return result;
+}
+
+CampaignOrScenario
+CampaignOrScenario::campaignWithStartingScenario(CampaignId campaignId,
+                                                 ScenarioId scenarioId) {
+  CampaignOrScenario result;
+  result.m_campaignId = std::move(campaignId);
+  result.m_scenarioId = std::move(scenarioId);
   return result;
 }
 
@@ -683,13 +831,14 @@ CampaignOrScenario::fromJson(const QJsonObject &requestObj, QStringView path) {
     scenarioId = *result;
   }
 
-  if (campaignId.has_value() == scenarioId.has_value())
+  // The backend's only invalid combination is neither set (a campaign may
+  // freely carry a starting scenario, and a standalone scenario carries no
+  // campaign) -- see this class's doc comment.
+  if (!campaignId.has_value() && !scenarioId.has_value())
     return failure(
-        QStringLiteral(
-            "%1: exactly one of \"campaignId\"/\"scenarioId\" must be set, "
-            "not %2")
-            .arg(path, campaignId.has_value() ? QStringLiteral("both")
-                                              : QStringLiteral("neither")));
+        QStringLiteral("%1: at least one of \"campaignId\"/\"scenarioId\" "
+                       "must be set")
+            .arg(path));
 
   CampaignOrScenario result;
   result.m_campaignId = std::move(campaignId);
@@ -763,11 +912,11 @@ ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
   auto optionsArr = Json::requireArrayField(obj, "options"_L1, optionsPath);
   if (!optionsArr)
     return failure(optionsArr.error());
-  QList<CampaignOption> options;
+  QList<CampaignOptionRequest> options;
   options.reserve(optionsArr->size());
   for (qsizetype i = 0; i < optionsArr->size(); ++i) {
-    auto item = CampaignOption::fromJson((*optionsArr)[i],
-                                         Json::indexPath(optionsPath, i));
+    auto item = CampaignOptionRequest::fromJson(
+        (*optionsArr)[i], Json::indexPath(optionsPath, i));
     if (!item)
       return failure(item.error());
     options.append(*item);
@@ -904,6 +1053,33 @@ QJsonObject ChooseDeckRequest::toJson() const {
   if (deckList)
     obj.insert(QStringLiteral("deckList"), deckList->toJson());
   return obj;
+}
+
+ValueOrError<ChooseDeckRequest>
+ChooseDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  auto decoded = fromJson(raw->toQJson(), path);
+  if (!decoded)
+    return failure(decoded.error());
+  if (raw->isObject() && decoded->deckList) {
+    const Json::Value deckListRaw = raw->value("deckList"_L1);
+    if (deckListRaw.isObject()) {
+      const Json::Value idValue = deckListRaw.value("id"_L1);
+      if (idValue.isNumber())
+        decoded->deckList->id.numberLiteral = idValue.toRawNumber().literal();
+    }
+  }
+  return *decoded;
+}
+
+QByteArray ChooseDeckRequest::toJsonBytes() const {
+  QJsonObject obj = toJson();
+  if (!deckList || deckList->id.tag != ExternalDeckIdTag::Number)
+    return QJsonDocument(obj).toJson(QJsonDocument::Compact);
+  obj.remove(QStringLiteral("deckList"));
+  return Json::spliceRawJsonMember(obj, "deckList"_L1, deckList->toJsonBytes());
 }
 
 ValueOrError<ClaimSeatRequest> ClaimSeatRequest::fromJson(const QJsonValue &v,

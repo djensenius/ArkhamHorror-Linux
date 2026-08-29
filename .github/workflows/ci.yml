@@ -20,6 +20,22 @@ env:
   QT_VERSION: 6.11.1
 
 jobs:
+  contract-provenance:
+    name: Contract provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Only the pinned backend commit is fetched by the script itself
+          # (from the backend's own remote); the client checkout needs no
+          # special depth.
+          fetch-depth: 1
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.14
+          cache: true
+      - run: mise run contracts:verify-provenance
+
   format:
     name: Format
     runs-on: ubuntu-latest

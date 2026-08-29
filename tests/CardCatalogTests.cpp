@@ -31,6 +31,9 @@ private slots:
   void homebrewCardCodeAccepted();
   void cardCodeWithoutCPrefixRejected();
   void bareCCardCodeRejected();
+  void cardCodeWithEmbeddedLineTerminatorRejected();
+  void cardCodeWithTrailingLineTerminatorRejected();
+  void cardCodeWithSupplementaryPlaneCharacterAccepted();
 
   // Closed enums ─────────────────────────────────────────────────────────────
   void unrecognizedCardTypeRejected();
@@ -40,8 +43,13 @@ private slots:
   void allCardCostVariantsRoundTrip();
   void allGameValueVariantsRoundTrip();
   void allSkillIconVariantsRoundTrip();
-  void unrecognizedCardCostTagRejected();
+  void unrecognizedCardCostTagPreservedNotRejected();
+  void unrecognizedGameValueTagPreservedNotRejected();
+  void unrecognizedSkillIconTagPreservedNotRejected();
   void missingContentsRejectedForRawPayloadCardCostTags();
+  void nullaryCardCostTagWithContentsRejected();
+  void nullaryGameValueTagWithContentsRejected();
+  void nullarySkillIconTagWithContentsRejected();
 
   // Forward compatibility ────────────────────────────────────────────────────
   void unknownAdditiveTopLevelFieldIgnored();
@@ -50,6 +58,25 @@ private slots:
   // Collections ──────────────────────────────────────────────────────────────
   void bondedWithRoundTrips();
   void alternateSkillsAndErrataRoundTrip();
+
+  // MEDIUM #6: strictly-typed optional scalar fields (null not permitted) ──
+  void explicitNullForNonNullableIntFieldRejected();
+  void explicitNullForNonNullableBoolFieldRejected();
+  void explicitNullForNonNullableStringFieldRejected();
+  void absentNonNullableScalarFieldsDecodeToNullopt();
+
+  // MEDIUM #6: outer-typed-but-inner-unconstrained array/object fields ─────
+  void wrongOuterTypeForArrayFieldRejected_data();
+  void wrongOuterTypeForArrayFieldRejected();
+  void explicitNullForArrayFieldRejected();
+  void wrongOuterTypeForObjectFieldRejected();
+  void arrayAndObjectFieldsPreservedVerbatimWhenOuterTypeValid();
+
+  // MEDIUM #6: uniqueItems enforcement ──────────────────────────────────────
+  void duplicateClassSymbolsRejected();
+  void duplicateCardTraitsRejected();
+  void duplicateRevealedCardTraitsRejected();
+  void duplicateTagsAllowedNoUniquenessConstraint();
 };
 
 namespace {
@@ -81,14 +108,14 @@ void CardCatalogTests::decodesFullCardFromFixture() {
   QCOMPARE(result->name.title, QStringLiteral("Machete"));
   QVERIFY(!result->name.subtitle.has_value());
   QVERIFY(result->cost.has_value());
-  QCOMPARE(result->cost->tag, CardCostTag::StaticCost);
-  QCOMPARE(*result->cost->staticAmount, 3);
+  QCOMPARE(result->cost->tag(), CardCostTag::StaticCost);
+  QCOMPARE(*result->cost->staticAmount(), 3);
   QCOMPARE(*result->level, 0);
   QCOMPARE(result->cardType, CardType::AssetType);
   QCOMPARE(result->classSymbols, (QList<ClassSymbol>{ClassSymbol::Guardian}));
   QCOMPARE(result->skills.size(), 1);
-  QCOMPARE(result->skills.at(0).tag, SkillIconTag::SkillIcon);
-  QCOMPARE(*result->skills.at(0).skill, SkillType::SkillCombat);
+  QCOMPARE(result->skills.at(0).tag(), SkillIconTag::SkillIcon);
+  QCOMPARE(*result->skills.at(0).skill(), SkillType::SkillCombat);
   QCOMPARE(result->cardTraits,
            (QStringList{u"Item"_s, u"Melee"_s, u"Weapon"_s}));
   QCOMPARE(result->cardSlots, (QList<SlotType>{SlotType::HandSlot}));
@@ -119,12 +146,12 @@ void CardCatalogTests::decodesHomebrewCardFromFixture() {
            QStringLiteral(":dark-matter:in_the_shadow_of_earth"));
   QCOMPARE(*result->encounterSetQuantity, 3);
   QVERIFY(result->health.has_value());
-  QCOMPARE(result->health->tag, GameValueTag::Static);
-  QCOMPARE(*result->health->singleAmount, 1);
-  QCOMPARE(result->fight->tag, GameValueTag::Static);
-  QCOMPARE(*result->fight->singleAmount, 1);
-  QCOMPARE(*result->evade->singleAmount, 3);
-  QCOMPARE(*result->healthDamage->singleAmount, 1);
+  QCOMPARE(result->health->tag(), GameValueTag::Static);
+  QCOMPARE(*result->health->singleAmount(), 1);
+  QCOMPARE(result->fight->tag(), GameValueTag::Static);
+  QCOMPARE(*result->fight->singleAmount(), 1);
+  QCOMPARE(*result->evade->singleAmount(), 3);
+  QCOMPARE(*result->healthDamage->singleAmount(), 1);
   QVERIFY(!result->sanityDamage.has_value());
 
   QCOMPARE(result->toJson(), homebrew.at(0).toObject());
@@ -273,6 +300,48 @@ void CardCatalogTests::bareCCardCodeRejected() {
   QVERIFY(!result.has_value());
 }
 
+void CardCatalogTests::cardCodeWithEmbeddedLineTerminatorRejected() {
+  // `^c.+$` under plain ECMA-262 semantics: `.` excludes line terminators
+  // (LF, CR, U+2028, U+2029) wherever they occur, not just at the end, so
+  // a code embedding one mid-string must be rejected -- not silently
+  // truncated or accepted.
+  for (const QChar terminator :
+       {QChar(u'\n'), QChar(u'\r'), QChar(0x2028), QChar(0x2029)}) {
+    const QString code =
+        QStringLiteral("c01") + terminator + QStringLiteral("020");
+    const auto result = CardCode::parse(code);
+    QVERIFY2(!result.has_value(),
+             qPrintable(QStringLiteral("terminator U+%1 unexpectedly accepted")
+                            .arg(static_cast<uint>(terminator.unicode()), 4, 16,
+                                 QChar(u'0'))));
+  }
+}
+
+void CardCatalogTests::cardCodeWithTrailingLineTerminatorRejected() {
+  // Unlike some regex flavors' `$` (which may match just before a trailing
+  // "\n"), ECMA-262 `$` without the multiline flag matches only the true
+  // end of the string, so a trailing terminator is not specially exempted
+  // either.
+  const auto result = CardCode::parse(QStringLiteral("c01020\n"));
+  QVERIFY(!result.has_value());
+}
+
+void CardCatalogTests::cardCodeWithSupplementaryPlaneCharacterAccepted() {
+  // A supplementary-plane character (outside the BMP) is represented as a
+  // UTF-16 surrogate pair -- two code units, each individually matched by
+  // `.` (neither half is a line terminator) -- so this is accepted with no
+  // special surrogate-pair handling required, confirming the code-unit
+  // (not code-point) matching semantics do not spuriously reject valid
+  // input either. U+1F0A1 (PLAYING CARD ACE OF SPADES) is used as a
+  // representative supplementary-plane character.
+  QString code = QStringLiteral("c");
+  code.append(QChar::highSurrogate(0x1F0A1));
+  code.append(QChar::lowSurrogate(0x1F0A1));
+  const auto result = CardCode::parse(code);
+  QVERIFY(result.has_value());
+  QCOMPARE(result->value(), code);
+}
+
 void CardCatalogTests::unrecognizedCardTypeRejected() {
   const QJsonObject obj = parseJson(R"({
     "cardCode": "c00001",
@@ -332,7 +401,7 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
   const auto staticResult = CardCost::fromJson(staticObj, u"cost");
   if (!staticResult)
     QFAIL(qPrintable(staticResult.error()));
-  QCOMPARE(*staticResult->staticAmount, 5);
+  QCOMPARE(*staticResult->staticAmount(), 5);
   QCOMPARE(staticResult->toJson(), staticObj);
 }
 
@@ -358,7 +427,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r3 = GameValue::fromJson(staticWithPerPlayerObj, u"gv");
   if (!r3)
     QFAIL(qPrintable(r3.error()));
-  QCOMPARE(r3->contents, (QList<int>{3, 1}));
+  QCOMPARE(r3->contents(), (QList<int>{3, 1}));
   QCOMPARE(r3->toJson(), staticWithPerPlayerObj);
 
   const QJsonObject byPlayerCountObj{
@@ -367,7 +436,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r4 = GameValue::fromJson(byPlayerCountObj, u"gv");
   if (!r4)
     QFAIL(qPrintable(r4.error()));
-  QCOMPARE(r4->contents, (QList<int>{2, 3, 4, 5}));
+  QCOMPARE(r4->contents(), (QList<int>{2, 3, 4, 5}));
   QCOMPARE(r4->toJson(), byPlayerCountObj);
 
   for (const auto &tag : {"ValueX"_L1, "ValueStar"_L1, "ValueUnknown"_L1}) {
@@ -397,7 +466,7 @@ void CardCatalogTests::allSkillIconVariantsRoundTrip() {
     auto r = SkillIcon::fromJson(obj, u"skill");
     if (!r)
       QFAIL(qPrintable(r.error()));
-    QCOMPARE(*r->skill, skill);
+    QCOMPARE(*r->skill(), skill);
     QCOMPARE(r->toJson(), obj);
   }
 
@@ -406,18 +475,102 @@ void CardCatalogTests::allSkillIconVariantsRoundTrip() {
     auto r = SkillIcon::fromJson(obj, u"skill");
     if (!r)
       QFAIL(qPrintable(r.error()));
-    QVERIFY(!r->skill.has_value());
+    QVERIFY(!r->skill().has_value());
     QCOMPARE(r->toJson(), obj);
   }
 }
 
-void CardCatalogTests::unrecognizedCardCostTagRejected() {
+void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
+  // Card content is added with nearly every release -- a decoded-but-
+  // unrecognized cardCost must survive round-tripping instead of failing
+  // outright, and must never be mistaken for any known tag.
+  const QJsonObject withContents{
+      {QStringLiteral("tag"), QStringLiteral("SomeFutureCostTag")},
+      {QStringLiteral("contents"), QJsonObject{{QStringLiteral("x"), 1}}}};
+  const auto result = CardCost::fromJson(withContents, u"cost");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->tag(), CardCostTag::Unknown);
+  QVERIFY(!result->staticAmount().has_value());
+  QCOMPARE(result->toJson(), withContents);
+
+  const QJsonObject withoutContents{
+      {QStringLiteral("tag"), QStringLiteral("AnotherFutureCostTag")}};
+  const auto result2 = CardCost::fromJson(withoutContents, u"cost");
+  if (!result2)
+    QFAIL(qPrintable(result2.error()));
+  QCOMPARE(result2->tag(), CardCostTag::Unknown);
+  QCOMPARE(result2->toJson(), withoutContents);
+
+  // There is no public factory that lets calling code fabricate an
+  // Unknown-kind CardCost directly.
+  QVERIFY(*result != CardCost::dynamicCost());
+}
+
+void CardCatalogTests::unrecognizedGameValueTagPreservedNotRejected() {
+  const QJsonObject obj{{QStringLiteral("tag"), QStringLiteral("ValueFuture")},
+                        {QStringLiteral("contents"), 42}};
+  const auto result = GameValue::fromJson(obj, u"gv");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->tag(), GameValueTag::Unknown);
+  // Must never be conflated with the *known* nullary tag literally named
+  // "ValueUnknown".
+  QVERIFY(result->tag() != GameValueTag::ValueUnknown);
+  QCOMPARE(result->toJson(), obj);
+}
+
+void CardCatalogTests::unrecognizedSkillIconTagPreservedNotRejected() {
   const QJsonObject obj{
-      {QStringLiteral("tag"), QStringLiteral("SomeFutureCostTag")}};
-  const auto result = CardCost::fromJson(obj, u"cost");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(QStringLiteral("cost")),
-           qPrintable(result.error()));
+      {QStringLiteral("tag"), QStringLiteral("SomeFutureIcon")}};
+  const auto result = SkillIcon::fromJson(obj, u"skill");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->tag(), SkillIconTag::Unknown);
+  QCOMPARE(result->toJson(), obj);
+}
+
+void CardCatalogTests::nullaryCardCostTagWithContentsRejected() {
+  for (const auto &tag :
+       {"DynamicCost"_L1, "DiscardAmountCost"_L1, "DeferredCost"_L1}) {
+    const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
+                          {QStringLiteral("contents"), QJsonValue()}};
+    const auto result = CardCost::fromJson(obj, u"cost");
+    QVERIFY2(!result.has_value(),
+             qPrintable(QStringLiteral("%1 unexpectedly accepted an "
+                                       "explicit-null contents")
+                            .arg(tag)));
+    QVERIFY2(result.error().contains(QStringLiteral("contents")),
+             qPrintable(result.error()));
+  }
+}
+
+void CardCatalogTests::nullaryGameValueTagWithContentsRejected() {
+  for (const auto &tag : {"ValueX"_L1, "ValueStar"_L1, "ValueUnknown"_L1}) {
+    const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
+                          {QStringLiteral("contents"), QJsonValue()}};
+    const auto result = GameValue::fromJson(obj, u"gv");
+    QVERIFY2(!result.has_value(),
+             qPrintable(QStringLiteral("%1 unexpectedly accepted an "
+                                       "explicit-null contents")
+                            .arg(tag)));
+    QVERIFY2(result.error().contains(QStringLiteral("contents")),
+             qPrintable(result.error()));
+  }
+}
+
+void CardCatalogTests::nullarySkillIconTagWithContentsRejected() {
+  for (const auto &tag : {"WildIcon"_L1, "WildMinusIcon"_L1}) {
+    const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
+                          {QStringLiteral("contents"), QJsonValue()}};
+    const auto result = SkillIcon::fromJson(obj, u"skill");
+    QVERIFY2(!result.has_value(),
+             qPrintable(QStringLiteral("%1 unexpectedly accepted an "
+                                       "explicit-null contents")
+                            .arg(tag)));
+    QVERIFY2(result.error().contains(QStringLiteral("contents")),
+             qPrintable(result.error()));
+  }
 }
 
 void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
@@ -448,7 +601,7 @@ void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
   const auto nullResult = CardCost::fromJson(nullContents, u"cost");
   if (!nullResult)
     QFAIL(qPrintable(nullResult.error()));
-  QVERIFY(nullResult->rawContents.isNull());
+  QVERIFY(nullResult->rawContents().isNull());
   QCOMPARE(nullResult->toJson(), nullContents);
 }
 
@@ -533,6 +686,232 @@ void CardCatalogTests::alternateSkillsAndErrataRoundTrip() {
   QCOMPARE(result->alternateSkills.value(QStringLiteral("c00002")).size(), 1);
   QCOMPARE(result->alternateErrata.value(QStringLiteral("c00002")),
            QStringLiteral("Errata text"));
+  QCOMPARE(result->toJson(), obj);
+}
+
+void CardCatalogTests::explicitNullForNonNullableIntFieldRejected() {
+  // catalog.schema.json types "level" strictly as "integer" (no "null" in
+  // its type union) and does not require it -- so an absent key decodes
+  // to std::nullopt, but an explicit JSON null is exactly as malformed as
+  // a present value of any other wrong type, and must fail rather than
+  // silently collapsing into "absent".
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "level": null
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("level")));
+}
+
+void CardCatalogTests::explicitNullForNonNullableBoolFieldRejected() {
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "unique": null
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("unique")));
+}
+
+void CardCatalogTests::explicitNullForNonNullableStringFieldRejected() {
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "errata": null
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("errata")));
+}
+
+void CardCatalogTests::absentNonNullableScalarFieldsDecodeToNullopt() {
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1"
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(!result->level.has_value());
+  QVERIFY(!result->victoryPoints.has_value());
+  QVERIFY(!result->vengeancePoints.has_value());
+  QVERIFY(!result->overrideActionPlayableIfCriteriaMet.has_value());
+  QVERIFY(!result->permanent.has_value());
+  QVERIFY(!result->encounterSet.has_value());
+  QVERIFY(!result->encounterSetQuantity.has_value());
+  QVERIFY(!result->unique.has_value());
+  QVERIFY(!result->doubleSided.has_value());
+  QVERIFY(!result->exceptional.has_value());
+  QVERIFY(!result->playableFromDiscard.has_value());
+  QVERIFY(!result->stage.has_value());
+  QVERIFY(!result->grantedXp.has_value());
+  QVERIFY(!result->canReplace.has_value());
+  QVERIFY(!result->skipPlayWindows.has_value());
+  QVERIFY(!result->beforeEffect.has_value());
+  QVERIFY(!result->canCommitWhenNoIcons.has_value());
+  QVERIFY(!result->commitTrigger.has_value());
+  QVERIFY(!result->errata.has_value());
+  // Round trip stays byte-faithful: none of these absent fields reappear.
+  const QJsonObject encoded = result->toJson();
+  QVERIFY(!encoded.contains(QStringLiteral("level")));
+  QVERIFY(!encoded.contains(QStringLiteral("errata")));
+}
+
+void CardCatalogTests::wrongOuterTypeForArrayFieldRejected_data() {
+  QTest::addColumn<QString>("fieldName");
+  QTest::newRow("keywords") << QStringLiteral("keywords");
+  QTest::newRow("commitRestrictions") << QStringLiteral("commitRestrictions");
+  QTest::newRow("attackOfOpportunityModifiers")
+      << QStringLiteral("attackOfOpportunityModifiers");
+  QTest::newRow("limits") << QStringLiteral("limits");
+  QTest::newRow("locationConnections") << QStringLiteral("locationConnections");
+  QTest::newRow("locationRevealedConnections")
+      << QStringLiteral("locationRevealedConnections");
+  QTest::newRow("deckRestrictions") << QStringLiteral("deckRestrictions");
+}
+
+void CardCatalogTests::wrongOuterTypeForArrayFieldRejected() {
+  QFETCH(QString, fieldName);
+  QJsonObject obj{
+      {QStringLiteral("cardCode"), QStringLiteral("c00001")},
+      {QStringLiteral("name"),
+       QJsonObject{{QStringLiteral("title"), QStringLiteral("X")},
+                   {QStringLiteral("subtitle"), QJsonValue()}}},
+      {QStringLiteral("cardType"), QStringLiteral("AssetType")},
+      {QStringLiteral("art"), QStringLiteral("1")},
+  };
+  // catalog.schema.json types this field's outer shape as "array"; a
+  // string value matches neither "array" nor "null" and must fail rather
+  // than being silently preserved as opaque raw JSON.
+  obj.insert(fieldName, QStringLiteral("not an array"));
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(fieldName));
+}
+
+void CardCatalogTests::explicitNullForArrayFieldRejected() {
+  // An explicit JSON null matches neither "array" nor "object", so it must
+  // be rejected for these outer-typed fields exactly like any other wrong
+  // type -- unlike optionalString/Int/Bool's absent-or-null collapse used
+  // for genuinely backend-nullable fields elsewhere.
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "keywords": null
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("keywords")));
+}
+
+void CardCatalogTests::wrongOuterTypeForObjectFieldRejected() {
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "meta": [1, 2, 3]
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("meta")));
+}
+
+void CardCatalogTests::
+    arrayAndObjectFieldsPreservedVerbatimWhenOuterTypeValid() {
+  const QJsonArray rawKeywords{QStringLiteral("surge"), 1, QJsonValue()};
+  const QJsonObject rawMeta{{QStringLiteral("adaptable"), true}};
+  const QJsonObject obj{
+      {QStringLiteral("cardCode"), QStringLiteral("c00001")},
+      {QStringLiteral("name"),
+       QJsonObject{{QStringLiteral("title"), QStringLiteral("X")},
+                   {QStringLiteral("subtitle"), QJsonValue()}}},
+      {QStringLiteral("cardType"), QStringLiteral("AssetType")},
+      {QStringLiteral("art"), QStringLiteral("1")},
+      {QStringLiteral("keywords"), rawKeywords},
+      {QStringLiteral("meta"), rawMeta},
+  };
+  const auto result = CardDef::fromJson(obj, u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->keywords, QJsonValue(rawKeywords));
+  QCOMPARE(result->meta, QJsonValue(rawMeta));
+  QCOMPARE(result->toJson(), obj);
+}
+
+void CardCatalogTests::duplicateClassSymbolsRejected() {
+  // classSymbols is schema-typed "uniqueItems":true; a repeated decoded
+  // value must fail rather than silently collapsing.
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "classSymbols": ["Guardian", "Guardian"]
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("classSymbols")));
+}
+
+void CardCatalogTests::duplicateCardTraitsRejected() {
+  // cardTraits $refs the shared stringSet def ("uniqueItems":true).
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "cardTraits": ["Tactic", "Tactic"]
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("cardTraits")));
+}
+
+void CardCatalogTests::duplicateRevealedCardTraitsRejected() {
+  const QJsonObject obj = parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "revealedCardTraits": ["Omen", "Omen"]
+  })"_L1);
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(QStringLiteral("revealedCardTraits")));
+}
+
+void CardCatalogTests::duplicateTagsAllowedNoUniquenessConstraint() {
+  // Unlike classSymbols/cardTraits/revealedCardTraits, "tags" is a plain
+  // string array with no "uniqueItems" constraint in the schema, so
+  // repeated values are valid and must round-trip unchanged.
+  const QJsonObject obj{
+      {QStringLiteral("cardCode"), QStringLiteral("c00001")},
+      {QStringLiteral("name"),
+       QJsonObject{{QStringLiteral("title"), QStringLiteral("X")},
+                   {QStringLiteral("subtitle"), QJsonValue()}}},
+      {QStringLiteral("cardType"), QStringLiteral("AssetType")},
+      {QStringLiteral("art"), QStringLiteral("1")},
+      {QStringLiteral("tags"),
+       QJsonArray{QStringLiteral("dup"), QStringLiteral("dup")}},
+  };
+  const auto result = CardDef::fromJson(obj, u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->tags.size(), 2);
   QCOMPARE(result->toJson(), obj);
 }
 

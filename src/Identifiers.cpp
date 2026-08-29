@@ -6,11 +6,28 @@ namespace Arkham {
 
 ValueOrError<CardCode> CardCode::parse(const QString &text) {
   // Matches contracts/schemas/catalog.schema.json's `cardCode` pattern
-  // `^c.+$`: a literal 'c' followed by at least one more character.
+  // `^c.+$` under plain ECMA-262 regex semantics (no schema-level regex
+  // flags): `^`/`$` anchor to the whole-string boundaries only (no
+  // multiline collapsing of a trailing line terminator), comparisons are
+  // done per UTF-16 code unit without any Unicode normalization (so this
+  // never NFC/NFD-folds the input), and `.` matches any code unit except
+  // the four ECMA-262 line terminators (LF, CR, U+2028 LINE SEPARATOR,
+  // U+2029 PARAGRAPH SEPARATOR) -- including ones embedded mid-string, not
+  // just a trailing one. A supplementary-plane character contributes two
+  // UTF-16 code units, each independently satisfying `.` (never a line
+  // terminator), so no special surrogate-pair handling is needed beyond
+  // this per-code-unit exclusion.
   if (text.size() < 2 || text.at(0) != u'c')
     return failure(QStringLiteral("card code must start with 'c' and have at "
                                   "least one more character: \"%1\"")
                        .arg(text));
+  for (qsizetype i = 1; i < text.size(); ++i) {
+    const QChar c = text.at(i);
+    if (c == u'\n' || c == u'\r' || c == QChar(0x2028) || c == QChar(0x2029))
+      return failure(
+          QStringLiteral("card code must not contain a line terminator: \"%1\"")
+              .arg(text));
+  }
   return CardCode(text);
 }
 

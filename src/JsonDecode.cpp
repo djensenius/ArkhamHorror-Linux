@@ -1,5 +1,6 @@
 #include "JsonDecode.h"
 
+#include <QJsonDocument>
 #include <QLatin1StringView>
 #include <charconv>
 #include <cmath>
@@ -189,6 +190,66 @@ optionalBool(const QJsonObject &obj, QLatin1StringView key, QStringView path) {
 }
 
 ValueOrError<std::optional<QString>>
+optionalNonNullString(const QJsonObject &obj, QLatin1StringView key,
+                      QStringView path) {
+  const QJsonValue v = obj.value(key);
+  if (v.isUndefined())
+    return std::optional<QString>{};
+  auto result = requireStringValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<QString>{*result};
+}
+
+ValueOrError<std::optional<int>> optionalNonNullInt(const QJsonObject &obj,
+                                                    QLatin1StringView key,
+                                                    QStringView path) {
+  const QJsonValue v = obj.value(key);
+  if (v.isUndefined())
+    return std::optional<int>{};
+  auto result = requireIntValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<int>{*result};
+}
+
+ValueOrError<std::optional<bool>> optionalNonNullBool(const QJsonObject &obj,
+                                                      QLatin1StringView key,
+                                                      QStringView path) {
+  const QJsonValue v = obj.value(key);
+  if (v.isUndefined())
+    return std::optional<bool>{};
+  auto result = requireBoolValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<bool>{*result};
+}
+
+ValueOrError<QJsonValue> optionalRawArrayField(const QJsonObject &obj,
+                                               QLatin1StringView key,
+                                               QStringView path) {
+  const QJsonValue v = obj.value(key);
+  if (v.isUndefined())
+    return v;
+  if (!v.isArray())
+    return failure(
+        QStringLiteral("%1: expected array, got %2").arg(path, typeName(v)));
+  return v;
+}
+
+ValueOrError<QJsonValue> optionalRawObjectField(const QJsonObject &obj,
+                                                QLatin1StringView key,
+                                                QStringView path) {
+  const QJsonValue v = obj.value(key);
+  if (v.isUndefined())
+    return v;
+  if (!v.isObject())
+    return failure(
+        QStringLiteral("%1: expected object, got %2").arg(path, typeName(v)));
+  return v;
+}
+
+ValueOrError<std::optional<QString>>
 requireNullableString(const QJsonObject &obj, QLatin1StringView key,
                       QStringView path) {
   switch (fieldPresence(obj, key)) {
@@ -246,7 +307,16 @@ ValueOrError<std::optional<QUuid>> decodeNullableUuid(const QJsonValue &v,
   return std::optional<QUuid>{*result};
 }
 
-QString scientificShow(double value) {
+ValueOrError<QString> scientificShow(double value, QStringView path) {
+  // A syntactically valid JSON number can still parse to a non-finite
+  // double once Qt's JSON parser has already narrowed it (e.g. "1e400"
+  // overflows to +Infinity) -- reject explicitly here rather than falling
+  // into std::to_chars's non-scientific "inf"/"nan" textual output, which
+  // has no Scientific-style digits/exponent to extract.
+  if (!std::isfinite(value))
+    return failure(
+        QStringLiteral("%1: number is too large to represent").arg(path));
+
   // See Data.Scientific's Show instance: fixed-point with a forced ".0" when
   // 0.1 <= |x| < 1e7, scientific notation ("d.ddde<exp>", no zero padding)
   // otherwise. `e` below follows that module's own convention: the decimal
@@ -257,10 +327,17 @@ QString scientificShow(double value) {
   char buf[64];
   const auto conv = std::to_chars(buf, buf + sizeof(buf), absValue,
                                   std::chars_format::scientific);
+  // Not data-dependent: every finite double's shortest round-trip
+  // scientific-notation representation fits comfortably within 64 bytes
+  // (at most ~1 sign + 17 significant digits + '.' + 'e' + sign + 3
+  // exponent digits), so this can never fail for the finite `absValue`
+  // guaranteed by the isfinite() check above.
   Q_ASSERT(conv.ec == std::errc{});
   const std::string_view text(buf, static_cast<size_t>(conv.ptr - buf));
 
   const size_t ePos = text.find('e');
+  // Guaranteed present: std::to_chars(..., chars_format::scientific) always
+  // emits an 'e' exponent marker for a finite value.
   Q_ASSERT(ePos != std::string_view::npos);
   const std::string_view mantissa = text.substr(0, ePos);
   std::string_view expText = text.substr(ePos + 1);
@@ -300,6 +377,22 @@ QString scientificShow(double value) {
         digitsQ(static_cast<size_t>(e), digits.size() - static_cast<size_t>(e));
   }
   return negative ? u'-' + out : out;
+}
+
+QByteArray spliceRawJsonMember(const QJsonObject &obj, QLatin1StringView key,
+                               QByteArrayView rawValueBytes) {
+  QByteArray bytes = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+  if (!bytes.endsWith('}'))
+    return bytes; // defensive-only: QJsonDocument::toJson always ends in '}'.
+  bytes.chop(1);
+  if (!obj.isEmpty())
+    bytes += ',';
+  bytes += '"';
+  bytes += QByteArrayView(key.data(), key.size());
+  bytes += "\":";
+  bytes += rawValueBytes;
+  bytes += '}';
+  return bytes;
 }
 
 } // namespace Arkham::Json

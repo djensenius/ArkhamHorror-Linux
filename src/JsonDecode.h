@@ -2,6 +2,8 @@
 
 #include "ValueOrError.h"
 
+#include <QByteArray>
+#include <QByteArrayView>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -79,12 +81,36 @@ requireObjectField(const QJsonObject &obj, QLatin1StringView key,
 
 // Optional-field decoders: an absent key or an explicit JSON null both
 // decode to std::nullopt. A present value of the wrong type still fails.
+// Matches a backend field whose own parser folds absence and null to the
+// same result (verified per-field against the backend's Aeson `.:?`/plain
+// generic-Maybe derivation -- see e.g. Games.h's ChooseDeckRequest and
+// Decks.h's saved-Deck fields) -- i.e. the *response semantics* genuinely
+// do not distinguish the two, not merely "this client doesn't care".
 [[nodiscard]] ValueOrError<std::optional<QString>>
 optionalString(const QJsonObject &obj, QLatin1StringView key, QStringView path);
 [[nodiscard]] ValueOrError<std::optional<int>>
 optionalInt(const QJsonObject &obj, QLatin1StringView key, QStringView path);
 [[nodiscard]] ValueOrError<std::optional<bool>>
 optionalBool(const QJsonObject &obj, QLatin1StringView key, QStringView path);
+
+// Optional-but-non-nullable decoders: an absent key decodes to
+// std::nullopt, matching a schema field typed only "string"/"integer"/
+// "boolean" (no "null" in its type union) that is simply not required --
+// e.g. catalog.schema.json's cardDef `level`/`unique`/`errata`. Unlike
+// optionalString/Int/Bool above, an explicit JSON null is *not* folded
+// into std::nullopt here: the schema never allows null for these fields,
+// so a present null is exactly as malformed as a present value of any
+// other wrong type, and must fail rather than silently disappearing into
+// "absent".
+[[nodiscard]] ValueOrError<std::optional<QString>>
+optionalNonNullString(const QJsonObject &obj, QLatin1StringView key,
+                      QStringView path);
+[[nodiscard]] ValueOrError<std::optional<int>>
+optionalNonNullInt(const QJsonObject &obj, QLatin1StringView key,
+                   QStringView path);
+[[nodiscard]] ValueOrError<std::optional<bool>>
+optionalNonNullBool(const QJsonObject &obj, QLatin1StringView key,
+                    QStringView path);
 
 // Required-but-nullable decoders: the key itself must be present (schemas
 // such as decks.schema.json's `deckList` and catalog.schema.json's `name`
@@ -97,6 +123,25 @@ requireNullableString(const QJsonObject &obj, QLatin1StringView key,
 [[nodiscard]] ValueOrError<std::optional<int>>
 requireNullableInt(const QJsonObject &obj, QLatin1StringView key,
                    QStringView path);
+
+// Optional-and-outer-typed raw decoders: match a schema field that is not
+// required and, when present, constrains only its *outer* JSON type
+// (array/object) while leaving everything nested inside fully
+// unconstrained (e.g. catalog.schema.json's cardDef `keywords`/`limits`
+// (array) and `meta` (object)). An absent key decodes to
+// QJsonValue(QJsonValue::Undefined) (preserved distinctly from an
+// explicit null, exactly like requireRawField, so an untouched fixture
+// entry round-trips byte-faithfully); a present value must have the
+// declared outer type -- including rejecting an explicit null, which
+// matches neither "array" nor "object" -- but its contents, once that
+// outer shape is confirmed, are preserved verbatim with no further
+// validation.
+[[nodiscard]] ValueOrError<QJsonValue>
+optionalRawArrayField(const QJsonObject &obj, QLatin1StringView key,
+                      QStringView path);
+[[nodiscard]] ValueOrError<QJsonValue>
+optionalRawObjectField(const QJsonObject &obj, QLatin1StringView key,
+                       QStringView path);
 
 // Strict non-null UUID decode: fails on null, on a malformed string, and on
 // the all-zero UUID (never a valid backend-assigned identity).
@@ -119,8 +164,13 @@ decodeNullableUuid(const QJsonValue &v, QStringView path);
 // backend's arbitrary-precision Aeson decoder exactly for every value that
 // still round-trips through a double (all realistic ArkhamDB deck IDs), and
 // is the most fidelity obtainable once Qt's JSON parser has already stored
-// the number as a double.
-[[nodiscard]] QString scientificShow(double value);
+// the number as a double. Fails rather than crashing for a non-finite
+// double -- a syntactically valid but astronomically large-exponent JSON
+// number literal (e.g. "1e400") parses to +/-Infinity once Qt's JSON
+// parser has already narrowed it to a double, and neither Infinity nor NaN
+// has a finite decimal Scientific-style expansion to produce.
+[[nodiscard]] ValueOrError<QString> scientificShow(double value,
+                                                   QStringView path);
 
 // Decodes a closed enum from a JSON string against an explicit
 // wire-name/value table. Unlike this codebase's open wire-string wrappers
@@ -158,5 +208,15 @@ template <typename Enum, std::size_t N>
   }
   Q_UNREACHABLE_RETURN(QString());
 }
+
+// Serializes `obj` to compact JSON bytes, then splices in `key: rawValue`
+// as an additional object member -- bypassing QJsonValue for that member's
+// value entirely, so a value QJsonValue cannot represent exactly (e.g. an
+// arbitrary-precision JSON number literal spliced in by a caller building
+// on RawJson.h) can still be encoded byte-exact. `obj` must not already
+// contain `key`.
+[[nodiscard]] QByteArray spliceRawJsonMember(const QJsonObject &obj,
+                                             QLatin1StringView key,
+                                             QByteArrayView rawValueBytes);
 
 } // namespace Arkham::Json
