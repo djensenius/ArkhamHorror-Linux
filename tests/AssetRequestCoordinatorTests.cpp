@@ -8,6 +8,7 @@
 
 #include <QBuffer>
 #include <QCoreApplication>
+#include <QFile>
 #include <QImage>
 #include <QNetworkAccessManager>
 #include <QTemporaryDir>
@@ -2871,4 +2872,109 @@ void AssetRequestCoordinatorTests::
   QCOMPARE(earlyResultAgain->error().code, AssetErrorCode::NotFound);
   QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/icon0.png")),
            2); // once originally, once again after its record was evicted
+}
+
+void AssetRequestCoordinatorTests::
+    failedDurableInvalidationOnDefinitive404NeverRecordsNegativeAndFailsClosed() {
+  // Round-6 item 6 ("definitive 404 invalidation ignores delete failure
+  // and manifest unlink lacks directory fsync; old 200 can revive after
+  // TTL/restart/crash"). Simulate a genuine on-disk deletion failure
+  // (revoking write permission on the cache directory -- unlinkat()
+  // requires write permission on the CONTAINING directory, not the file
+  // itself, so this deterministically fails the manifest unlink
+  // regardless of platform/privilege) at the exact moment a definitive
+  // 404 (from a conditional GET revalidation) tries to tombstone an
+  // already-cached 200 entry for the same cache key. The fix must never
+  // record a negative-404 over an entry it could not actually confirm
+  // gone -- doing so would let the never-actually-deleted stale entry
+  // resurface once that record's bounded TTL lazily expired. Instead the
+  // operation must fail closed with a typed, observable
+  // CachePersistenceFailed error.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+
+  // An ETag is required so the SECOND request below revalidates over a
+  // real conditional GET (startRevalidation()) rather than being served
+  // straight from the memory/disk cache with no network round trip at
+  // all -- see request()'s own cache-hit branches.
+  MockHttpServer::Response fastOk;
+  fastOk.contentType = "image/png";
+  fastOk.body = encodePng(8, 8);
+  fastOk.extraHeaders.append(
+      qMakePair(QByteArray("ETag"), QByteArray("\"v1\"")));
+  server.setResponse(path, fastOk);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  auto cache = std::make_unique<AssetCache>(cacheConfig);
+  auto coordinator = std::make_unique<AssetRequestCoordinator>(*cache, fetcher);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  // First request: an ordinary 200, durably stored to disk with its ETag.
+  std::optional<Result> firstResult;
+  coordinator->request(key, [&](Result r) { firstResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return firstResult.has_value(); }, 5000));
+  QVERIFY2(bool(*firstResult), qPrintable(firstResult->error().message));
+  const auto storedEntry = cache->lookupDisk(cacheKey);
+  QVERIFY(storedEntry.has_value());
+  QCOMPARE(storedEntry->etag, QStringLiteral("\"v1\""));
+
+  // Simulated restart with a BRAND NEW cache/coordinator pair pointed at
+  // the same directory: the in-memory cache starts cold, so the second
+  // request below is a genuine DISK hit carrying validators, which
+  // request() revalidates over a real conditional GET
+  // (startRevalidation()) rather than serving straight from a still-warm
+  // memory entry with no network round trip at all (see request()'s own
+  // memory-hit branch, which never revalidates).
+  coordinator.reset();
+  cache.reset();
+  cache = std::make_unique<AssetCache>(cacheConfig);
+  coordinator = std::make_unique<AssetRequestCoordinator>(*cache, fetcher);
+
+  // Now revoke write permission on the cache directory -- ALL of this
+  // entry's data is already safely on disk at this point, so nothing
+  // about the request above is affected; only a SUBSEQUENT unlink
+  // attempt is.
+  struct ScopedDirectoryPermissionLock {
+    QString path;
+    ~ScopedDirectoryPermissionLock() {
+      QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner |
+                                      QFile::ExeOwner);
+    }
+  } permissionGuard{m_tempDirPath};
+  QVERIFY(QFile::setPermissions(
+      m_tempDirPath, QFile::ReadOwner | QFile::ExeOwner)); // r-x, no write
+
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  server.setResponse(path, notFound);
+
+  // Second request for the SAME key: the cached entry carries an ETag,
+  // so this is a real conditional GET (startRevalidation()), which the
+  // server above answers with an unconditional (not-304) 404.
+  std::optional<Result> secondResult;
+  coordinator->request(key, [&](Result r) { secondResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 5000));
+
+  // The decisive assertions for the fix: this candidate transition must
+  // fail closed with the typed persistence error -- NOT report a
+  // (misleadingly successful-looking) NotFound, and NOT record a
+  // negative-404 for a key whose still-live disk entry could not
+  // actually be confirmed removed.
+  QVERIFY(!bool(*secondResult));
+  QCOMPARE(secondResult->error().code, AssetErrorCode::CachePersistenceFailed);
+  QVERIFY(!coordinator->hasNegative404ForTesting(cacheKey));
+
+  // Sanity: restoring write permission and letting the guard's own
+  // destructor run at scope exit (below) leaves the directory in a
+  // normal, writable state again -- this test's cleanup() (which resets
+  // m_tempDir) still works normally afterward.
 }

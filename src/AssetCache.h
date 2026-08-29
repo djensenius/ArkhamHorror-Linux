@@ -206,14 +206,40 @@ public:
   // instead of repeating the conditional GET.
   void promoteToMemory(const QString &key, CachedEntry entry);
 
+  // Round-6 item 6: whether invalidate() managed to durably commit
+  // `key`'s tombstone -- i.e. whether the manifest naming its live
+  // generation is now confirmed unlinked AND that unlink has been
+  // fsync-ed to the cache root directory, so the removal survives a
+  // crash immediately afterward. A caller that also plans to record a
+  // bounded-TTL negative-404 for this key (AssetRequestCoordinator) MUST
+  // check this: recording that negative record after a
+  // PersistenceFailed result would let a stale, still-live entry
+  // resurface once the record's TTL expires, since the entry was never
+  // actually confirmed gone.
+  enum class InvalidateResult {
+    DurablyInvalidated, // No live entry for `key` remains discoverable,
+                        // confirmed durable (or none ever existed).
+    PersistenceFailed,  // The manifest unlink and/or the directory fsync
+                        // that must follow it genuinely failed; `key`'s
+                        // on-disk state is NOT confirmed gone.
+  };
+
   // Unconditionally removes `key` from both memory and disk (payload +
   // metadata). Used when a previously-cached candidate is confirmed
   // definitively gone (an authoritative revalidation 404 -- see
   // AssetRequestCoordinator) or definitively invalid (a disk entry that
   // fails an integrity/format/limit re-check on read -- "quarantine").
   // A no-op if `key` is not currently cached anywhere; safe to call
-  // repeatedly.
-  void invalidate(const QString &key);
+  // repeatedly. Durability ordering (round-6 item 6): the manifest
+  // naming `key`'s live generation is unlinked and the cache root
+  // directory is fsync-ed BEFORE this cache's own remaining
+  // generation-scoped payload/metadata files are best-effort reclaimed
+  // -- so even if some of those files fail to unlink (leaving inert
+  // orphans the repair sweep will reclaim later), the entry is already
+  // durably invisible to every future lookup, which starts from the
+  // manifest. See InvalidateResult's comment for why callers must not
+  // ignore a PersistenceFailed result.
+  [[nodiscard]] InvalidateResult invalidate(const QString &key);
 
   // Repairs orphan payloads, corrupt entries, and stray temp files, then
   // evicts oldest-access entries if disk usage exceeds the 90% high-water
@@ -358,6 +384,24 @@ private:
   // (callers still verify that separately).
   [[nodiscard]] std::optional<QString>
   readManifestGeneration(const QString &key) const;
+  // Round-6 item 6: outcome of deleteEntry() below, split into the two
+  // questions its two different call-site families actually need
+  // answered, which are NOT the same question:
+  //  - quota eviction / corruption repair need "did every byte this key
+  //    occupied actually get reclaimed" (allFilesReclaimed);
+  //  - invalidate() (and, through it, an authoritative-404 negative-cache
+  //    decision) needs the narrower, durability-focused "is this key's
+  //    entry now confirmed, crash-durably, gone from every future
+  //    lookup's perspective" (manifestDurablyAbsent) -- true as soon as
+  //    the manifest itself is unlinked AND that unlink is fsync-ed,
+  //    regardless of whether some orphaned generation file underneath it
+  //    still failed to unlink (harmless: no lookup ever finds it without
+  //    a manifest naming it, and the repair sweep reclaims it later).
+  struct DeleteEntryOutcome {
+    bool allFilesReclaimed;
+    bool manifestDurablyAbsent;
+  };
+
   // Unconditionally reclaims EVERY file associated with `key` --
   // its manifest and every generation-scoped payload/metadata file that
   // exists for it, live or orphaned -- via a name-prefix sweep of this
@@ -365,13 +409,11 @@ private:
   // confirmed to have no valid entry at all (repair, invalidate(),
   // quota eviction); NEVER used mid-replacement in store(), which must
   // keep an old-but-still-live generation's files intact until its
-  // successor's manifest swap has actually committed. Review item 11:
-  // returns true only if every matched file was actually removed (or
-  // was already gone) -- a caller doing quota accounting (
-  // reapAndEnforceQuota()) must never count an entry's bytes as freed
-  // when the underlying removal genuinely failed (e.g. a filesystem
-  // permission error).
-  [[nodiscard]] bool deleteEntry(const QString &key) const;
+  // successor's manifest swap has actually committed. Ordering (round-6
+  // item 6): the manifest is unlinked and fsync-ed to the root directory
+  // FIRST, strictly before any other matched file is touched -- see
+  // DeleteEntryOutcome's comment.
+  [[nodiscard]] DeleteEntryOutcome deleteEntry(const QString &key) const;
 
   // Review item 11: mints the next value of this cache's per-process
   // monotonic access-sequence counter. Callers must already hold

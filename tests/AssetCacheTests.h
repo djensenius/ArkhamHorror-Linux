@@ -88,6 +88,11 @@ private slots:
   void ownedSuffixOfPlainDirectoriesUnderTrustedAnchorResolvesSuccessfully();
   void crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted();
 
+  // Round-6 item 6: invalidate() must report a typed failure -- rather
+  // than silently succeeding -- when the manifest unlink it depends on
+  // for a durable tombstone genuinely cannot be committed.
+  void invalidateReportsPersistenceFailedWhenManifestUnlinkFails();
+
 private:
   QString m_tempDirPath;
   std::unique_ptr<QTemporaryDir> m_tempDir;

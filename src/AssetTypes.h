@@ -178,6 +178,21 @@ enum class AssetErrorCode {
                         // to fail closed if any future or forged call
                         // site ever tries to fetch a URL that did not
                         // come from AssetLocator's validated resolution.
+  CachePersistenceFailed, // Round-6 item 6: an authoritative 404 required
+                          // durably tombstoning (unlinking + fsync-ing)
+                          // this exact cache key's manifest before it
+                          // would be safe to also record a bounded-TTL
+                          // negative-404 (AssetCache::invalidate()
+                          // returned InvalidateResult::PersistenceFailed
+                          // -- see its comment), and that durable
+                          // tombstone genuinely could not be committed
+                          // (e.g. a filesystem permission or I/O error on
+                          // the unlink or the directory fsync). Recording
+                          // the negative record anyway would let a stale,
+                          // still-live 200 resurface once that record's
+                          // TTL expired, so this candidate transition
+                          // fails closed with this typed error instead of
+                          // silently treating the 404 as fully applied.
 };
 
 struct AssetError {

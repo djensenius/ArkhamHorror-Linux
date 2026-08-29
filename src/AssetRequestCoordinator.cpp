@@ -659,8 +659,15 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
   // which never re-enters this method -- so a bad origin resource can
   // fail at most once more, never loop. The CAS application above already
   // recorded this exact issuance as the new current generation, so no
-  // separate bump is needed here.
-  m_cache.invalidate(cacheKey);
+  // separate bump is needed here. Note: unlike the definitive-404 case
+  // handled in startCandidate()/startRevalidation()'s NotFound branches,
+  // this invalidate() call's result is not itself load-bearing for
+  // correctness -- store()'s own crash-durable generation/manifest
+  // replacement (not this eager best-effort cleanup) is what actually
+  // guarantees the freshly-refetched replacement below supersedes this
+  // corrupt entry, whether or not this particular unlink attempt
+  // succeeds durably first.
+  (void)m_cache.invalidate(cacheKey);
   operation.isRevalidation = false;
   operation.staleEntry.reset();
   startCandidate(operationId);
@@ -820,7 +827,26 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
             // path already does, closes that gap unconditionally rather
             // than relying on the negative-404 TTL alone.
             if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
-              self->m_cache.invalidate(cacheKey);
+              const AssetCache::InvalidateResult invalidateResult =
+                  self->m_cache.invalidate(cacheKey);
+              if (invalidateResult ==
+                  AssetCache::InvalidateResult::PersistenceFailed) {
+                // Round-6 item 6: do not accept invalidation failure --
+                // recording a negative-404 here anyway would let the
+                // stale, still-live entry this invalidate() call could
+                // not durably tombstone resurface once that record's
+                // bounded TTL expired, since it was never actually
+                // confirmed gone. Fail this operation closed with a
+                // typed, observable error instead of silently treating
+                // the 404 as fully applied.
+                self->completeOperation(
+                    operationId,
+                    AssetOutcome<AssetCache::CachedEntry>(AssetError{
+                        AssetErrorCode::CachePersistenceFailed,
+                        QStringLiteral("failed to durably invalidate a "
+                                       "definitively 404'd cache entry")}));
+                return;
+              }
               self->recordNegative404(cacheKey, expectedGeneration);
             }
             if (operation.candidateIndex + 1 < operation.candidates.size()) {
@@ -942,7 +968,22 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         // or negative-cache over it.
         if (!result && result.error().code == AssetErrorCode::NotFound) {
           if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
-            self->m_cache.invalidate(cacheKey);
+            const AssetCache::InvalidateResult invalidateResult =
+                self->m_cache.invalidate(cacheKey);
+            if (invalidateResult ==
+                AssetCache::InvalidateResult::PersistenceFailed) {
+              // Round-6 item 6: see the identical comment in
+              // startCandidate()'s NotFound handler -- do not accept
+              // invalidation failure by recording a negative-404 over an
+              // entry that was never actually confirmed durably gone.
+              self->completeOperation(
+                  operationId,
+                  AssetOutcome<AssetCache::CachedEntry>(AssetError{
+                      AssetErrorCode::CachePersistenceFailed,
+                      QStringLiteral("failed to durably invalidate a "
+                                     "definitively 404'd cache entry")}));
+              return;
+            }
             self->recordNegative404(cacheKey, expectedGeneration);
           }
           if (operation.candidateIndex + 1 < operation.candidates.size()) {

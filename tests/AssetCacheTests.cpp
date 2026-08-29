@@ -1727,3 +1727,35 @@ void AssetCacheTests::
   QVERIFY(QFileInfo::exists(bindSource + QStringLiteral("/sentinel.bin")));
 #endif
 }
+
+void AssetCacheTests::
+    invalidateReportsPersistenceFailedWhenManifestUnlinkFails() {
+  // Round-6 item 6: invalidate()'s durable-tombstone guarantee is only
+  // meaningful if a genuine failure to commit it is actually reported,
+  // rather than the caller being told "done" regardless. Force the
+  // manifest unlink to fail the same deterministic way
+  // failedEvictionDeletionLeavesEntryCountedAsStillOccupyingSpace() does
+  // (revoke write permission on the containing directory).
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/undeletable.png")));
+  {
+    AssetCache cache(configFor(m_tempDirPath));
+    cache.store(key, makeEntry(QByteArray(64, 'x')));
+  }
+  QVERIFY(QFileInfo::exists(
+      AssetCache::manifestPathForTesting(m_tempDirPath, key)));
+
+  struct ScopedDirectoryPermissionLock {
+    QString path;
+    ~ScopedDirectoryPermissionLock() {
+      QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner |
+                                      QFile::ExeOwner);
+    }
+  } permissionGuard{m_tempDirPath};
+  QVERIFY(QFile::setPermissions(
+      m_tempDirPath, QFile::ReadOwner | QFile::ExeOwner)); // r-x, no write
+
+  AssetCache cache(configFor(m_tempDirPath));
+  QCOMPARE(cache.invalidate(key),
+           AssetCache::InvalidateResult::PersistenceFailed);
+}

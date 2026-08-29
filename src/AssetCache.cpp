@@ -1355,9 +1355,13 @@ AssetCache::readMetadata(const QString &metadataFilePath,
 #endif
 }
 
-bool AssetCache::deleteEntry(const QString &key) const {
+AssetCache::DeleteEntryOutcome
+AssetCache::deleteEntry(const QString &key) const {
   if (m_diskCacheDisabled || !verifyRootAnchorLocked()) {
-    return true; // nothing to delete when disk I/O is disabled entirely
+    // Nothing to delete when disk I/O is disabled entirely -- vacuously
+    // both "everything reclaimed" and "manifest durably absent" (there
+    // is no disk to hold one).
+    return {true, true};
   }
   // Review item 8: `key` no longer maps to a fixed pair of filenames --
   // reclaim EVERY file this cache could ever have written for it (the
@@ -1372,23 +1376,48 @@ bool AssetCache::deleteEntry(const QString &key) const {
   // path.
 #if defined(Q_OS_UNIX)
   if (m_rootFd < 0) {
-    return true;
+    return {true, true};
   }
   const QStringList matches = listNamesWithPrefixRelative(m_rootFd, key + u'.');
+  const QString manifestName = manifestPath(key);
+
+  // Round-6 item 6: the manifest is the ONE file whose presence/absence
+  // actually decides whether a future lookup can ever find this key
+  // again -- every other matched file is only reachable BY WAY OF the
+  // manifest naming its generation (see readManifestGeneration()).
+  // Unlink it, and only it, first; then fsync the root directory so that
+  // unlink is durable before this function does anything else. A crash
+  // at any point after this fsync returns leaves the manifest genuinely
+  // gone, even if the process never gets to reclaim the generation
+  // files below (those become ordinary orphans reapAndEnforceQuota()
+  // already knows how to reclaim later).
+  bool manifestRemoveOk = true;
+  bool manifestFsyncOk = true;
+  if (matches.contains(manifestName)) {
+    manifestRemoveOk = removeFileRelative(m_rootFd, manifestName);
+    if (manifestRemoveOk) {
+      manifestFsyncOk = fsyncRootLocked();
+    }
+  }
+  const bool manifestDurablyAbsent = manifestRemoveOk && manifestFsyncOk;
+
   // Review item 11: report whether EVERY matched file was actually
   // removed. A failed unlink (e.g. a permission error, or -- in tests --
   // a directory planted at the same path) means this key's disk
   // footprint was NOT fully reclaimed; a caller doing quota accounting
   // must not credit itself with bytes that are still genuinely occupied.
-  bool allRemoved = true;
+  bool allRemoved = manifestRemoveOk;
   for (const QString &name : matches) {
+    if (name == manifestName) {
+      continue; // already handled, durably, above
+    }
     if (!removeFileRelative(m_rootFd, name)) {
       allRemoved = false;
     }
   }
-  return allRemoved;
+  return {allRemoved, manifestDurablyAbsent};
 #else
-  return true;
+  return {true, true};
 #endif
 }
 
@@ -1844,13 +1873,15 @@ void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
                    static_cast<qsizetype>(heapEntry->costBytes()));
 }
 
-void AssetCache::invalidate(const QString &key) {
+AssetCache::InvalidateResult AssetCache::invalidate(const QString &key) {
   if (!isValidKey(key)) {
-    return;
+    return InvalidateResult::DurablyInvalidated;
   }
   QMutexLocker locker(&m_mutex);
   m_memory->remove(key);
-  (void)deleteEntry(key);
+  const DeleteEntryOutcome outcome = deleteEntry(key);
+  return outcome.manifestDurablyAbsent ? InvalidateResult::DurablyInvalidated
+                                       : InvalidateResult::PersistenceFailed;
 }
 
 void AssetCache::reapAndEnforceQuota() {
@@ -2141,7 +2172,7 @@ void AssetCache::reapAndEnforceQuota() {
     // fact, still fully valid on disk) -- moving on to the next
     // candidate rather than looping forever on the one that can't be
     // reclaimed.
-    if (deleteEntry(e.key)) {
+    if (deleteEntry(e.key).allFilesReclaimed) {
       m_memory->remove(e.key);
       totalBytes -= e.totalBytes;
     }
