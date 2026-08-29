@@ -202,10 +202,13 @@ def _resolve_schema_ref(schema_path: str, ref: str) -> str | None:
     # this makes the "./nested.schema.json"-style refs actually present in
     # the real backend schemas (e.g. game-list.schema.json's
     # "$ref": "./game-state.schema.json") resolve deterministically
-    # without depending on pathlib join internals. ".." is rejected above
-    # from the *raw* file_part before this call, so normpath here can only
-    # ever collapse a redundant "./", never silently normalize away an
-    # attempted directory-traversal escape.
+    # without depending on pathlib join internals. The ".." check just
+    # below inspects the *raw* (pre-normpath) file_part's path parts
+    # directly, so it independently catches any traversal attempt
+    # regardless of its ordering relative to this normpath() call --
+    # normpath() itself is only ever used to collapse a redundant "./"
+    # for the containment check further down, and is never relied upon
+    # to normalize away an attempted directory-traversal escape.
     normalized = posixpath.normpath(resolved)
     parts = Path(file_part).parts
     if ".." in parts:
