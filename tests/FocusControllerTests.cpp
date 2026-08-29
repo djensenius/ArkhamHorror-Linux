@@ -65,6 +65,7 @@ private slots:
   restoreSnapshotAlwaysWritesZoneMemoryForTheTargetEvenWhenAlreadyFocused();
   void
   removedEmptyZoneIsPrunedFromCycleOrderAndReappearsAtTheEndIfReintroduced();
+  void reregisteringANodeIntoADifferentZonePrunesTheOldZoneOnceItIsEmpty();
 };
 
 void FocusControllerTests::movesFocusAlongExplicitAdjacency() {
@@ -580,6 +581,59 @@ void FocusControllerTests::
   QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
   QVERIFY(controller.cycleZone(true)); // log -> hand (re-appended at the end)
   QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card3"));
+}
+
+void FocusControllerTests::
+    reregisteringANodeIntoADifferentZonePrunesTheOldZoneOnceItIsEmpty() {
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("log.entry"), QStringLiteral("log"), {}});
+  controller.setInitialFocus(QStringLiteral("board.nw"));
+
+  // zoneOrder_ so far: [board, hand, log].
+  QVERIFY(controller.cycleZone(true)); // board -> hand
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  QVERIFY(controller.cycleZone(true)); // hand -> log
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(true)); // log -> board (wraps)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Re-register hand's only node under a brand-new "archive" zone
+  // instead of removing it outright: this must empty "hand" exactly
+  // like removeNode() would, and prune it from the cycle order the same
+  // way -- not merely leave a stale, permanently-empty "hand" entry
+  // sitting in zoneOrder_ forever.
+  controller.registerNode(FocusNodeSpec{
+      QStringLiteral("hand.card1"), QStringLiteral("archive"), {}});
+
+  // zoneOrder_ must now be [board, log, archive] -- "hand" pruned,
+  // "archive" appended at the end -- not [board, hand, log, archive]
+  // with a dead "hand" entry still occupying its old slot.
+  QVERIFY(controller.cycleZone(true)); // board -> log
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(true)); // log -> archive
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  QVERIFY(controller.cycleZone(true)); // archive -> board (wraps)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Registering a brand-new node under the now-pruned "hand" zone id
+  // must be treated as a fresh zone, appended at the *current* end of
+  // the order (after "archive"), not reinserted at "hand"'s original
+  // position right after "board" -- proving the old "hand" entry was
+  // truly pruned, not merely bypassed.
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card2"), QStringLiteral("hand"), {}});
+  QVERIFY(controller.cycleZone(true)); // board -> log
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(true)); // log -> archive
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  QVERIFY(controller.cycleZone(true)); // archive -> hand (re-appended at end)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card2"));
+  QVERIFY(controller.cycleZone(true)); // hand -> board (wraps)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
 }
 
 QTEST_APPLESS_MAIN(FocusControllerTests)

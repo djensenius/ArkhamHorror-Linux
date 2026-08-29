@@ -105,7 +105,13 @@ public:
   // conflict ("tie") between two registrations for the same id is
   // resolved. Registering a node already tracked as a zone's
   // last-focused entry has no separate special case: that memory simply
-  // continues to refer to the same id, now with its new adjacency.
+  // continues to refer to the same id, now with its new adjacency. If
+  // this re-registration moves the node OUT of its previous zone (a
+  // different zoneId than before) and that was the zone's last member,
+  // the old zone id is pruned from the internal zone-cycle order, exactly
+  // like removeNode() below -- re-registering a node into a new zone must
+  // uphold the same "zoneOrder_ never retains an empty zone" invariant as
+  // actually removing it.
   void registerNode(const FocusNodeSpec &spec);
 
   // Removes |id| from the graph. If it was the current focus, focus falls
@@ -200,6 +206,13 @@ private:
   [[nodiscard]] std::optional<QString>
   resolveRemovalFallback(const QString &removedId, const Node &removedNode,
                          const QString &explicitFallbackId) const;
+  // Removes |zoneId| from zoneOrder_ if (and only if) no node currently
+  // in |nodes_| belongs to it. Shared by removeNode() (a node's removal
+  // may empty its zone) and registerNode() (re-registering an existing
+  // node under a *different* zoneId may empty its *old* zone) so both
+  // paths uphold the same "zoneOrder_ never retains an empty zone"
+  // invariant documented on removeNode().
+  void pruneZoneIfEmpty(const QString &zoneId);
 };
 
 } // namespace Arkham

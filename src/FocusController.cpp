@@ -20,6 +20,11 @@ void FocusController::setGeometryFallback(GeometryFallback fallback) {
 }
 
 void FocusController::registerNode(const FocusNodeSpec &spec) {
+  const auto existing = nodes_.constFind(spec.id);
+  const bool wasRegistered = existing != nodes_.constEnd();
+  const QString previousZoneId =
+      wasRegistered ? existing.value().zoneId : QString();
+
   Node node;
   node.zoneId = spec.zoneId;
   node.neighbors = spec.neighbors;
@@ -29,15 +34,22 @@ void FocusController::registerNode(const FocusNodeSpec &spec) {
   // node's position in its zone's deterministic ordering (used by
   // wrap-around and cycleZone) never shifts just because it was updated
   // in place.
-  const auto existing = nodes_.constFind(spec.id);
-  node.registrationOrder = existing != nodes_.constEnd()
-                               ? existing.value().registrationOrder
-                               : nextRegistrationOrder_++;
+  node.registrationOrder = wasRegistered ? existing.value().registrationOrder
+                                         : nextRegistrationOrder_++;
 
   nodes_.insert(spec.id, node);
 
   if (!zoneOrder_.contains(spec.zoneId)) {
     zoneOrder_.push_back(spec.zoneId);
+  }
+
+  // If this re-registration moved the node out of a different previous
+  // zone, that old zone may now be empty; prune it just like removeNode()
+  // does, so zoneOrder_ never retains a zone with no member nodes
+  // regardless of whether it emptied via removal or via re-registration
+  // into a new zone.
+  if (wasRegistered && previousZoneId != spec.zoneId) {
+    pruneZoneIfEmpty(previousZoneId);
   }
 }
 
@@ -57,13 +69,7 @@ void FocusController::removeNode(const QString &id, const QString &fallbackId) {
   // brand-new zone appended at the current end of zoneOrder_ -- exactly
   // like any other zone id seen for the first time -- rather than trying
   // to reinsert it at its old position.
-  const bool zoneStillHasNodes = std::any_of(
-      nodes_.constBegin(), nodes_.constEnd(), [&removedNode](const Node &node) {
-        return node.zoneId == removedNode.zoneId;
-      });
-  if (!zoneStillHasNodes) {
-    zoneOrder_.removeAll(removedNode.zoneId);
-  }
+  pruneZoneIfEmpty(removedNode.zoneId);
 
   for (auto zoneIt = zoneLastFocused_.begin();
        zoneIt != zoneLastFocused_.end();) {
@@ -335,6 +341,15 @@ void FocusController::setCurrentFocus(const QString &id) {
   // for their own invocation.
   const QString emittedId = currentFocusId_;
   emit currentFocusChanged(emittedId);
+}
+
+void FocusController::pruneZoneIfEmpty(const QString &zoneId) {
+  const bool zoneStillHasNodes = std::any_of(
+      nodes_.constBegin(), nodes_.constEnd(),
+      [&zoneId](const Node &node) { return node.zoneId == zoneId; });
+  if (!zoneStillHasNodes) {
+    zoneOrder_.removeAll(zoneId);
+  }
 }
 
 QVector<QString> FocusController::nodesInZone(const QString &zoneId) const {
