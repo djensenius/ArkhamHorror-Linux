@@ -58,6 +58,16 @@ private slots:
   // Round-3 item 9: root replaced (renamed away + a new directory
   // created at the same path) strictly AFTER construction.
   void rootReplacedAfterConstructionPermanentlyDisablesDiskIoForBothTargets();
+  // Round-4/5 review item 3: a MEMORY hit's recency bump must be exactly
+  // as anchor-verified as any other disk-touching operation.
+  void
+  memoryHitRecencyBumpAfterRootReplacementNeverTouchesReplacementDirectory();
+
+  // Round-4/5 review item 4: the on-disk generation identifier is an
+  // independently-minted token, decoupled from the payload's own
+  // content hash -- two byte-identical stores must not collapse onto
+  // the same generation filename.
+  void identicalPayloadReplacementMintsANewGenerationEachTime();
 
   // Round-3 item 8: metadata numeric-field cast safety.
   void metadataWithImpossibleNumericFieldsIsRejectedAndQuarantined();

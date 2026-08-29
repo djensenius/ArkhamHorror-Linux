@@ -69,6 +69,13 @@ void writeRawMetadataForTesting(const QString &metadataPath, const QString &key,
   obj[QStringLiteral("width")] = 1;
   obj[QStringLiteral("height")] = 1;
   obj[QStringLiteral("sha256")] = generation;
+  // Round-4/5 review item 4: `generationId` is the SEPARATE
+  // self-consistency witness cross-checked against the generation named
+  // by this filename/the manifest (see DiskMetadata::generationId's
+  // comment) -- callers of this helper always pass the exact generation
+  // this synthetic file is meant to represent, so it belongs here too,
+  // not just in `sha256`.
+  obj[QStringLiteral("generationId")] = generation;
   obj[QStringLiteral("etag")] = QString();
   obj[QStringLiteral("lastModified")] = QString();
   obj[QStringLiteral("insertedAtMs")] = QDateTime::currentMSecsSinceEpoch();
@@ -166,12 +173,18 @@ void AssetCacheTests::mismatchedPayloadMetadataPairIsRepaired() {
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/mismatch.png")));
   const QByteArray originalBytes = QByteArrayLiteral("original-bytes");
-  const QString generation = QString::fromLatin1(
-      QCryptographicHash::hash(originalBytes, QCryptographicHash::Sha256)
-          .toHex());
+  QString generation;
   {
     AssetCache cache(configFor(m_tempDirPath));
     cache.store(key, makeEntry(originalBytes));
+    // Round-4/5 review item 4: the generation identifier is an
+    // independently-minted opaque token, no longer sha256(payload
+    // bytes) -- discover the REAL one store() actually produced rather
+    // than assuming it.
+    const std::optional<QString> actualGeneration =
+        cache.currentGenerationForTesting(key);
+    QVERIFY(actualGeneration.has_value());
+    generation = *actualGeneration;
   }
 
   // Tamper with the LIVE generation's payload on disk directly,
@@ -244,14 +257,27 @@ void AssetCacheTests::
       QUrl(QStringLiteral("https://example.com/replace-before-swap.png")));
   const QByteArray bytesA = QByteArrayLiteral("generation-a-bytes");
   const QByteArray bytesB = QByteArrayLiteral("generation-b-bytes-different");
-  const QString generationA = QString::fromLatin1(
-      QCryptographicHash::hash(bytesA, QCryptographicHash::Sha256).toHex());
-  const QString generationB = QString::fromLatin1(
-      QCryptographicHash::hash(bytesB, QCryptographicHash::Sha256).toHex());
+  QString generationA;
   {
     AssetCache cache(configFor(m_tempDirPath));
     cache.store(key, makeEntry(bytesA));
+    // Round-4/5 review item 4: the generation identifier is an
+    // independently-minted opaque token, no longer sha256(payload
+    // bytes) -- discover the REAL one store() actually produced rather
+    // than assuming it.
+    const std::optional<QString> actualGenerationA =
+        cache.currentGenerationForTesting(key);
+    QVERIFY(actualGenerationA.has_value());
+    generationA = *actualGenerationA;
   }
+  // An arbitrary (but validly-shaped) generation identifier for the
+  // synthetic "replacement" pair planted directly below -- content
+  // hashes have no special meaning to the generation namespace anymore,
+  // this is just a convenient 64-hex string, guaranteed distinct from
+  // whatever store() minted for A above.
+  const QString generationB = QString::fromLatin1(
+      QCryptographicHash::hash(bytesB, QCryptographicHash::Sha256).toHex());
+  QVERIFY(generationB != generationA);
 
   const QString payloadPathB =
       AssetCache::payloadPathForTesting(m_tempDirPath, key, generationB);
@@ -291,14 +317,23 @@ void AssetCacheTests::
       QUrl(QStringLiteral("https://example.com/replace-after-swap.png")));
   const QByteArray bytesA = QByteArrayLiteral("generation-a-bytes");
   const QByteArray bytesB = QByteArrayLiteral("generation-b-bytes-different");
-  const QString generationA = QString::fromLatin1(
-      QCryptographicHash::hash(bytesA, QCryptographicHash::Sha256).toHex());
-  const QString generationB = QString::fromLatin1(
-      QCryptographicHash::hash(bytesB, QCryptographicHash::Sha256).toHex());
+  QString generationA;
   {
     AssetCache cache(configFor(m_tempDirPath));
     cache.store(key, makeEntry(bytesA));
+    // Round-4/5 review item 4: discover the REAL generation identifier
+    // store() minted for A -- see the previous test's identical comment.
+    const std::optional<QString> actualGenerationA =
+        cache.currentGenerationForTesting(key);
+    QVERIFY(actualGenerationA.has_value());
+    generationA = *actualGenerationA;
   }
+  // An arbitrary (but validly-shaped) generation identifier for the
+  // synthetic replacement pair planted directly below, guaranteed
+  // distinct from whatever store() minted for A above.
+  const QString generationB = QString::fromLatin1(
+      QCryptographicHash::hash(bytesB, QCryptographicHash::Sha256).toHex());
+  QVERIFY(generationB != generationA);
 
   const QString payloadPathB =
       AssetCache::payloadPathForTesting(m_tempDirPath, key, generationB);
@@ -496,6 +531,10 @@ void AssetCacheTests::
   obj[QStringLiteral("width")] = 1;
   obj[QStringLiteral("height")] = 1;
   obj[QStringLiteral("sha256")] = sha256Hex;
+  // Round-4/5 review item 4: the separate self-consistency witness,
+  // matching this metadata's own filename-embedded generation -- see
+  // DiskMetadata::generationId's comment.
+  obj[QStringLiteral("generationId")] = sha256Hex;
   obj[QStringLiteral("etag")] = QString();
   obj[QStringLiteral("lastModified")] = QString();
   obj[QStringLiteral("insertedAtMs")] = QDateTime::currentMSecsSinceEpoch();
@@ -615,6 +654,124 @@ void AssetCacheTests::
   QVERIFY(freshCacheOverOriginal.lookupDisk(existingKey).has_value());
   QCOMPARE(freshCacheOverOriginal.lookupDisk(existingKey)->encodedBytes,
            QByteArrayLiteral("pre-replacement-bytes"));
+}
+
+void AssetCacheTests::
+    memoryHitRecencyBumpAfterRootReplacementNeverTouchesReplacementDirectory() {
+  // Round-4/5 review item 3: touchAccessRecencyLocked() (reached via a
+  // pure MEMORY hit through lookupMemory(), never lookupDisk()) was
+  // previously missing its own verifyRootAnchorLocked() call entirely,
+  // so a memory-hit-triggered "bump this key's persisted recency"
+  // write could proceed even after the root directory had been
+  // replaced post-construction -- writing into whatever NEW object now
+  // sits at the same path. This proves the fix: a memory hit still
+  // succeeds (the memory cache itself is never anchor-gated), but the
+  // recency bump it triggers must detect the replacement and touch
+  // nothing in the replacement directory at all.
+  const QString cacheRoot =
+      m_tempDirPath + QStringLiteral("/memory-hit-cache-root");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("memory-hit-cache-root")));
+
+  AssetCache cache(configFor(cacheRoot));
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/memory-hit-recency.png")));
+  cache.store(key, makeEntry(QByteArrayLiteral("memory-hit-recency-bytes")));
+  QVERIFY(cache.lookupDisk(key).has_value()); // resident in memory now too
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  // Replace the root exactly as
+  // rootReplacedAfterConstructionPermanentlyDisablesDiskIoForBothTargets()
+  // does: rename the original away, create an empty directory at the
+  // exact same path, plant a sentinel file in it.
+  const QString renamedAwayRoot =
+      m_tempDirPath + QStringLiteral("/memory-hit-cache-root-renamed-away");
+  QVERIFY(QDir().rename(cacheRoot, renamedAwayRoot));
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("memory-hit-cache-root")));
+  const QString replacementSentinel =
+      cacheRoot + QStringLiteral("/replacement-sentinel.txt");
+  {
+    QFile file(replacementSentinel);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("untouched-by-any-memory-hit-recency-bump"));
+  }
+
+  // A pure memory hit: the entry is still resident in-process, so this
+  // must succeed and return the correct bytes regardless of what has
+  // happened to the disk root.
+  const auto memoryHit = cache.lookupMemory(key);
+  QVERIFY(memoryHit.has_value());
+  QCOMPARE(memoryHit->encodedBytes,
+           QByteArrayLiteral("memory-hit-recency-bytes"));
+
+  // The recency bump this memory hit triggers must have detected the
+  // anchor mismatch and disabled disk I/O -- never having written
+  // anything into the replacement directory.
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+  QDir replacementListing(cacheRoot);
+  QCOMPARE(replacementListing.entryList(QDir::Files),
+           QStringList{"replacement-sentinel.txt"});
+  {
+    QFile file(replacementSentinel);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(),
+             QByteArrayLiteral("untouched-by-any-memory-hit-recency-bump"));
+  }
+
+  // The ORIGINAL (renamed-away) directory must also remain exactly as
+  // it was: still holding the entry with its ORIGINAL access sequence,
+  // never touched by the memory hit's (correctly aborted) recency bump.
+  AssetCache freshCacheOverOriginal(configFor(renamedAwayRoot));
+  QVERIFY(freshCacheOverOriginal.lookupDisk(key).has_value());
+  QCOMPARE(freshCacheOverOriginal.lookupDisk(key)->encodedBytes,
+           QByteArrayLiteral("memory-hit-recency-bytes"));
+}
+
+void AssetCacheTests::identicalPayloadReplacementMintsANewGenerationEachTime() {
+  // Round-4/5 review item 4 (HIGH): the generation identifier is now an
+  // independently-minted opaque token (mintGenerationIdLocked()), never
+  // derived from the payload's own content hash. Two SEPARATE store()
+  // calls for the same key with BYTE-IDENTICAL content must therefore
+  // still produce two DIFFERENT generation filenames -- proving a
+  // same-bytes refresh can never collapse onto (and thus risk
+  // overwriting/rewriting) whatever generation filename an EARLIER
+  // store of the exact same content already published, which would
+  // otherwise let a failed second publish's cleanup delete what is
+  // actually still the first, live, already-served generation.
+  AssetCache cache(configFor(m_tempDirPath));
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/identical-payload.png")));
+  const QByteArray bytes = QByteArrayLiteral("byte-identical-payload-content");
+
+  cache.store(key, makeEntry(bytes));
+  const std::optional<QString> generationAfterFirstStore =
+      cache.currentGenerationForTesting(key);
+  QVERIFY(generationAfterFirstStore.has_value());
+  const QString payloadPathAfterFirstStore = AssetCache::payloadPathForTesting(
+      m_tempDirPath, key, *generationAfterFirstStore);
+  QVERIFY(QFile::exists(payloadPathAfterFirstStore));
+
+  // A second, entirely independent store() call for the SAME key with
+  // the EXACT same bytes -- an ordinary "re-fetched and re-validated
+  // the same content" cache refresh.
+  cache.store(key, makeEntry(bytes));
+  const std::optional<QString> generationAfterSecondStore =
+      cache.currentGenerationForTesting(key);
+  QVERIFY(generationAfterSecondStore.has_value());
+
+  QVERIFY2(*generationAfterFirstStore != *generationAfterSecondStore,
+           "identical payload bytes must never collapse onto the same "
+           "generation identifier");
+
+  // Normal post-publish cleanup still reclaims the now-superseded FIRST
+  // generation's files -- exactly the ordinary replacement path, not a
+  // crash scenario -- leaving exactly the second generation live.
+  QVERIFY(!QFile::exists(payloadPathAfterFirstStore));
+  QVERIFY(QFile::exists(AssetCache::payloadPathForTesting(
+      m_tempDirPath, key, *generationAfterSecondStore)));
+
+  const auto hit = cache.lookupDisk(key);
+  QVERIFY(hit.has_value());
+  QCOMPARE(hit->encodedBytes, bytes);
 }
 
 void AssetCacheTests::strayFileNotMatchingKeyShapeIsRemoved() {

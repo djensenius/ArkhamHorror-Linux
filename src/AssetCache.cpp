@@ -3,14 +3,13 @@
 #include <QCache>
 #include <QCryptographicHash>
 #include <QDir>
-#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMutexLocker>
+#include <QRandomGenerator>
 #include <QRegularExpression>
-#include <QSaveFile>
 #include <QSet>
 #include <QStandardPaths>
 #include <algorithm>
@@ -42,7 +41,7 @@ constexpr double kLowWaterMarkFraction = 0.75;
 // that same ceiling here, independent of whatever either on-disk file
 // claims about its own size, means a corrupted, truncated, or
 // locally-planted payload/metadata pair can never trigger an unbounded
-// read-back allocation -- see readVerifiedPayload() below.
+// read-back allocation -- see readExactSizeVerifiedRelative() below.
 constexpr qint64 kMaxSinglePayloadBytesOnDisk = 20LL * 1024 * 1024;
 
 // A legitimate metadata JSON file (see writeMetadata()) holds only a
@@ -110,22 +109,303 @@ readBoundedNonNegativeIntegerField(const QJsonValue &value, qint64 maxBound) {
 // lets a file that grew past the expected size be rejected by comparing
 // the actual byte count read against `expectedSize`, without ever
 // allocating for more than `expectedSize + 1` bytes regardless of what
-// the file claims or how large it has become.
-std::optional<QByteArray> readVerifiedPayload(QFile &payloadFile,
-                                              qint64 expectedSize) {
-  if (expectedSize < 0 || expectedSize > kMaxSinglePayloadBytesOnDisk ||
-      payloadFile.size() != expectedSize) {
+// the file claims or how large it has become. (This QFile-based version
+// previously lived here; round-4/5 review item 3 replaces every
+// production use of it with the fd-relative
+// readExactSizeVerifiedRelative() below, which applies exactly this same
+// size-drift-detection policy without ever reopening a path.)
+
+#if defined(Q_OS_UNIX)
+// Round-4/5 review item 3: the fd-relative I/O primitives below are the
+// ONLY way this class ever reads, writes, renames, or unlinks a file
+// once `m_rootFd` has been established at construction. Every one of
+// them takes `dirFd` (always `m_rootFd`) and a bare filename, and
+// resolves that name via openat()/fstatat()/renameat()/unlinkat() --
+// NEVER by concatenating it onto `m_directory` and reopening the result
+// via QFile/QSaveFile/QDir, which would re-resolve the path from the
+// filesystem root and reintroduce exactly the TOCTOU window a retained
+// descriptor exists to close (verifyRootAnchorLocked() becoming "only a
+// witness" that checked a path an unrelated later open/rename/unlink
+// call never actually used). `expectedDevice` (always `m_rootDevice`) is
+// independently re-checked via fstat() on the FILE DESCRIPTOR actually
+// opened (never a second path-based stat) before any content is
+// trusted, rejecting a child that has been replaced by a different
+// mounted filesystem (a bind mount, or any other device swapped in
+// under the cache root after construction) -- see the class comment's
+// mount-escape rationale.
+
+// Verifies (via fstatat with AT_SYMLINK_NOFOLLOW -- an lstat
+// equivalent) that `name` exists directly under `dirFd`. Returns the
+// stat buffer on success; used by callers that need to classify an
+// entry (regular file vs. directory vs. symlink node) without ever
+// resolving through a final symlink component.
+bool fstatRelativeNoFollow(int dirFd, const char *name, struct stat &outSt) {
+  return fstatat(dirFd, name, &outSt, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+// Opens `name` relative to `dirFd` for reading, verifying (via fstat on
+// the RESULTING DESCRIPTOR -- never a second path-based stat) that what
+// was actually opened is a regular file living on the SAME device as
+// `expectedDevice`. O_NOFOLLOW means a symlink node is refused outright
+// (ELOOP) rather than silently followed; the device check rejects a
+// child that resolves onto a different mounted filesystem than the
+// cache root itself. Returns -1 (with no fd left open) on any failure.
+int openRegularNoFollowRelative(int dirFd, const QByteArray &nameUtf8,
+                                quint64 expectedDevice) {
+  const int fd =
+      openat(dirFd, nameUtf8.constData(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  struct stat st {};
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+      static_cast<quint64>(st.st_dev) != expectedDevice) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+// A filesystem-safe, collision-resistant temporary filename for an
+// atomic write of `finalName`, drawn from QRandomGenerator::system() --
+// a real OS entropy source (unlike the seeded, reproducible
+// QRandomGenerator::global()) -- so two writers targeting the same
+// final name can never collide on the temp name itself, even though
+// this class's own m_mutex already serializes access from within one
+// process.
+QString temporaryNameFor(const QString &finalName) {
+  quint64 entropy[2] = {0, 0};
+  QRandomGenerator::system()->fillRange(entropy, 2);
+  return u'.' + finalName + ".tmp-"_L1 + QString::number(entropy[0], 16) +
+         QString::number(entropy[1], 16);
+}
+
+// The fd-relative equivalent of QSaveFile: writes `bytes` to a brand-new
+// temp file relative to `dirFd`, optionally fsyncs its content (see
+// `durable`), then atomically renames it onto `finalName` (also
+// relative to `dirFd`, via renameat -- never a path re-resolved from
+// the filesystem root). QSaveFile itself has no API to target an
+// already-open directory descriptor, only a path, which is exactly the
+// "reopens the path" gap review round-4/5 item 3 requires closing. On
+// ANY failure, a temp file that was actually created is unlinked before
+// returning false, so a failed write never leaves debris behind for the
+// reap sweep to have to clean up later (though it safely would).
+bool writeFileAtomicRelative(int dirFd, const QString &finalName,
+                             const QByteArray &bytes, bool durable) {
+  const QString tempName = temporaryNameFor(finalName);
+  const QByteArray tempNameUtf8 = tempName.toUtf8();
+  const int fd =
+      openat(dirFd, tempNameUtf8.constData(),
+             O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return false;
+  }
+  const char *data = bytes.constData();
+  qint64 remaining = bytes.size();
+  bool writeOk = true;
+  while (remaining > 0) {
+    const ssize_t n = ::write(fd, data, static_cast<size_t>(remaining));
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      writeOk = false;
+      break;
+    }
+    data += n;
+    remaining -= n;
+  }
+  if (writeOk && durable) {
+    writeOk = ::fsync(fd) == 0;
+  }
+  ::close(fd);
+  if (!writeOk) {
+    unlinkat(dirFd, tempNameUtf8.constData(), 0);
+    return false;
+  }
+  const QByteArray finalNameUtf8 = finalName.toUtf8();
+  if (renameat(dirFd, tempNameUtf8.constData(), dirFd,
+               finalNameUtf8.constData()) != 0) {
+    unlinkat(dirFd, tempNameUtf8.constData(), 0);
+    return false;
+  }
+  return true;
+}
+
+// Reads at most `maxBytes + 1` bytes of `name` relative to `dirFd`,
+// rejecting anything that isn't a regular, same-device file (see
+// openRegularNoFollowRelative()) and anything whose actual read byte
+// count exceeds `maxBytes`. Used for manifest/metadata reads, where the
+// exact expected size isn't known ahead of time -- only a sane upper
+// bound.
+std::optional<QByteArray> readBoundedRelative(int dirFd, quint64 expectedDevice,
+                                              const QString &name,
+                                              qint64 maxBytes) {
+  const QByteArray nameUtf8 = name.toUtf8();
+  const int fd = openRegularNoFollowRelative(dirFd, nameUtf8, expectedDevice);
+  if (fd < 0) {
     return std::nullopt;
   }
-  const QByteArray bytes = payloadFile.read(expectedSize + 1);
-  if (bytes.size() != expectedSize) {
-    // Either short (truncated mid-read) or exactly expectedSize + 1 (the
-    // file grew since the size() check above) -- neither is the exact,
-    // verified payload this cache promises to serve.
+  QByteArray buffer;
+  buffer.resize(static_cast<qsizetype>(maxBytes + 1));
+  qint64 total = 0;
+  bool ok = true;
+  while (total < buffer.size()) {
+    const ssize_t n = ::read(fd, buffer.data() + total,
+                             static_cast<size_t>(buffer.size() - total));
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      ok = false;
+      break;
+    }
+    if (n == 0) {
+      break; // EOF
+    }
+    total += n;
+  }
+  ::close(fd);
+  if (!ok || total > maxBytes) {
+    return std::nullopt;
+  }
+  buffer.resize(static_cast<qsizetype>(total));
+  return buffer;
+}
+
+// Reads exactly `expectedSize` bytes of `name` relative to `dirFd` (plus
+// one extra probe byte, applying the same size-drift-detection policy
+// documented above at readBoundedRelative()'s docstring predecessor: a
+// file that grew past `expectedSize` between an earlier stat and this
+// read is rejected by the resulting byte count, never trusted based on
+// a stale size() alone).
+std::optional<QByteArray> readExactSizeVerifiedRelative(int dirFd,
+                                                        quint64 expectedDevice,
+                                                        const QString &name,
+                                                        qint64 expectedSize,
+                                                        qint64 hardCap) {
+  if (expectedSize < 0 || expectedSize > hardCap) {
+    return std::nullopt;
+  }
+  const std::optional<QByteArray> bytes =
+      readBoundedRelative(dirFd, expectedDevice, name, expectedSize + 1);
+  if (!bytes || bytes->size() != expectedSize) {
     return std::nullopt;
   }
   return bytes;
 }
+
+// unlinkat relative to `dirFd`; tolerates an already-absent file (ENOENT)
+// as success, exactly like QFile::remove()'s callers in this file
+// already treat a missing file as "nothing left to do".
+bool removeFileRelative(int dirFd, const QString &name) {
+  const QByteArray nameUtf8 = name.toUtf8();
+  return unlinkat(dirFd, nameUtf8.constData(), 0) == 0 || errno == ENOENT;
+}
+
+// Opens a BRAND NEW file description for the same directory `dirFd`
+// already refers to, via `openat(dirFd, ".", ...)` -- resolved entirely
+// through the fd (never a path, so it cannot be tricked into a
+// different object even if some path once used to open `dirFd` has
+// since been replaced) -- rather than `dup(dirFd)`. This distinction
+// matters: POSIX `dup()` shares the underlying open file description,
+// INCLUDING its current read/seek offset, with the fd it was duplicated
+// from. A directory's "read position" for repeated readdir() calls is a
+// property of that shared offset, so two sequential dup()-based
+// listings of the SAME retained `dirFd` (e.g. one during
+// reapAndEnforceQuota()'s full sweep, immediately followed by another
+// inside deleteEntry()'s prefix scan while still holding `m_rootFd`)
+// would silently observe whatever position the FIRST listing already
+// advanced the shared offset to -- typically EOF -- causing the second
+// listing to spuriously enumerate zero entries. `openat(dirFd, ".")`
+// instead produces an independent, freshly-rewound file description
+// every time, exactly as if the directory had been opened again by
+// path, without ever re-resolving by path.
+int openFreshHandleToSameDirectory(int dirFd) {
+  return openat(dirFd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
+// Lists every immediate entry name directly under `dirFd` whose name
+// begins with `prefix`, via a fresh directory handle (see
+// openFreshHandleToSameDirectory()'s comment; never consuming the
+// caller's own `dirFd`, and never sharing its read offset). Used by
+// deleteEntry()'s name-prefix sweep, replacing a QDir::entryList() glob
+// that would otherwise re-resolve `m_directory` by path.
+QStringList listNamesWithPrefixRelative(int dirFd, const QString &prefix) {
+  QStringList names;
+  const int freshFd = openFreshHandleToSameDirectory(dirFd);
+  if (freshFd < 0) {
+    return names;
+  }
+  DIR *dirStream = fdopendir(freshFd);
+  if (!dirStream) {
+    ::close(freshFd);
+    return names;
+  }
+  errno = 0;
+  while (struct dirent *entry = readdir(dirStream)) {
+    if (qstrcmp(entry->d_name, ".") == 0 || qstrcmp(entry->d_name, "..") == 0) {
+      errno = 0;
+      continue;
+    }
+    const QString name = QString::fromUtf8(entry->d_name);
+    if (name.startsWith(prefix)) {
+      names.append(name);
+    }
+    errno = 0;
+  }
+  closedir(dirStream); // also closes freshFd
+  return names;
+}
+
+// One immediate entry under a directory, classified via a no-follow
+// fstatat -- reports the entry's OWN type, never resolving through a
+// final symlink component.
+struct RelativeDirEntry {
+  QString name;
+  bool isSymlinkNode{false};
+  bool isDirectory{false};
+  qint64 sizeBytes{0};
+};
+
+// Lists every immediate entry directly under `dirFd` (via a fresh
+// directory handle -- see openFreshHandleToSameDirectory()'s comment,
+// never consuming the caller's own `dirFd` or sharing its read offset),
+// classifying each one with fstatat(..., AT_SYMLINK_NOFOLLOW). Replaces
+// reapAndEnforceQuota()'s former QDir::entryList() listing, which
+// re-resolved `m_directory` by path for every call.
+std::vector<RelativeDirEntry> listAllEntriesRelative(int dirFd) {
+  std::vector<RelativeDirEntry> entries;
+  const int freshFd = openFreshHandleToSameDirectory(dirFd);
+  if (freshFd < 0) {
+    return entries;
+  }
+  DIR *dirStream = fdopendir(freshFd);
+  if (!dirStream) {
+    ::close(freshFd);
+    return entries;
+  }
+  errno = 0;
+  while (struct dirent *de = readdir(dirStream)) {
+    if (qstrcmp(de->d_name, ".") == 0 || qstrcmp(de->d_name, "..") == 0) {
+      errno = 0;
+      continue;
+    }
+    struct stat st {};
+    if (fstatat(dirFd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+      RelativeDirEntry entry;
+      entry.name = QString::fromUtf8(de->d_name);
+      entry.isSymlinkNode = S_ISLNK(st.st_mode);
+      entry.isDirectory = S_ISDIR(st.st_mode);
+      entry.sizeBytes = static_cast<qint64>(st.st_size);
+      entries.push_back(std::move(entry));
+    }
+    errno = 0;
+  }
+  closedir(dirStream); // also closes freshFd
+  return entries;
+}
+#endif // Q_OS_UNIX
 
 // A 64-character lowercase hex SHA-256 string -- the shape of both a
 // cache key (cacheKeyFor()) and a generation identifier (a payload's own
@@ -158,51 +438,15 @@ const QRegularExpression &generationMetadataNamePattern() {
   return re;
 }
 
-// Flushes `file`'s buffered writes and, on POSIX, fsyncs its underlying
-// descriptor BEFORE commit() performs the atomic rename that publishes
-// it -- so the rename that makes a new generation's (or the manifest's)
-// file visible can never be reordered, by the OS or a real power loss,
-// ahead of that file's own content actually reaching stable storage. On
-// a hypothetical non-POSIX build, this degrades to a plain flush (no
-// durability guarantee beyond whatever the OS itself provides for a
-// rename), which mirrors this codebase's existing safeRemoveTree()
-// POSIX-or-no-op precedent above.
-bool fsyncSaveFileBeforeCommit(QSaveFile &file) {
-  file.flush();
-#if defined(Q_OS_UNIX)
-  return ::fsync(static_cast<int>(file.handle())) == 0;
-#else
-  return true;
-#endif
-}
-
-// fsyncs the directory entry `dirPath` itself: on POSIX, a file rename
-// (as QSaveFile::commit() performs) is only durable across a crash once
-// the directory's own metadata update is flushed, independent of the
-// renamed file's own content already being synced (see
-// fsyncSaveFileBeforeCommit() above). Called once after the manifest
-// swap -- the single atomic pointer flip that actually publishes a new
-// generation -- commits, so that publication itself survives a crash
-// immediately following it. Review round-3 item 10: returns whether the
-// fsync itself actually succeeded (open+fsync both) -- a caller (store())
-// must NEVER proceed to reclaim the previous generation's files as if
-// publication were durable when this returns false; the previous
-// generation is the only durability hedge available at that point.
-bool fsyncDirectory(const QString &dirPath) {
-#if defined(Q_OS_UNIX)
-  const QByteArray dirUtf8 = QFile::encodeName(dirPath);
-  const int fd = ::open(dirUtf8.constData(), O_RDONLY | O_DIRECTORY);
-  if (fd < 0) {
-    return false;
-  }
-  const bool ok = ::fsync(fd) == 0;
-  ::close(fd);
-  return ok;
-#else
-  Q_UNUSED(dirPath);
-  return true;
-#endif
-}
+// (fsyncSaveFileBeforeCommit()/fsyncDirectory() previously lived here.
+// Round-4/5 review item 3 replaces every QSaveFile-based write with
+// writeFileAtomicRelative() above, which fsyncs its own file content
+// internally before its renameat() -- and the equivalent "fsync the
+// directory that just received a rename" step is now a direct
+// `::fsync(m_rootFd)` call (fsyncRootLocked(), defined with the rest of
+// this class's members below) rather than a function that reopens
+// `m_directory` by path, which was itself part of the "witness only"
+// gap this change closes.)
 
 // All disk-touching public entry points (lookupDisk(), store(),
 // touchAfterNotModified()) accept a caller-supplied key and use it,
@@ -245,9 +489,9 @@ QString defaultCacheDirectory() {
 // through, or touched in any way. A hard-linked regular file is just an
 // ordinary directory entry here: unlinkat() drops only that one link,
 // never recursing into or otherwise treating a hardlink specially.
-bool safeRemoveEntryAt(int parentFd, const char *name);
+bool safeRemoveEntryAt(int parentFd, const char *name, quint64 expectedDevice);
 
-bool safeRemoveDirectoryContentsAt(int dirFd) {
+bool safeRemoveDirectoryContentsAt(int dirFd, quint64 expectedDevice) {
   DIR *dirStream = fdopendir(dirFd);
   if (!dirStream) {
     ::close(dirFd);
@@ -259,7 +503,7 @@ bool safeRemoveDirectoryContentsAt(int dirFd) {
     if (qstrcmp(entry->d_name, ".") == 0 || qstrcmp(entry->d_name, "..") == 0) {
       continue;
     }
-    if (!safeRemoveEntryAt(dirFd, entry->d_name)) {
+    if (!safeRemoveEntryAt(dirFd, entry->d_name, expectedDevice)) {
       allOk = false;
     }
     errno = 0;
@@ -268,12 +512,26 @@ bool safeRemoveDirectoryContentsAt(int dirFd) {
   return allOk;
 }
 
-bool safeRemoveEntryAt(int parentFd, const char *name) {
+bool safeRemoveEntryAt(int parentFd, const char *name, quint64 expectedDevice) {
   struct stat st {};
   if (fstatat(parentFd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
     return errno == ENOENT; // already gone: nothing left to do
   }
   if (S_ISDIR(st.st_mode)) {
+    // Round-4/5 review item 9: refuse to descend into (let alone
+    // delete) a subdirectory that resolves onto a DIFFERENT mounted
+    // filesystem than the cache root -- a stray bind mount planted
+    // under this cache's exclusively-owned directory must never be
+    // recursed into or unlinked; its contents live on a filesystem this
+    // cache does not own at all. This is checked from the PARENT'S
+    // stat (both before and, again, after actually opening it below),
+    // never assumed from the listing alone.
+    if (static_cast<quint64>(st.st_dev) != expectedDevice) {
+      qWarning() << "AssetCache: refusing to descend into" << name
+                 << "-- different device than cache root (mount escape "
+                    "guard)";
+      return false;
+    }
     const int childFd =
         openat(parentFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (childFd < 0) {
@@ -283,39 +541,73 @@ bool safeRemoveEntryAt(int parentFd, const char *name) {
       // guessing.
       return false;
     }
-    if (!safeRemoveDirectoryContentsAt(childFd)) {
+    // Re-verify the device on the ACTUAL DESCRIPTOR just opened (never
+    // trusting the fstatat() above alone): closes the TOCTOU window
+    // where the entry could have been replaced by a different-device
+    // mount between that check and this open.
+    struct stat openedSt {};
+    if (::fstat(childFd, &openedSt) != 0 || !S_ISDIR(openedSt.st_mode) ||
+        static_cast<quint64>(openedSt.st_dev) != expectedDevice) {
+      ::close(childFd);
+      return false;
+    }
+    if (!safeRemoveDirectoryContentsAt(childFd, expectedDevice)) {
       return false;
     }
     return unlinkat(parentFd, name, AT_REMOVEDIR) == 0 || errno == ENOENT;
   }
   // A regular file, or a symlink node itself (S_ISLNK): unlinkat()
   // without AT_REMOVEDIR removes the directory ENTRY, never resolving or
-  // following it even when it names a symlink.
+  // following it even when it names a symlink. A regular file cannot
+  // itself BE a different mount (only a directory can be a mount
+  // point), so no device check applies here.
   return unlinkat(parentFd, name, 0) == 0 || errno == ENOENT;
 }
 #endif
 
-// Removes `path` (expected to be a directory) and everything under it,
-// using the no-follow descriptor-relative primitives above. Refuses
-// outright (a safe no-op) if `path` itself is a symlink, is not a
-// directory, or does not exist -- see safeRemoveEntryAt()'s comment for
-// the full rationale. On a hypothetical platform with no such
-// primitives available, this is a safe no-op rather than risking a
-// follow-through-symlink recursive delete.
-void safeRemoveTree(const QString &path) {
+// Removes `name` (expected to be a directory relative to `parentFd`)
+// and everything under it, using the no-follow, device-checked
+// descriptor-relative primitives above. Refuses outright (a safe no-op,
+// returning false) if `name` is a symlink, is not a directory, does not
+// exist, or resolves onto a different device than `expectedDevice` --
+// see safeRemoveEntryAt()'s comment for the full rationale. On a
+// hypothetical platform with no such primitives available, this is a
+// safe no-op rather than risking a follow-through-symlink recursive
+// delete.
+bool safeRemoveTreeRelative(int parentFd, const QString &name,
+                            quint64 expectedDevice) {
 #if defined(Q_OS_UNIX)
-  const QByteArray pathUtf8 = QFile::encodeName(path);
-  const int fd = ::open(pathUtf8.constData(),
+  const QByteArray nameUtf8 = name.toUtf8();
+  const int fd = openat(parentFd, nameUtf8.constData(),
                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) {
-    return;
+    return false;
   }
-  safeRemoveDirectoryContentsAt(fd); // closes fd
-  ::rmdir(pathUtf8.constData());
+  struct stat st {};
+  if (::fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+      static_cast<quint64>(st.st_dev) != expectedDevice) {
+    ::close(fd);
+    return false;
+  }
+  const bool contentsOk = safeRemoveDirectoryContentsAt(fd, expectedDevice);
+  const bool rmOk =
+      unlinkat(parentFd, nameUtf8.constData(), AT_REMOVEDIR) == 0 ||
+      errno == ENOENT;
+  return contentsOk && rmOk;
 #else
-  Q_UNUSED(path);
+  Q_UNUSED(parentFd);
+  Q_UNUSED(name);
+  Q_UNUSED(expectedDevice);
+  return false;
 #endif
 }
+
+// (safeRemoveTree(path) previously lived here, opening `path` directly by
+// absolute string. Round-4/5 review item 3/9 replaces it entirely with
+// safeRemoveTreeRelative() above -- descriptor-relative and
+// device-checked -- so every caller (reapAndEnforceQuota()'s stray-
+// directory cleanup) resolves a subdirectory only relative to the
+// already-anchored `m_rootFd`, never by re-deriving a path string.)
 
 } // namespace
 
@@ -393,17 +685,17 @@ QString AssetCache::cacheKeyFor(const QUrl &resolvedCandidateUrl) {
 }
 
 QString AssetCache::manifestPath(const QString &key) const {
-  return m_directory + u'/' + key + ".manifest.json"_L1;
+  return key + ".manifest.json"_L1;
 }
 
 QString AssetCache::generationPayloadPath(const QString &key,
                                           const QString &generation) const {
-  return m_directory + u'/' + key + u'.' + generation + ".bin"_L1;
+  return key + u'.' + generation + ".bin"_L1;
 }
 
 QString AssetCache::generationMetadataPath(const QString &key,
                                            const QString &generation) const {
-  return m_directory + u'/' + key + u'.' + generation + ".meta.json"_L1;
+  return key + u'.' + generation + ".meta.json"_L1;
 }
 
 QString AssetCache::manifestPathForTesting(const QString &directory,
@@ -447,13 +739,21 @@ void AssetCache::touchAccessRecencyLocked(const QString &key) {
   if (m_diskCacheDisabled || !isValidKey(key)) {
     return;
   }
+  // Round-4/5 review item 3: a MEMORY hit (lookupMemory() -> here) must
+  // be just as anchor-verified as a real disk read before this method
+  // touches the filesystem at all -- previously this call was missing
+  // entirely on the memory-hit path, letting a memory-hit recency bump
+  // proceed even after the root had been replaced post-construction.
+  if (!verifyRootAnchorLocked()) {
+    return;
+  }
   const std::optional<QString> generation = readManifestGeneration(key);
   if (!generation) {
     return; // nothing on disk for this key right now -- nothing to bump
   }
-  const QString metadataPath = generationMetadataPath(key, *generation);
-  const std::optional<DiskMetadata> metadata = readMetadata(metadataPath, key);
-  if (!metadata || metadata->sha256Hex != *generation) {
+  const QString metadataName = generationMetadataPath(key, *generation);
+  const std::optional<DiskMetadata> metadata = readMetadata(metadataName, key);
+  if (!metadata || metadata->generationId != *generation) {
     // A corrupt/self-inconsistent record here is a real-repair signal,
     // but repairing it is lookupDisk()/reapAndEnforceQuota()'s job (both
     // independently re-verify the payload itself before trusting
@@ -467,7 +767,7 @@ void AssetCache::touchAccessRecencyLocked(const QString &key) {
   // Review item 11: `durable = false` -- see writeMetadata()'s
   // declaration comment and the class comment for why a lost recency
   // bump on crash only ever affects eviction ordering, never integrity.
-  (void)writeMetadata(metadataPath, refreshed, /*durable=*/false);
+  (void)writeMetadata(metadataName, refreshed, /*durable=*/false);
 }
 
 bool AssetCache::verifyRootAnchorLocked() const {
@@ -489,7 +789,16 @@ bool AssetCache::verifyRootAnchorLocked() const {
   // still refers to. If the path has been renamed away, removed, or
   // replaced by anything else (a plain directory, a symlink, a
   // dangling entry), the (device, inode) pair observed here will not
-  // match what was captured from m_rootFd at construction.
+  // match what was captured from m_rootFd at construction. Round-4/5
+  // review item 3: this check is now purely ADVISORY (it stops future
+  // writes into a directory this instance no longer semantically
+  // considers its own the moment it can detect that) -- every actual
+  // disk operation's real safety comes from resolving through
+  // `m_rootFd` directly (openat/fstatat/renameat/unlinkat), which
+  // remains anchored to the ORIGINAL filesystem object regardless of
+  // what the path currently names, so a race between this check and a
+  // later operation can no longer let that operation touch the wrong
+  // object the way a path-reopening implementation could.
   const QByteArray dirUtf8 = QFile::encodeName(m_directory);
   if (::lstat(dirUtf8.constData(), &currentSt) != 0 ||
       static_cast<quint64>(currentSt.st_dev) != m_rootDevice ||
@@ -508,6 +817,104 @@ bool AssetCache::verifyRootAnchorLocked() const {
 #endif
 }
 
+bool AssetCache::fsyncRootLocked() const {
+#if defined(Q_OS_UNIX)
+  return m_rootFd >= 0 && ::fsync(m_rootFd) == 0;
+#else
+  return true;
+#endif
+}
+
+QString AssetCache::mintGenerationIdLocked(quint64 accessSequence) {
+  // Round-4/5 review item 4: independent of the payload's own content
+  // hash -- see DiskMetadata::generationId's comment for why a
+  // content-addressed generation identifier allows a same-bytes
+  // replacement to rewrite an already-live file in place. `accessSequence`
+  // (unique and monotonic for this store() transaction) plus real OS
+  // entropy means two mints can never collide even if minted in the same
+  // process tick; hashed down to the existing 64-lowercase-hex shape so
+  // no on-disk filename-pattern change is required.
+  quint64 entropy[2] = {0, 0};
+  QRandomGenerator::system()->fillRange(entropy, 2);
+  const QByteArray material =
+      QByteArray("assetcache-generation-v1\n") +
+      QByteArray::number(static_cast<qulonglong>(accessSequence)) + '\n' +
+      QByteArray::number(static_cast<qulonglong>(entropy[0]), 16) + '\n' +
+      QByteArray::number(static_cast<qulonglong>(entropy[1]), 16);
+  return QString::fromLatin1(
+      QCryptographicHash::hash(material, QCryptographicHash::Sha256).toHex());
+}
+
+#if defined(Q_OS_UNIX)
+namespace {
+// Recursive, descriptor-relative, no-follow, device-bounded byte-usage
+// walker (review round-4/5 items 3, 9, 11): sums the on-disk size of
+// every regular file/symlink-node entry found anywhere under `dirFd`
+// (which must be open for exactly one call -- this function always
+// closes it), recursing into subdirectories ONLY while they remain on
+// `expectedDevice`; a same-device directory's OWN entry size is never
+// counted (only the files found underneath it), matching this walker's
+// historical QDir::Files-equivalent semantics. A subdirectory found to
+// be a different mounted filesystem (a stray bind mount planted under
+// this cache's exclusively-owned directory) is never descended into --
+// but its OWN directory-entry size IS added in that one case, so it can
+// never simply vanish from the total the way silently skipping it
+// would; quota enforcement must see it as real, non-reclaimable usage
+// (see safeRemoveEntryAt()'s matching refusal to ever delete across
+// that same boundary) rather than falsely reporting the cache as
+// "under budget" while genuinely undeletable/unaccounted bytes remain
+// resident.
+qint64 sumUsageRelative(int dirFd, quint64 expectedDevice) {
+  qint64 total = 0;
+  DIR *dirStream = fdopendir(dirFd);
+  if (!dirStream) {
+    ::close(dirFd);
+    return 0;
+  }
+  errno = 0;
+  while (struct dirent *entry = readdir(dirStream)) {
+    if (qstrcmp(entry->d_name, ".") == 0 || qstrcmp(entry->d_name, "..") == 0) {
+      errno = 0;
+      continue;
+    }
+    struct stat st {};
+    if (fstatat(dirFd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      errno = 0;
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      if (static_cast<quint64>(st.st_dev) != expectedDevice) {
+        // Cross-device mount encountered: this directory can never be
+        // descended into or deleted (see safeRemoveEntryAt()'s matching
+        // refusal), so its own directory-entry size is counted here as
+        // an irreducible placeholder -- otherwise it would simply
+        // vanish from the total, letting quota enforcement falsely
+        // believe the cache is under budget while genuinely
+        // undeletable/unaccounted bytes remain resident. A same-device
+        // directory is never counted this way (matching this walker's
+        // historical QDir::Files-equivalent semantics): only the
+        // regular files found underneath it contribute bytes.
+        total += st.st_size;
+        errno = 0;
+        continue;
+      }
+      const int childFd =
+          openat(dirFd, entry->d_name,
+                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (childFd >= 0) {
+        total += sumUsageRelative(childFd, expectedDevice); // closes childFd
+      }
+    } else {
+      total += st.st_size;
+    }
+    errno = 0;
+  }
+  closedir(dirStream); // also closes dirFd
+  return total;
+}
+} // namespace
+#endif
+
 qint64 AssetCache::diskUsageBytesLocked() const {
   if (!verifyRootAnchorLocked()) {
     return 0;
@@ -516,15 +923,22 @@ qint64 AssetCache::diskUsageBytesLocked() const {
   // implementation, reused directly by reapAndEnforceQuota() -- review
   // round-3 item 11 -- so its eviction-target math is always driven by
   // a true, unconditional inventory rather than only the subset of
-  // entries that happened to validate cleanly).
-  qint64 total = 0;
-  QDirIterator it(m_directory, QDir::Files | QDir::Hidden,
-                  QDirIterator::Subdirectories);
-  while (it.hasNext()) {
-    it.next();
-    total += it.fileInfo().size();
+  // entries that happened to validate cleanly). Round-4/5 review item
+  // 3: resolved via a FRESH directory handle on the already-anchored
+  // `m_rootFd` (see openFreshHandleToSameDirectory()'s comment -- never
+  // a bare dup(), which would share `m_rootFd`'s read offset with
+  // whatever OTHER listing may have already been performed against it
+  // this call, and never a QDirIterator re-resolving `m_directory` by
+  // path).
+#if defined(Q_OS_UNIX)
+  const int freshFd = openFreshHandleToSameDirectory(m_rootFd);
+  if (freshFd < 0) {
+    return 0;
   }
-  return total;
+  return sumUsageRelative(freshFd, m_rootDevice); // closes freshFd
+#else
+  return 0;
+#endif
 }
 
 bool AssetCache::writeMetadata(const QString &metadataFilePath,
@@ -538,6 +952,10 @@ bool AssetCache::writeMetadata(const QString &metadataFilePath,
   obj[QStringLiteral("width")] = metadata.width;
   obj[QStringLiteral("height")] = metadata.height;
   obj[QStringLiteral("sha256")] = metadata.sha256Hex;
+  // Round-4/5 review item 4: the generation identifier is persisted
+  // explicitly and independently of `sha256Hex` -- see
+  // DiskMetadata::generationId's comment.
+  obj[QStringLiteral("generationId")] = metadata.generationId;
   obj[QStringLiteral("etag")] = metadata.etag;
   obj[QStringLiteral("lastModified")] = metadata.lastModified;
   obj[QStringLiteral("insertedAtMs")] = metadata.insertedAtMsecsSinceEpoch;
@@ -552,20 +970,21 @@ bool AssetCache::writeMetadata(const QString &metadataFilePath,
   // quint64-range string has no such ceiling.
   obj[QStringLiteral("accessSeq")] = QString::number(metadata.accessSequence);
 
-  QSaveFile file(metadataFilePath);
-  if (!file.open(QIODevice::WriteOnly)) {
-    return false;
-  }
-  file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
-  // Review item 8: fsync the metadata content itself before the commit()
-  // rename publishes it -- see fsyncSaveFileBeforeCommit()'s comment.
-  // Review item 11: `durable` is false only for a pure recency-only bump
-  // with no other semantic change -- see writeMetadata()'s declaration
-  // comment for why skipping the fsync there is safe.
-  if (durable && !fsyncSaveFileBeforeCommit(file)) {
-    return false;
-  }
-  return file.commit();
+#if defined(Q_OS_UNIX)
+  // Round-4/5 review item 3: fd-relative atomic write -- see
+  // writeFileAtomicRelative()'s comment. `durable` is false only for a
+  // pure recency-only bump with no other semantic change (see this
+  // method's declaration comment for why skipping the fsync there is
+  // safe).
+  return m_rootFd >= 0 &&
+         writeFileAtomicRelative(
+             m_rootFd, metadataFilePath,
+             QJsonDocument(obj).toJson(QJsonDocument::Compact), durable);
+#else
+  Q_UNUSED(metadataFilePath);
+  Q_UNUSED(durable);
+  return false;
+#endif
 }
 
 bool AssetCache::writeManifest(const QString &key,
@@ -575,28 +994,30 @@ bool AssetCache::writeManifest(const QString &key,
   obj[QStringLiteral("key")] = key;
   obj[QStringLiteral("generation")] = generation;
 
-  QSaveFile file(manifestPath(key));
-  if (!file.open(QIODevice::WriteOnly)) {
-    return false;
-  }
-  file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
-  return fsyncSaveFileBeforeCommit(file) && file.commit();
+#if defined(Q_OS_UNIX)
+  return m_rootFd >= 0 && writeFileAtomicRelative(
+                              m_rootFd, manifestPath(key),
+                              QJsonDocument(obj).toJson(QJsonDocument::Compact),
+                              /*durable=*/true);
+#else
+  Q_UNUSED(key);
+  Q_UNUSED(generation);
+  return false;
+#endif
 }
 
 std::optional<QString>
 AssetCache::readManifestGeneration(const QString &key) const {
-  QFile file(manifestPath(key));
-  if (!file.open(QIODevice::ReadOnly)) {
+#if defined(Q_OS_UNIX)
+  if (m_rootFd < 0) {
     return std::nullopt;
   }
-  if (file.size() < 0 || file.size() > kMaxMetadataBytesOnDisk) {
+  const std::optional<QByteArray> raw = readBoundedRelative(
+      m_rootFd, m_rootDevice, manifestPath(key), kMaxMetadataBytesOnDisk);
+  if (!raw) {
     return std::nullopt;
   }
-  const QByteArray raw = file.read(kMaxMetadataBytesOnDisk + 1);
-  if (raw.size() > kMaxMetadataBytesOnDisk) {
-    return std::nullopt;
-  }
-  const QJsonDocument doc = QJsonDocument::fromJson(raw);
+  const QJsonDocument doc = QJsonDocument::fromJson(*raw);
   if (!doc.isObject()) {
     return std::nullopt;
   }
@@ -607,45 +1028,45 @@ AssetCache::readManifestGeneration(const QString &key) const {
     return std::nullopt;
   }
   const QString generation = obj[QStringLiteral("generation")].toString();
-  // A generation identifier is always a payload's own SHA-256 hex
-  // digest -- exactly the same shape as a cache key -- and this string
-  // becomes part of a filesystem path below (generationPayloadPath()/
+  // A generation identifier is always a syntactically 64-hex string --
+  // exactly the same shape as a cache key -- and this string becomes
+  // part of a filesystem path below (generationPayloadPath()/
   // generationMetadataPath()): never trust it otherwise.
   if (!validKeyPattern().match(generation).hasMatch()) {
     return std::nullopt;
   }
   return generation;
+#else
+  Q_UNUSED(key);
+  return std::nullopt;
+#endif
 }
 
 std::optional<AssetCache::DiskMetadata>
 AssetCache::readMetadata(const QString &metadataFilePath,
                          const QString &expectedKey) const {
-  QFile file(metadataFilePath);
-  if (!file.open(QIODevice::ReadOnly)) {
+#if defined(Q_OS_UNIX)
+  if (m_rootFd < 0) {
     return std::nullopt;
   }
-  // Reject on the cheap stat alone, before ever calling read(): see
-  // kMaxMetadataBytesOnDisk's comment above. A corrupted or
-  // locally-planted metadata file can claim an arbitrary size regardless
-  // of what its (if any) JSON content actually is.
-  if (file.size() < 0 || file.size() > kMaxMetadataBytesOnDisk) {
+  // Round-4/5 review item 3: fd-relative bounded read -- see
+  // readBoundedRelative()'s comment. Bounding the read itself (not just
+  // a preceding stat) means this can never allocate more than
+  // kMaxMetadataBytesOnDisk + 1 bytes regardless of how large a
+  // corrupted/locally-planted file has actually become by the time this
+  // read runs.
+  const std::optional<QByteArray> rawOpt = readBoundedRelative(
+      m_rootFd, m_rootDevice, metadataFilePath, kMaxMetadataBytesOnDisk);
+  if (!rawOpt) {
     return std::nullopt;
   }
-  // Copilot review: bound the READ itself, not just the preceding stat --
-  // readAll() would trust file.size() implicitly, but the file can grow
-  // between the stat above and this read (concurrent local tampering, or
-  // a special file whose size() cannot be trusted). Reading at most
-  // kMaxMetadataBytesOnDisk + 1 bytes means this can never allocate more
-  // than that regardless of how large the file has actually become by
-  // the time this read runs; a JSON document can never legitimately need
-  // the extra byte, so no valid metadata file is ever affected.
-  const QByteArray raw = file.read(kMaxMetadataBytesOnDisk + 1);
-  if (raw.size() > kMaxMetadataBytesOnDisk) {
-    // The file grew past the cap between the stat above and this read --
-    // fail closed rather than attempting to parse a file this large as
-    // JSON.
-    return std::nullopt;
-  }
+  const QByteArray &raw = *rawOpt;
+#else
+  Q_UNUSED(metadataFilePath);
+  Q_UNUSED(expectedKey);
+  return std::nullopt;
+#endif
+#if defined(Q_OS_UNIX)
   const QJsonDocument doc = QJsonDocument::fromJson(raw);
   if (!doc.isObject()) {
     return std::nullopt;
@@ -685,6 +1106,14 @@ AssetCache::readMetadata(const QString &metadataFilePath,
   metadata.width = static_cast<int>(*width);
   metadata.height = static_cast<int>(*height);
   metadata.sha256Hex = obj[QStringLiteral("sha256")].toString();
+  // Round-4/5 review item 4: the explicit generation-identity witness --
+  // see DiskMetadata::generationId's comment. Absent (a pre-this-fix
+  // metadata file) parses as an empty string, which never matches a
+  // real (64-hex) generation identifier, so such a legacy record is
+  // treated as untrusted/self-inconsistent by every caller that compares
+  // it against the manifest's generation -- exactly the quarantine
+  // behaviour a genuinely corrupt record already receives.
+  metadata.generationId = obj[QStringLiteral("generationId")].toString();
   metadata.etag = obj[QStringLiteral("etag")].toString();
   metadata.lastModified = obj[QStringLiteral("lastModified")].toString();
   metadata.insertedAtMsecsSinceEpoch = *insertedAtMs;
@@ -706,6 +1135,7 @@ AssetCache::readMetadata(const QString &metadataFilePath,
     return std::nullopt;
   }
   return metadata;
+#endif
 }
 
 bool AssetCache::deleteEntry(const QString &key) const {
@@ -719,23 +1149,30 @@ bool AssetCache::deleteEntry(const QString &key) const {
   // interrupted replacement) via a name-prefix sweep, rather than
   // guessing at a single generation. `key` is always validated
   // (isValidKey()) by every public entry point before reaching here, so
-  // it can never itself contain a wildcard-special character.
-  QDir dir(m_directory);
-  const QStringList matches =
-      dir.entryList(QStringList{key + QStringLiteral(".*")}, QDir::Files);
+  // it can never itself contain a wildcard-special character. Round-4/5
+  // review item 3: both the listing and every removal are resolved
+  // relative to `m_rootFd`, never a QDir re-resolving `m_directory` by
+  // path.
+#if defined(Q_OS_UNIX)
+  if (m_rootFd < 0) {
+    return true;
+  }
+  const QStringList matches = listNamesWithPrefixRelative(m_rootFd, key + u'.');
   // Review item 11: report whether EVERY matched file was actually
-  // removed. QFile::remove() returning false (e.g. a permission error,
-  // or -- in tests -- a directory planted at the same path) means this
-  // key's disk footprint was NOT fully reclaimed; a caller doing quota
-  // accounting must not credit itself with bytes that are still
-  // genuinely occupied.
+  // removed. A failed unlink (e.g. a permission error, or -- in tests --
+  // a directory planted at the same path) means this key's disk
+  // footprint was NOT fully reclaimed; a caller doing quota accounting
+  // must not credit itself with bytes that are still genuinely occupied.
   bool allRemoved = true;
   for (const QString &name : matches) {
-    if (!QFile::remove(dir.filePath(name))) {
+    if (!removeFileRelative(m_rootFd, name)) {
       allRemoved = false;
     }
   }
   return allRemoved;
+#else
+  return true;
+#endif
 }
 
 std::optional<AssetCache::CachedEntry>
@@ -780,27 +1217,32 @@ AssetCache::lookupDisk(const QString &key) {
 
   const std::optional<DiskMetadata> metadata =
       readMetadata(generationMetadataPath(key, *generation), key);
-  if (!metadata || metadata->sha256Hex != *generation) {
+  if (!metadata || metadata->generationId != *generation) {
     // Metadata missing/corrupt, or (defense in depth) it does not even
     // claim to be the generation its own filename says it is.
     (void)deleteEntry(key);
     return std::nullopt;
   }
 
-  QFile payloadFile(generationPayloadPath(key, *generation));
-  if (!payloadFile.open(QIODevice::ReadOnly)) {
-    // Manifest+metadata present but this generation's payload missing:
-    // corrupt/incomplete entry.
-    (void)deleteEntry(key);
-    return std::nullopt;
-  }
+#if defined(Q_OS_UNIX)
+  // Round-4/5 review item 3: fd-relative, size-verified read -- see
+  // readExactSizeVerifiedRelative()'s comment. Rejected on size alone
+  // before any content beyond the probe byte is trusted; never a
+  // QFile reopening `m_directory` by path.
   const std::optional<QByteArray> verifiedBytes =
-      readVerifiedPayload(payloadFile, metadata->encodedSize);
-  payloadFile.close();
+      m_rootFd >= 0
+          ? readExactSizeVerifiedRelative(
+                m_rootFd, m_rootDevice, generationPayloadPath(key, *generation),
+                metadata->encodedSize, kMaxSinglePayloadBytesOnDisk)
+          : std::nullopt;
+#else
+  const std::optional<QByteArray> verifiedBytes = std::nullopt;
+#endif
   if (!verifiedBytes) {
-    // Rejected on size alone before any content was read -- see
-    // readVerifiedPayload()'s comment. Never trust a payload whose
-    // declared or actual size can't possibly be valid.
+    // Manifest+metadata present but this generation's payload missing,
+    // unreadable, or size-mismatched: corrupt/incomplete entry -- see
+    // readExactSizeVerifiedRelative()'s comment. Never trust a payload
+    // whose declared or actual size can't possibly be valid.
     (void)deleteEntry(key);
     return std::nullopt;
   }
@@ -808,11 +1250,10 @@ AssetCache::lookupDisk(const QString &key) {
 
   const QString actualSha256 = QString::fromLatin1(
       QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
-  if (actualSha256 != metadata->sha256Hex || actualSha256 != *generation ||
+  if (actualSha256 != metadata->sha256Hex ||
       bytes.size() != metadata->encodedSize) {
-    // Payload does not match the metadata that vouches for it (or the
-    // generation identifier its own filename claims): never trust a
-    // mismatched pair, no matter which file is "actually" wrong.
+    // Payload does not match the metadata that vouches for it: never
+    // trust a mismatched pair, no matter which file is "actually" wrong.
     (void)deleteEntry(key);
     return std::nullopt;
   }
@@ -832,7 +1273,8 @@ AssetCache::lookupDisk(const QString &key) {
   // atime). This rewrites the SAME generation's metadata file in place
   // (the generation, and therefore the manifest, is unchanged) -- a
   // failure here only loses this one LRU-freshness update, never the
-  // entry's validity: writeMetadata() is itself atomic (QSaveFile), so a
+  // entry's validity: writeMetadata() is itself atomic
+  // (writeFileAtomicRelative(), a temp-file-plus-renameat write), so a
   // crash mid-write leaves the prior, still-fully-valid metadata
   // untouched. Review item 11: also mints a fresh monotonic access
   // sequence (the primary eviction-ordering key -- see the class
@@ -902,11 +1344,11 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
     m_memory->insert(key, heapEntry, static_cast<qsizetype>(entry.costBytes()));
 
     // Never write a payload to disk that this cache could never itself
-    // read back: readVerifiedPayload() hard-caps any disk read at
-    // kMaxSinglePayloadBytesOnDisk, so a larger on-disk file would sit as
-    // unreclaimable disk usage (never a valid lookupDisk() hit) until a
-    // later reap sweep happens to notice it. Production callers already
-    // cap fetched bytes well below this via
+    // read back: readExactSizeVerifiedRelative() hard-caps any disk
+    // read at kMaxSinglePayloadBytesOnDisk, so a larger on-disk file
+    // would sit as unreclaimable disk usage (never a valid lookupDisk()
+    // hit) until a later reap sweep happens to notice it. Production
+    // callers already cap fetched bytes well below this via
     // AssetNetworkFetcher::Limits::maxEncodedBytes before a fetch even
     // completes; this guard is defense-in-depth against a bug or a
     // future caller invoking store() directly with an oversized entry.
@@ -918,24 +1360,50 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
       // Memory insert above still happened -- only the disk write is
       // skipped.
     } else if (entry.encodedBytes.size() <= kMaxSinglePayloadBytesOnDisk) {
-      // Review item 8: content-addressed generation publication. The
-      // generation's filename is derived from its own content hash, so
-      // writing generation N+1's files can NEVER touch generation N's
-      // files (unless the content is byte-identical, in which case
-      // there is nothing to actually replace) -- an existing, currently
-      // -live generation is therefore fully intact at every point up
-      // until the manifest swap below actually commits. See the class
-      // comment for the full crash-consistency argument.
-      const QString generation = entry.sha256Hex;
-      const std::optional<QString> previousGeneration =
-          readManifestGeneration(key);
-      const QString genPayloadPath = generationPayloadPath(key, generation);
-      const QString genMetadataPath = generationMetadataPath(key, generation);
+#if defined(Q_OS_UNIX)
+      if (m_rootFd < 0) {
+        // verifyRootAnchorLocked() above already guards this in
+        // practice, but guard defensively against any future caller
+        // path that reaches here without it.
+      } else {
+        // Round-4/5 review item 4: the generation identifier is now a
+        // fresh, unique value minted for THIS store() transaction --
+        // deliberately NOT the payload's own content hash (see
+        // mintGenerationIdLocked()'s and DiskMetadata::generationId's
+        // comments). Two store() calls for byte-identical content
+        // therefore always publish under two DIFFERENT generation
+        // filenames: the second call can never rewrite the first's
+        // already-live files in place, so a failure partway through the
+        // second call's own publication can never corrupt or delete
+        // bytes the first call already made durably live. An existing,
+        // currently-live generation is therefore fully intact at every
+        // point up until the manifest swap below actually commits. See
+        // the class comment for the full crash-consistency argument.
+        const std::optional<QString> previousGeneration =
+            readManifestGeneration(key);
+        // Review item 11: this access sequence is minted once and reused
+        // both as the metadata's own recency witness AND as part of the
+        // generation identifier's entropy material -- a single genuine
+        // access/store deserves exactly one sequence value.
+        const quint64 accessSequence = nextAccessSequenceLocked();
+        QString generation = mintGenerationIdLocked(accessSequence);
+        // Vanishingly unlikely (a 256-bit hash collision), but never
+        // silently reuse an already-live generation's filename: remint
+        // until it's confirmed distinct from whatever is currently
+        // published for this key.
+        while (previousGeneration && *previousGeneration == generation) {
+          generation = mintGenerationIdLocked(nextAccessSequenceLocked());
+        }
+        const QString genPayloadPath = generationPayloadPath(key, generation);
+        const QString genMetadataPath = generationMetadataPath(key, generation);
 
-      QSaveFile payloadFile(genPayloadPath);
-      if (payloadFile.open(QIODevice::WriteOnly)) {
-        payloadFile.write(entry.encodedBytes);
-        if (fsyncSaveFileBeforeCommit(payloadFile) && payloadFile.commit()) {
+        // Phase 1: write this generation's own two files (a temp name +
+        // fsync + renameat each, via writeFileAtomicRelative()) -- neither
+        // is visible under its FINAL name until its own rename commits,
+        // and neither one touches any OTHER generation's files at all.
+        bool phase1Ok = writeFileAtomicRelative(
+            m_rootFd, genPayloadPath, entry.encodedBytes, /*durable=*/true);
+        if (phase1Ok) {
           DiskMetadata metadata;
           metadata.key = key;
           metadata.contentType = entry.contentType;
@@ -943,78 +1411,108 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
           metadata.width = entry.dimensions.width();
           metadata.height = entry.dimensions.height();
           metadata.sha256Hex = entry.sha256Hex;
+          metadata.generationId = generation;
           metadata.etag = entry.etag;
           metadata.lastModified = entry.lastModified;
           metadata.insertedAtMsecsSinceEpoch = entry.insertedAtMsecsSinceEpoch;
           metadata.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
-          // Review item 11: a fresh store() is a genuine access too --
-          // mint a new monotonic sequence so this generation isn't
-          // mistaken for stale relative to whatever was live before it.
-          metadata.accessSequence = nextAccessSequenceLocked();
-          if (writeMetadata(genMetadataPath, metadata)) {
-            // Both of this generation's own files are now fully
-            // written, fsync'd, and committed -- ATOMICALLY publish it
-            // as the live one via the single mutable manifest pointer,
-            // then fsync the directory so that publish survives a crash
-            // immediately after it (see fsyncDirectory()'s comment).
-            if (writeManifest(key, generation)) {
-              // Review round-3 item 10: the manifest rename ITSELF is
-              // already committed at the filesystem level at this point
-              // (QSaveFile::commit() succeeded above) -- there is no
-              // reliable way to "roll it back" if the directory fsync
-              // that follows fails. What CAN still be controlled is
-              // whether the OLD generation's files are reclaimed: if
-              // fsyncDirectory() fails, this crash-durability barrier
-              // has NOT actually been crossed, so the old generation is
-              // deliberately kept around as a durability hedge (a crash
-              // right after this point could otherwise leave NEITHER
-              // generation recoverable if the rename itself hadn't
-              // actually reached stable storage) rather than reclaimed
-              // as if publication were guaranteed durable.
-              if (fsyncDirectory(m_directory)) {
-                // Only now -- strictly after the new generation is
-                // confirmed durably live -- reclaim the OLD
-                // generation's files, if there was a different one. A
-                // crash at any point before this line leaves the OLD
-                // generation still fully intact and still the one the
-                // manifest names.
-                if (previousGeneration && *previousGeneration != generation) {
-                  QFile::remove(
-                      generationPayloadPath(key, *previousGeneration));
-                  QFile::remove(
-                      generationMetadataPath(key, *previousGeneration));
-                }
-              } else {
-                qWarning()
-                    << "AssetCache: directory fsync failed after publishing"
-                    << key
-                    << "-- retaining previous generation as a durability "
-                       "hedge";
-              }
-            } else {
-              // Manifest publish failed: this generation's files become
-              // orphans, safely reclaimed by the next reap sweep (or
-              // immediately here, defensively) -- the OLD generation
-              // (if any) remains untouched and still live.
-              QFile::remove(genPayloadPath);
-              QFile::remove(genMetadataPath);
-            }
-          } else {
+          metadata.accessSequence = accessSequence;
+          phase1Ok = writeMetadata(genMetadataPath, metadata);
+          if (!phase1Ok) {
             // Metadata is the sole validity witness for a payload (see
             // lookupDisk()): without it, the payload just committed can
             // never be read back as valid. Delete it immediately rather
-            // than leaving that window open; the OLD generation (if
-            // any) is completely untouched by any of this.
-            QFile::remove(genPayloadPath);
+            // than leaving that window open; the OLD generation (if any)
+            // is completely untouched by any of this.
+            removeFileRelative(m_rootFd, genPayloadPath);
+          }
+        }
+
+        if (phase1Ok) {
+          // Round-4/5 review item 4/10: REQUIRED barrier #1 -- fsync the
+          // root directory NOW, capturing BOTH of this generation's own
+          // renames, BEFORE the manifest (the pointer that actually makes
+          // this generation "live") is even written. Without this barrier,
+          // a real power-loss between the manifest's rename and the
+          // filesystem journal actually committing the payload/metadata
+          // renames could leave the manifest pointing at a generation
+          // whose own files were never made durable. If this fsync
+          // fails, this generation's files are not yet the one anything
+          // points to -- discard them as orphans and leave whatever was
+          // previously live completely untouched.
+          if (!fsyncRootLocked()) {
+            qWarning() << "AssetCache: directory fsync failed after writing"
+                       << "new generation for" << key
+                       << "-- discarding it as an orphan";
+            removeFileRelative(m_rootFd, genPayloadPath);
+            removeFileRelative(m_rootFd, genMetadataPath);
+            phase1Ok = false;
+          }
+        }
+
+        if (phase1Ok) {
+          // Phase 2: the single atomic pointer swap that actually
+          // publishes this generation as the live one for `key`.
+          if (writeManifest(key, generation)) {
+            // Round-4/5 review item 4/10: REQUIRED barrier #2 -- fsync the
+            // root directory again, capturing the manifest's own rename.
+            // The manifest rename ITSELF is already committed at the
+            // filesystem level at this point -- there is no reliable way
+            // to "roll it back" if this fsync fails. What CAN still be
+            // controlled is whether the OLD generation's files are
+            // reclaimed: if this fsync fails, this crash-durability
+            // barrier has NOT actually been crossed, so the old
+            // generation is deliberately kept around as a durability
+            // hedge (a crash right after this point could otherwise leave
+            // NEITHER generation recoverable if the rename itself hadn't
+            // actually reached stable storage) rather than reclaimed as
+            // if publication were guaranteed durable.
+            if (fsyncRootLocked()) {
+              // Only now -- strictly after the new generation is
+              // confirmed durably live via TWO separate directory
+              // fsyncs -- reclaim the OLD generation's files, if there
+              // was a different one. A crash at any point before this
+              // line leaves the OLD generation still fully intact and
+              // still the one the manifest names (recovery -- see
+              // reapAndEnforceQuota() -- always resolves to whichever
+              // generation the manifest currently names, never a
+              // half-valid mix of the two).
+              if (previousGeneration && *previousGeneration != generation) {
+                removeFileRelative(
+                    m_rootFd, generationPayloadPath(key, *previousGeneration));
+                removeFileRelative(
+                    m_rootFd, generationMetadataPath(key, *previousGeneration));
+                // Review round-4/5 item 10: fsync once more after
+                // reclaiming the old generation, so that reclamation
+                // itself is durable and a crash immediately after it
+                // cannot resurrect the old generation's now-unlinked
+                // directory entries via a stale journal replay.
+                (void)fsyncRootLocked();
+              }
+            } else {
+              qWarning()
+                  << "AssetCache: directory fsync failed after publishing"
+                  << key
+                  << "-- retaining previous generation as a durability hedge";
+            }
+          } else {
+            // Manifest publish failed: this generation's files become
+            // orphans, safely reclaimed by the next reap sweep (or
+            // immediately here, defensively) -- the OLD generation (if
+            // any) remains untouched and still live.
+            removeFileRelative(m_rootFd, genPayloadPath);
+            removeFileRelative(m_rootFd, genMetadataPath);
           }
         }
       }
+#endif
     }
   }
 
-  // A cheap, stat-only usage check (diskUsageBytes(): sums QFileInfo::size()
-  // across the directory, no payload reads or re-hashing) gates the much
-  // more expensive full reap/validate sweep below: reapAndEnforceQuota()
+  // A cheap, stat-only usage check (diskUsageBytes(): sums fstatat-based
+  // sizes across the directory via sumUsageRelative(), no payload reads
+  // or re-hashing) gates the much more expensive full reap/validate
+  // sweep below: reapAndEnforceQuota()
   // re-reads and re-hashes EVERY cached payload to validate its
   // payload/metadata pair, which makes it O(N * entry_size) over the whole
   // cache -- unconditionally running that on every single store() call
@@ -1051,7 +1549,7 @@ void AssetCache::touchAfterNotModified(const QString &key,
   const std::optional<DiskMetadata> metadata =
       generation ? readMetadata(generationMetadataPath(key, *generation), key)
                  : std::nullopt;
-  if (!generation || !metadata || metadata->sha256Hex != *generation) {
+  if (!generation || !metadata || metadata->generationId != *generation) {
     // Manifest/metadata missing, corrupt, or self-inconsistent, exactly
     // as lookupDisk() and reapAndEnforceQuota() both handle: a caller
     // only reaches touchAfterNotModified() after a 304 response to a
@@ -1149,54 +1647,46 @@ void AssetCache::reapAndEnforceQuota() {
     return;
   }
 
-  QDir dir(m_directory);
-  if (!dir.exists()) {
+#if defined(Q_OS_UNIX)
+  if (m_rootFd < 0) {
     return;
   }
-  // Copilot review: enumerate BOTH files and directories here, not just
-  // QDir::Files -- this directory is exclusively owned by AssetCache
-  // (see the comment below), so a stray directory (planted, or left
-  // behind by some other means) is exactly as much of a leftover as a
-  // stray file, and must not be invisible to this repair sweep. Any
-  // directory found is removed recursively below, before the
-  // files-only key-shape pass that follows. QDir::Hidden is included
-  // too: QDir's filters exclude hidden entries (dotfiles) by default,
-  // so a stray hidden file/directory would otherwise be just as
-  // invisible to this sweep as a stray directory was before this fix.
-  // QDir::System is included so a DANGLING symlink (whose target no
-  // longer exists) is not silently invisible to this sweep either --
-  // without it, QDir::Files/QDir::Dirs alone only match entries whose
-  // resolved TARGET type is a regular file or directory, which excludes
-  // a broken symlink node entirely even though it still needs cleanup.
-  const QStringList allEntries =
-      dir.entryList(QDir::Files | QDir::Dirs | QDir::Hidden | QDir::System |
-                        QDir::NoDotAndDotDot,
-                    QDir::Name);
+  // Round-4/5 review item 3: enumerate relative to `m_rootFd`, never a
+  // QDir re-resolving `m_directory` by path. Every entry directly under
+  // the root -- files, directories, and symlink nodes (including a
+  // DANGLING symlink whose target no longer exists) -- is visible here,
+  // since fstatat(..., AT_SYMLINK_NOFOLLOW) reports the entry's own
+  // on-disk type without ever resolving through it; a stray directory or
+  // hidden dotfile is exactly as much of a leftover as a stray file, and
+  // must not be invisible to this repair sweep.
+  const std::vector<RelativeDirEntry> allEntries =
+      listAllEntriesRelative(m_rootFd);
   QStringList allFiles;
-  allFiles.reserve(allEntries.size());
-  for (const QString &name : allEntries) {
-    const QString fullPath = dir.filePath(name);
-    // Review item 7: classify with QFileInfo::isSymLink() FIRST, which
-    // (unlike isDir()) reports the entry's own type without resolving
-    // it. A symlink node found directly inside the cache root -- to a
-    // directory, a file, or a dangling target -- is unlinked itself via
-    // QFile::remove() (an unlink(), never a recursive follow); its
-    // target is never opened, stat'd through, or touched. Only a
-    // genuine (non-symlink) directory is recursed into, and even then
-    // via safeRemoveTree()'s descriptor-relative no-follow walk rather
-    // than QDir::removeRecursively() (which itself follows symlinks
-    // internally and would otherwise reintroduce exactly this escape).
-    const QFileInfo info(fullPath);
-    if (info.isSymLink()) {
-      QFile::remove(fullPath);
+  allFiles.reserve(static_cast<qsizetype>(allEntries.size()));
+  for (const RelativeDirEntry &entry : allEntries) {
+    // Review item 7: classify via the OWN-type stat above (never a
+    // second, path-based, potentially-resolving stat). A symlink node
+    // found directly inside the cache root -- to a directory, a file,
+    // or a dangling target -- is unlinked itself (an unlinkat(), never a
+    // recursive follow); its target is never opened, stat'd through, or
+    // touched. Only a genuine (non-symlink) directory is recursed into,
+    // and even then via safeRemoveTreeRelative()'s descriptor-relative,
+    // device-checked, no-follow walk (review round-4/5 item 9) rather
+    // than anything that could itself follow a symlink or cross a mount
+    // boundary.
+    if (entry.isSymlinkNode) {
+      removeFileRelative(m_rootFd, entry.name);
       continue;
     }
-    if (info.isDir()) {
-      safeRemoveTree(fullPath);
+    if (entry.isDirectory) {
+      safeRemoveTreeRelative(m_rootFd, entry.name, m_rootDevice);
       continue;
     }
-    allFiles.append(name);
+    allFiles.append(entry.name);
   }
+#else
+  return;
+#endif
 
   // First pass: discover every manifest (key -> the generation it
   // names) and every generation-scoped payload/metadata file present
@@ -1217,7 +1707,9 @@ void AssetCache::reapAndEnforceQuota() {
         // stray leftover -- remove outright. Any generation files it
         // might have named are reclaimed below as orphans, since no
         // valid manifest ends up naming this key.
-        QFile::remove(dir.filePath(name));
+#if defined(Q_OS_UNIX)
+        removeFileRelative(m_rootFd, name);
+#endif
       }
       continue;
     }
@@ -1232,10 +1724,13 @@ void AssetCache::reapAndEnforceQuota() {
       continue;
     }
     // Anything not matching one of the three known shapes is a stray
-    // leftover (a QSaveFile temp artifact from an interrupted write, or
-    // debris from an old format) -- this directory is exclusively owned
-    // by AssetCache, so removing it unconditionally is safe.
-    QFile::remove(dir.filePath(name));
+    // leftover (a writeFileAtomicRelative() temp artifact from an
+    // interrupted write, or debris from an old format) -- this
+    // directory is exclusively owned by AssetCache, so removing it
+    // unconditionally is safe.
+#if defined(Q_OS_UNIX)
+    removeFileRelative(m_rootFd, name);
+#endif
   }
 
   QSet<QString> allKeys;
@@ -1296,24 +1791,24 @@ void AssetCache::reapAndEnforceQuota() {
     const QString genMetadataPath = generationMetadataPath(key, generation);
     const std::optional<DiskMetadata> metadata =
         readMetadata(genMetadataPath, key);
-    QFile payloadFile(genPayloadPath);
-    const bool payloadReadable = payloadFile.open(QIODevice::ReadOnly);
+#if defined(Q_OS_UNIX)
     const std::optional<QByteArray> verifiedBytes =
-        (payloadReadable && metadata)
-            ? readVerifiedPayload(payloadFile, metadata->encodedSize)
-            : std::nullopt;
-    if (payloadReadable) {
-      payloadFile.close();
-    }
-    if (!metadata || metadata->sha256Hex != generation || !payloadReadable ||
-        !verifiedBytes) {
+        metadata ? readExactSizeVerifiedRelative(
+                       m_rootFd, m_rootDevice, genPayloadPath,
+                       metadata->encodedSize, kMaxSinglePayloadBytesOnDisk)
+                 : std::nullopt;
+#else
+    const std::optional<QByteArray> verifiedBytes = std::nullopt;
+#endif
+    if (!metadata || metadata->generationId != generation || !verifiedBytes) {
       (void)deleteEntry(key); // corrupt pair, or rejected on size alone
       continue;
     }
     const QByteArray &bytes = *verifiedBytes;
     const QString actualSha256 = QString::fromLatin1(
         QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
-    if (actualSha256 != generation || bytes.size() != metadata->encodedSize) {
+    if (actualSha256 != metadata->sha256Hex ||
+        bytes.size() != metadata->encodedSize) {
       (void)deleteEntry(key); // corrupt pair
       continue;
     }
@@ -1323,20 +1818,37 @@ void AssetCache::reapAndEnforceQuota() {
     // left by a crash between writing a new generation and cleaning up
     // its predecessor, or between writing a new generation's own files
     // and ever reaching the manifest swap (see store()).
+#if defined(Q_OS_UNIX)
     for (const QString &other : payloadGenerations.value(key)) {
       if (other != generation) {
-        QFile::remove(generationPayloadPath(key, other));
+        removeFileRelative(m_rootFd, generationPayloadPath(key, other));
       }
     }
     for (const QString &other : metadataGenerations.value(key)) {
       if (other != generation) {
-        QFile::remove(generationMetadataPath(key, other));
+        removeFileRelative(m_rootFd, generationMetadataPath(key, other));
       }
     }
+#endif
 
-    const qint64 manifestBytes = QFileInfo(manifestPath(key)).size();
-    const qint64 payloadBytes = QFileInfo(genPayloadPath).size();
-    const qint64 metadataBytes = QFileInfo(genMetadataPath).size();
+#if defined(Q_OS_UNIX)
+    const auto sizeOfRelative = [this](const QString &name) -> qint64 {
+      struct stat st {};
+      const QByteArray nameUtf8 = name.toUtf8();
+      if (fstatat(m_rootFd, nameUtf8.constData(), &st, AT_SYMLINK_NOFOLLOW) !=
+          0) {
+        return 0;
+      }
+      return static_cast<qint64>(st.st_size);
+    };
+    const qint64 manifestBytes = sizeOfRelative(manifestPath(key));
+    const qint64 payloadBytes = sizeOfRelative(genPayloadPath);
+    const qint64 metadataBytes = sizeOfRelative(genMetadataPath);
+#else
+    const qint64 manifestBytes = 0;
+    const qint64 payloadBytes = 0;
+    const qint64 metadataBytes = 0;
+#endif
     valid.push_back(ValidEntry{
         key, manifestBytes + payloadBytes + metadataBytes,
         metadata->lastAccessMsecsSinceEpoch, metadata->accessSequence});
@@ -1419,21 +1931,20 @@ qint64 AssetCache::memoryCostBytes() const {
 
 qint64 AssetCache::diskUsageBytes() const {
   QMutexLocker locker(&m_mutex);
-  // Copilot review: recurse into subdirectories here (QDirIterator with
-  // Subdirectories), not a flat QDir::Files listing -- this directory is
-  // exclusively owned by AssetCache, so a stray directory (e.g. planted,
-  // or otherwise left behind) should never be invisible to this usage
-  // total. This cheap, stat-only check gates whether the much more
-  // expensive reapAndEnforceQuota() sweep (which does recursively remove
-  // stray directories) runs at all in store()'s hot path -- if a stray
-  // directory's contents weren't counted here, that gate could never
-  // trip, and the sweep that would actually clean it up might never run.
-  // QDir::Hidden is included too: QDirIterator's filters exclude hidden
-  // entries by default, so a stray hidden file would otherwise undercount
-  // usage and could prevent the high-water-mark gate from ever tripping.
-  // Review round-3 item 9: routed through diskUsageBytesLocked(), which
-  // itself re-verifies the root anchor (device+inode) before enumerating
-  // anything -- see verifyRootAnchorLocked()'s comment.
+  // Recurses into subdirectories (see sumUsageRelative()), not a flat
+  // listing -- this directory is exclusively owned by AssetCache, so a
+  // stray directory (e.g. planted, or otherwise left behind) should
+  // never be invisible to this usage total. This cheap, stat-only check
+  // gates whether the much more expensive reapAndEnforceQuota() sweep
+  // (which does recursively remove stray directories) runs at all in
+  // store()'s hot path -- if a stray directory's contents weren't
+  // counted here, that gate could never trip, and the sweep that would
+  // actually clean it up might never run. Hidden entries are included
+  // too, so a stray hidden file would never undercount usage or prevent
+  // the high-water-mark gate from ever tripping. Review round-3 item 9:
+  // routed through diskUsageBytesLocked(), which itself re-verifies the
+  // root anchor (device+inode) before enumerating anything -- see
+  // verifyRootAnchorLocked()'s comment.
   return diskUsageBytesLocked();
 }
 
@@ -1442,19 +1953,28 @@ int AssetCache::diskEntryCount() const {
   if (!verifyRootAnchorLocked()) {
     return 0;
   }
-  QDir dir(m_directory);
+#if defined(Q_OS_UNIX)
+  if (m_rootFd < 0) {
+    return 0;
+  }
   int count = 0;
-  for (const QString &name : dir.entryList(QDir::Files)) {
+  // Round-4/5 review item 3: enumerated relative to `m_rootFd`, never a
+  // QDir re-resolving `m_directory` by path.
+  for (const RelativeDirEntry &entry : listAllEntriesRelative(m_rootFd)) {
     // One manifest file exists per live entry (review item 8) -- this is
     // a more accurate "how many entries does this cache have" count than
     // counting generation-scoped metadata files, which can transiently
     // include an orphan left by an interrupted replacement until the
     // next reap sweep reclaims it.
-    if (manifestNamePattern().match(name).hasMatch()) {
+    if (!entry.isDirectory && !entry.isSymlinkNode &&
+        manifestNamePattern().match(entry.name).hasMatch()) {
       ++count;
     }
   }
   return count;
+#else
+  return 0;
+#endif
 }
 
 std::optional<quint64>
@@ -1469,10 +1989,19 @@ AssetCache::accessSequenceForTesting(const QString &key) const {
   }
   const std::optional<DiskMetadata> metadata =
       readMetadata(generationMetadataPath(key, *generation), key);
-  if (!metadata || metadata->sha256Hex != *generation) {
+  if (!metadata || metadata->generationId != *generation) {
     return std::nullopt;
   }
   return metadata->accessSequence;
+}
+
+std::optional<QString>
+AssetCache::currentGenerationForTesting(const QString &key) const {
+  QMutexLocker locker(&m_mutex);
+  if (m_diskCacheDisabled || !isValidKey(key)) {
+    return std::nullopt;
+  }
+  return readManifestGeneration(key);
 }
 
 } // namespace Arkham

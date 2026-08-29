@@ -259,6 +259,19 @@ public:
   [[nodiscard]] std::optional<quint64>
   accessSequenceForTesting(const QString &key) const;
 
+  // Test-only exposure of the manifest's current live generation
+  // identifier for `key` (std::nullopt if no manifest names one right
+  // now). Round-4/5 review item 4 deliberately decouples the generation
+  // identifier from the payload's own content hash (see
+  // DiskMetadata::generationId's comment) -- this accessor is how a
+  // fault-injection test discovers the ACTUAL generation a real
+  // store()/replacement produced (to construct
+  // payloadPathForTesting()/metadataPathForTesting() paths against it),
+  // rather than a test wrongly assuming the generation still equals
+  // sha256(payload bytes).
+  [[nodiscard]] std::optional<QString>
+  currentGenerationForTesting(const QString &key) const;
+
 private:
   struct DiskMetadata {
     QString key;
@@ -267,6 +280,17 @@ private:
     int width{0};
     int height{0};
     QString sha256Hex;
+    // Round-4/5 review item 4: the generation identifier is now a
+    // per-store()-transaction unique value, deliberately independent of
+    // `sha256Hex` (the payload's own content hash) -- see
+    // mintGenerationIdLocked()'s comment. This field is the metadata's
+    // own self-consistency witness for that identifier: every reader
+    // that resolves a generation via the manifest cross-checks this
+    // field against the generation named there (in addition to
+    // independently re-hashing the payload against `sha256Hex`), so
+    // metadata can never be silently attached to the wrong generation's
+    // filename.
+    QString generationId;
     QString etag;
     QString lastModified;
     qint64 insertedAtMsecsSinceEpoch{0};
@@ -279,6 +303,14 @@ private:
     quint64 accessSequence{0};
   };
 
+  // Review round-4/5 item 3: these return a bare filesystem BASENAME
+  // (never a directory-joined path) -- every actual disk operation
+  // resolves that name relative to the already-open, anchor-verified
+  // `m_rootFd` (openat/fstatat/renameat/unlinkat), never by
+  // concatenating it onto `m_directory` and re-resolving the result
+  // from the filesystem root. `m_directory` itself is retained only for
+  // display/config/QStandardPaths-default purposes and the ONE-TIME
+  // construction-time open -- never for any I/O after that.
   [[nodiscard]] QString manifestPath(const QString &key) const;
   [[nodiscard]] QString generationPayloadPath(const QString &key,
                                               const QString &generation) const;
@@ -329,6 +361,15 @@ private:
   // m_mutex (the counter is not independently synchronized) -- see the
   // class comment for the recovery/uniqueness argument.
   [[nodiscard]] quint64 nextAccessSequenceLocked();
+  // Round-4/5 review item 4: mints a fresh, unique generation identifier
+  // for a single store() transaction -- see DiskMetadata::generationId's
+  // comment for why this must be independent of the payload's own
+  // content hash. Built from `accessSequence` (already-unique,
+  // monotonic, and persisted/recovered across restarts) plus real OS
+  // entropy, hashed to the same 64-lowercase-hex shape every other
+  // generation identifier already uses, so no on-disk filename-pattern
+  // change is required. Callers must already hold m_mutex.
+  [[nodiscard]] static QString mintGenerationIdLocked(quint64 accessSequence);
   // Bumps `key`'s on-disk access recency (accessSequence +
   // lastAccessMsecsSinceEpoch) in place, without touching its payload or
   // the manifest at all, tolerating a missing/corrupt disk record as a
@@ -353,6 +394,14 @@ private:
   // else entirely. Returns false iff disk I/O is (now, or already was)
   // disabled; callers must already hold m_mutex.
   [[nodiscard]] bool verifyRootAnchorLocked() const;
+  // Round-4/5 review item 3/10: fsyncs the retained root directory
+  // descriptor (`m_rootFd`) DIRECTLY -- never reopening `m_directory` by
+  // path -- so the two-phase publication barrier in store() (fsync
+  // after the payload+metadata renames, and again after the manifest
+  // rename) can never observe a different directory object than the
+  // one every other operation in this class already resolves through.
+  // Callers must already hold m_mutex.
+  [[nodiscard]] bool fsyncRootLocked() const;
   // Review round-3 item 11: a full, unconditional inventory of every
   // byte this cache's root directory ACTUALLY currently occupies on
   // disk (files, directories, symlink-node entries -- everything,
