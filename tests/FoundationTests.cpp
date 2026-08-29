@@ -1,9 +1,5 @@
-#include <array>
-#include <utility>
-
 #include <QtTest>
 
-#include "AppCommand.h"
 #include "ServerProfile.h"
 
 class FoundationTests final : public QObject {
@@ -13,7 +9,6 @@ private slots:
   void normalizesApiUrls();
   void convertsWebsocketSchemes();
   void rejectsUnsupportedServerSchemes();
-  void givesSemanticCommandsStableNames();
 };
 
 void FoundationTests::normalizesApiUrls() {
@@ -76,28 +71,6 @@ void FoundationTests::rejectsUnsupportedServerSchemes() {
   QVERIFY(!blank.isValid());
   QVERIFY(blank.apiUrl(u"whoami").isEmpty());
   QVERIFY(blank.websocketUrl(u"/arkham/games/game-id").isEmpty());
-}
-
-void FoundationTests::givesSemanticCommandsStableNames() {
-  const std::array mappings{
-      std::pair{Arkham::AppCommand::MoveUp, QStringLiteral("move-up")},
-      std::pair{Arkham::AppCommand::MoveDown, QStringLiteral("move-down")},
-      std::pair{Arkham::AppCommand::MoveLeft, QStringLiteral("move-left")},
-      std::pair{Arkham::AppCommand::MoveRight, QStringLiteral("move-right")},
-      std::pair{Arkham::AppCommand::Select, QStringLiteral("select")},
-      std::pair{Arkham::AppCommand::Back, QStringLiteral("back")},
-      std::pair{Arkham::AppCommand::Inspect, QStringLiteral("inspect")},
-      std::pair{Arkham::AppCommand::OpenActions,
-                QStringLiteral("open-actions")},
-      std::pair{Arkham::AppCommand::OpenHand, QStringLiteral("open-hand")},
-      std::pair{Arkham::AppCommand::OpenLog, QStringLiteral("open-log")},
-      std::pair{Arkham::AppCommand::RestoreCamera,
-                QStringLiteral("restore-camera")},
-  };
-
-  for (const auto &[command, expectedName] : mappings) {
-    QCOMPARE(Arkham::commandName(command), expectedName);
-  }
 }
 
 QTEST_APPLESS_MAIN(FoundationTests)

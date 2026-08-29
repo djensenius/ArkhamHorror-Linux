@@ -75,8 +75,6 @@ endif()
 
 add_library(arkham_foundation STATIC
     src/AppBootstrap.h
-    src/AppCommand.cpp
-    src/AppCommand.h
     src/AppSessionComposition.cpp
     src/AppSessionComposition.h
     src/AuthModels.cpp
@@ -89,9 +87,17 @@ add_library(arkham_foundation STATIC
     src/ContractPin.h
     src/ContractRevision.cpp
     src/ContractRevision.h
+    src/ControllerGlyphs.cpp
+    src/ControllerGlyphs.h
+    src/FocusController.cpp
+    src/FocusController.h
     src/IAuthenticationClient.h
     src/ICapabilityProbe.h
     src/IKeychainJobFactory.h
+    src/InputMapper.cpp
+    src/InputMapper.h
+    src/InputRouter.cpp
+    src/InputRouter.h
     src/IProfileStore.h
     src/ITokenStore.h
     src/NetworkAuthenticationClient.cpp
@@ -105,6 +111,8 @@ add_library(arkham_foundation STATIC
     src/QtKeychainJobFactory.h
     src/QtKeychainTokenStore.cpp
     src/QtKeychainTokenStore.h
+    src/SemanticCommand.cpp
+    src/SemanticCommand.h
     src/ServerCapabilities.cpp
     src/ServerCapabilities.h
     src/ServerProfile.cpp
@@ -123,6 +131,7 @@ add_library(arkham_foundation STATIC
 target_include_directories(arkham_foundation PUBLIC src)
 target_link_libraries(arkham_foundation PUBLIC
     Qt6::Core
+    Qt6::Gui
     Qt6::Network
     Qt6Keychain::Qt6Keychain
 )
@@ -225,6 +234,67 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME app_bootstrap COMMAND arkham-app-bootstrap-tests)
+
+    qt_add_executable(arkham-semantic-command-tests
+        tests/SemanticCommandTests.cpp
+    )
+    target_link_libraries(arkham-semantic-command-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME semantic_command COMMAND arkham-semantic-command-tests)
+
+    qt_add_executable(arkham-focus-controller-tests
+        tests/FocusControllerTests.cpp
+    )
+    target_link_libraries(arkham-focus-controller-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME focus_controller COMMAND arkham-focus-controller-tests)
+
+    qt_add_executable(arkham-input-mapper-tests
+        tests/InputMapperTests.cpp
+    )
+    target_link_libraries(arkham-input-mapper-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME input_mapper COMMAND arkham-input-mapper-tests)
+
+    qt_add_executable(arkham-input-router-tests
+        tests/InputRouterTests.cpp
+    )
+    target_link_libraries(arkham-input-router-tests PRIVATE
+        arkham_foundation
+        Qt6::Gui
+        Qt6::Test
+    )
+    add_test(NAME input_router COMMAND arkham-input-router-tests)
+
+    qt_add_executable(arkham-controller-glyph-tests
+        tests/ControllerGlyphTests.cpp
+    )
+    target_link_libraries(arkham-controller-glyph-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME controller_glyph COMMAND arkham-controller-glyph-tests)
+
+    qt_add_executable(arkham-semantic-input-fixture-tests
+        tests/SemanticInputFixtureTests.cpp
+    )
+    target_compile_definitions(arkham-semantic-input-fixture-tests PRIVATE
+        ARKHAM_TEST_QML_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml"
+    )
+    target_link_libraries(arkham-semantic-input-fixture-tests PRIVATE
+        arkham_foundation
+        Qt6::Gui
+        Qt6::Quick
+        Qt6::QuickControls2
+        Qt6::Test
+    )
+    add_test(NAME semantic_input_fixture COMMAND arkham-semantic-input-fixture-tests)
 
     # QtKeychain's kwallet5 backend (the two downstream hardening patches'
     # target) only exists in keychain_unix.cpp, compiled solely for
