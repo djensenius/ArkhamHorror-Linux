@@ -310,6 +310,95 @@ private:
     quint64 attemptId{0};
   };
 
+  // Per-property-group mutation/notification revision tracking. See the
+  // three PropertyRevision members below and publishDirtyProperties()'s
+  // own comment for the full model: |mutation| is bumped by the
+  // corresponding mutate*() helper ONLY when the externally observable
+  // getter value(s) it covers actually change (an unchanged reassignment
+  // -- e.g. a reentrant restart finding itself already in (Loading, "")
+  // -- creates no new obligation at all); |notified| records the highest
+  // |mutation| value whose signal has already been emitted. A property
+  // group is "dirty" (still owed a notification) exactly when
+  // notified < mutation. Both counters are quint64 and, like
+  // m_generation/m_nextTokenOpId/m_nextTokenAttemptId elsewhere in this
+  // class, rely on the practical impossibility of a single process
+  // instance performing 2^64 mutations of the same property within its
+  // lifetime rather than any explicit overflow handling.
+  struct PropertyRevision {
+    quint64 mutation{0};
+    quint64 notified{0};
+  };
+
+  // Assigns (state, diagnostic) and bumps m_stateRevision.mutation, but
+  // ONLY if the new tuple actually differs from the current one. Never
+  // emits by itself -- see publishDirtyProperties().
+  void mutateState(State state, QString diagnostic);
+
+  // Assigns the (optional) current-user identity (std::nullopt clears it)
+  // and bumps m_currentUserRevision.mutation, but ONLY if it actually
+  // differs (compared field-by-field: username/email/beta/admin, or
+  // has_value() for a clear). Never emits by itself.
+  void mutateCurrentUser(std::optional<CurrentUser> user);
+
+  // Assigns the selected profile ID/ServerProfile and bumps
+  // m_selectedProfileRevision.mutation, but ONLY if |profileId| actually
+  // differs from the current selection (matching switchProfile()'s own
+  // pre-existing "already selected" early-return check). Never emits by
+  // itself.
+  void mutateSelectedProfile(const QString &profileId,
+                             const ServerProfile &profile);
+
+  // The SOLE place stateChanged()/currentUserChanged()/
+  // selectedProfileChanged() are ever emitted. Every property group whose
+  // |mutation| revision is still newer than its |notified| revision at
+  // the moment this call reaches it is announced exactly once, in the
+  // fixed order state -> currentUser -> selectedProfile, marking
+  // |notified| == |mutation| for that group IMMEDIATELY BEFORE emitting
+  // its signal (never after). This ordering is what makes both directions
+  // of the review's finding impossible at once:
+  //
+  //  - A committed mutation is never left unannounced: unlike the
+  //    previous (buggy) design, staleness of the caller's own
+  //    |generation| is NEVER consulted here -- only actual coordinator
+  //    destruction (the QPointer going null, checked after every
+  //    individual emission) may skip a signal, since a destroyed QObject
+  //    cannot safely emit anything and nothing can observe it either.
+  //  - A value is never announced twice for the same settled revision: if
+  //    an earlier signal in this same call reentrantly triggers a NESTED
+  //    mutation/publication (e.g. a directly-connected stateChanged()
+  //    handler calling switchProfile() again), the nested call's own
+  //    dirty-check for any group this call already marked |notified| for
+  //    sees notified == mutation and correctly skips re-announcing it --
+  //    while any group the nested call mutates FURTHER (bumping
+  //    |mutation| again after this call already marked |notified|) is
+  //    left dirty for this call's own later, not-yet-reached check (which
+  //    will then announce the newest value, correctly reflecting the
+  //    nested call's outcome rather than this call's now-superseded one,
+  //    since notify signals carry no value and getters are always read
+  //    live).
+  //
+  // Returns false the moment destruction is observed, at which point
+  // nothing further may be touched; true otherwise. Callers must
+  // separately compare their own captured |generation| against
+  // m_generation (only once this returns true) to decide whether to
+  // proceed with any FURTHER asynchronous side effect (e.g. startProbe())
+  // -- never to decide whether notification happened, since by the time
+  // this returns, it already has, unconditionally, for every property
+  // that was genuinely dirty.
+  bool publishDirtyProperties(QPointer<SessionCoordinator> &self);
+
+  // Convenience wrapper for the common single-property-group case: calls
+  // mutateState() then publishDirtyProperties() via a fresh, local
+  // QPointer to `this`, so the majority of call sites that only ever
+  // change (state, diagnostic) don't need to construct their own
+  // QPointer or call publishDirtyProperties() by hand. A transition that
+  // mutates MORE than one property group together (start(),
+  // switchProfile(), clearCurrentUserAndSetStateIfCurrent(),
+  // applyCurrentUserAndSetStateIfCurrent()) instead calls the raw
+  // mutate*() helpers directly for every field in the same coherent
+  // batch, followed by exactly one shared publishDirtyProperties() call,
+  // so the very first signal already reflects every field's new value
+  // together.
   void setState(State state, QString diagnostic = {});
 
   void startProbe();
@@ -387,70 +476,24 @@ private:
   // ITokenStore.
   void invalidateProfileCredential(const QString &profileId);
 
-  // Emits stateChanged() and then, if |notifyUser| (resp. |notifyProfile|)
-  // is true, currentUserChanged() (resp. selectedProfileChanged()), in
-  // that fixed order. The caller must have already assigned every
-  // corresponding member variable (m_state/m_diagnostic always; the
-  // cleared/new m_currentUser iff |notifyUser|; m_selectedProfileId/
-  // m_currentProfile iff |notifyProfile|) BEFORE calling this, so every
-  // field is already coherent together at the moment of the FIRST
-  // notification: a directly-connected handler reentrantly calling
-  // switchProfile(), start(), signOut(), or destroying the coordinator
-  // during ANY of these signals never observes a hybrid snapshot (e.g.
-  // the new/cleared state together with the old identity or profile, or
-  // vice versa) -- only the complete new transition snapshot.
-  //
-  // Every signal below is unconditionally delivered once its field has
-  // been committed, REGARDLESS of whether an earlier signal in this same
-  // batch reentrantly triggers another transition that changes
-  // |generation|: once a member variable has been mutated, the
-  // corresponding Q_PROPERTY notify signal is owed and must fire while
-  // the QObject remains alive, or a binding on that property (QML or
-  // C++) would otherwise never learn the getter's value actually
-  // changed. A prior version of this function stopped delivering further
-  // signals the moment |generation| no longer matched, silently dropping
-  // an owed notification for a real, already-committed mutation whenever
-  // an earlier signal in the batch reentrantly triggered a nested
-  // transition -- this was itself the bug, not a safety feature: nothing
-  // about generation staleness makes a committed property mutation any
-  // less real or any less deserving of its notify signal. If a nested
-  // transition further mutates the same property again before a later
-  // signal in this batch is delivered, that later signal simply reflects
-  // whatever is currently in the member variable when it fires (notify
-  // signals carry no value; Qt property bindings always re-read via the
-  // getter), which is exactly the up-to-date value a binding needs.
-  //
-  // Only actual destruction (the QPointer going null) may skip a
-  // still-owed signal below, since a destroyed QObject cannot safely
-  // emit anything and nothing can observe it either; checked after EVERY
-  // individual emission, never combined with (or replaced by) the
-  // generation check. The returned bool reflects ONLY whether
-  // |generation| is still current once the entire notification batch has
-  // been delivered (false if destroyed at any point, or if superseded);
-  // every caller uses it solely to decide whether to start any FURTHER
-  // asynchronous side effect (probe/network/store) afterward -- never to
-  // decide whether to notify, since notification has unconditionally
-  // already happened above by the time this returns.
-  bool publishTransitionSnapshot(QPointer<SessionCoordinator> &self,
-                                 quint64 generation, bool notifyUser,
-                                 bool notifyProfile);
-
-  // Assigns the coherent (state, cleared-user) snapshot and then publishes
-  // it via publishTransitionSnapshot() above (with notifyProfile=false;
-  // this pattern never itself changes the selected profile), but only if
-  // |generation| is still current at the moment of the call. Every field
-  // that changes as part of this transition is assigned BEFORE either
-  // signal is emitted.
+  // Assigns the coherent (state, cleared-user) snapshot via
+  // mutateState()/mutateCurrentUser() (so every field that changes as
+  // part of this transition is committed BEFORE either signal is
+  // emitted), then publishes whichever of the two groups is actually
+  // dirty via publishDirtyProperties() above, and finally reports whether
+  // |generation| is still current -- but only once every genuinely dirty
+  // property has already been announced, per publishDirtyProperties()'s
+  // contract. Returns false immediately (without checking |generation|)
+  // if destroyed during publication.
   bool clearCurrentUserAndSetStateIfCurrent(quint64 generation, State state,
                                             QString diagnostic = {});
 
   // Same reentrancy-safety contract as clearCurrentUserAndSetStateIfCurrent
   // above, but for the "apply a freshly-known user, then transition to
   // SignedIn" pattern (credential restore's whoami success path): the new
-  // user and the new state are both assigned before stateChanged() is
-  // emitted, and currentUserChanged() is unconditionally delivered
-  // afterward (see publishTransitionSnapshot()'s contract) provided the
-  // coordinator is still alive.
+  // user and the new state are both committed via mutateCurrentUser()/
+  // mutateState() before either signal is published together via
+  // publishDirtyProperties().
   bool applyCurrentUserAndSetStateIfCurrent(quint64 generation,
                                             const CurrentUser &user,
                                             State state);
@@ -470,6 +513,13 @@ private:
   std::optional<ServerProfile> m_currentProfile;
 
   std::optional<CurrentUser> m_currentUser;
+
+  // Per-property-group mutation/notification revisions -- see
+  // PropertyRevision's own declaration and publishDirtyProperties()'s
+  // comment above for the full model.
+  PropertyRevision m_stateRevision;
+  PropertyRevision m_currentUserRevision;
+  PropertyRevision m_selectedProfileRevision;
 
   // Bumped on every profile switch, start() restart, and signOut();
   // captured by value in every asynchronous completion lambda so a stale

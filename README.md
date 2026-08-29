@@ -82,8 +82,15 @@ The current walking skeleton establishes:
   token, or `Authorization` header. Once a transition has assigned its
   observable fields, every notify signal it owes (`stateChanged`, and
   `currentUserChanged`/`selectedProfileChanged` where applicable) is
-  delivered in full via a single shared publication helper
-  (`publishTransitionSnapshot()`) -- checked only for coordinator
+  delivered via a single shared publication helper
+  (`publishDirtyProperties()`) that tracks a per-property-group mutation/
+  notification **revision** for each of the three groups (`state`+
+  `diagnostic`, `currentUser`, `selectedProfile`): a group's mutation
+  revision is bumped only when its externally observable getter value
+  actually changes, its notification revision is marked equal to the
+  current mutation revision immediately BEFORE emitting (never after),
+  and a signal fires only when a group's current mutation is still newer
+  than its last-notified revision. This is checked only for coordinator
   destruction between emissions, never for a nested reentrant transition
   having changed the generation in the meantime. A nested/reentrant
   transition changing the generation mid-batch only ever gates *further*
@@ -91,10 +98,16 @@ The current walking skeleton establishes:
   probe), never whether an already-committed field's change is announced;
   a directly-connected observer can therefore never observe a stale,
   un-notified value merely because another transition interrupted the
-  first one's own signal delivery. (A nested transition's own signals for
-  the same property may be delivered before the interrupted outer
-  transition's now-redundant, still-current-value delivery of that same
-  property -- an accepted, tested duplicate, never a dropped notification.)
+  first one's own signal delivery. Because notification revisions (not
+  coarse per-batch booleans) are tracked, a nested transition's own
+  publication for a property correctly satisfies an outer, not-yet-
+  notified obligation for that SAME property exactly once -- an unguarded
+  directly-connected handler that reassigns an unchanged value (e.g.
+  calling `start()` again whenever it observes `Loading`) creates no new
+  obligation and therefore cannot recurse, and a nested transition that
+  settles a property on a newer value than the interrupted outer
+  transition's own is announced exactly once, for the newest value, never
+  duplicated by the outer frame resuming afterward.
   Credential-restore additionally enforces at most one logical restore
   read queued or in-flight per profile, in every FIFO state (not only once
   a delete has already failed): repeated `start()` calls while a restore

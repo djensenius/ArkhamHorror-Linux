@@ -674,6 +674,9 @@ private slots:
   directStateChangedReentrancyDuringSwitchNestedSwitchStillDeliversAllOwedSignals();
   void
   coordinatorDestructionDuringSelectedProfileChangedEmissionDuringSwitchIsSafe();
+  void unguardedStateChangedHandlerCallingStartWheneverLoadingDoesNotRecurse();
+  void repeatedIdenticalRetryFailureDiagnosticEmitsStateChangedOnlyOnce();
+  void unchangedSwitchProfileReselectionEmitsNoSignals();
 
   // Secret-free diagnostics
   void diagnosticsAndStateNeverContainSecrets();
@@ -3355,21 +3358,20 @@ void SessionCoordinatorTests::
 
 void SessionCoordinatorTests::
     directStateChangedReentrancyDuringStartNestedRestartStillDeliversCurrentUserChanged() {
-  // Exact regression from review: publishTransitionSnapshot() (formerly
-  // publishClearedUserState()) used to check |generation| BETWEEN
-  // emissions and silently skip any signal not yet delivered the moment
-  // it no longer matched -- even though the corresponding member variable
-  // had already been permanently mutated. A directly-connected
-  // stateChanged() handler that reentrantly calls start() again bumps the
-  // generation WHILE the OUTER start()'s own stateChanged() emission is
-  // still being delivered; by the time control returns to the outer
-  // call, m_currentUser has already been committed to nil (by the outer
-  // assignment, confirmed unchanged by the inner restart, whose own
-  // hadUser is computed as false since the outer already cleared it) --
-  // yet the OLD code's generation check made the outer call return before
-  // ever emitting currentUserChanged() for that already-committed
-  // transition. Prove currentUserChanged() is still delivered for the
-  // whole nested batch despite the generation changing mid-emission.
+  // Exact regression from review: publishDirtyProperties() (formerly
+  // publishTransitionSnapshot()) uses per-property mutation/notification
+  // revisions rather than a coarse "was this property part of THIS batch"
+  // boolean. A directly-connected stateChanged() handler that reentrantly
+  // calls start() again bumps the generation WHILE the OUTER start()'s
+  // own stateChanged() emission is still being delivered; by the time
+  // control returns to the outer call, m_currentUser has already been
+  // committed to nil (by the outer assignment; the inner restart's own
+  // mutateCurrentUser(nullopt) is then a no-op since the value is already
+  // nil, so it bumps no further revision). Prove currentUserChanged() is
+  // still delivered EXACTLY ONCE for the whole nested batch -- never
+  // zero (the old bug: dropped because |generation| already changed) and
+  // never twice (a coarser fix that re-announces an already-settled
+  // value would also be wrong).
   Harness h;
   bootToSignedIn(h, QStringLiteral("session-token"));
   const QString profileId = h.coordinator->selectedProfileId();
@@ -3395,9 +3397,10 @@ void SessionCoordinatorTests::
 
   QVERIFY(handled);
   // The identity transition (signed-in user -> nil) was genuinely
-  // committed and must have been announced at least once, regardless of
+  // committed exactly once (the inner restart's own attempt to clear it
+  // again is a no-op) and must be announced exactly once, regardless of
   // the nested restart changing the generation mid-batch.
-  QVERIFY(currentUserSpy.count() >= 1);
+  QCOMPARE(currentUserSpy.count(), 1);
   QVERIFY(h.coordinator->currentUsername().isEmpty());
   // Existing token untouched: neither the outer nor the inner restart
   // ever calls signOut()/deletes anything.
@@ -3427,10 +3430,18 @@ void SessionCoordinatorTests::
   // OUTER switchProfile(B)'s own stateChanged() emission is still being
   // delivered -- the earliest possible interruption point, putting BOTH
   // of the outer call's remaining owed signals (currentUserChanged() and
-  // selectedProfileChanged()) at risk under the old code. Prove both are
-  // still delivered for the whole nested batch (their late/duplicate
-  // delivery here reflects the newest settled value, C, which is the
-  // correct, expected behavior for a nested transition -- not a bug).
+  // selectedProfileChanged()) at risk. Under the revision-tracking
+  // model: the outer's mutateSelectedProfile(B) bumps the profile
+  // revision but has not yet been marked notified (outer is still stuck
+  // inside its own stateChanged() emission); the nested switchProfile(C)
+  // call then bumps the SAME revision further (B -> C) and its OWN
+  // publishDirtyProperties() call marks/emits it, delivering C exactly
+  // once. When the outer frame resumes and reaches its own selectedProfile
+  // check, that revision is already notified, so it is NOT re-emitted.
+  // Prove selectedProfileChanged() fires EXACTLY ONCE for the final
+  // settled value C (never twice, and never zero), and currentUserChanged
+  // fires EXACTLY ONCE for the identity clear (the nested call's own
+  // re-clear is a no-op).
   Harness h;
   const ServerProfile hosted = ServerProfile::hostedDefault();
   const auto profileB = ServerProfile::custom(
@@ -3451,8 +3462,10 @@ void SessionCoordinatorTests::
                             &SessionCoordinator::currentUserChanged);
   QSignalSpy selectedProfileSpy(h.coordinator.get(),
                                 &SessionCoordinator::selectedProfileChanged);
+  QSignalSpy stateSpy(h.coordinator.get(), &SessionCoordinator::stateChanged);
   QVERIFY(currentUserSpy.isValid());
   QVERIFY(selectedProfileSpy.isValid());
+  QVERIFY(stateSpy.isValid());
 
   bool handled = false;
   QObject::connect(
@@ -3470,11 +3483,22 @@ void SessionCoordinatorTests::
   h.coordinator->switchProfile(idB);
 
   QVERIFY(handled);
-  // Both signals were genuinely committed (identity cleared; selection
-  // moved to C) and must have been announced at least once each,
-  // regardless of the nested switch changing the generation mid-batch.
-  QVERIFY(currentUserSpy.count() >= 1);
-  QVERIFY(selectedProfileSpy.count() >= 1);
+  // Both signals were genuinely committed exactly once each (identity
+  // cleared once; selection settled on C, with B's transient intermediate
+  // value never externally announced) despite the nested switch changing
+  // the generation mid-batch.
+  QCOMPARE(currentUserSpy.count(), 1);
+  QCOMPARE(selectedProfileSpy.count(), 1);
+  // stateChanged: the outer's own (SignedIn -> Loading) is the first
+  // genuine transition; the nested call's own attempt to reassign
+  // (Loading, "") is a no-op under mutateState()'s dirty-check and
+  // contributes no emission -- but the nested switchProfile(C) call runs
+  // all the way to its own startProbe(), whose setState(ProbingCapabilities)
+  // IS a genuinely new (state, diagnostic) value, producing a second,
+  // real emission before the outer frame ever resumes. Exactly 2, never
+  // 3 (no duplicate Loading) and never 1 (ProbingCapabilities must not be
+  // silently dropped either).
+  QCOMPARE(stateSpy.count(), 2);
 
   // Neither A's nor B's token was ever touched, and the final settled
   // selection is C -- with persisted storage agreeing (no split).
@@ -3501,10 +3525,10 @@ void SessionCoordinatorTests::
 void SessionCoordinatorTests::
     coordinatorDestructionDuringSelectedProfileChangedEmissionDuringSwitchIsSafe() {
   // Destruction safety for the THIRD signal in switchProfile()'s
-  // publishTransitionSnapshot() batch (selectedProfileChanged(), the last
-  // one delivered when notifyProfile=true): destroying the coordinator
-  // from directly within this specific emission must never crash or
-  // dereference `this`/`self` afterward. stateChanged() and
+  // publishDirtyProperties() batch (selectedProfileChanged(), the last
+  // one delivered since selectedProfile is always checked last): destroying
+  // the coordinator from directly within this specific emission must
+  // never crash or dereference `this`/`self` afterward. stateChanged() and
   // currentUserChanged() destruction safety are already covered by
   // coordinatorDestructionDuringStateChangedEmissionIsSafe() (the FIRST
   // signal) and the synchronous-delete test elsewhere; this completes the
@@ -3537,6 +3561,167 @@ void SessionCoordinatorTests::
   QVERIFY(handled);
   QVERIFY(h.coordinator == nullptr);
   // Reaching this line at all (no crash/UB) is the assertion.
+}
+
+// ─── Property-revision notification model ────────────────────────────────
+
+void SessionCoordinatorTests::
+    unguardedStateChangedHandlerCallingStartWheneverLoadingDoesNotRecurse() {
+  // Exact regression from review: under the OLD unconditional-emit
+  // setState(), a directly-connected stateChanged() handler that
+  // unconditionally calls start() whenever it observes state()==Loading
+  // would recurse forever -- every nested start() reassigns (Loading, "")
+  // even though the value never actually changes, and the old code
+  // re-emitted stateChanged() regardless, re-triggering the handler
+  // endlessly. Under mutateState()'s dirty-check, a reassignment of the
+  // IDENTICAL (state, diagnostic) tuple is a genuine no-op: it bumps no
+  // revision and therefore produces no emission, so the handler is never
+  // re-invoked for the same Loading value. This is the ONLY thing that
+  // makes this handler pattern -- deliberately written with NO "handled"
+  // guard, unlike every other reentrancy test in this file -- terminate
+  // at all: reaching this test's end (rather than a stack overflow/hang)
+  // is itself part of the assertion.
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  const int createdBefore = h.probeFactory.totalCreated();
+
+  QSignalSpy stateSpy(h.coordinator.get(), &SessionCoordinator::stateChanged);
+  QVERIFY(stateSpy.isValid());
+
+  int handlerInvocations = 0;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::stateChanged,
+      h.coordinator.get(),
+      [&h, &handlerInvocations] {
+        if (h.coordinator->state() == SessionCoordinator::State::Loading) {
+          ++handlerInvocations;
+          h.coordinator->start();
+        }
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->start();
+
+  // The outer start() commits (SignedIn -> Loading): the handler fires
+  // once, calls start() again; the nested start()'s own reassignment of
+  // (Loading, "") is a no-op, so the handler is NOT invoked a second time
+  // for the same value. The nested call proceeds all the way to a
+  // genuinely NEW state (ProbingCapabilities), at which point the
+  // handler's own `state() == Loading` condition no longer holds, so it
+  // does nothing further. Exactly one handler invocation; exactly two
+  // real stateChanged emissions (Loading once, ProbingCapabilities once);
+  // exactly one probe created (only the nested call ever reaches
+  // startProbe() -- the outer call is superseded by the generation bump
+  // before it would reach its own startProbe()).
+  QCOMPARE(handlerInvocations, 1);
+  QCOMPARE(stateSpy.count(), 2);
+  QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+
+  // The nested restart proceeds to completion normally.
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+}
+
+void SessionCoordinatorTests::
+    repeatedIdenticalRetryFailureDiagnosticEmitsStateChangedOnlyOnce() {
+  // Exact requirement: assigning the IDENTICAL (state, diagnostic) tuple
+  // must never create a new notification obligation. A profile whose
+  // required delete fails repeatedly with the EXACT SAME diagnostic text
+  // (backendErrorResult() always returns the static string
+  // "backend failure") reassigns (SecureStorageUnavailable,
+  // "backend failure") on every single failure -- under the OLD
+  // unconditional-emit setState(), each of these value-IDENTICAL
+  // reassignments re-emitted stateChanged() every time; the fix must
+  // emit it only once, for the first genuine transition into that
+  // (state, diagnostic) pair, with every subsequent identical failure
+  // producing zero further emissions.
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  h.coordinator->signOut();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+
+  QSignalSpy stateSpy(h.coordinator.get(), &SessionCoordinator::stateChanged);
+  QVERIFY(stateSpy.isValid());
+
+  h.tokenStore.complete(profileId, backendErrorResult()); // failure #1
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+  QCOMPARE(stateSpy.count(), 1);
+  const QString firstDiagnostic = h.coordinator->diagnostic();
+
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    h.coordinator->retry();
+    QVERIFY(pumpEventsUntil(
+        [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+    h.tokenStore.complete(profileId, backendErrorResult()); // identical
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    QCOMPARE(h.coordinator->state(),
+             SessionCoordinator::State::SecureStorageUnavailable);
+    QCOMPARE(h.coordinator->diagnostic(), firstDiagnostic);
+  }
+  // Every one of the 3 repeated identical failures reassigned the EXACT
+  // SAME (state, diagnostic) tuple: zero additional stateChanged()
+  // emissions beyond the first genuine transition.
+  QCOMPARE(stateSpy.count(), 1);
+
+  // The eventual success is still a genuinely NEW (state, diagnostic)
+  // pair and must still be announced.
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QCOMPARE(stateSpy.count(), 2);
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+}
+
+void SessionCoordinatorTests::
+    unchangedSwitchProfileReselectionEmitsNoSignals() {
+  // Exact requirement: reassigning an IDENTICAL value must never create a
+  // new notification obligation. switchProfile() re-selecting the
+  // already-selected profile is the clearest public-API scenario in
+  // which EVERY observable property genuinely stays byte-for-byte
+  // unchanged (state remains SignedIn with the same diagnostic,
+  // currentUser remains the same identity, selectedProfile remains the
+  // same profile): it must fire NONE of the three notify signals, not
+  // merely "no signal for whichever property happens to differ".
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  QSignalSpy stateSpy(h.coordinator.get(), &SessionCoordinator::stateChanged);
+  QSignalSpy currentUserSpy(h.coordinator.get(),
+                            &SessionCoordinator::currentUserChanged);
+  QSignalSpy selectedProfileSpy(h.coordinator.get(),
+                                &SessionCoordinator::selectedProfileChanged);
+  QVERIFY(stateSpy.isValid());
+  QVERIFY(currentUserSpy.isValid());
+  QVERIFY(selectedProfileSpy.isValid());
+
+  h.coordinator->switchProfile(profileId); // already selected: true no-op
+
+  QCOMPARE(stateSpy.count(), 0);
+  QCOMPARE(currentUserSpy.count(), 0);
+  QCOMPARE(selectedProfileSpy.count(), 0);
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedIn);
+  QCOMPARE(h.coordinator->selectedProfileId(), profileId);
 }
 
 // ─── Secret-free diagnostics ──────────────────────────────────────────────

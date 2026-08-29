@@ -84,15 +84,58 @@ bool SessionCoordinator::currentUserAdmin() const {
   return m_currentUser && m_currentUser->admin;
 }
 
-void SessionCoordinator::setState(State state, QString diagnostic) {
+void SessionCoordinator::mutateState(State state, QString diagnostic) {
+  if (m_state == state && m_diagnostic == diagnostic) {
+    // Reassigning the identical (state, diagnostic) tuple -- e.g. a
+    // reentrant restart() finding itself already at (Loading, "") -- is
+    // not a real transition and must never create a fresh notification
+    // obligation (this is what stops an unguarded stateChanged handler
+    // that unconditionally calls start() from recursing forever).
+    return;
+  }
   m_state = state;
   m_diagnostic = std::move(diagnostic);
-  emit stateChanged();
+  ++m_stateRevision.mutation;
+}
+
+void SessionCoordinator::mutateCurrentUser(std::optional<CurrentUser> user) {
+  const bool unchanged =
+      m_currentUser.has_value() == user.has_value() &&
+      (!user.has_value() || (m_currentUser->username == user->username &&
+                             m_currentUser->email == user->email &&
+                             m_currentUser->beta == user->beta &&
+                             m_currentUser->admin == user->admin));
+  if (unchanged) {
+    return;
+  }
+  m_currentUser = std::move(user);
+  ++m_currentUserRevision.mutation;
+}
+
+void SessionCoordinator::mutateSelectedProfile(const QString &profileId,
+                                               const ServerProfile &profile) {
+  if (profileId == m_selectedProfileId) {
+    // Matches switchProfile()'s own pre-existing "already selected"
+    // convention: re-selecting the SAME profile ID is not a real
+    // transition (even if some other ServerProfile field were somehow
+    // different, which selection itself never re-derives from).
+    return;
+  }
+  m_selectedProfileId = profileId;
+  m_currentProfile = profile;
+  ++m_selectedProfileRevision.mutation;
+}
+
+void SessionCoordinator::setState(State state, QString diagnostic) {
+  mutateState(state, std::move(diagnostic));
+  QPointer<SessionCoordinator> self(this);
+  publishDirtyProperties(self);
 }
 
 void SessionCoordinator::applyCurrentUser(const CurrentUser &user) {
-  m_currentUser = user;
-  emit currentUserChanged();
+  mutateCurrentUser(user);
+  QPointer<SessionCoordinator> self(this);
+  publishDirtyProperties(self);
 }
 
 // ─── Boot / profile loading ─────────────────────────────────────────────
@@ -115,24 +158,26 @@ void SessionCoordinator::start() {
   const quint64 generation = m_generation;
   m_retryAction = nullptr;
 
-  // Assign the complete new (Loading, cleared-identity) snapshot together
-  // BEFORE either notification is emitted below (see
-  // publishTransitionSnapshot()'s contract): a directly-connected handler
+  // Commit the complete new (Loading, cleared-identity) snapshot together
+  // BEFORE either notification is published below (see
+  // publishDirtyProperties()'s contract): a directly-connected handler
   // reentrantly calling switchProfile()/start()/signOut() from either
   // emission must see state()==Loading and currentUser()==nil already
   // coherent together, never a stale SignedIn alongside an already-
   // cleared identity (which previously let a reentrant signOut() during
   // this exact window proceed as if the session were still fully signed
-  // in).
-  const bool hadUser = m_currentUser.has_value();
-  m_currentUser.reset();
-  m_state = State::Loading;
-  m_diagnostic.clear();
+  // in). Reassigning identical values here (e.g. a reentrant restart
+  // finding itself already at (Loading, nil)) is a no-op under
+  // mutate*(): no duplicate notification is created.
+  mutateCurrentUser(std::nullopt);
+  mutateState(State::Loading, {});
 
   QPointer<SessionCoordinator> self(this);
-  if (!publishTransitionSnapshot(self, generation, hadUser,
-                                 /*notifyProfile=*/false)) {
-    return; // destroyed, or superseded (both signals above still fired)
+  if (!publishDirtyProperties(self)) {
+    return; // destroyed while a still-owed signal was being delivered
+  }
+  if (generation != m_generation) {
+    return; // superseded by a nested transition; side effects only
   }
 
   const auto profilesResult = m_profileStore.loadProfiles();
@@ -201,10 +246,11 @@ void SessionCoordinator::start() {
   // must never be dereferenced after the move below.
   const ServerProfile selectedProfile = *it;
   m_profiles = std::move(profiles);
-  m_selectedProfileId = selectedId;
-  m_currentProfile = selectedProfile;
-  emit selectedProfileChanged();
-  if (!self || generation != self->m_generation) {
+  mutateSelectedProfile(selectedId, selectedProfile);
+  if (!publishDirtyProperties(self)) {
+    return; // destroyed while a still-owed signal was being delivered
+  }
+  if (generation != m_generation) {
     return; // superseded while selectedProfileChanged() was being delivered
   }
 
@@ -271,23 +317,21 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
   // (which requires state()==SignedIn) can therefore never fire
   // reentrantly from within this transition at all, so it can never
   // observe -- or act on -- a hybrid of old and new identity. All three
-  // signals are delivered by the single publishTransitionSnapshot() call
-  // below -- including selectedProfileChanged(), which a previous version
-  // emitted separately AFTER that call returned, so a nested transition
-  // triggered by an earlier signal in the batch could make the
-  // superseded-generation check skip it entirely even though
-  // m_selectedProfileId/m_currentProfile had already been committed.
-  const bool hadUser = m_currentUser.has_value();
-  m_currentUser.reset();
-  m_state = State::Loading;
-  m_diagnostic.clear();
-  m_selectedProfileId = profileId;
-  m_currentProfile = *it;
+  // mutate*() calls below happen before the single publishDirtyProperties()
+  // call that follows, so every property that is genuinely dirty (state
+  // and currentUser always; selectedProfile always, since this function's
+  // own top-of-function early return already excludes the no-op
+  // re-selection case) is announced together from the very first signal.
+  mutateCurrentUser(std::nullopt);
+  mutateState(State::Loading, {});
+  mutateSelectedProfile(profileId, *it);
 
   QPointer<SessionCoordinator> self(this);
-  if (!publishTransitionSnapshot(self, generation, hadUser,
-                                 /*notifyProfile=*/true)) {
-    return; // destroyed, or superseded (all signals above still fired)
+  if (!publishDirtyProperties(self)) {
+    return; // destroyed while a still-owed signal was being delivered
+  }
+  if (generation != m_generation) {
+    return; // superseded by a nested transition; side effects only
   }
 
   startProbe();
@@ -1078,41 +1122,38 @@ void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
                  });
 }
 
-bool SessionCoordinator::publishTransitionSnapshot(
-    QPointer<SessionCoordinator> &self, quint64 generation, bool notifyUser,
-    bool notifyProfile) {
-  // Precondition (enforced by every caller): m_state/m_diagnostic, and
-  // whichever of m_currentUser (iff |notifyUser|) / m_selectedProfileId
-  // and m_currentProfile (iff |notifyProfile|) are part of this
-  // transition, have ALREADY been assigned before this runs, so the very
-  // first signal emitted below already carries the complete, coherent new
-  // snapshot -- never the old state/identity/profile paired with another
-  // field's new value.
-  emit stateChanged();
-  if (!self) {
-    return false; // destroyed while stateChanged() was being delivered
+bool SessionCoordinator::publishDirtyProperties(
+    QPointer<SessionCoordinator> &self) {
+  if (m_stateRevision.notified != m_stateRevision.mutation) {
+    // Mark |notified| BEFORE emitting (not after): if this emission
+    // synchronously triggers a nested transition that mutates the SAME
+    // property group further, the nested call's own publish step sees
+    // notified==mutation(old) as already stale relative to ITS newer
+    // mutation and correctly announces the newest value itself; when
+    // control returns here, this frame's own now-superseded obligation is
+    // already satisfied and must not re-fire.
+    m_stateRevision.notified = m_stateRevision.mutation;
+    emit stateChanged();
+    if (!self) {
+      return false; // destroyed while stateChanged() was being delivered
+    }
   }
-  if (notifyUser) {
+  if (m_currentUserRevision.notified != m_currentUserRevision.mutation) {
+    m_currentUserRevision.notified = m_currentUserRevision.mutation;
     emit currentUserChanged();
     if (!self) {
       return false; // destroyed while currentUserChanged() was delivered
     }
   }
-  if (notifyProfile) {
+  if (m_selectedProfileRevision.notified !=
+      m_selectedProfileRevision.mutation) {
+    m_selectedProfileRevision.notified = m_selectedProfileRevision.mutation;
     emit selectedProfileChanged();
     if (!self) {
       return false; // destroyed while selectedProfileChanged() was delivered
     }
   }
-  // Every notification owed by this transition has now been delivered in
-  // full, unconditionally, regardless of whether an earlier signal above
-  // reentrantly triggered a nested transition that changed |generation|
-  // (see this method's declaration in SessionCoordinator.h for why that
-  // must never suppress an already-committed property's notify signal).
-  // This return value is therefore consulted ONLY by the caller's
-  // decision to start a further asynchronous side effect (e.g.
-  // startProbe()) -- never to decide whether the signals above fired.
-  return generation == self->m_generation;
+  return true;
 }
 
 bool SessionCoordinator::clearCurrentUserAndSetStateIfCurrent(
@@ -1120,20 +1161,20 @@ bool SessionCoordinator::clearCurrentUserAndSetStateIfCurrent(
   if (generation != m_generation) {
     return false;
   }
-  // Assign the complete new (state, cleared-identity) snapshot together,
-  // BEFORE either signal is emitted: see publishTransitionSnapshot()'s
+  // Commit the complete new (state, cleared-identity) snapshot together,
+  // BEFORE either signal is published: see publishDirtyProperties()'s
   // contract. This is what makes a synchronously-completing ITokenStore
   // (see signOut()'s deletion path) safe -- a reentrant handler observing
   // either emission below sees the target state (e.g. SignedOut) and the
   // cleared identity together, never a stale SignedIn alongside an
   // already-cleared identity.
-  const bool hadUser = m_currentUser.has_value();
-  m_currentUser.reset();
-  m_state = state;
-  m_diagnostic = std::move(diagnostic);
+  mutateCurrentUser(std::nullopt);
+  mutateState(state, std::move(diagnostic));
   QPointer<SessionCoordinator> self(this);
-  return publishTransitionSnapshot(self, generation, hadUser,
-                                   /*notifyProfile=*/false);
+  if (!publishDirtyProperties(self)) {
+    return false;
+  }
+  return generation == self->m_generation;
 }
 
 bool SessionCoordinator::applyCurrentUserAndSetStateIfCurrent(
@@ -1141,15 +1182,16 @@ bool SessionCoordinator::applyCurrentUserAndSetStateIfCurrent(
   if (generation != m_generation) {
     return false;
   }
-  // Assign the complete new (state, identity) snapshot together, BEFORE
-  // either signal is emitted, for the same coherence reason as
+  // Commit the complete new (state, identity) snapshot together, BEFORE
+  // either signal is published, for the same coherence reason as
   // clearCurrentUserAndSetStateIfCurrent() above.
-  m_currentUser = user;
-  m_state = state;
-  m_diagnostic.clear();
+  mutateCurrentUser(user);
+  mutateState(state, {});
   QPointer<SessionCoordinator> self(this);
-  return publishTransitionSnapshot(self, generation, /*notifyUser=*/true,
-                                   /*notifyProfile=*/false);
+  if (!publishDirtyProperties(self)) {
+    return false;
+  }
+  return generation == self->m_generation;
 }
 
 } // namespace Arkham
