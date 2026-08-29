@@ -1,5 +1,7 @@
 #include "AuthModels.h"
 
+#include "TokenValidation.h"
+
 #include <QJsonValue>
 
 using namespace Qt::StringLiterals;
@@ -79,9 +81,18 @@ ValueOrError<AuthToken> AuthToken::fromJson(const QJsonObject &obj) {
   if (!tokenStr) {
     return failure(tokenStr.error());
   }
-  if (tokenStr->trimmed().isEmpty()) {
+  if (!isValidTokenContent(*tokenStr)) {
+    // See TokenValidation.h: this is the exact same shared check every
+    // other token trust boundary (whoAmI() admission, the coordinator's
+    // own handling of this result, secure-store save, and the durable
+    // envelope's own reader) enforces. Rejecting it here, at decode time,
+    // means a value like " valid-jwt " (which trims to non-blank but
+    // still carries leading/trailing whitespace) can never be admitted
+    // into an Authorization header or persisted in the first place, only
+    // to be classified Malformed and deleted on the very next restore.
+    // The error message never echoes the offending value.
     return failure(
-        QStringLiteral("response field \"token\" must not be blank"));
+        QStringLiteral("response field \"token\" is not a usable token"));
   }
   return AuthToken{*tokenStr};
 }
