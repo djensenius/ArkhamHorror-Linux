@@ -1,6 +1,5 @@
 #include "JsonDecode.h"
 
-#include <QJsonDocument>
 #include <QLatin1StringView>
 #include <charconv>
 #include <cmath>

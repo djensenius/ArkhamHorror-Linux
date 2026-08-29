@@ -510,11 +510,16 @@ struct CardDef {
   friend bool operator==(const CardDef &, const CardDef &) = default;
 };
 
-// Decodes contracts/fixtures/catalog.json's/the card-catalog endpoint's
-// complete top-level array via the canonical byte-level parser (see
+// Decodes the card-catalog endpoint's top-level array response shape (a
+// bare `[CardDef, ...]`) via the canonical byte-level parser (see
 // RawJson.h), never QJsonDocument -- see CardDef::fromRawJson()'s doc
 // comment for why this matters for this type specifically (every entry's
-// schema-unconstrained fields).
+// schema-unconstrained fields). Note this is NOT the vendored
+// contracts/fixtures/catalog.json fixture *bundle* shape, which is a
+// top-level object ({"cards": [...], "homebrewCards": [...],
+// "investigators": [...]}); a caller decoding that fixture must first
+// extract its "cards" (or "homebrewCards") array member and pass that
+// array's bytes here.
 [[nodiscard]] ValueOrError<QList<CardDef>>
 decodeCatalogFromRawBytes(QByteArrayView bytes, QStringView path);
 
