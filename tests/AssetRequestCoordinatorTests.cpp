@@ -549,6 +549,196 @@ void AssetRequestCoordinatorTests::cacheHitShortCircuitsNetworkEntirely() {
            0);
 }
 
+void AssetRequestCoordinatorTests::
+    cachedEnglishFallbackNeverSkipsUntriedLocalizedCandidate() {
+  // Regression for review item 5: a lower-priority candidate (English)
+  // that is already cached must never be served ahead of a
+  // higher-priority candidate (the localized "it" variant) that has not
+  // been tried at all. Real digest data confirms card "01001" has an
+  // Italian localized variant (see contracts/asset-locale-digest-
+  // sources/ita.json), so AssetLocator::resolveCandidates() proposes,
+  // in strict order: [it/cards/01001.avif, cards/01001.avif,
+  // cards/01001a.avif (alt-front fallback)].
+  MockHttpServer server;
+  MockHttpServer::Response localized;
+  localized.contentType = "image/avif";
+  localized.body = minimalAvifFtypBox();
+  server.setResponse(QStringLiteral("/img/arkham/ita/cards/01001.avif"),
+                     localized);
+  // Deliberately leave the English candidate unregistered: if the
+  // coordinator ever (incorrectly) served the pre-cached English entry
+  // instead of trying the untried localized candidate first, this test
+  // would still "pass" by accident unless we also prove the localized
+  // candidate was genuinely requested -- see the requestCount assertion
+  // below, which is the actual proof.
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  AssetKey key =
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                  QStringLiteral("01001"));
+  key.locale = QStringLiteral("it");
+
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  QCOMPARE(candidates->size(), 3);
+  QVERIFY2(candidates->at(1)
+               .url.toString(QUrl::FullyEncoded)
+               .endsWith(QStringLiteral("/img/arkham/cards/01001.avif")),
+           qPrintable(candidates->at(1).url.toString(QUrl::FullyEncoded)));
+  const QString englishCacheKey =
+      AssetCache::cacheKeyFor(candidates->at(1).url);
+  AssetCache::CachedEntry preSeededEnglish;
+  preSeededEnglish.encodedBytes = minimalAvifFtypBox();
+  preSeededEnglish.contentType = QStringLiteral("image/avif");
+  preSeededEnglish.dimensions = QSize(4, 4);
+  cache.store(englishCacheKey, preSeededEnglish);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  // Proof the untried localized candidate was genuinely attempted (not
+  // skipped): it was requested exactly once.
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
+      1);
+  // Proof the pre-cached English entry was never even consulted over the
+  // network for this same reason it was never served either: the final
+  // outcome is this environment's expected UnsupportedCodec (no Qt AVIF
+  // decode plugin -- see minimalAvifFtypBox()'s comment), NOT a success
+  // carrying the pre-seeded English bytes. If the coordinator had
+  // (incorrectly) shortcut straight to the cached English entry, this
+  // would instead be a success whose encodedBytes equal preSeededEnglish.
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
+           0);
+}
+
+void AssetRequestCoordinatorTests::
+    confirmedNegative404AuthorizesSkippingCandidate() {
+  // Only an exact, authoritative 404 for the EXACT candidate authorizes
+  // skipping it on a later logical request; anything else (including no
+  // record at all) never does -- see
+  // cachedEnglishFallbackNeverSkipsUntriedLocalizedCandidate() above for
+  // that side of review item 5's requirement.
+  MockHttpServer server;
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/img/arkham/ita/cards/01001.avif"),
+                     notFound);
+  MockHttpServer::Response english;
+  english.contentType = "image/avif";
+  english.body = minimalAvifFtypBox();
+  server.setResponse(QStringLiteral("/img/arkham/cards/01001.avif"), english);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  AssetKey key =
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                  QStringLiteral("01001"));
+  key.locale = QStringLiteral("it");
+
+  std::optional<Result> firstResult;
+  coordinator.request(key, [&](Result r) { firstResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return firstResult.has_value(); }, 5000));
+  // English is genuinely AVIF-shaped but undecodable in this environment
+  // (no Qt AVIF plugin): UnsupportedCodec, not a success -- deterministic
+  // and, crucially, never stored in the cache (only a successful outcome
+  // is ever cache-stored), so a second identical request cannot shortcut
+  // via an English cache hit either -- it can ONLY shortcut via the
+  // localized candidate's negative-404 record, which is exactly what this
+  // test proves.
+  QVERIFY(!bool(*firstResult));
+  QCOMPARE(firstResult->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
+      1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
+           1);
+
+  std::optional<Result> secondResult;
+  coordinator.request(key, [&](Result r) { secondResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 5000));
+
+  QVERIFY(!bool(*secondResult));
+  QCOMPARE(secondResult->error().code, AssetErrorCode::UnsupportedCodec);
+  // The localized candidate's confirmed negative-404 record authorized
+  // skipping it entirely on this second request: its request count did
+  // NOT increase, while English (genuinely re-tried, since its own
+  // UnsupportedCodec outcome left no cache entry or negative record) did.
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
+      1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
+           2);
+}
+
+void AssetRequestCoordinatorTests::
+    allCandidatesNegative404CompletesWithoutNetworkRoundTrip() {
+  MockHttpServer server;
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/img/arkham/ita/cards/01001.avif"),
+                     notFound);
+  server.setResponse(QStringLiteral("/img/arkham/cards/01001.avif"), notFound);
+  server.setResponse(QStringLiteral("/img/arkham/cards/01001a.avif"), notFound);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  AssetKey key =
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                  QStringLiteral("01001"));
+  key.locale = QStringLiteral("it");
+
+  std::optional<Result> firstResult;
+  coordinator.request(key, [&](Result r) { firstResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return firstResult.has_value(); }, 5000));
+  QVERIFY(!bool(*firstResult));
+  QCOMPARE(firstResult->error().code, AssetErrorCode::NotFound);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
+      1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
+           1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001a.avif")),
+           1);
+
+  std::optional<Result> secondResult;
+  coordinator.request(key, [&](Result r) { secondResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 5000));
+  QVERIFY(!bool(*secondResult));
+  QCOMPARE(secondResult->error().code, AssetErrorCode::NotFound);
+  // Every candidate carried a confirmed negative-404 record: the second,
+  // logically identical request resolves immediately with NO further
+  // network round trip for any of them.
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
+      1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
+           1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001a.avif")),
+           1);
+}
+
 void AssetRequestCoordinatorTests::destructionNeverInvokesStaleCallback() {
   MockHttpServer server;
   MockHttpServer::Response response;
@@ -937,11 +1127,80 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
-    diskHitRevalidationServesStaleOnAnyFailure() {
+    diskHitRevalidationEvictsEntryAndAdvancesOn404() {
+  // Regression for review item 5: a REVALIDATION 404 is the one
+  // revalidation failure that must NOT fall back to "stale-if-error" --
+  // the origin has authoritatively confirmed this exact candidate is
+  // gone, so the stale entry is evicted and the request advances through
+  // the remaining candidates exactly like a first-time miss. Uses a real
+  // Card key (English + alt-front-fallback candidates) so there IS a
+  // remaining candidate to advance to.
+  MockHttpServer server;
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/img/arkham/cards/valid01.avif"),
+                     notFound);
+  MockHttpServer::Response altFront;
+  altFront.contentType = "image/avif";
+  altFront.body = minimalAvifFtypBox();
+  server.setResponse(QStringLiteral("/img/arkham/cards/valid01a.avif"),
+                     altFront);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  QCOMPARE(candidates->size(), 2);
+  const QString englishCacheKey =
+      AssetCache::cacheKeyFor(candidates->at(0).url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = minimalAvifFtypBox();
+  preSeeded.contentType = QStringLiteral("image/avif");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.lastModified = QStringLiteral("Wed, 01 Jan 2020 00:00:00 GMT");
+  cache.store(englishCacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  // The 404'd English candidate was evicted (never resurrected via
+  // stale-if-error) and the request genuinely advanced to (and
+  // requested) the alt-front-fallback candidate: its own outcome is this
+  // environment's expected UnsupportedCodec (no Qt AVIF decode plugin),
+  // proving real advancement rather than a hang or a false stale
+  // success.
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/cards/valid01.avif")), 1);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/cards/valid01a.avif")),
+      1);
+  QVERIFY(!restartedCache.lookupDisk(englishCacheKey).has_value());
+}
+
+void AssetRequestCoordinatorTests::
+    diskHitRevalidationServesStaleOnNon404Failure() {
+  // Every OTHER revalidation failure (transport error, timeout, TLS
+  // failure, 5xx, cancellation, integrity/codec failure) is NOT proof
+  // the resource is gone: "stale-if-error" still applies, and a briefly-
+  // unreachable or since-changed origin can never make previously
+  // cached, already-displayed art disappear.
   MockHttpServer server;
   MockHttpServer::Response response;
-  response.status = 404;
-  response.reasonPhrase = "Not Found";
+  response.status = 500;
+  response.reasonPhrase = "Internal Server Error";
   server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
@@ -969,12 +1228,12 @@ void AssetRequestCoordinatorTests::
   coordinator.request(key, [&](Result r) { result = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
 
-  // "Stale-if-error": an origin that now 404s a previously-cached
-  // candidate must never make already-cached, already-displayed art
-  // disappear or error out.
   QVERIFY2(bool(*result), qPrintable(result->error().message));
   QCOMPARE((**result).encodedBytes, preSeeded.encodedBytes);
   QVERIFY(!(**result).decodedImage.isNull());
+  // The stale entry is still on disk, untouched -- a non-404 failure
+  // never evicts.
+  QVERIFY(restartedCache.lookupDisk(cacheKey).has_value());
 }
 
 void AssetRequestCoordinatorTests::

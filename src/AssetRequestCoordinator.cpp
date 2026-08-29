@@ -98,12 +98,23 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
 
   const QVector<AssetCandidate> &candidates = *candidatesResult;
 
-  // Serve directly from cache if ANY candidate (in fallback order) is
-  // already known-good: this reflects a previously-resolved outcome (e.g.
-  // "the localized image 404s, English succeeded") without repeating the
-  // fallback probing every time.
-  for (const AssetCandidate &candidate : candidates) {
+  // Walk candidates in STRICT priority order (review item 5): a
+  // lower-priority candidate that happens to already be cached must
+  // never be served ahead of a higher-priority candidate that has not
+  // yet been tried at all. The only thing that authorizes skipping a
+  // candidate here without trying it is an exact, authoritative
+  // negative-404 record for that EXACT resolved candidate URL (see
+  // hasNegative404() / the class comment) -- anything else (no record at
+  // all) stops this loop immediately, even if a later candidate would
+  // otherwise be servable straight from cache.
+  int candidateIndex = 0;
+  for (; candidateIndex < candidates.size(); ++candidateIndex) {
+    const AssetCandidate &candidate = candidates[candidateIndex];
     const QString cacheKey = AssetCache::cacheKeyFor(candidate.url);
+
+    if (hasNegative404(cacheKey)) {
+      continue; // authoritatively confirmed absent: try the next candidate
+    }
 
     // A same-process memory hit was already validated during this
     // process's own lifetime: serve it with no network round trip at all.
@@ -148,8 +159,13 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
       const quint64 operationId = m_nextOperationId++;
       Operation operation;
       operation.key = key;
-      operation.candidates = QVector<AssetCandidate>{candidate};
-      operation.candidateIndex = 0;
+      // The full candidate vector (not just this one candidate) is kept
+      // so that if this revalidation itself receives a definitive 404,
+      // it can evict this entry and advance through the REMAINING
+      // candidates exactly like a first-time miss (see
+      // startRevalidation()), rather than dead-ending here.
+      operation.candidates = candidates;
+      operation.candidateIndex = candidateIndex;
       operation.isRevalidation = true;
       operation.revalidationCacheKey = cacheKey;
       operation.staleEntry = std::move(entry);
@@ -160,6 +176,26 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
       startRevalidation(operationId);
       return RequestHandle{handleId};
     }
+
+    // Neither a confirmed-absent record nor a cache hit: this is the
+    // first genuinely untried candidate in strict priority order. Stop
+    // probing the cache here and fall through to the network below --
+    // an untried higher-priority candidate must never be skipped in
+    // favour of a lower-priority one that merely happens to already be
+    // cached.
+    break;
+  }
+
+  if (candidateIndex >= candidates.size()) {
+    // Every remaining candidate carries an authoritative confirmed-404
+    // record: the whole logical request is definitively not-found, with
+    // no network round trip required at all.
+    return registerImmediateCompletion(
+        key, std::move(callback),
+        AssetOutcome<AssetCache::CachedEntry>(AssetError{
+            AssetErrorCode::NotFound,
+            QStringLiteral("every candidate previously confirmed absent "
+                           "(negative cache)")}));
   }
 
   const QString opKey = canonicalOperationKey(key);
@@ -178,7 +214,7 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   Operation operation;
   operation.key = key;
   operation.candidates = candidates;
-  operation.candidateIndex = 0;
+  operation.candidateIndex = candidateIndex;
   operation.consumers.append(Consumer{handleId, std::move(callback)});
   m_operations.insert(operationId, std::move(operation));
   m_handleToOperation.insert(handleId, operationId);
@@ -196,6 +232,18 @@ AssetRequestCoordinator::findInFlightOperation(const QString &opKey) const {
     }
   }
   return std::nullopt;
+}
+
+bool AssetRequestCoordinator::hasNegative404(const QString &cacheKey) const {
+  return m_negative404.contains(cacheKey);
+}
+
+void AssetRequestCoordinator::recordNegative404(const QString &cacheKey) {
+  m_negative404.insert(cacheKey);
+}
+
+void AssetRequestCoordinator::clearNegative404(const QString &cacheKey) {
+  m_negative404.remove(cacheKey);
 }
 
 AssetOutcome<AssetCache::CachedEntry>
@@ -274,6 +322,13 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
           const AssetError &error = result.error();
           if (error.code == AssetErrorCode::NotFound) {
             Operation &operation = opIt.value();
+            // Authoritative: this EXACT candidate is definitively absent.
+            // Record it so a future request() for a different logical
+            // key that also resolves to this same candidate can skip it
+            // outright (see hasNegative404() / the class comment) --
+            // never recorded for any other error code.
+            self->recordNegative404(AssetCache::cacheKeyFor(
+                operation.candidates[operation.candidateIndex].url));
             if (operation.candidateIndex + 1 < operation.candidates.size()) {
               ++operation.candidateIndex;
               self->startCandidate(operationId);
@@ -304,6 +359,10 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
         Operation &operation = opIt.value();
         const QString cacheKey = AssetCache::cacheKeyFor(
             operation.candidates[operation.candidateIndex].url);
+        // Defensive: a candidate that once 404'd could, in principle,
+        // reappear -- never leave a stale negative record pointing at a
+        // now-confirmed-good candidate.
+        self->clearNegative404(cacheKey);
         AssetCache::CachedEntry entry = toCachedEntry(*result->asset);
         self->m_cache.store(cacheKey, entry);
         self->completeOperation(operationId,
@@ -317,7 +376,8 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
     return;
   }
   Operation &operation = it.value();
-  const AssetCandidate &candidate = operation.candidates.first();
+  const AssetCandidate &candidate =
+      operation.candidates[operation.candidateIndex];
   const AssetCache::CachedEntry &staleEntry = *operation.staleEntry;
 
   AssetNetworkFetcher::ConditionalHeaders conditional;
@@ -339,20 +399,45 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         Operation &operation = opIt.value();
         const AssetCache::CachedEntry stale = *operation.staleEntry;
 
-        // "Stale-if-error": ANY revalidation failure (a 404 because the
-        // origin removed this exact candidate, a transport error, a
-        // timeout, an integrity/codec failure, cancellation racing a
-        // teardown, etc.) attempts to serve the still-valid stale cached
-        // entry rather than surfacing the *revalidation's* error or
-        // advancing candidates -- a briefly-unreachable or since-changed
-        // origin can never make previously cached, already-displayed art
-        // disappear. This is "as-is" only in the sense that the cached
-        // payload bytes are never re-fetched or rewritten; ensureDecoded()
-        // below can still surface its own typed error (e.g. the on-disk
-        // bytes no longer decode because the installed codec plugins
-        // changed, or the payload was corrupted) instead of a decoded
-        // image -- that is a genuine, independent failure of the cached
-        // entry itself, not a failure of this revalidation attempt.
+        // A definitive 404 is the ONE revalidation failure that does NOT
+        // fall back to "stale-if-error" (review item 5): the origin has
+        // authoritatively confirmed this exact candidate no longer
+        // exists, so the stale cached entry is evicted (never served as
+        // a false "still good" success), a negative-404 record is
+        // written for it, and the request advances through the
+        // remaining candidates exactly like a first-time miss would --
+        // reusing the ordinary startCandidate() fetch path from here on.
+        if (!result && result.error().code == AssetErrorCode::NotFound) {
+          self->m_cache.invalidate(operation.revalidationCacheKey);
+          self->recordNegative404(operation.revalidationCacheKey);
+          if (operation.candidateIndex + 1 < operation.candidates.size()) {
+            ++operation.candidateIndex;
+            operation.isRevalidation = false;
+            operation.staleEntry.reset();
+            self->startCandidate(operationId);
+            return;
+          }
+          self->completeOperation(
+              operationId,
+              AssetOutcome<AssetCache::CachedEntry>(result.error()));
+          return;
+        }
+
+        // "Stale-if-error": every OTHER revalidation failure (transport
+        // error, timeout, TLS failure, 5xx, an integrity/codec failure,
+        // cancellation racing a teardown, etc.) attempts to serve the
+        // still-valid stale cached entry rather than surfacing the
+        // *revalidation's* error or advancing candidates -- a briefly-
+        // unreachable or since-changed origin can never make previously
+        // cached, already-displayed art disappear, and none of these
+        // outcomes is proof the resource is actually gone. This is
+        // "as-is" only in the sense that the cached payload bytes are
+        // never re-fetched or rewritten; ensureDecoded() below can still
+        // surface its own typed error (e.g. the on-disk bytes no longer
+        // decode because the installed codec plugins changed, or the
+        // payload was corrupted) instead of a decoded image -- that is a
+        // genuine, independent failure of the cached entry itself, not a
+        // failure of this revalidation attempt.
         if (!result) {
           self->completeOperation(
               operationId, self->ensureDecoded(stale, operation.key.format,

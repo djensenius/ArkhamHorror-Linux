@@ -500,6 +500,15 @@ void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
                    static_cast<qsizetype>(heapEntry->costBytes()));
 }
 
+void AssetCache::invalidate(const QString &key) {
+  if (!isValidKey(key)) {
+    return;
+  }
+  QMutexLocker locker(&m_mutex);
+  m_memory->remove(key);
+  deleteEntry(key);
+}
+
 void AssetCache::reapAndEnforceQuota() {
   QMutexLocker locker(&m_mutex);
 

@@ -145,6 +145,15 @@ public:
   // instead of repeating the conditional GET.
   void promoteToMemory(const QString &key, CachedEntry entry);
 
+  // Unconditionally removes `key` from both memory and disk (payload +
+  // metadata). Used when a previously-cached candidate is confirmed
+  // definitively gone (an authoritative revalidation 404 -- see
+  // AssetRequestCoordinator) or definitively invalid (a disk entry that
+  // fails an integrity/format/limit re-check on read -- "quarantine").
+  // A no-op if `key` is not currently cached anywhere; safe to call
+  // repeatedly.
+  void invalidate(const QString &key);
+
   // Repairs orphan payloads, corrupt entries, and stray temp files, then
   // evicts oldest-access entries if disk usage exceeds the 90% high-water
   // mark, down to the 75% low-water mark. Called once from the

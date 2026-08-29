@@ -6,6 +6,7 @@
 
 #include <QHash>
 #include <QObject>
+#include <QSet>
 #include <QVector>
 #include <functional>
 #include <memory>
@@ -20,6 +21,30 @@ namespace Arkham {
 // documents, and never on Transport/RedirectRejected/UnexpectedStatus/
 // ResponseTooLarge/ContentTypeMismatch/MagicBytesMismatch/DimensionTooLarge/
 // PixelBudgetExceeded/UnsupportedCodec/MalformedImage/Cancelled.
+//
+// Candidate priority order is enforced STRICTLY, including when consulting
+// the cache: a lower-priority candidate (e.g. the English fallback) that
+// happens to already be cached can never be served ahead of a
+// higher-priority candidate (e.g. a localized variant) that has not yet
+// been tried at all. The ONLY thing that authorizes skipping an untried
+// candidate is an exact, authoritative negative-404 record for that exact
+// resolved candidate URL (see hasNegative404()/recordNegative404() in the
+// .cpp) -- recorded only when a real fetch or revalidation for that exact
+// candidate received a definitive 404, NEVER for a timeout, TLS failure,
+// cancellation, 5xx, or any integrity/codec failure (those are transient
+// or ambiguous, not proof of absence). This record is memory-only (never
+// persisted to disk, so it cannot outlive this process) and scoped
+// per-candidate (never generalized to a whole identifier or logical key);
+// it is cleared if that exact candidate is later observed to succeed
+// (defensive: a resource that once 404'd could, in principle, reappear).
+// A revalidation (see startRevalidation()) that itself receives a 404
+// applies the identical rule: the previously-cached entry is evicted (see
+// AssetCache::invalidate()), a negative record is written, and the
+// request advances to the NEXT candidate exactly as a first-time miss
+// would -- this is the one revalidation outcome that does NOT fall back
+// to "stale-if-error"; every other revalidation failure (transport,
+// timeout, TLS, 5xx, cancellation, integrity/codec) still serves the
+// still-valid stale cached entry unchanged.
 //
 // A same-process (memory) cache hit short-circuits the network entirely,
 // since it was already validated during this process's own lifetime. A
@@ -154,6 +179,14 @@ private:
     std::optional<AssetCache::CachedEntry> staleEntry;
   };
 
+  // Authoritative negative-404 record lookup/write for one exact
+  // resolved-candidate cache key -- see the class comment above for the
+  // full contract (memory-only, per-candidate, 404-only, cleared on a
+  // later success).
+  [[nodiscard]] bool hasNegative404(const QString &cacheKey) const;
+  void recordNegative404(const QString &cacheKey);
+  void clearNegative404(const QString &cacheKey);
+
   RequestHandle
   registerImmediateCompletion(const AssetKey &key, ResultCallback callback,
                               AssetOutcome<AssetCache::CachedEntry> result);
@@ -212,6 +245,11 @@ private:
   // delivered one, delivering the original (non-cancelled) result anyway.
   QHash<quint64, std::shared_ptr<bool>>
       m_pendingDeliveryCancelled; // consumer handleId -> cancelled flag
+
+  // Cache keys (see AssetCache::cacheKeyFor()) for which an exact,
+  // authoritative 404 has been observed by THIS process; never
+  // persisted to disk. See the class comment for the full contract.
+  QSet<QString> m_negative404;
 };
 
 } // namespace Arkham
