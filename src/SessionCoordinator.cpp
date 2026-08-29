@@ -367,24 +367,48 @@ void SessionCoordinator::startCredentialRestore() {
   if (!self || generation != self->m_generation) {
     return; // superseded while stateChanged() was being delivered
   }
+  ITokenStore::ResultCallback onComplete =
+      [self, generation, profileId](TokenStoreResult result) {
+        if (!self) {
+          return;
+        }
+        if (generation != self->m_generation) {
+          return;
+        }
+        self->handleRestoreReadResult(generation, profileId, result);
+      };
   if (stalled) {
     // A previously-failed required deletion for this profile is still
-    // durably blocking its FIFO (see startFrontTokenOp()); enqueuing a
-    // fresh read below is still correct (it will simply wait behind that
-    // still-queued deletion), but retry() must resolve the deletion, not
-    // silently wait forever with no actionable feedback.
+    // durably blocking its FIFO (see startFrontTokenOp()); retry() must
+    // resolve the deletion, not silently wait forever with no actionable
+    // feedback.
     m_retryAction = [this, profileId] { retryStuckProfileTokenOp(profileId); };
+
+    // Avoid piling up redundant restore reads behind the still-stalled
+    // head: repeated start()/switchProfile() calls back to the same
+    // stalled profile would otherwise each enqueue another Read behind
+    // the stuck Delete, causing unbounded queue growth and duplicate
+    // secure-store I/O once the delete is finally retried. Only a Read
+    // can ever be queued behind a stalled Delete (see
+    // invalidateProfileCredential(); signIn()/registerAccount()/signOut()
+    // are all no-ops while this profile's state is
+    // SecureStorageUnavailable), so if the queue already holds more than
+    // just the stalled head, its tail is exactly one such already-queued
+    // Read: rebind its continuation to this call's (current) generation
+    // instead of enqueuing a second one. The previously queued
+    // continuation's own generation is necessarily stale by now -- this
+    // function is only reached again via a fresh start()/switchProfile()
+    // that re-derives |generation| from the (already possibly bumped)
+    // m_generation -- so it would have been a silent no-op once
+    // dispatched anyway.
+    const auto queueIt = m_tokenQueues.find(profileId);
+    if (queueIt != m_tokenQueues.end() && queueIt->size() > 1) {
+      (*queueIt)[queueIt->size() - 1].onComplete = std::move(onComplete);
+      return;
+    }
   }
   enqueueTokenOp(profileId, TokenOpKind::Read, QString(),
-                 [self, generation, profileId](TokenStoreResult result) {
-                   if (!self) {
-                     return;
-                   }
-                   if (generation != self->m_generation) {
-                     return;
-                   }
-                   self->handleRestoreReadResult(generation, profileId, result);
-                 });
+                 std::move(onComplete));
 }
 
 void SessionCoordinator::handleRestoreReadResult(

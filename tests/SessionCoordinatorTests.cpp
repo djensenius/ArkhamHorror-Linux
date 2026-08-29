@@ -605,6 +605,7 @@ private slots:
   void concurrentProfilesHaveIndependentTokenQueues();
   void
   retryCannotConcurrentlyRedispatchStalledDeleteAndDuplicateCallbackCannotDequeueNextOp();
+  void repeatedStartWhileStalledQueuesAtMostOneRestoreRead();
 
   // Destruction
   void destructionSuppressesProbeCompletion();
@@ -1803,6 +1804,78 @@ void SessionCoordinatorTests::
   QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
   }));
+}
+
+void SessionCoordinatorTests::
+    repeatedStartWhileStalledQueuesAtMostOneRestoreRead() {
+  // Exact regression from review: startCredentialRestore() previously
+  // enqueued a brand-new TokenOpKind::Read every single time it ran, even
+  // while a required deletion was still durably stalling this profile's
+  // FIFO. Repeated start()/switchProfile() calls back to the same stalled
+  // profile (e.g. a user mashing retry/restart while the delete was
+  // failing) would therefore silently accumulate multiple queued reads
+  // behind the stuck delete -- unbounded queue growth and duplicate
+  // secure-store I/O once the delete was eventually retried. Prove that no
+  // matter how many times start() is called while stalled, only ONE
+  // restore read is ever actually dispatched to the real store once the
+  // delete succeeds -- not one per repeated start() call.
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  h.coordinator->signOut();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, accessDeniedResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete
+
+  // Repeatedly restart while the profile remains stalled behind the
+  // failed, still-undispatched delete. Each call reaches
+  // startCredentialRestore() again with a freshly-bumped generation.
+  for (int i = 0; i < 5; ++i) {
+    h.coordinator->start();
+    QVERIFY(
+        pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+    h.probeFactory.current()->complete(compatibleProbeResult());
+    QVERIFY(pumpEventsUntil([&h] {
+      return h.coordinator->state() ==
+             SessionCoordinator::State::SecureStorageUnavailable;
+    }));
+  }
+  // None of the five repeated restarts touched the real store: it is
+  // still stalled behind the one still-undispatched delete, so the call
+  // log must be unchanged.
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, successWriteResult());
+
+  // Exactly ONE restore read must now dispatch to the real store -- not
+  // five -- proving the five stalled start() calls were deduplicated to a
+  // single queued read rather than each enqueuing their own.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 5);
+  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  // If a duplicate read had still been queued behind the deduplicated
+  // one, completing the single read above would have immediately
+  // dispatched it too (FIFO dispatch on dequeue is synchronous), leaving
+  // another pending op needing its own complete() call. Confirm the FIFO
+  // is fully drained with no extra dispatch and no extra call recorded.
+  QVERIFY(!h.tokenStore.hasPending(profileId));
+  QCOMPARE(h.tokenStore.calls.size(), 5);
 }
 
 void SessionCoordinatorTests::
