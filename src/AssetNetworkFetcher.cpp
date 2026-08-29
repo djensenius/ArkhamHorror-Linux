@@ -207,6 +207,35 @@ AssetNetworkFetcher::FetchHandle
 AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
                            ConditionalHeaders conditional,
                            FetchCallback callback) {
+  // Fail closed on any scheme other than http/https. This class is
+  // documented (and, via AssetLocator's UrlValidator::validateCustomUrl()
+  // gate, currently only ever invoked) as an HTTP(S)-only fetcher -- but
+  // QNetworkAccessManager itself happily services other schemes it
+  // supports (e.g. file://, qrc://). Without this explicit, independent
+  // check here, a future caller that ever passed this class an
+  // unvalidated URL (bypassing AssetLocator) could read arbitrary local
+  // files rather than fetching over the network. Checked and dispatched
+  // BEFORE any QNetworkRequest/QNetworkReply is created, so a rejected
+  // scheme never reaches QNetworkAccessManager at all.
+  const QString scheme = url.scheme();
+  if (scheme != QStringLiteral("http") && scheme != QStringLiteral("https")) {
+    const quint64 handle = m_nextHandle++;
+    QPointer<AssetNetworkFetcher> self(this);
+    QMetaObject::invokeMethod(
+        this,
+        [self, callback = std::move(callback)]() mutable {
+          if (self) {
+            std::move(callback)(AssetOutcome<ConditionalFetchResult>(AssetError{
+                AssetErrorCode::UnsupportedScheme,
+                QStringLiteral("only http and https URLs may be fetched")}));
+          }
+        },
+        Qt::QueuedConnection);
+    // Never inserted into m_pending: cancel() on this handle is already
+    // a safe no-op for any handle it does not recognise.
+    return FetchHandle{handle};
+  }
+
   QNetworkRequest request(url);
   applyCommonRequestSettings(request);
   if (!conditional.etag.isEmpty()) {

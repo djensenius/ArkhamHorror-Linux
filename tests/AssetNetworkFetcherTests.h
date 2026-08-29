@@ -18,6 +18,7 @@ class AssetNetworkFetcherTests final : public QObject {
 
 private slots:
   void successfulFetchNeverSendsCookiesOrAuthHeader();
+  void nonHttpSchemeIsRejectedAsUnsupportedSchemeWithoutTouchingNetwork();
   void manualRedirectPolicyRejectsEvery3xx_data();
   void manualRedirectPolicyRejectsEvery3xx();
   void notFoundMapsToNotFoundError();

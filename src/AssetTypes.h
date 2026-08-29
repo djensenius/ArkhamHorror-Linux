@@ -130,6 +130,10 @@ enum class AssetErrorCode {
   Cancelled,           // Caller cancelled, or the last consumer went away.
   CacheCorrupt,        // A cached payload/metadata pair failed validation.
   ConditionalWithoutCachedBody, // A 304 arrived with no valid cached body.
+  UnsupportedScheme, // URL scheme is not "http"/"https" (AssetNetworkFetcher
+                     // is an HTTP(S)-only fetcher and fails closed on any
+                     // other scheme, e.g. file://, rather than passing it
+                     // through to QNetworkAccessManager).
 };
 
 struct AssetError {

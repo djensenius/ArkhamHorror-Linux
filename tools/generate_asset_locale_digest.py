@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -193,6 +194,21 @@ def _clang_format(rendered: str) -> str:
     return result.stdout
 
 
+def _extract_embedded_sha256(header_text: str) -> str | None:
+    """Extracts the kSourceJsonSha256 hex string embedded in an already
+    generated header, or None if the header is missing/malformed. Used by
+    --check to validate drift by hash alone when clang-format isn't
+    available to make a full-text comparison meaningful (see
+    _clang_format's docstring): a checked-in header need only be
+    formatting-different, not data-different, to make a raw text compare
+    report a false positive.
+    """
+    match = re.search(
+        r'kSourceJsonSha256\[\]\s*=\s*"([0-9a-f]{64})"', header_text
+    )
+    return match.group(1) if match else None
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -205,6 +221,8 @@ def main(argv: list[str]) -> int:
 
     source_bytes = SOURCE_JSON.read_bytes()
     data = json.loads(source_bytes)
+    expected_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    clang_format_available = shutil.which("clang-format") is not None
     rendered = _clang_format(render_header(source_bytes, data))
 
     if args.check:
@@ -213,7 +231,27 @@ def main(argv: list[str]) -> int:
             if GENERATED_HEADER.exists()
             else ""
         )
-        if current != rendered:
+        if clang_format_available:
+            # The full-text comparison is meaningful here: `rendered` was
+            # itself just clang-formatted above, so any difference from
+            # `current` (which is expected to already be clang-formatted,
+            # being checked in) reflects real drift -- either data drift
+            # or a stale formatting pass -- not merely this run's
+            # clang-format availability.
+            is_stale = current != rendered
+        else:
+            # Without clang-format, `rendered`'s formatting cannot be
+            # trusted to match the checked-in header's -- comparing full
+            # text here would report the header as stale purely because
+            # this particular run lacks clang-format, even when the data
+            # itself (the actual drift signal) is unchanged. Fall back to
+            # comparing only the embedded SHA-256 of the JSON source
+            # against a fresh hash of it: that is the same drift check
+            # tests/AssetLocaleDigestTests.cpp performs independently in
+            # C++, and is unaffected by formatting-tool availability.
+            embedded = _extract_embedded_sha256(current)
+            is_stale = embedded != expected_sha256
+        if is_stale:
             print(
                 f"{GENERATED_HEADER} is stale; run "
                 "tools/generate_asset_locale_digest.py to regenerate it.",

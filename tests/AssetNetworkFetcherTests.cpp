@@ -8,6 +8,7 @@
 #include <QImageReader>
 #include <QNetworkAccessManager>
 #include <QSignalSpy>
+#include <QTemporaryFile>
 #include <QTest>
 #include <cstring>
 #include <optional>
@@ -66,6 +67,53 @@ void AssetNetworkFetcherTests::successfulFetchNeverSendsCookiesOrAuthHeader() {
   const auto headers = server.lastRequestHeaders(QStringLiteral("/ok.png"));
   QVERIFY(!headers.contains("cookie"));
   QVERIFY(!headers.contains("authorization"));
+}
+
+void AssetNetworkFetcherTests::
+    nonHttpSchemeIsRejectedAsUnsupportedSchemeWithoutTouchingNetwork() {
+  // Copilot review (round 26, high severity): AssetNetworkFetcher is
+  // documented as an HTTP(S)-only fetcher, but fetch() previously passed
+  // any URL straight to QNetworkAccessManager::get() with no scheme
+  // check of its own -- relying entirely on AssetLocator's
+  // UrlValidator::validateCustomUrl() gate upstream to keep non-http(s)
+  // schemes out. A future caller that ever invoked this class directly
+  // with an unvalidated URL (e.g. file://) could read arbitrary local
+  // filesystem contents rather than fetching over the network. This
+  // test proves the fetcher now fails closed on its own, independent of
+  // any upstream validation: a real, existing local file containing
+  // known "secret" bytes is never read at all -- the call fails with
+  // the typed UnsupportedScheme error, and the local file's content is
+  // never surfaced as a (mis-sniffed, but still leaked) successful
+  // result.
+  QTemporaryFile localFile;
+  QVERIFY(localFile.open());
+  const QByteArray secretBytes = QByteArrayLiteral("not-a-real-image-secret");
+  QCOMPARE(localFile.write(secretBytes), secretBytes.size());
+  localFile.close();
+  const QUrl fileUrl = QUrl::fromLocalFile(localFile.fileName());
+  QCOMPARE(fileUrl.scheme(), QStringLiteral("file"));
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  std::optional<AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult>>
+      result;
+  const AssetNetworkFetcher::FetchHandle handle = fetcher.fetch(
+      fileUrl, AssetFormat::Png, {},
+      [&result](
+          AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> outcome) {
+        result = std::move(outcome);
+      });
+  QVERIFY(handle.isValid());
+  // cancel() on THIS specific handle (returned for a rejected scheme,
+  // never registered as pending) must remain a safe no-op, exactly like
+  // cancelling an already-completed request -- it must not crash and
+  // must not prevent the queued UnsupportedScheme callback from still
+  // firing exactly once below.
+  fetcher.cancel(handle);
+  QVERIFY(QTest::qWaitFor([&result]() { return result.has_value(); }, 5000));
+
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedScheme);
 }
 
 void AssetNetworkFetcherTests::manualRedirectPolicyRejectsEvery3xx_data() {
