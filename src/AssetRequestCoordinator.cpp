@@ -4,11 +4,23 @@
 
 #include <QMetaObject>
 #include <QPointer>
+#include <chrono>
 #include <utility>
 
 namespace Arkham {
 
 namespace {
+
+// Review round-3 item 13: the production default for
+// AssetRequestCoordinator::m_monotonicNowMs. std::chrono::steady_clock
+// (never system_clock/QDateTime) is used deliberately: negative-404 TTL
+// expiry must never be sensitive to a wall-clock adjustment, NTP step, or
+// timezone/DST change, forward or backward.
+qint64 defaultMonotonicNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // A canonical, order-sensitive string identity for an AssetKey, used only
 // to coalesce concurrent identical requests while one is in flight. Two
@@ -71,7 +83,8 @@ toCachedEntry(const AssetNetworkFetcher::FetchedAsset &asset) {
 AssetRequestCoordinator::AssetRequestCoordinator(AssetCache &cache,
                                                  AssetNetworkFetcher &fetcher,
                                                  QObject *parent)
-    : QObject(parent), m_cache(cache), m_fetcher(fetcher) {}
+    : QObject(parent), m_cache(cache), m_fetcher(fetcher),
+      m_monotonicNowMs(&defaultMonotonicNowMs) {}
 
 AssetRequestCoordinator::~AssetRequestCoordinator() {
   // Abort every in-flight fetch without invoking any consumer's callback:
@@ -125,9 +138,15 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
     // rather than permanently poisoning this key with a fixed, pre-
     // computed failure outcome.
     if (auto hit = m_cache.lookupMemory(cacheKey)) {
+      // Review round-3 item 14: mint a fresh ISSUANCE value for this
+      // cache hit (never merely read the current applied watermark --
+      // see issueCacheKeyGeneration()'s comment) so a concurrent network
+      // fetch issued after this exact moment for the same cache key
+      // correctly outranks this cache hit's own eventual decode/promote
+      // side effects, regardless of which one finishes first.
       return registerCacheHitCompletion(
           key, std::move(callback), candidates, candidateIndex, std::move(*hit),
-          cacheKey, currentCacheKeyGeneration(cacheKey));
+          cacheKey, issueCacheKeyGeneration(cacheKey));
     }
 
     if (auto hit = m_cache.lookupDisk(cacheKey)) {
@@ -135,9 +154,11 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
       if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
         // Nothing to conditionally revalidate against: serve as-is,
         // exactly like a memory hit (see the comment above).
+        // Review round-3 item 14: same reasoning as the memory-hit branch
+        // above -- mint, never merely read.
         return registerCacheHitCompletion(
             key, std::move(callback), candidates, candidateIndex,
-            std::move(entry), cacheKey, currentCacheKeyGeneration(cacheKey));
+            std::move(entry), cacheKey, issueCacheKeyGeneration(cacheKey));
       }
 
       // A disk hit carrying validators is revalidated with a real
@@ -225,7 +246,14 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   m_operations.insert(operationId, std::move(operation));
   m_handleToOperation.insert(handleId, operationId);
 
-  startCandidate(operationId);
+  // Review round-3 item 12: route the very first network-bound candidate
+  // through the SAME single path every later 404/quarantine-driven
+  // advance also uses (see advanceCandidates()'s comment) -- this
+  // specific index was already independently confirmed above to be
+  // neither negative-cached nor a cache hit, so advanceCandidates() will
+  // immediately re-confirm that (a harmless, cheap re-check) and fall
+  // through to startCandidate() exactly as before.
+  advanceCandidates(operationId);
 
   return RequestHandle{handleId};
 }
@@ -241,11 +269,29 @@ AssetRequestCoordinator::findInFlightOperation(const QString &opKey) const {
 }
 
 bool AssetRequestCoordinator::hasNegative404(const QString &cacheKey) const {
-  return m_negative404.contains(cacheKey);
+  const auto it = m_negative404.constFind(cacheKey);
+  if (it == m_negative404.constEnd()) {
+    return false;
+  }
+  // Review round-3 item 13: a record is authoritative only while BOTH
+  // hold: (a) `cacheKey`'s applied generation has not moved past the
+  // exact issuance this record was written under (a later success, or a
+  // later negative recording -- from this operation or a completely
+  // different one -- both count), and (b) its TTL has not yet elapsed
+  // against the injectable monotonic clock. Lazy expiry: an
+  // expired/superseded entry is simply left in place (never actively
+  // swept) until overwritten by a fresh recordNegative404() or removed by
+  // clearNegative404() -- this method never mutates state, consistent
+  // with it being callable from a const context.
+  return it->generation == currentCacheKeyGeneration(cacheKey) &&
+         m_monotonicNowMs() < it->expiresAtMonotonicMs;
 }
 
-void AssetRequestCoordinator::recordNegative404(const QString &cacheKey) {
-  m_negative404.insert(cacheKey);
+void AssetRequestCoordinator::recordNegative404(const QString &cacheKey,
+                                                quint64 generation) {
+  m_negative404.insert(
+      cacheKey,
+      Negative404Entry{generation, m_monotonicNowMs() + kNegative404TtlMs});
 }
 
 void AssetRequestCoordinator::clearNegative404(const QString &cacheKey) {
@@ -258,16 +304,26 @@ quint64 AssetRequestCoordinator::currentCacheKeyGeneration(
 }
 
 quint64
-AssetRequestCoordinator::bumpCacheKeyGeneration(const QString &cacheKey) {
-  const quint64 next = currentCacheKeyGeneration(cacheKey) + 1;
-  m_cacheKeyGeneration.insert(cacheKey, next);
+AssetRequestCoordinator::issueCacheKeyGeneration(const QString &cacheKey) {
+  const quint64 next = m_cacheKeyIssuedGeneration.value(cacheKey, 0) + 1;
+  m_cacheKeyIssuedGeneration.insert(cacheKey, next);
   return next;
+}
+
+bool AssetRequestCoordinator::tryApplyCacheKeyMutation(
+    const QString &cacheKey, quint64 issuedGeneration) {
+  if (issuedGeneration < currentCacheKeyGeneration(cacheKey)) {
+    // A strictly newer issuance has already been applied to this cache
+    // key -- see the declaration comment for the full ordering argument.
+    return false;
+  }
+  m_cacheKeyGeneration.insert(cacheKey, issuedGeneration);
+  return true;
 }
 
 AssetOutcome<AssetCache::CachedEntry>
 AssetRequestCoordinator::ensureDecoded(AssetCache::CachedEntry entry,
-                                       AssetFormat format,
-                                       const QString &cacheKey) {
+                                       AssetFormat format) {
   if (!entry.decodedImage.isNull()) {
     return AssetOutcome<AssetCache::CachedEntry>(std::move(entry));
   }
@@ -279,7 +335,6 @@ AssetRequestCoordinator::ensureDecoded(AssetCache::CachedEntry entry,
   }
 
   entry.decodedImage = *decoded;
-  m_cache.updateMemoryDecodedImage(cacheKey, entry.decodedImage);
   return AssetOutcome<AssetCache::CachedEntry>(std::move(entry));
 }
 
@@ -387,17 +442,22 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
           ? operation.candidates[operation.candidateIndex].format
           : operation.key.format;
   AssetOutcome<AssetCache::CachedEntry> outcome =
-      ensureDecoded(std::move(entry), expectedFormat, cacheKey);
+      ensureDecoded(std::move(entry), expectedFormat);
 
   if (outcome) {
-    // Review item 6: only promote if no other, more recently issued
-    // operation has mutated this cache key since `expectedGeneration` was
-    // captured -- a stale promotion here could otherwise republish an
-    // outdated body into memory over top of a genuinely newer entry.
-    if (promoteOnSuccess &&
-        currentCacheKeyGeneration(cacheKey) == expectedGeneration) {
-      m_cache.promoteToMemory(cacheKey, *outcome);
-      bumpCacheKeyGeneration(cacheKey);
+    // Review round-3 items 14/15: gate BOTH the memory-decoded-image
+    // republish (ensureDecoded() is deliberately side-effect-free -- see
+    // its comment) and, when requested, the full promoteToMemory() behind
+    // the SAME issuance-ordered CAS (tryApplyCacheKeyMutation()). A
+    // decode that raced a newer-issued operation's own publish can
+    // therefore never mutate the current live memory entry with stale
+    // pixels, regardless of which operation's disk read/decode happens
+    // to finish first.
+    if (tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
+      m_cache.updateMemoryDecodedImage(cacheKey, outcome->decodedImage);
+      if (promoteOnSuccess) {
+        m_cache.promoteToMemory(cacheKey, *outcome);
+      }
     }
     completeOperation(operationId, std::move(outcome));
     return;
@@ -408,16 +468,17 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
     return;
   }
 
-  if (currentCacheKeyGeneration(cacheKey) != expectedGeneration) {
-    // Review item 6: some more recently issued operation has already
-    // superseded this exact cache key since this entry was read (or since
-    // this revalidation was issued) -- this now-outdated view failing to
-    // decode is NOT proof the CURRENT entry is bad, so never invalidate
-    // (which could destroy a newer, perfectly valid entry) and never
-    // retry the candidate over the network on this stale path either
-    // (which could itself race with, and overwrite, whatever the newer
-    // operation just published). Simply report the failure this stale
-    // view genuinely observed to this operation's own consumers.
+  if (!tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
+    // Review round-3 item 14: some more recently ISSUED operation has
+    // already applied its own mutation for this exact cache key since
+    // this entry was read (or since this revalidation was issued) --
+    // this now-outdated view failing to decode is NOT proof the CURRENT
+    // entry is bad, so never invalidate (which could destroy a newer,
+    // perfectly valid entry) and never retry the candidate over the
+    // network on this stale path either (which could itself race with,
+    // and overwrite, whatever the newer operation just published). Simply
+    // report the failure this stale view genuinely observed to this
+    // operation's own consumers.
     completeOperation(operationId, std::move(outcome));
     return;
   }
@@ -434,12 +495,80 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
   // anywhere. A decode failure on the freshly-refetched bytes (if any)
   // completes via startCandidate()'s own normal fetch-failure handling,
   // which never re-enters this method -- so a bad origin resource can
-  // fail at most once more, never loop.
+  // fail at most once more, never loop. The CAS application above already
+  // recorded this exact issuance as the new current generation, so no
+  // separate bump is needed here.
   m_cache.invalidate(cacheKey);
-  bumpCacheKeyGeneration(cacheKey);
   operation.isRevalidation = false;
   operation.staleEntry.reset();
   startCandidate(operationId);
+}
+
+void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
+  auto it = m_operations.find(operationId);
+  if (it == m_operations.end()) {
+    return; // cancelled/destroyed
+  }
+  Operation &operation = it.value();
+  operation.isRevalidation = false;
+  operation.staleEntry.reset();
+
+  // Review round-3 item 12: identical priority-order/cache-then-network
+  // scan as request()'s own initial loop (see its comment) -- the ONE
+  // path every transition (the very first untried candidate, and every
+  // later 404/quarantine-driven advance) uses, so a localized-then-404
+  // candidate can never bypass an already-cached lower-priority candidate
+  // (e.g. an English fallback) by jumping straight to a network fetch for
+  // the next index without first re-checking negative-404/memory/disk for
+  // it.
+  for (; operation.candidateIndex < operation.candidates.size();
+       ++operation.candidateIndex) {
+    const AssetCandidate &candidate =
+        operation.candidates[operation.candidateIndex];
+    const QString cacheKey = AssetCache::cacheKeyFor(candidate.url);
+
+    if (hasNegative404(cacheKey)) {
+      continue; // authoritatively confirmed absent: try the next candidate
+    }
+
+    if (auto hit = m_cache.lookupMemory(cacheKey)) {
+      completeCacheReadOrQuarantine(operationId, std::move(*hit), cacheKey,
+                                    issueCacheKeyGeneration(cacheKey),
+                                    /*promoteOnSuccess=*/false);
+      return;
+    }
+
+    if (auto hit = m_cache.lookupDisk(cacheKey)) {
+      AssetCache::CachedEntry entry = *hit;
+      if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
+        completeCacheReadOrQuarantine(operationId, std::move(entry), cacheKey,
+                                      issueCacheKeyGeneration(cacheKey),
+                                      /*promoteOnSuccess=*/false);
+        return;
+      }
+      operation.isRevalidation = true;
+      operation.revalidationCacheKey = cacheKey;
+      operation.staleEntry = std::move(entry);
+      startRevalidation(operationId);
+      return;
+    }
+
+    // Neither a confirmed-absent record nor a cache hit: the first
+    // genuinely untried candidate from here -- fall through to the
+    // network.
+    startCandidate(operationId);
+    return;
+  }
+
+  // Every remaining candidate carries an authoritative confirmed-404
+  // record (or none remain at all): the whole logical request is
+  // definitively not-found, with no further network round trip.
+  completeOperation(
+      operationId,
+      AssetOutcome<AssetCache::CachedEntry>(AssetError{
+          AssetErrorCode::NotFound,
+          QStringLiteral("every candidate previously confirmed absent "
+                         "(negative cache)")}));
 }
 
 void AssetRequestCoordinator::startCandidate(quint64 operationId) {
@@ -450,13 +579,16 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
   Operation &operation = it.value();
   const AssetCandidate &candidate =
       operation.candidates[operation.candidateIndex];
-  // Review item 6: the generation in effect for this exact candidate's
-  // cache key AT THE MOMENT this fetch is issued -- the CAS baseline a
-  // stale callback is checked against before it is allowed to mutate
-  // shared cache/negative-404 state. See the class comment's
+  // Review round-3 item 14: the ISSUANCE value minted for this exact
+  // candidate's cache key AT THE MOMENT this fetch is issued -- the CAS
+  // baseline a completion callback (however late it arrives, and
+  // regardless of completion order relative to any other operation on
+  // this same cache key) is checked against before it is allowed to
+  // mutate shared cache/negative-404 state. See
+  // tryApplyCacheKeyMutation()'s comment and the class comment's
   // "Cross-logical-key races" paragraph.
   const quint64 expectedGeneration =
-      currentCacheKeyGeneration(AssetCache::cacheKeyFor(candidate.url));
+      issueCacheKeyGeneration(AssetCache::cacheKeyFor(candidate.url));
 
   QPointer<AssetRequestCoordinator> self(this);
   operation.fetchHandle = m_fetcher.fetch(
@@ -482,19 +614,25 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
             // key that also resolves to this same candidate can skip it
             // outright (see hasNegative404() / the class comment) --
             // never recorded for any other error code. Gated by the CAS
-            // check (review item 6): if some more recently issued
-            // operation has already mutated this cache key (e.g.
-            // published a fresh 200) since this fetch was issued, this
-            // 404 -- observed against an older view of the world -- must
-            // not resurrect a negative record over it.
-            if (self->currentCacheKeyGeneration(cacheKey) ==
-                expectedGeneration) {
-              self->recordNegative404(cacheKey);
-              self->bumpCacheKeyGeneration(cacheKey);
+            // check (review round-3 item 14): if some more recently
+            // ISSUED operation has already applied its own mutation for
+            // this cache key (e.g. published a fresh 200) since THIS
+            // fetch was issued, this 404 -- observed against an older
+            // view of the world -- must not resurrect a negative record
+            // over it.
+            if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
+              self->recordNegative404(cacheKey, expectedGeneration);
             }
             if (operation.candidateIndex + 1 < operation.candidates.size()) {
+              // Review round-3 item 12: route this advance through the
+              // single shared candidate-processing path -- see
+              // advanceCandidates()'s comment -- rather than jumping
+              // straight back to a network fetch, so an untried
+              // higher-index candidate that happens to already be cached
+              // (memory or disk) is never skipped in favour of issuing a
+              // redundant network request for it.
               ++operation.candidateIndex;
-              self->startCandidate(operationId);
+              self->advanceCandidates(operationId);
               return;
             }
           }
@@ -522,19 +660,19 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
         Operation &operation = opIt.value();
         const QString cacheKey = AssetCache::cacheKeyFor(
             operation.candidates[operation.candidateIndex].url);
-        // Review item 6: only publish into the shared cache/negative-404
-        // state if no more recently issued operation has mutated this
-        // cache key in the meantime; otherwise skip the mutation but
-        // still hand THIS operation's own consumers the outcome it
-        // genuinely fetched (see the class comment).
-        if (self->currentCacheKeyGeneration(cacheKey) == expectedGeneration) {
+        // Review round-3 item 14: only publish into the shared
+        // cache/negative-404 state if no more recently ISSUED operation
+        // has already applied its own mutation for this cache key;
+        // otherwise skip the mutation but still hand THIS operation's own
+        // consumers the outcome it genuinely fetched (see the class
+        // comment).
+        if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
           // Defensive: a candidate that once 404'd could, in principle,
           // reappear -- never leave a stale negative record pointing at a
           // now-confirmed-good candidate.
           self->clearNegative404(cacheKey);
           AssetCache::CachedEntry entry = toCachedEntry(*result->asset);
           self->m_cache.store(cacheKey, entry);
-          self->bumpCacheKeyGeneration(cacheKey);
           self->completeOperation(operationId,
                                   AssetOutcome<AssetCache::CachedEntry>(entry));
           return;
@@ -554,11 +692,12 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
   const AssetCandidate &candidate =
       operation.candidates[operation.candidateIndex];
   const AssetCache::CachedEntry &staleEntry = *operation.staleEntry;
-  // Review item 6: the generation in effect for this revalidation's cache
-  // key AT THE MOMENT it is issued -- see startCandidate()'s identical
-  // comment and the class comment's "Cross-logical-key races" paragraph.
+  // Review round-3 item 14: the ISSUANCE value minted for this exact
+  // revalidation's cache key AT THE MOMENT it is issued -- see
+  // startCandidate()'s identical comment, tryApplyCacheKeyMutation()'s
+  // comment, and the class comment's "Cross-logical-key races" paragraph.
   const quint64 expectedGeneration =
-      currentCacheKeyGeneration(operation.revalidationCacheKey);
+      issueCacheKeyGeneration(operation.revalidationCacheKey);
 
   AssetNetworkFetcher::ConditionalHeaders conditional;
   conditional.etag = staleEntry.etag;
@@ -586,24 +725,26 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         // exists, so the stale cached entry is evicted (never served as
         // a false "still good" success), a negative-404 record is
         // written for it, and the request advances through the
-        // remaining candidates exactly like a first-time miss would --
-        // reusing the ordinary startCandidate() fetch path from here on.
-        // Gated by the CAS check (review item 6): if some more recently
-        // issued operation has already published a fresh entry for this
-        // cache key since this revalidation was issued, this 404 --
+        // remaining candidates exactly like a first-time miss would.
+        // Gated by the CAS check (review round-3 item 14): if some more
+        // recently ISSUED operation has already applied a fresh entry for
+        // this cache key since this revalidation was issued, this 404 --
         // observed against an older view of the world -- must not evict
         // or negative-cache over it.
         if (!result && result.error().code == AssetErrorCode::NotFound) {
-          if (self->currentCacheKeyGeneration(cacheKey) == expectedGeneration) {
+          if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
             self->m_cache.invalidate(cacheKey);
-            self->recordNegative404(cacheKey);
-            self->bumpCacheKeyGeneration(cacheKey);
+            self->recordNegative404(cacheKey, expectedGeneration);
           }
           if (operation.candidateIndex + 1 < operation.candidates.size()) {
+            // Review round-3 item 12: route this advance through the
+            // single shared candidate-processing path -- see
+            // advanceCandidates()'s comment -- which itself resets
+            // isRevalidation/staleEntry before scanning forward, rather
+            // than jumping straight back to a network fetch and skipping
+            // an already-cached higher-index candidate.
             ++operation.candidateIndex;
-            operation.isRevalidation = false;
-            operation.staleEntry.reset();
-            self->startCandidate(operationId);
+            self->advanceCandidates(operationId);
             return;
           }
           self->completeOperation(
@@ -642,18 +783,20 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
           // 304 to rotate ETag/Last-Modified without a body); the payload
           // bytes are never touched. Empty fields leave the existing
           // validator untouched (see touchAfterNotModified()). Gated by
-          // the CAS check (review item 6): a stale 304 must not touch
-          // recency metadata a newer operation has since superseded; if
-          // stale, `postTouchGeneration` stays equal to the ORIGINAL
-          // `expectedGeneration`, which deliberately still mismatches
-          // whatever this cache key's generation has since become, so
-          // completeCacheReadOrQuarantine() below also correctly refuses
-          // to promote/quarantine on this stale view.
-          quint64 postTouchGeneration = expectedGeneration;
-          if (self->currentCacheKeyGeneration(cacheKey) == expectedGeneration) {
+          // the CAS check (review round-3 item 14): a stale 304 must not
+          // touch recency metadata a newer operation has since
+          // superseded. Unlike the old completion-ordered scheme, no
+          // separate "post-touch generation" is needed here: this touch
+          // and completeCacheReadOrQuarantine()'s own subsequent
+          // promotion below share the exact same `expectedGeneration`
+          // issuance value, and tryApplyCacheKeyMutation()'s ">="
+          // semantics (see its comment) correctly allow BOTH of this
+          // SAME operation's sequential mutations to apply when the
+          // first one succeeds, while a genuinely superseded
+          // `expectedGeneration` correctly fails BOTH.
+          if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
             self->m_cache.touchAfterNotModified(cacheKey, result->refreshedEtag,
                                                 result->refreshedLastModified);
-            postTouchGeneration = self->bumpCacheKeyGeneration(cacheKey);
           }
           // A validator-carrying disk hit is normally withheld from
           // memory promotion (see lookupDisk()) until it has actually
@@ -666,7 +809,7 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
           // instead (review item 9), the just-touched metadata/payload
           // are evicted again and the same candidate is retried fresh.
           self->completeCacheReadOrQuarantine(operationId, stale, cacheKey,
-                                              postTouchGeneration,
+                                              expectedGeneration,
                                               /*promoteOnSuccess=*/true);
           return;
         }
@@ -683,14 +826,13 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         // The origin sent a fresh 200 body despite our conditional
         // headers (its content genuinely changed): replace the cached
         // entry and serve the new content. Gated by the CAS check
-        // (review item 6), exactly like startCandidate()'s fresh-200
-        // path: if stale, still hand THIS operation's own consumers the
-        // freshly-fetched bytes, just never publish them over a cache
-        // key a newer operation has already superseded.
+        // (review round-3 item 14), exactly like startCandidate()'s
+        // fresh-200 path: if stale, still hand THIS operation's own
+        // consumers the freshly-fetched bytes, just never publish them
+        // over a cache key a newer operation has already superseded.
         AssetCache::CachedEntry fresh = toCachedEntry(*result->asset);
-        if (self->currentCacheKeyGeneration(cacheKey) == expectedGeneration) {
+        if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
           self->m_cache.store(cacheKey, fresh);
-          self->bumpCacheKeyGeneration(cacheKey);
         }
         self->completeOperation(operationId,
                                 AssetOutcome<AssetCache::CachedEntry>(fresh));

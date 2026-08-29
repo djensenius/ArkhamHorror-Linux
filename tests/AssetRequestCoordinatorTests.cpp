@@ -12,6 +12,7 @@
 #include <QNetworkAccessManager>
 #include <QTemporaryDir>
 #include <QTest>
+#include <avif/avif.h>
 #include <optional>
 
 using namespace Arkham;
@@ -61,6 +62,79 @@ QByteArray minimalAvifFtypBox() {
   bytes.append(char(0));
   bytes.append(char(0));
   bytes.append(char(0)); // minor_version = 0
+  return bytes;
+}
+
+// A tiny, genuinely valid, original (never-shipped) AVIF fixture encoded
+// at test-runtime via libavif's own encoder API -- mirrors
+// AssetNetworkFetcherTests.cpp's encodeAvifFixture() exactly (this file
+// needs its own copy: AssetNetworkFetcherTests.cpp's is file-local to its
+// own anonymous namespace). Unlike minimalAvifFtypBox() above (a bare
+// container with no actual image content, used only to reach past the
+// magic-byte sniff gate and then fail decode), this produces bytes that
+// genuinely decode -- required for the round-3 items 12/14/15 tests
+// below, which need a cache entry that can actually complete a real
+// ensureDecoded() call rather than failing at MalformedImage.
+QByteArray encodeAvifFixture(int width, int height) {
+  avifImage *image = avifImageCreate(static_cast<uint32_t>(width),
+                                     static_cast<uint32_t>(height),
+                                     /*depth=*/8, AVIF_PIXEL_FORMAT_YUV420);
+  if (image == nullptr) {
+    qFatal("encodeAvifFixture() failed to allocate an avifImage");
+  }
+
+  avifRGBImage rgb;
+  avifRGBImageSetDefaults(&rgb, image);
+  rgb.format = AVIF_RGB_FORMAT_RGBA;
+  rgb.depth = 8;
+  // avifRGBImageAllocatePixels() returns void in some libavif releases
+  // this project must support (e.g. Ubuntu 22.04's packaged 0.9.3) and
+  // avifResult in later ones -- its return value is therefore never
+  // captured, for portability across both signatures. A null `pixels`
+  // after the call is the one failure signal valid under every version.
+  (void)avifRGBImageAllocatePixels(&rgb);
+  if (rgb.pixels == nullptr) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifFixture() failed to allocate RGB pixels");
+  }
+  for (uint32_t row = 0; row < rgb.height; ++row) {
+    uint8_t *line = rgb.pixels + static_cast<size_t>(row) * rgb.rowBytes;
+    for (uint32_t col = 0; col < rgb.width; ++col) {
+      uint8_t *pixel = line + static_cast<size_t>(col) * 4;
+      pixel[0] = 0x40;
+      pixel[1] = 0x80;
+      pixel[2] = 0xC0;
+      pixel[3] = 0xFF;
+    }
+  }
+
+  const avifResult toYuvResult = avifImageRGBToYUV(image, &rgb);
+  avifRGBImageFreePixels(&rgb);
+  if (toYuvResult != AVIF_RESULT_OK) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifFixture() failed to convert RGB to YUV: %s",
+           avifResultToString(toYuvResult));
+  }
+
+  avifEncoder *encoder = avifEncoderCreate();
+  if (encoder == nullptr) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifFixture() failed to allocate an avifEncoder");
+  }
+  encoder->speed = AVIF_SPEED_FASTEST;
+
+  avifRWData output = AVIF_DATA_EMPTY;
+  const avifResult writeResult = avifEncoderWrite(encoder, image, &output);
+  avifEncoderDestroy(encoder);
+  avifImageDestroy(image);
+  if (writeResult != AVIF_RESULT_OK) {
+    qFatal("encodeAvifFixture() failed to encode: %s",
+           avifResultToString(writeResult));
+  }
+
+  QByteArray bytes(reinterpret_cast<const char *>(output.data),
+                   static_cast<int>(output.size));
+  avifRWDataFree(&output);
   return bytes;
 }
 
@@ -1749,4 +1823,368 @@ void AssetRequestCoordinatorTests::unsupportedCodecIsNeverQuarantineWorthy() {
       !AssetRequestCoordinator::isQuarantineWorthy(AssetErrorCode::Transport));
   QVERIFY(!AssetRequestCoordinator::isQuarantineWorthy(
       AssetErrorCode::ContentTypeMismatch));
+}
+
+void AssetRequestCoordinatorTests::
+    localized404AdvanceServesAlreadyCachedEnglishCandidateWithoutNetwork() {
+  // Review round-3 item 12: startCandidate()'s/startRevalidation()'s
+  // 404-driven advance to the next candidate used to jump straight to a
+  // fresh network fetch, bypassing the negative-404/memory/disk cache
+  // checks that request()'s OWN initial scan already performs for the
+  // first candidate -- so a localized candidate confirmed absent
+  // (genuine 404) mid-operation could never discover that the NEXT
+  // candidate (English) was already validly cached, needlessly
+  // refetching it over the network instead. advanceCandidates() is the
+  // single shared path both the initial attempt and every later
+  // 404-driven advance now route through, closing that gap.
+  //
+  // The English candidate's path is deliberately left UNREGISTERED on
+  // the mock server: if the coordinator (incorrectly) fell through to a
+  // fresh network fetch for it instead of discovering the pre-seeded
+  // cache entry, its request count would be nonzero below.
+  MockHttpServer server;
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/img/arkham/ita/cards/01001.avif"),
+                     notFound);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  AssetKey key =
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                  QStringLiteral("01001"));
+  key.locale = QStringLiteral("it");
+
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  QVERIFY2(candidates->at(1)
+               .url.toString(QUrl::FullyEncoded)
+               .endsWith(QStringLiteral("/img/arkham/cards/01001.avif")),
+           qPrintable(candidates->at(1).url.toString(QUrl::FullyEncoded)));
+  const QString englishCacheKey =
+      AssetCache::cacheKeyFor(candidates->at(1).url);
+
+  AssetCache::CachedEntry preSeededEnglish;
+  preSeededEnglish.encodedBytes = encodeAvifFixture(32, 24);
+  preSeededEnglish.contentType = QStringLiteral("image/avif");
+  preSeededEnglish.dimensions = QSize(32, 24);
+  cache.store(englishCacheKey, preSeededEnglish);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).encodedBytes, preSeededEnglish.encodedBytes);
+  QVERIFY(!(**result).decodedImage.isNull());
+
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/ita/cards/01001.avif")),
+      1);
+  // The decisive assertion: the already-cached English candidate was
+  // served from cache, never re-requested over the network.
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
+           0);
+}
+
+void AssetRequestCoordinatorTests::
+    negative404RecordExpiresAfterTtlAndIsRefetched() {
+  // Review round-3 item 13: a confirmed negative-404 record is no
+  // longer permanent -- it expires after a bounded TTL
+  // (kNegative404TtlMs), using an injectable monotonic clock
+  // (setMonotonicNowForTesting()) so this test can deterministically
+  // simulate the passage of time without a real sleep.
+  MockHttpServer server;
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), notFound);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  qint64 fakeNowMs = 1'000'000;
+  coordinator.setMonotonicNowForTesting([&]() { return fakeNowMs; });
+
+  AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+
+  std::optional<Result> firstResult;
+  coordinator.request(key, [&](Result r) { firstResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return firstResult.has_value(); }, 5000));
+  QVERIFY(!bool(*firstResult));
+  QCOMPARE(firstResult->error().code, AssetErrorCode::NotFound);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+
+  // Still well within the TTL: the negative record authorizes skipping
+  // the candidate entirely -- no new network round trip.
+  fakeNowMs += 60'000; // +1 minute, TTL is 5 minutes
+  std::optional<Result> secondResult;
+  coordinator.request(key, [&](Result r) { secondResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 5000));
+  QVERIFY(!bool(*secondResult));
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+
+  // Past the TTL: the negative record has lazily expired, so this
+  // candidate must be genuinely re-tried over the network.
+  fakeNowMs += 6 * 60'000; // +6 more minutes -- 7 total, past the 5-minute TTL
+  std::optional<Result> thirdResult;
+  coordinator.request(key, [&](Result r) { thirdResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return thirdResult.has_value(); }, 5000));
+  QVERIFY(!bool(*thirdResult));
+  QCOMPARE(thirdResult->error().code, AssetErrorCode::NotFound);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           2);
+}
+
+void AssetRequestCoordinatorTests::
+    laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond() {
+  // Review round-3 item 14 (HIGH: "CAS orders completion not issuance").
+  // The OLD scheme captured each operation's "expected generation" by
+  // READING the applied watermark at issue time; two operations issued
+  // back-to-back, before EITHER has completed, both capture the exact
+  // SAME watermark value. Under that old scheme, whichever of the two
+  // completes FIRST always wins, regardless of which was genuinely
+  // issued later -- so if the FIRST-issued operation happens to also
+  // complete FIRST (this test's exact scenario), the SECOND-issued
+  // operation's later completion was wrongly treated as stale and
+  // refused to publish, even though it was the more recently issued
+  // (and therefore should-win) operation.
+  //
+  // Two different, non-coalescing AssetKeys (differing only in
+  // `locale`, which SetIcon ignores when resolving candidates -- see
+  // AssetLocator::resolveCandidates()'s `localizable` gate) resolve to
+  // the exact same candidate URL/cache key. Operation A is issued
+  // FIRST and given a FAST (immediate) response; operation B is issued
+  // SECOND -- only once the server has already fully received A's
+  // request (proven via the requestHandled signal, not an assumption
+  // about synchronous socket writes) -- and given a SLOW (slow-drip)
+  // response, so A is guaranteed to complete FIRST and B SECOND. B,
+  // despite completing second, must still be the one whose bytes end up
+  // published in the shared cache: it is the genuinely later-issued
+  // operation, and the fix (a strictly-increasing-per-cache-key
+  // ISSUANCE counter, minted at issue time and compared via
+  // issuedGeneration >= appliedWatermark) allows a later-issued
+  // operation to always publish regardless of completion order.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+
+  MockHttpServer::Response fastResponse;
+  fastResponse.contentType = "image/png";
+  fastResponse.body = encodePng(8, 8);
+  server.setResponse(path, fastResponse);
+
+  MockHttpServer::Response slowResponse;
+  slowResponse.contentType = "image/png";
+  slowResponse.body = encodePng(16, 16);
+  slowResponse.slowDrip = true;
+  slowResponse.chunkSize = 4096;
+  slowResponse.chunkDelayMs = 200;
+  bool swapped = false;
+  QObject::connect(
+      &server, &MockHttpServer::requestHandled, &server,
+      [&](const QString &firedPath) {
+        if (firedPath == path && !swapped) {
+          swapped = true;
+          server.setResponse(path, slowResponse);
+        }
+      },
+      Qt::QueuedConnection);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidatesA = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidatesA));
+  const auto candidatesB = AssetLocator::resolveCandidates(keyB);
+  QVERIFY(bool(candidatesB));
+  QCOMPARE(candidatesA->first().url, candidatesB->first().url);
+  const QString cacheKey = AssetCache::cacheKeyFor(candidatesA->first().url);
+
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+
+  // Issue A (fast response registered); wait until the server has fully
+  // received A's request (and the queued swap handler has run) before
+  // issuing B, so B's own request deterministically picks up the
+  // now-slow configuration while A's -- already in flight against the
+  // original fast configuration -- is unaffected.
+  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
+  QCOMPARE(server.requestCount(path), 1);
+
+  coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
+  QCOMPARE(server.requestCount(path), 2);
+
+  // Both operations' own consumers still genuinely observe the bytes
+  // THEY fetched.
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QCOMPARE((**resultA).encodedBytes, fastResponse.body);
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QCOMPARE((**resultB).encodedBytes, slowResponse.body);
+
+  // The decisive assertion: the cache holds B's (later-issued) bytes,
+  // NOT A's (earlier-issued, even though A completed first).
+  const auto onDisk = cache.lookupDisk(cacheKey);
+  QVERIFY(onDisk.has_value());
+  QCOMPARE(onDisk->encodedBytes, slowResponse.body);
+}
+
+void AssetRequestCoordinatorTests::
+    queuedStaleDiskDecodeNeverMutatesANewerLiveMemoryEntry() {
+  // Review round-3 item 15 (HIGH: "stale disk decode mutates before
+  // CAS"). ensureDecoded() used to call
+  // AssetCache::updateMemoryDecodedImage() as an unconditional side
+  // effect immediately upon a successful decode, BEFORE
+  // completeCacheReadOrQuarantine()'s own CAS check -- so a slow/stale
+  // disk-read's decode could mutate a NEWER, already-live memory
+  // entry's decodedImage field with older pixels, entirely bypassing
+  // the CAS protection. ensureDecoded() is now purely side-effect-free;
+  // completeCacheReadOrQuarantine() gates the memory-image update
+  // behind the SAME CAS check that guards promotion.
+  //
+  // Two different, non-coalescing AssetKeys (differing only in
+  // `locale`) both revalidate the SAME pre-seeded-on-disk entry (never
+  // touching the still-cold memory cache directly, so both genuinely go
+  // through startRevalidation()). Operation A is issued FIRST (an
+  // older issuance) and given a SLOW-DRIPPED non-404 failure response
+  // (500 UnexpectedStatus) -- this drives A into "stale-if-error",
+  // which decodes A's own STALE cached bytes via
+  // completeCacheReadOrQuarantine(). Operation B is issued SECOND (a
+  // newer issuance) once the server has already fully received A's
+  // request (proven via the requestHandled signal, not a raw sleep) and
+  // is answered immediately with a FRESH 200 carrying different bytes,
+  // which publishes and memory-promotes well before A's slow failure
+  // response finishes dripping. When A's slow failure finally
+  // completes and decodes its own now-superseded stale bytes, that
+  // decode must never overwrite what B already published live in
+  // memory -- exactly the bug ensureDecoded()'s old side effect could
+  // cause.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+
+  const QByteArray staleBytes = encodePng(8, 8);
+  const QByteArray freshBytes = encodePng(16, 16);
+
+  MockHttpServer::Response slowFailureResponse;
+  slowFailureResponse.status = 500;
+  slowFailureResponse.reasonPhrase = "Internal Server Error";
+  slowFailureResponse.body = QByteArrayLiteral("temporarily unavailable");
+  slowFailureResponse.slowDrip = true;
+  slowFailureResponse.chunkSize = 8;
+  slowFailureResponse.chunkDelayMs = 200;
+  server.setResponse(path, slowFailureResponse);
+
+  MockHttpServer::Response freshResponse;
+  freshResponse.contentType = "image/png";
+  freshResponse.body = freshBytes;
+  bool swapped = false;
+  QObject::connect(
+      &server, &MockHttpServer::requestHandled, &server,
+      [&](const QString &firedPath) {
+        if (firedPath == path && !swapped) {
+          swapped = true;
+          server.setResponse(path, freshResponse);
+        }
+      },
+      Qt::QueuedConnection);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidatesA = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidatesA));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidatesA->first().url);
+
+  AssetCache::CachedEntry staleEntry;
+  staleEntry.encodedBytes = staleBytes;
+  staleEntry.contentType = QStringLiteral("image/png");
+  staleEntry.dimensions = QSize(8, 8);
+  staleEntry.etag = QStringLiteral("\"stale-etag\"");
+  cache.store(cacheKey, staleEntry);
+  // Force this key out of the (still warm) memory cache so both A's and
+  // B's requests genuinely go through lookupDisk()'s validator-carrying,
+  // withhold-from-memory path and trigger startRevalidation() rather
+  // than a plain, non-revalidating memory hit -- constructing a fresh
+  // AssetCache instance pointed at the same directory is the simplest
+  // way to guarantee a cold memory cache while keeping the on-disk
+  // entry intact.
+  AssetCache coldCache(cacheConfig);
+  AssetRequestCoordinator coordinator(coldCache, fetcher);
+
+  std::optional<Result> resultA;
+  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
+
+  // Waits until A's conditional GET has been fully received by the
+  // server (its slow-dripped 500 already scheduled using the ORIGINAL
+  // config) AND the queued swap handler has run -- deterministic, no
+  // reliance on raw socket-level timing.
+  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
+  QCOMPARE(server.requestCount(path), 1);
+
+  std::optional<Result> resultB;
+  coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
+  QCOMPARE(server.requestCount(path), 2);
+
+  // B's own consumer observes its own freshly-fetched bytes.
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QCOMPARE((**resultB).encodedBytes, freshBytes);
+
+  // A's own consumer still genuinely observes the "stale-if-error"
+  // fallback: A's own (stale) cached bytes, decoded -- a stale decode
+  // being withheld from the SHARED cache is not the same as A's own
+  // request failing.
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QCOMPARE((**resultA).encodedBytes, staleBytes);
+  QVERIFY(!(**resultA).decodedImage.isNull());
+  QCOMPARE((**resultA).decodedImage.size(), QSize(8, 8));
+
+  // The decisive assertion: B's fresh entry -- in memory -- was never
+  // mutated by A's own (stale-view) revalidation decode completing
+  // afterwards. A memory lookup must still return B's bytes/decoded
+  // image, never A's stale ones spliced in by a side-effecting decode.
+  const auto memoryHit = coldCache.lookupMemory(cacheKey);
+  QVERIFY(memoryHit.has_value());
+  QCOMPARE(memoryHit->encodedBytes, freshBytes);
+  QVERIFY(!memoryHit->decodedImage.isNull());
+  QCOMPARE(memoryHit->decodedImage.size(), QSize(16, 16));
 }

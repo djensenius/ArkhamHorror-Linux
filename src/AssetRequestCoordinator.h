@@ -105,21 +105,29 @@ namespace Arkham {
 // mutation of a given cache key (a fresh 200 store(), a 304's
 // touchAfterNotModified()/memory promotion, or a definitive 404's
 // invalidate()+negative-404 record) is guarded by a per-cache-key
-// optimistic-concurrency generation counter (see currentCacheKeyGeneration()/
-// bumpCacheKeyGeneration() in the .cpp), captured at the moment the
-// asynchronous operation was issued (or, for a cache hit, at the moment of
-// the hit) and re-checked immediately before the mutation is actually
-// applied. A mismatch means some OTHER, more recently issued operation has
-// already mutated this exact cache key in the meantime, so this stale
-// callback's mutation is silently skipped -- its OWN consumers still
-// receive the outcome it genuinely observed (the bytes it fetched, or the
-// fact that its candidate really did 404, are both correct for them), it
-// simply never gets to publish that outcome into the shared cache/negative-
-// 404 state that a newer operation has already superseded. This is what
-// prevents a delayed 200 from overwriting a newer 200, a delayed 304 from
-// touching or memory-promoting a stale body over a newer entry, and a
-// delayed 404 from evicting or negative-caching a cache key a newer
-// operation has since populated with a genuinely fresh success.
+// optimistic-concurrency scheme (see currentCacheKeyGeneration()/
+// issueCacheKeyGeneration()/tryApplyCacheKeyMutation() in the .cpp):
+// every asynchronous operation mints its own strictly-increasing
+// ISSUANCE value at the moment it starts (or, for a cache hit, at the
+// moment of the hit) -- never merely reading whatever generation happens
+// to be currently applied -- and a mutation is actually allowed to apply
+// only if no STRICTLY NEWER issuance has already applied one first. A
+// mismatch means some OTHER, more recently ISSUED operation has already
+// mutated this exact cache key, so this stale callback's mutation is
+// silently skipped -- its OWN consumers still receive the outcome it
+// genuinely observed (the bytes it fetched, or the fact that its
+// candidate really did 404, are both correct for them), it simply never
+// gets to publish that outcome into the shared cache/negative-404 state
+// that a newer operation has already superseded. Critically, this orders
+// mutations by ISSUANCE, not by whichever operation's disk read or
+// network fetch happens to COMPLETE first: a slower-to-complete OLDER
+// operation can never overwrite a faster-to-complete NEWER one, and vice
+// versa a NEWER operation is never blocked merely because an older one
+// happened to finish first. This is what prevents a delayed 200 from
+// overwriting a newer 200, a delayed 304 from touching or memory-
+// promoting a stale body over a newer entry, and a delayed 404 from
+// evicting or negative-caching a cache key a newer operation has since
+// populated with a genuinely fresh success.
 //
 // Cancellation/destruction semantics:
 //   - cancel(handle) detaches exactly that one consumer. While this
@@ -204,6 +212,16 @@ public:
     return m_operations.size();
   }
 
+  // Review round-3 item 13: replaces the real monotonic (steady_clock)
+  // clock used to expire negative-404 records with a caller-supplied
+  // function, so tests can deterministically simulate TTL expiry without
+  // a real sleep and without any sensitivity to wall-clock changes. Test-
+  // only; production code never calls this.
+  using MonotonicNowFn = std::function<qint64()>;
+  void setMonotonicNowForTesting(MonotonicNowFn nowFn) {
+    m_monotonicNowMs = std::move(nowFn);
+  }
+
 private:
   struct Consumer {
     quint64 handleId{0};
@@ -229,9 +247,16 @@ private:
   // Authoritative negative-404 record lookup/write for one exact
   // resolved-candidate cache key -- see the class comment above for the
   // full contract (memory-only, per-candidate, 404-only, cleared on a
-  // later success).
+  // later success). Review round-3 item 13: NEVER permanent -- bounded by
+  // kNegative404TtlMs, and additionally invalidated the instant
+  // `cacheKey`'s applied generation (see tryApplyCacheKeyMutation()) moves
+  // past the value the record was written under (a later success or a
+  // later negative recording both count, including via a completely
+  // different in-flight operation). `generation` is the exact issuance
+  // value (see issueCacheKeyGeneration()) that was just successfully
+  // applied via tryApplyCacheKeyMutation() when this 404 was recorded.
   [[nodiscard]] bool hasNegative404(const QString &cacheKey) const;
-  void recordNegative404(const QString &cacheKey);
+  void recordNegative404(const QString &cacheKey, quint64 generation);
   void clearNegative404(const QString &cacheKey);
 
   RequestHandle
@@ -273,14 +298,23 @@ private:
   // first, so a caller can never observe a successful result whose
   // decodedImage is null. A no-op (returns `entry` unchanged) if it
   // already carries a decoded image (the common case: freshly fetched
-  // entries, or an entry already patched by a prior call here via
-  // AssetCache::updateMemoryDecodedImage()). `cacheKey` is the exact
-  // AssetCache key `entry` was retrieved under, so the freshly-decoded
-  // image can be published back into the memory cache for subsequent
-  // lookupMemory() hits.
+  // entries, or an entry already patched by completeCacheReadOrQuarantine()
+  // via AssetCache::updateMemoryDecodedImage()).
+  //
+  // Review round-3 item 15: deliberately SIDE-EFFECT FREE -- this must
+  // never itself call AssetCache::updateMemoryDecodedImage() (or any
+  // other cache mutation), because the entry it is decoding may already
+  // be stale relative to the cache key by the time this runs (e.g. an
+  // older, slower-to-complete disk read racing a newer operation that
+  // has already published a fresh generation for the same key -- see the
+  // class comment's "Cross-logical-key races" paragraph). Publishing a
+  // decode's side effects unconditionally here could patch a NEWER live
+  // memory entry's decodedImage with pixels decoded from OLDER encoded
+  // bytes. The caller (completeCacheReadOrQuarantine()) is the only place
+  // that has both the decoded result AND the CAS generation check needed
+  // to decide whether it is still safe to publish it.
   [[nodiscard]] AssetOutcome<AssetCache::CachedEntry>
-  ensureDecoded(AssetCache::CachedEntry entry, AssetFormat format,
-                const QString &cacheKey);
+  ensureDecoded(AssetCache::CachedEntry entry, AssetFormat format);
   // Shared by every code path that hands a CACHE-SOURCED entry (never a
   // freshly-fetched one, which always already carries a decoded image --
   // see ensureDecoded()'s comment) to a consumer: runs ensureDecoded(),
@@ -294,15 +328,16 @@ private:
   // the ordinary network-fetch-failure path instead of looping. Any other
   // failure (including UnsupportedCodec) completes the operation with
   // that error, unchanged, without touching the cache entry at all. On
-  // success, `promoteOnSuccess` additionally publishes the now-decoded
-  // entry into the memory cache via AssetCache::promoteToMemory() -- only
-  // needed by the post-304-revalidation caller, whose entry was
-  // deliberately withheld from memory promotion until this exact
-  // revalidation happened (see AssetCache::lookupDisk()'s comment); the
-  // plain cache-hit callers pass promoteOnSuccess=false because
-  // ensureDecoded() already republishes the decoded image in place via
-  // AssetCache::updateMemoryDecodedImage() for an entry already resident
-  // in memory.
+  // success, this method republishes the decoded image back into the
+  // memory cache (AssetCache::updateMemoryDecodedImage()) and,
+  // additionally when `promoteOnSuccess` is set, publishes the whole
+  // entry via AssetCache::promoteToMemory() -- only needed by the
+  // post-304-revalidation caller, whose entry was deliberately withheld
+  // from memory promotion until this exact revalidation happened (see
+  // AssetCache::lookupDisk()'s comment). Review round-3 item 15: BOTH of
+  // these publishes are gated by the exact same `expectedGeneration` CAS
+  // check, so a decode that raced a newer operation's publish can never
+  // mutate the now-current memory entry with stale pixels.
   // `expectedGeneration`: see the class comment's "Cross-logical-key
   // races" paragraph. Gates BOTH the promoteOnSuccess memory promotion and
   // the quarantine-worthy invalidate() below against a cache key already
@@ -316,15 +351,58 @@ private:
                                      bool promoteOnSuccess);
   // Per-cache-key optimistic-concurrency counter (review item 6); see the
   // class comment's "Cross-logical-key races" paragraph. A cache key
-  // never observed before implicitly starts at generation 0.
+  // never observed before implicitly starts at generation 0. This is the
+  // "last successfully APPLIED" watermark -- see tryApplyCacheKeyMutation()
+  // -- never itself minted directly by an issuing call site.
   [[nodiscard]] quint64
   currentCacheKeyGeneration(const QString &cacheKey) const;
-  // Increments and returns the new generation for `cacheKey`; called
-  // immediately after every successful cache mutation (store/invalidate/
-  // touchAfterNotModified/promoteToMemory) performed on that key, so a
-  // subsequent CAS check by any other in-flight operation correctly
-  // observes that this key has since changed.
-  quint64 bumpCacheKeyGeneration(const QString &cacheKey);
+  // Review round-3 item 14: mints and returns a NEW, strictly-increasing
+  // per-cache-key ISSUANCE sequence number. Called exactly once per
+  // operation, at the moment that operation's disk read or network
+  // fetch/revalidation for `cacheKey` is actually ISSUED (never at
+  // completion time) -- see tryApplyCacheKeyMutation()'s comment for why
+  // this must be a distinct counter from the "applied" one
+  // currentCacheKeyGeneration() reads.
+  [[nodiscard]] quint64 issueCacheKeyGeneration(const QString &cacheKey);
+  // Review round-3 item 14: the single CAS gate every cache/negative-404
+  // mutation for `cacheKey` must go through, replacing the old "review
+  // item 6" equality check (`currentCacheKeyGeneration(cacheKey) ==
+  // expectedGeneration`) that ordered mutations by COMPLETION order
+  // rather than ISSUANCE order. `issuedGeneration` is the value a call
+  // site captured from issueCacheKeyGeneration() when its operation was
+  // issued. Succeeds -- applying `issuedGeneration` as the new current
+  // generation and returning true -- iff no STRICTLY NEWER issuance has
+  // already been applied, i.e. `issuedGeneration >=
+  // currentCacheKeyGeneration(cacheKey)`. Deliberately ">=", not ">":
+  // several mutations belonging to the SAME operation (e.g. a 304's
+  // recency touch immediately followed by completeCacheReadOrQuarantine()'s
+  // own promotion) share one issuedGeneration value and must all be able
+  // to apply in sequence, while an OLDER operation's issuedGeneration can
+  // never "catch up" past whatever a genuinely newer operation already
+  // applied. The net effect: a slower-to-complete OLDER operation can
+  // never overwrite state a faster-to-complete NEWER operation already
+  // published, and a faster NEWER operation is never blocked merely
+  // because an older one happened to complete first -- ordering is by
+  // ISSUANCE, never by completion race, regardless of which of two
+  // concurrent operations' disk reads or network fetches happens to
+  // finish first.
+  [[nodiscard]] bool tryApplyCacheKeyMutation(const QString &cacheKey,
+                                              quint64 issuedGeneration);
+  // Review round-3 item 12: the ONE path every candidate-list transition
+  // (the very first look at an untried candidate, and every subsequent
+  // advance past a definitive 404/quarantine) routes through, so a
+  // localized-then-404 candidate can never bypass an already-cached
+  // lower-priority candidate (e.g. an English fallback) that a divergent
+  // ad hoc "just jump straight to the network for the next index" path
+  // could otherwise skip. Walks `operation.candidates` forward from its
+  // CURRENT candidateIndex exactly like request()'s own initial scan
+  // (negative-404 skip, memory hit, disk hit with/without validators,
+  // first genuinely untried candidate falls through to startCandidate()),
+  // operating on an EXISTING operationId (never registers a new
+  // consumer/operation -- see registerCacheHitCompletion() for that).
+  // Completes the operation with NotFound if every remaining candidate is
+  // exhausted or authoritatively negative-cached.
+  void advanceCandidates(quint64 operationId);
   void startCandidate(quint64 operationId);
   void startRevalidation(quint64 operationId);
   void completeOperation(quint64 operationId,
@@ -358,16 +436,42 @@ private:
   QHash<quint64, std::shared_ptr<bool>>
       m_pendingDeliveryCancelled; // consumer handleId -> cancelled flag
 
+  // Review round-3 item 13: a bounded (kNegative404TtlMs), generation-
+  // scoped negative-404 record -- see hasNegative404()'s comment for the
+  // full expiry contract. Replaces a bare QSet<QString> (permanent for
+  // this coordinator's entire lifetime) with this small struct so a
+  // record naturally, deterministically stops being trusted without
+  // requiring an active sweep/timer.
+  struct Negative404Entry {
+    quint64 generation{0};
+    qint64 expiresAtMonotonicMs{0};
+  };
   // Cache keys (see AssetCache::cacheKeyFor()) for which an exact,
   // authoritative 404 has been observed by THIS process; never
-  // persisted to disk. See the class comment for the full contract.
-  QSet<QString> m_negative404;
+  // persisted to disk. See the class comment for the full contract, and
+  // hasNegative404()'s comment for the TTL/generation expiry.
+  QHash<QString, Negative404Entry> m_negative404;
+  static constexpr qint64 kNegative404TtlMs = 5 * 60 * 1000; // 5 minutes
+  // Review round-3 item 13: the monotonic clock negative-404 expiry is
+  // measured against -- steady_clock in production (see the .cpp),
+  // replaceable via setMonotonicNowForTesting() above. Deliberately NOT
+  // wall-clock time: a system clock adjustment/rollback must never
+  // resurrect or prematurely expire a negative-404 record.
+  MonotonicNowFn m_monotonicNowMs;
 
-  // Per-cache-key optimistic-concurrency generation counters (review item
-  // 6); see currentCacheKeyGeneration()/bumpCacheKeyGeneration() and the
-  // class comment's "Cross-logical-key races" paragraph. Memory-only,
-  // like m_negative404.
+  // Per-cache-key optimistic-concurrency APPLIED-generation watermark
+  // (review item 6, refined by round-3 item 14); see
+  // currentCacheKeyGeneration()/tryApplyCacheKeyMutation() and the class
+  // comment's "Cross-logical-key races" paragraph. Memory-only, like
+  // m_negative404.
   QHash<QString, quint64> m_cacheKeyGeneration;
+  // Review round-3 item 14: per-cache-key ISSUANCE counter -- see
+  // issueCacheKeyGeneration()'s comment. Deliberately a SEPARATE counter
+  // from m_cacheKeyGeneration (which tracks what has actually been
+  // APPLIED): every operation issued against a cache key mints a new,
+  // strictly-increasing value here at issue time, independent of
+  // whichever operation's mutation eventually gets applied or when.
+  QHash<QString, quint64> m_cacheKeyIssuedGeneration;
 };
 
 } // namespace Arkham

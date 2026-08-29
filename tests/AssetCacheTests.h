@@ -55,6 +55,14 @@ private slots:
   void fileSymlinkInsideCacheRootIsUnlinkedNotFollowed();
   void danglingSymlinkInsideCacheRootIsUnlinkedSafely();
 
+  // Round-3 item 9: root replaced (renamed away + a new directory
+  // created at the same path) strictly AFTER construction.
+  void rootReplacedAfterConstructionPermanentlyDisablesDiskIoForBothTargets();
+
+  // Round-3 item 8: metadata numeric-field cast safety.
+  void metadataWithImpossibleNumericFieldsIsRejectedAndQuarantined();
+  void accessSequenceAbove2Pow53RoundTripsExactlyAcrossARestart();
+
   // Review item 11: monotonic-sequence LRU accuracy.
   void
   accessSequenceIsMonotonicAndUniqueEvenForSameMillisecondConsecutiveStores();

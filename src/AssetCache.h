@@ -338,11 +338,58 @@ private:
   // hold m_mutex.
   void touchAccessRecencyLocked(const QString &key);
 
-  bool m_diskCacheDisabled{false};
+  // Review round-3 item 9: re-validates that `m_directory` still names
+  // the EXACT filesystem object (device+inode) this cache anchored to a
+  // retained, already-open directory descriptor at construction time
+  // (see the constructor and m_rootFd's comment). Called at the top of
+  // every disk-touching operation. If the path has since been replaced
+  // (the directory itself renamed/removed and a new one -- possibly a
+  // symlink -- created at the same path, or any ancestor component
+  // replaced such that the path no longer resolves to the anchored
+  // object). this call permanently disables disk I/O for the remainder
+  // of this instance's lifetime (mirroring the constructor's own
+  // symlink-at-construction handling) rather than silently continuing
+  // to operate against a path string that may now resolve somewhere
+  // else entirely. Returns false iff disk I/O is (now, or already was)
+  // disabled; callers must already hold m_mutex.
+  [[nodiscard]] bool verifyRootAnchorLocked() const;
+  // Review round-3 item 11: a full, unconditional inventory of every
+  // byte this cache's root directory ACTUALLY currently occupies on
+  // disk (files, directories, symlink-node entries -- everything,
+  // regardless of whether it parses as a valid/recognized entry shape),
+  // via a no-follow-symlinks recursive traversal. Unlike summing only
+  // the entries reapAndEnforceQuota() has independently validated as
+  // live/correct, this can never UNDERCOUNT: a stray/orphan/corrupt
+  // entry that a repair pass FAILED to delete (a permission error, a
+  // hostile undeletable node, a cross-device mount point it refused to
+  // recurse into) still occupies real bytes and must still count
+  // against quota, or eviction could stop "successfully" long before
+  // actual disk usage has genuinely been brought down. Callers must
+  // already hold m_mutex.
+  [[nodiscard]] qint64 diskUsageBytesLocked() const;
+
+  mutable bool m_diskCacheDisabled{false};
   Config m_config;
   QString m_directory;
   mutable QMutex m_mutex;
   QCache<QString, CachedEntry> *m_memory;
+  // Review round-3 item 9: an already-open, O_DIRECTORY|O_NOFOLLOW|
+  // O_CLOEXEC descriptor for `m_directory`, opened once at construction
+  // and retained for this instance's entire lifetime, together with the
+  // (device, inode) pair it named at that moment (via fstat() on the
+  // SAME descriptor, never a second path-based stat). A file descriptor
+  // continues to refer to the original filesystem object even if the
+  // path that named it is later renamed, removed, or replaced by
+  // something else entirely (including a symlink) -- so re-deriving the
+  // current (device, inode) for `m_directory` via a fresh path-based
+  // stat and comparing it against these retained values
+  // (verifyRootAnchorLocked()) detects exactly that class of
+  // post-construction root replacement/mount-swap, which a
+  // construction-time-only symlink check cannot. -1 when unavailable
+  // (disk cache disabled, or a non-POSIX platform).
+  mutable int m_rootFd{-1};
+  mutable quint64 m_rootDevice{0};
+  mutable quint64 m_rootInode{0};
   // Review item 11: guarded by m_mutex; recovered in the constructor (via
   // reapAndEnforceQuota()'s directory scan) and re-validated (monotonic,
   // never decreasing) on every subsequent reapAndEnforceQuota() call, so

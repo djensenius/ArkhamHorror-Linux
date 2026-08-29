@@ -14,6 +14,7 @@
 #include <QSet>
 #include <QStandardPaths>
 #include <algorithm>
+#include <cmath>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,49 @@ constexpr qint64 kMaxSinglePayloadBytesOnDisk = 20LL * 1024 * 1024;
 // any of its content is even parsed. 64 KiB leaves generous headroom
 // over any legitimate metadata payload while still bounding the read.
 constexpr qint64 kMaxMetadataBytesOnDisk = 64 * 1024;
+
+// Review round-3 item 8: an independent (deliberately NOT shared with
+// AssetNetworkFetcher::Limits -- see kMaxSinglePayloadBytesOnDisk's
+// comment for the same "mirror, don't couple" reasoning) sane upper bound
+// on a single dimension read back from metadata. Real assets never
+// remotely approach this; it exists purely so a corrupted/malicious
+// metadata field can never reach the width/height cast below with a
+// value that could overflow a later width*height multiplication.
+constexpr qint64 kMaxDimensionPixelsOnDisk = 65536;
+
+// The largest double value that can represent every integer exactly
+// (2^53): the JSON number type is IEEE-754 double-precision, so ANY
+// integer-valued field this cache itself ever legitimately writes (see
+// writeMetadata()) that could plausibly exceed this bound must be
+// persisted as a decimal STRING instead (see the accessSequence handling
+// in readMetadata()/writeMetadata()) rather than a bare JSON number.
+// Timestamp fields (insertedAtMs/lastAccessMs) are bounded against this
+// same limit below purely as a "finite, integral, in-range" sanity gate
+// -- not because a real timestamp could ever legitimately approach it.
+constexpr double kMaxExactJsonIntegerDouble = 9007199254740992.0; // 2^53
+
+// Review round-3 item 8: validates that `value` is a JSON number encoding
+// a finite, integral, non-negative value no larger than `maxBound` --
+// returns std::nullopt for anything else (a fractional value, NaN,
+// +/-infinity, negative, oversized, or simply not a number at all).
+// QJsonValue::toDouble() happily returns any of those for a corrupted or
+// maliciously-planted metadata file; casting such a double DIRECTLY to a
+// narrower integer type (as this file used to do for encodedSize/width/
+// height) is undefined behaviour for an out-of-range value, not merely
+// "wrong" -- this rejects all of that BEFORE any cast is ever performed,
+// rather than trusting the cast itself to fail safely.
+std::optional<qint64>
+readBoundedNonNegativeIntegerField(const QJsonValue &value, qint64 maxBound) {
+  if (!value.isDouble()) {
+    return std::nullopt;
+  }
+  const double d = value.toDouble();
+  if (!std::isfinite(d) || d < 0.0 || d > static_cast<double>(maxBound) ||
+      d != std::trunc(d)) {
+    return std::nullopt;
+  }
+  return static_cast<qint64>(d);
+}
 
 // Verifies `payloadFile`'s on-disk size against `expectedSize` (from
 // metadata) and an absolute hard ceiling BEFORE ever calling read(), THEN
@@ -140,16 +184,31 @@ bool fsyncSaveFileBeforeCommit(QSaveFile &file) {
 // swap -- the single atomic pointer flip that actually publishes a new
 // generation -- commits, so that publication itself survives a crash
 // immediately following it.
-void fsyncDirectory(const QString &dirPath) {
+// fsyncs the directory entry `dirPath` itself: on POSIX, a file rename
+// (as QSaveFile::commit() performs) is only durable across a crash once
+// the directory's own metadata update is flushed, independent of the
+// renamed file's own content already being synced (see
+// fsyncSaveFileBeforeCommit() above). Called once after the manifest
+// swap -- the single atomic pointer flip that actually publishes a new
+// generation -- commits, so that publication itself survives a crash
+// immediately following it. Review round-3 item 10: returns whether the
+// fsync itself actually succeeded (open+fsync both) -- a caller (store())
+// must NEVER proceed to reclaim the previous generation's files as if
+// publication were durable when this returns false; the previous
+// generation is the only durability hedge available at that point.
+bool fsyncDirectory(const QString &dirPath) {
 #if defined(Q_OS_UNIX)
   const QByteArray dirUtf8 = QFile::encodeName(dirPath);
   const int fd = ::open(dirUtf8.constData(), O_RDONLY | O_DIRECTORY);
-  if (fd >= 0) {
-    ::fsync(fd);
-    ::close(fd);
+  if (fd < 0) {
+    return false;
   }
+  const bool ok = ::fsync(fd) == 0;
+  ::close(fd);
+  return ok;
 #else
   Q_UNUSED(dirPath);
+  return true;
 #endif
 }
 
@@ -286,11 +345,52 @@ AssetCache::AssetCache(Config config)
   } else {
     QDir().mkpath(m_directory);
   }
+#if defined(Q_OS_UNIX)
+  // Review round-3 item 9: open and retain a directory descriptor for
+  // `m_directory` NOW, at construction, and record the (device, inode)
+  // pair it names via fstat() on THIS SAME descriptor -- never a second,
+  // later path-based stat, which could observe a DIFFERENT filesystem
+  // object if the path has since been replaced. O_NOFOLLOW means this
+  // open itself fails if the path (already checked above, but this is
+  // an independent, TOCTOU-closing re-check via the syscall itself
+  // rather than a separate stat) resolves to a symlink. Every later
+  // disk-touching operation re-derives the CURRENT (device, inode) for
+  // this same path and compares it against these retained values
+  // (verifyRootAnchorLocked()) before proceeding, so a root directory
+  // renamed away and replaced by a new one (or an ancestor component
+  // replaced such that the same path now resolves elsewhere) is
+  // detected and disk I/O is permanently disabled rather than silently
+  // operating against a different object than the one this instance
+  // was constructed against.
+  if (!m_diskCacheDisabled) {
+    const QByteArray dirUtf8 = QFile::encodeName(m_directory);
+    const int fd = ::open(dirUtf8.constData(),
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat st {};
+    if (fd < 0 || ::fstat(fd, &st) != 0) {
+      if (fd >= 0) {
+        ::close(fd);
+      }
+      m_diskCacheDisabled = true;
+    } else {
+      m_rootFd = fd;
+      m_rootDevice = static_cast<quint64>(st.st_dev);
+      m_rootInode = static_cast<quint64>(st.st_ino);
+    }
+  }
+#endif
   m_memory->setMaxCost(m_config.memoryMaxCostBytes);
   reapAndEnforceQuota();
 }
 
-AssetCache::~AssetCache() { delete m_memory; }
+AssetCache::~AssetCache() {
+  delete m_memory;
+#if defined(Q_OS_UNIX)
+  if (m_rootFd >= 0) {
+    ::close(m_rootFd);
+  }
+#endif
+}
 
 QString AssetCache::cacheKeyFor(const QUrl &resolvedCandidateUrl) {
   const QByteArray canonical =
@@ -378,6 +478,63 @@ void AssetCache::touchAccessRecencyLocked(const QString &key) {
   (void)writeMetadata(metadataPath, refreshed, /*durable=*/false);
 }
 
+bool AssetCache::verifyRootAnchorLocked() const {
+  if (m_diskCacheDisabled) {
+    return false;
+  }
+#if defined(Q_OS_UNIX)
+  if (m_rootFd < 0) {
+    // Never opened successfully at construction (or on a platform
+    // without this protection) -- treat as already disabled rather than
+    // silently skipping the check.
+    m_diskCacheDisabled = true;
+    return false;
+  }
+  struct stat currentSt {};
+  // lstat (never a path resolved THROUGH the retained descriptor, and
+  // never following a final symlink component): re-derives what
+  // `m_directory` names RIGHT NOW, independent of the object m_rootFd
+  // still refers to. If the path has been renamed away, removed, or
+  // replaced by anything else (a plain directory, a symlink, a
+  // dangling entry), the (device, inode) pair observed here will not
+  // match what was captured from m_rootFd at construction.
+  const QByteArray dirUtf8 = QFile::encodeName(m_directory);
+  if (::lstat(dirUtf8.constData(), &currentSt) != 0 ||
+      static_cast<quint64>(currentSt.st_dev) != m_rootDevice ||
+      static_cast<quint64>(currentSt.st_ino) != m_rootInode) {
+    qWarning() << "AssetCache: root directory anchor mismatch for"
+               << m_directory
+               << "-- permanently disabling disk I/O for this instance";
+    m_diskCacheDisabled = true;
+    ::close(m_rootFd);
+    m_rootFd = -1;
+    return false;
+  }
+  return true;
+#else
+  return true;
+#endif
+}
+
+qint64 AssetCache::diskUsageBytesLocked() const {
+  if (!verifyRootAnchorLocked()) {
+    return 0;
+  }
+  // See diskUsageBytes()'s comment (this is its lock-already-held
+  // implementation, reused directly by reapAndEnforceQuota() -- review
+  // round-3 item 11 -- so its eviction-target math is always driven by
+  // a true, unconditional inventory rather than only the subset of
+  // entries that happened to validate cleanly).
+  qint64 total = 0;
+  QDirIterator it(m_directory, QDir::Files | QDir::Hidden,
+                  QDirIterator::Subdirectories);
+  while (it.hasNext()) {
+    it.next();
+    total += it.fileInfo().size();
+  }
+  return total;
+}
+
 bool AssetCache::writeMetadata(const QString &metadataFilePath,
                                const DiskMetadata &metadata,
                                bool durable) const {
@@ -393,13 +550,15 @@ bool AssetCache::writeMetadata(const QString &metadataFilePath,
   obj[QStringLiteral("lastModified")] = metadata.lastModified;
   obj[QStringLiteral("insertedAtMs")] = metadata.insertedAtMsecsSinceEpoch;
   obj[QStringLiteral("lastAccessMs")] = metadata.lastAccessMsecsSinceEpoch;
-  // Review item 11: the monotonic access-sequence witness (see the class
-  // comment). Stored as a JSON number, exactly like every other integer
-  // field already in this object (encodedSize, the two *Ms fields) --
-  // all of them already accept the same double-precision representation
-  // limit, which this counter will not realistically approach.
-  obj[QStringLiteral("accessSeq")] =
-      static_cast<double>(metadata.accessSequence);
+  // Review round-3 item 8: persisted as a decimal STRING, not a bare
+  // JSON number -- see kMaxExactJsonIntegerDouble's comment. A JSON
+  // number is an IEEE-754 double and can only represent every integer
+  // *exactly* up to 2^53; this counter increments once per successful
+  // access/store and, over a long enough cache lifetime, could
+  // plausibly exceed that threshold, silently losing precision (and
+  // therefore LRU ordering correctness) if stored as a number. A
+  // quint64-range string has no such ceiling.
+  obj[QStringLiteral("accessSeq")] = QString::number(metadata.accessSequence);
 
   QSaveFile file(metadataFilePath);
   if (!file.open(QIODevice::WriteOnly)) {
@@ -507,19 +666,49 @@ AssetCache::readMetadata(const QString &metadataFilePath,
   DiskMetadata metadata;
   metadata.key = obj[QStringLiteral("key")].toString();
   metadata.contentType = obj[QStringLiteral("contentType")].toString();
-  metadata.encodedSize =
-      static_cast<qint64>(obj[QStringLiteral("encodedSize")].toDouble(-1));
-  metadata.width = obj[QStringLiteral("width")].toInt(-1);
-  metadata.height = obj[QStringLiteral("height")].toInt(-1);
+  // Review round-3 item 8: every numeric field below is independently
+  // validated as finite/integral/non-negative/in-range BEFORE any cast
+  // to a narrower type -- a corrupted or maliciously-planted metadata
+  // file can otherwise supply a fractional, negative, NaN, +/-infinity,
+  // or absurdly oversized JSON number, and casting THAT directly to
+  // qint64/int/quint64 (as this file used to do) is undefined behaviour,
+  // not merely "produces a wrong value". Any field that fails this check
+  // renders the whole metadata record untrusted (return std::nullopt
+  // below), which the caller then treats as a quarantine-and-refetch
+  // candidate exactly like a missing/absent file.
+  const std::optional<qint64> encodedSize = readBoundedNonNegativeIntegerField(
+      obj[QStringLiteral("encodedSize")], kMaxSinglePayloadBytesOnDisk);
+  const std::optional<qint64> width = readBoundedNonNegativeIntegerField(
+      obj[QStringLiteral("width")], kMaxDimensionPixelsOnDisk);
+  const std::optional<qint64> height = readBoundedNonNegativeIntegerField(
+      obj[QStringLiteral("height")], kMaxDimensionPixelsOnDisk);
+  const std::optional<qint64> insertedAtMs = readBoundedNonNegativeIntegerField(
+      obj[QStringLiteral("insertedAtMs")], kMaxExactJsonIntegerDouble);
+  const std::optional<qint64> lastAccessMs = readBoundedNonNegativeIntegerField(
+      obj[QStringLiteral("lastAccessMs")], kMaxExactJsonIntegerDouble);
+  if (!encodedSize || !width || !height || !insertedAtMs || !lastAccessMs) {
+    return std::nullopt;
+  }
+  metadata.encodedSize = *encodedSize;
+  metadata.width = static_cast<int>(*width);
+  metadata.height = static_cast<int>(*height);
   metadata.sha256Hex = obj[QStringLiteral("sha256")].toString();
   metadata.etag = obj[QStringLiteral("etag")].toString();
   metadata.lastModified = obj[QStringLiteral("lastModified")].toString();
-  metadata.insertedAtMsecsSinceEpoch =
-      static_cast<qint64>(obj[QStringLiteral("insertedAtMs")].toDouble(0));
-  metadata.lastAccessMsecsSinceEpoch =
-      static_cast<qint64>(obj[QStringLiteral("lastAccessMs")].toDouble(0));
-  metadata.accessSequence =
-      static_cast<quint64>(obj[QStringLiteral("accessSeq")].toDouble(0));
+  metadata.insertedAtMsecsSinceEpoch = *insertedAtMs;
+  metadata.lastAccessMsecsSinceEpoch = *lastAccessMs;
+  // Review round-3 item 8: accessSeq is persisted as a decimal STRING
+  // (see writeMetadata()'s comment), not a bare JSON number -- parse it
+  // with QString::toULongLong()'s own strict validation (rejects
+  // fractional/non-digit/out-of-quint64-range content via `ok`) rather
+  // than a JSON-number cast at all. Absent/malformed defaults to 0
+  // (the same default a pre-existing/legacy metadata file with no such
+  // field at all would have produced), never an arbitrary or partially-
+  // parsed value.
+  bool accessSeqOk = false;
+  const quint64 accessSeq =
+      obj[QStringLiteral("accessSeq")].toString().toULongLong(&accessSeqOk);
+  metadata.accessSequence = accessSeqOk ? accessSeq : 0;
   if (metadata.key != expectedKey || metadata.sha256Hex.isEmpty() ||
       metadata.encodedSize < 0) {
     return std::nullopt;
@@ -528,7 +717,7 @@ AssetCache::readMetadata(const QString &metadataFilePath,
 }
 
 bool AssetCache::deleteEntry(const QString &key) const {
-  if (m_diskCacheDisabled) {
+  if (m_diskCacheDisabled || !verifyRootAnchorLocked()) {
     return true; // nothing to delete when disk I/O is disabled entirely
   }
   // Review item 8: `key` no longer maps to a fixed pair of filenames --
@@ -579,6 +768,12 @@ AssetCache::lookupDisk(const QString &key) {
   }
 
   QMutexLocker locker(&m_mutex);
+
+  if (!verifyRootAnchorLocked()) {
+    // Review round-3 item 9: the root has been replaced/removed/mounted
+    // over since construction -- refuse to read through it at all.
+    return std::nullopt;
+  }
 
   const std::optional<QString> generation = readManifestGeneration(key);
   if (!generation) {
@@ -725,9 +920,11 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
     // future caller invoking store() directly with an oversized entry.
     // The memory insert above is unaffected -- QCache's own cost-based
     // eviction already bounds memory usage independently of disk.
-    if (m_diskCacheDisabled) {
-      // Review item 7: root was a symlink at construction. Memory
-      // insert above still happened -- only the disk write is skipped.
+    if (m_diskCacheDisabled || !verifyRootAnchorLocked()) {
+      // Review item 7 / round-3 item 9: root was a symlink at
+      // construction, or has since been replaced/removed/mounted over.
+      // Memory insert above still happened -- only the disk write is
+      // skipped.
     } else if (entry.encodedBytes.size() <= kMaxSinglePayloadBytesOnDisk) {
       // Review item 8: content-addressed generation publication. The
       // generation's filename is derived from its own content hash, so
@@ -769,15 +966,38 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
             // then fsync the directory so that publish survives a crash
             // immediately after it (see fsyncDirectory()'s comment).
             if (writeManifest(key, generation)) {
-              fsyncDirectory(m_directory);
-              // Only now -- strictly after the new generation is
-              // durably live -- reclaim the OLD generation's files, if
-              // there was a different one. A crash at any point before
-              // this line leaves the OLD generation still fully intact
-              // and still the one the manifest names.
-              if (previousGeneration && *previousGeneration != generation) {
-                QFile::remove(generationPayloadPath(key, *previousGeneration));
-                QFile::remove(generationMetadataPath(key, *previousGeneration));
+              // Review round-3 item 10: the manifest rename ITSELF is
+              // already committed at the filesystem level at this point
+              // (QSaveFile::commit() succeeded above) -- there is no
+              // reliable way to "roll it back" if the directory fsync
+              // that follows fails. What CAN still be controlled is
+              // whether the OLD generation's files are reclaimed: if
+              // fsyncDirectory() fails, this crash-durability barrier
+              // has NOT actually been crossed, so the old generation is
+              // deliberately kept around as a durability hedge (a crash
+              // right after this point could otherwise leave NEITHER
+              // generation recoverable if the rename itself hadn't
+              // actually reached stable storage) rather than reclaimed
+              // as if publication were guaranteed durable.
+              if (fsyncDirectory(m_directory)) {
+                // Only now -- strictly after the new generation is
+                // confirmed durably live -- reclaim the OLD
+                // generation's files, if there was a different one. A
+                // crash at any point before this line leaves the OLD
+                // generation still fully intact and still the one the
+                // manifest names.
+                if (previousGeneration && *previousGeneration != generation) {
+                  QFile::remove(
+                      generationPayloadPath(key, *previousGeneration));
+                  QFile::remove(
+                      generationMetadataPath(key, *previousGeneration));
+                }
+              } else {
+                qWarning()
+                    << "AssetCache: directory fsync failed after publishing"
+                    << key
+                    << "-- retaining previous generation as a durability "
+                       "hedge";
               }
             } else {
               // Manifest publish failed: this generation's files become
@@ -832,6 +1052,9 @@ void AssetCache::touchAfterNotModified(const QString &key,
     return;
   }
   QMutexLocker locker(&m_mutex);
+  if (!verifyRootAnchorLocked()) {
+    return;
+  }
   const std::optional<QString> generation = readManifestGeneration(key);
   const std::optional<DiskMetadata> metadata =
       generation ? readMetadata(generationMetadataPath(key, *generation), key)
@@ -928,6 +1151,11 @@ void AssetCache::reapAndEnforceQuota() {
     return;
   }
   QMutexLocker locker(&m_mutex);
+  if (!verifyRootAnchorLocked()) {
+    // Review round-3 item 9: root replaced since construction -- never
+    // enumerate, follow, or delete anything through it.
+    return;
+  }
 
   QDir dir(m_directory);
   if (!dir.exists()) {
@@ -1134,10 +1362,16 @@ void AssetCache::reapAndEnforceQuota() {
   m_nextAccessSequence =
       qMax(m_nextAccessSequence, maxObservedAccessSequence + 1);
 
-  qint64 totalBytes = 0;
-  for (const ValidEntry &e : valid) {
-    totalBytes += e.totalBytes;
-  }
+  qint64 totalBytes = diskUsageBytesLocked();
+  // Review round-3 item 11: the eviction-target math below is driven by
+  // a TRUE, unconditional inventory of every byte still actually present
+  // under the root (diskUsageBytesLocked()), not merely the sum of
+  // entries that happened to validate cleanly above. A stray/orphan/
+  // corrupt entry the cleanup pass above FAILED to remove (a permission
+  // error, an undeletable node, or any other reclaim failure) still
+  // occupies real, countable disk space; summing only `valid` would
+  // silently ignore it and could let quota enforcement report "already
+  // under budget" while genuinely undeletable bytes remain resident.
 
   const qint64 highWaterMark =
       static_cast<qint64>(m_config.diskMaxBytes * kHighWaterMarkFraction);
@@ -1193,11 +1427,6 @@ qint64 AssetCache::memoryCostBytes() const {
 
 qint64 AssetCache::diskUsageBytes() const {
   QMutexLocker locker(&m_mutex);
-  if (m_diskCacheDisabled) {
-    // Review item 7: never enumerate through a symlinked root, even for
-    // a read-only usage total.
-    return 0;
-  }
   // Copilot review: recurse into subdirectories here (QDirIterator with
   // Subdirectories), not a flat QDir::Files listing -- this directory is
   // exclusively owned by AssetCache, so a stray directory (e.g. planted,
@@ -1210,19 +1439,15 @@ qint64 AssetCache::diskUsageBytes() const {
   // QDir::Hidden is included too: QDirIterator's filters exclude hidden
   // entries by default, so a stray hidden file would otherwise undercount
   // usage and could prevent the high-water-mark gate from ever tripping.
-  qint64 total = 0;
-  QDirIterator it(m_directory, QDir::Files | QDir::Hidden,
-                  QDirIterator::Subdirectories);
-  while (it.hasNext()) {
-    it.next();
-    total += it.fileInfo().size();
-  }
-  return total;
+  // Review round-3 item 9: routed through diskUsageBytesLocked(), which
+  // itself re-verifies the root anchor (device+inode) before enumerating
+  // anything -- see verifyRootAnchorLocked()'s comment.
+  return diskUsageBytesLocked();
 }
 
 int AssetCache::diskEntryCount() const {
   QMutexLocker locker(&m_mutex);
-  if (m_diskCacheDisabled) {
+  if (!verifyRootAnchorLocked()) {
     return 0;
   }
   QDir dir(m_directory);

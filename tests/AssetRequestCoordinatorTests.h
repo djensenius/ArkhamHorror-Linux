@@ -72,10 +72,15 @@ private slots:
   void malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork();
   void quarantineRefetchFailureSurfacesFreshErrorWithoutLooping();
   void unsupportedCodecIsNeverQuarantineWorthy();
-  void
-  delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry();
+  void delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry();
   void
   delayedStaleRevalidationSuccessAfterDefinitive404NeverResurrectsEvictedEntry();
+  // Review round-3 items 12-15.
+  void localized404AdvanceServesAlreadyCachedEnglishCandidateWithoutNetwork();
+  void negative404RecordExpiresAfterTtlAndIsRefetched();
+  void
+  laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond();
+  void queuedStaleDiskDecodeNeverMutatesANewerLiveMemoryEntry();
 
 private:
   QString m_tempDirPath;

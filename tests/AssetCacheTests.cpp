@@ -369,6 +369,254 @@ void AssetCacheTests::storeReplacementLeavesExactlyOneLiveGenerationOnDisk() {
   QCOMPARE(metadataCount, 1);
 }
 
+void AssetCacheTests::
+    metadataWithImpossibleNumericFieldsIsRejectedAndQuarantined() {
+  // Review round-3 item 8: readMetadata() must reject a fractional,
+  // negative, non-numeric, or out-of-bound JSON number for encodedSize/
+  // width/height BEFORE ever casting it to a narrower integer type --
+  // casting an out-of-range double directly (as this file used to do)
+  // is undefined behaviour, not merely "produces a wrong value". Each
+  // variant below is otherwise a fully self-consistent payload/metadata/
+  // manifest triple (correct SHA-256, matching declared size) -- only
+  // the single named field is impossible -- isolating readMetadata()'s
+  // own per-field validation from the other integrity checks already
+  // covered elsewhere in this file (oversized payload, mismatched hash,
+  // etc). A fresh AssetCache's own constructor-time reapAndEnforceQuota()
+  // sweep must quarantine (fully remove) every variant on its own.
+  struct Variant {
+    const char *label;
+    const char *fieldName;
+    QJsonValue badValue;
+  };
+  const QVector<Variant> variants = {
+      {"fractional-width", "width", QJsonValue(4.5)},
+      {"negative-height", "height", QJsonValue(-10)},
+      {"width-above-dimension-bound", "width", QJsonValue(999999999.0)},
+      {"encodedSize-above-absolute-cap", "encodedSize",
+       QJsonValue(50.0 * 1024 * 1024)},
+      {"non-numeric-height", "height", QJsonValue(QStringLiteral("nope"))},
+  };
+
+  int index = 0;
+  for (const Variant &variant : variants) {
+    const QUrl url(QStringLiteral("https://example.com/impossible-field-%1.png")
+                       .arg(index++));
+    const QString key = AssetCache::cacheKeyFor(url);
+    const QByteArray bytes = QByteArrayLiteral("impossible-field-payload");
+    const QString sha256Hex = QString::fromLatin1(
+        QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+    const QString payloadPath =
+        AssetCache::payloadPathForTesting(m_tempDirPath, key, sha256Hex);
+    const QString metadataPath =
+        AssetCache::metadataPathForTesting(m_tempDirPath, key, sha256Hex);
+    const QString manifestPath =
+        AssetCache::manifestPathForTesting(m_tempDirPath, key);
+
+    {
+      QFile payload(payloadPath);
+      QVERIFY2(payload.open(QIODevice::WriteOnly), variant.label);
+      payload.write(bytes);
+    }
+
+    QJsonObject obj;
+    obj[QStringLiteral("formatVersion")] = 1;
+    obj[QStringLiteral("key")] = key;
+    obj[QStringLiteral("contentType")] = QStringLiteral("image/png");
+    obj[QStringLiteral("encodedSize")] = bytes.size();
+    obj[QStringLiteral("width")] = 1;
+    obj[QStringLiteral("height")] = 1;
+    obj[QStringLiteral("sha256")] = sha256Hex;
+    obj[QStringLiteral("etag")] = QString();
+    obj[QStringLiteral("lastModified")] = QString();
+    obj[QStringLiteral("insertedAtMs")] = QDateTime::currentMSecsSinceEpoch();
+    obj[QStringLiteral("lastAccessMs")] = QDateTime::currentMSecsSinceEpoch();
+    obj[QStringLiteral("accessSeq")] = QStringLiteral("1");
+    obj[QLatin1String(variant.fieldName)] = variant.badValue;
+
+    {
+      QFile metadata(metadataPath);
+      QVERIFY2(metadata.open(QIODevice::WriteOnly), variant.label);
+      metadata.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    }
+
+    QJsonObject manifestObj;
+    manifestObj[QStringLiteral("formatVersion")] = 1;
+    manifestObj[QStringLiteral("key")] = key;
+    manifestObj[QStringLiteral("generation")] = sha256Hex;
+    {
+      QFile manifest(manifestPath);
+      QVERIFY2(manifest.open(QIODevice::WriteOnly), variant.label);
+      manifest.write(QJsonDocument(manifestObj).toJson(QJsonDocument::Compact));
+    }
+
+    AssetCache cache(configFor(m_tempDirPath));
+    QVERIFY2(!cache.lookupDisk(key).has_value(), variant.label);
+    QVERIFY2(!QFile::exists(payloadPath), variant.label);
+    QVERIFY2(!QFile::exists(metadataPath), variant.label);
+    QVERIFY2(!QFile::exists(manifestPath), variant.label);
+  }
+}
+
+void AssetCacheTests::
+    accessSequenceAbove2Pow53RoundTripsExactlyAcrossARestart() {
+  // Review round-3 item 8: accessSeq is persisted as a decimal STRING
+  // specifically so a value beyond 2^53 (the largest integer a JSON
+  // double can represent exactly) survives a write/read round trip with
+  // no precision loss -- a bare JSON number would silently round such a
+  // value to the nearest representable double. Hand-plants a fully
+  // valid, self-consistent generation whose accessSeq field is set to a
+  // quint64 value comfortably past 2^53, then constructs a fresh
+  // AssetCache (a real restart) and reads it back via
+  // accessSequenceForTesting(), asserting the EXACT value survives.
+  constexpr quint64 kAbove2Pow53 = 9007199254741101ULL; // 2^53 + 109
+  const QUrl url(
+      QStringLiteral("https://example.com/huge-access-sequence.png"));
+  const QString key = AssetCache::cacheKeyFor(url);
+  const QByteArray bytes = QByteArrayLiteral("huge-sequence-payload");
+  const QString sha256Hex = QString::fromLatin1(
+      QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+  const QString payloadPath =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, sha256Hex);
+  const QString metadataPath =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, sha256Hex);
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
+
+  {
+    QFile payload(payloadPath);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(bytes);
+  }
+
+  QJsonObject obj;
+  obj[QStringLiteral("formatVersion")] = 1;
+  obj[QStringLiteral("key")] = key;
+  obj[QStringLiteral("contentType")] = QStringLiteral("image/png");
+  obj[QStringLiteral("encodedSize")] = bytes.size();
+  obj[QStringLiteral("width")] = 1;
+  obj[QStringLiteral("height")] = 1;
+  obj[QStringLiteral("sha256")] = sha256Hex;
+  obj[QStringLiteral("etag")] = QString();
+  obj[QStringLiteral("lastModified")] = QString();
+  obj[QStringLiteral("insertedAtMs")] = QDateTime::currentMSecsSinceEpoch();
+  obj[QStringLiteral("lastAccessMs")] = QDateTime::currentMSecsSinceEpoch();
+  obj[QStringLiteral("accessSeq")] = QString::number(kAbove2Pow53);
+
+  {
+    QFile metadata(metadataPath);
+    QVERIFY(metadata.open(QIODevice::WriteOnly));
+    metadata.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+  }
+
+  QJsonObject manifestObj;
+  manifestObj[QStringLiteral("formatVersion")] = 1;
+  manifestObj[QStringLiteral("key")] = key;
+  manifestObj[QStringLiteral("generation")] = sha256Hex;
+  {
+    QFile manifest(manifestPath);
+    QVERIFY(manifest.open(QIODevice::WriteOnly));
+    manifest.write(QJsonDocument(manifestObj).toJson(QJsonDocument::Compact));
+  }
+
+  AssetCache cache(configFor(m_tempDirPath));
+
+  // Read the persisted value BEFORE any lookup: accessSequenceForTesting()
+  // is a pure read with no touch/bump side effect, but lookupDisk()
+  // deliberately mints and persists a FRESH sequence on every real hit
+  // (see its "Refresh on-disk lastAccess" comment) -- calling it first
+  // would overwrite the exact value this test needs to verify survived
+  // the write/read round trip with zero precision loss.
+  const std::optional<quint64> readSeq = cache.accessSequenceForTesting(key);
+  QVERIFY(readSeq.has_value());
+  QCOMPARE(*readSeq, kAbove2Pow53);
+
+  const auto hit = cache.lookupDisk(key);
+  QVERIFY(hit.has_value());
+  QCOMPARE(hit->encodedBytes, bytes);
+
+  // The real disk hit above already minted a fresh sequence strictly
+  // past the recovered maximum -- never silently starting back over
+  // from a small default because the on-disk value could not be
+  // represented.
+  const std::optional<quint64> afterHit = cache.accessSequenceForTesting(key);
+  QVERIFY(afterHit.has_value());
+  QVERIFY(*afterHit > kAbove2Pow53);
+}
+
+void AssetCacheTests::
+    rootReplacedAfterConstructionPermanentlyDisablesDiskIoForBothTargets() {
+  // Review round-3 item 9 (HIGH): a constructor-only symlink check plus
+  // absolute paths is insufficient -- the cache root can be renamed
+  // away and a NEW filesystem object (a plain directory, here) created
+  // at the exact same path strictly AFTER construction. The retained
+  // root directory descriptor (O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC) plus
+  // its captured (device, inode) pair, re-verified via
+  // verifyRootAnchorLocked() at the top of every disk-touching method,
+  // must detect this and permanently disable disk I/O for this
+  // instance -- rather than silently continuing to operate against
+  // whatever object the path now resolves to (splitting/leaking into
+  // the replacement) or reopening the ORIGINAL (renamed-away) directory
+  // by path (which could just as easily have been deleted entirely).
+  const QString cacheRoot = m_tempDirPath + QStringLiteral("/cache-root");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("cache-root")));
+
+  AssetCache cache(configFor(cacheRoot));
+  const QString existingKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/pre-replacement.png")));
+  cache.store(existingKey,
+              makeEntry(QByteArrayLiteral("pre-replacement-bytes")));
+  QVERIFY(cache.lookupDisk(existingKey).has_value());
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  // Rename the ORIGINAL root away (still containing the entry just
+  // stored above), then create a brand-new, empty directory at the
+  // EXACT original path -- simulating a root replacement/mount-swap
+  // race that happens after this AssetCache instance is already alive.
+  const QString renamedAwayRoot =
+      m_tempDirPath + QStringLiteral("/cache-root-renamed-away");
+  QVERIFY(QDir().rename(cacheRoot, renamedAwayRoot));
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("cache-root")));
+  const QString replacementSentinel =
+      cacheRoot + QStringLiteral("/replacement-sentinel.txt");
+  {
+    QFile file(replacementSentinel);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("attacker-or-race-controlled"));
+  }
+
+  // Any further disk-touching call must detect the mismatch and
+  // permanently disable disk I/O -- proven here via a fresh store()
+  // for a brand-new key, not merely a re-lookup of the old one.
+  const QString newKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/post-replacement.png")));
+  cache.store(newKey, makeEntry(QByteArrayLiteral("post-replacement-bytes")));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+  // The memory cache is unaffected: the new entry is still observable
+  // in-process even though nothing was persisted for it.
+  QVERIFY(cache.lookupMemory(newKey).has_value());
+
+  // The REPLACEMENT directory at the original path must remain
+  // completely untouched: no cache files written into it at all, only
+  // the sentinel this test itself planted.
+  QDir replacementListing(cacheRoot);
+  QCOMPARE(replacementListing.entryList(QDir::Files),
+           QStringList{"replacement-sentinel.txt"});
+  {
+    QFile file(replacementSentinel);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("attacker-or-race-controlled"));
+  }
+
+  // The ORIGINAL (renamed-away) directory must also remain untouched --
+  // still holding exactly the entry stored before the replacement, with
+  // no attempt made to write, delete, or otherwise reopen it by path.
+  AssetCache::Config renamedConfig = configFor(renamedAwayRoot);
+  AssetCache freshCacheOverOriginal(renamedConfig);
+  QVERIFY(freshCacheOverOriginal.lookupDisk(existingKey).has_value());
+  QCOMPARE(freshCacheOverOriginal.lookupDisk(existingKey)->encodedBytes,
+           QByteArrayLiteral("pre-replacement-bytes"));
+}
+
 void AssetCacheTests::strayFileNotMatchingKeyShapeIsRemoved() {
   const QString strayPath =
       m_tempDirPath + QStringLiteral("/not-a-valid-key.tmp");
