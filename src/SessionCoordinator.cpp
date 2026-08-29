@@ -758,10 +758,10 @@ void SessionCoordinator::saveFreshlyObtainedToken(quint64 generation,
 }
 
 // A restored/freshly-authenticated token that cannot be trusted -- rejected
-// by the server (AuthOutcome::Unauthorized) or, since PR #17, found by
-// ITokenStore to be bound to a different endpoint, pre-envelope legacy, or
-// structurally malformed (TokenStoreOutcome::BindingMismatch /
-// LegacyUnbound / Malformed) -- must be durably deleted before the
+// by the server (AuthOutcome::Unauthorized) or found by ITokenStore to be
+// bound to a different endpoint, pre-envelope legacy, or structurally
+// malformed (TokenStoreOutcome::BindingMismatch / LegacyUnbound /
+// Malformed) -- must be durably deleted before the
 // coordinator is allowed to claim signed out. Defined as a reusable,
 // generation-guarded step (rather than an inline lambda) so a deletion
 // failure can install a retry action that re-invokes exactly this same

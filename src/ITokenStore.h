@@ -72,8 +72,8 @@ struct TokenStoreResult {
 // Injectable, asynchronous secure token store keyed by canonical
 // ServerProfile::profileId().
 //
-// Since PR #17, every stored token is wrapped in a durable, versioned,
-// endpoint-bound envelope (see TokenEnvelope.h): saveToken() records not
+// Every stored token is wrapped in a durable, versioned, endpoint-bound
+// envelope (see TokenEnvelope.h): saveToken() records not
 // just the token but the canonical credential-endpoint identity (see
 // ServerProfile::credentialEndpointIdentity()) it was saved for, and
 // readToken() requires the caller to state the endpoint identity it
