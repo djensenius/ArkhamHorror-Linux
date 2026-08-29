@@ -2,11 +2,13 @@
 
 #include "AssetAvifDecoder.h"
 
+#include <QAuthenticator>
 #include <QBuffer>
 #include <QCryptographicHash>
 #include <QImageReader>
 #include <QMetaObject>
 #include <QNetworkAccessManager>
+#include <QNetworkProxy>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
@@ -15,7 +17,6 @@
 #include <QVariant>
 #include <QtAssert>
 #include <cstring>
-#include <stdexcept>
 #include <utility>
 
 using namespace Qt::StringLiterals;
@@ -107,11 +108,12 @@ std::optional<AssetFormat> sniffMagicBytes(const QByteArray &bytes) {
 // actually present in the supplied bytes, distinct from (and run before
 // trusting) Qt's own decode.
 //
-// Trailing-data policy: once a genuine EOI marker is found, the scan
-// stops and reports success immediately -- any bytes that might follow
-// EOI (e.g. padding, or another concatenated stream) are deliberately
-// not inspected. Only bytes that never reach a genuine EOI at all (a
-// truncated response) are rejected here.
+// Trailing-data policy (review item 6, documented strict policy): a
+// genuine EOI marker must be found AND must be the last thing in the
+// buffer -- any byte following it (padding, a second concatenated JPEG
+// stream, or anything else) is rejected. This is deliberately stricter
+// than "an EOI exists somewhere"; a concatenated/trailer-appended body
+// is never treated as a single complete, trusted codestream.
 //
 // This does not replace normal magic-byte or QImageReader
 // validation -- a body that fails this check is prevented from ever
@@ -145,7 +147,10 @@ bool jpegCodestreamHasGenuineEoi(const QByteArray &bytes) {
     const unsigned char marker = data[pos];
     ++pos;
     if (marker == 0xD9) {
-      return true; // genuine EOI actually present in the supplied bytes
+      // Genuine EOI found: strict policy requires it to be the very
+      // last byte of the supplied body (see the trailing-data policy
+      // comment above).
+      return pos == size;
     }
     if (marker == 0x00) {
       return false; // a stuffed byte can only appear inside scan data
@@ -286,6 +291,75 @@ void applyCommonRequestSettings(QNetworkRequest &request) {
 
 } // namespace
 
+AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>
+AssetNetworkFetcher::create(Limits limits, std::chrono::milliseconds timeout,
+                            QObject *parent) {
+  if (std::optional<AssetError> error =
+          validateConfiguration(limits, timeout)) {
+    return AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>(
+        std::move(*error));
+  }
+  return AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>(
+      std::make_unique<AssetNetworkFetcher>(limits, timeout, parent));
+}
+
+AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>
+AssetNetworkFetcher::create(QNetworkAccessManager &nam, Limits limits,
+                            std::chrono::milliseconds timeout,
+                            QObject *parent) {
+  if (std::optional<AssetError> error =
+          validateConfiguration(limits, timeout)) {
+    return AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>(
+        std::move(*error));
+  }
+  return AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>(
+      std::make_unique<AssetNetworkFetcher>(nam, limits, timeout, parent));
+}
+
+std::optional<AssetError>
+AssetNetworkFetcher::validateConfiguration(const Limits &limits,
+                                           std::chrono::milliseconds timeout) {
+  // Review item 7: timeout must be strictly positive and bounded -- a
+  // zero/negative value is rejected rather than being (as before)
+  // silently reinterpreted as "disable the timeout entirely", and an
+  // absurdly large value is rejected rather than risking overflow when
+  // eventually handed to QTimer::start() (whose interval is ultimately a
+  // plain `int` millisecond count).
+  if (timeout <= std::chrono::milliseconds::zero() ||
+      timeout > kMaxAllowedTimeout) {
+    return AssetError{
+        AssetErrorCode::InvalidConfiguration,
+        QStringLiteral("asset fetcher timeout must be positive and at "
+                       "most %1 ms")
+            .arg(kMaxAllowedTimeout.count())};
+  }
+  if (limits.maxEncodedBytes <= 0 ||
+      limits.maxEncodedBytes > kMaxAllowedEncodedBytes) {
+    return AssetError{
+        AssetErrorCode::InvalidConfiguration,
+        QStringLiteral("asset fetcher maxEncodedBytes must be positive and "
+                       "at most %1 bytes")
+            .arg(kMaxAllowedEncodedBytes)};
+  }
+  if (limits.maxDimensionPixels <= 0 ||
+      limits.maxDimensionPixels > kMaxAllowedDimensionPixels) {
+    return AssetError{
+        AssetErrorCode::InvalidConfiguration,
+        QStringLiteral("asset fetcher maxDimensionPixels must be positive "
+                       "and at most %1")
+            .arg(kMaxAllowedDimensionPixels)};
+  }
+  if (limits.maxTotalPixels <= 0 ||
+      limits.maxTotalPixels > kMaxAllowedTotalPixels) {
+    return AssetError{
+        AssetErrorCode::InvalidConfiguration,
+        QStringLiteral("asset fetcher maxTotalPixels must be positive and "
+                       "at most %1")
+            .arg(kMaxAllowedTotalPixels)};
+  }
+  return std::nullopt;
+}
+
 AssetNetworkFetcher::AssetNetworkFetcher(Limits limits,
                                          std::chrono::milliseconds timeout,
                                          QObject *parent)
@@ -304,14 +378,29 @@ AssetNetworkFetcher::AssetNetworkFetcher(
     std::chrono::milliseconds timeout, QObject *parent)
     : QObject(parent), m_ownedNam(std::move(ownedNam)),
       m_nam(m_ownedNam ? *m_ownedNam : *borrowedNam), m_limits(limits),
-      m_timeout(timeout) {
-  if (timeout < std::chrono::milliseconds::zero()) {
-    throw std::invalid_argument("asset fetcher timeout cannot be negative");
-  }
-  if (limits.maxEncodedBytes <= 0 || limits.maxDimensionPixels <= 0 ||
-      limits.maxTotalPixels <= 0) {
-    throw std::invalid_argument("asset fetcher limits must be positive");
-  }
+      m_timeout(timeout),
+      m_configurationError(validateConfiguration(limits, timeout)) {
+  // Review item 5: this fetcher's QNetworkAccessManager must never send a
+  // system/application-configured proxy's credentials, even though it is
+  // otherwise a normal QNetworkAccessManager instance that would
+  // otherwise inherit
+  // QNetworkProxyFactory's/QNetworkProxy::applicationProxy()'s process-wide
+  // default. Explicitly forcing NoProxy here means every request always goes
+  // directly to the origin server named by its URL, regardless of what the
+  // embedding process/environment has configured.
+  m_nam.setProxy(QNetworkProxy::NoProxy);
+  // Defence in depth: even with NoProxy explicitly set above, connect a
+  // handler that never populates the QAuthenticator, so that even in a
+  // hypothetical future where this manager's proxy is reconfigured, no
+  // Proxy-Authorization credential value can ever be attached by this
+  // class -- the request instead fails naturally with
+  // QNetworkReply::ProxyAuthenticationRequiredError, reported as a typed
+  // AssetErrorCode::Transport error via the normal
+  // `!statusAttr.isValid()` branch in handleFinished().
+  connect(&m_nam, &QNetworkAccessManager::proxyAuthenticationRequired, this,
+          [](const QNetworkProxy &, QAuthenticator *) {
+            // Deliberately left blank: never supply credentials.
+          });
 }
 
 AssetNetworkFetcher::~AssetNetworkFetcher() {
@@ -331,6 +420,26 @@ AssetNetworkFetcher::FetchHandle
 AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
                            ConditionalHeaders conditional,
                            FetchCallback callback) {
+  // Review item 7: an invalid configuration (see validateConfiguration())
+  // fails every fetch() the exact same way UnsupportedScheme does below:
+  // queued, never synchronous, and without ever touching
+  // QNetworkAccessManager or inserting anything into m_pending (so
+  // cancel() on the returned invalid handle is correctly a safe no-op).
+  if (m_configurationError) {
+    QPointer<AssetNetworkFetcher> self(this);
+    QMetaObject::invokeMethod(
+        this,
+        [self, callback = std::move(callback),
+         error = *m_configurationError]() mutable {
+          if (self) {
+            std::move(callback)(
+                AssetOutcome<ConditionalFetchResult>(std::move(error)));
+          }
+        },
+        Qt::QueuedConnection);
+    return FetchHandle{};
+  }
+
   // Fail closed on any scheme other than http/https. This class is
   // documented (and, via AssetLocator's UrlValidator::validateCustomUrl()
   // gate, currently only ever invoked) as an HTTP(S)-only fetcher -- but
@@ -591,10 +700,20 @@ void AssetNetworkFetcher::handleFinished(quint64 handle) {
     return;
   }
 
-  if (status < 200 || status >= 300) {
+  // Review item 4: a response body is only ever accepted as a successful
+  // fetched asset for EXACTLY status 200. Every other status in the
+  // 2xx/1xx/5xx range not already special-cased above (201/202/203/204/
+  // 206/1xx/5xx and anything else) is rejected as UnexpectedStatus rather
+  // than silently treated as success -- in particular, 206 Partial
+  // Content must never be decoded/cached as if it were the complete
+  // representation, and 204 No Content must never be treated as a valid
+  // (empty) image.
+  if (status != 200) {
     emitResult(AssetError{
         AssetErrorCode::UnexpectedStatus,
-        QStringLiteral("server responded with unexpected HTTP status %1")
+        QStringLiteral("server responded with unexpected HTTP status %1; "
+                       "only exactly 200 (or 304 for a conditional "
+                       "request) is accepted")
             .arg(status)});
     return;
   }

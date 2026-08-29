@@ -92,6 +92,27 @@ public:
           maxTotalPixels(32'000'000) {}
   };
 
+  // Review item 7: the sanity ceiling `maxEncodedBytes` (and every
+  // derived "+1 over-read" computation in handleReadyRead()/
+  // handleFinished()) must stay validated below, so that arithmetic on it
+  // can never overflow qint64 and the value always fits comfortably
+  // within QByteArray's/qsizetype's real capacity on every platform this
+  // project targets (32-bit qsizetype builds included). 1 GiB is already
+  // far larger than any plausible single card-art asset.
+  static constexpr qint64 kMaxAllowedEncodedBytes = 1LL * 1024 * 1024 * 1024;
+  // A configured dimension/pixel cap above this is nonsensical for card
+  // art and would itself risk overflow in downstream 32-bit-sized pixel
+  // buffers (QImage's own row-stride arithmetic); bounded here rather
+  // than trusted from configuration.
+  static constexpr int kMaxAllowedDimensionPixels = 65536;
+  static constexpr qint64 kMaxAllowedTotalPixels = 4'000'000'000LL;
+  // QTimer ultimately stores its interval as a plain `int` millisecond
+  // count; bounding the configured timeout here (well under INT_MAX,
+  // ~24.8 days) keeps `timer->start(m_timeout)` overflow-free on every
+  // platform without ever silently truncating a caller's requested value.
+  static constexpr std::chrono::milliseconds kMaxAllowedTimeout{24LL * 60 * 60 *
+                                                                1000};
+
   struct FetchHandle {
     quint64 id{0};
     [[nodiscard]] bool isValid() const noexcept { return id != 0; }
@@ -142,12 +163,44 @@ public:
 
   static constexpr std::chrono::seconds kDefaultTimeout{30};
 
+  // Review item 7: preferred construction path for any real (non-test)
+  // caller -- validates `limits`/`timeout` BEFORE any QObject/
+  // QNetworkAccessManager is ever created, returning a typed
+  // AssetErrorCode::InvalidConfiguration instead of throwing. Composition
+  // code that wires this fetcher into the running application (outside
+  // this PR's scope; see the class comment) must surface this typed
+  // error rather than let an exception propagate out of startup.
+  [[nodiscard]] static AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>
+  create(Limits limits = {},
+         std::chrono::milliseconds timeout = kDefaultTimeout,
+         QObject *parent = nullptr);
+  // Test/composition factory: borrows an externally-owned, isolated
+  // QNetworkAccessManager (e.g. one pointed at a loopback test server).
+  [[nodiscard]] static AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>
+  create(QNetworkAccessManager &nam, Limits limits = {},
+         std::chrono::milliseconds timeout = kDefaultTimeout,
+         QObject *parent = nullptr);
+
   // Production constructor: owns a dedicated QNetworkAccessManager.
+  //
+  // Review item 7: an invalid `limits`/`timeout` no longer throws.
+  // Instead, this object is still fully constructed but enters a
+  // permanently-failed configuration state (see isValid()/
+  // configurationError()): every fetch() call on it completes
+  // asynchronously with AssetErrorCode::InvalidConfiguration, and no
+  // QNetworkAccessManager request is ever issued. Prefer create() over
+  // this constructor directly wherever the caller can act on a typed
+  // error before ever calling fetch() at all; this constructor exists
+  // (fail-closed rather than throwing) so existing call sites that
+  // always pass valid, statically-known-good configuration are never
+  // forced to handle a factory result they know can never be an error.
   explicit AssetNetworkFetcher(
       Limits limits = {}, std::chrono::milliseconds timeout = kDefaultTimeout,
       QObject *parent = nullptr);
   // Test constructor: borrows an externally-owned, isolated
   // QNetworkAccessManager (e.g. one pointed at a loopback test server).
+  // See the production constructor's comment above for the same
+  // fail-closed-not-throwing configuration-validation behaviour.
   explicit AssetNetworkFetcher(
       QNetworkAccessManager &nam, Limits limits = {},
       std::chrono::milliseconds timeout = kDefaultTimeout,
@@ -155,6 +208,19 @@ public:
   ~AssetNetworkFetcher() override;
 
   [[nodiscard]] const Limits &limits() const { return m_limits; }
+
+  // Review item 7: true iff the configuration passed to the constructor
+  // was valid. False on a fetcher constructed with invalid
+  // limits/timeout: every fetch() call still completes asynchronously
+  // (never synchronously), always with AssetErrorCode::InvalidConfiguration,
+  // and never touches QNetworkAccessManager.
+  [[nodiscard]] bool isValid() const noexcept {
+    return !m_configurationError.has_value();
+  }
+  // Precondition: !isValid(). The exact typed reason construction failed.
+  [[nodiscard]] const AssetError &configurationError() const {
+    return *m_configurationError;
+  }
 
   // Issues a GET for `url`, validating the response against `expectedFormat`
   // as described in the class comment. `conditional` may be empty for a
@@ -217,6 +283,16 @@ private:
                       QNetworkAccessManager *borrowedNam, Limits limits,
                       std::chrono::milliseconds timeout, QObject *parent);
 
+  // Review item 7: returns the typed configuration error for
+  // `limits`/`timeout` if invalid, or std::nullopt if both are within the
+  // bounds documented on kMaxAllowedEncodedBytes/kMaxAllowedDimensionPixels/
+  // kMaxAllowedTotalPixels/kMaxAllowedTimeout above. A zero or negative
+  // timeout is rejected outright -- it is never silently reinterpreted as
+  // "disable the timeout".
+  [[nodiscard]] static std::optional<AssetError>
+  validateConfiguration(const Limits &limits,
+                        std::chrono::milliseconds timeout);
+
   void completeWithError(quint64 handle, AssetError error);
   void handleReadyRead(quint64 handle);
   void handleFinished(quint64 handle);
@@ -227,6 +303,9 @@ private:
   std::chrono::milliseconds m_timeout;
   quint64 m_nextHandle{1};
   QHash<quint64, Pending> m_pending;
+  // Review item 7: set iff the constructor's limits/timeout failed
+  // validateConfiguration(); see isValid()/configurationError() above.
+  std::optional<AssetError> m_configurationError;
 };
 
 } // namespace Arkham

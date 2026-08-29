@@ -7,6 +7,7 @@
 #include <QImage>
 #include <QImageReader>
 #include <QNetworkAccessManager>
+#include <QNetworkProxy>
 #include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QTest>
@@ -108,6 +109,85 @@ QByteArray encodeAvifFixture(int width, int height) {
   if (writeResult != AVIF_RESULT_OK) {
     qFatal("encodeAvifFixture() failed to encode: %s",
            avifResultToString(writeResult));
+  }
+
+  QByteArray bytes(reinterpret_cast<const char *>(output.data),
+                   static_cast<int>(output.size));
+  avifRWDataFree(&output);
+  return bytes;
+}
+
+// Encodes a genuine, real (never-shipped) AVIF IMAGE SEQUENCE ("avis") of
+// exactly `frameCount` (>= 2) identical tiny frames via libavif's own
+// avifEncoderAddImage()/avifEncoderFinish() API -- used to prove (review
+// item 6) that decodeAvifImage() rejects a sequence/animation outright
+// via decoder->imageCount, never silently decoding only its first frame.
+QByteArray encodeAvifSequenceFixture(int frameCount) {
+  constexpr int kWidth = 4;
+  constexpr int kHeight = 4;
+  avifImage *image =
+      avifImageCreate(kWidth, kHeight, /*depth=*/8, AVIF_PIXEL_FORMAT_YUV420);
+  if (image == nullptr) {
+    qFatal("encodeAvifSequenceFixture() failed to allocate an avifImage");
+  }
+  avifRGBImage rgb;
+  avifRGBImageSetDefaults(&rgb, image);
+  rgb.format = AVIF_RGB_FORMAT_RGBA;
+  rgb.depth = 8;
+  (void)avifRGBImageAllocatePixels(&rgb);
+  if (rgb.pixels == nullptr) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifSequenceFixture() failed to allocate RGB pixels");
+  }
+  for (uint32_t row = 0; row < rgb.height; ++row) {
+    uint8_t *line = rgb.pixels + static_cast<size_t>(row) * rgb.rowBytes;
+    for (uint32_t col = 0; col < rgb.width; ++col) {
+      uint8_t *pixel = line + static_cast<size_t>(col) * 4;
+      pixel[0] = 0x10;
+      pixel[1] = 0x20;
+      pixel[2] = 0x30;
+      pixel[3] = 0xFF;
+    }
+  }
+  const avifResult toYuvResult = avifImageRGBToYUV(image, &rgb);
+  avifRGBImageFreePixels(&rgb);
+  if (toYuvResult != AVIF_RESULT_OK) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifSequenceFixture() failed to convert RGB to YUV: %s",
+           avifResultToString(toYuvResult));
+  }
+
+  avifEncoder *encoder = avifEncoderCreate();
+  if (encoder == nullptr) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifSequenceFixture() failed to allocate an avifEncoder");
+  }
+  encoder->speed = AVIF_SPEED_FASTEST;
+  encoder->timescale = 30;
+
+  avifResult addResult = AVIF_RESULT_OK;
+  for (int frame = 0; frame < frameCount; ++frame) {
+    const bool isLast = (frame == frameCount - 1);
+    addResult = avifEncoderAddImage(encoder, image, /*durationInTimescales=*/1,
+                                    isLast ? AVIF_ADD_IMAGE_FLAG_NONE
+                                           : AVIF_ADD_IMAGE_FLAG_NONE);
+    if (addResult != AVIF_RESULT_OK) {
+      break;
+    }
+  }
+  avifImageDestroy(image);
+  if (addResult != AVIF_RESULT_OK) {
+    avifEncoderDestroy(encoder);
+    qFatal("encodeAvifSequenceFixture() failed to add a frame: %s",
+           avifResultToString(addResult));
+  }
+
+  avifRWData output = AVIF_DATA_EMPTY;
+  const avifResult finishResult = avifEncoderFinish(encoder, &output);
+  avifEncoderDestroy(encoder);
+  if (finishResult != AVIF_RESULT_OK) {
+    qFatal("encodeAvifSequenceFixture() failed to finish: %s",
+           avifResultToString(finishResult));
   }
 
   QByteArray bytes(reinterpret_cast<const char *>(output.data),
@@ -306,11 +386,39 @@ void AssetNetworkFetcherTests::notFoundMapsToNotFoundError() {
   QCOMPARE(result->error().code, AssetErrorCode::NotFound);
 }
 
+void AssetNetworkFetcherTests::serverErrorMapsToUnexpectedStatus_data() {
+  QTest::addColumn<int>("status");
+  QTest::addColumn<bool>("withValidLookingImageBody");
+
+  // Review item 4: body success is accepted ONLY for exactly HTTP 200
+  // (304 is handled by the separate conditional-request tests below).
+  // Every other status here -- including the 2xx variants a naive
+  // "200 <= status < 300" range check would wrongly accept -- must be
+  // rejected as UnexpectedStatus, even when (206 in particular) the body
+  // looks like a perfectly valid, complete image: a partial-content
+  // response must never be decoded/cached as if it were the full
+  // representation.
+  QTest::newRow("500-internal-server-error") << 500 << false;
+  QTest::newRow("201-created") << 201 << false;
+  QTest::newRow("202-accepted") << 202 << false;
+  QTest::newRow("203-non-authoritative") << 203 << false;
+  QTest::newRow("204-no-content") << 204 << false;
+  QTest::newRow("206-partial-content-with-valid-looking-image-body")
+      << 206 << true;
+}
+
 void AssetNetworkFetcherTests::serverErrorMapsToUnexpectedStatus() {
+  QFETCH(int, status);
+  QFETCH(bool, withValidLookingImageBody);
+
   MockHttpServer server;
   MockHttpServer::Response response;
-  response.status = 500;
-  response.reasonPhrase = "Internal Server Error";
+  response.status = status;
+  response.reasonPhrase = "Test Status";
+  if (withValidLookingImageBody) {
+    response.contentType = "image/png";
+    response.body = encodeImage(4, 4, "PNG");
+  }
   server.setResponse(QStringLiteral("/broken.png"), response);
 
   QNetworkAccessManager nam;
@@ -686,6 +794,83 @@ void AssetNetworkFetcherTests::
   QCOMPARE((**result).asset->dimensions, QSize(48, 48));
 }
 
+void AssetNetworkFetcherTests::jpegTrailingDataAfterGenuineEoiIsRejected() {
+  // Review item 6/10: the strict trailing-data policy requires a genuine
+  // EOI marker to be the very LAST byte of the body -- anything after it
+  // (padding, or a second concatenated JPEG stream) is rejected, even
+  // though the body up to and including that EOI is itself perfectly
+  // complete and would decode fine on its own.
+  const bool jpegSupported =
+      QImageReader::supportedImageFormats().contains(
+          QByteArrayLiteral("jpeg")) ||
+      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
+  if (!jpegSupported) {
+    QSKIP("this Qt build has no JPEG decode plugin under either key");
+  }
+
+  const QByteArray validJpeg = encodeImage(16, 16, "JPG");
+  QVERIFY(validJpeg.size() > 2);
+  QVERIFY(static_cast<unsigned char>(validJpeg[validJpeg.size() - 2]) == 0xFF &&
+          static_cast<unsigned char>(validJpeg[validJpeg.size() - 1]) == 0xD9);
+
+  // Case 1: a second, fully valid, concatenated JPEG stream appended
+  // after the first's genuine EOI.
+  {
+    QByteArray concatenated = validJpeg + validJpeg;
+    MockHttpServer server;
+    MockHttpServer::Response response;
+    response.contentType = "image/jpeg";
+    response.body = concatenated;
+    server.setResponse(QStringLiteral("/concatenated.jpg"), response);
+
+    QNetworkAccessManager nam;
+    AssetNetworkFetcher fetcher(nam);
+    const auto result = fetchAndWait(
+        fetcher, server.baseUrlFor(QStringLiteral("/concatenated.jpg")),
+        AssetFormat::Jpeg);
+    QVERIFY(result.has_value());
+    QVERIFY(!bool(*result));
+    QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+  }
+
+  // Case 2: arbitrary trailing padding bytes (not even a valid marker)
+  // after the genuine EOI.
+  {
+    QByteArray padded = validJpeg + QByteArray("\x00\x00\x00\x00", 4);
+    MockHttpServer server;
+    MockHttpServer::Response response;
+    response.contentType = "image/jpeg";
+    response.body = padded;
+    server.setResponse(QStringLiteral("/padded.jpg"), response);
+
+    QNetworkAccessManager nam;
+    AssetNetworkFetcher fetcher(nam);
+    const auto result =
+        fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/padded.jpg")),
+                     AssetFormat::Jpeg);
+    QVERIFY(result.has_value());
+    QVERIFY(!bool(*result));
+    QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+  }
+
+  // Control: the unmodified, single, complete stream must still decode.
+  {
+    MockHttpServer server;
+    MockHttpServer::Response response;
+    response.contentType = "image/jpeg";
+    response.body = validJpeg;
+    server.setResponse(QStringLiteral("/valid.jpg"), response);
+
+    QNetworkAccessManager nam;
+    AssetNetworkFetcher fetcher(nam);
+    const auto result =
+        fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/valid.jpg")),
+                     AssetFormat::Jpeg);
+    QVERIFY(result.has_value());
+    QVERIFY2(bool(*result), qPrintable(result->error().message));
+  }
+}
+
 void AssetNetworkFetcherTests::avifRealFixtureAlwaysDecodesViaLibavif() {
   // Review item 4 (PR #18 cumulative review): AVIF decode is no longer
   // "environment adaptive" (dependent on whatever Qt image plugins a
@@ -711,6 +896,29 @@ void AssetNetworkFetcherTests::avifRealFixtureAlwaysDecodesViaLibavif() {
   QVERIFY2(bool(*result), qPrintable(result->error().message));
   QCOMPARE((**result).asset->dimensions, QSize(32, 24));
   QVERIFY(!(**result).asset->decodedImage.isNull());
+}
+
+void AssetNetworkFetcherTests::avifImageSequenceIsRejectedAsUnsupportedCodec() {
+  // Review item 6: a genuine, validly-encoded AVIF image SEQUENCE
+  // (decoder->imageCount > 1, i.e. an "avis"-brand animation) must be
+  // rejected outright rather than silently decoding only its first
+  // frame -- this project only ever serves/consumes a single still
+  // image per asset candidate.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  response.body = encodeAvifSequenceFixture(3);
+  server.setResponse(QStringLiteral("/sequence.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/sequence.avif")),
+                   AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
 }
 
 void AssetNetworkFetcherTests::
@@ -1167,4 +1375,136 @@ void AssetNetworkFetcherTests::destructionNeverInvokesStaleCallback() {
 
   QTest::qWait(300); // long enough that the slow drip would otherwise finish
   QVERIFY(!callbackFired);
+}
+
+void AssetNetworkFetcherTests::
+    applicationProxyWithCredentialsIsNeverUsedOrLeaked() {
+  // Review item 5: AssetNetworkFetcher's dedicated QNetworkAccessManager
+  // must explicitly force QNetworkProxy::NoProxy, so it can never
+  // inherit a process-wide application proxy (even one an embedding
+  // application configured with embedded credentials) -- every request
+  // must go directly to the origin named by its URL, and no
+  // Proxy-Authorization header may ever leave the process. Setting a
+  // deliberately unreachable bogus proxy host+port with credentials
+  // proves this two ways at once: if AssetNetworkFetcher ever tried to
+  // actually route through it, the request would fail/time out (nothing
+  // is listening there); direct success instead is only possible if the
+  // NoProxy override is genuinely in effect.
+  const QNetworkProxy previousApplicationProxy =
+      QNetworkProxy::applicationProxy();
+  QNetworkProxy bogusProxy(QNetworkProxy::HttpProxy,
+                           QStringLiteral("203.0.113.1"), 1, // TEST-NET-3,
+                           QStringLiteral("proxyuser"),      // never routable
+                           QStringLiteral("proxypass"));
+  QNetworkProxy::setApplicationProxy(bogusProxy);
+  struct ProxyRestoreGuard {
+    QNetworkProxy previous;
+    ~ProxyRestoreGuard() { QNetworkProxy::setApplicationProxy(previous); }
+  } restoreGuard{previousApplicationProxy};
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(4, 4, "PNG");
+  server.setResponse(QStringLiteral("/direct.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/direct.png")),
+                   AssetFormat::Png, {}, /*timeoutMs=*/5000);
+
+  QVERIFY2(result.has_value(),
+           "request never completed -- AssetNetworkFetcher appears to "
+           "have actually attempted to route through the unreachable "
+           "bogus application proxy instead of connecting directly");
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE(server.requestCount(QStringLiteral("/direct.png")), 1);
+  QVERIFY(!server.anyRequestEverHadHeader(
+      QByteArrayLiteral("proxy-authorization")));
+}
+
+void AssetNetworkFetcherTests::
+    invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing_data() {
+  QTest::addColumn<qint64>("maxEncodedBytes");
+  QTest::addColumn<int>("maxDimensionPixels");
+  QTest::addColumn<qint64>("maxTotalPixels");
+  QTest::addColumn<qint64>("timeoutMs");
+
+  const qint64 validEncodedBytes = 20LL * 1024 * 1024;
+  const int validDimension = 8192;
+  const qint64 validTotalPixels = 32'000'000;
+  const qint64 validTimeoutMs = 30'000;
+
+  QTest::newRow("zero-encoded-bytes")
+      << qint64(0) << validDimension << validTotalPixels << validTimeoutMs;
+  QTest::newRow("negative-encoded-bytes")
+      << qint64(-1) << validDimension << validTotalPixels << validTimeoutMs;
+  QTest::newRow("encoded-bytes-above-sane-cap")
+      << (AssetNetworkFetcher::kMaxAllowedEncodedBytes + 1) << validDimension
+      << validTotalPixels << validTimeoutMs;
+  QTest::newRow("zero-dimension")
+      << validEncodedBytes << 0 << validTotalPixels << validTimeoutMs;
+  QTest::newRow("negative-dimension")
+      << validEncodedBytes << -1 << validTotalPixels << validTimeoutMs;
+  QTest::newRow("zero-total-pixels")
+      << validEncodedBytes << validDimension << qint64(0) << validTimeoutMs;
+  QTest::newRow("zero-timeout-does-not-disable-it")
+      << validEncodedBytes << validDimension << validTotalPixels << qint64(0);
+  QTest::newRow("negative-timeout")
+      << validEncodedBytes << validDimension << validTotalPixels << qint64(-1);
+  QTest::newRow("timeout-above-sane-cap")
+      << validEncodedBytes << validDimension << validTotalPixels
+      << (AssetNetworkFetcher::kMaxAllowedTimeout.count() + 1);
+}
+
+void AssetNetworkFetcherTests::
+    invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing() {
+  QFETCH(qint64, maxEncodedBytes);
+  QFETCH(int, maxDimensionPixels);
+  QFETCH(qint64, maxTotalPixels);
+  QFETCH(qint64, timeoutMs);
+
+  AssetNetworkFetcher::Limits limits;
+  limits.maxEncodedBytes = maxEncodedBytes;
+  limits.maxDimensionPixels = maxDimensionPixels;
+  limits.maxTotalPixels = maxTotalPixels;
+  const std::chrono::milliseconds timeout(timeoutMs);
+
+  // create() must report the typed error rather than throw.
+  const auto factoryResult = AssetNetworkFetcher::create(limits, timeout);
+  QVERIFY(!factoryResult.has_value());
+  QCOMPARE(factoryResult.error().code, AssetErrorCode::InvalidConfiguration);
+
+  // The raw constructor must likewise never throw -- it must construct
+  // successfully into a permanently-invalid state instead.
+  AssetNetworkFetcher fetcher(limits, timeout);
+  QVERIFY(!fetcher.isValid());
+  QCOMPARE(fetcher.configurationError().code,
+           AssetErrorCode::InvalidConfiguration);
+
+  // Every fetch() on such a fetcher must fail the exact same way,
+  // asynchronously, without ever touching the network.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(4, 4, "PNG");
+  server.setResponse(QStringLiteral("/should-never-be-requested.png"),
+                     response);
+
+  const auto fetchResult = fetchAndWait(
+      fetcher,
+      server.baseUrlFor(QStringLiteral("/should-never-be-requested.png")),
+      AssetFormat::Png);
+  QVERIFY(fetchResult.has_value());
+  QVERIFY(!bool(*fetchResult));
+  QCOMPARE(fetchResult->error().code, AssetErrorCode::InvalidConfiguration);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/should-never-be-requested.png")), 0);
+}
+
+void AssetNetworkFetcherTests::validConfigurationFactorySucceeds() {
+  const auto result = AssetNetworkFetcher::create();
+  QVERIFY2(result.has_value(), qPrintable(result.error().message));
+  QVERIFY((*result)->isValid());
 }

@@ -27,6 +27,7 @@ private slots:
   void manualRedirectPolicyRejectsEvery3xx_data();
   void manualRedirectPolicyRejectsEvery3xx();
   void notFoundMapsToNotFoundError();
+  void serverErrorMapsToUnexpectedStatus_data();
   void serverErrorMapsToUnexpectedStatus();
   void incrementalByteCapAbortsBeforeFullBodyArrives();
   void finalDrainNeverExceedsByteCapForAFastNonIncrementalResponse();
@@ -40,7 +41,9 @@ private slots:
   void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected_data();
   void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected();
   void jpegWithStuffedFFBytesInScanDataStillDecodesWhenComplete();
+  void jpegTrailingDataAfterGenuineEoiIsRejected();
   void avifRealFixtureAlwaysDecodesViaLibavif();
+  void avifImageSequenceIsRejectedAsUnsupportedCodec();
   void avifMalformedContainerIsReportedAsMalformedImage();
   void avifDimensionBombIsRejectedBeforeAnyPixelDecodeOrAllocation();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
@@ -54,4 +57,9 @@ private slots:
   void cancelInvokesCallbackExactlyOnceWithCancelled();
   void timeoutFiresExactlyOnceAndCleansUpItsTimer();
   void destructionNeverInvokesStaleCallback();
+  void applicationProxyWithCredentialsIsNeverUsedOrLeaked();
+  void
+  invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing_data();
+  void invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing();
+  void validConfigurationFactorySucceeds();
 };

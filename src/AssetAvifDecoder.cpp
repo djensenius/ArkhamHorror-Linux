@@ -80,6 +80,28 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
                   .arg(QString::fromLatin1(avifResultToString(result)))});
   }
 
+  // Review item 6: this project only ever serves/decodes a SINGLE still
+  // AVIF image (the "avif" major/compatible brand, `imageCount == 1`).
+  // An animated/sequence AVIF ("avis", or a still-image container that
+  // nonetheless declares more than one coded image) is rejected outright
+  // -- decoding only its first frame and silently discarding the rest
+  // would misrepresent a multi-frame asset as if it were the single
+  // canonical image, which the CDN never actually serves for card art
+  // but a hostile/misconfigured server could still attempt to send.
+  // `imageCount` is authoritative only after avifDecoderParse() has
+  // already succeeded, so this check is placed strictly after it (and,
+  // like the dimension check just below, strictly before
+  // avifDecoderNextImage() ever decodes a single pixel).
+  if (decoder->imageCount != 1) {
+    avifDecoderDestroy(decoder);
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::UnsupportedCodec,
+        QStringLiteral("AVIF image sequences/animations (imageCount=%1) "
+                       "are not supported; only a single still image is "
+                       "accepted")
+            .arg(decoder->imageCount)});
+  }
+
   // avifDecoderParse() has populated decoder->image's container-declared
   // dimensions from metadata (an ISOBMFF `ispe` box) alone -- no AV1
   // payload has been decoded, and no full-resolution pixel buffer has been
