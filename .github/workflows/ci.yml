@@ -397,85 +397,62 @@ jobs:
           avif_name="$(basename "$avif_lib")"
           echo "Auditing the real bundled libavif closure (codec backends included)..."
           python3 packaging/audit_dependency_closure.py "$avif_lib_dir" --root "$avif_name"
-      - name: Verify every bundled codec library ships its required license notice
-        # Review round-3 item 17: linuxdeploy's automatic ldd-based
-        # bundling has no notion of license attribution, so nothing
-        # bundles libavif's (or its AV1 codec backend's) required
-        # BSD/Apache notice text alongside the .so files themselves --
-        # this repository's own build-appimage.sh does that explicitly
-        # via bundle_codec_notices() (already unit-tested in isolation
-        # above). This step is the end-to-end proof against the REAL
-        # produced AppImage: for every one of the known codec library
-        # name patterns bundle_codec_notices() recognizes, if a matching
-        # .so is actually present in the extracted AppImage, its notice
-        # directory must also be present under
-        # usr/share/doc/ArkhamHorror/third_party/<name>/ with non-empty
-        # content -- never assume a notice "must have" shipped via some
-        # Ubuntu package doc path, since an AppImage bundles libraries as
-        # bare .so files with no accompanying package metadata at all.
-        # libavif itself is asserted unconditionally (it is a mandatory
-        # dependency of every build).
+      - name: Verify every bundled ELF library ships its required license notice
+        # Review round-3 item 17 (initial version) / round-4 item 12 (this
+        # rewrite): linuxdeploy's automatic ldd-based bundling has no
+        # notion of license attribution at all, so nothing arranges for a
+        # bundled library's required notice text to ship alongside the
+        # bare .so files it copies -- and a small handwritten glob table
+        # (the prior version of this step) can only ever check the
+        # libraries its author happened to anticipate: round-4's own
+        # cumulative review found the real produced AppImage additionally
+        # bundling libjpeg and an entire family of libabsl_* (Abseil)
+        # libraries with zero notice coverage, entirely undetected by the
+        # old table.
+        #
+        # This step instead runs packaging/audit_codec_notices.py's
+        # verify-notices mode against the REAL, final, already-extracted
+        # AppImage (never the pre-packaging AppDir): it first recursively
+        # classifies EVERY bundled .so* file under the extracted usr/lib
+        # tree, hard-failing by exact path if even one cannot be resolved
+        # to either the small ABI allowlist (needs no notice) or a known
+        # third_party/<component>/ notice source -- so a brand-new,
+        # never-before-seen bundled library (the exact class of defect
+        # round-4 item 12 found) fails packaging here rather than
+        # silently shipping unattributed. It then checksum-verifies every
+        # checked-in third_party/<component>/* file is also present,
+        # non-empty, and byte-for-byte identical under
+        # usr/share/doc/ArkhamHorror/third_party/<component>/ in the
+        # extracted AppImage -- proving genuine bundled *content*, not
+        # merely a same-named file.
         run: |
           set -euo pipefail
           extracted="$(pwd)/squashfs-root"
+          # linuxdeploy's exact library placement (usr/lib vs. a per-arch
+          # subdirectory) is an implementation detail this must not
+          # hard-code -- matching every other closure-related step in
+          # this workflow, search the whole usr/ tree recursively rather
+          # than assuming one fixed lib subdirectory.
+          lib_search_root="$extracted/usr"
+          [[ -d "$lib_search_root" ]] || {
+            echo "Expected extracted AppImage usr/ directory not found: $lib_search_root" >&2
+            exit 1
+          }
           doc_root="$extracted/usr/share/doc/ArkhamHorror/third_party"
 
-          declare -A codec_globs=(
-            ["libavif"]='libavif.so*'
-            ["dav1d"]='libdav1d.so*'
-            ["libaom"]='libaom.so*'
-            ["libgav1"]='libgav1.so*'
-            ["rav1e"]='librav1e.so*'
-            ["svt-av1"]='libSvtAv1*.so*'
-            ["libyuv"]='libyuv.so*'
-          )
+          sbom_path="$(pwd)/codec-notice-sbom.json"
+          python3 packaging/audit_codec_notices.py classify "$lib_search_root" \
+            --json-out "$sbom_path"
+          echo "Wrote machine-readable bundled-library SBOM to $sbom_path"
 
-          fail=0
-          for name in "${!codec_globs[@]}"; do
-            glob="${codec_globs[$name]}"
-            found="$(find "$extracted" -name "$glob" -print -quit)"
-            is_mandatory=0
-            [[ "$name" == "libavif" ]] && is_mandatory=1
-
-            if [[ -z "$found" && "$is_mandatory" -eq 0 ]]; then
-              echo "No bundled '$name' library found (glob '$glob') -- skipping its notice check."
-              continue
-            fi
-            if [[ -z "$found" && "$is_mandatory" -eq 1 ]]; then
-              echo "Mandatory codec library '$name' (glob '$glob') was not bundled." >&2
-              fail=1
-              continue
-            fi
-
-            echo "Found bundled '$name': $found -- verifying every checked-in notice file for it is present."
-            source_dir="third_party/$name"
-            if [[ ! -d "$source_dir" ]]; then
-              echo "No checked-in notice source directory at $source_dir for bundled '$name'" >&2
-              fail=1
-              continue
-            fi
-            # Assert every regular file this repository ships for $name
-            # (LICENSE, NOTICE.md, and libaom's PATENTS where present) --
-            # not just LICENSE -- is also bundled non-empty, so a
-            # regression that drops one of the extra required/legal-
-            # relevant files (while LICENSE alone still ships) cannot
-            # silently pass this check.
-            for source_file in "$source_dir"/*; do
-              [[ -f "$source_file" ]] || continue
-              file_name="$(basename "$source_file")"
-              bundled_path="$doc_root/$name/$file_name"
-              if [[ ! -s "$bundled_path" ]]; then
-                echo "Bundled '$name' is missing its required non-empty '$file_name' at $bundled_path" >&2
-                fail=1
-              fi
-            done
-          done
-
-          if [[ "$fail" -ne 0 ]]; then
-            echo "One or more bundled codec libraries are missing their required license notice." >&2
-            exit 1
-          fi
-          echo "Every bundled codec library's required license notice files are present."
+          python3 packaging/audit_codec_notices.py verify-notices \
+            "$lib_search_root" third_party "$doc_root"
+      - name: Upload bundled-library SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: codec-notice-sbom
+          path: codec-notice-sbom.json
+          if-no-files-found: error
       - name: Verify the bundled libavif decodes AVIF images with no host codec fallback
         # Complementary to the static closure audit above (mirroring the
         # libsecret dlopen() no-host-fallback proof further below): builds

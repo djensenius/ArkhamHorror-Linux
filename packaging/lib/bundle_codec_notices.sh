@@ -2,108 +2,96 @@
 #
 # bundle_codec_notices <bundled_lib_search_root> <third_party_root> <doc_dest_dir>
 #
-# Review round-3 item 17: libavif (mandatory, see CMakeLists.txt's
-# pkg_check_modules(LIBAVIF REQUIRED ...)) and whichever AV1 codec
-# backend(s) the system libavif package was actually built against
-# (typically dav1d and/or aom on Debian/Ubuntu, see libavif15's own
-# package dependencies) are ordinary linked (DT_NEEDED) libraries that
-# linuxdeploy's automatic ldd-based bundling follows and copies into the
-# AppImage on its own -- but linuxdeploy has no notion of *license*
-# attribution, so nothing previously arranged for their required
-# BSD/Apache notice texts to ship alongside them the way QtKeychain's
-# already do (see the "Package the third-party attribution files" step
-# in build-appimage.sh and third_party/qtkeychain/). Silently omitting
-# them is exactly the gap this closes: never assume a notice "must have"
-# shipped via some Ubuntu package doc path -- an AppImage bundles its
-# libraries as bare .so files with no accompanying package metadata at
-# all.
+# Review round-3 item 17 (initial version) / round-4 item 12 (this
+# rewrite): every ELF shared library linuxdeploy's automatic ldd-based
+# bundling copies into the AppDir -- libavif and whichever AV1 codec
+# backend(s) the system libavif package was built against, Qt's own
+# libraries, and (as review round-4 item 12's real cumulative-review
+# finding on the actual produced AppImage showed) libjpeg and an entire
+# family of libabsl_* (Abseil) libraries neither of which had ever been
+# anticipated by a small handwritten glob table -- needs a bundled
+# license/notice text, since linuxdeploy has no notion of license
+# attribution at all and an AppImage ships bare .so files with no
+# accompanying package metadata whatsoever.
 #
-# Recursively scans <bundled_lib_search_root> (e.g. the AppDir's "usr"
-# tree, after linuxdeploy has already run its automatic
-# dependency-following pass but *before* the final --output appimage
-# packaging step) for each known codec library's SONAME glob -- matching
-# CI's own extracted-AppImage verification steps, which likewise `find`
-# by filename rather than assuming one fixed lib subdirectory, since
-# linuxdeploy's exact placement (usr/lib vs. a per-arch subdirectory) is
-# an implementation detail this should not hard-code two different ways.
-# For every one actually found, copies every regular file present under
-# <third_party_root>/<name>/ (LICENSE, and PATENTS/NOTICE.md where
-# present) to <doc_dest_dir>/third_party/<name>/ -- mirroring the
-# existing third_party/qtkeychain/ layout so both attribution sources use
-# the same on-disk shape inside the shipped AppImage.
+# This used to work "forwards": a small fixed table of exactly seven
+# codec-library SONAME globs, each individually checked "if bundled, does
+# it have a notice?" -- which could never catch a library the table's
+# author simply never anticipated. It now works "backwards", delegating
+# to packaging/audit_codec_notices.py's `classify` mode: that script
+# recursively finds EVERY bundled `.so*` file under
+# <bundled_lib_search_root>, and requires each one to resolve to either
+# the small ABI allowlist (needs no notice) or one of its own
+# COMPONENT_PATTERNS entries -- failing loudly, by exact library path, if
+# even one bundled library cannot be classified at all. This function
+# only ever bundles notices for whichever DISTINCT set of components that
+# classification actually reports as present, so a brand-new
+# never-before-seen bundled library fails packaging here rather than
+# silently shipping unattributed (the "packaging fails on any unmapped
+# new SONAME" contract from review round-4 item 12).
 #
-# libavif itself is unconditionally required (the build cannot produce a
-# working binary without it, so its absence here would indicate a
-# packaging bug, not a legitimate "backend not used" case) -- every other
-# name in the table is genuinely optional, since which AV1 backend(s) the
-# system libavif package pulls in varies by distro/version. Returns
-# non-zero (WITHOUT bundling any notices at all -- every candidate is
-# validated before any file is copied, so a failure partway through
-# validation can never leave a partial some-but-not-all mix of notices on
-# disk) if libavif's own bundled library or its notice source directory
-# cannot be found, or if a recognized codec backend library is found
-# bundled but this repository has no corresponding notice source for it --
-# fail loudly here rather than silently ship an unattributed binary
-# dependency.
+# For every classified component, copies every regular file present under
+# <third_party_root>/<component>/ (LICENSE, and NOTICE.md/PATENTS/README
+# where present) to <doc_dest_dir>/third_party/<component>/ -- mirroring
+# the existing third_party/qtkeychain/ layout so every attribution source
+# uses the same on-disk shape inside the shipped AppImage. Every possible
+# validation failure (classification failure, a classified component with
+# no notice source directory or no notice files) happens strictly before
+# the first `install -Dm644` call, so a mid-list failure can never leave a
+# partial some-but-not-all mix of notices on disk.
 bundle_codec_notices() {
   local bundled_lib_search_root="$1"
   local third_party_root="$2"
   local doc_dest_dir="$3"
 
-  # name -> SONAME glob, one pair per line. libavif is listed first and is
-  # the only mandatory entry; the rest are optional AV1 codec backends
-  # libavif may or may not have been linked against. Keys are explicitly
-  # quoted: although GNU Bash treats an associative-array subscript as a
-  # plain string (never arithmetic) regardless of quoting, a hyphenated
-  # key like "svt-av1" is quoted anyway so intent is unambiguous and this
-  # never depends on that subtler-than-it-looks distinction from ordinary
-  # indexed-array subscripts (which ARE arithmetically evaluated).
-  local -a mandatory_names=(libavif)
-  local -a optional_names=(dav1d libaom libgav1 rav1e svt-av1 libyuv)
-  local -A globs=(
-    ["libavif"]='libavif.so*'
-    ["dav1d"]='libdav1d.so*'
-    ["libaom"]='libaom.so*'
-    ["libgav1"]='libgav1.so*'
-    ["rav1e"]='librav1e.so*'
-    ["svt-av1"]='libSvtAv1*.so*'
-    ["libyuv"]='libyuv.so*'
-  )
+  # BASH_SOURCE[0] inside a function defined in a sourced file always
+  # resolves to the file the function was *defined* in (this file, not
+  # whichever script happens to have sourced it) -- this is a documented
+  # bash property (see the shell's own manual: "the name of the file
+  # where the current function ... was defined"), verified deliberately
+  # here rather than assumed, so this never depends on the caller's own
+  # $0/directory layout. Avoids requiring callers to pass a fourth
+  # repo_root argument just to locate the sibling audit_codec_notices.py
+  # script.
+  local self_dir
+  self_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  local audit_script="$self_dir/../audit_codec_notices.py"
 
-  # Phase 1: work out which names actually need bundling, and VALIDATE
-  # every one of their notice sources up front, without copying a single
-  # file yet. This is what makes the "no partial bundling" guarantee
-  # above true: every possible validation failure below happens strictly
-  # before phase 2's first `install -Dm644` call, so a mid-list failure
-  # can never leave some names' notices copied and others missing.
+  local classify_output
+  if ! classify_output="$(python3 "$audit_script" \
+    classify "$bundled_lib_search_root" 2>&1)"; then
+    echo "bundle_codec_notices: audit_codec_notices.py classify failed:" >&2
+    echo "$classify_output" >&2
+    return 1
+  fi
+
+  # classify_output is "<component>\t<path>" lines, one per bundled
+  # library requiring a notice; reduce to the distinct component set.
   local -a names_to_bundle=()
-  local name
-  for name in "${mandatory_names[@]}"; do
-    local glob="${globs[$name]}"
-    local found
-    found="$(find "$bundled_lib_search_root" -name "$glob" -print -quit 2>/dev/null || true)"
-    if [[ -z "$found" ]]; then
-      echo "bundle_codec_notices: mandatory codec library '$name'" \
-        "(glob '$glob') was not found bundled under $bundled_lib_search_root." >&2
-      return 1
+  local component
+  while IFS=$'\t' read -r component _path; do
+    [[ -n "$component" ]] || continue
+    local already_listed=0
+    local existing
+    for existing in "${names_to_bundle[@]+"${names_to_bundle[@]}"}"; do
+      if [[ "$existing" == "$component" ]]; then
+        already_listed=1
+        break
+      fi
+    done
+    if [[ "$already_listed" -eq 0 ]]; then
+      names_to_bundle+=("$component")
     fi
-    names_to_bundle+=("$name")
-  done
-  for name in "${optional_names[@]}"; do
-    local glob="${globs[$name]}"
-    local found
-    found="$(find "$bundled_lib_search_root" -name "$glob" -print -quit 2>/dev/null || true)"
-    if [[ -n "$found" ]]; then
-      names_to_bundle+=("$name")
-    fi
-  done
+  done <<<"$classify_output"
 
-  local notice_src dest f
-  for name in "${names_to_bundle[@]}"; do
+  # Phase 1: validate every classified component's notice source exists
+  # and has at least one file, without copying anything yet.
+  local notice_src dest f name
+  for name in "${names_to_bundle[@]+"${names_to_bundle[@]}"}"; do
     notice_src="$third_party_root/$name"
     if [[ ! -d "$notice_src" ]]; then
       echo "bundle_codec_notices: no notice source at $notice_src for" \
-        "bundled codec library '$name'." >&2
+        "bundled component '$name'." >&2
       return 1
     fi
     local has_file=0
@@ -122,7 +110,7 @@ bundle_codec_notices() {
 
   # Phase 2: every candidate validated successfully -- now, and only
   # now, actually copy files.
-  for name in "${names_to_bundle[@]}"; do
+  for name in "${names_to_bundle[@]+"${names_to_bundle[@]}"}"; do
     notice_src="$third_party_root/$name"
     dest="$doc_dest_dir/third_party/$name"
     mkdir -p "$dest"
