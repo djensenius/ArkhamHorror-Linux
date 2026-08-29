@@ -218,7 +218,7 @@ bool safeRemoveDirectoryContentsAt(int dirFd) {
 }
 
 bool safeRemoveEntryAt(int parentFd, const char *name) {
-  struct stat st{};
+  struct stat st {};
   if (fstatat(parentFd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
     return errno == ENOENT; // already gone: nothing left to do
   }

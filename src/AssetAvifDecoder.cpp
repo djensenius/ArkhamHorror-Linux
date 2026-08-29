@@ -139,15 +139,30 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   // always constructible as a QImage::Format_RGBA8888 buffer.
   rgb.depth = 8;
   rgb.format = AVIF_RGB_FORMAT_RGBA;
-  rgb.maxThreads = 1;
+  // Deliberately NOT setting rgb.maxThreads here: that field does not
+  // exist on avifRGBImage in every libavif release this project must
+  // support (e.g. Ubuntu 22.04's packaged 0.9.3 predates it), so setting
+  // it would be a portability/build break on some targets. The
+  // resource-exhaustion bound that matters -- the actual AV1 decode via
+  // avifDecoderNextImage() above -- is already constrained by
+  // decoder->maxThreads = 1 near the top of this function, which has
+  // been present and stable across libavif versions for far longer; the
+  // YUV->RGB pixel-format conversion below is comparatively lightweight
+  // per-frame CPU work, not the primary threading/resource concern here.
 
-  result = avifRGBImageAllocatePixels(&rgb);
-  if (result != AVIF_RESULT_OK) {
+  // avifRGBImageAllocatePixels() returns void in some libavif releases
+  // this project must support (e.g. Ubuntu 22.04's packaged 0.9.3) and
+  // avifResult in later ones -- its return value (where present) is
+  // therefore deliberately never captured, for portability across both
+  // signatures. Failure is instead detected the one way that is valid
+  // under every version: a null `rgb.pixels` after the call (the
+  // documented behavior of both signatures on an allocation failure).
+  (void)avifRGBImageAllocatePixels(&rgb);
+  if (rgb.pixels == nullptr) {
     avifDecoderDestroy(decoder);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
-        QStringLiteral("failed to allocate the RGB conversion buffer: %1")
-            .arg(QString::fromLatin1(avifResultToString(result)))});
+        QStringLiteral("failed to allocate the RGB conversion buffer")});
   }
 
   result = avifImageYUVToRGB(decoder->image, &rgb);

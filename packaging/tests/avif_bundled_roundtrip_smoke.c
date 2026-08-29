@@ -47,7 +47,13 @@ int main(void) {
   avifRGBImage sourceRgb;
   avifRGBImageSetDefaults(&sourceRgb, source);
   sourceRgb.format = AVIF_RGB_FORMAT_RGBA;
-  if (avifRGBImageAllocatePixels(&sourceRgb) != AVIF_RESULT_OK) {
+  /* avifRGBImageAllocatePixels() returns void in some libavif releases
+   * (e.g. Ubuntu 22.04's packaged 0.9.3) and avifResult in later ones;
+   * its return value is therefore never captured here for portability
+   * across both signatures. A null `pixels` after the call is the one
+   * failure signal valid under every version. */
+  (void)avifRGBImageAllocatePixels(&sourceRgb);
+  if (sourceRgb.pixels == NULL) {
     fprintf(stderr, "avifRGBImageAllocatePixels() failed\n");
     avifImageDestroy(source);
     return 1;
@@ -129,7 +135,8 @@ int main(void) {
   avifRGBImage decodedRgb;
   avifRGBImageSetDefaults(&decodedRgb, decoder->image);
   decodedRgb.format = AVIF_RGB_FORMAT_RGBA;
-  if (avifRGBImageAllocatePixels(&decodedRgb) != AVIF_RESULT_OK) {
+  (void)avifRGBImageAllocatePixels(&decodedRgb);
+  if (decodedRgb.pixels == NULL) {
     fprintf(stderr, "avifRGBImageAllocatePixels() (decode side) failed\n");
     avifDecoderDestroy(decoder);
     return 1;

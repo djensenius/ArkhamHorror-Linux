@@ -15,7 +15,18 @@ description = "Install Qt development dependencies with Homebrew"
 # asset is not acceptable. libavif is therefore a REQUIRED build
 # dependency (see CMakeLists.txt's pkg_check_modules(LIBAVIF REQUIRED
 # ...)), installed here via Homebrew alongside the Qt packages.
-run = "brew install clang-format qtbase qtdeclarative qtshadertools qtsvg qtwebsockets libavif pkg-config"
+#
+# llvm@18 (rather than the plain, ever-rolling-latest "clang-format"
+# formula) is installed specifically for its bundled clang-format: CI's
+# format job installs clang-format via `apt-get install clang-format` on
+# ubuntu-latest, which currently resolves to LLVM 18.x, and clang-format
+# has changed brace-init spacing rules for `Type var{};` locals between
+# major versions (verified: LLVM 18.1.x and 23.x disagree on this exact
+# construct). Pinning locally to the same major version CI actually uses
+# keeps `mise run format:check` meaningful here instead of silently
+# drifting out of sync with the one clang-format invocation that actually
+# gates merges.
+run = "brew install llvm@18 qtbase qtdeclarative qtshadertools qtsvg qtwebsockets libavif pkg-config"
 
 [tasks.configure]
 description = "Configure the Qt build"
@@ -41,7 +52,15 @@ run = "ctest --test-dir \"$BUILD_DIR\" --output-on-failure"
 [tasks."format:check"]
 description = "Check C++ and QML formatting"
 run = '''
-clang-format --dry-run --Werror src/*.cpp src/*.h tests/*.cpp
+# Prefer the llvm@18-pinned clang-format installed by setup:macos, so
+# this check agrees with CI's clang-format (currently 18.x via apt on
+# ubuntu-latest) rather than whatever newer major version Homebrew's
+# plain "clang-format" formula happens to track; fall back to whatever
+# "clang-format" is on PATH (e.g. Linux CI itself, or a macOS setup that
+# hasn't run setup:macos) if the pinned binary isn't present.
+CLANG_FORMAT="$(brew --prefix llvm@18 2>/dev/null)/bin/clang-format"
+[ -x "$CLANG_FORMAT" ] || CLANG_FORMAT="clang-format"
+"$CLANG_FORMAT" --dry-run --Werror src/*.cpp src/*.h tests/*.cpp
 for file in qml/*.qml; do
   formatted="$(mktemp)"
   qmlformat "$file" > "$formatted"

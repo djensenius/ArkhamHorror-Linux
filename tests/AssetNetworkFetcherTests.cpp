@@ -62,7 +62,13 @@ QByteArray encodeAvifFixture(int width, int height) {
   avifRGBImageSetDefaults(&rgb, image);
   rgb.format = AVIF_RGB_FORMAT_RGBA;
   rgb.depth = 8;
-  if (avifRGBImageAllocatePixels(&rgb) != AVIF_RESULT_OK) {
+  // avifRGBImageAllocatePixels() returns void in some libavif releases
+  // this project must support (e.g. Ubuntu 22.04's packaged 0.9.3) and
+  // avifResult in later ones -- its return value is therefore never
+  // captured, for portability across both signatures. A null `pixels`
+  // after the call is the one failure signal valid under every version.
+  (void)avifRGBImageAllocatePixels(&rgb);
+  if (rgb.pixels == nullptr) {
     avifImageDestroy(image);
     qFatal("encodeAvifFixture() failed to allocate RGB pixels");
   }
