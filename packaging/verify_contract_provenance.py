@@ -68,7 +68,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 DEFAULT_REMOTE = "https://github.com/djensenius/ArkhamHorror.git"
 
@@ -107,7 +107,6 @@ ROOT_EXTRA_FIXTURES: tuple[str, ...] = ("contracts/fixtures/capabilities.json",)
 _SCANNED_DIRS: tuple[str, ...] = ("contracts/schemas", "contracts/fixtures")
 
 _EXPECTED_BLOB_MODE = "100644"
-_REF_RE = re.compile(r'"\$ref"\s*:\s*"([^"]+)"')
 
 
 def _repo_root() -> Path:
@@ -215,6 +214,26 @@ def _resolve_schema_ref(schema_path: str, ref: str) -> str | None:
     return normalized
 
 
+def _iter_ref_values(node: object) -> Iterator[str]:
+    """Recursively walks a *parsed* JSON Schema document and yields every
+    string value bound to an actual `"$ref"` object key at any nesting
+    depth. Unlike a text-level regex scan (which would match the four
+    characters `"$ref"` anywhere a schema author happened to write them --
+    for instance inside a `"description"` or `"examples"` string literal
+    describing `$ref` itself), this only ever considers a real JSON object
+    key, so it cannot produce a false-positive dependency from prose that
+    merely mentions the syntax."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                yield value
+            else:
+                yield from _iter_ref_values(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_ref_values(item)
+
+
 def compute_schema_closure(
     tree: GitTree, roots: Sequence[str]
 ) -> dict[str, bytes]:
@@ -255,8 +274,22 @@ def compute_schema_closure(
                 f"{path}: schema is not valid UTF-8 ({exc}); refusing to "
                 "scan it for $ref"
             ) from exc
-        for match in _REF_RE.finditer(text):
-            target = _resolve_schema_ref(path, match.group(1))
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            # A text-level regex scan for `"$ref"` would still "work" on
+            # unparsable JSON, but could then just as easily match that
+            # four-character sequence inside a string value the author
+            # never intended as a real reference (a description or
+            # example mentioning `$ref` syntax) -- or, on malformed JSON,
+            # match a `$ref` key that isn't even reachable at runtime.
+            # Parsing first and walking the real object graph via
+            # _iter_ref_values() below closes both gaps at once; a schema
+            # that isn't valid JSON at all is itself a hard failure, since
+            # this client cannot decode against it either.
+            raise RuntimeError(f"{path}: schema is not valid JSON ({exc})") from exc
+        for ref in _iter_ref_values(parsed):
+            target = _resolve_schema_ref(path, ref)
             if target is not None and target not in discovered:
                 pending.append(target)
     return discovered

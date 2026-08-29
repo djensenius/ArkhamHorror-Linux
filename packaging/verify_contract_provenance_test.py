@@ -128,6 +128,30 @@ class ClosureTests(unittest.TestCase):
         closure = vcp.compute_schema_closure(tree, ["contracts/schemas/catalog.schema.json"])
         self.assertEqual(list(closure), ["contracts/schemas/catalog.schema.json"])
 
+    def test_ref_substring_in_prose_is_not_a_dependency(self):
+        # A schema author writing prose that happens to contain the four
+        # characters "$ref" (e.g. documenting $ref syntax itself in a
+        # description/examples string) must NOT be treated as a real
+        # dependency: only an actual JSON object key literally named
+        # "$ref" may name one. A naive text-level regex scan for the
+        # substring '"$ref": "..."' would false-positive here and try to
+        # fetch a schema that was never really referenced.
+        blobs = _baseline_blobs()
+        blobs["contracts/schemas/catalog.schema.json"] = (
+            b'{"description": "See the \\"$ref\\": \\"missing.schema.json\\" '
+            b'syntax for details.", "$defs": {"x": {}}}'
+        )
+        tree = FakeTree(blobs)
+        closure = vcp.compute_schema_closure(tree, ["contracts/schemas/catalog.schema.json"])
+        self.assertEqual(list(closure), ["contracts/schemas/catalog.schema.json"])
+
+    def test_malformed_json_schema_rejected(self):
+        blobs = _baseline_blobs()
+        blobs["contracts/schemas/catalog.schema.json"] = b'{"$defs": {'
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
 
 class VerifyTests(unittest.TestCase):
     def setUp(self):
