@@ -48,7 +48,17 @@ _VALID_SIDES = {"front", "back", "alternate_front", "resolved_front", "mutated_f
 
 
 def _escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    # Escape backslashes and quotes first (order matters: backslash must
+    # be escaped before the sequences that introduce a backslash for the
+    # other control characters below), then the common C++ string-literal
+    # control-character escapes. Without this, a pinned JSON value that
+    # ever contains a newline/tab/carriage-return -- even by accident --
+    # would silently produce an invalid (or line-broken) C++ string
+    # literal in the generated header.
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("\n", "\\n").replace("\r", "\\r")
+    escaped = escaped.replace("\t", "\\t")
+    return escaped
 
 
 def render_header(source_bytes: bytes, data: dict) -> str:

@@ -24,6 +24,7 @@ private slots:
   void cleanup();
 
   void coalescesConcurrentIdenticalRequests();
+  void keysDifferingOnlyByHostileLocaleContentNeverCoalesce();
   void cancellingOneConsumerNeverAffectsAnother();
   void lastConsumerCancellationAbortsUnderlyingFetch();
   void advancesToNextCandidateOnlyOnNotFound();

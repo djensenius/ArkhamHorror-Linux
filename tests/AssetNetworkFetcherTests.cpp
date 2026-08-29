@@ -393,6 +393,44 @@ void AssetNetworkFetcherTests::conditionalRequestAcceptsMatchingNotModified() {
   QVERIFY(!(**result).asset.has_value());
 }
 
+void AssetNetworkFetcherTests::
+    conditionalRequestWithLastModifiedAcceptsMatchingNotModified() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(16, 16, "png");
+  response.lastModifiedForConditionalMatch = "Wed, 21 Oct 2015 07:28:00 GMT";
+  server.setResponse(QStringLiteral("/conditional-lm.png"), response);
+
+  AssetNetworkFetcher::ConditionalHeaders conditional;
+  conditional.lastModified = QStringLiteral("Wed, 21 Oct 2015 07:28:00 GMT");
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/conditional-lm.png")),
+      AssetFormat::Png, conditional);
+
+  QVERIFY(result.has_value());
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QVERIFY((**result).notModified);
+  QVERIFY(!(**result).asset.has_value());
+
+  // A DIFFERENT If-Modified-Since value must NOT be treated as a match
+  // (this is the exact behavior MockHttpServer previously got wrong: it
+  // only checked header *presence*, not an exact value match).
+  AssetNetworkFetcher::ConditionalHeaders mismatched;
+  mismatched.lastModified = QStringLiteral("Thu, 01 Jan 1970 00:00:00 GMT");
+  const auto mismatchedResult = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/conditional-lm.png")),
+      AssetFormat::Png, mismatched);
+  QVERIFY(mismatchedResult.has_value());
+  QVERIFY2(bool(*mismatchedResult),
+           qPrintable(mismatchedResult->error().message));
+  QVERIFY(!(**mismatchedResult).notModified);
+  QVERIFY((**mismatchedResult).asset.has_value());
+}
+
 void AssetNetworkFetcherTests::unconditional304IsRejectedAsTypedError() {
   MockHttpServer server;
   MockHttpServer::Response response;

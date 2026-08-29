@@ -31,6 +31,7 @@ private slots:
   void avifCodecSupportIsEnvironmentAdaptive();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void conditionalRequestAcceptsMatchingNotModified();
+  void conditionalRequestWithLastModifiedAcceptsMatchingNotModified();
   void unconditional304IsRejectedAsTypedError();
   void cancelInvokesCallbackExactlyOnceWithCancelled();
   void timeoutFiresExactlyOnceAndCleansUpItsTimer();

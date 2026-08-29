@@ -99,6 +99,88 @@ void AssetRequestCoordinatorTests::coalescesConcurrentIdenticalRequests() {
   QCOMPARE((**resultA).encodedBytes, (**resultB).encodedBytes);
 }
 
+void AssetRequestCoordinatorTests::
+    keysDifferingOnlyByHostileLocaleContentNeverCoalesce() {
+  // Regression test for a HIGH-severity coalescing-key robustness finding:
+  // the operation key used to join fields (assetBase, category,
+  // identifier, side, locale, format) with a plain separator character.
+  // `identifier` is validated by AssetLocator's grammar (so it can never
+  // itself contain the separator) and `assetBase` is percent-encoded
+  // before joining, but `locale` is caller-supplied free text with NO
+  // such validation -- so, unlike every other field, it alone could carry
+  // a raw separator character. With every OTHER field's width/content
+  // pinned by validation as it is today, that alone does not yet produce
+  // a *reachable* full-string collision (this exact input, verified by
+  // hand, still distinguished the two operations even before the
+  // subsequent length-prefixing fix) -- but that safety is an accidental
+  // byproduct of unrelated invariants living in AssetLocator/AssetTypes,
+  // not a property of canonicalOperationKey() itself, and would silently
+  // break the moment any of those invariants changed (a looser identifier
+  // grammar, or AssetCategory/AssetSide/AssetFormat growing to 10+
+  // values). The fix makes injectivity unconditional (length-prefixed
+  // fields) instead of relying on that coupling, and this test pins down
+  // the actual observable contract that must never regress regardless of
+  // how the encoding is implemented: two AssetKey values that are NOT
+  // operator==-equal (locale differs, here via hostile content) must
+  // never be merged into the same in-flight operation. This holds
+  // regardless of whether the two locale values happen to resolve to the
+  // same candidate URLs (neither "de" nor a hostile variant of it maps to
+  // a supported localized variant here, so both fall back to the same
+  // English candidate) -- operation-key identity is deliberately
+  // independent of resolved-URL identity (see the class doc comment on
+  // canonicalOperationKey()).
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  response.slowDrip = true; // both requests must overlap in flight
+  response.chunkSize = 32;
+  response.chunkDelayMs = 20;
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  AssetKey keyA =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  keyA.locale = QStringLiteral("de");
+
+  AssetKey keyB = keyA;
+  // Embeds the historical separator character plus digits chosen to look
+  // like a plausible (but different) trailing field, exercising exactly
+  // the collision shape the finding describes.
+  keyB.locale = QStringLiteral("de\x1f2");
+
+  QVERIFY(!(keyA == keyB));
+
+  int completions = 0;
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  coordinator.request(keyA, [&](Result r) {
+    ++completions;
+    resultA = std::move(r);
+  });
+  coordinator.request(keyB, [&](Result r) {
+    ++completions;
+    resultB = std::move(r);
+  });
+
+  // The real assertion: two AssetKeys that differ (only in locale, via
+  // hostile content) must occupy two SEPARATE in-flight operations, never
+  // one merged operation.
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 2);
+
+  QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
+  QVERIFY(resultA.has_value());
+  QVERIFY(resultB.has_value());
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+}
+
 void AssetRequestCoordinatorTests::cancellingOneConsumerNeverAffectsAnother() {
   MockHttpServer server;
   MockHttpServer::Response response;

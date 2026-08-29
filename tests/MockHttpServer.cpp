@@ -132,20 +132,25 @@ void MockHttpServer::writeResponse(
     QTcpSocket *socket, const QString &path, const Response &response,
     const QHash<QByteArray, QByteArray> &requestHeaders) {
   // Conditional-match check: an exact If-None-Match match against the
-  // configured ETag, or (if no ETag is configured) any If-Modified-Since
-  // presence when a lastModifiedForConditionalMatch is configured,
-  // answers with a bodyless 304 instead of the full response.
+  // configured ETag, or an exact If-Modified-Since match against the
+  // configured lastModifiedForConditionalMatch, answers with a bodyless
+  // 304 instead of the full response.
   const bool etagMatches =
       !response.etagForConditionalMatch.isEmpty() &&
       requestHeaders.value("if-none-match") == response.etagForConditionalMatch;
   const bool lastModifiedMatches =
       !response.lastModifiedForConditionalMatch.isEmpty() &&
-      requestHeaders.contains("if-modified-since");
+      requestHeaders.value("if-modified-since") ==
+          response.lastModifiedForConditionalMatch;
 
   if (etagMatches || lastModifiedMatches) {
     QByteArray out = "HTTP/1.1 304 Not Modified\r\n";
     if (!response.etagForConditionalMatch.isEmpty()) {
       out += "ETag: " + response.etagForConditionalMatch + "\r\n";
+    }
+    if (!response.lastModifiedForConditionalMatch.isEmpty()) {
+      out +=
+          "Last-Modified: " + response.lastModifiedForConditionalMatch + "\r\n";
     }
     out += "Content-Length: 0\r\n";
     out += "Connection: close\r\n\r\n";

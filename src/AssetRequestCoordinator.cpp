@@ -15,12 +15,26 @@ namespace {
 // requests coalesce if and only if every field compares equal -- this is
 // deliberately simpler than (and independent of) AssetCache::cacheKeyFor(),
 // which hashes a resolved *candidate* URL rather than the logical request.
+//
+// Each field is length-prefixed ("<charCount>:<field>") rather than
+// joined with a plain separator character: `identifier` passes through
+// AssetLocator's strict grammar, but `locale` is NOT similarly validated,
+// so a delimiter-based join could let a locale value containing the
+// delimiter make two genuinely different AssetKey values collide onto
+// the same operation key. Length-prefixing makes the concatenation
+// injective regardless of what characters any field contains, since each
+// field's exact length is known before its content is read.
+QString lengthPrefixed(const QString &field) {
+  return QString::number(field.size()) + u':' + field;
+}
+
 QString canonicalOperationKey(const AssetKey &key) {
-  static const QChar sep = u'\x1f';
-  return key.assetBase.toString(QUrl::FullyEncoded) + sep +
-         QString::number(static_cast<int>(key.category)) + sep +
-         key.identifier + sep + QString::number(static_cast<int>(key.side)) +
-         sep + key.locale + sep + QString::number(static_cast<int>(key.format));
+  return lengthPrefixed(key.assetBase.toString(QUrl::FullyEncoded)) +
+         lengthPrefixed(QString::number(static_cast<int>(key.category))) +
+         lengthPrefixed(key.identifier) +
+         lengthPrefixed(QString::number(static_cast<int>(key.side))) +
+         lengthPrefixed(key.locale) +
+         lengthPrefixed(QString::number(static_cast<int>(key.format)));
 }
 
 AssetCache::CachedEntry
@@ -326,7 +340,14 @@ void AssetRequestCoordinator::dispatchToConsumers(
         this,
         [self, callback = std::move(consumer.callback), result]() mutable {
           if (self) {
-            std::move(callback)(result);
+            // `result` is this lambda's own private capture (a per-
+            // consumer copy of the shared outcome, made because there
+            // may be multiple consumers to fan out to) -- once we are
+            // inside this specific lambda invocation, nothing else still
+            // needs it, so move it into the callback rather than paying
+            // for another deep copy of a potentially large CachedEntry
+            // (encoded bytes plus a decoded QImage).
+            std::move(callback)(std::move(result));
           }
         },
         Qt::QueuedConnection);

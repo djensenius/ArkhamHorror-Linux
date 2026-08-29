@@ -41,10 +41,11 @@ public:
     // automatically and must not be duplicated here.
     QList<QPair<QByteArray, QByteArray>> extraHeaders;
 
-    // If set, a request whose If-None-Match exactly matches this value
-    // (or, if empty, whose If-Modified-Since is set at all when
-    // ifModifiedSinceMatch is non-empty) is answered with a bodyless 304
-    // instead of this full response.
+    // If set, a request whose If-None-Match exactly matches
+    // etagForConditionalMatch, OR whose If-Modified-Since exactly matches
+    // lastModifiedForConditionalMatch, is answered with a bodyless 304
+    // (echoing whichever configured validator(s) are non-empty) instead
+    // of this full response.
     QByteArray etagForConditionalMatch;
     QByteArray lastModifiedForConditionalMatch;
 
