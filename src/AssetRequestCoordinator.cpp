@@ -326,10 +326,17 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         // "Stale-if-error": ANY revalidation failure (a 404 because the
         // origin removed this exact candidate, a transport error, a
         // timeout, an integrity/codec failure, cancellation racing a
-        // teardown, etc.) serves the still-valid stale cached entry
-        // as-is rather than surfacing an error or advancing candidates --
-        // a briefly-unreachable or since-changed origin can never make
-        // previously cached, already-displayed art disappear.
+        // teardown, etc.) attempts to serve the still-valid stale cached
+        // entry rather than surfacing the *revalidation's* error or
+        // advancing candidates -- a briefly-unreachable or since-changed
+        // origin can never make previously cached, already-displayed art
+        // disappear. This is "as-is" only in the sense that the cached
+        // payload bytes are never re-fetched or rewritten; ensureDecoded()
+        // below can still surface its own typed error (e.g. the on-disk
+        // bytes no longer decode because the installed codec plugins
+        // changed, or the payload was corrupted) instead of a decoded
+        // image -- that is a genuine, independent failure of the cached
+        // entry itself, not a failure of this revalidation attempt.
         if (!result) {
           self->completeOperation(
               operationId, self->ensureDecoded(stale, operation.key.format,

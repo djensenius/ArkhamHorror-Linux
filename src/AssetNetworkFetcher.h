@@ -66,8 +66,8 @@ namespace Arkham {
 // Every async callback is guarded by a QPointer and an exact per-request
 // handle so a reply belonging to an old, cancelled, or superseded request
 // can never invoke a callback after this object (or the specific pending
-// request) is gone -- see FetchNetworkAccessManager::fetch()'s
-// implementation comment for the exact mechanism.
+// request) is gone -- see AssetNetworkFetcher::fetch()'s implementation
+// comment for the exact mechanism.
 class AssetNetworkFetcher final : public QObject {
   Q_OBJECT
 public:
