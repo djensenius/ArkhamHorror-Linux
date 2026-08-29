@@ -500,22 +500,28 @@ QJsonObject GameListRow::toJson() const {
 
   // id/gameState/multiplayerVariant are documented as always populated
   // together with Kind::Success, but they are public std::optional fields
-  // with no constructor enforcing that invariant. Assert it explicitly so a
-  // GameListRow assembled by hand with a field left unset fails loudly here
-  // instead of dereferencing an empty optional (UB) below.
+  // with no constructor enforcing that invariant. Q_ASSERT alone is not
+  // enough: it compiles out entirely in release (NDEBUG) builds, which
+  // would leave a bare dereference of an empty optional below -- undefined
+  // behavior. Keep the assert for a loud, early failure in debug/test
+  // builds, but also branch on has_value() so a release build that somehow
+  // hits the invalid state degrades to a JSON null for the offending
+  // field(s) instead of crashing.
   Q_ASSERT(id.has_value());
   Q_ASSERT(gameState.has_value());
   Q_ASSERT(multiplayerVariant.has_value());
 
   QJsonObject obj;
-  obj.insert(QStringLiteral("id"), id->toJson());
+  obj.insert(QStringLiteral("id"),
+             id ? id->toJson() : QJsonValue(QJsonValue::Null));
   obj.insert(QStringLiteral("scenario"), scenario
                                              ? QJsonValue(scenario->toJson())
                                              : QJsonValue(QJsonValue::Null));
   obj.insert(QStringLiteral("campaign"), campaign
                                              ? QJsonValue(campaign->toJson())
                                              : QJsonValue(QJsonValue::Null));
-  obj.insert(QStringLiteral("gameState"), gameState->toJson());
+  obj.insert(QStringLiteral("gameState"),
+             gameState ? gameState->toJson() : QJsonValue(QJsonValue::Null));
   obj.insert(QStringLiteral("name"), name);
   QJsonArray investigatorsArr;
   for (const auto &investigator : investigators)
@@ -525,9 +531,11 @@ QJsonObject GameListRow::toJson() const {
   for (const auto &investigator : otherInvestigators)
     otherArr.append(investigator.toJson());
   obj.insert(QStringLiteral("otherInvestigators"), otherArr);
-  obj.insert(
-      QStringLiteral("multiplayerVariant"),
-      Json::encodeClosedEnum(*multiplayerVariant, kMultiplayerVariantTable));
+  obj.insert(QStringLiteral("multiplayerVariant"),
+             multiplayerVariant
+                 ? QJsonValue(Json::encodeClosedEnum(*multiplayerVariant,
+                                                     kMultiplayerVariantTable))
+                 : QJsonValue(QJsonValue::Null));
   obj.insert(QStringLiteral("hasOpenSeats"), hasOpenSeats);
   return obj;
 }

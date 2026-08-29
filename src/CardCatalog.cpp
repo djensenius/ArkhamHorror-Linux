@@ -300,12 +300,21 @@ ValueOrError<SkillIcon> SkillIcon::fromJson(const QJsonValue &v,
 
 QJsonObject SkillIcon::toJson() const {
   switch (tag) {
-  case SkillIconTag::SkillIcon:
+  case SkillIconTag::SkillIcon: {
+    // skill is documented as always populated when tag == SkillIcon, but
+    // it is a public std::optional field with no constructor enforcing
+    // that invariant. Q_ASSERT compiles out in release builds, so also
+    // branch on has_value(): a release build that somehow hits the
+    // invalid state degrades to a JSON null payload instead of
+    // dereferencing an empty optional (UB).
+    Q_ASSERT(skill.has_value());
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("SkillIcon")},
         {QStringLiteral("contents"),
-         Json::encodeClosedEnum(*skill, kSkillTypeTable)},
+         skill ? QJsonValue(Json::encodeClosedEnum(*skill, kSkillTypeTable))
+               : QJsonValue(QJsonValue::Null)},
     };
+  }
   case SkillIconTag::WildIcon:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("WildIcon")}};
   case SkillIconTag::WildMinusIcon:
