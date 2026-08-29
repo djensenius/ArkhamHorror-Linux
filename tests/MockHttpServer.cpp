@@ -251,6 +251,24 @@ void MockHttpServer::writeSlowDrip(QTcpSocket *socket, const QString &path,
               m_lastSlowDripBytesWritten[path] = offset;
               return;
             }
+            // Copilot review: QTcpSocket::write() only reports bytes
+            // QUEUED into Qt's internal write buffer, not bytes actually
+            // handed to the OS/transmitted on the wire -- without an
+            // explicit flush() here, lastBytesWrittenForSlowDrip() could
+            // over-report progress relative to what a peer has actually
+            // received, making "aborted before full body arrived"-style
+            // assertions timing-dependent rather than a reliable proof
+            // of incremental delivery. flush() returning false here
+            // means the socket could not actually send anything (e.g. it
+            // is already gone) -- treat that exactly like a write
+            // failure: stop dripping and do not count this slice as
+            // delivered.
+            if (!socket->flush()) {
+              timer->stop();
+              timer->deleteLater();
+              m_lastSlowDripBytesWritten[path] = offset;
+              return;
+            }
             offset += written;
             m_lastSlowDripBytesWritten[path] = offset;
           });
