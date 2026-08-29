@@ -62,11 +62,35 @@ namespace Arkham {
 //
 // Metadata (not filesystem atime, which many container/build
 // environments mount with atime updates disabled or coarsened) drives
-// LRU eviction: `lastAccessMsecsSinceEpoch` is refreshed on every disk
-// hit (rewritten via the same atomic metadata-write path) and consulted
-// by reapAndEnforceQuota(), which evicts oldest-access entries once disk
-// usage exceeds the 90% high-water mark, down to the 75% low-water mark.
-// Quota accounting always sums payload + metadata file sizes together.
+// LRU eviction. Review item 11: eviction order is primarily a per-process
+// MONOTONIC ACCESS SEQUENCE (`accessSeq` in the metadata JSON, recovered
+// at every construction -- including a real process restart -- as
+// (the maximum `accessSeq` found among all valid entries on disk) + 1,
+// so a fresh instance's counter always starts strictly after every value
+// any prior instance ever persisted for this same directory), not raw
+// wall-clock time: `lastAccessMsecsSinceEpoch` is still recorded
+// alongside it for diagnostics and as the tie-break should two entries
+// somehow carry an identical sequence (only possible for legacy entries
+// predating this field), with the cache key itself as the final,
+// fully-deterministic tie-break. Every successful access -- a disk hit
+// (lookupDisk()), a conditional-request touch (touchAfterNotModified()),
+// a fresh store(), AND a MEMORY-only hit (lookupMemory()) -- mints and
+// persists a fresh sequence value, so a key kept alive purely by
+// repeated in-process memory hits is never mistaken by
+// reapAndEnforceQuota() (which only ever consults on-disk metadata) for
+// a cold, rarely-used entry. The memory-hit and disk-hit recency bumps
+// are deliberately NOT fsync'd before their commit() (unlike every
+// crash-consistency-relevant write elsewhere in this class): losing the
+// very latest few bumps to a hard power-loss only ever affects eviction
+// ORDERING, a heuristic, never the integrity of any entry's actual
+// bytes. reapAndEnforceQuota() evicts oldest-access entries once disk
+// usage exceeds the 90% high-water mark, down to the 75% low-water
+// mark, and only ever counts an entry's bytes as freed once its files
+// were actually confirmed removed -- a deletion that fails (e.g. a
+// filesystem permission error) leaves that entry counted as still
+// occupying its space, rather than silently believing quota was
+// reclaimed when it wasn't. Quota accounting always sums payload +
+// metadata file sizes together.
 //
 // Symlink safety: a configured cache directory that is ALREADY a symlink
 // at construction time is rejected outright -- disk I/O is disabled for
@@ -130,12 +154,14 @@ public:
   // the same key independent of any live AssetCache instance.
   [[nodiscard]] static QString cacheKeyFor(const QUrl &resolvedCandidateUrl);
 
-  // Fast path: memory-only lookup. Does not touch disk or update
-  // lastAccess metadata on disk (a memory hit is not persisted as a
-  // separate disk access -- disk lastAccess is only meaningful for disk
-  // eviction, and a memory hit by definition did not need disk I/O).
-  [[nodiscard]] std::optional<CachedEntry>
-  lookupMemory(const QString &key) const;
+  // Fast path: memory-only lookup. Review item 11: on a hit, this ALSO
+  // refreshes `key`'s PERSISTED on-disk recency witness (monotonic
+  // access sequence + wall-clock timestamp), non-durably (see the class
+  // comment) -- a memory hit is a genuine access and must count for
+  // disk-eviction purposes, even though it needs no disk READ. A miss,
+  // or a key with no disk record at all yet, does nothing extra. No
+  // longer `const` because of this disk side effect.
+  [[nodiscard]] std::optional<CachedEntry> lookupMemory(const QString &key);
 
   // Disk lookup: validates the payload/metadata pair (deleting either or
   // both if corrupt/orphaned), promotes a valid hit into memory (UNLESS it
@@ -225,6 +251,14 @@ public:
   metadataPathForTesting(const QString &directory, const QString &key,
                          const QString &generation);
 
+  // Test-only exposure of review item 11's monotonic access-sequence
+  // witness for `key`'s current live generation (std::nullopt if `key`
+  // has no valid disk record right now), so tests can assert ordering/
+  // recovery directly rather than only inferring it indirectly through
+  // eviction side effects.
+  [[nodiscard]] std::optional<quint64>
+  accessSequenceForTesting(const QString &key) const;
+
 private:
   struct DiskMetadata {
     QString key;
@@ -237,6 +271,12 @@ private:
     QString lastModified;
     qint64 insertedAtMsecsSinceEpoch{0};
     qint64 lastAccessMsecsSinceEpoch{0};
+    // Review item 11: monotonic per-directory access sequence (see the
+    // class comment). Defaults to 0 for metadata written by a version of
+    // this class that predates this field -- readMetadata() below never
+    // trusts a bare 0 as "the earliest possible real access": ties are
+    // resolved by lastAccessMsecsSinceEpoch and then the cache key.
+    quint64 accessSequence{0};
   };
 
   [[nodiscard]] QString manifestPath(const QString &key) const;
@@ -244,8 +284,16 @@ private:
                                               const QString &generation) const;
   [[nodiscard]] QString generationMetadataPath(const QString &key,
                                                const QString &generation) const;
+  // `durable`: whether the write is fsync'd before its commit(). Every
+  // crash-consistency-relevant metadata write (the initial publish in
+  // store(), or an etag/lastModified refresh in touchAfterNotModified())
+  // passes true (the default). A pure recency-only bump with no other
+  // semantic change (lookupDisk()'s lastAccess/accessSeq refresh, and
+  // touchAccessRecencyLocked() below) passes false -- see the class
+  // comment for why that's safe.
   [[nodiscard]] bool writeMetadata(const QString &metadataFilePath,
-                                   const DiskMetadata &metadata) const;
+                                   const DiskMetadata &metadata,
+                                   bool durable = true) const;
   [[nodiscard]] std::optional<DiskMetadata>
   readMetadata(const QString &metadataFilePath,
                const QString &expectedKey) const;
@@ -268,14 +316,40 @@ private:
   // confirmed to have no valid entry at all (repair, invalidate(),
   // quota eviction); NEVER used mid-replacement in store(), which must
   // keep an old-but-still-live generation's files intact until its
-  // successor's manifest swap has actually committed.
-  void deleteEntry(const QString &key) const;
+  // successor's manifest swap has actually committed. Review item 11:
+  // returns true only if every matched file was actually removed (or
+  // was already gone) -- a caller doing quota accounting (
+  // reapAndEnforceQuota()) must never count an entry's bytes as freed
+  // when the underlying removal genuinely failed (e.g. a filesystem
+  // permission error).
+  [[nodiscard]] bool deleteEntry(const QString &key) const;
+
+  // Review item 11: mints the next value of this cache's per-process
+  // monotonic access-sequence counter. Callers must already hold
+  // m_mutex (the counter is not independently synchronized) -- see the
+  // class comment for the recovery/uniqueness argument.
+  [[nodiscard]] quint64 nextAccessSequenceLocked();
+  // Bumps `key`'s on-disk access recency (accessSequence +
+  // lastAccessMsecsSinceEpoch) in place, without touching its payload or
+  // the manifest at all, tolerating a missing/corrupt disk record as a
+  // silent no-op (real repair is lookupDisk()/reapAndEnforceQuota()'s
+  // job, not this purely-cosmetic bump's). Called for a memory hit
+  // (lookupMemory()) and a disk hit (lookupDisk()); callers must already
+  // hold m_mutex.
+  void touchAccessRecencyLocked(const QString &key);
 
   bool m_diskCacheDisabled{false};
   Config m_config;
   QString m_directory;
   mutable QMutex m_mutex;
   QCache<QString, CachedEntry> *m_memory;
+  // Review item 11: guarded by m_mutex; recovered in the constructor (via
+  // reapAndEnforceQuota()'s directory scan) and re-validated (monotonic,
+  // never decreasing) on every subsequent reapAndEnforceQuota() call, so
+  // a fresh AssetCache instance pointed at a directory a PRIOR instance
+  // already wrote to (a real process restart) never reissues a sequence
+  // value any earlier instance already persisted.
+  quint64 m_nextAccessSequence{1};
 };
 
 } // namespace Arkham

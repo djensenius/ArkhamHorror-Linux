@@ -332,16 +332,55 @@ QString AssetCache::metadataPathForTesting(const QString &directory,
 }
 
 std::optional<AssetCache::CachedEntry>
-AssetCache::lookupMemory(const QString &key) const {
+AssetCache::lookupMemory(const QString &key) {
   QMutexLocker locker(&m_mutex);
-  if (CachedEntry *entry = m_memory->object(key)) {
-    return *entry;
+  CachedEntry *entry = m_memory->object(key);
+  if (!entry) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  const CachedEntry hit = *entry;
+  // Review item 11: a memory hit is a genuine access and must be
+  // reflected in this key's PERSISTED disk recency, not just its
+  // in-memory presence -- see touchAccessRecencyLocked()'s comment and
+  // the class comment for the full rationale.
+  touchAccessRecencyLocked(key);
+  return hit;
+}
+
+quint64 AssetCache::nextAccessSequenceLocked() {
+  return m_nextAccessSequence++;
+}
+
+void AssetCache::touchAccessRecencyLocked(const QString &key) {
+  if (m_diskCacheDisabled || !isValidKey(key)) {
+    return;
+  }
+  const std::optional<QString> generation = readManifestGeneration(key);
+  if (!generation) {
+    return; // nothing on disk for this key right now -- nothing to bump
+  }
+  const QString metadataPath = generationMetadataPath(key, *generation);
+  const std::optional<DiskMetadata> metadata = readMetadata(metadataPath, key);
+  if (!metadata || metadata->sha256Hex != *generation) {
+    // A corrupt/self-inconsistent record here is a real-repair signal,
+    // but repairing it is lookupDisk()/reapAndEnforceQuota()'s job (both
+    // independently re-verify the payload itself before trusting
+    // anything) -- this purely-cosmetic recency bump must not delete a
+    // record it hasn't actually read/verified the PAYLOAD of.
+    return;
+  }
+  DiskMetadata refreshed = *metadata;
+  refreshed.lastAccessMsecsSinceEpoch = QDateTime::currentMSecsSinceEpoch();
+  refreshed.accessSequence = nextAccessSequenceLocked();
+  // Review item 11: `durable = false` -- see writeMetadata()'s
+  // declaration comment and the class comment for why a lost recency
+  // bump on crash only ever affects eviction ordering, never integrity.
+  (void)writeMetadata(metadataPath, refreshed, /*durable=*/false);
 }
 
 bool AssetCache::writeMetadata(const QString &metadataFilePath,
-                               const DiskMetadata &metadata) const {
+                               const DiskMetadata &metadata,
+                               bool durable) const {
   QJsonObject obj;
   obj[QStringLiteral("formatVersion")] = kMetadataFormatVersion;
   obj[QStringLiteral("key")] = metadata.key;
@@ -354,6 +393,13 @@ bool AssetCache::writeMetadata(const QString &metadataFilePath,
   obj[QStringLiteral("lastModified")] = metadata.lastModified;
   obj[QStringLiteral("insertedAtMs")] = metadata.insertedAtMsecsSinceEpoch;
   obj[QStringLiteral("lastAccessMs")] = metadata.lastAccessMsecsSinceEpoch;
+  // Review item 11: the monotonic access-sequence witness (see the class
+  // comment). Stored as a JSON number, exactly like every other integer
+  // field already in this object (encodedSize, the two *Ms fields) --
+  // all of them already accept the same double-precision representation
+  // limit, which this counter will not realistically approach.
+  obj[QStringLiteral("accessSeq")] =
+      static_cast<double>(metadata.accessSequence);
 
   QSaveFile file(metadataFilePath);
   if (!file.open(QIODevice::WriteOnly)) {
@@ -362,7 +408,13 @@ bool AssetCache::writeMetadata(const QString &metadataFilePath,
   file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
   // Review item 8: fsync the metadata content itself before the commit()
   // rename publishes it -- see fsyncSaveFileBeforeCommit()'s comment.
-  return fsyncSaveFileBeforeCommit(file) && file.commit();
+  // Review item 11: `durable` is false only for a pure recency-only bump
+  // with no other semantic change -- see writeMetadata()'s declaration
+  // comment for why skipping the fsync there is safe.
+  if (durable && !fsyncSaveFileBeforeCommit(file)) {
+    return false;
+  }
+  return file.commit();
 }
 
 bool AssetCache::writeManifest(const QString &key,
@@ -466,6 +518,8 @@ AssetCache::readMetadata(const QString &metadataFilePath,
       static_cast<qint64>(obj[QStringLiteral("insertedAtMs")].toDouble(0));
   metadata.lastAccessMsecsSinceEpoch =
       static_cast<qint64>(obj[QStringLiteral("lastAccessMs")].toDouble(0));
+  metadata.accessSequence =
+      static_cast<quint64>(obj[QStringLiteral("accessSeq")].toDouble(0));
   if (metadata.key != expectedKey || metadata.sha256Hex.isEmpty() ||
       metadata.encodedSize < 0) {
     return std::nullopt;
@@ -473,9 +527,9 @@ AssetCache::readMetadata(const QString &metadataFilePath,
   return metadata;
 }
 
-void AssetCache::deleteEntry(const QString &key) const {
+bool AssetCache::deleteEntry(const QString &key) const {
   if (m_diskCacheDisabled) {
-    return;
+    return true; // nothing to delete when disk I/O is disabled entirely
   }
   // Review item 8: `key` no longer maps to a fixed pair of filenames --
   // reclaim EVERY file this cache could ever have written for it (the
@@ -488,9 +542,19 @@ void AssetCache::deleteEntry(const QString &key) const {
   QDir dir(m_directory);
   const QStringList matches =
       dir.entryList(QStringList{key + QStringLiteral(".*")}, QDir::Files);
+  // Review item 11: report whether EVERY matched file was actually
+  // removed. QFile::remove() returning false (e.g. a permission error,
+  // or -- in tests -- a directory planted at the same path) means this
+  // key's disk footprint was NOT fully reclaimed; a caller doing quota
+  // accounting must not credit itself with bytes that are still
+  // genuinely occupied.
+  bool allRemoved = true;
   for (const QString &name : matches) {
-    QFile::remove(dir.filePath(name));
+    if (!QFile::remove(dir.filePath(name))) {
+      allRemoved = false;
+    }
   }
+  return allRemoved;
 }
 
 std::optional<AssetCache::CachedEntry>
@@ -523,7 +587,7 @@ AssetCache::lookupDisk(const QString &key) {
     // which generation, if any, is live). Reclaim anything left behind
     // for this key -- including any orphaned generation files -- rather
     // than leaking it until the next sweep.
-    deleteEntry(key);
+    (void)deleteEntry(key);
     return std::nullopt;
   }
 
@@ -532,7 +596,7 @@ AssetCache::lookupDisk(const QString &key) {
   if (!metadata || metadata->sha256Hex != *generation) {
     // Metadata missing/corrupt, or (defense in depth) it does not even
     // claim to be the generation its own filename says it is.
-    deleteEntry(key);
+    (void)deleteEntry(key);
     return std::nullopt;
   }
 
@@ -540,7 +604,7 @@ AssetCache::lookupDisk(const QString &key) {
   if (!payloadFile.open(QIODevice::ReadOnly)) {
     // Manifest+metadata present but this generation's payload missing:
     // corrupt/incomplete entry.
-    deleteEntry(key);
+    (void)deleteEntry(key);
     return std::nullopt;
   }
   const std::optional<QByteArray> verifiedBytes =
@@ -550,7 +614,7 @@ AssetCache::lookupDisk(const QString &key) {
     // Rejected on size alone before any content was read -- see
     // readVerifiedPayload()'s comment. Never trust a payload whose
     // declared or actual size can't possibly be valid.
-    deleteEntry(key);
+    (void)deleteEntry(key);
     return std::nullopt;
   }
   const QByteArray &bytes = *verifiedBytes;
@@ -562,7 +626,7 @@ AssetCache::lookupDisk(const QString &key) {
     // Payload does not match the metadata that vouches for it (or the
     // generation identifier its own filename claims): never trust a
     // mismatched pair, no matter which file is "actually" wrong.
-    deleteEntry(key);
+    (void)deleteEntry(key);
     return std::nullopt;
   }
 
@@ -583,10 +647,16 @@ AssetCache::lookupDisk(const QString &key) {
   // failure here only loses this one LRU-freshness update, never the
   // entry's validity: writeMetadata() is itself atomic (QSaveFile), so a
   // crash mid-write leaves the prior, still-fully-valid metadata
-  // untouched.
+  // untouched. Review item 11: also mints a fresh monotonic access
+  // sequence (the primary eviction-ordering key -- see the class
+  // comment), and this bump is deliberately non-durable
+  // (`durable=false`): losing it to a crash only affects eviction
+  // ordering, never this entry's integrity.
   DiskMetadata refreshed = *metadata;
   refreshed.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
-  (void)writeMetadata(generationMetadataPath(key, *generation), refreshed);
+  refreshed.accessSequence = nextAccessSequenceLocked();
+  (void)writeMetadata(generationMetadataPath(key, *generation), refreshed,
+                      /*durable=*/false);
 
   // Promote into memory ONLY when this entry needs no further
   // revalidation. AssetRequestCoordinator's memory-hit path (see
@@ -688,6 +758,10 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
           metadata.lastModified = entry.lastModified;
           metadata.insertedAtMsecsSinceEpoch = entry.insertedAtMsecsSinceEpoch;
           metadata.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
+          // Review item 11: a fresh store() is a genuine access too --
+          // mint a new monotonic sequence so this generation isn't
+          // mistaken for stale relative to whatever was live before it.
+          metadata.accessSequence = nextAccessSequenceLocked();
           if (writeMetadata(genMetadataPath, metadata)) {
             // Both of this generation's own files are now fully
             // written, fsync'd, and committed -- ATOMICALLY publish it
@@ -771,11 +845,15 @@ void AssetCache::touchAfterNotModified(const QString &key,
     // "already evicted." Clean up defensively for the same reason
     // lookupDisk() does; a subsequent lookup will simply miss and
     // refetch from scratch.
-    deleteEntry(key);
+    (void)deleteEntry(key);
     return;
   }
   DiskMetadata refreshed = *metadata;
   refreshed.lastAccessMsecsSinceEpoch = QDateTime::currentMSecsSinceEpoch();
+  // Review item 11: a successful conditional revalidation is a genuine
+  // access -- mint a fresh monotonic sequence exactly like a full
+  // disk/memory hit does.
+  refreshed.accessSequence = nextAccessSequenceLocked();
   if (!newEtag.isEmpty()) {
     refreshed.etag = newEtag;
   }
@@ -840,7 +918,7 @@ void AssetCache::invalidate(const QString &key) {
   }
   QMutexLocker locker(&m_mutex);
   m_memory->remove(key);
-  deleteEntry(key);
+  (void)deleteEntry(key);
 }
 
 void AssetCache::reapAndEnforceQuota() {
@@ -958,8 +1036,21 @@ void AssetCache::reapAndEnforceQuota() {
     QString key;
     qint64 totalBytes;
     qint64 lastAccessMs;
+    // Review item 11: the primary eviction-ordering key (see the class
+    // comment) -- monotonic and unique-at-write-time for any entry ever
+    // written by this fix, so lastAccessMs only ever matters as a
+    // tie-break for legacy (pre-this-fix) entries that still carry the
+    // default 0.
+    quint64 accessSequence;
   };
   std::vector<ValidEntry> valid;
+  // Review item 11: recovers this process's monotonic access-sequence
+  // counter from whatever the highest value any entry on disk already
+  // carries, so a fresh AssetCache instance (a real process restart)
+  // never reissues a sequence number an earlier instance already
+  // persisted. Accumulated across every valid entry found in this same
+  // sweep, below.
+  quint64 maxObservedAccessSequence = 0;
 
   for (const QString &key : allKeys) {
     const auto manifestIt = manifestGeneration.constFind(key);
@@ -967,7 +1058,7 @@ void AssetCache::reapAndEnforceQuota() {
       // No valid manifest names this key at all: nothing for it can be
       // trusted (see the class comment) -- reclaim every generation
       // file left behind for it.
-      deleteEntry(key);
+      (void)deleteEntry(key);
       continue;
     }
     const QString &generation = manifestIt.value();
@@ -978,7 +1069,7 @@ void AssetCache::reapAndEnforceQuota() {
     if (!payloadPresent || !metadataPresent) {
       // The manifest names a generation whose files are (partially or
       // wholly) missing -- corrupt/incomplete, never a half-valid hit.
-      deleteEntry(key);
+      (void)deleteEntry(key);
       continue;
     }
     const QString genPayloadPath = generationPayloadPath(key, generation);
@@ -996,14 +1087,14 @@ void AssetCache::reapAndEnforceQuota() {
     }
     if (!metadata || metadata->sha256Hex != generation || !payloadReadable ||
         !verifiedBytes) {
-      deleteEntry(key); // corrupt pair, or rejected on size alone
+      (void)deleteEntry(key); // corrupt pair, or rejected on size alone
       continue;
     }
     const QByteArray &bytes = *verifiedBytes;
     const QString actualSha256 = QString::fromLatin1(
         QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
     if (actualSha256 != generation || bytes.size() != metadata->encodedSize) {
-      deleteEntry(key); // corrupt pair
+      (void)deleteEntry(key); // corrupt pair
       continue;
     }
 
@@ -1026,10 +1117,22 @@ void AssetCache::reapAndEnforceQuota() {
     const qint64 manifestBytes = QFileInfo(manifestPath(key)).size();
     const qint64 payloadBytes = QFileInfo(genPayloadPath).size();
     const qint64 metadataBytes = QFileInfo(genMetadataPath).size();
-    valid.push_back(ValidEntry{key,
-                               manifestBytes + payloadBytes + metadataBytes,
-                               metadata->lastAccessMsecsSinceEpoch});
+    valid.push_back(ValidEntry{
+        key, manifestBytes + payloadBytes + metadataBytes,
+        metadata->lastAccessMsecsSinceEpoch, metadata->accessSequence});
+    maxObservedAccessSequence =
+        qMax(maxObservedAccessSequence, metadata->accessSequence);
   }
+
+  // Review item 11: never DECREASE the counter -- only ever advance it
+  // to strictly past the highest value observed on disk. If this
+  // process has already minted sequence values more recent than
+  // anything currently on disk (e.g. this sweep ran mid-process after
+  // recent memory-only touches whose disk bump is itself in this same
+  // batch and therefore already reflected above), m_nextAccessSequence
+  // must not regress.
+  m_nextAccessSequence =
+      qMax(m_nextAccessSequence, maxObservedAccessSequence + 1);
 
   qint64 totalBytes = 0;
   for (const ValidEntry &e : valid) {
@@ -1045,19 +1148,41 @@ void AssetCache::reapAndEnforceQuota() {
     return;
   }
 
-  // Oldest lastAccess first: evict until at or below the low-water mark.
+  // Oldest access first: evict until at or below the low-water mark.
+  // Review item 11: primary key is the monotonic access sequence, NOT
+  // raw wall-clock time -- two entries stored/touched within the same
+  // millisecond (routine on a fast machine, or in a fast test) are still
+  // deterministically ordered by which one was actually accessed first,
+  // never by whatever order QHash/QSet happened to iterate `allKeys` in.
+  // lastAccessMs and then the cache key itself are tie-breaks, reached
+  // only for legacy entries that share the default accessSequence of 0.
   std::sort(valid.begin(), valid.end(),
             [](const ValidEntry &a, const ValidEntry &b) {
-              return a.lastAccessMs < b.lastAccessMs;
+              if (a.accessSequence != b.accessSequence) {
+                return a.accessSequence < b.accessSequence;
+              }
+              if (a.lastAccessMs != b.lastAccessMs) {
+                return a.lastAccessMs < b.lastAccessMs;
+              }
+              return a.key < b.key;
             });
 
   for (const ValidEntry &e : valid) {
     if (totalBytes <= lowWaterMark) {
       break;
     }
-    deleteEntry(e.key);
-    m_memory->remove(e.key);
-    totalBytes -= e.totalBytes;
+    // Review item 11: only credit quota accounting with this entry's
+    // bytes as freed if its files were actually confirmed removed. A
+    // failed deletion (e.g. a permission error, or a hostile/corrupt
+    // entry replaced by an undeletable node) leaves the entry counted as
+    // still occupying its space and still resident in memory (it is, in
+    // fact, still fully valid on disk) -- moving on to the next
+    // candidate rather than looping forever on the one that can't be
+    // reclaimed.
+    if (deleteEntry(e.key)) {
+      m_memory->remove(e.key);
+      totalBytes -= e.totalBytes;
+    }
   }
 }
 
@@ -1113,6 +1238,24 @@ int AssetCache::diskEntryCount() const {
     }
   }
   return count;
+}
+
+std::optional<quint64>
+AssetCache::accessSequenceForTesting(const QString &key) const {
+  QMutexLocker locker(&m_mutex);
+  if (m_diskCacheDisabled || !isValidKey(key)) {
+    return std::nullopt;
+  }
+  const std::optional<QString> generation = readManifestGeneration(key);
+  if (!generation) {
+    return std::nullopt;
+  }
+  const std::optional<DiskMetadata> metadata =
+      readMetadata(generationMetadataPath(key, *generation), key);
+  if (!metadata || metadata->sha256Hex != *generation) {
+    return std::nullopt;
+  }
+  return metadata->accessSequence;
 }
 
 } // namespace Arkham

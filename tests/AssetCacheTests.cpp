@@ -1011,3 +1011,200 @@ void AssetCacheTests::danglingSymlinkInsideCacheRootIsUnlinkedSafely() {
 
   QVERIFY(!QFileInfo(danglingSymlink).isSymLink());
 }
+
+void AssetCacheTests::
+    accessSequenceIsMonotonicAndUniqueEvenForSameMillisecondConsecutiveStores() {
+  // Review item 11: two entries stored back-to-back with no artificial
+  // delay (routine on any fast machine, and the norm in a test) must
+  // still receive strictly increasing, unique access sequence numbers
+  // -- proving ordering never silently degrades to "whatever order a
+  // hash/set iterates in" merely because wall-clock milliseconds tied.
+  AssetCache cache(configFor(m_tempDirPath));
+  const QString keyA = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/seq-a.png")));
+  const QString keyB = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/seq-b.png")));
+  const QString keyC = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/seq-c.png")));
+
+  cache.store(keyA, makeEntry(QByteArrayLiteral("bytes-a")));
+  cache.store(keyB, makeEntry(QByteArrayLiteral("bytes-b")));
+  cache.store(keyC, makeEntry(QByteArrayLiteral("bytes-c")));
+
+  const std::optional<quint64> seqA = cache.accessSequenceForTesting(keyA);
+  const std::optional<quint64> seqB = cache.accessSequenceForTesting(keyB);
+  const std::optional<quint64> seqC = cache.accessSequenceForTesting(keyC);
+  QVERIFY(seqA.has_value());
+  QVERIFY(seqB.has_value());
+  QVERIFY(seqC.has_value());
+  QVERIFY(*seqA < *seqB);
+  QVERIFY(*seqB < *seqC);
+
+  // A subsequent MEMORY-only hit on the oldest key must mint a fresh
+  // sequence past every other entry's, without ever touching
+  // lookupDisk().
+  QVERIFY(cache.lookupMemory(keyA).has_value());
+  const std::optional<quint64> seqAAfterMemoryHit =
+      cache.accessSequenceForTesting(keyA);
+  QVERIFY(seqAAfterMemoryHit.has_value());
+  QVERIFY(*seqAAfterMemoryHit > *seqC);
+}
+
+void AssetCacheTests::accessSequenceRecoversPastPriorMaximumAcrossARestart() {
+  // Review item 11: m_nextAccessSequence is purely in-memory per
+  // AssetCache instance -- a real process restart must recover it from
+  // the highest accessSeq value already persisted on disk (via the
+  // constructor's initial reapAndEnforceQuota() sweep), never reset to
+  // a low default that could let a NEW entry's sequence collide with,
+  // or rank below, an old entry's already-persisted sequence.
+  const QString keyA = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/restart-a.png")));
+  const QString keyB = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/restart-b.png")));
+  const QString keyC = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/restart-c.png")));
+
+  quint64 seqBBeforeRestart = 0;
+  {
+    AssetCache cache(configFor(m_tempDirPath));
+    cache.store(keyA, makeEntry(QByteArrayLiteral("bytes-a")));
+    cache.store(keyB, makeEntry(QByteArrayLiteral("bytes-b")));
+    const std::optional<quint64> seqB = cache.accessSequenceForTesting(keyB);
+    QVERIFY(seqB.has_value());
+    seqBBeforeRestart = *seqB;
+  }
+
+  // A fresh instance over the SAME directory: its constructor's initial
+  // reap must recover m_nextAccessSequence to strictly past
+  // seqBBeforeRestart before anything new is ever stored.
+  AssetCache restarted(configFor(m_tempDirPath));
+  restarted.store(keyC, makeEntry(QByteArrayLiteral("bytes-c")));
+  const std::optional<quint64> seqCAfterRestart =
+      restarted.accessSequenceForTesting(keyC);
+  QVERIFY(seqCAfterRestart.has_value());
+  QVERIFY(*seqCAfterRestart > seqBBeforeRestart);
+}
+
+void AssetCacheTests::memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry() {
+  // Review item 11 regression: a memory hit must refresh a key's
+  // PERSISTED disk recency, not merely its in-memory presence --
+  // otherwise a key kept "alive" purely via repeated memory hits could
+  // still be evicted from disk as if it had never been accessed since
+  // its original store().
+  const QByteArray payload(2000, 'x');
+  const QString keptWarmKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/kept-warm.png")));
+  const QString neverTouchedAgainKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/never-touched-again.png")));
+  QStringList fillerKeys;
+
+  {
+    // A generous quota here: nothing is evicted yet in this block. It
+    // only establishes the on-disk state -- and, crucially, each
+    // entry's persisted access sequence -- that the second,
+    // differently (tightly) configured instance below actually evicts
+    // from.
+    AssetCache cache(configFor(m_tempDirPath, /*diskMaxBytes=*/1'000'000));
+
+    // Stored FIRST, in this order: under a naive wall-clock- or
+    // store-order-only LRU scheme, keptWarmKey (stored first) would
+    // look strictly OLDER than neverTouchedAgainKey (stored second)
+    // forever, with no way to ever change that ranking short of an
+    // actual disk re-fetch.
+    cache.store(keptWarmKey, makeEntry(payload));
+    cache.store(neverTouchedAgainKey, makeEntry(payload));
+
+    for (int i = 0; i < 4; ++i) {
+      const QString fillerKey = AssetCache::cacheKeyFor(
+          QUrl(QStringLiteral("https://example.com/lru-filler-%1.png").arg(i)));
+      fillerKeys.append(fillerKey);
+      cache.store(fillerKey, makeEntry(payload));
+    }
+
+    // Strictly AFTER every other entry above has already been stored,
+    // refresh keptWarmKey via repeated MEMORY-only hits -- never once
+    // calling lookupDisk() -- so its persisted access sequence becomes
+    // the highest of all six entries.
+    for (int i = 0; i < 3; ++i) {
+      QVERIFY(cache.lookupMemory(keptWarmKey).has_value());
+    }
+  }
+
+  // A second instance, configured with a small quota, stands in for a
+  // later point at which this directory is discovered to exceed its
+  // budget -- its constructor's initial reapAndEnforceQuota() sweep
+  // performs the one, fully deterministic eviction pass this test
+  // actually checks (no auto-eviction from an earlier store() call in
+  // the block above can have fired prematurely, since that block's
+  // quota was always generous enough to avoid it).
+  AssetCache tightCache(configFor(m_tempDirPath, /*diskMaxBytes=*/9000));
+
+  QVERIFY2(!QFile::exists(AssetCache::manifestPathForTesting(
+               m_tempDirPath, neverTouchedAgainKey)),
+           "an entry never touched again after its initial store() must "
+           "be evicted ahead of one refreshed via later memory hits");
+  QVERIFY2(QFile::exists(
+               AssetCache::manifestPathForTesting(m_tempDirPath, keptWarmKey)),
+           "an entry kept warm purely via memory hits must survive "
+           "eviction even though it was stored FIRST (i.e. structurally "
+           "older) than the entry above");
+}
+
+void AssetCacheTests::
+    failedEvictionDeletionLeavesEntryCountedAsStillOccupyingSpace() {
+  // Review item 11: quota accounting must only credit an entry's bytes
+  // as freed once its files are actually confirmed removed. Simulate a
+  // real-world deletion failure (a read-only remount, a permission
+  // error) by revoking write permission on the cache directory itself
+  // -- QFile::remove() then deterministically fails for every entry
+  // (unlink requires write permission on the containing directory, not
+  // on the file itself), regardless of platform or of whether the test
+  // happens to run as an unprivileged user.
+  const QByteArray payload(900, 'x');
+  const QString oldestKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/undeletable-oldest.png")));
+  const QString newerKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/newer.png")));
+
+  // A generous quota here: both entries are stored without any risk of
+  // store()'s OWN post-store auto-eviction check tripping (which would
+  // otherwise race ahead of the permission lock below and evict
+  // oldestKey normally, before this test ever gets a chance to prove
+  // anything about a FAILED deletion).
+  qint64 usageBeforeFailedEviction = 0;
+  {
+    AssetCache cache(configFor(m_tempDirPath, /*diskMaxBytes=*/1'000'000));
+    cache.store(oldestKey, makeEntry(payload));
+    cache.store(newerKey, makeEntry(payload));
+    usageBeforeFailedEviction = cache.diskUsageBytes();
+  }
+  QVERIFY(usageBeforeFailedEviction > 0);
+
+  // Restores full owner permissions unconditionally when this scope
+  // ends, including via an early QVERIFY-triggered return -- otherwise
+  // the managed QTemporaryDir could fail to clean itself up afterward.
+  struct ScopedDirectoryPermissionLock {
+    QString path;
+    ~ScopedDirectoryPermissionLock() {
+      QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner |
+                                      QFile::ExeOwner);
+    }
+  } permissionGuard{m_tempDirPath};
+  QVERIFY(QFile::setPermissions(
+      m_tempDirPath, QFile::ReadOwner | QFile::ExeOwner)); // r-x, no write
+
+  // A second instance, configured with a TIGHT quota, is constructed
+  // only now -- strictly after the permission lock above is already in
+  // place -- so its constructor's initial reapAndEnforceQuota() sweep
+  // is the one, fully controlled point at which eviction of oldestKey
+  // (the lower-sequence, and therefore normally-first-evicted, entry)
+  // is attempted and must fail.
+  AssetCache tightCache(configFor(m_tempDirPath, /*diskMaxBytes=*/3000));
+
+  QCOMPARE(tightCache.diskUsageBytes(), usageBeforeFailedEviction);
+  QVERIFY2(QFile::exists(
+               AssetCache::manifestPathForTesting(m_tempDirPath, oldestKey)),
+           "an entry whose deletion failed must remain fully resident, "
+           "never counted as freed");
+  QVERIFY(tightCache.lookupDisk(oldestKey).has_value());
+}

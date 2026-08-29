@@ -9,9 +9,14 @@
 // generation+manifest publication and crash/corruption repair (orphan
 // generation payload/metadata, mismatched pair, stray temp file,
 // interrupted-replacement orphan before/after the manifest swap),
-// metadata-driven LRU quota/watermark eviction, touch-after-304
-// lastAccess refresh, and restart persistence (a fresh AssetCache
-// instance pointed at the same directory sees prior entries).
+// metadata-driven LRU quota/watermark eviction using a monotonic access
+// sequence (review item 11) rather than raw wall-clock time -- covering
+// same-millisecond ordering, cross-restart sequence recovery, a
+// memory-only hit keeping an entry warm over a colder disk-only entry,
+// and eviction quota accounting only crediting bytes as freed once
+// deletion actually succeeds -- touch-after-304 lastAccess refresh, and
+// restart persistence (a fresh AssetCache instance pointed at the same
+// directory sees prior entries).
 class AssetCacheTests final : public QObject {
   Q_OBJECT
 
@@ -41,8 +46,7 @@ private slots:
   // Review item 8: crash-consistent generation/manifest publication.
   void initialInsertCrashBeforeManifestPublishLeavesNoValidEntry();
   void replacementCrashBeforeManifestSwapPreservesOldGenerationIntact();
-  void
-  replacementCrashAfterManifestSwapPromotesNewGenerationAndReclaimsOld();
+  void replacementCrashAfterManifestSwapPromotesNewGenerationAndReclaimsOld();
   void storeReplacementLeavesExactlyOneLiveGenerationOnDisk();
 
   // Review item 7: symlink cache-root/entry escape prevention.
@@ -50,6 +54,13 @@ private slots:
   void directorySymlinkInsideCacheRootIsUnlinkedNotFollowed();
   void fileSymlinkInsideCacheRootIsUnlinkedNotFollowed();
   void danglingSymlinkInsideCacheRootIsUnlinkedSafely();
+
+  // Review item 11: monotonic-sequence LRU accuracy.
+  void
+  accessSequenceIsMonotonicAndUniqueEvenForSameMillisecondConsecutiveStores();
+  void accessSequenceRecoversPastPriorMaximumAcrossARestart();
+  void memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry();
+  void failedEvictionDeletionLeavesEntryCountedAsStillOccupyingSpace();
 
 private:
   QString m_tempDirPath;
