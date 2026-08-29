@@ -150,18 +150,18 @@ public:
   ~SessionCoordinator() override;
 
   // Not always m_state verbatim: see hasBlockingOrphanCleanup()'s doc
-  // comment. For as long as a durably-failed required secure-store
-  // deletion for some OTHER profile than the one currently selected (or
-  // no profile at all) remains unresolved, this deliberately reports
-  // SecureStorageUnavailable instead, regardless of the CURRENT profile's
-  // own, genuinely-progressing underlying state -- which keeps advancing
-  // in the background via the ordinary mutateState()/setState() calls
-  // throughout this class and becomes visible again automatically, with
-  // no separate "resume" step anywhere, the instant the last such
-  // obligation clears. When the currently selected profile IS the one
-  // with the outstanding obligation (the common single-profile case),
-  // this override does not apply and the real, live-transitioning
-  // m_state is returned exactly as before.
+  // comment. For as long as ANY profile's durably-failed required
+  // secure-store deletion remains unresolved -- regardless of whether
+  // that profile is currently selected, unselected, absent (removed), or
+  // has since been re-added/re-selected -- this deliberately reports
+  // SecureStorageUnavailable instead of the real, live m_state. The
+  // affected profile's own genuinely-progressing underlying state keeps
+  // advancing in the background via the ordinary mutateState()/setState()
+  // calls throughout this class (mutateState() itself never turns such a
+  // masked internal transition into a spurious notification -- see its
+  // own doc comment) and becomes visible again automatically, with no
+  // separate "resume" step anywhere, the instant the last such obligation
+  // clears.
   [[nodiscard]] State state() const noexcept;
   // Static, secret-free, human-readable label for state(). Never derived
   // from any server- or user-supplied text.
@@ -386,8 +386,18 @@ private:
   };
 
   // Assigns (state, diagnostic) and bumps m_stateRevision.mutation, but
-  // ONLY if the new tuple actually differs from the current one. Never
-  // emits by itself -- see publishDirtyProperties().
+  // ONLY if doing so actually changes the EXTERNALLY OBSERVABLE (state(),
+  // diagnostic()) tuple -- not merely the raw (m_state, m_diagnostic)
+  // fields. These differ exactly when hasBlockingOrphanCleanup() is
+  // currently masking them (see its own doc comment): a real, necessary
+  // raw transition (e.g. a reselected profile's own probe moving from
+  // Loading to Incompatible while some profile's required deletion is
+  // still unresolved) must still be recorded in m_state/m_diagnostic so
+  // internal gating and the profile's own progress remain correct, but
+  // must create no notification obligation while it stays fully masked --
+  // otherwise a stateChanged() would fire that reports the exact same
+  // masked value before and after, incorrectly implying something new was
+  // published. Never emits by itself -- see publishDirtyProperties().
   void mutateState(State state, QString diagnostic);
 
   // Assigns the (optional) current-user identity (std::nullopt clears it)
@@ -715,31 +725,34 @@ private:
   // True exactly when state()/diagnostic() must report the oldest
   // unresolved orphan-cleanup obligation (see m_stalledProfileOrder)
   // instead of the real, live m_state/m_diagnostic: there is at least one
-  // outstanding obligation, AND it does not belong to the profile
-  // currently selected (including the case where no profile is currently
-  // selected at all). When the obligation instead belongs to the
-  // currently selected profile -- the common single-profile-stall case --
-  // this deliberately returns false, because that case is already fully,
-  // correctly handled by startFrontTokenOp()/startCredentialRestore()
-  // directly setting the real m_state/m_diagnostic to
-  // SecureStorageUnavailable, exactly as before this override existed;
-  // overriding it a second time here would only hide that profile's own
-  // genuine, live transitions from callers that legitimately need to
-  // observe them (e.g. tests synchronizing on real progress via
-  // state()). For any OTHER, unselected/orphaned profile's failure,
-  // nothing else would ever make it visible, so this override is what
-  // does -- coarsely and deliberately (a security-first, "some cleanup is
-  // required somewhere" presentation), without needing to reconstruct or
-  // cache whatever the current profile's own state would otherwise have
-  // been: since the real m_state/m_diagnostic fields are never touched by
-  // this override (only read around it), the current profile's own flow
-  // keeps genuinely progressing in the background the entire time this
-  // returns true, and becomes visible again automatically -- with no
-  // separate "resume" step anywhere -- the instant it no longer does.
+  // outstanding obligation, full stop -- regardless of whether its
+  // profileId is currently selected, unselected, absent from
+  // m_profiles() entirely (removed), or has since been re-added/
+  // re-selected. This is deliberately UNCONDITIONAL on selection: a
+  // profile whose required deletion is stalled can later be reselected
+  // (e.g. the user switches away and back, or the profile store is
+  // reloaded and reselects it), and its own capability probe or restore
+  // flow will keep legitimately mutating the real m_state/m_diagnostic in
+  // the background regardless (Loading -> Incompatible/RecoverableFailure
+  // -> ...) -- none of that is a substitute for the still-outstanding
+  // Delete, and none of it may be allowed to surface through state()/
+  // diagnostic() and silently hide the obligation retry() is still
+  // resolving. (An earlier version of this override instead excluded the
+  // currently-selected profile's own head obligation, on the theory that
+  // startFrontTokenOp()'s own direct setState() call already surfaced it
+  // for that one case; that reasoning broke the instant that same profile
+  // was reselected and its probe overwrote the real m_state with an
+  // unrelated live transition, which is exactly the bug this comment
+  // documents fixing.) Since the real m_state/m_diagnostic fields are
+  // never touched by this override (only read around it, and mutateState()
+  // itself refuses to publish a notification for any raw change that does
+  // not alter what this override exposes -- see mutateState()'s own doc
+  // comment), the current profile's own flow keeps genuinely progressing
+  // in the background the entire time this returns true, and becomes
+  // visible again automatically -- with no separate "resume" step
+  // anywhere -- the instant it no longer does.
   [[nodiscard]] bool hasBlockingOrphanCleanup() const noexcept {
-    return !m_stalledProfileOrder.isEmpty() &&
-           (!m_currentProfile.has_value() ||
-            m_stalledProfileOrder.first() != m_currentProfile->profileId());
+    return !m_stalledProfileOrder.isEmpty();
   }
 
   // Records |profileId| as newly (or still) durably stalled behind a

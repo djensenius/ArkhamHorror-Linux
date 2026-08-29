@@ -194,75 +194,66 @@ void QtKeychainTokenStore::readToken(const QString &profileId,
   m_pendingReads.emplace(jobPtr,
                          PendingRead{std::move(job), std::move(callback)});
 
-  connect(
-      jobPtr, &IKeychainReadJob::finished, this,
-      [this, jobPtr, expectedEndpointIdentity]() {
-        auto it = m_pendingReads.find(jobPtr);
-        if (it == m_pendingReads.end()) {
-          return; // already handled (defensive; should not happen)
-        }
-        ResultCallback cb = std::move(it->second.callback);
-        const QKeychain::Error err = jobPtr->error();
-        QString token;
-        TokenStoreOutcome outcome = mapReadError(err);
-        QString diagnostic;
-        if (outcome == TokenStoreOutcome::Success) {
-          const QString raw = jobPtr->textData();
-          if (raw.trimmed().isEmpty()) {
-            // saveToken() never persists an empty/whitespace-only payload, so
-            // a backend that nonetheless returns one alongside a success
-            // status indicates a corrupt/tampered entry (e.g. manually edited
-            // outside this application), not a usable session. Surfacing this
-            // as Success would let a caller believe it is signed in with an
-            // unusable blank token; map it to BackendError and drop the
-            // value instead. This check must run BEFORE envelope parsing:
-            // parseTokenEnvelope() assumes a non-blank input (see
-            // TokenEnvelope.h).
-            outcome = TokenStoreOutcome::BackendError;
-            diagnostic = QStringLiteral(
-                "secure storage returned an empty or whitespace-only token");
-          } else {
-            const TokenEnvelopeParseResult parsed = parseTokenEnvelope(raw);
-            switch (parsed.outcome) {
-            case TokenEnvelopeParseOutcome::Parsed:
-              if (parsed.token.trimmed().isEmpty()) {
-                // parseTokenEnvelope() only rejects a completely empty
-                // token portion (see TokenEnvelope.cpp); a structurally
-                // valid envelope whose token trims to nothing but is not
-                // literally empty (e.g. a tampered/corrupted entry with a
-                // whitespace-only token) would otherwise slip through as
-                // Parsed. saveToken() already refuses to persist such a
-                // value, so treat one found on read the same way this
-                // function treats a whitespace-only raw payload above:
-                // never surface it as a usable Success token.
-                outcome = TokenStoreOutcome::BackendError;
-                diagnostic = QStringLiteral(
-                    "secure storage returned an empty or whitespace-only "
-                    "token");
-              } else if (parsed.endpointIdentity == expectedEndpointIdentity) {
-                token = parsed.token;
-              } else {
-                outcome = TokenStoreOutcome::BindingMismatch;
-              }
-              break;
-            case TokenEnvelopeParseOutcome::LegacyUnbound:
-              outcome = TokenStoreOutcome::LegacyUnbound;
-              break;
-            case TokenEnvelopeParseOutcome::Malformed:
-              outcome = TokenStoreOutcome::Malformed;
-              break;
+  connect(jobPtr, &IKeychainReadJob::finished, this,
+          [this, jobPtr, expectedEndpointIdentity]() {
+            auto it = m_pendingReads.find(jobPtr);
+            if (it == m_pendingReads.end()) {
+              return; // already handled (defensive; should not happen)
             }
-          }
-        }
-        if (diagnostic.isEmpty()) {
-          diagnostic = diagnosticFor(outcome);
-        }
-        it->second.job.release()->deleteLater();
-        m_pendingReads.erase(it);
-        emitAsync(
-            std::move(cb),
-            TokenStoreResult{outcome, std::move(diagnostic), std::move(token)});
-      });
+            ResultCallback cb = std::move(it->second.callback);
+            const QKeychain::Error err = jobPtr->error();
+            QString token;
+            TokenStoreOutcome outcome = mapReadError(err);
+            QString diagnostic;
+            if (outcome == TokenStoreOutcome::Success) {
+              const QString raw = jobPtr->textData();
+              if (raw.trimmed().isEmpty()) {
+                // saveToken() never persists an empty/whitespace-only payload,
+                // so a backend that nonetheless returns one alongside a success
+                // status indicates a corrupt/tampered entry (e.g. manually
+                // edited outside this application), not a usable session or a
+                // transient backend hiccup. Classified as Malformed (not
+                // BackendError) so the coordinator's
+                // required-delete-then-fresh-flow path can actually resolve it,
+                // rather than retrying this exact same corrupt read forever
+                // under a retryable-looking outcome. This check must run BEFORE
+                // envelope parsing: parseTokenEnvelope() assumes a non-blank
+                // input (see TokenEnvelope.h).
+                outcome = TokenStoreOutcome::Malformed;
+              } else {
+                const TokenEnvelopeParseResult parsed = parseTokenEnvelope(raw);
+                switch (parsed.outcome) {
+                case TokenEnvelopeParseOutcome::Parsed:
+                  // parseTokenEnvelope() itself now rejects every definitively
+                  // invalid token content (empty, whitespace-only,
+                  // leading/trailing whitespace, or embedded control
+                  // characters) as Malformed -- see
+                  // isDefinitivelyInvalidTokenContent() in TokenEnvelope.cpp --
+                  // so a Parsed outcome here always carries a usable token.
+                  if (parsed.endpointIdentity == expectedEndpointIdentity) {
+                    token = parsed.token;
+                  } else {
+                    outcome = TokenStoreOutcome::BindingMismatch;
+                  }
+                  break;
+                case TokenEnvelopeParseOutcome::LegacyUnbound:
+                  outcome = TokenStoreOutcome::LegacyUnbound;
+                  break;
+                case TokenEnvelopeParseOutcome::Malformed:
+                  outcome = TokenStoreOutcome::Malformed;
+                  break;
+                }
+              }
+            }
+            if (diagnostic.isEmpty()) {
+              diagnostic = diagnosticFor(outcome);
+            }
+            it->second.job.release()->deleteLater();
+            m_pendingReads.erase(it);
+            emitAsync(std::move(cb),
+                      TokenStoreResult{outcome, std::move(diagnostic),
+                                       std::move(token)});
+          });
 
   jobPtr->start();
 }

@@ -277,8 +277,8 @@ private slots:
   void saveThenReadRoundTrip();
   void updateOverwritesPreviousToken();
   void readMissingProfileIsNotFound();
-  void readBlankStoredTokenIsBackendError_data();
-  void readBlankStoredTokenIsBackendError();
+  void readBlankStoredTokenIsMalformed_data();
+  void readBlankStoredTokenIsMalformed();
   void deleteRemovesToken();
   void deleteMissingProfileIsIdempotentSuccess();
   void backendUnavailableIsTypedFailure();
@@ -306,7 +306,7 @@ private slots:
   void readMalformedEnvelopeIsRejectedWithNoToken();
   void updatedEndpointBindingReplacesPreviousBinding();
   void diagnosticsNeverContainEndpointIdentityOrTokenForBindingOutcomes();
-  void readMatchedBindingWithWhitespaceOnlyTokenIsBackendErrorNotSuccess();
+  void readMatchedBindingWithWhitespaceOnlyTokenIsMalformedNotSuccess();
 
   // ─── TokenEnvelope free-function unit tests (bypassing async I/O) ───
 
@@ -317,6 +317,8 @@ private slots:
   void envelopeParseRejectsTruncatedIdentityLength();
   void envelopeParseRejectsEmptyToken();
   void envelopeParseRejectsPrefixWithNoVersionDigits();
+  void envelopeParseRejectsInvalidTokenGrammar_data();
+  void envelopeParseRejectsInvalidTokenGrammar();
 };
 
 void TokenStoreTests::saveThenReadRoundTrip() {
@@ -391,13 +393,17 @@ void TokenStoreTests::readMissingProfileIsNotFound() {
   QVERIFY(result->token.isEmpty());
 }
 
-void TokenStoreTests::readBlankStoredTokenIsBackendError() {
+void TokenStoreTests::readBlankStoredTokenIsMalformed() {
   // saveToken() rejects empty/whitespace-only tokens outright (see
   // emptyTokenRejectedOnSave/whitespaceTokenRejectedOnSave below), so a
   // successfully-read blank token can only happen via a corrupt or
   // externally-tampered keyring entry. readToken() must not surface that
   // as a usable Success -- production code that treats Success as "signed
-  // in" must never receive an empty token string.
+  // in" must never receive an empty token string. Classified as Malformed
+  // (a terminal, cleanup-requiring outcome) rather than BackendError (a
+  // retryable-looking one) so the coordinator's required-delete-then-
+  // fresh-flow path can actually resolve this corrupt entry instead of
+  // retrying the exact same blank read forever.
   QFETCH(QString, storedValue);
 
   auto factory = std::make_unique<FakeKeychainJobFactory>();
@@ -411,14 +417,11 @@ void TokenStoreTests::readBlankStoredTokenIsBackendError() {
     store.readToken(profileId, endpointIdentityA(), std::move(cb));
   });
   QVERIFY(result.has_value());
-  QCOMPARE(result->outcome, TokenStoreOutcome::BackendError);
+  QCOMPARE(result->outcome, TokenStoreOutcome::Malformed);
   QVERIFY(result->token.isEmpty());
-  QCOMPARE(result->diagnostic,
-           QStringLiteral(
-               "secure storage returned an empty or whitespace-only token"));
 }
 
-void TokenStoreTests::readBlankStoredTokenIsBackendError_data() {
+void TokenStoreTests::readBlankStoredTokenIsMalformed_data() {
   QTest::addColumn<QString>("storedValue");
   QTest::newRow("empty") << QString();
   QTest::newRow("whitespace-only") << QStringLiteral("   \t  ");
@@ -801,6 +804,23 @@ void TokenStoreTests::readMalformedEnvelopeIsRejectedWithNoToken_data() {
   QTest::newRow("no-version-terminator")
       << QStringLiteral("AHKV1identitytoken");
   QTest::newRow("empty-token-remainder") << QStringLiteral("AHKV1:5:hosta");
+
+  // A structurally valid envelope (correct magic prefix/version/identity
+  // framing) whose token portion is definitively invalid per the
+  // backend's actual token grammar (see isDefinitivelyInvalidTokenContent()
+  // in TokenEnvelope.cpp): these must ALSO be classified Malformed, never
+  // silently parsed as a usable token.
+  const QString identity = endpointIdentityA();
+  const auto envelopeWithToken = [&identity](const QString &token) {
+    return QStringLiteral("AHKV1:") + QString::number(identity.size()) + u':' +
+           identity + token;
+  };
+  QTest::newRow("whitespace-only-token")
+      << envelopeWithToken(QStringLiteral("   \t  "));
+  QTest::newRow("leading-trailing-whitespace-token")
+      << envelopeWithToken(QStringLiteral("  token-with-padding  "));
+  QTest::newRow("embedded-control-character-token")
+      << envelopeWithToken(QStringLiteral("token\r\nwith-crlf"));
 }
 
 void TokenStoreTests::readMalformedEnvelopeIsRejectedWithNoToken() {
@@ -822,13 +842,14 @@ void TokenStoreTests::readMalformedEnvelopeIsRejectedWithNoToken() {
 }
 
 void TokenStoreTests::
-    readMatchedBindingWithWhitespaceOnlyTokenIsBackendErrorNotSuccess() {
+    readMatchedBindingWithWhitespaceOnlyTokenIsMalformedNotSuccess() {
   // Craft a structurally valid v1 envelope (correct magic prefix, version,
   // and identity-length framing, with the expected endpoint identity) whose
   // TOKEN portion is whitespace-only. serializeTokenEnvelope()/saveToken()
   // never produce this themselves -- saveToken() rejects a whitespace-only
   // token outright -- so this simulates a tampered/corrupted secure-store
-  // entry that nonetheless parses as TokenEnvelopeParseOutcome::Parsed.
+  // entry. parseTokenEnvelope() itself now classifies this as Malformed
+  // (see isDefinitivelyInvalidTokenContent()), never Parsed.
   const QString identity = endpointIdentityA();
   const QString whitespaceToken = QStringLiteral("   \t  ");
   const QString tampered = QStringLiteral("AHKV1:") +
@@ -836,8 +857,8 @@ void TokenStoreTests::
                            whitespaceToken;
 
   const TokenEnvelopeParseResult parsed = parseTokenEnvelope(tampered);
-  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Parsed);
-  QVERIFY(parsed.token.trimmed().isEmpty());
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
+  QVERIFY(parsed.token.isEmpty());
 
   auto factory = std::make_unique<FakeKeychainJobFactory>();
   auto *rawFactory = factory.get();
@@ -851,8 +872,10 @@ void TokenStoreTests::
   });
   QVERIFY(readResult.has_value());
   // Must NEVER surface Success with an unusable whitespace-only token, even
-  // though the envelope's endpoint-identity binding matched exactly.
-  QCOMPARE(readResult->outcome, TokenStoreOutcome::BackendError);
+  // though the envelope's endpoint-identity binding matched exactly. Must
+  // be Malformed (cleanup-requiring), not a retryable-looking outcome, so
+  // the coordinator's required-delete path actually resolves this entry.
+  QCOMPARE(readResult->outcome, TokenStoreOutcome::Malformed);
   QVERIFY(readResult->token.isEmpty());
   QVERIFY(!readResult->diagnostic.contains(whitespaceToken));
 }
@@ -998,6 +1021,39 @@ void TokenStoreTests::envelopeParseRejectsPrefixWithNoVersionDigits() {
       parseTokenEnvelope(QStringLiteral("AHKV:5:hostatoken"));
   QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
   QVERIFY(parsed.token.isEmpty());
+}
+
+void TokenStoreTests::envelopeParseRejectsInvalidTokenGrammar_data() {
+  QTest::addColumn<QString>("token");
+  QTest::newRow("whitespace-only") << QStringLiteral("   \t  ");
+  QTest::newRow("leading-whitespace") << QStringLiteral(" token");
+  QTest::newRow("trailing-whitespace") << QStringLiteral("token ");
+  QTest::newRow("leading-and-trailing-whitespace")
+      << QStringLiteral("  token  ");
+  QTest::newRow("embedded-newline") << QStringLiteral("tok\nen");
+  QTest::newRow("embedded-carriage-return") << QStringLiteral("tok\ren");
+  QTest::newRow("embedded-tab") << QStringLiteral("tok\ten");
+  QTest::newRow("embedded-null")
+      << (QStringLiteral("tok") + QChar(QChar::Null) + QStringLiteral("en"));
+}
+
+void TokenStoreTests::envelopeParseRejectsInvalidTokenGrammar() {
+  // The backend's actual token grammar (signed JWT compact serialization)
+  // never contains whitespace or control characters, so every one of
+  // these definitively-invalid token contents must be classified
+  // Malformed by parseTokenEnvelope() itself -- even though the envelope's
+  // magic prefix/version/identity-length framing is otherwise perfectly
+  // well-formed -- never silently accepted as Parsed. This closes a
+  // defense-in-depth gap: an embedded CR/LF must never reach
+  // `Authorization: Token <token>` verbatim.
+  QFETCH(QString, token);
+  const QString identity = QStringLiteral("host");
+  const QString serialized =
+      QStringLiteral("AHKV1:%1:%2%3").arg(identity.size()).arg(identity, token);
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(serialized);
+  QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
+  QVERIFY(parsed.token.isEmpty());
+  QVERIFY(parsed.endpointIdentity.isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TokenStoreTests)

@@ -23,8 +23,12 @@ enum class TokenEnvelopeParseOutcome {
                  ///< token.
   Malformed,     ///< The payload begins with this format's magic prefix but
                  ///< fails strict structural validation (bad/unsupported
-                 ///< version, corrupt length field, truncated content, or an
-                 ///< empty token portion). Never trusted or exposed.
+                 ///< version, corrupt length field, truncated content, or a
+                 ///< token portion that is empty, whitespace-only, has
+                 ///< leading/trailing whitespace, or contains any control
+                 ///< character -- see parseTokenEnvelope()'s own comment on
+                 ///< why this grammar check lives here rather than being
+                 ///< left to a caller). Never trusted or exposed.
 };
 
 struct TokenEnvelopeParseResult {

@@ -104,16 +104,37 @@ bool SessionCoordinator::currentUserAdmin() const {
 
 void SessionCoordinator::mutateState(State state, QString diagnostic) {
   if (m_state == state && m_diagnostic == diagnostic) {
-    // Reassigning the identical (state, diagnostic) tuple -- e.g. a
-    // reentrant restart() finding itself already at (Loading, "") -- is
-    // not a real transition and must never create a fresh notification
-    // obligation (this is what stops an unguarded stateChanged handler
-    // that unconditionally calls start() from recursing forever).
+    // Reassigning the identical raw (state, diagnostic) tuple can never
+    // change what is externally observable either --
+    // hasBlockingOrphanCleanup()'s masking decision depends only on
+    // m_stalledProfileOrder/ m_currentProfile, never on m_state/m_diagnostic
+    // themselves -- so this is not a real transition and must never create a
+    // fresh notification obligation (this is what stops an unguarded
+    // stateChanged handler that unconditionally calls start() from
+    // recursing forever).
     return;
   }
+  const State oldExposedState = this->state();
+  const QString oldExposedDiagnostic = this->diagnostic();
   m_state = state;
   m_diagnostic = std::move(diagnostic);
-  ++m_stateRevision.mutation;
+  // A raw transition that happens while an orphan-cleanup obligation is
+  // currently masking state()/diagnostic() (see hasBlockingOrphanCleanup())
+  // produces the exact same externally observable tuple before and after
+  // -- e.g. a reselected/re-added profile's own probe legitimately moving
+  // its real internal state from Loading to Incompatible/
+  // RecoverableFailure while its (or some other profile's) required
+  // deletion is still unresolved. Such a transition is real and necessary
+  // internally -- the profile's own flow must keep progressing so it is
+  // ready to be shown the instant the mask lifts -- but it must never
+  // itself be announced, and must never appear to have "published over"
+  // the still-owed cleanup failure. Only bump the revision -- and
+  // therefore only ever emit stateChanged() -- when the EXPOSED tuple
+  // genuinely changed as a result of this specific assignment.
+  if (this->state() != oldExposedState ||
+      this->diagnostic() != oldExposedDiagnostic) {
+    ++m_stateRevision.mutation;
+  }
 }
 
 void SessionCoordinator::mutateCurrentUser(std::optional<CurrentUser> user) {
@@ -1157,12 +1178,19 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
 
       if (self->m_currentProfile.has_value() &&
           self->m_currentProfile->profileId() == profileId) {
-        // This profile's OWN flow is the one directly affected: surface
-        // the failure through its ordinary, real state too (the
-        // orphan-cleanup override above does not apply while this
-        // profile is itself the one selected -- see
-        // hasBlockingOrphanCleanup()'s doc comment), exactly as before
-        // this profile-independent tracking existed.
+        // Also synchronize the REAL, raw m_state/m_diagnostic to this
+        // exact obligation when this profile happens to be the one
+        // currently selected. hasBlockingOrphanCleanup() now masks
+        // state()/diagnostic() to the oldest obligation UNCONDITIONALLY
+        // (regardless of selection -- see its own doc comment), so this
+        // call changes nothing externally observable by itself; its
+        // purpose is purely to keep the raw fields from silently drifting
+        // out of sync with what has already been published while this
+        // profile remains masked, so that mutateState()'s exposed-value
+        // comparison and clearProfileCleanupStalled()'s own before/after
+        // comparison never misfire an extra reveal-then-immediately-
+        // overwritten pair of signals the moment this exact obligation is
+        // the one that eventually resolves.
         self->setState(State::SecureStorageUnavailable, stallDiagnostic);
       }
 
@@ -1263,11 +1291,13 @@ void SessionCoordinator::markProfileCleanupStalled(
   if (state() == oldExposedState && diagnostic() == oldExposedDiagnostic) {
     // Either this profile was already tracked and remains behind an
     // earlier, still-unresolved obligation for a DIFFERENT profile (which
-    // stays displayed/retried first, unaffected), or it is the currently
-    // selected profile (whose own real setState() call, made by the
-    // caller alongside this one, is what actually surfaces it -- see
-    // hasBlockingOrphanCleanup()'s doc comment). Either way, nothing
-    // externally observable changed as a direct result of THIS call.
+    // stays displayed/retried first, unaffected), or it is the very first
+    // obligation AND the currently selected profile, in which case the
+    // caller's own companion setState() call (made alongside this one --
+    // see startFrontTokenOp()) keeps the raw fields synchronized with
+    // what THIS call already published, so that call itself detects no
+    // further exposed change either. Either way, nothing externally
+    // observable changed as a direct result of THIS call.
     return;
   }
   ++m_stateRevision.mutation;
@@ -1287,10 +1317,12 @@ void SessionCoordinator::clearProfileCleanupStalled(const QString &profileId) {
     // Resolving a non-head obligation (queued behind an earlier,
     // still-unresolved failure for a different profile) is deliberately
     // silent: the head remains displayed/retried first, unaffected. This
-    // is also the outcome when the CURRENT profile's own stall resolves
-    // (see hasBlockingOrphanCleanup()): the caller's own success path
-    // (e.g. handleSignOutDeletionResult()) is what surfaces that via the
-    // real m_state, not this override.
+    // is also the outcome when the CURRENT profile's own head stall
+    // resolves and at least one other obligation remains queued behind
+    // it (that next obligation becomes the new head, an already-published
+    // value, so nothing changes here either); the case where this WAS the
+    // very last outstanding obligation and belonged to the current
+    // profile is handled by the branch below instead.
     return;
   }
   // This WAS the head of an orphan-cleanup override: either a NEXT
