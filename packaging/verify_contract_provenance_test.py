@@ -152,6 +152,25 @@ class ClosureTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             vcp.compute_governed_paths(tree)
 
+    def test_invalid_utf8_manifest_bytes_rejected(self):
+        # contracts/manifest.json itself must be decoded just as strictly
+        # as any schema: a corrupted/non-UTF-8 manifest blob at the
+        # pinned backend commit is a hard failure (RuntimeError), never a
+        # silently-replaced-character decode that could mask corruption
+        # and compute an incorrect governed-fixture set.
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = b'{"fixtures": [\xff\xfe]}'
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_malformed_json_manifest_rejected(self):
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = b'{"fixtures": ['
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
 
 class VerifyTests(unittest.TestCase):
     def setUp(self):

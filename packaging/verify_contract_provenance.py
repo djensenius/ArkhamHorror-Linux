@@ -317,9 +317,25 @@ def compute_governed_fixtures(tree: GitTree, schema_paths: set[str]) -> list[str
     `schema_paths` -- i.e. every fixture this client's modeled schemas
     actually govern, discovered independently of anything checked into
     this repository."""
-    manifest = json.loads(
-        tree.blob_bytes("contracts/manifest.json").decode("utf-8")
-    )
+    manifest_path = "contracts/manifest.json"
+    raw = tree.blob_bytes(manifest_path)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Mirrors compute_schema_closure()'s strict decode: a corrupted or
+        # unexpectedly non-UTF-8 manifest blob at the pinned backend
+        # commit must fail deterministically here rather than raising an
+        # unhandled traceback past verify()'s RuntimeError/RefEscapeError
+        # handling.
+        raise RuntimeError(
+            f"{manifest_path}: manifest is not valid UTF-8 ({exc})"
+        ) from exc
+    try:
+        manifest = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"{manifest_path}: manifest is not valid JSON ({exc})"
+        ) from exc
     result = []
     for entry in manifest.get("fixtures", []):
         schema = _resolve_manifest_path(entry["schema"])
