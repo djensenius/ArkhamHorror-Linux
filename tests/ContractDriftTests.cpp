@@ -97,11 +97,22 @@ void ContractDriftTests::hashHelperDetectsASingleByteMutation() {
   // by mutating one real vendored file's bytes in memory (never touching
   // disk) and confirming the recomputed digest no longer matches the
   // recorded one.
-  const GovernedFixtureDigest &manifestEntry = governedFixtureDigests().at(0);
-  QCOMPARE(manifestEntry.relativePath, QStringLiteral("manifest.json"));
+  //
+  // Looked up by relativePath rather than a fixed index: depending on
+  // governedFixtureDigests()'s entry order would make this test brittle to
+  // a harmless reordering of that table.
+  const QList<GovernedFixtureDigest> &digests = governedFixtureDigests();
+  const GovernedFixtureDigest *manifestEntry = nullptr;
+  for (const GovernedFixtureDigest &entry : digests) {
+    if (entry.relativePath == QStringLiteral("manifest.json")) {
+      manifestEntry = &entry;
+      break;
+    }
+  }
+  QVERIFY(manifestEntry != nullptr);
 
   const QString path = QStringLiteral(ARKHAM_TEST_CONTRACTS_DIR) + u'/' +
-                       manifestEntry.relativePath;
+                       manifestEntry->relativePath;
   QFile f(path);
   QVERIFY(f.open(QIODevice::ReadOnly));
   QByteArray bytes = f.readAll();
@@ -109,10 +120,10 @@ void ContractDriftTests::hashHelperDetectsASingleByteMutation() {
 
   // Sanity: the unmutated bytes still match (otherwise this test would
   // "pass" for the wrong reason if the fixture were already drifted).
-  QCOMPARE(hexSha256(bytes), manifestEntry.sha256Hex);
+  QCOMPARE(hexSha256(bytes), manifestEntry->sha256Hex);
 
   bytes[0] = bytes[0] ^ char(0x01);
-  QVERIFY(hexSha256(bytes) != manifestEntry.sha256Hex);
+  QVERIFY(hexSha256(bytes) != manifestEntry->sha256Hex);
 }
 
 void ContractDriftTests::pinnedDigestsAreLowercaseHex() {

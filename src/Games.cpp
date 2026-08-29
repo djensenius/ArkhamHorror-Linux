@@ -498,6 +498,15 @@ QJsonObject GameListRow::toJson() const {
   if (kind == Kind::Failure)
     return QJsonObject{{QStringLiteral("error"), error}};
 
+  // id/gameState/multiplayerVariant are documented as always populated
+  // together with Kind::Success, but they are public std::optional fields
+  // with no constructor enforcing that invariant. Assert it explicitly so a
+  // GameListRow assembled by hand with a field left unset fails loudly here
+  // instead of dereferencing an empty optional (UB) below.
+  Q_ASSERT(id.has_value());
+  Q_ASSERT(gameState.has_value());
+  Q_ASSERT(multiplayerVariant.has_value());
+
   QJsonObject obj;
   obj.insert(QStringLiteral("id"), id->toJson());
   obj.insert(QStringLiteral("scenario"), scenario
