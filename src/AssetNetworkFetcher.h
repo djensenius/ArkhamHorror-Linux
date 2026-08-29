@@ -152,9 +152,12 @@ public:
 
   // Issues a GET for `url`, validating the response against `expectedFormat`
   // as described in the class comment. `conditional` may be empty for a
-  // plain unconditional fetch. `callback` is always invoked exactly once,
-  // asynchronously (never synchronously from within this call), with
-  // either the fetched result or a typed error.
+  // plain unconditional fetch. While this fetcher is alive, `callback` is
+  // invoked exactly once, asynchronously (never synchronously from within
+  // this call), with either the fetched result or a typed error. If this
+  // AssetNetworkFetcher is destroyed while the request is still pending,
+  // delivery is suppressed entirely (see the destructor) -- callers must
+  // not depend on `callback` firing once destruction is possible.
   //
   // The returned handle is invalid (FetchHandle::isValid() == false) when
   // `url`'s scheme is anything other than http/https: that request is
@@ -170,9 +173,12 @@ public:
   // handle is a safe no-op that never invokes `callback` on cancel()'s
   // behalf (the request's real outcome, if any is still pending
   // delivery, is unaffected). For a handle that IS actually pending,
-  // cancellation is synchronous and guaranteed: the callback is invoked
-  // exactly once with AssetErrorCode::Cancelled, and it is never invoked
-  // again afterwards for this handle.
+  // cancellation removes it from the pending set synchronously (so a
+  // second cancel() on the same handle is immediately a no-op), but
+  // `callback`'s Cancelled delivery itself is queued via the event loop
+  // rather than invoked inline from this call. If this AssetNetworkFetcher
+  // is destroyed before that queued delivery runs, it is suppressed
+  // entirely, exactly like a still-pending fetch() callback would be.
   void cancel(FetchHandle handle);
 
   // Validates and decodes already-downloaded, already-trusted encoded

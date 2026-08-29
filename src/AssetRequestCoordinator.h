@@ -109,9 +109,13 @@ public:
   // otherwise fetches -- coalescing with any identical in-flight request
   // for the SAME canonicalized AssetKey (see canonicalOperationKey() in
   // the .cpp; this includes both ordinary fetches and disk-hit
-  // revalidations). `callback` is always invoked exactly once
-  // (synchronously-deferred via the event loop), even when the request is
-  // rejected before any network I/O (e.g. InvalidIdentifier).
+  // revalidations). While this coordinator is alive, `callback` is invoked
+  // exactly once (synchronously-deferred via the event loop), even when
+  // the request is rejected before any network I/O (e.g.
+  // InvalidIdentifier). If this AssetRequestCoordinator is destroyed while
+  // the request is still in flight, delivery is suppressed entirely (see
+  // the destructor) -- callers must not depend on `callback` firing once
+  // destruction is possible.
   RequestHandle request(const AssetKey &key, ResultCallback callback);
 
   // Detaches this one consumer; see the class comment for the exact
