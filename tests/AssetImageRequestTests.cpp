@@ -154,11 +154,14 @@ void AssetImageRequestTests::failedLoadTransitionsIdleLoadingError() {
 
   QSignalSpy errorSpy(&request, &AssetImageRequest::errorChanged);
 
-  // "UPPER01" fails AssetLocator's identifier grammar synchronously
-  // (before any network I/O), exercising the InvalidIdentifier -> Error
-  // path.
+  // "a/b" fails AssetLocator's identifier grammar synchronously (before
+  // any network I/O) via its embedded path separator, exercising the
+  // InvalidIdentifier -> Error path. (Uppercase letters, e.g. "UPPER01",
+  // are valid identifier characters -- real pinned digest sources contain
+  // uppercase segments in official card codes/mutationIds -- so uppercase
+  // alone is no longer a synchronous-rejection fixture.)
   request.load(makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
-                       QStringLiteral("UPPER01")));
+                       QStringLiteral("a/b")));
   QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
 
   QVERIFY(QTest::qWaitFor(
@@ -256,16 +259,16 @@ void AssetImageRequestTests::
 
   {
     AssetImageRequest request(coordinator);
-    // "UPPER01" fails AssetLocator's identifier grammar synchronously,
-    // so AssetRequestCoordinator::request() queues an immediate error
-    // completion (via QMetaObject::invokeMethod) rather than starting any
-    // network fetch. Destroying `request` right here -- before that
-    // queued completion has run -- is exactly the scenario that used to
-    // use-after-free: an invalid RequestHandle meant this object's
-    // destructor could never suppress the queued delivery.
+    // "a/b" fails AssetLocator's identifier grammar synchronously (via
+    // its embedded path separator), so AssetRequestCoordinator::request()
+    // queues an immediate error completion (via QMetaObject::invokeMethod)
+    // rather than starting any network fetch. Destroying `request` right
+    // here -- before that queued completion has run -- is exactly the
+    // scenario that used to use-after-free: an invalid RequestHandle meant
+    // this object's destructor could never suppress the queued delivery.
     request.load(
         makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
-                QStringLiteral("UPPER01")));
+                QStringLiteral("a/b")));
     // request destroyed here, before the event loop has run at all.
   }
 
@@ -335,11 +338,12 @@ void AssetImageRequestTests::
   AssetRequestCoordinator coordinator(cache, fetcher);
   AssetImageRequest request(coordinator);
 
-  // First load fails synchronously (before any network I/O): "UPPER01"
-  // fails AssetLocator's identifier grammar, exercising the
-  // InvalidIdentifier -> Error path and populating errorString/errorCode.
+  // First load fails synchronously (before any network I/O): "a/b"
+  // fails AssetLocator's identifier grammar (via its embedded path
+  // separator), exercising the InvalidIdentifier -> Error path and
+  // populating errorString/errorCode.
   request.load(makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
-                       QStringLiteral("UPPER01")));
+                       QStringLiteral("a/b")));
   QVERIFY(QTest::qWaitFor(
       [&]() { return request.status() == AssetImageRequest::Status::Error; },
       5000));

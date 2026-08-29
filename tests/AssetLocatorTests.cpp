@@ -143,7 +143,13 @@ void AssetLocatorTests::hostileIdentifiersRejected_data() {
   QTest::newRow("nested-slash") << QStringLiteral("a/b") << false;
   QTest::newRow("dot") << QStringLiteral(".") << false;
   QTest::newRow("dotdot") << QStringLiteral("..") << false;
-  QTest::newRow("uppercase") << QStringLiteral("CARD01") << false;
+  // Real pinned digest sources contain uppercase segments in official card
+  // identifiers (e.g. contracts/asset-locale-digest-sources/ita.json's
+  // "cards/04242B.avif"); the grammar accepts ASCII letters of either
+  // case, case preserved (never normalized), while still rejecting every
+  // other hostile construct below.
+  QTest::newRow("uppercase") << QStringLiteral("CARD01") << true;
+  QTest::newRow("mixed-case-suffix") << QStringLiteral("04242B") << true;
   QTest::newRow("space") << QStringLiteral("a b") << false;
   QTest::newRow("userinfo-at") << QStringLiteral("a@b") << false;
   QTest::newRow("colon") << QStringLiteral("a:b") << false;
@@ -363,6 +369,12 @@ void AssetLocatorTests::mutationIdValidated_data() {
       << QStringLiteral("../etc") << int(AssetSide::MutatedFront) << false;
   QTest::newRow("mutated-front-valid-mutation-id")
       << QStringLiteral("mut-42_a") << int(AssetSide::MutatedFront) << true;
+  // Real pinned digest sources contain uppercase mutationId segments (e.g.
+  // contracts/asset-locale-digest-sources/fr.json's
+  // "cards/01514_Mutated19.avif"); the identifier grammar must accept ASCII
+  // uppercase letters, case preserved, not just lowercase.
+  QTest::newRow("mutated-front-uppercase-mutation-id")
+      << QStringLiteral("Mutated19") << int(AssetSide::MutatedFront) << true;
   QTest::newRow("front-side-with-mutation-id-rejected")
       << QStringLiteral("mut42") << int(AssetSide::Front) << false;
 }

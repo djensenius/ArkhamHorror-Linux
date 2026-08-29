@@ -37,17 +37,22 @@ bool isCategoryLocalizable(AssetCategory category) {
          category == AssetCategory::HomebrewCard;
 }
 
-bool isAsciiLowerAlnum(QChar c) {
+bool isAsciiAlnum(QChar c) {
   const char16_t u = c.unicode();
-  return (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'z');
+  return (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'z') ||
+         (u >= u'A' && u <= u'Z');
 }
 
 bool isAllowedIdentifierChar(QChar c) {
-  return isAsciiLowerAlnum(c) || c == u'-' || c == u'_';
+  return isAsciiAlnum(c) || c == u'-' || c == u'_';
 }
 
-// Strict allow-list grammar shared by every category: only ASCII lowercase
-// letters, digits, '-', and '_'; must start and end with an alphanumeric
+// Strict allow-list grammar shared by every category: only ASCII letters
+// (both cases -- real pinned digest sources contain uppercase segments,
+// e.g. contracts/asset-locale-digest-sources/ita.json's "cards/04242B"
+// card code and fr.json's "cards/01514_Mutated19" mutationId, and case is
+// never normalized away, per this project's case-sensitive-identifier
+// policy), digits, '-', and '_'; must start and end with an alphanumeric
 // character. This structurally rejects "/", "\\", "..", ".", control
 // characters, "%", "@", ":", "?", "#", whitespace, and any non-ASCII code
 // point -- there is no separate sanitisation step, so a hostile identifier
@@ -57,12 +62,42 @@ bool isValidIdentifier(const QString &identifier, qsizetype maxLength) {
   if (identifier.isEmpty() || identifier.size() > maxLength) {
     return false;
   }
-  if (!isAsciiLowerAlnum(identifier.front()) ||
-      !isAsciiLowerAlnum(identifier.back())) {
+  if (!isAsciiAlnum(identifier.front()) || !isAsciiAlnum(identifier.back())) {
     return false;
   }
   for (const QChar c : identifier) {
     if (!isAllowedIdentifierChar(c)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isAsciiLower(QChar c) {
+  const char16_t u = c.unicode();
+  return (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'z');
+}
+
+bool isAllowedHomebrewNamespaceChar(QChar c) {
+  return isAsciiLower(c) || c == u'-' || c == u'_';
+}
+
+// homebrewNamespace is a community-authored slug (a campaign/collection
+// name a homebrew author picks), not an upstream-assigned card code, and
+// has no known real-world case-sensitive requirement the way official
+// card identifiers/mutationIds do (see isValidIdentifier above) -- it
+// keeps the original strict ASCII-lowercase-only grammar so homebrew
+// authors get one unambiguous canonical spelling rather than "MyCampaign"
+// and "mycampaign" silently addressing different cache/CDN paths.
+bool isValidHomebrewNamespace(const QString &identifier, qsizetype maxLength) {
+  if (identifier.isEmpty() || identifier.size() > maxLength) {
+    return false;
+  }
+  if (!isAsciiLower(identifier.front()) || !isAsciiLower(identifier.back())) {
+    return false;
+  }
+  for (const QChar c : identifier) {
+    if (!isAllowedHomebrewNamespaceChar(c)) {
       return false;
     }
   }
@@ -306,8 +341,8 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
   const bool wantsHomebrewNamespace =
       key.category == AssetCategory::HomebrewCard;
   if (wantsHomebrewNamespace) {
-    if (!isValidIdentifier(key.homebrewNamespace,
-                           kHomebrewIdentifierMaxLength)) {
+    if (!isValidHomebrewNamespace(key.homebrewNamespace,
+                                  kHomebrewIdentifierMaxLength)) {
       return AssetError{
           AssetErrorCode::InvalidHomebrewNamespace,
           QStringLiteral("HomebrewCard requires a valid homebrewNamespace"),
