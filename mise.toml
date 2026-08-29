@@ -58,8 +58,13 @@ run = '''
 # plain "clang-format" formula happens to track; fall back to whatever
 # "clang-format" is on PATH (e.g. Linux CI itself, or a macOS setup that
 # hasn't run setup:macos) if the pinned binary isn't present.
-CLANG_FORMAT="$(brew --prefix llvm@18 2>/dev/null)/bin/clang-format"
-[ -x "$CLANG_FORMAT" ] || CLANG_FORMAT="clang-format"
+CLANG_FORMAT="clang-format"
+if command -v brew >/dev/null 2>&1; then
+  LLVM18_PREFIX="$(brew --prefix llvm@18 2>/dev/null || true)"
+  if [ -x "$LLVM18_PREFIX/bin/clang-format" ]; then
+    CLANG_FORMAT="$LLVM18_PREFIX/bin/clang-format"
+  fi
+fi
 "$CLANG_FORMAT" --dry-run --Werror src/*.cpp src/*.h tests/*.cpp
 for file in qml/*.qml; do
   formatted="$(mktemp)"
