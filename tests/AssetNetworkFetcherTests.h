@@ -52,6 +52,7 @@ private slots:
   void pngWithApngAnimationChunksIsRejected();
   void pngWithTrailingBytesAfterIendIsRejected();
   void pngWithMultipleIhdrChunksIsRejected();
+  void pngWithNonConsecutiveIdatChunksIsRejected();
   void avifRealFixtureAlwaysDecodesViaLibavif();
   void avifImageSequenceIsRejectedAsMalformedImage();
   void avifMalformedContainerIsReportedAsMalformedImage();

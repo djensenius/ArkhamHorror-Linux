@@ -124,6 +124,8 @@ add_library(arkham_foundation STATIC
     src/AssetLocator.h
     src/AssetNetworkFetcher.cpp
     src/AssetNetworkFetcher.h
+    src/AssetPngValidator.cpp
+    src/AssetPngValidator.h
     src/AssetRequestCoordinator.cpp
     src/AssetRequestCoordinator.h
     src/AssetTypes.cpp
@@ -291,6 +293,7 @@ if(BUILD_TESTING)
     qt_add_executable(arkham-asset-tests
         tests/AssetCacheTests.cpp
         tests/AssetCacheTests.h
+        tests/AssetFetchUrlTestSupport.h
         tests/AssetImageRequestTests.cpp
         tests/AssetImageRequestTests.h
         tests/AssetLocaleDigestTests.cpp

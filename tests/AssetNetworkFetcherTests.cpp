@@ -1,7 +1,9 @@
 #include "AssetNetworkFetcherTests.h"
 
+#include "AssetFetchUrlTestSupport.h"
 #include "AssetJpegDecoder.h"
 #include "AssetNetworkFetcher.h"
+#include "AssetPngValidator.h"
 #include "MockHttpServer.h"
 
 #include <QBuffer>
@@ -31,6 +33,23 @@ using namespace Arkham;
 // enforces that no code anywhere -- test or production -- can construct
 // an AssetFetchUrl directly from a QUrl without going through the
 // validating validate() factory.
+//
+// Review round-5 item 1 (PR #18 cumulative review at 6bdc68cf): validate()
+// itself is now private too (reachable only from AssetRequestCoordinator
+// and, via the dedicated AssetFetchUrlTestSupport seam included above,
+// this test suite) -- see AssetNetworkFetcher.h's class comment on
+// AssetFetchUrl. That access restriction is enforced structurally by the
+// compiler at every call site (this translation unit only compiles
+// because it goes through AssetFetchUrlTestSupport::validate(), never
+// AssetFetchUrl::validate() directly) rather than by a trait here:
+// std::is_constructible's access-checking guarantee is specific to
+// constructors, and there is no equivalent SFINAE-friendly trait for an
+// arbitrary private static member function's accessibility (confirmed
+// experimentally: a requires-expression naming an inaccessible private
+// member is a hard compile error in this project's compilers, not a
+// substitution failure) -- so unlike the constructibility checks below,
+// this specific guarantee cannot be expressed as a negative static_assert
+// without producing a permanently-failing build.
 static_assert(!std::is_constructible_v<AssetFetchUrl, QUrl>,
               "AssetFetchUrl must not be constructible from an arbitrary "
               "QUrl outside AssetFetchUrl::validate()");
@@ -263,10 +282,11 @@ QByteArray patchAvifIspeBoxDimensions(const QByteArray &original, quint32 width,
 // a test bug; qFatal() for the same reason fetchAndWait()'s timeout
 // branch does.
 AssetFetchUrl mustValidate(const QUrl &url) {
-  AssetOutcome<AssetFetchUrl> validated = AssetFetchUrl::validate(url);
+  AssetOutcome<AssetFetchUrl> validated =
+      AssetFetchUrlTestSupport::validate(url);
   if (!validated) {
     qFatal("mustValidate() was given a URL that failed "
-           "AssetFetchUrl::validate(): %s",
+           "AssetFetchUrlTestSupport::validate(): %s",
            qPrintable(validated.error().message));
   }
   return *validated;
@@ -292,10 +312,11 @@ fetchAndWait(AssetNetworkFetcher &fetcher, const QUrl &url, AssetFormat format,
   // a validation failure here is always a test bug, not an expected
   // outcome -- qFatal() for the same reason the timeout branch below
   // does.
-  const AssetOutcome<AssetFetchUrl> validated = AssetFetchUrl::validate(url);
+  const AssetOutcome<AssetFetchUrl> validated =
+      AssetFetchUrlTestSupport::validate(url);
   if (!validated) {
     qFatal("fetchAndWait() was given a URL that failed "
-           "AssetFetchUrl::validate(): %s",
+           "AssetFetchUrlTestSupport::validate(): %s",
            qPrintable(validated.error().message));
   }
   std::optional<Outcome> result;
@@ -355,7 +376,7 @@ void AssetNetworkFetcherTests::
   QCOMPARE(fileUrl.scheme(), QStringLiteral("file"));
 
   const AssetOutcome<AssetFetchUrl> validated =
-      AssetFetchUrl::validate(fileUrl);
+      AssetFetchUrlTestSupport::validate(fileUrl);
   QVERIFY(!validated);
   QCOMPARE(validated.error().code, AssetErrorCode::UnsupportedScheme);
 }
@@ -409,7 +430,8 @@ void AssetNetworkFetcherTests::
 
   const QUrl url(urlString, QUrl::StrictMode);
   QVERIFY(url.isValid());
-  const AssetOutcome<AssetFetchUrl> validated = AssetFetchUrl::validate(url);
+  const AssetOutcome<AssetFetchUrl> validated =
+      AssetFetchUrlTestSupport::validate(url);
   QVERIFY(!validated);
   QCOMPARE(validated.error().code, expectedCode);
 }
@@ -422,14 +444,14 @@ void AssetNetworkFetcherTests::
   const QUrl httpsUrl(QStringLiteral("https://cdn.example.com/img/a.png"),
                       QUrl::StrictMode);
   const AssetOutcome<AssetFetchUrl> validatedHttps =
-      AssetFetchUrl::validate(httpsUrl);
+      AssetFetchUrlTestSupport::validate(httpsUrl);
   QVERIFY2(bool(validatedHttps), qPrintable(validatedHttps.error().message));
   QCOMPARE(validatedHttps->url(), httpsUrl);
 
   const QUrl loopbackUrl(QStringLiteral("http://127.0.0.1:9999/img/a.png"),
                          QUrl::StrictMode);
   const AssetOutcome<AssetFetchUrl> validatedLoopback =
-      AssetFetchUrl::validate(loopbackUrl);
+      AssetFetchUrlTestSupport::validate(loopbackUrl);
   QVERIFY2(bool(validatedLoopback),
            qPrintable(validatedLoopback.error().message));
   QCOMPARE(validatedLoopback->url(), loopbackUrl);
@@ -1233,6 +1255,121 @@ void AssetNetworkFetcherTests::pngWithMultipleIhdrChunksIsRejected() {
   QVERIFY(result.has_value());
   QVERIFY(!bool(*result));
   QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::pngWithNonConsecutiveIdatChunksIsRejected() {
+  // Round-5 review item 3: a PNG whose single logical IDAT run has been
+  // split into two separate IDAT chunks with an intervening chunk of a
+  // different type (IHDR,IDAT,tEXt,IDAT,IEND) is CRC-valid per-chunk and
+  // a decoder that merely concatenates every IDAT payload it encounters
+  // (ignoring the PNG spec's "IDAT chunks must be consecutive"
+  // requirement) would accept and cache it. This must be rejected.
+  auto crc32Of = [](const QByteArray &bytes) {
+    static const auto table = [] {
+      std::array<quint32, 256> t{};
+      for (quint32 n = 0; n < 256; ++n) {
+        quint32 c = n;
+        for (int k = 0; k < 8; ++k) {
+          c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        }
+        t[n] = c;
+      }
+      return t;
+    }();
+    quint32 crcAcc = 0xFFFFFFFFu;
+    for (unsigned char byte : bytes) {
+      crcAcc = table[(crcAcc ^ byte) & 0xFFu] ^ (crcAcc >> 8);
+    }
+    return crcAcc ^ 0xFFFFFFFFu;
+  };
+  auto appendChunk = [&](QByteArray &out, const QByteArray &type,
+                         const QByteArray &data) {
+    QVERIFY(type.size() == 4);
+    const quint32 length = static_cast<quint32>(data.size());
+    out.append(static_cast<char>((length >> 24) & 0xFF));
+    out.append(static_cast<char>((length >> 16) & 0xFF));
+    out.append(static_cast<char>((length >> 8) & 0xFF));
+    out.append(static_cast<char>(length & 0xFF));
+    out.append(type);
+    out.append(data);
+    const quint32 crc = crc32Of(type + data);
+    out.append(static_cast<char>((crc >> 24) & 0xFF));
+    out.append(static_cast<char>((crc >> 16) & 0xFF));
+    out.append(static_cast<char>((crc >> 8) & 0xFF));
+    out.append(static_cast<char>(crc & 0xFF));
+  };
+
+  const QByteArray originalPng = encodeImage(16, 16, "png");
+  const qsizetype idatTypeOffset = originalPng.indexOf("IDAT");
+  QVERIFY(idatTypeOffset > 4);
+  const qsizetype idatLengthOffset = idatTypeOffset - 4;
+  const quint32 idatLength =
+      (static_cast<unsigned char>(
+           originalPng[static_cast<int>(idatLengthOffset)])
+       << 24) |
+      (static_cast<unsigned char>(
+           originalPng[static_cast<int>(idatLengthOffset + 1)])
+       << 16) |
+      (static_cast<unsigned char>(
+           originalPng[static_cast<int>(idatLengthOffset + 2)])
+       << 8) |
+      static_cast<unsigned char>(
+          originalPng[static_cast<int>(idatLengthOffset + 3)]);
+  const qsizetype idatDataOffset = idatTypeOffset + 4;
+  const QByteArray idatData =
+      originalPng.mid(idatDataOffset, static_cast<qsizetype>(idatLength));
+  QVERIFY(idatData.size() > 4); // needs to be splittable into two nonempty
+                                // halves for this test to be meaningful
+
+  const qsizetype splitPoint = idatData.size() / 2;
+  const QByteArray firstHalf = idatData.left(splitPoint);
+  const QByteArray secondHalf = idatData.mid(splitPoint);
+
+  // Rebuild: signature + IHDR (unchanged) + IDAT(firstHalf) + tEXt +
+  // IDAT(secondHalf) + IEND (unchanged). Concatenating firstHalf+secondHalf
+  // reproduces the exact original (valid) zlib stream, so any rejection
+  // observed below is attributable ONLY to the non-consecutive IDAT
+  // structure, not to corrupted image data.
+  const qsizetype idatChunkEnd = idatDataOffset + idatLength + 4; // + CRC
+  QByteArray body = originalPng.left(idatLengthOffset);
+  appendChunk(body, "IDAT", firstHalf);
+  appendChunk(body, "tEXt", QByteArrayLiteral("split"));
+  appendChunk(body, "IDAT", secondHalf);
+  body += originalPng.mid(idatChunkEnd);
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = body;
+  server.setResponse(QStringLiteral("/split-idat.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/split-idat.png")),
+      AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+
+  // The above end-to-end assertion alone is not sufficient proof that
+  // THIS project's own pngChunksAreStrictlyValid() is what rejected the
+  // payload: a sufficiently strict host libpng build may independently
+  // refuse to decode a non-consecutive IDAT stream regardless of our own
+  // pre-check (verified locally: this exact crafted body is ALSO
+  // rejected by QImageReader's underlying libpng even with the
+  // idatRunClosed tracking above disabled). Calling the validator
+  // directly proves this project's OWN structural policy -- not an
+  // incidental agreement with one particular host decoder -- is what
+  // makes this rejection deterministic across every target platform.
+  QVERIFY(!Arkham::pngChunksAreStrictlyValid(body));
+  // Control: the unmodified original body (same image data, still
+  // structurally a single consecutive IDAT run) must still be accepted,
+  // proving the rejection above is specific to the non-consecutive
+  // structure and not some incidental difference introduced by rebuilding
+  // the byte sequence chunk-by-chunk.
+  QVERIFY(Arkham::pngChunksAreStrictlyValid(originalPng));
 }
 
 void AssetNetworkFetcherTests::avifRealFixtureAlwaysDecodesViaLibavif() {

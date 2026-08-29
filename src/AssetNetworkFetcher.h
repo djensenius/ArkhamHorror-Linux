@@ -17,36 +17,72 @@ class QNetworkAccessManager;
 class QNetworkReply;
 class QTimer;
 
+// Forward-declared at GLOBAL scope (matching where these Qt test classes
+// are actually defined -- see tests/AssetNetworkFetcherTests.h et al.,
+// none of which wrap their test class in any namespace) so that the
+// `friend class ::AssetNetworkFetcherTests;` etc. declarations inside
+// namespace Arkham below (explicitly `::`-qualified -- an unqualified
+// friend name written inside a namespace does NOT find an
+// already-visible same-named declaration from an enclosing/global scope;
+// it introduces a brand-new, unrelated class nested inside that
+// namespace instead, per the C++ standard's friend name lookup rules)
+// refer to these actual global-scope test classes.
+class AssetNetworkFetcherTests;
+class AssetRequestCoordinatorTests;
+class AssetImageRequestTests;
+
 namespace Arkham {
+
+class AssetRequestCoordinator;
+class AssetFetchUrlTestSupport;
 
 // Review round-4 item 1: the ONLY way AssetNetworkFetcher::fetch() can be
 // reached at all -- a QUrl by itself, however innocuous-looking, is never
 // an acceptable fetch() argument. An AssetFetchUrl cannot be default- or
-// copy-constructed from an arbitrary QUrl: its only public constructor
-// path is the validating factory validate(), which reuses this project's
+// copy-constructed from an arbitrary QUrl: its only construction path is
+// the validating factory validate(), which reuses this project's
 // existing shared transport-security policy exactly (see
 // isSecureOrLoopbackAuthTransport() in AuthTransportSecurity.h, already
 // used for the same purpose elsewhere) rather than forking a weaker,
 // asset-only reimplementation of "is this URL safe to request": https is
 // permitted to any host; http is permitted ONLY to an exact canonical
 // loopback spelling; a URL carrying userinfo, a missing host, a query
-// string, or a fragment is rejected outright. A real AssetCandidate::url
-// (built by AssetLocator from an already-validated ValidatedAssetSource
-// plus a hardened relative path -- see AssetTypes.cpp/AssetLocator.cpp)
-// always trivially satisfies this policy; an arbitrary, forged, or
-// otherwise unvalidated URL -- passed directly to fetch() by a future or
-// buggy call site, bypassing AssetLocator entirely -- can never become an
-// AssetFetchUrl in the first place, so it can never reach this class's
-// QNetworkAccessManager at all. There is no bypass constructor, public or
-// private, other than validate().
+// string, or a fragment is rejected outright.
+//
+// Review round-5 item 1 (PR #18 cumulative review at 6bdc68cf): validate()
+// itself is now PRIVATE. Before this, ANY code anywhere in the process --
+// not just AssetLocator's own candidate-building pipeline -- could call
+// AssetFetchUrl::validate(anyUrlItLikes) directly and obtain a value that
+// AssetNetworkFetcher::fetch() would accept, completely bypassing
+// AssetLocator's own additional asset-specific canonicalisation/identity
+// checks (exact configured host/port, hostile-identifier rejection,
+// canonical base-URL construction -- see AssetLocator.cpp/AssetTypes.cpp).
+// Generic transport-security safety (this class's own concern) is not the
+// same guarantee as "this URL was actually produced by the asset
+// locator/source pipeline this project trusts" (a concern that belongs to
+// AssetRequestCoordinator/AssetLocator, not here) -- conflating the two by
+// leaving validate() universally callable let a future or buggy call site
+// reach a real network fetch with an attacker-influenced URL that merely
+// happens to be https (or exact loopback http), never having gone through
+// AssetLocator at all. validate() is now reachable only from
+// AssetRequestCoordinator (this project's sole production caller, which
+// only ever calls it with an AssetCandidate::url that AssetLocator already
+// built from a validated ValidatedAssetSource) and from this project's own
+// test suite (via the dedicated AssetFetchUrlTestSupport seam declared in
+// tests/AssetFetchUrlTestSupport.h, which every test file that needs to
+// construct one directly -- rather than through a full
+// AssetRequestCoordinator round-trip -- includes explicitly). There is no
+// other bypass, public or private.
 class AssetFetchUrl {
 public:
-  [[nodiscard]] static AssetOutcome<AssetFetchUrl> validate(const QUrl &url);
-
   [[nodiscard]] const QUrl &url() const { return m_url; }
 
 private:
+  [[nodiscard]] static AssetOutcome<AssetFetchUrl> validate(const QUrl &url);
   explicit AssetFetchUrl(QUrl url) : m_url(std::move(url)) {}
+
+  friend class AssetRequestCoordinator;
+  friend class AssetFetchUrlTestSupport;
 
   QUrl m_url;
 };
@@ -206,14 +242,6 @@ public:
   create(Limits limits = {},
          std::chrono::milliseconds timeout = kDefaultTimeout,
          QObject *parent = nullptr);
-  // TEST-ONLY factory: borrows an externally-owned, isolated
-  // QNetworkAccessManager (e.g. one pointed at a loopback test server).
-  // See the constructor of the same signature below for why production/
-  // composition code must never call this.
-  [[nodiscard]] static AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>
-  create(QNetworkAccessManager &nam, Limits limits = {},
-         std::chrono::milliseconds timeout = kDefaultTimeout,
-         QObject *parent = nullptr);
 
   // Production constructor: owns a dedicated QNetworkAccessManager.
   //
@@ -230,28 +258,6 @@ public:
   // forced to handle a factory result they know can never be an error.
   explicit AssetNetworkFetcher(
       Limits limits = {}, std::chrono::milliseconds timeout = kDefaultTimeout,
-      QObject *parent = nullptr);
-  // TEST-ONLY constructor: borrows an externally-owned, isolated
-  // QNetworkAccessManager (e.g. one pointed at a loopback test server).
-  // See the production constructor's comment above for the same
-  // fail-closed-not-throwing configuration-validation behaviour.
-  //
-  // Review round-4 item 1: production/composition code must always use
-  // the owned-manager constructor (or create()) above, never this one.
-  // The borrowed manager is not this class's own object: this
-  // constructor still forces QNetworkProxy::NoProxy on it once here (see
-  // the .cpp), but fetch() ALSO re-asserts NoProxy immediately before
-  // every individual request precisely because a caller retaining its
-  // own live reference to the same borrowed manager could otherwise
-  // reconfigure its proxy at any later point, silently reintroducing
-  // exactly the credential/proxy leak this class exists to prevent. This
-  // constructor exists purely so tests can point a fetcher at an
-  // in-process loopback MockHttpServer without needing a real, separate
-  // QNetworkAccessManager per test case; it must never be reachable from
-  // any real application wiring.
-  explicit AssetNetworkFetcher(
-      QNetworkAccessManager &nam, Limits limits = {},
-      std::chrono::milliseconds timeout = kDefaultTimeout,
       QObject *parent = nullptr);
   ~AssetNetworkFetcher() override;
 
@@ -338,6 +344,32 @@ private:
     FetchCallback callback;
   };
 
+  // TEST-ONLY constructor: borrows an externally-owned, isolated
+  // QNetworkAccessManager (e.g. one pointed at a loopback test server).
+  //
+  // Review round-5 item 1 (PR #18 cumulative review at 6bdc68cf): this
+  // constructor is now PRIVATE, reachable only from this project's own
+  // test suite via the friend declarations below. Before this, it was
+  // public, and the ONLY thing stopping arbitrary production/composition
+  // code from calling it directly with an arbitrary, possibly
+  // caller-configured QNetworkAccessManager (which could carry cookies, a
+  // proxy with embedded credentials, or an authentication cache, and
+  // whose lifetime this class does not own or control -- an external
+  // caller destroying it out from under a still-alive AssetNetworkFetcher
+  // is a use-after-free) was a doc comment. This constructor still forces
+  // QNetworkProxy::NoProxy on the borrowed manager once here (see the
+  // .cpp), and fetch() ALSO re-asserts NoProxy immediately before every
+  // individual request precisely because a caller retaining its own live
+  // reference to the same borrowed manager could otherwise reconfigure
+  // its proxy at any later point -- but private construction is what
+  // actually proves an arbitrary/external QNetworkAccessManager can never
+  // reach this class from production code at all, rather than merely
+  // documenting that it must not.
+  explicit AssetNetworkFetcher(
+      QNetworkAccessManager &nam, Limits limits = {},
+      std::chrono::milliseconds timeout = kDefaultTimeout,
+      QObject *parent = nullptr);
+
   AssetNetworkFetcher(std::unique_ptr<QNetworkAccessManager> ownedNam,
                       QNetworkAccessManager *borrowedNam, Limits limits,
                       std::chrono::milliseconds timeout, QObject *parent);
@@ -355,6 +387,16 @@ private:
   void completeWithError(quint64 handle, AssetError error);
   void handleReadyRead(quint64 handle);
   void handleFinished(quint64 handle);
+
+  // Review round-5 item 1: the ONLY code, anywhere, permitted to
+  // construct an AssetNetworkFetcher against a borrowed (non-owned)
+  // QNetworkAccessManager -- this project's own test suite. No
+  // production/composition code is listed here, and none may be added
+  // without also justifying why it needs to bypass this class's owned-
+  // manager isolation guarantee.
+  friend class ::AssetNetworkFetcherTests;
+  friend class ::AssetRequestCoordinatorTests;
+  friend class ::AssetImageRequestTests;
 
   std::unique_ptr<QNetworkAccessManager> m_ownedNam;
   QNetworkAccessManager &m_nam;
