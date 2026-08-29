@@ -409,6 +409,115 @@ void AssetRequestCoordinatorTests::
   QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
 }
 
+void AssetRequestCoordinatorTests::
+    keysDifferingOnlyByBackIdentityFieldsNeverCoalesce() {
+  // Fresh-cumulative-review regression: canonicalOperationKey() joined
+  // assetBase/category/identifier/side/locale/homebrewNamespace/
+  // mutationId/format, but omitted backKind/otherSideIdentifier/
+  // customBackFilename entirely -- even though AssetKey::operator==
+  // compares all three (see AssetTypes.h). Two AssetSide::Back requests
+  // with identical everything else but a DIFFERENT explicit other-side
+  // card code would therefore incorrectly coalesce onto the same
+  // in-flight operation, and whichever request's candidate the shared
+  // operation actually resolved/fetched would silently be delivered to
+  // BOTH consumers -- one of them receiving the wrong card's back art
+  // entirely.
+  //
+  // This uses CardBackKind::ExplicitOtherSide with two different
+  // `otherSideIdentifier` values (identifier itself is empty for this
+  // backKind, so it alone could never distinguish the two keys): the
+  // resulting AssetKeys are NOT operator==-equal, and -- unlike the
+  // locale-only regression above, which deliberately keeps both
+  // candidates resolving to the SAME URL to isolate the operation-key
+  // encoding itself -- these two also resolve to two genuinely DIFFERENT
+  // candidate URLs/card art, so a coalescing bug here would be
+  // observable as one consumer receiving the wrong image's bytes, not
+  // merely a bookkeeping-only discrepancy.
+  MockHttpServer server;
+
+  MockHttpServer::Response responseOne;
+  responseOne.contentType = "image/avif";
+  responseOne.body = encodeAvifFixture(8, 8);
+  responseOne.slowDrip = true; // both requests must overlap in flight
+  responseOne.chunkSize = 64;
+  responseOne.chunkDelayMs = 20;
+  server.setResponse(QStringLiteral("/img/arkham/cards/01001.avif"),
+                     responseOne);
+
+  MockHttpServer::Response responseTwo;
+  responseTwo.contentType = "image/avif";
+  responseTwo.body = encodeAvifFixture(16, 16);
+  responseTwo.slowDrip = true;
+  responseTwo.chunkSize = 64;
+  responseTwo.chunkDelayMs = 20;
+  server.setResponse(QStringLiteral("/img/arkham/cards/01002.avif"),
+                     responseTwo);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  const QString base = QStringLiteral("http://127.0.0.1:%1").arg(server.port());
+  const AssetOutcome<ValidatedAssetSource> validatedBase =
+      ValidatedAssetSource::fromRaw(base);
+  QVERIFY2(bool(validatedBase), qPrintable(validatedBase.error().message));
+
+  AssetKey keyOne;
+  keyOne.assetBase = *validatedBase;
+  keyOne.category = AssetCategory::Card;
+  keyOne.side = AssetSide::Back;
+  keyOne.backKind = CardBackKind::ExplicitOtherSide;
+  keyOne.otherSideIdentifier = QStringLiteral("01001");
+  keyOne.format = AssetFormat::Avif;
+
+  AssetKey keyTwo = keyOne;
+  keyTwo.otherSideIdentifier = QStringLiteral("01002");
+
+  QVERIFY(!(keyOne == keyTwo));
+
+  const auto candidatesOne = AssetLocator::resolveCandidates(keyOne);
+  QVERIFY2(bool(candidatesOne), qPrintable(candidatesOne.error().message));
+  const auto candidatesTwo = AssetLocator::resolveCandidates(keyTwo);
+  QVERIFY2(bool(candidatesTwo), qPrintable(candidatesTwo.error().message));
+  QVERIFY(candidatesOne->first().url != candidatesTwo->first().url);
+
+  int completions = 0;
+  std::optional<Result> resultOne;
+  std::optional<Result> resultTwo;
+  coordinator.request(keyOne, [&](Result r) {
+    ++completions;
+    resultOne = std::move(r);
+  });
+  coordinator.request(keyTwo, [&](Result r) {
+    ++completions;
+    resultTwo = std::move(r);
+  });
+
+  // The real assertion: two AssetKeys that differ only by back-identity
+  // fields must occupy two SEPARATE in-flight operations, never one
+  // merged operation.
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 2);
+
+  QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01001.avif")),
+           1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/cards/01002.avif")),
+           1);
+
+  QVERIFY2(bool(*resultOne), qPrintable(resultOne->error().message));
+  QVERIFY2(bool(*resultTwo), qPrintable(resultTwo->error().message));
+  // Each consumer must receive exactly the bytes for ITS OWN requested
+  // card, never the other's -- the failure mode a coalescing bug here
+  // would actually produce.
+  QCOMPARE((**resultOne).encodedBytes, responseOne.body);
+  QCOMPARE((**resultTwo).encodedBytes, responseTwo.body);
+  QCOMPARE((**resultOne).dimensions, QSize(8, 8));
+  QCOMPARE((**resultTwo).dimensions, QSize(16, 16));
+}
+
 void AssetRequestCoordinatorTests::cancellingOneConsumerNeverAffectsAnother() {
   MockHttpServer server;
   MockHttpServer::Response response;

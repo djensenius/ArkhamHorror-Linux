@@ -56,12 +56,29 @@ QString canonicalizedAssetBase(const ValidatedAssetSource &assetBase) {
 }
 
 QString canonicalOperationKey(const AssetKey &key) {
+  // Review round-3 fresh-review item: this must cover EVERY field
+  // AssetKey::operator== compares, or two genuinely different requests
+  // (identical identifier/side but a different back identity) can
+  // incorrectly coalesce onto the same in-flight operation and one
+  // consumer would receive the wrong candidate/result. backKind is
+  // std::nullopt for every non-Back side (see AssetKey's own field
+  // documentation); it is mapped to a "none" sentinel string (never
+  // producible by QString::number() of an enum's underlying int) before
+  // being length-prefixed the same uniform way as every other field
+  // here, so its presence/absence is unambiguous without a separate
+  // encoding scheme.
+  const QString backKindString =
+      key.backKind.has_value()
+          ? QString::number(static_cast<int>(*key.backKind))
+          : QStringLiteral("none");
   return lengthPrefixed(canonicalizedAssetBase(key.assetBase)) +
          lengthPrefixed(QString::number(static_cast<int>(key.category))) +
          lengthPrefixed(key.identifier) +
          lengthPrefixed(QString::number(static_cast<int>(key.side))) +
          lengthPrefixed(key.locale) + lengthPrefixed(key.homebrewNamespace) +
-         lengthPrefixed(key.mutationId) +
+         lengthPrefixed(key.mutationId) + lengthPrefixed(backKindString) +
+         lengthPrefixed(key.otherSideIdentifier) +
+         lengthPrefixed(key.customBackFilename) +
          lengthPrefixed(QString::number(static_cast<int>(key.format)));
 }
 

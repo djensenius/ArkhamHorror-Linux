@@ -49,6 +49,7 @@ private slots:
 
   void coalescesConcurrentIdenticalRequests();
   void keysDifferingOnlyByHostileLocaleContentNeverCoalesce();
+  void keysDifferingOnlyByBackIdentityFieldsNeverCoalesce();
   void keysDifferingOnlyByAssetBaseTrailingSlashStillCoalesce();
   void cancellingOneConsumerNeverAffectsAnother();
   void lastConsumerCancellationAbortsUnderlyingFetch();
