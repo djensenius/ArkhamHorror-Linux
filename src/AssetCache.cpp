@@ -513,9 +513,13 @@ void AssetCache::reapAndEnforceQuota() {
   // behind by some other means) is exactly as much of a leftover as a
   // stray file, and must not be invisible to this repair sweep. Any
   // directory found is removed recursively below, before the
-  // files-only key-shape pass that follows.
+  // files-only key-shape pass that follows. QDir::Hidden is included
+  // too: QDir's filters exclude hidden entries (dotfiles) by default,
+  // so a stray hidden file/directory would otherwise be just as
+  // invisible to this sweep as a stray directory was before this fix.
   const QStringList allEntries = dir.entryList(
-      QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+      QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot,
+      QDir::Name);
   QStringList allFiles;
   allFiles.reserve(allEntries.size());
   for (const QString &name : allEntries) {
@@ -653,8 +657,12 @@ qint64 AssetCache::diskUsageBytes() const {
   // stray directories) runs at all in store()'s hot path -- if a stray
   // directory's contents weren't counted here, that gate could never
   // trip, and the sweep that would actually clean it up might never run.
+  // QDir::Hidden is included too: QDirIterator's filters exclude hidden
+  // entries by default, so a stray hidden file would otherwise undercount
+  // usage and could prevent the high-water-mark gate from ever tripping.
   qint64 total = 0;
-  QDirIterator it(m_directory, QDir::Files, QDirIterator::Subdirectories);
+  QDirIterator it(m_directory, QDir::Files | QDir::Hidden,
+                  QDirIterator::Subdirectories);
   while (it.hasNext()) {
     it.next();
     total += it.fileInfo().size();

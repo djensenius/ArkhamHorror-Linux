@@ -47,7 +47,7 @@ using Outcome = AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult>;
 // site that ever forgot to), aborts deterministically via qFatal(),
 // enforced in every build configuration, exactly like this test suite's
 // other "must never silently continue" invariants (see
-// MockHttpServer::run()'s qFatal() on listen failure).
+// MockHttpServer's constructor qFatal()ing on listen() failure).
 std::optional<Outcome>
 fetchAndWait(AssetNetworkFetcher &fetcher, const QUrl &url, AssetFormat format,
              AssetNetworkFetcher::ConditionalHeaders conditional = {},

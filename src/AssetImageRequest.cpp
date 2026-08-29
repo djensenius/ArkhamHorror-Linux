@@ -71,8 +71,13 @@ AssetImageRequest::~AssetImageRequest() {
 
 void AssetImageRequest::load(const AssetKey &key,
                              const QString &callerAccessibleDescription) {
+  // cancel() already bumps m_generation unconditionally (invalidating any
+  // in-flight callback tied to the previous generation, whether or not a
+  // handle was actually live). A second bump here would be redundant --
+  // this new request's generation only needs to be distinct from
+  // whatever generation preceded it, which cancel()'s bump already
+  // guarantees.
   cancel();
-  ++m_generation;
   const quint64 generation = m_generation;
   const QString base =
       baseAccessibleDescriptionFor(key, callerAccessibleDescription);
