@@ -2,6 +2,7 @@
 
 #include "AssetTypes.h"
 
+#include <QByteArray>
 #include <QHash>
 #include <QImage>
 #include <QObject>

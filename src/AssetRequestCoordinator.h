@@ -35,11 +35,16 @@ namespace Arkham {
 // stored validators at all (e.g. an origin that never sent either header)
 // is served immediately with no network round trip, exactly as before.
 //
-// Concurrent identical requests (same cache key, derived from the SAME
-// resolved candidate -- see AssetCache::cacheKeyFor()) are coalesced: a
-// second request() for a key already in flight attaches as an additional
-// consumer of the same underlying operation rather than issuing a second
-// network fetch. Each consumer receives its own opaque RequestHandle --
+// Concurrent identical requests (same canonicalized AssetKey -- every
+// field, including assetBase/category/identifier/side/locale/format,
+// compares equal; see canonicalOperationKey() in the .cpp) are coalesced:
+// a second request() for a key already in flight attaches as an
+// additional consumer of the same underlying operation rather than
+// issuing a second network fetch. This is deliberately independent of
+// AssetCache::cacheKeyFor(), which hashes a resolved *candidate* URL --
+// two AssetKeys that differ (e.g. only in locale) are never coalesced
+// here even if they would happen to resolve to the same candidate URL.
+// Each consumer receives its own opaque RequestHandle --
 // including immediate cache-hit and error completions, which are queued
 // through the same operation/consumer bookkeeping specifically so that
 // handle remains valid for cancel() up until the queued delivery actually

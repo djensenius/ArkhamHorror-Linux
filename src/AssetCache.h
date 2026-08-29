@@ -1,9 +1,11 @@
 #pragma once
 
+#include <QByteArray>
 #include <QDateTime>
 #include <QHash>
 #include <QImage>
 #include <QMutex>
+#include <QSize>
 #include <QString>
 #include <QUrl>
 #include <optional>
