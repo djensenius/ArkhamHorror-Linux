@@ -212,6 +212,30 @@ public:
     return m_operations.size();
   }
 
+  // Round-6 item 8: the number of DISTINCT shared candidate-fetch
+  // attempts currently in flight -- lets a test assert that N concurrent
+  // requests for DIFFERENT logical AssetKeys resolving to the SAME
+  // candidate genuinely share exactly one attempt (this count stays 1
+  // regardless of N) rather than merely trusting the coalescing
+  // happened.
+  [[nodiscard]] int candidateAttemptCountForTesting() const {
+    return m_candidateAttempts.size();
+  }
+  // Round-6 item 8: the number of operations currently subscribed to the
+  // shared attempt for `cacheKey` (0 if no such attempt exists), so a
+  // test can assert every expected subscriber actually joined the same
+  // attempt rather than each starting its own.
+  [[nodiscard]] int
+  candidateAttemptSubscriberCountForTesting(const QString &cacheKey) const {
+    for (auto it = m_candidateAttempts.cbegin();
+         it != m_candidateAttempts.cend(); ++it) {
+      if (it.value().cacheKey == cacheKey) {
+        return it.value().subscriberOperationIds.size();
+      }
+    }
+    return 0;
+  }
+
   // Review round-4 item 7: observable sizes of the three per-cache-key
   // maps (m_negative404, m_cacheKeyGeneration, m_cacheKeyIssuedGeneration)
   // that pruneStaleCacheKeyState() bounds -- see its declaration comment
@@ -280,6 +304,19 @@ private:
     bool isRevalidation{false};
     QString revalidationCacheKey;
     std::optional<AssetCache::CachedEntry> staleEntry;
+
+    // Round-6 item 8: non-empty exactly while this operation is a
+    // subscriber of a shared m_candidateAttempts entry (see
+    // candidateAttemptKey()'s comment) -- i.e. its current network fetch
+    // or revalidation is coalesced with one or more OTHER operations
+    // (necessarily different logical AssetKeys; same-AssetKey coalescing
+    // is handled entirely separately by findInFlightOperation()) that
+    // resolved to the identical candidate cache key/format/validator
+    // snapshot. cancel()'s last-consumer branch consults this to decide
+    // whether it may actually abort fetchHandle (only once no attempt
+    // subscriber remains) or must merely unsubscribe and leave the
+    // shared fetch running for the other subscriber(s).
+    QString pendingAttemptKey;
   };
 
   // Authoritative negative-404 record lookup/write for one exact
@@ -327,6 +364,93 @@ private:
   // starting a redundant network operation. Returns nullopt if none.
   [[nodiscard]] std::optional<quint64>
   findInFlightOperation(const QString &opKey) const;
+
+  // Round-6 item 8 ("coalescing by logical AssetKey duplicates
+  // network/decode for aliases resolving to same candidate/cache key"):
+  // findInFlightOperation() above only coalesces two request() calls
+  // whose full AssetKey canonicalizes identically -- it deliberately
+  // never catches two DIFFERENT logical AssetKeys (e.g. an explicit "en"
+  // locale and an unset one, both falling back to the same English
+  // candidate) that happen to resolve to the SAME candidate URL. Each
+  // such Operation previously issued its own independent
+  // AssetNetworkFetcher::fetch() call for that candidate -- a real
+  // network round trip AND a real image decode duplicated once per
+  // distinct logical key, even though only one is ever needed.
+  //
+  // A CandidateAttempt is the shared unit of transport for exactly one
+  // (cacheKey, format, conditional-validator-snapshot) combination:
+  // whichever Operation reaches startCandidate()/startRevalidation()
+  // FIRST for that combination creates it (minting the one shared
+  // issuedGeneration value -- see issueCacheKeyGeneration()'s comment --
+  // every subscriber's eventual CAS-guarded mutation is checked against);
+  // every subsequent Operation that reaches the identical combination
+  // while it is still in flight simply appends its operationId to
+  // subscriberOperationIds instead of calling m_fetcher.fetch() again.
+  // When the single shared fetch completes, the attempt is immediately
+  // erased from m_candidateAttempts (so a later request for the same
+  // combination starts a genuinely fresh attempt, never appends to one
+  // that already fired) and the CAS-guarded cache/negative-404 mutation
+  // is applied AT MOST ONCE for the whole group -- then EVERY subscriber
+  // is independently dispatched through its own fallback/completion logic
+  // (advance to its own next candidate on a 404, quarantine its own
+  // stale entry, complete successfully, etc.) via
+  // dispatchCandidateFetchResult()/dispatchRevalidationResult() below.
+  // This preserves each subscriber's fully independent
+  // fallback/cancellation semantics -- only the underlying HTTP
+  // request/decode and the cache mutation are ever shared, never a
+  // subscriber's own candidate list, index, or per-consumer cancellation.
+  struct CandidateAttempt {
+    QString cacheKey;
+    quint64 issuedGeneration{0};
+    AssetNetworkFetcher::FetchHandle fetchHandle;
+    bool isRevalidation{false};
+    QVector<quint64> subscriberOperationIds;
+  };
+  // Identifies a CandidateAttempt: distinct cache keys, formats, or
+  // conditional-validator snapshots (an unconditional first-try fetch
+  // uses empty etag/lastModified and is thus never coalesced with a
+  // revalidation of a DIFFERENT stale entry's validators, even for the
+  // same cache key) never share one. `format` is included because
+  // AssetLocator always resolves one canonical format per candidate, but
+  // this keeps the key precise even if that were ever to change.
+  [[nodiscard]] static QString candidateAttemptKey(const QString &cacheKey,
+                                                   AssetFormat format,
+                                                   const QString &etag,
+                                                   const QString &lastModified);
+  // Applies the CAS-guarded mutation for `cacheKey`/`issuedGeneration`
+  // exactly once for `result` (a completed, UNCONDITIONAL fetch outcome),
+  // then dispatches every operationId in `subscribers` still present in
+  // m_operations through the exact per-operation continuation
+  // startCandidate()'s callback used to run inline for a single
+  // operation (advance candidates on a definitive 404, complete on
+  // success/other error) -- see startCandidate()'s comment.
+  void dispatchCandidateFetchResult(
+      const QString &cacheKey, quint64 issuedGeneration,
+      const QVector<quint64> &subscribers,
+      AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result);
+  // Identical role for a completed CONDITIONAL (revalidation) fetch
+  // outcome -- see startRevalidation()'s comment for the full set of
+  // per-subscriber branches (404-advance, stale-if-error,
+  // 304-touch-and-promote, fresh-200-replace), each still applied
+  // independently per subscriber using THAT subscriber's own staleEntry/
+  // candidateIndex even though the network round trip was shared.
+  void dispatchRevalidationResult(
+      const QString &cacheKey, quint64 issuedGeneration,
+      const QVector<quint64> &subscribers,
+      AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result);
+  // Round-6 item 8: removes `operationId` from whichever CandidateAttempt
+  // it is currently subscribed to (a no-op if `pendingAttemptKey` is
+  // empty, i.e. this operation is not -- or is no longer -- coalesced).
+  // Returns the attempt's fetchHandle IFF `operationId` was the last
+  // remaining subscriber (in which case the attempt is also erased from
+  // m_candidateAttempts) so the caller can actually abort the now-
+  // orphaned shared fetch; returns an invalid handle otherwise, meaning
+  // the shared fetch must keep running unabated for the remaining
+  // subscriber(s). Called from cancel()'s last-consumer branch and from
+  // the coordinator's destructor-adjacent cleanup paths.
+  [[nodiscard]] AssetNetworkFetcher::FetchHandle
+  unsubscribeFromCandidateAttempt(quint64 operationId,
+                                  const QString &attemptKey);
   // A disk-served (or memory-promoted-from-disk) CachedEntry never
   // carries a decoded QImage: only encodedBytes/metadata are ever
   // persisted to disk (see AssetCache::store()/lookupDisk()). Every path
@@ -566,6 +690,13 @@ private:
   // strictly-increasing value here at issue time, independent of
   // whichever operation's mutation eventually gets applied or when.
   QHash<QString, quint64> m_cacheKeyIssuedGeneration;
+
+  // Round-6 item 8: see CandidateAttempt's declaration comment above.
+  // Memory-only, like every other in-flight-operation-scoped map here --
+  // an attempt only ever exists between the moment its first subscriber
+  // issues the shared fetch and the moment that fetch completes (or every
+  // subscriber cancels, unsubscribing it back down to empty).
+  QHash<QString, CandidateAttempt> m_candidateAttempts;
 };
 
 } // namespace Arkham

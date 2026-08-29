@@ -83,9 +83,16 @@ private slots:
   // Review round-3 items 12-15.
   void localized404AdvanceServesAlreadyCachedEnglishCandidateWithoutNetwork();
   void negative404RecordExpiresAfterTtlAndIsRefetched();
-  void
-  laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond();
-  void queuedStaleDiskDecodeNeverMutatesANewerLiveMemoryEntry();
+  // Round-6 item 8: coalescing by logical AssetKey duplicates
+  // network/decode for aliases resolving to the same candidate/cache
+  // key. These replace the now-structurally-impossible
+  // cross-logical-key completion-ORDER races that
+  // laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond
+  // and queuedStaleDiskDecodeNeverMutatesANewerLiveMemoryEntry used to
+  // construct, proving the new CandidateAttempt coalescing directly
+  // instead.
+  void cancellingOneCoalescedCrossLogicalKeySubscriberNeverAbortsAnother();
+  void coalescedRevalidationAppliesFreshReplaceOnceForAllSubscribers();
   // Review round-4 items 5, 7.
   void newer404TombstonesOlderCachedEntryAcrossTtlExpiryAndRestart();
   void negative404AndGenerationStateStayBoundedUnderHighCardinality();

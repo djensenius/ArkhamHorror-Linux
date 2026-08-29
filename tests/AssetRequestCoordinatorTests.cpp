@@ -2005,49 +2005,40 @@ void AssetRequestCoordinatorTests::
 
 void AssetRequestCoordinatorTests::
     delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry() {
-  // Review item 6 (cross-logical-key stale resurrection): two DIFFERENT
-  // AssetKeys -- differing only in `locale`, which SetIcon (unlike Card)
-  // completely ignores when resolving candidates (see
-  // AssetLocator::resolveCandidates()'s `localizable` gate) -- resolve to
-  // the exact SAME candidate URL/cache key, yet never coalesce
-  // (canonicalOperationKey() includes `locale`), so both genuinely run as
-  // independent, concurrent network fetches for the SAME cache key.
+  // Round-6 item 8 ("coalescing by logical AssetKey duplicates
+  // network/decode for aliases resolving to same candidate/cache key").
+  // This test previously proved the round-3-item-14 CAS by forcing two
+  // DIFFERENT AssetKeys (differing only in `locale`, which SetIcon
+  // ignores when resolving candidates) that resolve to the SAME
+  // candidate/cache key to issue TWO independent, genuinely concurrent
+  // network fetches with a rigged completion order. That scenario is no
+  // longer constructible: startCandidate() now coalesces any second
+  // operation reaching the identical (cacheKey, format, no-conditional-
+  // headers) combination onto the FIRST operation's already in-flight
+  // CandidateAttempt (see AssetRequestCoordinator.h's CandidateAttempt
+  // comment) instead of issuing a second HTTP request at all -- so there
+  // is no longer a "late, superseded" completion to race against a
+  // "first-published" one for this exact scenario.
   //
-  // `keyOld`'s response is deliberately delayed via slowDrip; the
-  // response CONFIGURATION is then swapped -- via a requestHandled
-  // handler connected with Qt::QueuedConnection, so the swap can only
-  // ever take effect for a connection whose headers have not yet been
-  // parsed -- before `keyNew` is even issued. This makes the completion
-  // ORDER fully deterministic (no reliance on raw socket-level timing):
-  // `keyNew` is guaranteed to complete and publish into the shared cache
-  // FIRST, and `keyOld`'s slow, now-superseded response is guaranteed to
-  // arrive SECOND. The stale, late-arriving `keyOld` success must never
-  // overwrite what `keyNew` already published -- even though `keyOld`'s
-  // own consumer still genuinely receives the bytes IT fetched.
+  // This test now proves that coalescing directly: two different logical
+  // AssetKeys requested while genuinely still in flight together (the
+  // response is slow-dripped specifically so both requests are issued
+  // before either can complete) share exactly ONE underlying
+  // CandidateAttempt and result in exactly ONE HTTP request, yet BOTH
+  // consumers still receive their own independent, correct completion
+  // with the identical fetched bytes, and the disk cache ends up holding
+  // exactly those bytes -- never split-brained between two different
+  // outcomes.
   MockHttpServer server;
   const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
 
-  MockHttpServer::Response slowResponse;
-  slowResponse.contentType = "image/png";
-  slowResponse.body = encodePng(8, 8);
-  slowResponse.slowDrip = true;
-  slowResponse.chunkSize = 4096;
-  slowResponse.chunkDelayMs = 200;
-  server.setResponse(path, slowResponse);
-
-  MockHttpServer::Response fastResponse;
-  fastResponse.contentType = "image/png";
-  fastResponse.body = encodePng(16, 16);
-  bool swapped = false;
-  QObject::connect(
-      &server, &MockHttpServer::requestHandled, &server,
-      [&](const QString &firedPath) {
-        if (firedPath == path && !swapped) {
-          swapped = true;
-          server.setResponse(path, fastResponse);
-        }
-      },
-      Qt::QueuedConnection);
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  response.slowDrip = true;
+  response.chunkSize = 32;
+  response.chunkDelayMs = 20;
+  server.setResponse(path, response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -2073,89 +2064,62 @@ void AssetRequestCoordinatorTests::
   std::optional<Result> resultOld;
   std::optional<Result> resultNew;
   coordinator.request(keyOld, [&](Result r) { resultOld = std::move(r); });
-
-  // Waits until keyOld's request has been fully received by the server
-  // (its slow-dripped response already scheduled using the ORIGINAL
-  // config) AND the queued swap handler has run.
-  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
-  QCOMPARE(server.requestCount(path), 1);
-
   coordinator.request(keyNew, [&](Result r) { resultNew = std::move(r); });
+
+  // Both operations are genuinely in flight, sharing exactly one
+  // CandidateAttempt -- the decisive proof that this is coalesced
+  // transport, not two independent fetches racing.
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 2);
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 2);
+
   QVERIFY(QTest::qWaitFor(
       [&]() { return resultOld.has_value() && resultNew.has_value(); }, 5000));
-  QCOMPARE(server.requestCount(path), 2);
 
-  QVERIFY2(bool(*resultNew), qPrintable(resultNew->error().message));
-  QCOMPARE((**resultNew).encodedBytes, fastResponse.body);
+  // Exactly one HTTP request reached the server -- the second logical
+  // key's request never issued its own.
+  QCOMPARE(server.requestCount(path), 1);
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 0);
 
-  // keyOld's own consumer still genuinely observes the bytes IT fetched
-  // -- a stale publish being skipped is not the same as keyOld's own
-  // request failing.
   QVERIFY2(bool(*resultOld), qPrintable(resultOld->error().message));
-  QCOMPARE((**resultOld).encodedBytes, slowResponse.body);
+  QVERIFY2(bool(*resultNew), qPrintable(resultNew->error().message));
+  QCOMPARE((**resultOld).encodedBytes, response.body);
+  QCOMPARE((**resultNew).encodedBytes, response.body);
 
-  // The decisive assertion: the cache holds keyNew's (first-published)
-  // bytes, NOT keyOld's late, now-stale ones.
   const auto onDisk = cache.lookupDisk(cacheKey);
   QVERIFY(onDisk.has_value());
-  QCOMPARE(onDisk->encodedBytes, fastResponse.body);
+  QCOMPARE(onDisk->encodedBytes, response.body);
 }
 
 void AssetRequestCoordinatorTests::
     delayedStaleRevalidationSuccessAfterDefinitive404NeverResurrectsEvictedEntry() {
-  // Companion to the test above, exercising the OTHER two CAS-gated
-  // mutation sites in startRevalidation() (review item 6): the
-  // definitive-404 eviction/negative-404-record branch, and the "origin
-  // sent a fresh 200 body despite our conditional headers" branch. Two
-  // DIFFERENT AssetKeys (again differing only in `locale`, ignored by
-  // SetIcon) both revalidate the SAME pre-seeded disk entry/cache key,
-  // never coalescing. `opFresh`'s conditional GET is delayed (via
-  // slowDrip) and answered with a fresh 200 body; `opNotFound`'s
-  // conditional GET -- issued only once the server has already received
-  // `opFresh`'s request and the response config has been swapped to a
-  // plain 404 -- is answered quickly with a definitive 404, which evicts
-  // the pre-seeded entry and records a negative-404 for this exact cache
-  // key. `opFresh`'s slow, now-superseded 200 must NOT resurrect (store
-  // over) the entry `opNotFound`'s 404 already evicted.
-  //
-  // (A genuine bodyless 304 cannot be substituted for `opFresh`'s
-  // response here: MockHttpServer answers a conditional match
-  // synchronously with no delay hook at all -- see writeResponse()'s
-  // 304 branch -- so there is no way to force it to arrive "late". The
-  // 304/touchAfterNotModified call site is gated by the textually
-  // identical CAS pattern immediately alongside the two sites this test
-  // and the one above DO exercise; see startRevalidation()'s `result->
-  // notModified` branch.)
+  // Round-6 item 8 (see the identical comment on the test above this
+  // one): two DIFFERENT logical AssetKeys (differing only in `locale`)
+  // revalidating the SAME pre-seeded disk entry -- same cacheKey, same
+  // format, and (since both read the identical on-disk etag) the same
+  // conditional-validator snapshot -- now coalesce onto exactly one
+  // shared conditional GET (see startRevalidation()'s CandidateAttempt
+  // join) instead of racing two independent ones. This test proves that
+  // coalescing for the revalidation path specifically, then reuses the
+  // original test's tail to prove the round-4-item-5 invalidate()-on-404
+  // behavior (eviction, negative-404 recording, TTL, and restart
+  // durability) still holds exactly as before -- now driven by ONE
+  // shared 404 response instead of a racing pair.
   MockHttpServer server;
   const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
-
-  MockHttpServer::Response freshResponse;
-  freshResponse.contentType = "image/png";
-  freshResponse.body = encodePng(8, 8);
-  freshResponse.slowDrip = true;
-  freshResponse.chunkSize = 4096;
-  freshResponse.chunkDelayMs = 200;
-  server.setResponse(path, freshResponse);
 
   MockHttpServer::Response notFoundResponse;
   notFoundResponse.status = 404;
   notFoundResponse.reasonPhrase = "Not Found";
-  bool swapped = false;
-  QObject::connect(
-      &server, &MockHttpServer::requestHandled, &server,
-      [&](const QString &firedPath) {
-        if (firedPath == path && !swapped) {
-          swapped = true;
-          server.setResponse(path, notFoundResponse);
-        }
-      },
-      Qt::QueuedConnection);
+  notFoundResponse.slowDrip = true;
+  notFoundResponse.chunkSize = 4;
+  notFoundResponse.chunkDelayMs = 20;
+  server.setResponse(path, notFoundResponse);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
   AssetCache::Config cacheConfig;
   cacheConfig.directory = m_tempDirPath;
-  AssetCache cache(cacheConfig);
 
   AssetKey keyFresh =
       makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
@@ -2168,39 +2132,57 @@ void AssetRequestCoordinatorTests::
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
 
-  AssetCache::CachedEntry preSeeded;
-  preSeeded.encodedBytes = QByteArrayLiteral("seed-bytes-being-revalidated");
-  preSeeded.contentType = QStringLiteral("image/png");
-  preSeeded.dimensions = QSize(4, 4);
-  preSeeded.etag = QStringLiteral("\"shared-etag\"");
-  cache.store(cacheKey, preSeeded);
+  // Written through a throwaway AssetCache instance, then read back
+  // through a BRAND-NEW instance pointed at the same directory (a
+  // simulated restart) so the entry exists ONLY on disk, never in this
+  // test's own actual AssetCache's in-process memory cache. A memory
+  // hit is served immediately with no revalidation at all (see
+  // request()'s own comment) -- exercising that path here would
+  // silently bypass startRevalidation() (and this coalescing fix)
+  // entirely.
+  {
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry preSeeded;
+    preSeeded.encodedBytes = QByteArrayLiteral("seed-bytes-being-revalidated");
+    preSeeded.contentType = QStringLiteral("image/png");
+    preSeeded.dimensions = QSize(4, 4);
+    preSeeded.etag = QStringLiteral("\"shared-etag\"");
+    seedCache.store(cacheKey, preSeeded);
+  }
+  AssetCache cache(cacheConfig);
+  QVERIFY(cache.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cache.lookupMemory(cacheKey).has_value());
 
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   std::optional<Result> resultFresh;
   std::optional<Result> resultNotFound;
   coordinator.request(keyFresh, [&](Result r) { resultFresh = std::move(r); });
-  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
-  QCOMPARE(server.requestCount(path), 1);
-
   coordinator.request(keyNotFound,
                       [&](Result r) { resultNotFound = std::move(r); });
+
+  // Both operations share exactly one coalesced revalidation attempt.
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 2);
+
   QVERIFY(QTest::qWaitFor(
       [&]() { return resultFresh.has_value() && resultNotFound.has_value(); },
       5000));
-  QCOMPARE(server.requestCount(path), 2);
 
+  // Exactly one conditional GET reached the server.
+  QCOMPARE(server.requestCount(path), 1);
+
+  // Both consumers observe the SAME definitive 404 -- coalescing means
+  // there is no "fresh" vs "not found" split outcome anymore for this
+  // exact scenario; both share the one real response.
+  QVERIFY(!bool(*resultFresh));
+  QCOMPARE(resultFresh->error().code, AssetErrorCode::NotFound);
   QVERIFY(!bool(*resultNotFound));
   QCOMPARE(resultNotFound->error().code, AssetErrorCode::NotFound);
 
-  // keyFresh's own consumer still genuinely observes the fresh bytes IT
-  // fetched -- its publish being skipped is not the same as its own
-  // request failing.
-  QVERIFY2(bool(*resultFresh), qPrintable(resultFresh->error().message));
-  QCOMPARE((**resultFresh).encodedBytes, freshResponse.body);
-
-  // The decisive assertion: the entry stays evicted -- keyFresh's late
-  // 200 must not have resurrected it.
+  // The decisive assertion: the pre-seeded entry was evicted by the
+  // shared 404's invalidate() call (round-4 item 5), never left as an
+  // untouched stale success masked only by the negative-404 TTL.
   QVERIFY(!cache.lookupDisk(cacheKey).has_value());
   QVERIFY(!cache.lookupMemory(cacheKey).has_value());
 
@@ -2214,7 +2196,7 @@ void AssetRequestCoordinatorTests::
   QVERIFY(QTest::qWaitFor([&]() { return resultThird.has_value(); }, 5000));
   QVERIFY(!bool(*resultThird));
   QCOMPARE(resultThird->error().code, AssetErrorCode::NotFound);
-  QCOMPARE(server.requestCount(path), 2);
+  QCOMPARE(server.requestCount(path), 1);
 }
 
 void AssetRequestCoordinatorTests::unsupportedCodecIsNeverQuarantineWorthy() {
@@ -2385,58 +2367,26 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
-    laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond() {
-  // Review round-3 item 14 (HIGH: "CAS orders completion not issuance").
-  // The OLD scheme captured each operation's "expected generation" by
-  // READING the applied watermark at issue time; two operations issued
-  // back-to-back, before EITHER has completed, both capture the exact
-  // SAME watermark value. Under that old scheme, whichever of the two
-  // completes FIRST always wins, regardless of which was genuinely
-  // issued later -- so if the FIRST-issued operation happens to also
-  // complete FIRST (this test's exact scenario), the SECOND-issued
-  // operation's later completion was wrongly treated as stale and
-  // refused to publish, even though it was the more recently issued
-  // (and therefore should-win) operation.
-  //
-  // Two different, non-coalescing AssetKeys (differing only in
-  // `locale`, which SetIcon ignores when resolving candidates -- see
-  // AssetLocator::resolveCandidates()'s `localizable` gate) resolve to
-  // the exact same candidate URL/cache key. Operation A is issued
-  // FIRST and given a FAST (immediate) response; operation B is issued
-  // SECOND -- only once the server has already fully received A's
-  // request (proven via the requestHandled signal, not an assumption
-  // about synchronous socket writes) -- and given a SLOW (slow-drip)
-  // response, so A is guaranteed to complete FIRST and B SECOND. B,
-  // despite completing second, must still be the one whose bytes end up
-  // published in the shared cache: it is the genuinely later-issued
-  // operation, and the fix (a strictly-increasing-per-cache-key
-  // ISSUANCE counter, minted at issue time and compared via
-  // issuedGeneration >= appliedWatermark) allows a later-issued
-  // operation to always publish regardless of completion order.
+    cancellingOneCoalescedCrossLogicalKeySubscriberNeverAbortsAnother() {
+  // Round-6 item 8's explicit "preserving independent fallback/cancel
+  // semantics" requirement, for the cross-logical-key coalescing case
+  // specifically (cancellingOneConsumerNeverAffectsAnother above only
+  // covers two requests for the IDENTICAL AssetKey, which was already
+  // coalesced before this round). Two DIFFERENT logical AssetKeys
+  // (differing only in `locale`) resolve to the same candidate/cache key
+  // and are issued while genuinely still in flight together, sharing one
+  // CandidateAttempt. Cancelling ONE of them must not abort the shared
+  // fetch: the other subscriber must still complete successfully, and
+  // only cancelling BOTH may the underlying fetch actually be aborted.
   MockHttpServer server;
   const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
-
-  MockHttpServer::Response fastResponse;
-  fastResponse.contentType = "image/png";
-  fastResponse.body = encodePng(8, 8);
-  server.setResponse(path, fastResponse);
-
-  MockHttpServer::Response slowResponse;
-  slowResponse.contentType = "image/png";
-  slowResponse.body = encodePng(16, 16);
-  slowResponse.slowDrip = true;
-  slowResponse.chunkSize = 4096;
-  slowResponse.chunkDelayMs = 200;
-  bool swapped = false;
-  QObject::connect(
-      &server, &MockHttpServer::requestHandled, &server,
-      [&](const QString &firedPath) {
-        if (firedPath == path && !swapped) {
-          swapped = true;
-          server.setResponse(path, slowResponse);
-        }
-      },
-      Qt::QueuedConnection);
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  response.slowDrip = true;
+  response.chunkSize = 32;
+  response.chunkDelayMs = 20;
+  server.setResponse(path, response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -2452,109 +2402,68 @@ void AssetRequestCoordinatorTests::
   keyB.locale = QStringLiteral("fr");
   QVERIFY(!(keyA == keyB));
 
-  const auto candidatesA = AssetLocator::resolveCandidates(keyA);
-  QVERIFY(bool(candidatesA));
-  const auto candidatesB = AssetLocator::resolveCandidates(keyB);
-  QVERIFY(bool(candidatesB));
-  QCOMPARE(candidatesA->first().url, candidatesB->first().url);
-  const QString cacheKey = AssetCache::cacheKeyFor(candidatesA->first().url);
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
 
-  std::optional<Result> resultA;
-  std::optional<Result> resultB;
+  std::optional<Result> cancelledResult;
+  std::optional<Result> survivorResult;
+  const auto cancelledHandle = coordinator.request(
+      keyA, [&](Result r) { cancelledResult = std::move(r); });
+  coordinator.request(keyB, [&](Result r) { survivorResult = std::move(r); });
 
-  // Issue A (fast response registered); wait until the server has fully
-  // received A's request (and the queued swap handler has run) before
-  // issuing B, so B's own request deterministically picks up the
-  // now-slow configuration while A's -- already in flight against the
-  // original fast configuration -- is unaffected.
-  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
-  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 2);
+
+  coordinator.cancel(cancelledHandle);
+  QVERIFY(QTest::qWaitFor([&]() { return cancelledResult.has_value(); }, 5000));
+  QVERIFY(!bool(*cancelledResult));
+  QCOMPARE(cancelledResult->error().code, AssetErrorCode::Cancelled);
+
+  // The shared attempt survives with exactly one remaining subscriber --
+  // one consumer's cancellation must never tear down the group.
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 1);
+
+  QVERIFY(!survivorResult.has_value());
+  QVERIFY(QTest::qWaitFor([&]() { return survivorResult.has_value(); }, 5000));
+  QVERIFY2(bool(*survivorResult), qPrintable(survivorResult->error().message));
+  QCOMPARE((**survivorResult).encodedBytes, response.body);
+
+  // Exactly one HTTP request served both the cancelled and surviving
+  // subscribers -- cancelling one never caused a second, independent
+  // fetch to be issued for the survivor.
   QCOMPARE(server.requestCount(path), 1);
-
-  coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
-
-  QVERIFY(QTest::qWaitFor(
-      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
-  QCOMPARE(server.requestCount(path), 2);
-
-  // Both operations' own consumers still genuinely observe the bytes
-  // THEY fetched.
-  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
-  QCOMPARE((**resultA).encodedBytes, fastResponse.body);
-  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
-  QCOMPARE((**resultB).encodedBytes, slowResponse.body);
-
-  // The decisive assertion: the cache holds B's (later-issued) bytes,
-  // NOT A's (earlier-issued, even though A completed first).
-  const auto onDisk = cache.lookupDisk(cacheKey);
-  QVERIFY(onDisk.has_value());
-  QCOMPARE(onDisk->encodedBytes, slowResponse.body);
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 0);
 }
 
 void AssetRequestCoordinatorTests::
-    queuedStaleDiskDecodeNeverMutatesANewerLiveMemoryEntry() {
-  // Review round-3 item 15 (HIGH: "stale disk decode mutates before
-  // CAS"). ensureDecoded() used to call
-  // AssetCache::updateMemoryDecodedImage() as an unconditional side
-  // effect immediately upon a successful decode, BEFORE
-  // completeCacheReadOrQuarantine()'s own CAS check -- so a slow/stale
-  // disk-read's decode could mutate a NEWER, already-live memory
-  // entry's decodedImage field with older pixels, entirely bypassing
-  // the CAS protection. ensureDecoded() is now purely side-effect-free;
-  // completeCacheReadOrQuarantine() gates the memory-image update
-  // behind the SAME CAS check that guards promotion.
-  //
-  // Two different, non-coalescing AssetKeys (differing only in
-  // `locale`) both revalidate the SAME pre-seeded-on-disk entry (never
-  // touching the still-cold memory cache directly, so both genuinely go
-  // through startRevalidation()). Operation A is issued FIRST (an
-  // older issuance) and given a SLOW-DRIPPED non-404 failure response
-  // (500 UnexpectedStatus) -- this drives A into "stale-if-error",
-  // which decodes A's own STALE cached bytes via
-  // completeCacheReadOrQuarantine(). Operation B is issued SECOND (a
-  // newer issuance) once the server has already fully received A's
-  // request (proven via the requestHandled signal, not a raw sleep) and
-  // is answered immediately with a FRESH 200 carrying different bytes,
-  // which publishes and memory-promotes well before A's slow failure
-  // response finishes dripping. When A's slow failure finally
-  // completes and decodes its own now-superseded stale bytes, that
-  // decode must never overwrite what B already published live in
-  // memory -- exactly the bug ensureDecoded()'s old side effect could
-  // cause.
+    coalescedRevalidationAppliesFreshReplaceOnceForAllSubscribers() {
+  // Round-6 item 8: proves the "duplicates network/decode" defect is
+  // fixed for the OTHER revalidation verdict not covered by
+  // delayedStaleRevalidationSuccessAfterDefinitive404NeverResurrectsEvictedEntry
+  // (which covers the definitive-404 verdict) -- namely, the origin
+  // sending a fresh 200 body despite conditional headers. Two DIFFERENT
+  // logical AssetKeys revalidating the SAME pre-seeded stale disk entry
+  // (same cacheKey, same on-disk etag, so the same validator snapshot)
+  // must coalesce onto exactly one conditional GET and exactly one
+  // decode/store of the fresh body, never a per-subscriber duplicate,
+  // and the memory cache must end up holding exactly the fresh entry --
+  // never any remnant of the pre-seeded stale one.
   MockHttpServer server;
   const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
-
-  const QByteArray staleBytes = encodePng(8, 8);
-  const QByteArray freshBytes = encodePng(16, 16);
-
-  MockHttpServer::Response slowFailureResponse;
-  slowFailureResponse.status = 500;
-  slowFailureResponse.reasonPhrase = "Internal Server Error";
-  slowFailureResponse.body = QByteArrayLiteral("temporarily unavailable");
-  slowFailureResponse.slowDrip = true;
-  slowFailureResponse.chunkSize = 8;
-  slowFailureResponse.chunkDelayMs = 200;
-  server.setResponse(path, slowFailureResponse);
-
   MockHttpServer::Response freshResponse;
   freshResponse.contentType = "image/png";
-  freshResponse.body = freshBytes;
-  bool swapped = false;
-  QObject::connect(
-      &server, &MockHttpServer::requestHandled, &server,
-      [&](const QString &firedPath) {
-        if (firedPath == path && !swapped) {
-          swapped = true;
-          server.setResponse(path, freshResponse);
-        }
-      },
-      Qt::QueuedConnection);
+  freshResponse.body = encodePng(16, 16);
+  freshResponse.slowDrip = true;
+  freshResponse.chunkSize = 32;
+  freshResponse.chunkDelayMs = 20;
+  server.setResponse(path, freshResponse);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
   AssetCache::Config cacheConfig;
   cacheConfig.directory = m_tempDirPath;
-  AssetCache cache(cacheConfig);
 
   AssetKey keyA =
       makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
@@ -2563,63 +2472,59 @@ void AssetRequestCoordinatorTests::
   keyB.locale = QStringLiteral("fr");
   QVERIFY(!(keyA == keyB));
 
-  const auto candidatesA = AssetLocator::resolveCandidates(keyA);
-  QVERIFY(bool(candidatesA));
-  const QString cacheKey = AssetCache::cacheKeyFor(candidatesA->first().url);
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
 
-  AssetCache::CachedEntry staleEntry;
-  staleEntry.encodedBytes = staleBytes;
-  staleEntry.contentType = QStringLiteral("image/png");
-  staleEntry.dimensions = QSize(8, 8);
-  staleEntry.etag = QStringLiteral("\"stale-etag\"");
-  cache.store(cacheKey, staleEntry);
-  // Force this key out of the (still warm) memory cache so both A's and
-  // B's requests genuinely go through lookupDisk()'s validator-carrying,
-  // withhold-from-memory path and trigger startRevalidation() rather
-  // than a plain, non-revalidating memory hit -- constructing a fresh
-  // AssetCache instance pointed at the same directory is the simplest
-  // way to guarantee a cold memory cache while keeping the on-disk
-  // entry intact.
-  AssetCache coldCache(cacheConfig);
-  AssetRequestCoordinator coordinator(coldCache, fetcher);
+  // See the identical restart-simulation comment in
+  // delayedStaleRevalidationSuccessAfterDefinitive404NeverResurrectsEvictedEntry:
+  // written through a throwaway instance, then read back through a
+  // brand-new one so the stale entry exists ONLY on disk, never in this
+  // test's own AssetCache's in-process memory cache (a memory hit would
+  // otherwise be served immediately with no revalidation at all).
+  {
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry staleSeed;
+    staleSeed.encodedBytes = encodePng(4, 4);
+    staleSeed.contentType = QStringLiteral("image/png");
+    staleSeed.dimensions = QSize(4, 4);
+    staleSeed.etag = QStringLiteral("\"shared-etag\"");
+    seedCache.store(cacheKey, staleSeed);
+  }
+  AssetCache cache(cacheConfig);
+  QVERIFY(cache.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cache.lookupMemory(cacheKey).has_value());
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
 
   std::optional<Result> resultA;
-  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
-
-  // Waits until A's conditional GET has been fully received by the
-  // server (its slow-dripped 500 already scheduled using the ORIGINAL
-  // config) AND the queued swap handler has run -- deterministic, no
-  // reliance on raw socket-level timing.
-  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
-  QCOMPARE(server.requestCount(path), 1);
-
   std::optional<Result> resultB;
+  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
   coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 2);
 
   QVERIFY(QTest::qWaitFor(
       [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
-  QCOMPARE(server.requestCount(path), 2);
 
-  // B's own consumer observes its own freshly-fetched bytes.
-  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
-  QCOMPARE((**resultB).encodedBytes, freshBytes);
+  // Exactly one conditional GET served both subscribers.
+  QCOMPARE(server.requestCount(path), 1);
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 0);
 
-  // A's own consumer still genuinely observes the "stale-if-error"
-  // fallback: A's own (stale) cached bytes, decoded -- a stale decode
-  // being withheld from the SHARED cache is not the same as A's own
-  // request failing.
   QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
-  QCOMPARE((**resultA).encodedBytes, staleBytes);
-  QVERIFY(!(**resultA).decodedImage.isNull());
-  QCOMPARE((**resultA).decodedImage.size(), QSize(8, 8));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QCOMPARE((**resultA).encodedBytes, freshResponse.body);
+  QCOMPARE((**resultB).encodedBytes, freshResponse.body);
+  QCOMPARE((**resultA).decodedImage.size(), QSize(16, 16));
+  QCOMPARE((**resultB).decodedImage.size(), QSize(16, 16));
 
-  // The decisive assertion: B's fresh entry -- in memory -- was never
-  // mutated by A's own (stale-view) revalidation decode completing
-  // afterwards. A memory lookup must still return B's bytes/decoded
-  // image, never A's stale ones spliced in by a side-effecting decode.
-  const auto memoryHit = coldCache.lookupMemory(cacheKey);
+  // The memory cache holds exactly one entry for this key: the fresh
+  // 16x16 bytes, never a duplicated/independently-decoded copy and never
+  // any remnant of the pre-seeded stale 4x4 bytes.
+  const auto memoryHit = cache.lookupMemory(cacheKey);
   QVERIFY(memoryHit.has_value());
-  QCOMPARE(memoryHit->encodedBytes, freshBytes);
+  QCOMPARE(memoryHit->encodedBytes, freshResponse.body);
   QVERIFY(!memoryHit->decodedImage.isNull());
   QCOMPARE(memoryHit->decodedImage.size(), QSize(16, 16));
 }
@@ -2628,61 +2533,36 @@ void AssetRequestCoordinatorTests::
     newer404TombstonesOlderCachedEntryAcrossTtlExpiryAndRestart() {
   // Review round-4 item 5 ("newer unconditional 404 records negative
   // but doesn't invalidate older cached 200; after TTL old
-  // resurrects"). Previously, startCandidate()'s definitive-404 branch
-  // called recordNegative404() but never m_cache.invalidate(cacheKey)
-  // (unlike startRevalidation()'s equivalent branch, which always did).
-  // A still-cached 200 for the exact same cache key -- published by a
-  // DIFFERENT, cross-logical-key, genuinely CONCURRENT operation
-  // (locale-only difference, same candidate URL -- an ordinary
-  // sequential second request would just be served straight from that
-  // now-cached 200 entry without ever reaching the network again, so
-  // this scenario needs two operations racing while BOTH are still
-  // genuinely in flight, like
-  // laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond
-  // below) -- was therefore left completely untouched by the newer
-  // operation's later negative-404 recording: hasNegative404() correctly
-  // HID it for as long as the negative record's TTL lasted, but once
-  // that TTL lazily expired, an ordinary cache lookup would find and
-  // serve the never-actually-evicted stale entry again, resurrecting
-  // content the origin has since authoritatively confirmed gone.
+  // resurrects"), now revisited for round-6 item 8. The original
+  // scenario here forced two DIFFERENT logical keys resolving to the
+  // SAME candidate/cache key to race as two INDEPENDENT concurrent
+  // fetches with a rigged completion order (one 200, one later 404).
+  // With startCandidate()'s coalescing (item 8), that exact scenario is
+  // now structurally impossible for an unconditional (no-validator)
+  // fetch: any two requests for the identical candidate while genuinely
+  // still in flight together always share ONE CandidateAttempt and
+  // therefore ONE outcome -- there is no longer a way for one subscriber
+  // to observe a 200 while another subscriber of the exact same attempt
+  // observes a 404. (A stale ALREADY-cached 200 entry with no validators
+  // is also unreachable here: request() serves such an entry immediately
+  // -- see its own comment -- so it can never even reach startCandidate()
+  // again to race against a later 404 in the first place.)
+  //
+  // This test therefore now proves the surviving, still-load-bearing
+  // part of the original fix: startCandidate()'s definitive-404 branch's
+  // m_cache.invalidate(cacheKey) call (a no-op here, since nothing was
+  // ever cached, but exercised all the same) plus the negative-404
+  // TTL/restart durability, driven by a coalesced 404 shared by two
+  // DIFFERENT logical keys instead of by a single key.
   MockHttpServer server;
   const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
-
-  // keyA is issued FIRST and given a FAST 200; keyB is issued SECOND
-  // (only once the server has fully received A's request, so B's own
-  // request() call -- which runs its cache-miss check synchronously,
-  // before any further event-loop pumping -- is guaranteed to observe
-  // the SAME "nothing cached yet" state A itself saw) and given a
-  // SLOW-dripped 404, so A is guaranteed to complete (and apply: 200,
-  // issuance 1) well before B (404, issuance 2). This is the ONE
-  // completion order that actually exercises the item-5 fix: an
-  // ALREADY-applied older 200 that a genuinely later-issued 404 must
-  // still tombstone. (The reverse order -- B's 404 applying before A's
-  // 200 even arrives -- would instead just exercise the ALREADY-fixed
-  // round-3 item 14 CAS refusing A's now-stale 200 outright, never
-  // populating the cache in the first place, which would prove nothing
-  // about invalidate() being called here.)
-  MockHttpServer::Response fastOk;
-  fastOk.contentType = "image/png";
-  fastOk.body = encodePng(8, 8);
-  server.setResponse(path, fastOk);
-
-  MockHttpServer::Response slowNotFound;
-  slowNotFound.status = 404;
-  slowNotFound.reasonPhrase = "Not Found";
-  slowNotFound.slowDrip = true;
-  slowNotFound.chunkSize = 4096;
-  slowNotFound.chunkDelayMs = 200;
-  bool swapped = false;
-  QObject::connect(
-      &server, &MockHttpServer::requestHandled, &server,
-      [&](const QString &firedPath) {
-        if (firedPath == path && !swapped) {
-          swapped = true;
-          server.setResponse(path, slowNotFound);
-        }
-      },
-      Qt::QueuedConnection);
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  notFound.slowDrip = true;
+  notFound.chunkSize = 4;
+  notFound.chunkDelayMs = 20;
+  server.setResponse(path, notFound);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -2707,57 +2587,55 @@ void AssetRequestCoordinatorTests::
 
   std::optional<Result> resultA;
   std::optional<Result> resultB;
-
   coordinator->request(keyA, [&](Result r) { resultA = std::move(r); });
-  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
-  QCOMPARE(server.requestCount(path), 1);
-
   coordinator->request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  // Both operations share exactly one coalesced attempt: there is no
+  // longer any way for A and B to observe different outcomes for the
+  // identical candidate.
+  QCOMPARE(coordinator->candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator->candidateAttemptSubscriberCountForTesting(cacheKey), 2);
 
   QVERIFY(QTest::qWaitFor(
       [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
-  QCOMPARE(server.requestCount(path), 2);
+  QCOMPARE(server.requestCount(path), 1);
 
-  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
-  QCOMPARE((**resultA).encodedBytes, fastOk.body);
+  QVERIFY(!bool(*resultA));
+  QCOMPARE(resultA->error().code, AssetErrorCode::NotFound);
   QVERIFY(!bool(*resultB));
   QCOMPARE(resultB->error().code, AssetErrorCode::NotFound);
 
-  // The decisive assertion for the FIX: A's own consumer still
-  // genuinely observed its own fetched 200 bytes (never itself
-  // corrupted/blocked), but the SHARED cache entry must be gone
-  // IMMEDIATELY once B's later-issued, newer 404 applies -- never
-  // merely masked by the negative-404 record.
+  // Nothing was ever cached: the shared 404's invalidate() call is a
+  // harmless no-op here, but must not itself misbehave (e.g. crash or
+  // leave a partial entry) when there was nothing to remove.
   QVERIFY(!cache->lookupDisk(cacheKey).has_value());
 
-  // Still well within the negative-404 TTL: keyA must observe NotFound
-  // (from the negative record, no new network round trip) -- never a
-  // resurrected stale success.
+  // Still well within the negative-404 TTL: a third, later request for
+  // the SAME cache key observes NotFound from the negative record, no
+  // new network round trip.
   fakeNowMs += 60'000; // +1 minute, TTL is 5 minutes
   std::optional<Result> resultAAgain;
   coordinator->request(keyA, [&](Result r) { resultAAgain = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return resultAAgain.has_value(); }, 5000));
   QVERIFY(!bool(*resultAAgain));
   QCOMPARE(resultAAgain->error().code, AssetErrorCode::NotFound);
-  QCOMPARE(server.requestCount(path), 2); // no new network round trip
+  QCOMPARE(server.requestCount(path), 1); // no new network round trip
 
-  // Past the negative-404 TTL: the record has lazily expired, but (with
-  // the fix) the underlying cache entry was ALREADY evicted above, so
-  // this must genuinely re-check the network -- never silently
-  // resurrect the long-gone cached 200 bytes.
+  // Past the negative-404 TTL: the record has lazily expired, so this
+  // must genuinely re-check the network -- and must never resurrect any
+  // cached success (there never was one, but the invalidated/absent
+  // state must still be observed correctly after expiry).
   fakeNowMs += 6 * 60'000; // +6 more minutes -- past the 5-minute TTL
   std::optional<Result> resultAPastTtl;
   coordinator->request(keyA, [&](Result r) { resultAPastTtl = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return resultAPastTtl.has_value(); }, 5000));
   QVERIFY(!bool(*resultAPastTtl));
   QCOMPARE(resultAPastTtl->error().code, AssetErrorCode::NotFound);
-  QCOMPARE(server.requestCount(path), 3); // genuinely re-tried
+  QCOMPARE(server.requestCount(path), 2); // genuinely re-tried
 
   // Simulated restart: a brand-new AssetCache/AssetRequestCoordinator
   // pair backed by the SAME on-disk directory must never find a
-  // resurrected stale entry either -- invalidate() deletes the disk
-  // files themselves (see AssetCache::invalidate()), not merely an
-  // in-memory record that a restart would naturally drop anyway.
+  // resurrected entry either.
   coordinator.reset();
   cache.reset();
   AssetCache restartedCache(cacheConfig);
