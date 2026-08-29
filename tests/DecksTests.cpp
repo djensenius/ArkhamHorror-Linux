@@ -124,7 +124,7 @@ void DecksTests::decodesCreateDeckRequestFromFixture() {
   // already rounded the fixture's literal "id": 4242 through a double
   // before this type ever saw it -- numberLiteral is the best-effort
   // reconstruction of that (already-lossy) double; see
-  // decodesCreateDeckRequestFromFixtureBytesPreservesExactIdPrecision()
+  // createDeckRequestFromRawBytesPreservesEveryIdVariantExactly()
   // below for the genuinely lossless entry point.
   QCOMPARE(result->deckList.id.numberLiteral, QStringLiteral("4242.0"));
   // sideSlots is `[]` on the wire -- a malformed/legacy shape, preserved
