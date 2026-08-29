@@ -211,6 +211,9 @@ void SemanticInputFixtureTests::
        QAccessible::StaticText},
   };
 
+  QTRY_VERIFY(window_->property("itemsById")
+                  .toMap()
+                  .contains(QStringLiteral("board.nw")));
   const QVariantMap itemsById = window_->property("itemsById").toMap();
 
   for (const auto &[nodeId, expectedName, expectedRole] : expected) {
@@ -238,13 +241,17 @@ void SemanticInputFixtureTests::semanticFocusMovesTheQmlActiveFocusRectangle() {
   auto *ne = itemsById.value(QStringLiteral("board.ne")).value<QQuickItem *>();
   QVERIFY(nw != nullptr);
   QVERIFY(ne != nullptr);
-  QVERIFY(nw->hasActiveFocus());
-  QVERIFY(!ne->hasActiveFocus());
+  // Real QML activeFocus is applied asynchronously via the
+  // currentFocusChanged -> Connections -> forceActiveFocus() signal
+  // chain (see qml/SemanticInputFixture.qml), so poll rather than assert
+  // immediately to stay robust against event-loop timing.
+  QTRY_VERIFY(nw->hasActiveFocus());
+  QTRY_VERIFY(!ne->hasActiveFocus());
 
   QVERIFY(focus_->moveFocus(FocusDirection::Right));
   QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.ne"));
-  QVERIFY(!nw->hasActiveFocus());
-  QVERIFY(ne->hasActiveFocus());
+  QTRY_VERIFY(!nw->hasActiveFocus());
+  QTRY_VERIFY(ne->hasActiveFocus());
 }
 
 void SemanticInputFixtureTests::shoulderZoneSwitchingMovesFocusBetweenZones() {
@@ -265,7 +272,7 @@ void SemanticInputFixtureTests::shoulderZoneSwitchingMovesFocusBetweenZones() {
   auto *handCard1 =
       itemsById.value(QStringLiteral("hand.card1")).value<QQuickItem *>();
   QVERIFY(handCard1 != nullptr);
-  QVERIFY(handCard1->hasActiveFocus());
+  QTRY_VERIFY(handCard1->hasActiveFocus());
 }
 
 void SemanticInputFixtureTests::
@@ -283,7 +290,7 @@ void SemanticInputFixtureTests::
   const QVariantMap itemsById = window_->property("itemsById").toMap();
   auto *se = itemsById.value(QStringLiteral("board.se")).value<QQuickItem *>();
   QVERIFY(se != nullptr);
-  QVERIFY(se->hasActiveFocus());
+  QTRY_VERIFY(se->hasActiveFocus());
 }
 
 QTEST_MAIN(SemanticInputFixtureTests)

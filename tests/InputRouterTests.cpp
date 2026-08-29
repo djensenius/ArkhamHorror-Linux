@@ -155,11 +155,14 @@ void InputRouterTests::installAcrossThreadsIsRejected() {
 
   workerThread.quit();
   workerThread.wait();
-  targetOnWorker->deleteLater();
-  // Process the deleteLater() posted above before the test object graph
-  // tears down, now that targetOnWorker is back under no thread's active
-  // event loop ownership concerns for this short-lived test.
-  QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+
+  // The worker thread has already stopped, so its event loop will never
+  // process a deleteLater() posted for an object still affinitized to
+  // it; move the object back to this thread first so it can be deleted
+  // deterministically, without leaking and without deleting across
+  // threads.
+  targetOnWorker->moveToThread(QThread::currentThread());
+  delete targetOnWorker;
 }
 
 void InputRouterTests::onlyKeyEventsOnTheInstalledTargetAreConsidered() {

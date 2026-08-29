@@ -16,12 +16,13 @@ namespace Arkham {
 // Lifetime/threading contract:
 //  - install(target) installs this router as an event filter on |target|.
 //    It is rejected (returns false, no filter installed) if |target| is
-//    null, already has this router installed, or lives on a different
-//    thread than this router -- Qt event filters are not supported across
-//    threads, so this is a deterministic safe refusal rather than
-//    undefined behavior.
-//  - Only one target may be installed at a time; installing a new target
-//    first uninstalls any previous one.
+//    null or lives on a different thread than this router -- Qt event
+//    filters are not supported across threads, so this is a deterministic
+//    safe refusal rather than undefined behavior. Calling install() again
+//    with the exact same |target| that is already installed is a
+//    deterministic no-op success (returns true, filter state unchanged).
+//  - Only one target may be installed at a time; installing a *different*
+//    new target first uninstalls any previous one.
 //  - uninstall() removes the filter and is always safe to call, including
 //    when nothing is installed, and including more than once.
 //  - If the installed target is destroyed without uninstall() being
