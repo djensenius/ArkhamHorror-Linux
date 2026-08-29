@@ -477,6 +477,7 @@ private slots:
   void saveProfilesFailureDuringSeedIsProfileStorageFailure();
   void persistedSelectionMissingFromListIsProfileStorageFailure();
   void emptySelectionWithExistingProfilesSeedsFirstProfile();
+  void reentrantStartDiscardsPriorProbeAndRestartsCleanly();
 
   // Capability probing
   void compatibleProbeProceedsToCredentialRestore();
@@ -593,6 +594,48 @@ void SessionCoordinatorTests::
   const QString expectedId = hosted.profileId();
   const QString actualId = h.coordinator->selectedProfileId();
   QVERIFY(actualId == expectedId);
+}
+
+void SessionCoordinatorTests::
+    reentrantStartDiscardsPriorProbeAndRestartsCleanly() {
+  // start() is a public slot reachable from QML/re-entrant signal delivery.
+  // A second call while the first boot's probe is still in flight must not
+  // let that stale probe's later completion mutate state: it discards the
+  // prior probe and begins an entirely fresh boot sequence instead.
+  Harness h;
+  h.coordinator->start();
+  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  // Track the first probe's liveness with a QPointer rather than comparing
+  // its raw address later: once destroyed, that address may be reused by
+  // an unrelated allocation (e.g. the very next FakeCapabilityProbe), which
+  // would make a dangling-pointer comparison flaky/undefined rather than a
+  // reliable destruction proof.
+  const QPointer<FakeCapabilityProbe> firstProbe = h.probeFactory.current();
+  QVERIFY(!firstProbe.isNull());
+  const int createdBefore = h.probeFactory.totalCreated();
+
+  h.coordinator->start();
+  pumpEventsUntil([&h, createdBefore] {
+    return h.probeFactory.totalCreated() > createdBefore;
+  });
+
+  // The first probe was genuinely destroyed (QPointer self-clears), and a
+  // fresh probe instance was created for the restarted boot.
+  QVERIFY(firstProbe.isNull());
+  QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
+  QVERIFY(h.probeFactory.current() != nullptr);
+
+  // The restarted boot still completes normally end-to-end, proving this
+  // is a real restart rather than a stuck/broken state.
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  const QString profileId = h.coordinator->selectedProfileId();
+  pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  h.tokenStore.complete(profileId, notFoundResult());
+  pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  });
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
 }
 
 // ─── Capability probing ──────────────────────────────────────────────────

@@ -151,8 +151,13 @@ public slots:
   // one exists but nothing was previously selected), then starts a
   // capability probe for the selected profile. Any load/save error is an
   // explicit ProfileStorageFailure; it is never treated as first-run
-  // success. Must be called exactly once per coordinator instance before
-  // any other slot is meaningful.
+  // success. Intended to be called exactly once per coordinator instance
+  // before any other slot is meaningful; however, because this is a public
+  // Q_INVOKABLE-reachable slot, a re-entrant/duplicate call is defensively
+  // guarded rather than assumed away: it cancels any pending auth request,
+  // discards the current probe, and bumps the generation first, so every
+  // async completion from a prior start() becomes stale and is safely
+  // ignored (identical to switchProfile()/signOut()'s own restart guard).
   void start();
 
   // Switches to a different loaded profile. Persists the new selection

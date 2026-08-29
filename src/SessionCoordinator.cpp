@@ -104,6 +104,17 @@ void SessionCoordinator::clearCurrentUser() {
 // ─── Boot / profile loading ─────────────────────────────────────────────
 
 void SessionCoordinator::start() {
+  // Defensive guard against re-entrant/duplicate invocation (see the
+  // start() doc comment in SessionCoordinator.h): cancelling any pending
+  // auth request, discarding the current probe, and bumping the generation
+  // makes every in-flight async completion from a prior start() stale, so
+  // it can never mutate state after this restart.
+  cancelPendingAuthRequest();
+  m_probe.reset();
+  ++m_generation;
+  m_retryAction = nullptr;
+  clearCurrentUser();
+
   setState(State::Loading);
 
   const auto profilesResult = m_profileStore.loadProfiles();
