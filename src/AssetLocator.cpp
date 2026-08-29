@@ -325,7 +325,7 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
     return AssetError{
         AssetErrorCode::InvalidIdentifier,
         QStringLiteral("asset identifier is empty, too long, or contains a "
-                       "character outside [a-z0-9_-]"),
+                       "character outside [A-Za-z0-9_-]"),
     };
   }
 

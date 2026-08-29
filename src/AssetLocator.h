@@ -23,15 +23,23 @@ namespace Arkham {
 // any candidate is built.
 //
 // Per-category identifier grammar is intentionally an allow-list: only
-// ASCII lowercase letters, digits, '-', and '_' are ever accepted, and the
-// identifier must start and end with an alphanumeric character. This
+// ASCII letters (either case), digits, '-', and '_' are ever accepted, and
+// the identifier must start and end with an alphanumeric character. This
 // structurally rejects path separators, ".."/"." segments, control
 // characters, "%"-encoding, and userinfo/query/fragment-injection
 // characters ("@", ":", "?", "#") outright -- there is no sanitising step
 // that could turn a hostile identifier into a different, unintended asset.
-// Identifiers are never re-cased: the grammar simply never accepts an
-// uppercase letter, so a caller cannot smuggle a differently-cased request
-// past this check by relying on later normalisation.
+// Identifiers are case-sensitive and never re-cased: real pinned digest
+// sources contain uppercase segments in official card codes and
+// mutationIds (e.g. contracts/asset-locale-digest-sources/ita.json's
+// "cards/04242B.avif" and fr.json's "cards/01514_Mutated19.avif"), and
+// this grammar preserves whatever case the caller supplied rather than
+// normalising it, so two differently-cased spellings of the same
+// identifier are treated (and cached/requested) as distinct assets rather
+// than silently folded together. homebrewNamespace is the one exception:
+// it uses a separate, still ASCII-lowercase-only grammar, since it is a
+// community-authored slug with no known real-world case-sensitivity
+// requirement.
 namespace AssetLocator {
 
 // Returns the default asset base (https://assets.arkhamhorror.app),
