@@ -151,13 +151,16 @@ void InputMapper::resetToDefaults() {
 std::optional<DispatchedCommand>
 InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
                         const bool isAutoRepeat) {
-  const bool currentlyHeld = heldKeys_.value(physicalKey, false);
+  const auto heldIt = heldKeys_.constFind(physicalKey);
+  const bool currentlyHeld = heldIt != heldKeys_.constEnd();
 
   if (isPress) {
     if (isAutoRepeat) {
-      // A repeat can never establish new held-state on its own: it must
-      // follow a real (non-auto-repeat) press we already observed.
-      if (!currentlyHeld) {
+      // A repeat can never establish new held-state on its own, and can
+      // never continue a hold that never actually had a dispatched
+      // Pressed (e.g. the key was unbound for the whole press so far):
+      // it must follow a real press that itself produced a Pressed.
+      if (!currentlyHeld || heldIt.value() != HoldState::Armed) {
         return std::nullopt;
       }
     } else {
@@ -166,12 +169,17 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
         // across a focus-loss/regrab): suppressed, held state unchanged.
         return std::nullopt;
       }
-      heldKeys_.insert(physicalKey, true);
+      heldKeys_.insert(physicalKey, HoldState::Unarmed);
     }
 
     const auto command = commandFor(physicalKey);
     if (!command.has_value()) {
       return std::nullopt;
+    }
+    if (!isAutoRepeat) {
+      // Only a real press arms the hold; this is what lets a later
+      // repeat/release for this same hold actually dispatch.
+      heldKeys_.insert(physicalKey, HoldState::Armed);
     }
     return DispatchedCommand{*command, isAutoRepeat ? CommandPhase::Repeated
                                                     : CommandPhase::Pressed};
@@ -182,11 +190,17 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
     // Stray release (never pressed, or already released): suppressed.
     return std::nullopt;
   }
-  // Remove rather than store false: a key that's not held has no
-  // useful state to remember, so this keeps heldKeys_ bounded to only
+  const bool wasArmed = heldIt.value() == HoldState::Armed;
+  // Remove rather than store an unheld marker: a key that's not held has
+  // no useful state to remember, so this keeps heldKeys_ bounded to only
   // the keys currently pressed instead of growing for every key ever
   // seen over the process lifetime.
   heldKeys_.remove(physicalKey);
+  if (!wasArmed) {
+    // This hold never had a dispatched Pressed (it was unbound for the
+    // entire press), so it must not dispatch a Released either.
+    return std::nullopt;
+  }
 
   const auto command = commandFor(physicalKey);
   if (!command.has_value()) {

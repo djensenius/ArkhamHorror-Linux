@@ -25,6 +25,7 @@ private slots:
   void duplicatePressWithoutReleaseIsDeduped();
   void strayReleaseWithoutAPriorPressIsDeduped();
   void autoRepeatBeforeAnyRealPressIsDeduped();
+  void bindingAKeyMidHoldNeverProducesARepeatedOrReleasedWithoutAPressed();
   void resetToDefaultsClearsHeldStateAndCustomBindings();
   void modifiersDistinguishOtherwiseIdenticalKeys();
 
@@ -202,6 +203,43 @@ void InputMapperTests::autoRepeatBeforeAnyRealPressIsDeduped() {
   const auto pressed = mapper.processKey(key(Qt::Key_Up), true, false);
   QVERIFY(pressed.has_value());
   QCOMPARE(pressed->phase, CommandPhase::Pressed);
+}
+
+void InputMapperTests::
+    bindingAKeyMidHoldNeverProducesARepeatedOrReleasedWithoutAPressed() {
+  InputMapper mapper;
+  // F1 is unbound by default (see
+  // resetToDefaultsClearsHeldStateAndCustomBindings).
+  const PhysicalKey f1 = key(Qt::Key_F1);
+  QVERIFY(!mapper.commandFor(f1).has_value());
+
+  // Press F1 while it is still unbound: correctly produces no command.
+  QVERIFY(!mapper.processKey(f1, true, false).has_value());
+
+  // Now bind F1 to a command *while it is still physically held down*
+  // (e.g. the user opened a remap UI mid-hold). Neither an auto-repeat
+  // nor the eventual release of this same hold may dispatch anything:
+  // this hold never had a dispatched Pressed, so it must stay silent
+  // for the rest of its lifetime rather than emit a Repeated or
+  // Released with no matching Pressed (see CommandPhase's contract).
+  QVERIFY(!mapper.remap(f1, SemanticCommand::Undo).has_value());
+  QCOMPARE(mapper.commandFor(f1), SemanticCommand::Undo);
+
+  QVERIFY(!mapper.processKey(f1, true, true).has_value());
+  QVERIFY(!mapper.processKey(f1, false, false).has_value());
+
+  // The release above still correctly cleared the held state: a brand
+  // new press-repeat-release cycle for the now-bound key behaves
+  // normally.
+  const auto pressed = mapper.processKey(f1, true, false);
+  QVERIFY(pressed.has_value());
+  QCOMPARE(pressed->phase, CommandPhase::Pressed);
+  const auto repeated = mapper.processKey(f1, true, true);
+  QVERIFY(repeated.has_value());
+  QCOMPARE(repeated->phase, CommandPhase::Repeated);
+  const auto released = mapper.processKey(f1, false, false);
+  QVERIFY(released.has_value());
+  QCOMPARE(released->phase, CommandPhase::Released);
 }
 
 void InputMapperTests::resetToDefaultsClearsHeldStateAndCustomBindings() {

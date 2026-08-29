@@ -56,6 +56,7 @@ private slots:
   void removingCurrentlyFocusedNodeFallsBackToNeighborThenZone();
   void removingCurrentlyFocusedNodeWithNoFallbackClearsFocus();
   void removalAlsoFixesUpModalReturnTargets();
+  void removingAModalsOwnEntryNodeStillUnwindsCorrectlyOnPop();
   void snapshotRestorationIsDeterministicAndRepeatable();
   void geometryFallbackIsOptInAndNeverUsedByDefault();
   void currentFocusChangedFiresOnlyOnActualChange();
@@ -302,6 +303,45 @@ void FocusControllerTests::removalAlsoFixesUpModalReturnTargets() {
   // Falls back the same deterministic way removeNode's own current-focus
   // fallback would have: board.se's Up neighbor, board.ne.
   QCOMPARE(controller.currentFocusId(), QStringLiteral("board.ne"));
+}
+
+void FocusControllerTests::
+    removingAModalsOwnEntryNodeStillUnwindsCorrectlyOnPop() {
+  // Removing the node a modal level is itself currently focused on (not
+  // just its return target, covered above) must not corrupt later
+  // popModal() unwinding: the return target captured at push time is
+  // untouched and still used, one level at a time, regardless of
+  // whether that level's own entry node still exists.
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("modal.a"), QStringLiteral("modal-a"), {}});
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("modal.b"), QStringLiteral("modal-b"), {}});
+  controller.setInitialFocus(QStringLiteral("board.nw"));
+
+  controller.pushModal(QStringLiteral("modal.a"));
+  controller.pushModal(QStringLiteral("modal.b"));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("modal.b"));
+
+  // Remove the innermost modal's own currently-focused entry node.
+  controller.removeNode(QStringLiteral("modal.b"));
+  QVERIFY(controller.isModalActive());
+  // modal.b has no explicit fallback, no neighbors, and no other node
+  // in its own zone, so focus falls all the way to unfocused; this
+  // deliberately does *not* auto-pop the modal.
+  QVERIFY(controller.currentFocusId().isEmpty());
+
+  // A single popModal() must still unwind exactly one level, returning
+  // to modal.a (modal.b's captured return target) -- not skipping past
+  // it to board.nw -- even though modal.b's own node is gone.
+  QVERIFY(controller.popModal());
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("modal.a"));
+  QVERIFY(controller.isModalActive());
+
+  QVERIFY(controller.popModal());
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+  QVERIFY(!controller.isModalActive());
 }
 
 void FocusControllerTests::snapshotRestorationIsDeterministicAndRepeatable() {

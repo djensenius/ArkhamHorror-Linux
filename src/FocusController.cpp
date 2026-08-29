@@ -64,6 +64,16 @@ void FocusController::removeNode(const QString &id, const QString &fallbackId) {
                          .value_or(QString());
     }
   }
+  // Deliberately *not* touched above: entry.first (a modal level's own
+  // entry node). popModal() only ever reads entry.second -- the return
+  // target, which is kept valid by the loop above -- so a stale
+  // entry.first left behind here is inert: it is never dereferenced
+  // against |nodes_| again during live operation, and correctly gates
+  // nested unwinding one level at a time regardless of whether that
+  // level's own node still exists. The only place entry.first is later
+  // revalidated against the graph is restoreSnapshot(), which discards
+  // any level whose entry no longer exists at *that* point in time, on
+  // a copy of this stack it was independently given.
 
   if (currentFocusId_ == id) {
     setCurrentFocus(resolveRemovalFallback(id, removedNode, fallbackId)

@@ -148,12 +148,30 @@ public:
   //    remap() of that same physical key starts from a correct held
   //    state), but it can never produce a dispatched command while
   //    unbound.
+  //  - A key that was unbound for its entire press (or that only became
+  //    bound again, via remap(), after already being released once) is
+  //    never "armed": even if it is subsequently rebound while still
+  //    physically held, its later auto-repeat and release transitions
+  //    keep returning std::nullopt for the rest of that hold, rather
+  //    than emitting a Repeated or Released with no preceding
+  //    dispatched Pressed for that same hold.
   [[nodiscard]] std::optional<DispatchedCommand>
   processKey(const PhysicalKey &physicalKey, bool isPress, bool isAutoRepeat);
 
 private:
+  // Per-held-key state: a key present in |heldKeys_| is physically held
+  // down regardless of whether it is currently bound to a command.
+  // |Armed| additionally means a Pressed was actually dispatched for
+  // this specific hold; only an Armed hold may go on to dispatch
+  // Repeated/Released, so a key that was unbound at press time (and
+  // only became bound later, mid-hold, via remap()) can never emit a
+  // Repeated or Released with no matching Pressed -- it stays silent
+  // for the rest of that hold instead, preserving the Pressed/
+  // Repeated*/Released contract documented on CommandPhase.
+  enum class HoldState { Unarmed, Armed };
+
   QHash<PhysicalKey, SemanticCommand> bindings_;
-  QHash<PhysicalKey, bool> heldKeys_;
+  QHash<PhysicalKey, HoldState> heldKeys_;
 
   static bool isReservedKey(const PhysicalKey &physicalKey);
 };
