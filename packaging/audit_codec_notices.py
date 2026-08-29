@@ -129,6 +129,37 @@ COMPONENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^libselinux\.so"), "libselinux"),
     (re.compile(r"^liblzma\.so"), "liblzma"),
     (re.compile(r"^lib(gcc_s|stdc\+\+)\.so"), "gcc-runtime"),
+    # A second, larger wave of previously-unmapped libraries found by a
+    # later cumulative review running this same classifier against the
+    # real produced AppImage's full recursive `usr/` closure (not just
+    # `usr/lib`, which the original round-4 item-12 work above happened
+    # to be validated against): the xcb/X11/xkbcommon family Qt's xcb
+    # platform plugin transitively needs, QtKeychain's own bundled
+    # `libqt6keychain.so*` (previously only its *dependencies* -- e.g.
+    # libsecret -- were mapped, never the library itself), and a further
+    # round of glibc-adjacent system libraries (Kerberos/GSSAPI, ICU,
+    # keyutils, systemd, lz4/zstd/brotli, legacy PCRE1, libpng, libcap,
+    # D-Bus, libbsd/libmd) that distribution-specific glib/D-Bus/Qt
+    # builds transitively pull in. See the individual
+    # third_party/<name>/NOTICE.md files for exactly why each is bundled.
+    (re.compile(r"^libXau\.so"), "libxau"),
+    (re.compile(r"^libXdmcp\.so"), "libxdmcp"),
+    (re.compile(r"^libxcb.*\.so"), "xcb"),
+    (re.compile(r"^libxkbcommon(-x11)?\.so"), "xkbcommon"),
+    (re.compile(r"^libbrotli(common|dec|enc)\.so"), "brotli"),
+    (re.compile(r"^libbsd\.so"), "libbsd"),
+    (re.compile(r"^libmd\.so"), "libmd"),
+    (re.compile(r"^libcap\.so"), "libcap"),
+    (re.compile(r"^libdbus-1\.so"), "dbus"),
+    (re.compile(r"^lib(krb5support|gssapi_krb5|k5crypto|krb5)\.so"), "krb5"),
+    (re.compile(r"^libicu(data|i18n|uc)\.so"), "icu"),
+    (re.compile(r"^libkeyutils\.so"), "libkeyutils"),
+    (re.compile(r"^liblz4\.so"), "lz4"),
+    (re.compile(r"^libpcre\.so"), "pcre"),
+    (re.compile(r"^libpng(1[0-9])?\.so"), "libpng"),
+    (re.compile(r"^libqt6keychain\.so"), "qtkeychain"),
+    (re.compile(r"^libsystemd\.so"), "systemd"),
+    (re.compile(r"^libzstd\.so"), "zstd"),
 ]
 
 MANDATORY_COMPONENTS: frozenset[str] = frozenset({"libavif"})
@@ -167,6 +198,24 @@ QT_PLUGIN_DIRECTORIES: frozenset[str] = frozenset(
     }
 )
 
+# Qt Quick/QML modules (Controls styles, Layouts, LocalStorage, Particles,
+# Shapes, Window, ...) are deployed by linuxdeploy's Qt plugin under a
+# fixed top-level "qml" directory name (e.g.
+# usr/qml/QtQuick/Controls/libqtquickcontrols2plugin.so,
+# usr/qml/QtQml/Models/libmodelsplugin.so) -- a second real, previously
+# unanticipated case of "official Qt content whose basename never matches
+# libQt6.*", exactly analogous to QT_PLUGIN_DIRECTORIES above but for
+# QML rather than C++ plugins. Every one of these was found unmapped by a
+# later cumulative review the first time this classifier ran against the
+# real produced AppImage's full `usr/` tree (previously only validated
+# against `usr/lib`). Matched as a whole path *component* named "qml"
+# appearing anywhere in the path (not just as the immediate parent, since
+# real QML modules nest arbitrarily deep, e.g.
+# usr/qml/QtQuick/Controls/Basic/impl/...) -- never a bare substring
+# test, so a hypothetical unrelated "libqmlfoo.so" is never
+# misclassified purely by name.
+QT_QML_ROOT_DIRNAME: str = "qml"
+
 
 def classify(basename: str) -> str | None:
     """Returns the component name a bundled library's basename belongs to,
@@ -185,10 +234,18 @@ def classify(basename: str) -> str | None:
 def classify_path(path: Path) -> str | None:
     """Like classify(), but additionally resolves any library located
     directly inside one of Qt's own standardized plugin subdirectories
-    (QT_PLUGIN_DIRECTORIES) to the "qt" component regardless of its own
-    basename -- see QT_PLUGIN_DIRECTORIES's docstring for why basename
-    matching alone is insufficient for Qt's plugins specifically."""
+    (QT_PLUGIN_DIRECTORIES), or anywhere beneath a literal "qml" path
+    component (QT_QML_ROOT_DIRNAME), to the "qt" component regardless of
+    its own basename -- see QT_PLUGIN_DIRECTORIES's and
+    QT_QML_ROOT_DIRNAME's docstrings for why basename matching alone is
+    insufficient for either Qt plugins or Qt Quick/QML modules.
+    Matches QT_QML_ROOT_DIRNAME against whole path *components*
+    (path.parts), never a bare substring test, so a hypothetical
+    unrelated directory merely containing "qml" as part of a longer name
+    (e.g. "libqmlfoo") is never misclassified."""
     if path.parent.name in QT_PLUGIN_DIRECTORIES:
+        return "qt"
+    if QT_QML_ROOT_DIRNAME in path.parts:
         return "qt"
     return classify(path.name)
 

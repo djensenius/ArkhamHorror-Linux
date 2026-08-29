@@ -110,6 +110,76 @@ class ClassifyTests(unittest.TestCase):
             with self.subTest(basename=basename):
                 self.assertEqual(audit.classify(basename), "qt")
 
+    def test_second_review_wave_of_bundled_system_libraries_classifies(
+        self,
+    ) -> None:
+        # A later cumulative review (round-4/5 item 12's continuation) ran
+        # this exact classifier against the real produced AppImage's full
+        # `usr/` tree (not just `usr/lib`, which the original round-4
+        # item-12 work above was validated against) and found 72
+        # previously-unmapped bundled libraries -- the xcb/X11/xkbcommon
+        # family Qt's xcb platform plugin transitively needs,
+        # QtKeychain's own bundled libqt6keychain.so* (previously only
+        # its *dependencies* were mapped, never the library itself), and
+        # a further wave of glibc-adjacent system libraries various
+        # distributions' glib/D-Bus/Qt builds transitively pull in. See
+        # the individual third_party/<name>/NOTICE.md files this review
+        # added for exactly why each is bundled.
+        cases = {
+            "libXau.so.6": "libxau",
+            "libXdmcp.so.6": "libxdmcp",
+            "libxcb-cursor.so.0": "xcb",
+            "libxcb-glx.so.0": "xcb",
+            "libxcb-icccm.so.4": "xcb",
+            "libxcb-image.so.0": "xcb",
+            "libxcb-keysyms.so.1": "xcb",
+            "libxcb-randr.so.0": "xcb",
+            "libxcb-render-util.so.0": "xcb",
+            "libxcb-render.so.0": "xcb",
+            "libxcb-shape.so.0": "xcb",
+            "libxcb-shm.so.0": "xcb",
+            "libxcb-sync.so.1": "xcb",
+            "libxcb-util.so.1": "xcb",
+            "libxcb-xfixes.so.0": "xcb",
+            "libxcb-xkb.so.1": "xcb",
+            "libxkbcommon.so.0": "xkbcommon",
+            "libxkbcommon-x11.so.0": "xkbcommon",
+            "libbrotlicommon.so.1": "brotli",
+            "libbrotlidec.so.1": "brotli",
+            "libbsd.so.0": "libbsd",
+            "libmd.so.0": "libmd",
+            "libcap.so.2": "libcap",
+            "libdbus-1.so.3": "dbus",
+            "libgssapi_krb5.so.2": "krb5",
+            "libk5crypto.so.3": "krb5",
+            "libkrb5.so.3": "krb5",
+            "libkrb5support.so.0": "krb5",
+            "libicudata.so.73": "icu",
+            "libicui18n.so.73": "icu",
+            "libicuuc.so.73": "icu",
+            "libkeyutils.so.1": "libkeyutils",
+            "liblz4.so.1": "lz4",
+            "libpcre.so.3": "pcre",
+            "libpng16.so.16": "libpng",
+            "libqt6keychain.so": "qtkeychain",
+            "libqt6keychain.so.0.17.0": "qtkeychain",
+            "libqt6keychain.so.1": "qtkeychain",
+            "libsystemd.so.0": "systemd",
+            "libzstd.so.1": "zstd",
+        }
+        for basename, expected in cases.items():
+            with self.subTest(basename=basename):
+                self.assertEqual(audit.classify(basename), expected)
+
+    def test_legacy_pcre1_and_pcre2_remain_distinct_components(self) -> None:
+        # libpcre.so.3 (legacy PCRE1) and libpcre2-8.so.0 (PCRE2, already
+        # covered by test_libsecret_transitive_closure_classifies above)
+        # must resolve to two different components, not collapse onto
+        # one -- they are separate upstream projects with separate
+        # third_party/ notice directories.
+        self.assertEqual(audit.classify("libpcre.so.3"), "pcre")
+        self.assertEqual(audit.classify("libpcre2-8.so.0.11.2"), "pcre2")
+
     def test_completely_unknown_library_is_unmapped(self) -> None:
         self.assertIsNone(audit.classify("libtotallyunknownvendorlib.so.1"))
 
@@ -144,6 +214,39 @@ class ClassifyTests(unittest.TestCase):
         )
         self.assertIsNone(
             audit.classify_path(Path("/AppDir/usr/lib/libtotallyunknown.so.1"))
+        )
+
+    def test_qml_module_directory_classifies_regardless_of_basename(
+        self,
+    ) -> None:
+        # linuxdeploy's Qt plugin deploys every Qt Quick/QML module under
+        # a fixed top-level "qml" directory name, arbitrarily nested
+        # (e.g. usr/qml/QtQuick/Controls/Basic/impl/...); none of these
+        # basenames match libQt6.* or live in a QT_PLUGIN_DIRECTORIES
+        # entry, so without this directory-based fallback every one of
+        # them is reported unmapped the first time this classifier runs
+        # against a real AppImage built with QML content.
+        cases = {
+            Path("/AppDir/usr/qml/QtQml/Models/libmodelsplugin.so"): "qt",
+            Path(
+                "/AppDir/usr/qml/QtQuick/Controls/Basic/impl/"
+                "libqtquickcontrols2basicstyleimplplugin.so"
+            ): "qt",
+            Path("/AppDir/usr/qml/QtQuick/Effects/libeffectsplugin.so"): "qt",
+            Path("/AppDir/usr/qml/QtQuick/libqtquick2plugin.so"): "qt",
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=str(path)):
+                self.assertEqual(audit.classify_path(path), expected)
+
+    def test_qml_directory_match_requires_whole_path_component(self) -> None:
+        # QT_QML_ROOT_DIRNAME must match a literal "qml" path *component*,
+        # never a bare substring -- a hypothetical unrelated
+        # "libqmlfoo.so" living outside any real "qml" directory must not
+        # be misclassified as Qt merely because its basename contains the
+        # substring "qml".
+        self.assertIsNone(
+            audit.classify_path(Path("/AppDir/usr/lib/libqmlfoo.so.1"))
         )
 
     def test_abi_allowlisted_library_is_not_itself_matched_by_a_component(
