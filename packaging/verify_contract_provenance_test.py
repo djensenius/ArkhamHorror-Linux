@@ -194,6 +194,82 @@ class ClosureTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             vcp.compute_governed_paths(tree)
 
+    def test_manifest_top_level_not_object_rejected(self):
+        # A syntactically-valid-JSON manifest whose top level is a bare
+        # array (not an object) must still be a clean RuntimeError, never
+        # an unhandled AttributeError from calling .get() on a list.
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = b"[]"
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_manifest_fixtures_not_a_list_rejected(self):
+        # "fixtures" present but bound to an object, not a list, must be a
+        # clean RuntimeError, never an unhandled exception from iterating
+        # over dict keys as if they were {schema, path} entries.
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = b'{"fixtures": {"not": "a list"}}'
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_manifest_fixture_entry_not_an_object_rejected(self):
+        # A fixtures[] entry that is a bare string (not an object) must be
+        # a clean RuntimeError, never an unhandled TypeError from
+        # subscripting a str with ["schema"].
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = b'{"fixtures": ["not-an-object"]}'
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_manifest_fixture_entry_missing_schema_key_rejected(self):
+        # A fixtures[] entry missing the required "schema" key must be a
+        # clean RuntimeError, never an unhandled KeyError escaping
+        # verify()'s narrow exception handling as a raw traceback.
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = (
+            b'{"fixtures": [{"path": "contracts/fixtures/catalog.json"}]}'
+        )
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_manifest_fixture_entry_missing_path_key_rejected(self):
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = (
+            b'{"fixtures": [{"schema": '
+            b'"contracts/schemas/catalog.schema.json"}]}'
+        )
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_manifest_fixture_entry_non_string_schema_rejected(self):
+        # A fixtures[] entry whose "schema" value is not a string (e.g. an
+        # integer) must be a clean RuntimeError, never an unhandled
+        # exception from passing a non-str to _resolve_manifest_path's
+        # str.startswith()/Path() calls.
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = (
+            b'{"fixtures": [{"schema": 1, '
+            b'"path": "contracts/fixtures/catalog.json"}]}'
+        )
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_manifest_fixture_entry_non_string_path_rejected(self):
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = (
+            b'{"fixtures": [{"schema": '
+            b'"contracts/schemas/catalog.schema.json", "path": null}]}'
+        )
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
 
 class VerifyTests(unittest.TestCase):
     def setUp(self):

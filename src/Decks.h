@@ -102,9 +102,14 @@ public:
   // Precondition: kind() != Kind::Absent -- an absent id has no JSON
   // representation at all (the caller must omit the "id" key from the
   // enclosing object entirely, not insert some sentinel value); calling
-  // this for Kind::Absent returns Json::Value::makeNull() defensively
-  // (never crashes) but is a caller bug, since it would wrongly encode an
-  // omitted id as an explicit null.
+  // this for Kind::Absent returns a default-constructed Json::Value
+  // (Kind::Undefined) defensively (never crashes), never
+  // Json::Value::makeNull(), so any attempt to serialize it standalone
+  // fails loudly via Json::Value::toJsonBytes() rejecting Kind::Undefined
+  // -- but relying on that is still a caller bug, since composing an
+  // Undefined fragment into an enclosing object silently omits the key
+  // rather than encoding an explicit null for what should have been
+  // omitted entirely.
   [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const ExternalDeckId &,

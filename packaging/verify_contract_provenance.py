@@ -345,8 +345,42 @@ def compute_governed_fixtures(tree: GitTree, schema_paths: set[str]) -> list[str
         raise RuntimeError(
             f"{manifest_path}: manifest is not valid JSON ({exc})"
         ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(
+            f"{manifest_path}: manifest top level is "
+            f"{type(manifest).__name__}, expected an object"
+        )
+    fixtures_raw = manifest.get("fixtures", [])
+    if not isinstance(fixtures_raw, list):
+        raise RuntimeError(
+            f"{manifest_path}: \"fixtures\" is {type(fixtures_raw).__name__}, "
+            "expected a list of {schema, path} objects"
+        )
+    # Every entry's shape is validated explicitly -- rather than letting a
+    # malformed backend manifest (a non-object entry, or one missing the
+    # required "schema"/"path" string keys) raise an unhandled
+    # KeyError/TypeError/AttributeError that would escape verify()'s
+    # narrow `except (RuntimeError, RefEscapeError)` handling as a raw
+    # traceback instead of a clean, reported failure.
     result = []
-    for entry in manifest.get("fixtures", []):
+    for index, entry in enumerate(fixtures_raw):
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                f'{manifest_path}: fixtures[{index}] is '
+                f"{type(entry).__name__}, expected an object with "
+                '"schema" and "path" keys'
+            )
+        for key in ("schema", "path"):
+            if key not in entry:
+                raise RuntimeError(
+                    f"{manifest_path}: fixtures[{index}] is missing "
+                    f"required key {key!r}"
+                )
+            if not isinstance(entry[key], str):
+                raise RuntimeError(
+                    f"{manifest_path}: fixtures[{index}][{key!r}] is "
+                    f"{type(entry[key]).__name__}, expected a string"
+                )
         schema = _resolve_manifest_path(entry["schema"])
         path = _resolve_manifest_path(entry["path"])
         if schema in schema_paths:
