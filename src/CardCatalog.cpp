@@ -350,15 +350,30 @@ ValueOrError<CardCost> CardCost::fromJson(const QJsonValue &v,
     return CardCost{.tag = CardCostTag::DiscardAmountCost};
   if (tag == "DeferredCost"_L1)
     return CardCost{.tag = CardCostTag::DeferredCost};
-  if (tag == "MaxDynamicCost"_L1)
+  if (tag == "MaxDynamicCost"_L1) {
+    auto contents = Json::requireRawField(obj, "contents"_L1,
+                                          Json::joinPath(path, u"contents"));
+    if (!contents)
+      return failure(contents.error());
     return CardCost{.tag = CardCostTag::MaxDynamicCost,
-                    .rawContents = obj.value("contents"_L1)};
-  if (tag == "AnyMatchingCardCost"_L1)
+                    .rawContents = *contents};
+  }
+  if (tag == "AnyMatchingCardCost"_L1) {
+    auto contents = Json::requireRawField(obj, "contents"_L1,
+                                          Json::joinPath(path, u"contents"));
+    if (!contents)
+      return failure(contents.error());
     return CardCost{.tag = CardCostTag::AnyMatchingCardCost,
-                    .rawContents = obj.value("contents"_L1)};
-  if (tag == "MatchingEnemyFieldCost"_L1)
+                    .rawContents = *contents};
+  }
+  if (tag == "MatchingEnemyFieldCost"_L1) {
+    auto contents = Json::requireRawField(obj, "contents"_L1,
+                                          Json::joinPath(path, u"contents"));
+    if (!contents)
+      return failure(contents.error());
     return CardCost{.tag = CardCostTag::MatchingEnemyFieldCost,
-                    .rawContents = obj.value("contents"_L1)};
+                    .rawContents = *contents};
+  }
   return failure(
       QStringLiteral("%1.tag: unrecognized value \"%2\"").arg(path, tag));
 }
@@ -366,8 +381,17 @@ ValueOrError<CardCost> CardCost::fromJson(const QJsonValue &v,
 QJsonObject CardCost::toJson() const {
   switch (tag) {
   case CardCostTag::StaticCost:
+    // staticAmount is documented as always populated when tag ==
+    // StaticCost, but it is a public std::optional field with no
+    // constructor enforcing that invariant. Q_ASSERT compiles out in
+    // release builds, so also branch on has_value(): a release build that
+    // somehow hits the invalid state degrades to a JSON null payload
+    // instead of dereferencing an empty optional (UB).
+    Q_ASSERT(staticAmount.has_value());
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("StaticCost")},
-                       {QStringLiteral("contents"), *staticAmount}};
+                       {QStringLiteral("contents"),
+                        staticAmount ? QJsonValue(*staticAmount)
+                                     : QJsonValue(QJsonValue::Null)}};
   case CardCostTag::DynamicCost:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("DynamicCost")}};
   case CardCostTag::DiscardAmountCost:
@@ -459,9 +483,21 @@ QJsonObject GameValue::toJson() const {
     arr.append(n);
   switch (tag) {
   case GameValueTag::Static:
-    return withContents("Static"_L1, *singleAmount);
+    // singleAmount is documented as always populated for Static/PerPlayer,
+    // but it is a public std::optional field with no constructor enforcing
+    // that invariant. Q_ASSERT compiles out in release builds, so also
+    // branch on has_value(): a release build that somehow hits the invalid
+    // state degrades to a JSON null payload instead of dereferencing an
+    // empty optional (UB).
+    Q_ASSERT(singleAmount.has_value());
+    return withContents("Static"_L1, singleAmount
+                                         ? QJsonValue(*singleAmount)
+                                         : QJsonValue(QJsonValue::Null));
   case GameValueTag::PerPlayer:
-    return withContents("PerPlayer"_L1, *singleAmount);
+    Q_ASSERT(singleAmount.has_value());
+    return withContents("PerPlayer"_L1, singleAmount
+                                            ? QJsonValue(*singleAmount)
+                                            : QJsonValue(QJsonValue::Null));
   case GameValueTag::StaticWithPerPlayer:
     return withContents("StaticWithPerPlayer"_L1, arr);
   case GameValueTag::ByPlayerCount:

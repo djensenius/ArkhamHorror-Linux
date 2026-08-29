@@ -127,6 +127,15 @@ ValueOrError<QJsonArray> requireArrayField(const QJsonObject &obj,
   return requireArray(obj.value(key), path);
 }
 
+ValueOrError<QJsonValue> requireRawField(const QJsonObject &obj,
+                                         QLatin1StringView key,
+                                         QStringView path) {
+  if (fieldPresence(obj, key) == FieldPresence::Absent)
+    return failure(
+        QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
+  return obj.value(key);
+}
+
 ValueOrError<std::optional<QString>> optionalString(const QJsonObject &obj,
                                                     QLatin1StringView key,
                                                     QStringView path) {

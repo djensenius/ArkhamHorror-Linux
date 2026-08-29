@@ -66,6 +66,17 @@ requireObjectField(const QJsonObject &obj, QLatin1StringView key,
                                                          QLatin1StringView key,
                                                          QStringView path);
 
+// Required-but-unconstrained-value decoder: fails only if the key itself is
+// absent. Unlike every other require* helper, a present value -- of any
+// type, including explicit null -- decodes verbatim with no type check.
+// Matches schema fields typed fully open (`{}`) that are nonetheless
+// required, e.g. CardCost's MaxDynamicCost/AnyMatchingCardCost/
+// MatchingEnemyFieldCost `contents`, so a fixture that omits the field
+// still fails to decode instead of silently round-tripping without it.
+[[nodiscard]] ValueOrError<QJsonValue> requireRawField(const QJsonObject &obj,
+                                                       QLatin1StringView key,
+                                                       QStringView path);
+
 // Optional-field decoders: an absent key or an explicit JSON null both
 // decode to std::nullopt. A present value of the wrong type still fails.
 [[nodiscard]] ValueOrError<std::optional<QString>>

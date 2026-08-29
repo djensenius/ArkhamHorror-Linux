@@ -41,6 +41,7 @@ private slots:
   void allGameValueVariantsRoundTrip();
   void allSkillIconVariantsRoundTrip();
   void unrecognizedCardCostTagRejected();
+  void missingContentsRejectedForRawPayloadCardCostTags();
 
   // Forward compatibility ────────────────────────────────────────────────────
   void unknownAdditiveTopLevelFieldIgnored();
@@ -413,6 +414,38 @@ void CardCatalogTests::unrecognizedCardCostTagRejected() {
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("cost")),
            qPrintable(result.error()));
+}
+
+void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
+  // MaxDynamicCost/AnyMatchingCardCost/MatchingEnemyFieldCost's `contents`
+  // is schema-unconstrained but still required; omitting the key entirely
+  // must fail to decode rather than silently succeeding with an
+  // undefined/absent rawContents that would then re-encode without the
+  // required key.
+  const QList<QLatin1StringView> rawPayload{"MaxDynamicCost"_L1,
+                                            "AnyMatchingCardCost"_L1,
+                                            "MatchingEnemyFieldCost"_L1};
+  for (const auto &tag : rawPayload) {
+    const QJsonObject obj{{QStringLiteral("tag"), QString(tag)}};
+    const auto result = CardCost::fromJson(obj, u"cost");
+    QVERIFY2(!result.has_value(),
+             qPrintable(QStringLiteral("%1 unexpectedly decoded without a "
+                                       "contents field")
+                            .arg(tag)));
+    QVERIFY2(result.error().contains(QStringLiteral("contents")),
+             qPrintable(result.error()));
+  }
+
+  // An explicit JSON null still counts as present -- only an entirely
+  // absent key is rejected.
+  const QJsonObject nullContents{
+      {QStringLiteral("tag"), QStringLiteral("MaxDynamicCost")},
+      {QStringLiteral("contents"), QJsonValue(QJsonValue::Null)}};
+  const auto nullResult = CardCost::fromJson(nullContents, u"cost");
+  if (!nullResult)
+    QFAIL(qPrintable(nullResult.error()));
+  QVERIFY(nullResult->rawContents.isNull());
+  QCOMPARE(nullResult->toJson(), nullContents);
 }
 
 void CardCatalogTests::unknownAdditiveTopLevelFieldIgnored() {
