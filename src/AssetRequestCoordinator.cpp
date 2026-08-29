@@ -393,8 +393,19 @@ void AssetRequestCoordinator::completeOperation(
   }
   Operation operation = std::move(it.value());
   m_operations.erase(it);
+  // The consumer handle must remain valid for cancel() until the queued
+  // delivery below actually runs (see the class comment): simply erasing
+  // it from m_handleToOperation here, with nothing replacing it, would
+  // let a cancel() call racing this completion see an indistinguishable
+  // "stale" handle and silently no-op even though no delivery has
+  // happened yet. Instead, hand each consumer's handle off to a lighter
+  // "delivery pending" registry that cancel() also consults; each
+  // consumer's queued lambda in dispatchToConsumers() below consumes
+  // (erases) its own entry exactly when it runs.
   for (const Consumer &consumer : operation.consumers) {
     m_handleToOperation.remove(consumer.handleId);
+    m_pendingDeliveryCancelled.insert(consumer.handleId,
+                                      std::make_shared<bool>(false));
   }
   dispatchToConsumers(operation, std::move(result));
 }
@@ -403,19 +414,42 @@ void AssetRequestCoordinator::dispatchToConsumers(
     Operation &operation, AssetOutcome<AssetCache::CachedEntry> result) {
   QPointer<AssetRequestCoordinator> self(this);
   for (Consumer &consumer : operation.consumers) {
+    const quint64 handleId = consumer.handleId;
     QMetaObject::invokeMethod(
         this,
-        [self, callback = std::move(consumer.callback), result]() mutable {
-          if (self) {
-            // `result` is this lambda's own private capture (a per-
-            // consumer copy of the shared outcome, made because there
-            // may be multiple consumers to fan out to) -- once we are
-            // inside this specific lambda invocation, nothing else still
-            // needs it, so move it into the callback rather than paying
-            // for another deep copy of a potentially large CachedEntry
-            // (encoded bytes plus a decoded QImage).
-            std::move(callback)(std::move(result));
+        [self, handleId, callback = std::move(consumer.callback),
+         result]() mutable {
+          if (!self) {
+            return;
           }
+          // A cancel() call that raced this queued delivery (arriving
+          // after completeOperation() ran but before this exact lambda
+          // did) flips the shared flag below rather than silently
+          // no-op-ing on a handle it can no longer find in
+          // m_handleToOperation; honour that here by substituting
+          // Cancelled for the real result, so cancel()'s "own callback
+          // is invoked exactly once, with Cancelled" contract holds
+          // across this window too.
+          bool cancelled = false;
+          auto flagIt = self->m_pendingDeliveryCancelled.find(handleId);
+          if (flagIt != self->m_pendingDeliveryCancelled.end()) {
+            cancelled = *flagIt.value();
+            self->m_pendingDeliveryCancelled.erase(flagIt);
+          }
+          if (cancelled) {
+            std::move(callback)(AssetOutcome<AssetCache::CachedEntry>(
+                AssetError{AssetErrorCode::Cancelled,
+                           QStringLiteral("request was cancelled")}));
+            return;
+          }
+          // `result` is this lambda's own private capture (a per-
+          // consumer copy of the shared outcome, made because there
+          // may be multiple consumers to fan out to) -- once we are
+          // inside this specific lambda invocation, nothing else still
+          // needs it, so move it into the callback rather than paying
+          // for another deep copy of a potentially large CachedEntry
+          // (encoded bytes plus a decoded QImage).
+          std::move(callback)(std::move(result));
         },
         Qt::QueuedConnection);
   }
@@ -425,9 +459,21 @@ void AssetRequestCoordinator::cancel(RequestHandle handle) {
   if (!handle.isValid()) {
     return;
   }
+
+  // Check the "delivery already dispatched but not yet run" registry
+  // FIRST: completeOperation() moves a consumer's handle here the
+  // instant it runs, well before this consumer's own queued delivery
+  // actually executes, so a handle can legitimately be absent from
+  // m_handleToOperation below yet still be cancel()-able.
+  auto pendingIt = m_pendingDeliveryCancelled.find(handle.id);
+  if (pendingIt != m_pendingDeliveryCancelled.end()) {
+    *pendingIt.value() = true;
+    return;
+  }
+
   auto handleIt = m_handleToOperation.find(handle.id);
   if (handleIt == m_handleToOperation.end()) {
-    return; // stale or already-completed handle: safe no-op
+    return; // stale or already-delivered handle: safe no-op
   }
   const quint64 operationId = handleIt.value();
   m_handleToOperation.erase(handleIt);

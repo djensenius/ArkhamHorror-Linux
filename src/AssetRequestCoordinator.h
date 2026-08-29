@@ -70,6 +70,12 @@ namespace Arkham {
 //   - cancel(handle) detaches exactly that one consumer. Its own callback
 //     is invoked exactly once, with AssetErrorCode::Cancelled, and never
 //     again afterwards.
+//   - This holds even after the underlying operation has already
+//     completed (successfully or not): the handle stays cancel()-able
+//     across the whole window until this consumer's own queued delivery
+//     actually runs, at which point cancel() substitutes Cancelled for
+//     the real result rather than letting it through -- see
+//     m_pendingDeliveryCancelled in the .h for the mechanism.
 //   - Other consumers of the same coalesced operation are entirely
 //     unaffected by one consumer's cancellation: the underlying fetch
 //     keeps running and still completes normally for them.
@@ -178,6 +184,24 @@ private:
   QHash<quint64, Operation> m_operations; // operationId -> Operation
   QHash<quint64, quint64>
       m_handleToOperation; // consumer handleId -> operationId
+  // A consumer's handle remains valid for cancel() from the moment
+  // request() returns it until its queued delivery actually runs (see the
+  // class comment) -- which spans TWO queued hops for an immediate
+  // completion (the queued completeOperation() call, then the queued
+  // per-consumer delivery inside dispatchToConsumers()) and one hop for
+  // an ordinary fetch completion. m_handleToOperation only covers the
+  // first hop (the handle is removed from it the instant
+  // completeOperation() runs, before the per-consumer delivery is even
+  // queued). This map covers the remaining window: completeOperation()
+  // inserts a fresh (false) flag per consumer here instead of simply
+  // forgetting the handle, and each consumer's queued lambda in
+  // dispatchToConsumers() consults and erases its own entry exactly when
+  // it runs, substituting a Cancelled result if cancel() flipped the flag
+  // in the meantime. Without this, cancel() would silently no-op on a
+  // handle it could not distinguish from a genuinely stale/already-
+  // delivered one, delivering the original (non-cancelled) result anyway.
+  QHash<quint64, std::shared_ptr<bool>>
+      m_pendingDeliveryCancelled; // consumer handleId -> cancelled flag
 };
 
 } // namespace Arkham

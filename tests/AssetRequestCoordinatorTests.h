@@ -32,6 +32,7 @@ private slots:
   void cacheHitShortCircuitsNetworkEntirely();
   void destructionNeverInvokesStaleCallback();
   void cancellingImmediateCacheHitCompletionSuppressesDelivery();
+  void cancellingAfterCompletionButBeforeQueuedDeliverySuppressesResult();
   void diskHitWithValidatorsRevalidatesAndServesStaleOn304();
   void confirmedNotModifiedPromotesEntryToMemoryForSameProcessShortCircuit();
   void diskHitRevalidationReplacesEntryOnFresh200();

@@ -7,6 +7,7 @@
 #include "MockHttpServer.h"
 
 #include <QBuffer>
+#include <QCoreApplication>
 #include <QImage>
 #include <QNetworkAccessManager>
 #include <QTemporaryDir>
@@ -455,6 +456,71 @@ void AssetRequestCoordinatorTests::
   // fire before asserting it never did.
   QTest::qWait(100);
   QCOMPARE(callbackCount, 1);
+}
+
+void AssetRequestCoordinatorTests::
+    cancellingAfterCompletionButBeforeQueuedDeliverySuppressesResult() {
+  // cancellingImmediateCacheHitCompletionSuppressesDelivery() above covers
+  // cancelling BEFORE the event loop has run at all -- i.e. before even
+  // completeOperation() (the first of two queued hops for an immediate
+  // completion) has run. This test targets the OTHER window the class
+  // comment documents: cancel() must ALSO work after completeOperation()
+  // has already run (moving the consumer out of m_handleToOperation) but
+  // before that specific consumer's own queued delivery inside
+  // dispatchToConsumers() has executed. QCoreApplication::sendPostedEvents
+  // targeted at exactly this object processes only events already queued
+  // at the time of the call -- a new event posted from WITHIN that call
+  // (dispatchToConsumers()'s own queued delivery, posted while
+  // completeOperation() is running) is deferred to the next call, giving
+  // a fully deterministic way to observe the in-between state without
+  // any timing-dependent QTest::qWait race.
+  MockHttpServer server; // no responses registered: any network hit fails.
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(4, 4);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  cache.store(cacheKey, preSeeded);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  int callbackCount = 0;
+  std::optional<Result> result;
+  const auto handle = coordinator.request(key, [&](Result r) {
+    ++callbackCount;
+    result = std::move(r);
+  });
+  QVERIFY(handle.isValid());
+
+  // Run exactly the first queued hop (completeOperation()), which moves
+  // this consumer's handle out of m_handleToOperation and queues the
+  // second hop (the actual delivery) -- but does not run that second hop
+  // within this same call.
+  QCoreApplication::sendPostedEvents(&coordinator, QEvent::MetaCall);
+  QCOMPARE(callbackCount, 0);
+
+  // The handle is no longer "in flight" by any naive definition, yet
+  // cancel() here must still suppress the queued (but not yet delivered)
+  // success result.
+  coordinator.cancel(handle);
+
+  // Now let the second hop run.
+  QCoreApplication::sendPostedEvents(&coordinator, QEvent::MetaCall);
+
+  QCOMPARE(callbackCount, 1);
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::Cancelled);
 }
 
 void AssetRequestCoordinatorTests::
