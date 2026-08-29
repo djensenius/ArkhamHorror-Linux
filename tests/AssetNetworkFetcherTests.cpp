@@ -406,6 +406,44 @@ void AssetNetworkFetcherTests::
   }
 }
 
+void AssetNetworkFetcherTests::
+    avifFtypMinorVersionIsNeverMisreadAsCompatibleBrand() {
+  // ISO/IEC 14496-12 `ftyp` box layout: [0..4) box size, [4..8) "ftyp",
+  // [8..12) major_brand, [12..16) minor_version (a 4-byte VERSION NUMBER,
+  // not a brand identifier), [16..end) compatible_brands. A body whose
+  // major_brand is a real, non-AVIF brand (e.g. "mif1", used by HEIF)
+  // but whose minor_version bytes happen to spell "avif" must be
+  // rejected as MagicBytesMismatch, never accepted as a real AVIF
+  // signature -- treating minor_version as a scannable brand slot would
+  // let a crafted/adversarial file masquerade as AVIF. This is
+  // deterministic (MagicBytesMismatch) regardless of whether the local
+  // Qt build has AVIF codec support: without the fix, a build lacking
+  // AVIF support would instead surface UnsupportedCodec (having wrongly
+  // accepted the signature first), and a build with AVIF support would
+  // instead attempt a real decode of this 16-byte non-image body and
+  // surface MalformedImage -- neither of which is the correct outcome.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  // 4-byte box size (0 == extends to end) + "ftyp" + major_brand="mif1"
+  // (a real, non-AVIF ISOBMFF brand) + minor_version bytes == "avif".
+  response.body = QByteArrayLiteral("\x00\x00\x00\x00"
+                                    "ftyp"
+                                    "mif1"
+                                    "avif");
+  server.setResponse(QStringLiteral("/minor-version-trap.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/minor-version-trap.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MagicBytesMismatch);
+}
+
 void AssetNetworkFetcherTests::conditionalRequestAcceptsMatchingNotModified() {
   MockHttpServer server;
   MockHttpServer::Response response;

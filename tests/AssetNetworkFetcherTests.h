@@ -31,6 +31,7 @@ private slots:
   void jpegDecodesRegardlessOfQtPluginKeySpelling();
   void avifCodecSupportIsEnvironmentAdaptive();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
+  void avifFtypMinorVersionIsNeverMisreadAsCompatibleBrand();
   void conditionalRequestAcceptsMatchingNotModified();
   void conditionalRequestWithLastModifiedAcceptsMatchingNotModified();
   void unconditional304IsRejectedAsTypedError();
