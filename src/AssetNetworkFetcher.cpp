@@ -12,6 +12,7 @@
 #include <QUrl>
 #include <QVariant>
 #include <QtAssert>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 
@@ -67,14 +68,23 @@ std::optional<AssetFormat> sniffMagicBytes(const QByteArray &bytes) {
       // more 4-byte compatible_brands. Checking major_brand and then
       // skipping straight to compatible_brands (offset 16) avoids
       // misclassifying a crafted minor_version as a brand match.
-      if (bytes.mid(8, 4) == QByteArrayLiteral("avif") ||
-          bytes.mid(8, 4) == QByteArrayLiteral("avis")) {
+      //
+      // Compare directly against bytes.constData() rather than slicing
+      // with mid(): a crafted box can declare boxEnd up to the full
+      // capped download size (maxEncodedBytes, 20 MiB), which would
+      // otherwise drive up to ~5 million loop iterations, each
+      // allocating (and immediately discarding) a 4-byte QByteArray --
+      // an avoidable CPU/allocation cost inflicted by network-controlled
+      // bytes.
+      const char *const data = bytes.constData();
+      const auto isBrandAt = [data](qint64 offset, const char *brand) {
+        return std::memcmp(data + offset, brand, 4) == 0;
+      };
+      if (isBrandAt(8, "avif") || isBrandAt(8, "avis")) {
         return AssetFormat::Avif;
       }
       for (qint64 offset = 16; offset + 4 <= boxEnd; offset += 4) {
-        const QByteArray brand = bytes.mid(offset, 4);
-        if (brand == QByteArrayLiteral("avif") ||
-            brand == QByteArrayLiteral("avis")) {
+        if (isBrandAt(offset, "avif") || isBrandAt(offset, "avis")) {
           return AssetFormat::Avif;
         }
       }

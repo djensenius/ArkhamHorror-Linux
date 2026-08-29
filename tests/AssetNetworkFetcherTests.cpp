@@ -9,6 +9,7 @@
 #include <QNetworkAccessManager>
 #include <QSignalSpy>
 #include <QTest>
+#include <cstring>
 #include <optional>
 
 using namespace Arkham;
@@ -511,6 +512,102 @@ void AssetNetworkFetcherTests::
   AssetNetworkFetcher fetcher(nam);
   const auto result = fetchAndWait(
       fetcher, server.baseUrlFor(QStringLiteral("/truncated-box.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MagicBytesMismatch);
+}
+
+namespace {
+// Builds a synthetic AVIF `ftyp` box of exactly `totalSize` bytes: 4-byte
+// big-endian size + "ftyp" + major_brand="mif1" (a real, non-AVIF
+// ISOBMFF brand, so major_brand alone never satisfies the sniff) +
+// 4-byte minor_version + a compatible_brands region filled with
+// `fillerBrand` repeated to pad out to totalSize, with `matchBrand`
+// (if non-null) written into the LAST 4-byte compatible_brands slot.
+// totalSize must be 16 plus a multiple of 4 so the compatible_brands
+// region divides evenly into whole 4-byte slots.
+QByteArray buildLargeFtypBox(qint64 totalSize, const char *fillerBrand,
+                             const char *matchBrand) {
+  Q_ASSERT(totalSize >= 16 && (totalSize - 16) % 4 == 0);
+  QByteArray body(totalSize, Qt::Uninitialized);
+  body[0] = static_cast<char>((totalSize >> 24) & 0xFF);
+  body[1] = static_cast<char>((totalSize >> 16) & 0xFF);
+  body[2] = static_cast<char>((totalSize >> 8) & 0xFF);
+  body[3] = static_cast<char>(totalSize & 0xFF);
+  memcpy(body.data() + 4, "ftyp", 4);
+  memcpy(body.data() + 8, "mif1", 4); // major_brand: real, non-AVIF brand
+  memcpy(body.data() + 12, "\x00\x00\x00\x00", 4); // minor_version
+  for (qint64 offset = 16; offset + 4 <= totalSize; offset += 4) {
+    memcpy(body.data() + offset, fillerBrand, 4);
+  }
+  if (matchBrand != nullptr) {
+    memcpy(body.data() + totalSize - 4, matchBrand, 4);
+  }
+  return body;
+}
+} // namespace
+
+void AssetNetworkFetcherTests::
+    avifCompatibleBrandMatchAtVeryLastSlotOfLargeBoxIsFound() {
+  // Regression test for a refactor (Copilot review round 25) that
+  // rewrote the compatible_brands scan loop to compare directly against
+  // bytes.constData() via memcmp() instead of allocating a QByteArray
+  // per iteration via mid() -- purely a CPU/allocation-cost fix with no
+  // intended behavioural change. A large box (1 MiB, ~262k compatible
+  // brand slots) whose ONLY matching brand sits in the very last slot
+  // proves the rewritten loop still scans the full declared range
+  // (rather than stopping early or miscomputing the final offset), and
+  // that the pointer-arithmetic-based comparison is exactly equivalent
+  // to the byte-value comparison it replaced.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  response.body =
+      buildLargeFtypBox(1 * 1024 * 1024, "QQQQ", /*matchBrand=*/"avif");
+  server.setResponse(QStringLiteral("/large-last-slot.avif"), response);
+
+  const bool avifSupported =
+      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/large-last-slot.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  if (!bool(*result)) {
+    // The signature matched (that is what this test is proving); this
+    // body is not a real decodable image, so any failure past that
+    // point must never be MagicBytesMismatch.
+    QVERIFY(result->error().code != AssetErrorCode::MagicBytesMismatch);
+    if (!avifSupported) {
+      QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+    }
+  }
+}
+
+void AssetNetworkFetcherTests::
+    avifLargeBoxWithNoMatchingBrandAnywhereIsRejected() {
+  // Companion to the "last slot" test above: the same large box shape
+  // with NO matching brand anywhere in the compatible_brands region
+  // must still be rejected as MagicBytesMismatch. Together the two
+  // tests bound the rewritten scan's correctness at both ends of its
+  // range: it must neither stop before the true match (this test) nor
+  // report a false match when none exists (this test).
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  response.body =
+      buildLargeFtypBox(1 * 1024 * 1024, "QQQQ", /*matchBrand=*/nullptr);
+  server.setResponse(QStringLiteral("/large-no-match.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/large-no-match.avif")),
       AssetFormat::Avif);
 
   QVERIFY(result.has_value());

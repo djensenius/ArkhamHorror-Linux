@@ -34,6 +34,8 @@ private slots:
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void avifFtypMinorVersionIsNeverMisreadAsCompatibleBrand();
   void avifFtypTruncatedBoxSizeNeverReadsPastDeclaredBoundary();
+  void avifCompatibleBrandMatchAtVeryLastSlotOfLargeBoxIsFound();
+  void avifLargeBoxWithNoMatchingBrandAnywhereIsRejected();
   void conditionalRequestAcceptsMatchingNotModified();
   void conditionalRequestWithLastModifiedAcceptsMatchingNotModified();
   void unconditional304IsRejectedAsTypedError();
