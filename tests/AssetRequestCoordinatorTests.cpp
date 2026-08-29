@@ -1793,6 +1793,112 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
+    diskMetadataDimensionMismatchIsQuarantinedAndRefetched() {
+  // Round-4 review item 9: the encoded bytes themselves are perfectly
+  // valid and self-consistent (a genuine 6x6 PNG whose sha256Hex/
+  // encodedSize the payload-integrity check in AssetCache::lookupDisk()
+  // has no reason to reject) -- but the metadata describing them claims
+  // a dimension (40x40) that does not match what those bytes actually,
+  // truly decode to. This is exactly the "well-formed but wrong"
+  // metadata case AssetCache::lookupDisk()'s own payload-hash check
+  // cannot catch (it only proves the PAYLOAD matches its own hash, never
+  // that the METADATA agrees with the payload's real decoded content).
+  // ensureDecoded()'s cross-validation must catch this on the very first
+  // read, quarantine the entry, and transparently refetch exactly once.
+  MockHttpServer server;
+  MockHttpServer::Response fresh;
+  fresh.contentType = "image/png";
+  fresh.body = encodePng(6, 6);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), fresh);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  // Genuinely valid, decodable 6x6 PNG bytes -- only the persisted
+  // dimensions metadata is wrong/stale/tampered.
+  preSeeded.encodedBytes = encodePng(6, 6);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(40, 40); // does not match the real bytes
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).dimensions, QSize(6, 6));
+
+  const auto onDisk = restartedCache.lookupDisk(cacheKey);
+  QVERIFY(onDisk.has_value());
+  QCOMPARE(onDisk->dimensions, QSize(6, 6));
+}
+
+void AssetRequestCoordinatorTests::
+    diskMetadataContentTypeMismatchIsQuarantinedAndRefetched() {
+  // Round-4 review item 9: same principle as the dimension-mismatch test
+  // above, but for the persisted contentType field -- genuinely valid
+  // PNG bytes whose metadata claims a JPEG contentType. The payload's
+  // own magic bytes still match the candidate's actual (PNG) format, so
+  // decodeAndValidate() succeeds; only the separately-persisted metadata
+  // field disagrees, which only ensureDecoded()'s explicit cross-check
+  // can catch.
+  MockHttpServer server;
+  MockHttpServer::Response fresh;
+  fresh.contentType = "image/png";
+  fresh.body = encodePng(6, 6);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), fresh);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(6, 6);
+  preSeeded.contentType = QStringLiteral("image/jpeg"); // wrong on purpose
+  preSeeded.dimensions = QSize(6, 6);
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).dimensions, QSize(6, 6));
+
+  const auto onDisk = restartedCache.lookupDisk(cacheKey);
+  QVERIFY(onDisk.has_value());
+  QCOMPARE(onDisk->contentType, QStringLiteral("image/png"));
+}
+
+void AssetRequestCoordinatorTests::
     diskCachedAvifSequenceIsQuarantinedAndRefetchedFromNetwork() {
   // Review round-4 item 10: a disk-cached AVIF entry whose bytes decode
   // to a valid multi-image ("avis"-brand) container must be classified

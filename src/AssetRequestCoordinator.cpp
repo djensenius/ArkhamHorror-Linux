@@ -455,6 +455,47 @@ AssetRequestCoordinator::ensureDecoded(AssetCache::CachedEntry entry,
     return AssetOutcome<AssetCache::CachedEntry>(decoded.error());
   }
 
+  // Round-4 review item 9: a disk hit's metadata (contentType/dimensions)
+  // is read back from a JSON file this process itself does not
+  // continuously guard -- it can be corrupted independently of the
+  // payload it describes (disk bitrot touching only the metadata file,
+  // a partially-applied external edit, or an adversary who can write
+  // into the cache directory but does not control this process). The
+  // payload's own byte-for-byte integrity (sha256Hex/encodedSize) is
+  // already fully re-verified by AssetCache::lookupDisk() before this
+  // function ever runs -- but that only proves the ENCODED bytes are
+  // exactly what was originally stored, not that the METADATA describing
+  // them (which lookupDisk() reads from a separate file and trusts
+  // verbatim into CachedEntry::contentType/dimensions) still agrees with
+  // what those bytes actually, truly decode to. Cross-validate both
+  // fields against the just-decoded, ground-truth QImage/candidate
+  // format now: a mismatch means the metadata is self-inconsistent with
+  // its own payload (zero/wrong-but-well-formed JSON, or a stale field
+  // left over from some earlier, different generation) and must never be
+  // served -- CacheCorrupt routes this exact case through the same
+  // quarantine-then-single-fresh-refetch path
+  // completeCacheReadOrQuarantine() already uses for a hard decode
+  // failure (see isQuarantineWorthy()).
+  //
+  // entry.contentType is compared against assetFormatMimeType(format)
+  // rather than re-deriving it from magic bytes a second time here:
+  // decodeAndValidate() above already independently confirmed (via
+  // sniffMagicBytes()) that the ENCODED bytes' magic bytes match
+  // `format` exactly, and every legitimate store() call persists
+  // contentType as precisely assetFormatMimeType() of the format the
+  // bytes were fetched/validated against (see
+  // AssetNetworkFetcher::fetch()'s declaredContentType check) -- so this
+  // comparison catches a metadata file whose contentType field was
+  // corrupted/tampered/stale independently of the payload, without
+  // redundantly re-implementing the magic-byte check.
+  if (entry.contentType != assetFormatMimeType(format) ||
+      entry.dimensions != decoded->size()) {
+    return AssetOutcome<AssetCache::CachedEntry>(AssetError{
+        AssetErrorCode::CacheCorrupt,
+        QStringLiteral("cached metadata (contentType/dimensions) does not "
+                       "match the actual decoded image")});
+  }
+
   entry.decodedImage = *decoded;
   return AssetOutcome<AssetCache::CachedEntry>(std::move(entry));
 }

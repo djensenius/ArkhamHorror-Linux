@@ -72,6 +72,8 @@ private slots:
   void diskHitAfterRestartDecodesOnDemandAndPublishesToMemory();
   void concurrentIdenticalRequestsForADiskHitCoalesceIntoASingleDecode();
   void malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork();
+  void diskMetadataDimensionMismatchIsQuarantinedAndRefetched();
+  void diskMetadataContentTypeMismatchIsQuarantinedAndRefetched();
   void diskCachedAvifSequenceIsQuarantinedAndRefetchedFromNetwork();
   void quarantineRefetchFailureSurfacesFreshErrorWithoutLooping();
   void unsupportedCodecIsNeverQuarantineWorthy();
