@@ -443,12 +443,27 @@ void AssetRequestCoordinator::completeOperation(
 void AssetRequestCoordinator::dispatchToConsumers(
     Operation &operation, AssetOutcome<AssetCache::CachedEntry> result) {
   QPointer<AssetRequestCoordinator> self(this);
+  // Copilot review (round 32, suppressed comment): share the single
+  // completion result across every fanned-out consumer via one
+  // shared_ptr rather than materialising a fresh captured copy of
+  // `result` inside each consumer's own closure below. Every member of
+  // AssetOutcome<CachedEntry> (QByteArray/QImage/QString) is an
+  // implicitly-shared, copy-on-write Qt value type, so even the
+  // previous per-consumer captured copies were already cheap reference
+  // bumps rather than genuine deep duplication of encoded bytes or
+  // decoded pixel data -- but sharing one instance still avoids N
+  // redundant std::optional<CachedEntry>/AssetError wrapper copies (and
+  // their own reference-count bookkeeping) when an operation fans out
+  // to many coalesced consumers.
+  auto sharedResult =
+      std::make_shared<const AssetOutcome<AssetCache::CachedEntry>>(
+          std::move(result));
   for (Consumer &consumer : operation.consumers) {
     const quint64 handleId = consumer.handleId;
     QMetaObject::invokeMethod(
         this,
         [self, handleId, callback = std::move(consumer.callback),
-         result]() mutable {
+         sharedResult]() mutable {
           if (!self) {
             return;
           }
@@ -472,14 +487,13 @@ void AssetRequestCoordinator::dispatchToConsumers(
                            QStringLiteral("request was cancelled")}));
             return;
           }
-          // `result` is this lambda's own private capture (a per-
-          // consumer copy of the shared outcome, made because there
-          // may be multiple consumers to fan out to) -- once we are
-          // inside this specific lambda invocation, nothing else still
-          // needs it, so move it into the callback rather than paying
-          // for another deep copy of a potentially large CachedEntry
-          // (encoded bytes plus a decoded QImage).
-          std::move(callback)(std::move(result));
+          // `sharedResult` is shared across every consumer's closure
+          // (some of which may not have run yet), so it can never be
+          // moved-from here -- copy-construct the callback's argument
+          // from the shared const instance instead. As above, this is
+          // cheap (reference-count bumps on implicitly-shared Qt
+          // members), not a deep copy.
+          std::move(callback)(*sharedResult);
         },
         Qt::QueuedConnection);
   }

@@ -6,6 +6,7 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <utility>
 
 MockHttpServer::MockHttpServer(QObject *parent)
     : QObject(parent), m_server(new QTcpServer(this)) {
@@ -217,8 +218,16 @@ void MockHttpServer::writeSlowDrip(QTcpSocket *socket, const QString &path,
   auto *timer = new QTimer(this);
   timer->setInterval(chunkDelayMs);
 
+  // `body` is moved (not copied) into the lambda: `writeSlowDrip()`
+  // already took it by value (one copy from the caller), so capturing
+  // it by value again here would make a second full copy of the
+  // response body that lives for the whole slow-drip duration -- wasted
+  // memory that scales with fixture size (e.g. multi-megabyte
+  // incremental-cap test bodies). Since `body` is never read again in
+  // this function after this point, moving it is free and behaviourally
+  // identical.
   connect(timer, &QTimer::timeout, this,
-          [this, socket, path, body, chunkSize, timer,
+          [this, socket, path, body = std::move(body), chunkSize, timer,
            offset = qint64{0}]() mutable {
             if (!m_connections.contains(socket)) {
               timer->stop();
