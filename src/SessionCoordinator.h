@@ -28,14 +28,18 @@ namespace Arkham {
 // establishes the ordering guarantees a future UI can build on.
 //
 // Never exposes a password, token, or Authorization header through any
-// property, signal, QVariant, log, or debug operator. state() is always a
-// fixed, static description of the enum value. diagnostic() is secret-free
-// but not always static text: for transport/backend/malformed-payload
-// failures it forwards the typed, already-secret-free diagnostic produced
-// by IAuthenticationClient/ITokenStore/ICapabilityProbe (safe categories
-// and static messages only, per their own contracts), so its exact string
-// can vary with the underlying failure while never containing request/
-// response bodies, credentials, or low-level exception text.
+// property, signal, QVariant, log, or debug operator. state() returns the
+// typed State enum value; stateDescription() is always a fixed, static,
+// secret-free label for that value. diagnostic() is secret-free but not
+// always static text: for transport/backend/malformed-payload failures it
+// forwards the typed, already-secret-free diagnostic produced by
+// IAuthenticationClient/ITokenStore/ICapabilityProbe. Those diagnostics are
+// safe-category text but not necessarily static strings -- for example
+// ICapabilityProbe's NetworkCapabilityProbe implementation includes
+// QNetworkReply::errorString()/QJsonParseError::errorString() wording -- so
+// diagnostic()'s exact text can vary with the underlying failure while
+// never containing request/response bodies, credentials, or an
+// Authorization header.
 //
 // Threading/lifetime: every dependency is borrowed by reference and must
 // outlive this coordinator (see composeProductionSession() in
