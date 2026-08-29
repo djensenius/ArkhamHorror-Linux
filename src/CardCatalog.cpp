@@ -303,16 +303,19 @@ QJsonObject SkillIcon::toJson() const {
   case SkillIconTag::SkillIcon: {
     // skill is documented as always populated when tag == SkillIcon, but
     // it is a public std::optional field with no constructor enforcing
-    // that invariant. Q_ASSERT compiles out in release builds, so also
-    // branch on has_value(): a release build that somehow hits the
-    // invalid state degrades to a JSON null payload instead of
-    // dereferencing an empty optional (UB).
-    Q_ASSERT(skill.has_value());
+    // that invariant. Q_ASSERT alone is not enough (it compiles out in
+    // release/NDEBUG builds, leaving a bare optional dereference below --
+    // UB), and substituting JSON null would produce a schema-invalid
+    // "contents" (an enum string is always required here) while masking
+    // the bug. qFatal() is never compiled out and halts with a clear
+    // diagnostic instead of doing either.
+    if (!skill)
+      qFatal("SkillIcon::toJson: tag == SkillIcon but skill is unset; this "
+             "is a construction bug, not a decode failure");
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("SkillIcon")},
         {QStringLiteral("contents"),
-         skill ? QJsonValue(Json::encodeClosedEnum(*skill, kSkillTypeTable))
-               : QJsonValue(QJsonValue::Null)},
+         Json::encodeClosedEnum(*skill, kSkillTypeTable)},
     };
   }
   case SkillIconTag::WildIcon:
@@ -383,15 +386,17 @@ QJsonObject CardCost::toJson() const {
   case CardCostTag::StaticCost:
     // staticAmount is documented as always populated when tag ==
     // StaticCost, but it is a public std::optional field with no
-    // constructor enforcing that invariant. Q_ASSERT compiles out in
-    // release builds, so also branch on has_value(): a release build that
-    // somehow hits the invalid state degrades to a JSON null payload
-    // instead of dereferencing an empty optional (UB).
-    Q_ASSERT(staticAmount.has_value());
+    // constructor enforcing that invariant. Q_ASSERT alone is not enough
+    // (it compiles out in release/NDEBUG builds, leaving a bare optional
+    // dereference below -- UB), and substituting JSON null would produce a
+    // schema-invalid "contents" (an integer is always required here) while
+    // masking the bug. qFatal() is never compiled out and halts with a
+    // clear diagnostic instead of doing either.
+    if (!staticAmount)
+      qFatal("CardCost::toJson: tag == StaticCost but staticAmount is "
+             "unset; this is a construction bug, not a decode failure");
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("StaticCost")},
-                       {QStringLiteral("contents"),
-                        staticAmount ? QJsonValue(*staticAmount)
-                                     : QJsonValue(QJsonValue::Null)}};
+                       {QStringLiteral("contents"), *staticAmount}};
   case CardCostTag::DynamicCost:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("DynamicCost")}};
   case CardCostTag::DiscardAmountCost:
@@ -485,19 +490,21 @@ QJsonObject GameValue::toJson() const {
   case GameValueTag::Static:
     // singleAmount is documented as always populated for Static/PerPlayer,
     // but it is a public std::optional field with no constructor enforcing
-    // that invariant. Q_ASSERT compiles out in release builds, so also
-    // branch on has_value(): a release build that somehow hits the invalid
-    // state degrades to a JSON null payload instead of dereferencing an
-    // empty optional (UB).
-    Q_ASSERT(singleAmount.has_value());
-    return withContents("Static"_L1, singleAmount
-                                         ? QJsonValue(*singleAmount)
-                                         : QJsonValue(QJsonValue::Null));
+    // that invariant. Q_ASSERT alone is not enough (it compiles out in
+    // release/NDEBUG builds, leaving a bare optional dereference below --
+    // UB), and substituting JSON null would produce a schema-invalid
+    // "contents" (an integer is always required here) while masking the
+    // bug. qFatal() is never compiled out and halts with a clear
+    // diagnostic instead of doing either.
+    if (!singleAmount)
+      qFatal("GameValue::toJson: tag == Static but singleAmount is unset; "
+             "this is a construction bug, not a decode failure");
+    return withContents("Static"_L1, *singleAmount);
   case GameValueTag::PerPlayer:
-    Q_ASSERT(singleAmount.has_value());
-    return withContents("PerPlayer"_L1, singleAmount
-                                            ? QJsonValue(*singleAmount)
-                                            : QJsonValue(QJsonValue::Null));
+    if (!singleAmount)
+      qFatal("GameValue::toJson: tag == PerPlayer but singleAmount is "
+             "unset; this is a construction bug, not a decode failure");
+    return withContents("PerPlayer"_L1, *singleAmount);
   case GameValueTag::StaticWithPerPlayer:
     return withContents("StaticWithPerPlayer"_L1, arr);
   case GameValueTag::ByPlayerCount:
