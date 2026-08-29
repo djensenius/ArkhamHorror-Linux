@@ -144,7 +144,36 @@ COMPONENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # third_party/<name>/NOTICE.md files for exactly why each is bundled.
     (re.compile(r"^libXau\.so"), "libxau"),
     (re.compile(r"^libXdmcp\.so"), "libxdmcp"),
-    (re.compile(r"^libxcb.*\.so"), "xcb"),
+    # A later cumulative review found the single wildcard `libxcb.*\.so`
+    # pattern previously here was factually wrong: it silently conflated
+    # base libxcb (and the built-in protocol-extension libraries built
+    # from libxcb's OWN single source repository, listed explicitly by
+    # exact extension name below) with FIVE further `libxcb-*` libraries
+    # that are each their own genuinely SEPARATE upstream git
+    # repository/project (xcb-util, xcb-util-image, xcb-util-keysyms,
+    # xcb-util-renderutil, xcb-util-wm) with their OWN, differently
+    # dated copyright holders -- see third_party/xcb/NOTICE.md and the
+    # sibling third_party/xcb-util*/NOTICE.md files for the exact
+    # per-project copyright text this split now correctly attributes.
+    # Deliberately listed as an explicit, closed set (never a `libxcb.*`
+    # wildcard) so a hypothetical future `libxcb-something-new.so` this
+    # list has no entry for is reported unmapped and fails packaging,
+    # per this same review's "unknown binary must fail" requirement,
+    # rather than being silently (and incorrectly) folded into "xcb".
+    (re.compile(r"^libxcb\.so"), "xcb"),
+    (
+        re.compile(
+            r"^libxcb-(glx|randr|render|shape|shm|sync|xfixes|xkb|dri2|dri3"
+            r"|present|res|screensaver|xf86dri|xinerama|xtest|xv|xvmc)\.so"
+        ),
+        "xcb",
+    ),
+    (re.compile(r"^libxcb-util\.so"), "xcb-util"),
+    (re.compile(r"^libxcb-image\.so"), "xcb-util-image"),
+    (re.compile(r"^libxcb-keysyms\.so"), "xcb-util-keysyms"),
+    (re.compile(r"^libxcb-render-util\.so"), "xcb-util-renderutil"),
+    (re.compile(r"^libxcb-(icccm|ewmh)\.so"), "xcb-util-wm"),
+    (re.compile(r"^libxcb-cursor\.so"), "xcb-util-cursor"),
     (re.compile(r"^libxkbcommon(-x11)?\.so"), "xkbcommon"),
     (re.compile(r"^libbrotli(common|dec|enc)\.so"), "brotli"),
     (re.compile(r"^libbsd\.so"), "libbsd"),
@@ -177,6 +206,21 @@ MANDATORY_COMPONENTS: frozenset[str] = frozenset({"libavif"})
 # AppImage -- they are still an inseparable, officially-distributed part
 # of the same Qt project documented in third_party/qt/NOTICE.md, not a
 # distinct third-party dependency requiring its own notice directory.
+#
+# IMPORTANT: a directory name being one of these alone is NOT sufficient
+# to classify a file as "qt" -- see classify_path()'s qt_reference_dir
+# parameter. A later cumulative review correctly found that "any .so
+# found inside a directory with one of these names is Qt" is fail-open:
+# an attacker (or a broken build step) could drop an arbitrary,
+# unaudited `.so` directly into e.g. `usr/lib/plugins/platforms/` and
+# have it silently accepted as legitimate, notice-covered Qt content.
+# classify_path() now additionally requires that a file with the exact
+# same relative sub-path genuinely exists under the real Qt SDK
+# installation used for this build (passed in as qt_reference_dir, e.g.
+# `$QT_ROOT_DIR` as exported by jurplel/install-qt-action) before ever
+# returning "qt" for a directory-matched file; without a reference
+# directory, directory-based Qt-plugin/QML classification is refused
+# entirely (fails closed) rather than trusting the path alone.
 QT_PLUGIN_DIRECTORIES: frozenset[str] = frozenset(
     {
         "imageformats",
@@ -213,7 +257,9 @@ QT_PLUGIN_DIRECTORIES: frozenset[str] = frozenset(
 # real QML modules nest arbitrarily deep, e.g.
 # usr/qml/QtQuick/Controls/Basic/impl/...) -- never a bare substring
 # test, so a hypothetical unrelated "libqmlfoo.so" is never
-# misclassified purely by name.
+# misclassified purely by name. As with QT_PLUGIN_DIRECTORIES, the "qml"
+# directory name alone is not sufficient; see classify_path()'s
+# qt_reference_dir parameter.
 QT_QML_ROOT_DIRNAME: str = "qml"
 
 
@@ -231,21 +277,47 @@ def classify(basename: str) -> str | None:
     return None
 
 
-def classify_path(path: Path) -> str | None:
+def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool:
+    """Returns True only if a file with the SAME relative sub-path (plugin
+    subdirectory + basename, or the full path beneath the "qml" root)
+    genuinely exists under qt_reference_dir -- the real Qt SDK
+    installation actually used to build this project (e.g. `$QT_ROOT_DIR`
+    as exported by jurplel/install-qt-action in CI). This is what turns
+    the directory-name-based Qt-plugin/QML fallback in classify_path()
+    from a fail-open "trust the path" check into one anchored to an
+    authoritative, independently-obtained source: an attacker who can
+    merely place a file inside the AppDir's imageformats/ or qml/
+    directory cannot also cause a same-named, same-subpath file to
+    already exist inside the pinned Qt SDK download this function
+    consults, so an unrecognized/attacker-supplied binary is refused
+    here and falls through to classify_path()'s unmapped return."""
+    if path.parent.name in QT_PLUGIN_DIRECTORIES:
+        candidate = qt_reference_dir / "plugins" / path.parent.name / path.name
+        return candidate.is_file()
+    if QT_QML_ROOT_DIRNAME in path.parts:
+        qml_index = path.parts.index(QT_QML_ROOT_DIRNAME)
+        sub_path = Path(*path.parts[qml_index + 1 :])
+        candidate = qt_reference_dir / QT_QML_ROOT_DIRNAME / sub_path
+        return candidate.is_file()
+    return False
+
+
+def classify_path(path: Path, qt_reference_dir: Path | None = None) -> str | None:
     """Like classify(), but additionally resolves any library located
     directly inside one of Qt's own standardized plugin subdirectories
     (QT_PLUGIN_DIRECTORIES), or anywhere beneath a literal "qml" path
-    component (QT_QML_ROOT_DIRNAME), to the "qt" component regardless of
-    its own basename -- see QT_PLUGIN_DIRECTORIES's and
-    QT_QML_ROOT_DIRNAME's docstrings for why basename matching alone is
-    insufficient for either Qt plugins or Qt Quick/QML modules.
-    Matches QT_QML_ROOT_DIRNAME against whole path *components*
-    (path.parts), never a bare substring test, so a hypothetical
-    unrelated directory merely containing "qml" as part of a longer name
-    (e.g. "libqmlfoo") is never misclassified."""
-    if path.parent.name in QT_PLUGIN_DIRECTORIES:
-        return "qt"
-    if QT_QML_ROOT_DIRNAME in path.parts:
+    component (QT_QML_ROOT_DIRNAME), to the "qt" component -- but, unlike
+    an earlier version of this function, ONLY if qt_reference_dir is
+    supplied AND a file with the identical relative sub-path is verified
+    to genuinely exist under it (see
+    _is_real_qt_plugin_or_qml_module()'s docstring for why this
+    authoritative cross-check is required, not merely the directory name
+    itself). If qt_reference_dir is None, directory-based Qt
+    classification is refused entirely (returns None, i.e. unmapped,
+    rather than trusting the path) -- callers that omit it therefore
+    fail closed rather than silently reintroducing the fail-open
+    behavior a cumulative review found and required be fixed."""
+    if qt_reference_dir is not None and _is_real_qt_plugin_or_qml_module(path, qt_reference_dir):
         return "qt"
     return classify(path.name)
 
@@ -262,17 +334,20 @@ def find_bundled_libraries(lib_dir: Path) -> list[Path]:
 
 def classify_all(
     lib_dir: Path,
+    qt_reference_dir: Path | None = None,
 ) -> tuple[dict[str, list[Path]], list[Path]]:
     """Returns (component -> [paths requiring that component's notice],
     unmapped_paths). ABI_ALLOWLIST-covered libraries are excluded from
-    both (they need no notice and are not a failure)."""
+    both (they need no notice and are not a failure). qt_reference_dir is
+    forwarded to classify_path() -- see its docstring; omitting it means
+    every directory-matched Qt plugin/QML module is reported unmapped."""
     by_component: dict[str, list[Path]] = {}
     unmapped: list[Path] = []
     for path in find_bundled_libraries(lib_dir):
         basename = path.name
         if basename in ABI_ALLOWLIST:
             continue
-        component = classify_path(path)
+        component = classify_path(path, qt_reference_dir)
         if component is None:
             unmapped.append(path)
             continue
@@ -289,12 +364,17 @@ def cmd_classify(args: argparse.Namespace) -> int:
     if not lib_dir.is_dir():
         print(f"Not a directory: {lib_dir}", file=sys.stderr)
         return 2
+    qt_reference_dir: Path | None = args.qt_reference_dir
+    if qt_reference_dir is not None and not qt_reference_dir.is_dir():
+        print(f"Not a directory: {qt_reference_dir}", file=sys.stderr)
+        return 2
 
-    by_component, unmapped = classify_all(lib_dir)
+    by_component, unmapped = classify_all(lib_dir, qt_reference_dir)
 
     if args.json_out is not None:
         manifest = {
             "libDir": str(lib_dir),
+            "qtReferenceDir": str(qt_reference_dir) if qt_reference_dir is not None else None,
             "components": {
                 component: [str(p.relative_to(lib_dir)) for p in paths]
                 for component, paths in sorted(by_component.items())
@@ -336,12 +416,16 @@ def cmd_verify_notices(args: argparse.Namespace) -> int:
     lib_dir: Path = args.lib_dir
     third_party_root: Path = args.third_party_root
     doc_root: Path = args.doc_root
+    qt_reference_dir: Path | None = args.qt_reference_dir
 
     if not lib_dir.is_dir():
         print(f"Not a directory: {lib_dir}", file=sys.stderr)
         return 2
+    if qt_reference_dir is not None and not qt_reference_dir.is_dir():
+        print(f"Not a directory: {qt_reference_dir}", file=sys.stderr)
+        return 2
 
-    by_component, unmapped = classify_all(lib_dir)
+    by_component, unmapped = classify_all(lib_dir, qt_reference_dir)
 
     missing_mandatory = MANDATORY_COMPONENTS - by_component.keys()
     if missing_mandatory:
@@ -423,15 +507,27 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
+    qt_reference_dir_help = (
+        "path to the real Qt SDK installation actually used to build this "
+        "project (e.g. $QT_ROOT_DIR as exported by jurplel/install-qt-action "
+        "in CI). Required to classify any bundled library found inside a "
+        "Qt plugin subdirectory or beneath a 'qml' directory as the 'qt' "
+        "component -- see classify_path()'s docstring. Omitting this means "
+        "such libraries are reported unmapped (fail closed) rather than "
+        "trusted by directory name alone."
+    )
+
     classify_parser = subparsers.add_parser("classify")
     classify_parser.add_argument("lib_dir", type=Path)
     classify_parser.add_argument("--json-out", type=Path, default=None)
+    classify_parser.add_argument("--qt-reference-dir", type=Path, default=None, help=qt_reference_dir_help)
     classify_parser.set_defaults(func=cmd_classify)
 
     verify_parser = subparsers.add_parser("verify-notices")
     verify_parser.add_argument("lib_dir", type=Path)
     verify_parser.add_argument("third_party_root", type=Path)
     verify_parser.add_argument("doc_root", type=Path)
+    verify_parser.add_argument("--qt-reference-dir", type=Path, default=None, help=qt_reference_dir_help)
     verify_parser.set_defaults(func=cmd_verify_notices)
 
     args = parser.parse_args(argv)

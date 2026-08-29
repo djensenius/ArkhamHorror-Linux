@@ -453,13 +453,27 @@ jobs:
           }
           doc_root="$extracted/usr/share/doc/ArkhamHorror/third_party"
 
+          # --qt-reference-dir anchors the classifier's Qt-plugin/QML
+          # directory-based fallback to the ACTUAL Qt SDK installed for
+          # this build ($QT_ROOT_DIR, exported by jurplel/install-qt-action
+          # above): a later cumulative review found the previous,
+          # directory-name-only fallback fail-open (an arbitrary .so
+          # merely placed inside e.g. imageformats/ was silently accepted
+          # as "qt"). With this argument, such a file is only classified
+          # as "qt" if a file with the identical relative sub-path also
+          # genuinely exists inside the pinned Qt SDK download itself.
+          [[ -n "${QT_ROOT_DIR:-}" ]] || {
+            echo "QT_ROOT_DIR is not set; install-qt-action should have exported it." >&2
+            exit 1
+          }
+
           sbom_path="$(pwd)/codec-notice-sbom.json"
           python3 packaging/audit_codec_notices.py classify "$lib_search_root" \
-            --json-out "$sbom_path"
+            --json-out "$sbom_path" --qt-reference-dir "$QT_ROOT_DIR"
           echo "Wrote machine-readable bundled-library SBOM to $sbom_path"
 
           python3 packaging/audit_codec_notices.py verify-notices \
-            "$lib_search_root" third_party "$doc_root"
+            "$lib_search_root" third_party "$doc_root" --qt-reference-dir "$QT_ROOT_DIR"
       - name: Upload bundled-library SBOM
         uses: actions/upload-artifact@v4
         with:

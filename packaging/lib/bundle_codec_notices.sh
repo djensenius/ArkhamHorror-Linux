@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 #
-# bundle_codec_notices <bundled_lib_search_root> <third_party_root> <doc_dest_dir>
+# bundle_codec_notices <bundled_lib_search_root> <third_party_root> <doc_dest_dir> [qt_reference_dir]
 #
 # Review round-3 item 17 (initial version) / round-4 item 12 (this
 # rewrite): every ELF shared library linuxdeploy's automatic ldd-based
@@ -30,6 +30,19 @@
 # silently shipping unattributed (the "packaging fails on any unmapped
 # new SONAME" contract from review round-4 item 12).
 #
+# The optional fourth argument, qt_reference_dir, is forwarded verbatim
+# as audit_codec_notices.py's own `--qt-reference-dir` flag: a later
+# cumulative review found that classifier's directory-name-only
+# Qt-plugin/QML fallback fail-open (an arbitrary .so merely placed inside
+# a Qt plugin/qml directory was silently accepted as "qt"), so it now
+# requires a verified reference to the real Qt SDK actually used for this
+# build before ever resolving such a file to "qt" -- callers of this
+# function that bundle any real Qt plugin/QML content (i.e. every normal
+# AppImage build using --plugin qt) MUST supply this argument or every
+# bundled Qt plugin/QML module will be reported unmapped and fail here.
+# Pass an empty string to explicitly opt out (e.g. from a synthetic test
+# fixture that never bundles genuine Qt plugin/qml content at all).
+#
 # For every classified component, copies every regular file present under
 # <third_party_root>/<component>/ (LICENSE, and NOTICE.md/PATENTS/README
 # where present) to <doc_dest_dir>/third_party/<component>/ -- mirroring
@@ -43,6 +56,7 @@ bundle_codec_notices() {
   local bundled_lib_search_root="$1"
   local third_party_root="$2"
   local doc_dest_dir="$3"
+  local qt_reference_dir="${4:-}"
 
   # BASH_SOURCE[0] inside a function defined in a sourced file always
   # resolves to the file the function was *defined* in (this file, not
@@ -57,9 +71,14 @@ bundle_codec_notices() {
   self_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
   local audit_script="$self_dir/../audit_codec_notices.py"
 
+  local -a classify_args=(classify "$bundled_lib_search_root")
+  if [[ -n "$qt_reference_dir" ]]; then
+    classify_args+=(--qt-reference-dir "$qt_reference_dir")
+  fi
+
   local classify_output
   if ! classify_output="$(python3 "$audit_script" \
-    classify "$bundled_lib_search_root" 2>&1)"; then
+    "${classify_args[@]}" 2>&1)"; then
     echo "bundle_codec_notices: audit_codec_notices.py classify failed:" >&2
     echo "$classify_output" >&2
     return 1

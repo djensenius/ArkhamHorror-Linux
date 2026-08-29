@@ -1,11 +1,12 @@
-# Third-party dependency: libxcb and its extension libraries
+# Third-party dependency: libxcb (base library and built-in extensions)
 
 This directory documents (it does not vendor or build) a third-party runtime
 dependency of the ArkhamHorror-Linux client's AppImage packaging:
 
-- **Name:** libxcb and its extension libraries (libxcb-cursor, -glx, -icccm,
-  -image, -keysyms, -randr, -render, -render-util, -shape, -shm, -sync,
-  -util, -xfixes, -xkb, ...)
+- **Name:** libxcb, and the X11 protocol-extension libraries built from the
+  SAME upstream source repository (libxcb-glx, -randr, -render, -shape,
+  -shm, -sync, -xfixes, -xkb, -dri2, -dri3, -present, -res, -screensaver,
+  -xf86dri, -xinerama, -xtest, -xv, -xvmc)
 - **Upstream:** https://gitlab.freedesktop.org/xorg/lib/libxcb
 - **License:** MIT (see `LICENSE`, reproduced verbatim from upstream's
   `COPYING`)
@@ -16,13 +17,17 @@ dependency of the ArkhamHorror-Linux client's AppImage packaging:
 
 Qt's xcb platform plugin (`libqxcb.so`, force-included via linuxdeploy's
 `--plugin qt` since this is the only supported Linux windowing backend for
-this project) links against the base libxcb library and a family of
-similarly-licensed `libxcb-*` extension libraries. All are published from
-the same upstream project sharing one license, matched here by a single
-`libxcb.*` basename prefix pattern (see `COMPONENT_PATTERNS` in
-`packaging/audit_codec_notices.py`) rather than an exhaustive per-extension
-name list -- mirroring how the already-documented `libQt6.*`/`libabsl_*`
-families are handled.
+this project) links against the base libxcb library and the X11 protocol
+extensions listed above, all of which are built from libxcb's own single
+source repository and share exactly one license/copyright. Matched here by
+an explicit `libxcb\.so` pattern plus a fixed, explicit list of these
+specific built-in extension basenames (see `COMPONENT_PATTERNS` in
+`packaging/audit_codec_notices.py`) -- never a bare `libxcb.*` wildcard,
+which would incorrectly also match the genuinely SEPARATE, differently
+copyrighted `xcb-util`/`xcb-util-image`/`xcb-util-keysyms`/
+`xcb-util-renderutil`/`xcb-util-wm`/`xcb-util-cursor` projects documented
+in their own `third_party/xcb-util*/` directories -- a misattribution a
+later cumulative review specifically found and required be split apart.
 
 This directory is present unconditionally in the source tree so its notice
 is always available to bundle when needed; `packaging/audit_codec_notices.py`

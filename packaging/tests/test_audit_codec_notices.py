@@ -128,18 +128,13 @@ class ClassifyTests(unittest.TestCase):
         cases = {
             "libXau.so.6": "libxau",
             "libXdmcp.so.6": "libxdmcp",
-            "libxcb-cursor.so.0": "xcb",
+            "libxcb.so.1": "xcb",
             "libxcb-glx.so.0": "xcb",
-            "libxcb-icccm.so.4": "xcb",
-            "libxcb-image.so.0": "xcb",
-            "libxcb-keysyms.so.1": "xcb",
             "libxcb-randr.so.0": "xcb",
-            "libxcb-render-util.so.0": "xcb",
             "libxcb-render.so.0": "xcb",
             "libxcb-shape.so.0": "xcb",
             "libxcb-shm.so.0": "xcb",
             "libxcb-sync.so.1": "xcb",
-            "libxcb-util.so.1": "xcb",
             "libxcb-xfixes.so.0": "xcb",
             "libxcb-xkb.so.1": "xcb",
             "libxkbcommon.so.0": "xkbcommon",
@@ -171,6 +166,44 @@ class ClassifyTests(unittest.TestCase):
             with self.subTest(basename=basename):
                 self.assertEqual(audit.classify(basename), expected)
 
+    def test_xcb_util_family_are_distinct_components_from_base_xcb(self) -> None:
+        # A later cumulative review found the single wildcard `libxcb.*`
+        # pattern this test previously encoded incorrectly conflated
+        # base libxcb (and its own built-in protocol extensions, still
+        # legitimately "xcb") with FIVE further libxcb-* libraries that
+        # are each their own genuinely separate upstream git
+        # repository/project with distinct, differently-dated copyright
+        # holders -- see third_party/xcb/NOTICE.md and the sibling
+        # third_party/xcb-util*/NOTICE.md files. Each must resolve to
+        # its own distinct component, never collapse onto "xcb".
+        cases = {
+            "libxcb-util.so.1": "xcb-util",
+            "libxcb-image.so.0": "xcb-util-image",
+            "libxcb-keysyms.so.1": "xcb-util-keysyms",
+            "libxcb-render-util.so.0": "xcb-util-renderutil",
+            "libxcb-icccm.so.4": "xcb-util-wm",
+            "libxcb-ewmh.so.2": "xcb-util-wm",
+            "libxcb-cursor.so.0": "xcb-util-cursor",
+        }
+        for basename, expected in cases.items():
+            with self.subTest(basename=basename):
+                self.assertEqual(audit.classify(basename), expected)
+        # And base libxcb / its own built-in extensions must still
+        # classify as "xcb", never accidentally swept into one of the
+        # xcb-util-* components above by an overly broad regex.
+        for basename in ("libxcb.so.1", "libxcb-randr.so.0", "libxcb-dri3.so.0"):
+            with self.subTest(basename=basename):
+                self.assertEqual(audit.classify(basename), "xcb")
+
+    def test_unrecognized_future_xcb_library_is_unmapped_not_xcb(self) -> None:
+        # The explicit, closed per-component list replacing the old
+        # `libxcb.*` wildcard must never silently accept a hypothetical
+        # future libxcb-something-new.so this list has no entry for --
+        # proving the "unknown binary must fail" requirement holds for
+        # the xcb family specifically, not just in the general case.
+        self.assertIsNone(audit.classify("libxcb-somethingnew.so.1"))
+
+
     def test_legacy_pcre1_and_pcre2_remain_distinct_components(self) -> None:
         # libpcre.so.3 (legacy PCRE1) and libpcre2-8.so.0 (PCRE2, already
         # covered by test_libsecret_transitive_closure_classifies above)
@@ -183,7 +216,7 @@ class ClassifyTests(unittest.TestCase):
     def test_completely_unknown_library_is_unmapped(self) -> None:
         self.assertIsNone(audit.classify("libtotallyunknownvendorlib.so.1"))
 
-    def test_qt_plugin_directory_classifies_regardless_of_basename(
+    def test_qt_plugin_directory_classifies_against_verified_qt_reference(
         self,
     ) -> None:
         # Qt's own plugins (imageformats/libqjpeg.so, platforms/libqxcb.so,
@@ -191,17 +224,57 @@ class ClassifyTests(unittest.TestCase):
         # by this project's own build-appimage.sh via
         # EXTRA_PLATFORM_PLUGINS) do not match the libQt6.* basename
         # pattern at all; classify_path() must still resolve them to "qt"
-        # by directory location, or every real AppImage build's bundled
-        # Qt plugins would be reported unmapped.
-        cases = {
-            Path("/AppDir/usr/plugins/imageformats/libqjpeg.so"): "qt",
-            Path("/AppDir/usr/plugins/platforms/libqxcb.so"): "qt",
-            Path("/AppDir/usr/plugins/generic/libqoffscreen.so"): "qt",
-            Path("/AppDir/usr/plugins/tls/libqopensslbackend.so"): "qt",
-        }
-        for path, expected in cases.items():
-            with self.subTest(path=str(path)):
-                self.assertEqual(audit.classify_path(path), expected)
+        # by directory location, but -- per a later cumulative review
+        # that found the directory-name-only version of this check
+        # fail-open -- ONLY once a file with the identical relative
+        # sub-path is verified to genuinely exist under a supplied
+        # qt_reference_dir (standing in for the real Qt SDK install).
+        with tempfile.TemporaryDirectory() as qt_root_name:
+            qt_root = Path(qt_root_name)
+            (qt_root / "plugins" / "imageformats").mkdir(parents=True)
+            (qt_root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(b"")
+            (qt_root / "plugins" / "platforms").mkdir(parents=True)
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            (qt_root / "plugins" / "generic").mkdir(parents=True)
+            (qt_root / "plugins" / "generic" / "libqoffscreen.so").write_bytes(b"")
+            (qt_root / "plugins" / "tls").mkdir(parents=True)
+            (qt_root / "plugins" / "tls" / "libqopensslbackend.so").write_bytes(b"")
+
+            cases = {
+                Path("/AppDir/usr/plugins/imageformats/libqjpeg.so"): "qt",
+                Path("/AppDir/usr/plugins/platforms/libqxcb.so"): "qt",
+                Path("/AppDir/usr/plugins/generic/libqoffscreen.so"): "qt",
+                Path("/AppDir/usr/plugins/tls/libqopensslbackend.so"): "qt",
+            }
+            for path, expected in cases.items():
+                with self.subTest(path=str(path)):
+                    self.assertEqual(audit.classify_path(path, qt_root), expected)
+
+    def test_qt_plugin_directory_without_reference_dir_is_unmapped(self) -> None:
+        # The core fail-closed-by-default contract: omitting
+        # qt_reference_dir entirely must NOT fall back to trusting the
+        # directory name alone (that was the exact fail-open defect a
+        # later cumulative review found and required be fixed).
+        self.assertIsNone(
+            audit.classify_path(Path("/AppDir/usr/plugins/platforms/libqxcb.so"))
+        )
+
+    def test_qt_plugin_directory_with_unverified_binary_is_unmapped(self) -> None:
+        # The core regression this review finding specifically requires:
+        # an attacker (or a broken build step) placing an arbitrary,
+        # unaudited .so directly inside a real Qt plugin directory must
+        # be reported unmapped (and fail packaging), not silently
+        # accepted as "qt" merely because of its parent directory's name.
+        with tempfile.TemporaryDirectory() as qt_root_name:
+            qt_root = Path(qt_root_name)
+            (qt_root / "plugins" / "platforms").mkdir(parents=True)
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            # Note: no "libevil.so" exists anywhere under qt_root.
+            self.assertIsNone(
+                audit.classify_path(
+                    Path("/AppDir/usr/plugins/platforms/libevil.so"), qt_root
+                )
+            )
 
     def test_qt_plugin_directory_does_not_shadow_unrelated_library(
         self,
@@ -216,7 +289,7 @@ class ClassifyTests(unittest.TestCase):
             audit.classify_path(Path("/AppDir/usr/lib/libtotallyunknown.so.1"))
         )
 
-    def test_qml_module_directory_classifies_regardless_of_basename(
+    def test_qml_module_directory_classifies_against_verified_qt_reference(
         self,
     ) -> None:
         # linuxdeploy's Qt plugin deploys every Qt Quick/QML module under
@@ -225,29 +298,94 @@ class ClassifyTests(unittest.TestCase):
         # basenames match libQt6.* or live in a QT_PLUGIN_DIRECTORIES
         # entry, so without this directory-based fallback every one of
         # them is reported unmapped the first time this classifier runs
-        # against a real AppImage built with QML content.
-        cases = {
-            Path("/AppDir/usr/qml/QtQml/Models/libmodelsplugin.so"): "qt",
-            Path(
-                "/AppDir/usr/qml/QtQuick/Controls/Basic/impl/"
-                "libqtquickcontrols2basicstyleimplplugin.so"
-            ): "qt",
-            Path("/AppDir/usr/qml/QtQuick/Effects/libeffectsplugin.so"): "qt",
-            Path("/AppDir/usr/qml/QtQuick/libqtquick2plugin.so"): "qt",
-        }
-        for path, expected in cases.items():
-            with self.subTest(path=str(path)):
-                self.assertEqual(audit.classify_path(path), expected)
+        # against a real AppImage built with QML content -- but, as with
+        # Qt plugins above, only once verified against qt_reference_dir.
+        with tempfile.TemporaryDirectory() as qt_root_name:
+            qt_root = Path(qt_root_name)
+            (qt_root / "qml" / "QtQml" / "Models").mkdir(parents=True)
+            (
+                qt_root / "qml" / "QtQml" / "Models" / "libmodelsplugin.so"
+            ).write_bytes(b"")
+            (
+                qt_root
+                / "qml"
+                / "QtQuick"
+                / "Controls"
+                / "Basic"
+                / "impl"
+            ).mkdir(parents=True)
+            (
+                qt_root
+                / "qml"
+                / "QtQuick"
+                / "Controls"
+                / "Basic"
+                / "impl"
+                / "libqtquickcontrols2basicstyleimplplugin.so"
+            ).write_bytes(b"")
+            (qt_root / "qml" / "QtQuick" / "Effects").mkdir(parents=True)
+            (
+                qt_root / "qml" / "QtQuick" / "Effects" / "libeffectsplugin.so"
+            ).write_bytes(b"")
+            (qt_root / "qml" / "QtQuick").mkdir(parents=True, exist_ok=True)
+            (qt_root / "qml" / "QtQuick" / "libqtquick2plugin.so").write_bytes(b"")
+
+            cases = {
+                Path("/AppDir/usr/qml/QtQml/Models/libmodelsplugin.so"): "qt",
+                Path(
+                    "/AppDir/usr/qml/QtQuick/Controls/Basic/impl/"
+                    "libqtquickcontrols2basicstyleimplplugin.so"
+                ): "qt",
+                Path("/AppDir/usr/qml/QtQuick/Effects/libeffectsplugin.so"): "qt",
+                Path("/AppDir/usr/qml/QtQuick/libqtquick2plugin.so"): "qt",
+            }
+            for path, expected in cases.items():
+                with self.subTest(path=str(path)):
+                    self.assertEqual(audit.classify_path(path, qt_root), expected)
+
+    def test_qml_directory_without_reference_dir_is_unmapped(self) -> None:
+        self.assertIsNone(
+            audit.classify_path(
+                Path("/AppDir/usr/qml/QtQml/Models/libmodelsplugin.so")
+            )
+        )
+
+    def test_qml_directory_with_unverified_binary_is_unmapped(self) -> None:
+        # Same fail-closed regression as the Qt plugin-directory case
+        # above, for the "qml" root instead.
+        with tempfile.TemporaryDirectory() as qt_root_name:
+            qt_root = Path(qt_root_name)
+            (qt_root / "qml" / "QtQml" / "Models").mkdir(parents=True)
+            (
+                qt_root / "qml" / "QtQml" / "Models" / "libmodelsplugin.so"
+            ).write_bytes(b"")
+            self.assertIsNone(
+                audit.classify_path(
+                    Path("/AppDir/usr/qml/QtQml/Models/libevilplugin.so"), qt_root
+                )
+            )
 
     def test_qml_directory_match_requires_whole_path_component(self) -> None:
         # QT_QML_ROOT_DIRNAME must match a literal "qml" path *component*,
         # never a bare substring -- a hypothetical unrelated
         # "libqmlfoo.so" living outside any real "qml" directory must not
         # be misclassified as Qt merely because its basename contains the
-        # substring "qml".
+        # substring "qml". Verified both without and with a qt_reference_dir
+        # present (containing an unrelated real qml module), so this
+        # isn't merely passing because no reference directory was
+        # supplied at all.
         self.assertIsNone(
             audit.classify_path(Path("/AppDir/usr/lib/libqmlfoo.so.1"))
         )
+        with tempfile.TemporaryDirectory() as qt_root_name:
+            qt_root = Path(qt_root_name)
+            (qt_root / "qml" / "QtQml" / "Models").mkdir(parents=True)
+            (
+                qt_root / "qml" / "QtQml" / "Models" / "libmodelsplugin.so"
+            ).write_bytes(b"")
+            self.assertIsNone(
+                audit.classify_path(Path("/AppDir/usr/lib/libqmlfoo.so.1"), qt_root)
+            )
 
     def test_abi_allowlisted_library_is_not_itself_matched_by_a_component(
         self,
@@ -299,7 +437,8 @@ class ClassifyAllAndCliTests(unittest.TestCase):
         # non-Qt-plugin directory name so this is purely a nested-directory
         # discovery check, independent of the dedicated Qt-plugin-directory
         # classification behavior covered by
-        # test_qt_plugin_directory_classifies_regardless_of_basename above.
+        # test_qt_plugin_directory_classifies_against_verified_qt_reference
+        # above.
         nested = self.lib_dir / "x86_64-linux-gnu" / "codecs"
         nested.mkdir(parents=True)
         (nested / "libjpeg.so.8").write_bytes(b"")
@@ -315,22 +454,68 @@ class ClassifyAllAndCliTests(unittest.TestCase):
         # libQt6.* basename prefix, so without directory-based
         # classification every one of these would show up as unmapped the
         # first time this ran against a real linuxdeploy --plugin qt
-        # output.
+        # output. Requires a verified qt_reference_dir (see
+        # test_qt_plugin_directory_without_reference_dir_is_unmapped for
+        # the fail-closed-by-default case).
         (self.lib_dir / "imageformats").mkdir()
         (self.lib_dir / "imageformats" / "libqjpeg.so").write_bytes(b"")
         (self.lib_dir / "platforms").mkdir()
         (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
         (self.lib_dir / "generic").mkdir()
         (self.lib_dir / "generic" / "libqoffscreen.so").write_bytes(b"")
+        with tempfile.TemporaryDirectory() as qt_root_name:
+            qt_root = Path(qt_root_name)
+            (qt_root / "plugins" / "imageformats").mkdir(parents=True)
+            (qt_root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(b"")
+            (qt_root / "plugins" / "platforms").mkdir(parents=True)
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            (qt_root / "plugins" / "generic").mkdir(parents=True)
+            (qt_root / "plugins" / "generic" / "libqoffscreen.so").write_bytes(b"")
+            by_component, unmapped = audit.classify_all(self.lib_dir, qt_root)
+            self.assertEqual(unmapped, [])
+            self.assertEqual(len(by_component.get("qt", [])), 3)
+
+    def test_classify_all_without_reference_dir_reports_qt_plugins_unmapped(
+        self,
+    ) -> None:
+        # classify_all's own default (qt_reference_dir=None) must fail
+        # closed exactly like classify_path's -- a caller that forgets to
+        # pass a reference directory does not silently regress to the
+        # old fail-open directory-name-only behavior.
+        (self.lib_dir / "platforms").mkdir()
+        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
         by_component, unmapped = audit.classify_all(self.lib_dir)
-        self.assertEqual(unmapped, [])
-        self.assertEqual(len(by_component.get("qt", [])), 3)
+        self.assertEqual(len(unmapped), 1)
+        self.assertNotIn("qt", by_component)
 
     def _run_classify_cli(self, *extra_args: str) -> tuple[int, str, str]:
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = audit.main(["classify", str(self.lib_dir), *extra_args])
         return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def test_classify_cli_qt_reference_dir_resolves_real_qt_plugins(self) -> None:
+        (self.lib_dir / "platforms").mkdir()
+        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
+        with tempfile.TemporaryDirectory() as qt_root_name:
+            qt_root = Path(qt_root_name)
+            (qt_root / "plugins" / "platforms").mkdir(parents=True)
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            exit_code, _stdout, stderr = self._run_classify_cli(
+                "--qt-reference-dir", str(qt_root)
+            )
+            # libavif is still mandatory and missing here, but the Qt
+            # plugin itself must not additionally show up as unmapped.
+            self.assertEqual(exit_code, 1)
+            self.assertNotIn("libqxcb.so", stderr)
+
+    def test_classify_cli_without_qt_reference_dir_fails_on_qt_plugin(self) -> None:
+        self._touch("libavif.so.16.0.0")
+        (self.lib_dir / "platforms").mkdir()
+        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
+        exit_code, _stdout, stderr = self._run_classify_cli()
+        self.assertEqual(exit_code, 1)
+        self.assertIn("libqxcb.so", stderr)
 
     def test_classify_cli_fails_when_mandatory_libavif_missing(self) -> None:
         self._touch("libdav1d.so.7.0.0")

@@ -35,6 +35,38 @@ command -v "$qt_plugin" >/dev/null 2>&1 || {
   exit 2
 }
 
+# packaging/audit_codec_notices.py's classifier requires a verified
+# reference to the real Qt SDK actually used for this build before ever
+# resolving a directory-matched bundled library (a Qt plugin or QML
+# module, neither of which matches its own libQt6.* basename pattern) to
+# the "qt" component -- see bundle_codec_notices()'s own doc comment for
+# why. Resolved the same way linuxdeploy-plugin-qt itself locates Qt:
+# `qmake -query QT_INSTALL_PREFIX`, honoring an explicit $QMAKE override
+# first (matching linuxdeploy-plugin-qt's own documented QMAKE
+# environment variable) so this never depends on jurplel/install-qt-action
+# CI-specific env vars and works identically for a developer's own local
+# Qt installation.
+qmake_bin="${QMAKE:-}"
+if [[ -z "$qmake_bin" ]]; then
+  if command -v qmake6 >/dev/null 2>&1; then
+    qmake_bin="qmake6"
+  elif command -v qmake >/dev/null 2>&1; then
+    qmake_bin="qmake"
+  fi
+fi
+[[ -n "$qmake_bin" ]] || {
+  echo "Could not locate qmake (set QMAKE or put qmake6/qmake on PATH)." \
+    "Needed to resolve the real Qt SDK root for codec-notice" \
+    "classification." >&2
+  exit 2
+}
+qt_reference_dir="$("$qmake_bin" -query QT_INSTALL_PREFIX)"
+[[ -n "$qt_reference_dir" && -d "$qt_reference_dir" ]] || {
+  echo "qmake -query QT_INSTALL_PREFIX did not report a real directory:" \
+    "'$qt_reference_dir'" >&2
+  exit 2
+}
+
 # QtKeychain's Secret Service backend loads libsecret-1 at runtime via
 # QLibrary (dlopen), not as a linked (DT_NEEDED) dependency of
 # libqt6keychain -- see qtkeychain/libsecret.cpp's
@@ -181,7 +213,8 @@ bundled_search_root="$app_dir/usr"
   echo "linuxdeploy did not populate the expected $bundled_search_root." >&2
   exit 2
 }
-bundle_codec_notices "$bundled_search_root" "$repo_root/third_party" "$doc_dir" || {
+bundle_codec_notices "$bundled_search_root" "$repo_root/third_party" "$doc_dir" \
+  "$qt_reference_dir" || {
   echo "Failed to bundle required codec library license/notice text --" \
     "see the message(s) above. This is a hard failure: a codec library" \
     "must never ship inside the AppImage without its required" \

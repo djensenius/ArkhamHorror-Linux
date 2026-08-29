@@ -45,7 +45,18 @@ attribution -- to resolve to a known component with a notice source
 directory here under `third_party/`; Qt is one of those components.
 `packaging/lib/bundle_codec_notices.sh` copies this notice into the
 distributed AppImage at `usr/share/doc/ArkhamHorror/third_party/qt/` -- see
-`packaging/build-appimage.sh`.
+`packaging/build-appimage.sh`. Bundled Qt *plugins* (e.g.
+`imageformats/libqjpeg.so`, `platforms/libqxcb.so`) and Qt Quick/QML
+modules (deployed under a top-level `qml/` directory) never match Qt's own
+`libQt6*.so` basename pattern; a later cumulative review found that
+resolving them to this same `qt` component purely by their containing
+directory's name was fail-open (an arbitrary, unaudited binary merely
+placed in one of those directories would be silently accepted), so the
+classifier now additionally requires `--qt-reference-dir` to point at the
+real Qt SDK actually used for the build and verifies a file with the
+identical relative sub-path genuinely exists there before ever classifying
+such a file as `qt` -- see `audit_codec_notices.py`'s own module
+docstring and `classify_path()`.
 
 ## License scope
 
