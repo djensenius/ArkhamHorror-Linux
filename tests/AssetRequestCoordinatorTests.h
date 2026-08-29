@@ -28,7 +28,18 @@
 // ones) or fails (the retry's own fresh error surfaces, never a repeat
 // or a loop); AssetErrorCode::UnsupportedCodec is the sole carve-out,
 // since it means the cached bytes are still valid and must never be
-// evicted for lack of an installed decoder.
+// evicted for lack of an installed decoder. Also covers review item 6
+// (cross-logical-key stale resurrection): two DIFFERENT AssetKeys that
+// happen to resolve to the SAME candidate/cache key (never coalesced,
+// since coalescing keys on the whole logical AssetKey) genuinely race
+// when both are in flight at once; a per-cache-key optimistic-
+// concurrency generation counter (see AssetRequestCoordinator.h's
+// "Cross-logical-key races" paragraph) ensures a callback that arrives
+// AFTER some other, more recently issued operation has already mutated
+// that exact cache key silently skips its own would-be mutation (never
+// overwriting a newer store(), never resurrecting a cache key a newer
+// operation has since evicted via a definitive 404) while still
+// completing accurately for its own consumers.
 class AssetRequestCoordinatorTests final : public QObject {
   Q_OBJECT
 
@@ -61,6 +72,10 @@ private slots:
   void malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork();
   void quarantineRefetchFailureSurfacesFreshErrorWithoutLooping();
   void unsupportedCodecDecodeFailureNeverQuarantinesValidBytes();
+  void
+  delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry();
+  void
+  delayedStaleRevalidationSuccessAfterDefinitive404NeverResurrectsEvictedEntry();
 
 private:
   QString m_tempDirPath;

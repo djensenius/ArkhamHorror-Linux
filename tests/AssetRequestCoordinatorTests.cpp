@@ -1492,6 +1492,220 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
+    delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry() {
+  // Review item 6 (cross-logical-key stale resurrection): two DIFFERENT
+  // AssetKeys -- differing only in `locale`, which SetIcon (unlike Card)
+  // completely ignores when resolving candidates (see
+  // AssetLocator::resolveCandidates()'s `localizable` gate) -- resolve to
+  // the exact SAME candidate URL/cache key, yet never coalesce
+  // (canonicalOperationKey() includes `locale`), so both genuinely run as
+  // independent, concurrent network fetches for the SAME cache key.
+  //
+  // `keyOld`'s response is deliberately delayed via slowDrip; the
+  // response CONFIGURATION is then swapped -- via a requestHandled
+  // handler connected with Qt::QueuedConnection, so the swap can only
+  // ever take effect for a connection whose headers have not yet been
+  // parsed -- before `keyNew` is even issued. This makes the completion
+  // ORDER fully deterministic (no reliance on raw socket-level timing):
+  // `keyNew` is guaranteed to complete and publish into the shared cache
+  // FIRST, and `keyOld`'s slow, now-superseded response is guaranteed to
+  // arrive SECOND. The stale, late-arriving `keyOld` success must never
+  // overwrite what `keyNew` already published -- even though `keyOld`'s
+  // own consumer still genuinely receives the bytes IT fetched.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+
+  MockHttpServer::Response slowResponse;
+  slowResponse.contentType = "image/png";
+  slowResponse.body = encodePng(8, 8);
+  slowResponse.slowDrip = true;
+  slowResponse.chunkSize = 4096;
+  slowResponse.chunkDelayMs = 200;
+  server.setResponse(path, slowResponse);
+
+  MockHttpServer::Response fastResponse;
+  fastResponse.contentType = "image/png";
+  fastResponse.body = encodePng(16, 16);
+  bool swapped = false;
+  QObject::connect(
+      &server, &MockHttpServer::requestHandled, &server,
+      [&](const QString &firedPath) {
+        if (firedPath == path && !swapped) {
+          swapped = true;
+          server.setResponse(path, fastResponse);
+        }
+      },
+      Qt::QueuedConnection);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  AssetKey keyOld =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyOld.locale = QString();
+  AssetKey keyNew = keyOld;
+  keyNew.locale = QStringLiteral("fr");
+  QVERIFY(!(keyOld == keyNew));
+
+  const auto candidatesOld = AssetLocator::resolveCandidates(keyOld);
+  QVERIFY(bool(candidatesOld));
+  const auto candidatesNew = AssetLocator::resolveCandidates(keyNew);
+  QVERIFY(bool(candidatesNew));
+  QCOMPARE(candidatesOld->first().url, candidatesNew->first().url);
+  const QString cacheKey = AssetCache::cacheKeyFor(candidatesOld->first().url);
+
+  std::optional<Result> resultOld;
+  std::optional<Result> resultNew;
+  coordinator.request(keyOld, [&](Result r) { resultOld = std::move(r); });
+
+  // Waits until keyOld's request has been fully received by the server
+  // (its slow-dripped response already scheduled using the ORIGINAL
+  // config) AND the queued swap handler has run.
+  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
+  QCOMPARE(server.requestCount(path), 1);
+
+  coordinator.request(keyNew, [&](Result r) { resultNew = std::move(r); });
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultOld.has_value() && resultNew.has_value(); }, 5000));
+  QCOMPARE(server.requestCount(path), 2);
+
+  QVERIFY2(bool(*resultNew), qPrintable(resultNew->error().message));
+  QCOMPARE((**resultNew).encodedBytes, fastResponse.body);
+
+  // keyOld's own consumer still genuinely observes the bytes IT fetched
+  // -- a stale publish being skipped is not the same as keyOld's own
+  // request failing.
+  QVERIFY2(bool(*resultOld), qPrintable(resultOld->error().message));
+  QCOMPARE((**resultOld).encodedBytes, slowResponse.body);
+
+  // The decisive assertion: the cache holds keyNew's (first-published)
+  // bytes, NOT keyOld's late, now-stale ones.
+  const auto onDisk = cache.lookupDisk(cacheKey);
+  QVERIFY(onDisk.has_value());
+  QCOMPARE(onDisk->encodedBytes, fastResponse.body);
+}
+
+void AssetRequestCoordinatorTests::
+    delayedStaleRevalidationSuccessAfterDefinitive404NeverResurrectsEvictedEntry() {
+  // Companion to the test above, exercising the OTHER two CAS-gated
+  // mutation sites in startRevalidation() (review item 6): the
+  // definitive-404 eviction/negative-404-record branch, and the "origin
+  // sent a fresh 200 body despite our conditional headers" branch. Two
+  // DIFFERENT AssetKeys (again differing only in `locale`, ignored by
+  // SetIcon) both revalidate the SAME pre-seeded disk entry/cache key,
+  // never coalescing. `opFresh`'s conditional GET is delayed (via
+  // slowDrip) and answered with a fresh 200 body; `opNotFound`'s
+  // conditional GET -- issued only once the server has already received
+  // `opFresh`'s request and the response config has been swapped to a
+  // plain 404 -- is answered quickly with a definitive 404, which evicts
+  // the pre-seeded entry and records a negative-404 for this exact cache
+  // key. `opFresh`'s slow, now-superseded 200 must NOT resurrect (store
+  // over) the entry `opNotFound`'s 404 already evicted.
+  //
+  // (A genuine bodyless 304 cannot be substituted for `opFresh`'s
+  // response here: MockHttpServer answers a conditional match
+  // synchronously with no delay hook at all -- see writeResponse()'s
+  // 304 branch -- so there is no way to force it to arrive "late". The
+  // 304/touchAfterNotModified call site is gated by the textually
+  // identical CAS pattern immediately alongside the two sites this test
+  // and the one above DO exercise; see startRevalidation()'s `result->
+  // notModified` branch.)
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+
+  MockHttpServer::Response freshResponse;
+  freshResponse.contentType = "image/png";
+  freshResponse.body = encodePng(8, 8);
+  freshResponse.slowDrip = true;
+  freshResponse.chunkSize = 4096;
+  freshResponse.chunkDelayMs = 200;
+  server.setResponse(path, freshResponse);
+
+  MockHttpServer::Response notFoundResponse;
+  notFoundResponse.status = 404;
+  notFoundResponse.reasonPhrase = "Not Found";
+  bool swapped = false;
+  QObject::connect(
+      &server, &MockHttpServer::requestHandled, &server,
+      [&](const QString &firedPath) {
+        if (firedPath == path && !swapped) {
+          swapped = true;
+          server.setResponse(path, notFoundResponse);
+        }
+      },
+      Qt::QueuedConnection);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  AssetKey keyFresh =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyFresh.locale = QString();
+  AssetKey keyNotFound = keyFresh;
+  keyNotFound.locale = QStringLiteral("fr");
+  QVERIFY(!(keyFresh == keyNotFound));
+
+  const auto candidates = AssetLocator::resolveCandidates(keyFresh);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = QByteArrayLiteral("seed-bytes-being-revalidated");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.etag = QStringLiteral("\"shared-etag\"");
+  cache.store(cacheKey, preSeeded);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  std::optional<Result> resultFresh;
+  std::optional<Result> resultNotFound;
+  coordinator.request(keyFresh, [&](Result r) { resultFresh = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
+  QCOMPARE(server.requestCount(path), 1);
+
+  coordinator.request(keyNotFound,
+                      [&](Result r) { resultNotFound = std::move(r); });
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultFresh.has_value() && resultNotFound.has_value(); },
+      5000));
+  QCOMPARE(server.requestCount(path), 2);
+
+  QVERIFY(!bool(*resultNotFound));
+  QCOMPARE(resultNotFound->error().code, AssetErrorCode::NotFound);
+
+  // keyFresh's own consumer still genuinely observes the fresh bytes IT
+  // fetched -- its publish being skipped is not the same as its own
+  // request failing.
+  QVERIFY2(bool(*resultFresh), qPrintable(resultFresh->error().message));
+  QCOMPARE((**resultFresh).encodedBytes, freshResponse.body);
+
+  // The decisive assertion: the entry stays evicted -- keyFresh's late
+  // 200 must not have resurrected it.
+  QVERIFY(!cache.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cache.lookupMemory(cacheKey).has_value());
+
+  // The negative-404 record survives intact: a third request for the
+  // SAME cache key completes as NotFound with NO further network round
+  // trip at all.
+  AssetKey keyThird = keyFresh;
+  keyThird.locale = QStringLiteral("de");
+  std::optional<Result> resultThird;
+  coordinator.request(keyThird, [&](Result r) { resultThird = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return resultThird.has_value(); }, 5000));
+  QVERIFY(!bool(*resultThird));
+  QCOMPARE(resultThird->error().code, AssetErrorCode::NotFound);
+  QCOMPARE(server.requestCount(path), 2);
+}
+
+void AssetRequestCoordinatorTests::
     unsupportedCodecDecodeFailureNeverQuarantinesValidBytes() {
   // Review item 9's explicit carve-out: AssetErrorCode::UnsupportedCodec
   // means the cached bytes are still perfectly valid -- this process

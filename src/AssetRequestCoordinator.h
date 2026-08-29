@@ -91,6 +91,36 @@ namespace Arkham {
 // handle remains valid for cancel() up until the queued delivery actually
 // runs.
 //
+// Cross-logical-key races on a shared cache key (review item 6): because
+// coalescing above is keyed on the whole logical AssetKey rather than the
+// resolved candidate/cache key, two DIFFERENT AssetKeys that happen to
+// resolve to the SAME candidate URL (e.g. an explicit "en" locale and an
+// unset/unresolvable locale, both falling back to the same English
+// candidate) are NOT coalesced into a single network operation and can
+// genuinely run concurrently, each with its own independent fetch or
+// revalidation in flight against the identical AssetCache key. Actually
+// merging their transport is a larger change (deliberately descoped here
+// given delivery constraints -- see the .cpp), but the correctness
+// consequence of NOT merging it is fully closed off: every asynchronous
+// mutation of a given cache key (a fresh 200 store(), a 304's
+// touchAfterNotModified()/memory promotion, or a definitive 404's
+// invalidate()+negative-404 record) is guarded by a per-cache-key
+// optimistic-concurrency generation counter (see currentCacheKeyGeneration()/
+// bumpCacheKeyGeneration() in the .cpp), captured at the moment the
+// asynchronous operation was issued (or, for a cache hit, at the moment of
+// the hit) and re-checked immediately before the mutation is actually
+// applied. A mismatch means some OTHER, more recently issued operation has
+// already mutated this exact cache key in the meantime, so this stale
+// callback's mutation is silently skipped -- its OWN consumers still
+// receive the outcome it genuinely observed (the bytes it fetched, or the
+// fact that its candidate really did 404, are both correct for them), it
+// simply never gets to publish that outcome into the shared cache/negative-
+// 404 state that a newer operation has already superseded. This is what
+// prevents a delayed 200 from overwriting a newer 200, a delayed 304 from
+// touching or memory-promoting a stale body over a newer entry, and a
+// delayed 404 from evicting or negative-caching a cache key a newer
+// operation has since populated with a genuinely fresh success.
+//
 // Cancellation/destruction semantics:
 //   - cancel(handle) detaches exactly that one consumer. While this
 //     coordinator is alive, its own callback is invoked exactly once,
@@ -200,12 +230,17 @@ private:
   // failure discovered here must be able to quarantine the entry and
   // retry the SAME candidate over the network, which registerImmediate
   // Completion's fixed pre-computed AssetOutcome cannot express).
-  RequestHandle registerCacheHitCompletion(const AssetKey &key,
-                                           ResultCallback callback,
-                                           QVector<AssetCandidate> candidates,
-                                           int candidateIndex,
-                                           AssetCache::CachedEntry entry,
-                                           QString cacheKey);
+  // `expectedGeneration` is currentCacheKeyGeneration(cacheKey) captured
+  // synchronously at the moment of the cache hit in request() -- see the
+  // class comment's "Cross-logical-key races" paragraph -- and is
+  // threaded through to the eventual completeCacheReadOrQuarantine() call
+  // so a quarantine discovered there can be CAS-gated against whatever
+  // may have mutated this cache key during the queued-delivery hop.
+  RequestHandle
+  registerCacheHitCompletion(const AssetKey &key, ResultCallback callback,
+                             QVector<AssetCandidate> candidates,
+                             int candidateIndex, AssetCache::CachedEntry entry,
+                             QString cacheKey, quint64 expectedGeneration);
   // Finds an already in-flight operation (revalidation or ordinary
   // candidate fetch) whose AssetKey canonicalizes to the same opKey, so a
   // new request() call can attach as an additional consumer instead of
@@ -262,10 +297,28 @@ private:
   // ensureDecoded() already republishes the decoded image in place via
   // AssetCache::updateMemoryDecodedImage() for an entry already resident
   // in memory.
+  // `expectedGeneration`: see the class comment's "Cross-logical-key
+  // races" paragraph. Gates BOTH the promoteOnSuccess memory promotion and
+  // the quarantine-worthy invalidate() below against a cache key already
+  // superseded by a more recently issued operation -- either one applied
+  // to a now-stale view of this cache key could otherwise resurrect or
+  // destroy state a newer operation already established.
   void completeCacheReadOrQuarantine(quint64 operationId,
                                      AssetCache::CachedEntry entry,
                                      const QString &cacheKey,
+                                     quint64 expectedGeneration,
                                      bool promoteOnSuccess);
+  // Per-cache-key optimistic-concurrency counter (review item 6); see the
+  // class comment's "Cross-logical-key races" paragraph. A cache key
+  // never observed before implicitly starts at generation 0.
+  [[nodiscard]] quint64
+  currentCacheKeyGeneration(const QString &cacheKey) const;
+  // Increments and returns the new generation for `cacheKey`; called
+  // immediately after every successful cache mutation (store/invalidate/
+  // touchAfterNotModified/promoteToMemory) performed on that key, so a
+  // subsequent CAS check by any other in-flight operation correctly
+  // observes that this key has since changed.
+  quint64 bumpCacheKeyGeneration(const QString &cacheKey);
   void startCandidate(quint64 operationId);
   void startRevalidation(quint64 operationId);
   void completeOperation(quint64 operationId,
@@ -303,6 +356,12 @@ private:
   // authoritative 404 has been observed by THIS process; never
   // persisted to disk. See the class comment for the full contract.
   QSet<QString> m_negative404;
+
+  // Per-cache-key optimistic-concurrency generation counters (review item
+  // 6); see currentCacheKeyGeneration()/bumpCacheKeyGeneration() and the
+  // class comment's "Cross-logical-key races" paragraph. Memory-only,
+  // like m_negative404.
+  QHash<QString, quint64> m_cacheKeyGeneration;
 };
 
 } // namespace Arkham
