@@ -26,8 +26,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import generate_asset_locale_digest as gen  # noqa: E402
+_TOOLS_DIR = str(Path(__file__).resolve().parent)
+sys.path.insert(0, _TOOLS_DIR)
+try:
+    import generate_asset_locale_digest as gen  # noqa: E402
+finally:
+    # Restore sys.path immediately after the import completes: leaving
+    # tools/ permanently on sys.path for the rest of the process is
+    # unnecessary once `gen` is cached in sys.modules, and keeping this
+    # hermetic avoids surprising import-order coupling if more Python
+    # tests/tools are ever added to this repository.
+    sys.path.remove(_TOOLS_DIR)
 
 
 class GenerateAssetLocaleDigestCheckTests(unittest.TestCase):

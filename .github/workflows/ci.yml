@@ -412,19 +412,35 @@ jobs:
               continue
             fi
 
-            echo "Found bundled '$name': $found -- verifying its notice is present."
-            license_path="$doc_root/$name/LICENSE"
-            if [[ ! -s "$license_path" ]]; then
-              echo "Bundled '$name' has no non-empty LICENSE at $license_path" >&2
+            echo "Found bundled '$name': $found -- verifying every checked-in notice file for it is present."
+            source_dir="third_party/$name"
+            if [[ ! -d "$source_dir" ]]; then
+              echo "No checked-in notice source directory at $source_dir for bundled '$name'" >&2
               fail=1
+              continue
             fi
+            # Assert every regular file this repository ships for $name
+            # (LICENSE, NOTICE.md, and libaom's PATENTS where present) --
+            # not just LICENSE -- is also bundled non-empty, so a
+            # regression that drops one of the extra required/legal-
+            # relevant files (while LICENSE alone still ships) cannot
+            # silently pass this check.
+            for source_file in "$source_dir"/*; do
+              [[ -f "$source_file" ]] || continue
+              file_name="$(basename "$source_file")"
+              bundled_path="$doc_root/$name/$file_name"
+              if [[ ! -s "$bundled_path" ]]; then
+                echo "Bundled '$name' is missing its required non-empty '$file_name' at $bundled_path" >&2
+                fail=1
+              fi
+            done
           done
 
           if [[ "$fail" -ne 0 ]]; then
             echo "One or more bundled codec libraries are missing their required license notice." >&2
             exit 1
           fi
-          echo "Every bundled codec library's required license notice is present."
+          echo "Every bundled codec library's required license notice files are present."
       - name: Verify the bundled libavif decodes AVIF images with no host codec fallback
         # Complementary to the static closure audit above (mirroring the
         # libsecret dlopen() no-host-fallback proof further below): builds
