@@ -24,7 +24,12 @@ namespace Arkham {
 //  - Only one target may be installed at a time; installing a *different*
 //    new target first uninstalls any previous one.
 //  - uninstall() removes the filter and is always safe to call, including
-//    when nothing is installed, and including more than once.
+//    when nothing is installed, and including more than once. It also
+//    forgets any keys the mapper currently considers held (see
+//    InputMapper::clearHeldKeys()): once uninstalled, this router can
+//    never observe that key's real release, so continuing to track it as
+//    held could otherwise leak into a later install() on a different
+//    target.
 //  - If the installed target is destroyed without uninstall() being
 //    called first, this router notices: installedTarget_ is a
 //    QPointer<QObject>, which automatically nulls itself the moment the
@@ -36,6 +41,18 @@ namespace Arkham {
 //  - Destroying the router itself uninstalls it first: no further
 //    eventFilter() call (e.g. from an event already queued at the moment
 //    of destruction) can ever run any dispatch logic afterwards.
+//  - The installed target losing keyboard focus (QEvent::FocusOut) or its
+//    window/application becoming inactive (QEvent::WindowDeactivate /
+//    QEvent::ApplicationDeactivate) also clears the mapper's held-key
+//    state, without dispatching anything: the platform is free to never
+//    deliver a matching KeyRelease once focus/activation is lost (e.g.
+//    Alt-Tabbing away while a key is held down), so a held key can
+//    otherwise stay stuck armed forever, silently swallowing whichever
+//    physical key it was the next time it is pressed again. A future
+//    controller-disconnect notification (there is no live
+//    controller/gamepad input API in this codebase today -- see
+//    InputMapper.h) should clear held state through the same seam,
+//    InputMapper::clearHeldKeys().
 //
 // This class dispatches exactly one thing -- a (SemanticCommand,
 // CommandPhase) pair via commandDispatched() -- and contains no Arkham

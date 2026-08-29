@@ -49,6 +49,22 @@ void FocusController::removeNode(const QString &id, const QString &fallbackId) {
   const Node removedNode = it.value();
   nodes_.remove(id);
 
+  // Prune the zone from zoneOrder_ once it has no remaining member node,
+  // so a long session that dynamically creates and destroys many
+  // transient zone ids (e.g. per-scenario/per-investigator zones) does
+  // not grow this vector without bound. If the same zone id is
+  // registered again later, registerNode() simply treats it as a
+  // brand-new zone appended at the current end of zoneOrder_ -- exactly
+  // like any other zone id seen for the first time -- rather than trying
+  // to reinsert it at its old position.
+  const bool zoneStillHasNodes = std::any_of(
+      nodes_.constBegin(), nodes_.constEnd(), [&removedNode](const Node &node) {
+        return node.zoneId == removedNode.zoneId;
+      });
+  if (!zoneStillHasNodes) {
+    zoneOrder_.removeAll(removedNode.zoneId);
+  }
+
   for (auto zoneIt = zoneLastFocused_.begin();
        zoneIt != zoneLastFocused_.end();) {
     if (zoneIt.value() == id) {
@@ -281,6 +297,21 @@ void FocusController::restoreSnapshot(const FocusSnapshot &snapshot) {
       target = firstRegisteredNodeId();
     }
   }
+  // Write the target's zone memory directly, rather than relying on
+  // setCurrentFocus()'s own side effect for it: setCurrentFocus() no-ops
+  // entirely (including that side effect) when |target| already equals
+  // the *live* currentFocusId_ from before this call, which would
+  // otherwise make the result of restoreSnapshot() depend on whatever
+  // focus happened to be current beforehand -- rather than being a pure
+  // function of (snapshot, current graph) alone, as documented above and
+  // on the class comment. This keeps repeated restoration of the same
+  // snapshot fully deterministic regardless of what was focused first.
+  if (!target.isEmpty()) {
+    const QString targetZone = zoneOf(target);
+    if (!targetZone.isEmpty()) {
+      zoneLastFocused_.insert(targetZone, target);
+    }
+  }
   setCurrentFocus(target);
 }
 
@@ -295,7 +326,15 @@ void FocusController::setCurrentFocus(const QString &id) {
       zoneLastFocused_.insert(zone, id);
     }
   }
-  emit currentFocusChanged(currentFocusId_);
+  // Emit a local copy, not the live member: a direct-connected slot that
+  // reenters (e.g. calls moveFocus()/setCurrentFocus() again before this
+  // emit's other connected slots have all run) would otherwise mutate
+  // currentFocusId_ out from under this emit, making every slot -- even
+  // ones invoked *before* the reentrant call -- observe the final,
+  // already-mutated value instead of the value that was actually current
+  // for their own invocation.
+  const QString emittedId = currentFocusId_;
+  emit currentFocusChanged(emittedId);
 }
 
 QVector<QString> FocusController::nodesInZone(const QString &zoneId) const {

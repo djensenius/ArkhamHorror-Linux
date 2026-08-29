@@ -130,6 +130,10 @@ private slots:
   void semanticFocusMovesTheQmlActiveFocusRectangle();
   void shoulderZoneSwitchingMovesFocusBetweenZones();
   void wrapPolicyKeepsTheQmlFocusRectangleInStepOnWrap();
+  void
+  realKeyEventsThroughTheInstalledRouterDriveFocusAndTheQmlFixtureEndToEnd();
+  void unboundKeyEventsThroughTheInstalledRouterNeverMoveFocus();
+  void tabAndBacktabNeverDivergeSemanticFocusFromRealQmlActiveFocus();
 
 private:
   std::unique_ptr<QQmlApplicationEngine> engine_;
@@ -291,6 +295,117 @@ void SemanticInputFixtureTests::
   auto *se = itemsById.value(QStringLiteral("board.se")).value<QQuickItem *>();
   QVERIFY(se != nullptr);
   QTRY_VERIFY(se->hasActiveFocus());
+}
+
+void SemanticInputFixtureTests::
+    realKeyEventsThroughTheInstalledRouterDriveFocusAndTheQmlFixtureEndToEnd() {
+  // Unlike semanticFocusMovesTheQmlActiveFocusRectangle() and
+  // shoulderZoneSwitchingMovesFocusBetweenZones() above (which call
+  // focus_->moveFocus()/cycleZone() directly), this test drives real
+  // QKeyEvents through the *installed* InputRouter -- exercising the
+  // full router -> commandDispatched -> wireCommandsToFocus ->
+  // FocusController -> QML activeFocus chain end-to-end, exactly as a
+  // real keyboard or a Steam Deck's generic-controller/Steam Input
+  // desktop template would drive it. It fails if wireCommandsToFocus()
+  // is ever removed or has its command->direction switch cases inverted,
+  // since focus_->currentFocusId() would then never change in response
+  // to these real key events at all.
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+
+  const QVariantMap itemsById = window_->property("itemsById").toMap();
+  auto *nw = itemsById.value(QStringLiteral("board.nw")).value<QQuickItem *>();
+  auto *ne = itemsById.value(QStringLiteral("board.ne")).value<QQuickItem *>();
+  auto *handCard1 =
+      itemsById.value(QStringLiteral("hand.card1")).value<QQuickItem *>();
+  QVERIFY(nw != nullptr);
+  QVERIFY(ne != nullptr);
+  QVERIFY(handCard1 != nullptr);
+  QTRY_VERIFY(nw->hasActiveFocus());
+
+  // Arrow-key directional focus: the same keys a generic controller's
+  // D-pad/left-stick maps to under Steam Input's desktop template.
+  QTest::keyClick(window_, Qt::Key_Right);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.ne"));
+  QTRY_VERIFY(!nw->hasActiveFocus());
+  QTRY_VERIFY(ne->hasActiveFocus());
+
+  QTest::keyClick(window_, Qt::Key_Left);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+  QTRY_VERIFY(nw->hasActiveFocus());
+  QTRY_VERIFY(!ne->hasActiveFocus());
+
+  // Shoulder-zone switching: Page Down/Page Up, matching the L1/R1
+  // shoulder-button convention a generic controller/Steam Input desktop
+  // template (and the Steam Deck's own shoulder buttons) map to.
+  QTest::keyClick(window_, Qt::Key_PageDown);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("hand.card1"));
+  QTRY_VERIFY(handCard1->hasActiveFocus());
+
+  QTest::keyClick(window_, Qt::Key_PageUp);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+  QTRY_VERIFY(nw->hasActiveFocus());
+}
+
+void SemanticInputFixtureTests::
+    unboundKeyEventsThroughTheInstalledRouterNeverMoveFocus() {
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+
+  const QVariantMap itemsById = window_->property("itemsById").toMap();
+  auto *nw = itemsById.value(QStringLiteral("board.nw")).value<QQuickItem *>();
+  QVERIFY(nw != nullptr);
+  QTRY_VERIFY(nw->hasActiveFocus());
+
+  // Qt::Key_F13 has no default binding in InputMapper::resetToDefaults();
+  // the router must let it propagate as an ordinary unconsumed key event
+  // rather than the fixture (or anything else) reacting to it, and focus
+  // must not move.
+  QTest::keyClick(window_, Qt::Key_F13);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+  QTRY_VERIFY(nw->hasActiveFocus());
+}
+
+void SemanticInputFixtureTests::
+    tabAndBacktabNeverDivergeSemanticFocusFromRealQmlActiveFocus() {
+  // Regression test: Tab/Backtab are not bound to any SemanticCommand,
+  // so the router never consumes them and they reach Qt's own native
+  // tab-focus-chain handling. Every semantic delegate in
+  // qml/SemanticInputFixture.qml sets activeFocusOnTab: false precisely
+  // so that native chain can never move real Qt activeFocus out from
+  // under FocusController, which must remain the sole source of truth.
+  // If activeFocusOnTab were ever reverted to true, Tab/Backtab would
+  // move real active focus to a neighbouring delegate in the QML
+  // Repeater's declaration order while focus_->currentFocusId() stayed
+  // unchanged, so semantic focus and real active focus would visibly
+  // diverge -- exactly what this test asserts never happens.
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+
+  const QVariantMap itemsById = window_->property("itemsById").toMap();
+  auto *nw = itemsById.value(QStringLiteral("board.nw")).value<QQuickItem *>();
+  QVERIFY(nw != nullptr);
+  QTRY_VERIFY(nw->hasActiveFocus());
+
+  QTest::keyClick(window_, Qt::Key_Tab);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+  QTRY_VERIFY(nw->hasActiveFocus());
+
+  QTest::keyClick(window_, Qt::Key_Backtab);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+  QTRY_VERIFY(nw->hasActiveFocus());
+
+  // A real semantic-command key still works normally afterwards, proving
+  // Tab/Backtab left no lingering native-focus-chain state that would
+  // interfere with ordinary semantic navigation.
+  QTest::keyClick(window_, Qt::Key_Right);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.ne"));
+  auto *ne = itemsById.value(QStringLiteral("board.ne")).value<QQuickItem *>();
+  QVERIFY(ne != nullptr);
+  QTRY_VERIFY(ne->hasActiveFocus());
 }
 
 QTEST_MAIN(SemanticInputFixtureTests)

@@ -97,11 +97,19 @@ public:
   // they currently map to.
   [[nodiscard]] bool isReserved(const PhysicalKey &physicalKey) const;
 
-  // Binds |physicalKey| to |command|, replacing any existing binding for
-  // that exact command (a command may only ever be bound to one physical
-  // key at a time). This does *not* steal |physicalKey| away from a
-  // different command it may already be bound to -- see the rejection
-  // rule below -- it only ever moves |command| itself to a new key.
+  // Binds |physicalKey| to |command|. Multiple physical keys may be
+  // bound to the same command at once -- this is the normal case, not an
+  // edge case: the built-in defaults deliberately bind several aliases to
+  // some commands (e.g. Up and W both to FocusUp; Return, Enter, and
+  // Space all to PrimaryAction). remap() only ever adds or moves the one
+  // |physicalKey| given; it never inspects or touches any *other* key's
+  // existing binding, so remapping one alias of a command can never
+  // silently evict a sibling default alias, and can never evict a
+  // permanently reserved key's binding either (see the class comment). A
+  // caller that actually wants to free up a specific old key must
+  // explicitly unbind() it first -- exactly the same explicit step
+  // already required to steal a key away from a different command (see
+  // the rejection rule below).
   //
   // Rejected (and the existing binding table is left completely
   // unchanged) when:
@@ -166,6 +174,20 @@ public:
   [[nodiscard]] std::optional<DispatchedCommand>
   processKey(const PhysicalKey &physicalKey, bool isPress, bool isAutoRepeat);
 
+  // Forgets every currently-tracked held key without dispatching
+  // anything -- in particular, this never synthesizes a Released for
+  // whatever hold(s) were armed. Call this whenever physical key state
+  // can no longer be trusted to eventually deliver a matching release:
+  // the installed target/window losing focus or becoming inactive, an
+  // InputRouter being uninstalled or losing its target, and (a hook for
+  // future work, since this codebase has no live controller/gamepad
+  // input API) a controller-disconnect notification, should all clear
+  // held state through here. Afterwards, every physical key is treated
+  // as fully released: the next press of any key -- even one that was
+  // physically still held down when this was called -- always starts a
+  // brand-new hold rather than being mistaken for a stray duplicate.
+  void clearHeldKeys();
+
 private:
   // Per-held-key state: a key present in |heldKeys_| is physically held
   // down regardless of whether it is currently bound to a command. A
@@ -180,8 +202,27 @@ private:
   // no matching Pressed -- it stays silent for the rest of that hold
   // instead, preserving the Pressed/Repeated*/Released contract
   // documented on CommandPhase.
+  //
+  // Keyed by Qt::Key alone -- not the full PhysicalKey (which also
+  // carries live modifiers) -- because a physical key is a single
+  // switch with exactly one held/not-held state regardless of what
+  // modifiers happen to accompany any one event for it. Live modifiers
+  // routinely differ between a key's press and its own release: e.g.
+  // pressing Z while Ctrl is down reports modifiers() ==
+  // Qt::ControlModifier, but if the user releases Ctrl *before*
+  // releasing Z (an entirely ordinary way to type a chord), the
+  // eventual KeyRelease for Z reports modifiers() == Qt::NoModifier.
+  // Keying held-state by the full PhysicalKey would make that release
+  // fail to find the entry armed at press time -- treating a real
+  // release as a stray one, leaking the stale entry forever, and
+  // silently swallowing the *next* legitimate press of that same key
+  // once it collides again with the never-cleared old entry. Keying by
+  // Qt::Key alone matches the actual physical model and sidesteps this
+  // entirely; commandFor()/bindings_ still use the full PhysicalKey (key
+  // + modifiers) for the one-time lookup at press time, which is all
+  // that ever decides which command a hold is armed with.
   QHash<PhysicalKey, SemanticCommand> bindings_;
-  QHash<PhysicalKey, std::optional<SemanticCommand>> heldKeys_;
+  QHash<Qt::Key, std::optional<SemanticCommand>> heldKeys_;
 
   static bool isReservedKey(const PhysicalKey &physicalKey);
 };

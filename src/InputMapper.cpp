@@ -56,17 +56,16 @@ std::optional<RemapError> InputMapper::remap(const PhysicalKey &physicalKey,
     return RemapError::KeyAlreadyBound;
   }
 
-  // A command may only ever be bound to one physical key at a time: drop
-  // whatever key currently owns |command| (if any, and if it is not
-  // |physicalKey| itself) before installing the new binding.
-  for (auto it = bindings_.begin(); it != bindings_.end();) {
-    if (it.value() == command && it.key() != physicalKey) {
-      it = bindings_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
+  // Deliberately does *not* evict whatever other key(s) currently own
+  // |command|: multiple physical keys may legitimately share a command
+  // (see the class comment), including the permanently reserved keys
+  // (Escape/Back both own SecondaryAction; Menu owns OpenMenu) and the
+  // built-in multi-alias defaults (Up+W, Return+Enter+Space). Silently
+  // evicting them here would both break the reserved keys' "permanently
+  // fixed" structural invariant and collapse a default alias set down to
+  // one key the moment any single alias was remapped. |physicalKey|
+  // itself is still guarded above (ReservedKey/KeyAlreadyBound), so this
+  // only ever adds or moves this *one* key's own binding.
   bindings_.insert(physicalKey, command);
   return std::nullopt;
 }
@@ -151,7 +150,7 @@ void InputMapper::resetToDefaults() {
 std::optional<DispatchedCommand>
 InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
                         const bool isAutoRepeat) {
-  const auto heldIt = heldKeys_.constFind(physicalKey);
+  const auto heldIt = heldKeys_.constFind(physicalKey.key);
   const bool currentlyHeld = heldIt != heldKeys_.constEnd();
 
   if (isPress) {
@@ -180,7 +179,7 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
     // later Repeated/Released for this same hold reuses this same
     // stored value rather than re-querying the current bindings.
     const auto command = commandFor(physicalKey);
-    heldKeys_.insert(physicalKey, command);
+    heldKeys_.insert(physicalKey.key, command);
     if (!command.has_value()) {
       return std::nullopt;
     }
@@ -197,7 +196,7 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
   // no useful state to remember, so this keeps heldKeys_ bounded to only
   // the keys currently pressed instead of growing for every key ever
   // seen over the process lifetime.
-  heldKeys_.remove(physicalKey);
+  heldKeys_.remove(physicalKey.key);
   if (!armedCommand.has_value()) {
     // This hold never had a dispatched Pressed (it was unbound for the
     // entire press), so it must not dispatch a Released either.
@@ -206,5 +205,7 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
 
   return DispatchedCommand{*armedCommand, CommandPhase::Released};
 }
+
+void InputMapper::clearHeldKeys() { heldKeys_.clear(); }
 
 } // namespace Arkham

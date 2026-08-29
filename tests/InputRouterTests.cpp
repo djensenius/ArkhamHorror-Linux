@@ -45,6 +45,17 @@ private slots:
   void onlyKeyEventsOnTheInstalledTargetAreConsidered();
   void suppressedDedupTransitionsAreStillConsumedForABoundKey();
   void keyEventsForAnUnboundKeyAreNeverConsumed();
+  void focusOutClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress();
+  void windowDeactivateClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress();
+  void
+  applicationDeactivateClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress();
+  void uninstallForgetsHeldKeysSoAFreshInstallNeverInheritsStaleHolds();
+  void installingANewTargetForgetsHeldKeysFromThePreviousTarget();
+  void targetDestructionWhileHeldDoesNotLeakStaleHeldStateIntoALaterInstall();
+  void keypadEnterIsReachableDespiteItsKeypadModifier();
+
+private:
+  void assertLifecycleEventClearsHeldKeys(QEvent::Type eventType);
 };
 
 void InputRouterTests::dispatchesACommandForARealKeyPress() {
@@ -227,6 +238,136 @@ void InputRouterTests::keyEventsForAnUnboundKeyAreNeverConsumed() {
   QCOMPARE(spy.count(), 0);
   QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_F13));
   QCOMPARE(spy.count(), 0);
+}
+
+void InputRouterTests::assertLifecycleEventClearsHeldKeys(
+    const QEvent::Type eventType) {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 1);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+
+  // The platform is free to never deliver Up's real KeyRelease once
+  // focus/activation is lost (e.g. Alt-Tabbing away while a key is held
+  // down), so this lifecycle event must forget the held state itself,
+  // without dispatching anything of its own.
+  QEvent lifecycleEvent(eventType);
+  QCoreApplication::sendEvent(&target, &lifecycleEvent);
+  QCOMPARE(spy.count(), 1);
+
+  // Because held state was forgotten, a fresh press of the same key with
+  // no intervening release is correctly a brand-new hold (a new
+  // Pressed), never a suppressed stray duplicate.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+}
+
+void InputRouterTests::
+    focusOutClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress() {
+  assertLifecycleEventClearsHeldKeys(QEvent::FocusOut);
+}
+
+void InputRouterTests::
+    windowDeactivateClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress() {
+  assertLifecycleEventClearsHeldKeys(QEvent::WindowDeactivate);
+}
+
+void InputRouterTests::
+    applicationDeactivateClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress() {
+  assertLifecycleEventClearsHeldKeys(QEvent::ApplicationDeactivate);
+}
+
+void InputRouterTests::
+    uninstallForgetsHeldKeysSoAFreshInstallNeverInheritsStaleHolds() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject first;
+  QVERIFY(router.install(&first));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+  QVERIFY(sendKey(&first, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 1);
+
+  // Up was never released on |first|; uninstall() must forget it rather
+  // than let it leak into whatever target is installed next.
+  router.uninstall();
+
+  QObject second;
+  QVERIFY(router.install(&second));
+  QVERIFY(sendKey(&second, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+}
+
+void InputRouterTests::
+    installingANewTargetForgetsHeldKeysFromThePreviousTarget() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject first;
+  QObject second;
+  QVERIFY(router.install(&first));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+  QVERIFY(sendKey(&first, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 1);
+
+  // Installing a *different* target implicitly uninstalls the previous
+  // one; the still-held Up key from |first| must not leak into |second|.
+  QVERIFY(router.install(&second));
+  QVERIFY(sendKey(&second, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+}
+
+void InputRouterTests::
+    targetDestructionWhileHeldDoesNotLeakStaleHeldStateIntoALaterInstall() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  auto *target = new QObject();
+  QVERIFY(router.install(target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+  QVERIFY(sendKey(target, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 1);
+
+  delete target; // Never released; QPointer nulls installedTarget_.
+  QVERIFY(!router.isInstalled());
+
+  QObject second;
+  QVERIFY(router.install(&second));
+  QVERIFY(sendKey(&second, QEvent::KeyPress, Qt::Key_Up));
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+}
+
+void InputRouterTests::keypadEnterIsReachableDespiteItsKeypadModifier() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+  // A real keypad Enter QKeyEvent carries Qt::KeypadModifier alongside
+  // Qt::NoModifier; without normalizing it away, this would never match
+  // the plain PhysicalKey{Key_Enter, NoModifier} default binding and
+  // keypad Enter would be permanently unreachable.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_Enter, false,
+                  Qt::KeypadModifier));
+  QCOMPARE(spy.count(), 1);
+  QCOMPARE(spy.constFirst().at(0).value<SemanticCommand>(),
+           SemanticCommand::PrimaryAction);
+  QCOMPARE(spy.constFirst().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_Enter, false,
+                  Qt::KeypadModifier));
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Released);
 }
 
 QTEST_GUILESS_MAIN(InputRouterTests)

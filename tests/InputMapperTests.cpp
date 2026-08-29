@@ -17,7 +17,9 @@ private slots:
   void reservedKeysAreFixedAndCannotBeRemapped();
   void reservedKeysCannotBeUnbound();
   void unknownKeyIsSafeAndProducesNoCommand();
-  void remapMovesABindingAndEvictsThePreviousOwner();
+  void remapAddsAnAliasWithoutEvictingTheOldBinding();
+  void remapOfAnOrdinaryKeyNeverEvictsReservedKeyAliases();
+  void remapOfOneDefaultAliasPreservesItsSiblingDefaultAliases();
   void remapRejectsStealingAnAlreadyBoundKeyWithoutExplicitUnbind();
   void remapToleratesReassigningACommandToItsOwnCurrentKey();
   void unbindRemovesANonReservedBinding();
@@ -29,7 +31,13 @@ private slots:
   void rebindingAnArmedHeldKeyStillReleasesTheOriginallyDispatchedCommand();
   void unbindingAnArmedHeldKeyStillReleasesTheOriginallyDispatchedCommand();
   void resetToDefaultsClearsHeldStateAndCustomBindings();
-  void modifiersDistinguishOtherwiseIdenticalKeys();
+  void modifiersAreOnlyPartOfBindingLookupNotHeldKeyIdentity();
+  void
+  releasingAHeldKeyWithChangedLiveModifiersStillReleasesThePressTimeCommand();
+  void addingAModifierMidHoldStillRepeatsWithThePressTimeCommand();
+  void pressAfterAModifierChangedReleaseIsNotSwallowed();
+  void twoDifferentPhysicalKeysAliasedToTheSameCommandAreTrackedIndependently();
+  void clearHeldKeysForgetsArmedHoldsWithoutDispatchingAndAllowsAFreshPress();
 
 private:
   static PhysicalKey key(Qt::Key key,
@@ -102,15 +110,90 @@ void InputMapperTests::unknownKeyIsSafeAndProducesNoCommand() {
   QVERIFY(!released.has_value());
 }
 
-void InputMapperTests::remapMovesABindingAndEvictsThePreviousOwner() {
+void InputMapperTests::remapAddsAnAliasWithoutEvictingTheOldBinding() {
   InputMapper mapper;
   QVERIFY(!mapper.remap(key(Qt::Key_F1), SemanticCommand::Undo).has_value());
   QCOMPARE(mapper.commandFor(key(Qt::Key_F1)), SemanticCommand::Undo);
 
-  // Undo was already bound to Ctrl+Z by default; moving it to F1 must
-  // evict the old Ctrl+Z -> Undo binding entirely (a command may only
-  // ever be bound to one physical key at a time).
+  // Undo was already bound to Ctrl+Z by default; remap() only ever adds
+  // or moves the one physical key it was given (F1), so the old Ctrl+Z
+  // binding must still be intact -- multiple physical keys may share a
+  // command, exactly like the built-in multi-alias defaults (Up+W,
+  // Return+Enter+Space) already do.
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Z, Qt::ControlModifier)),
+           SemanticCommand::Undo);
+
+  // Both aliases actually dispatch Undo independently.
+  const auto f1Pressed = mapper.processKey(key(Qt::Key_F1), true, false);
+  QVERIFY(f1Pressed.has_value());
+  QCOMPARE(f1Pressed->command, SemanticCommand::Undo);
+  const auto ctrlZPressed =
+      mapper.processKey(key(Qt::Key_Z, Qt::ControlModifier), true, false);
+  QVERIFY(ctrlZPressed.has_value());
+  QCOMPARE(ctrlZPressed->command, SemanticCommand::Undo);
+
+  // A caller that actually wants to free up the old key must explicitly
+  // unbind() it -- the same explicit step already required to steal a
+  // key away from a different command.
+  QVERIFY(mapper.unbind(key(Qt::Key_Z, Qt::ControlModifier)));
   QVERIFY(!mapper.commandFor(key(Qt::Key_Z, Qt::ControlModifier)).has_value());
+  QCOMPARE(mapper.commandFor(key(Qt::Key_F1)), SemanticCommand::Undo);
+}
+
+void InputMapperTests::remapOfAnOrdinaryKeyNeverEvictsReservedKeyAliases() {
+  InputMapper mapper;
+  // Escape and Back are both permanently reserved and both already own
+  // SecondaryAction by default; Menu is reserved and owns OpenMenu.
+  // Remapping an ordinary key to one of those same commands must not
+  // silently unbind (or otherwise disturb) the reserved keys' own fixed
+  // bindings.
+  QVERIFY(!mapper.remap(key(Qt::Key_F1), SemanticCommand::SecondaryAction)
+               .has_value());
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Escape)),
+           SemanticCommand::SecondaryAction);
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Back)),
+           SemanticCommand::SecondaryAction);
+
+  QVERIFY(
+      !mapper.remap(key(Qt::Key_F2), SemanticCommand::OpenMenu).has_value());
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Menu)), SemanticCommand::OpenMenu);
+
+  // Escape/Back/Menu must still actually dispatch and consume their
+  // reserved commands afterwards, not merely still report them via
+  // commandFor().
+  const auto escapePressed =
+      mapper.processKey(key(Qt::Key_Escape), true, false);
+  QVERIFY(escapePressed.has_value());
+  QCOMPARE(escapePressed->command, SemanticCommand::SecondaryAction);
+  const auto backPressed = mapper.processKey(key(Qt::Key_Back), true, false);
+  QVERIFY(backPressed.has_value());
+  QCOMPARE(backPressed->command, SemanticCommand::SecondaryAction);
+  const auto menuPressed = mapper.processKey(key(Qt::Key_Menu), true, false);
+  QVERIFY(menuPressed.has_value());
+  QCOMPARE(menuPressed->command, SemanticCommand::OpenMenu);
+}
+
+void InputMapperTests::
+    remapOfOneDefaultAliasPreservesItsSiblingDefaultAliases() {
+  InputMapper mapper;
+  // FocusUp is bound by default to both Up and W; PrimaryAction to
+  // Return, Enter, and Space. Remapping a single alias of one of these
+  // commands to a brand-new key must not collapse -- or otherwise
+  // disturb -- the other, unrelated sibling aliases.
+  QVERIFY(!mapper.remap(key(Qt::Key_F1), SemanticCommand::FocusUp).has_value());
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Up)), SemanticCommand::FocusUp);
+  QCOMPARE(mapper.commandFor(key(Qt::Key_W)), SemanticCommand::FocusUp);
+  QCOMPARE(mapper.commandFor(key(Qt::Key_F1)), SemanticCommand::FocusUp);
+
+  QVERIFY(!mapper.remap(key(Qt::Key_F2), SemanticCommand::PrimaryAction)
+               .has_value());
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Return)),
+           SemanticCommand::PrimaryAction);
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Enter)),
+           SemanticCommand::PrimaryAction);
+  QCOMPARE(mapper.commandFor(key(Qt::Key_Space)),
+           SemanticCommand::PrimaryAction);
+  QCOMPARE(mapper.commandFor(key(Qt::Key_F2)), SemanticCommand::PrimaryAction);
 }
 
 void InputMapperTests::
@@ -323,20 +406,154 @@ void InputMapperTests::resetToDefaultsClearsHeldStateAndCustomBindings() {
   QCOMPARE(pressed->phase, CommandPhase::Pressed);
 }
 
-void InputMapperTests::modifiersDistinguishOtherwiseIdenticalKeys() {
+void InputMapperTests::modifiersAreOnlyPartOfBindingLookupNotHeldKeyIdentity() {
   InputMapper mapper;
-  // Ctrl+Z (Undo) and plain Z (unbound by default) are distinct physical
-  // inputs.
+  // Ctrl+Z (Undo) and plain Z (unbound by default) are distinct
+  // *bindings* -- modifiers are part of a physical key's identity for
+  // commandFor()/bindings_ lookup purposes.
   QCOMPARE(mapper.commandFor(key(Qt::Key_Z, Qt::ControlModifier)),
            SemanticCommand::Undo);
   QVERIFY(!mapper.commandFor(key(Qt::Key_Z)).has_value());
 
+  // But once Z is physically pressed (as Ctrl+Z), it is the exact same
+  // physical Z key regardless of what modifiers a later event for it
+  // reports: held-key tracking is keyed by Qt::Key alone (see
+  // heldKeys_'s doc comment), so a second "press" of Z with different
+  // modifiers while it is still held is correctly a stray duplicate of
+  // the *same* hold, not an independent second press. (See
+  // releasingAHeldKeyWithChangedLiveModifiersStillReleasesThePressTimeCommand
+  // for the release-side counterpart of this exact scenario.)
   QVERIFY(mapper.processKey(key(Qt::Key_Z, Qt::ControlModifier), true, false)
               .has_value());
-  // Pressing plain Z (no modifier) while Ctrl+Z is "held" is an entirely
-  // separate physical key and must not be affected by Ctrl+Z's held
-  // state.
   QVERIFY(!mapper.processKey(key(Qt::Key_Z), true, false).has_value());
+
+  // A totally different physical key (Y) remains fully independent: it
+  // was never pressed, so a release for it is a stray release.
+  QVERIFY(!mapper.processKey(key(Qt::Key_Y), false, false).has_value());
+}
+
+void InputMapperTests::
+    releasingAHeldKeyWithChangedLiveModifiersStillReleasesThePressTimeCommand() {
+  InputMapper mapper;
+  // Press Ctrl+Z: Undo is armed for the physical Z key.
+  const auto pressed =
+      mapper.processKey(key(Qt::Key_Z, Qt::ControlModifier), true, false);
+  QVERIFY(pressed.has_value());
+  QCOMPARE(pressed->command, SemanticCommand::Undo);
+  QCOMPARE(pressed->phase, CommandPhase::Pressed);
+
+  // A perfectly ordinary way to type a chord: release Ctrl *before*
+  // releasing Z. The eventual KeyRelease event for Z then reports
+  // Qt::NoModifier (Ctrl is no longer held), not the Qt::ControlModifier
+  // that was live when Z was pressed. This must still be recognized as
+  // releasing the same physical Z key and still report the command that
+  // was actually armed at press time (Undo), not be treated as an
+  // unrelated stray release.
+  const auto released = mapper.processKey(key(Qt::Key_Z), false, false);
+  QVERIFY(released.has_value());
+  QCOMPARE(released->command, SemanticCommand::Undo);
+  QCOMPARE(released->phase, CommandPhase::Released);
+}
+
+void InputMapperTests::
+    addingAModifierMidHoldStillRepeatsWithThePressTimeCommand() {
+  InputMapper mapper;
+  const auto pressed =
+      mapper.processKey(key(Qt::Key_Z, Qt::ControlModifier), true, false);
+  QVERIFY(pressed.has_value());
+  QCOMPARE(pressed->command, SemanticCommand::Undo);
+
+  // The user presses Shift *while still holding* Ctrl+Z, so the
+  // platform's auto-repeat for Z now reports Ctrl+Shift instead of just
+  // Ctrl. The repeat must still report the command armed at press time
+  // (Undo), regardless of the now-different live modifiers.
+  const auto repeated = mapper.processKey(
+      key(Qt::Key_Z, Qt::ControlModifier | Qt::ShiftModifier), true, true);
+  QVERIFY(repeated.has_value());
+  QCOMPARE(repeated->command, SemanticCommand::Undo);
+  QCOMPARE(repeated->phase, CommandPhase::Repeated);
+
+  const auto released = mapper.processKey(
+      key(Qt::Key_Z, Qt::ControlModifier | Qt::ShiftModifier), false, false);
+  QVERIFY(released.has_value());
+  QCOMPARE(released->command, SemanticCommand::Undo);
+  QCOMPARE(released->phase, CommandPhase::Released);
+}
+
+void InputMapperTests::pressAfterAModifierChangedReleaseIsNotSwallowed() {
+  InputMapper mapper;
+  // This is the exact regression the modifier-independent held-key
+  // tracking fixes: without it, the release below (with changed live
+  // modifiers) would be misclassified as a stray release, permanently
+  // leaking the original press-time hold and causing the *next*
+  // legitimate Ctrl+Z press to be misclassified as a stray duplicate and
+  // suppressed entirely.
+  QVERIFY(mapper.processKey(key(Qt::Key_Z, Qt::ControlModifier), true, false)
+              .has_value());
+  QVERIFY(mapper.processKey(key(Qt::Key_Z), false, false).has_value());
+
+  const auto secondPress =
+      mapper.processKey(key(Qt::Key_Z, Qt::ControlModifier), true, false);
+  QVERIFY(secondPress.has_value());
+  QCOMPARE(secondPress->command, SemanticCommand::Undo);
+  QCOMPARE(secondPress->phase, CommandPhase::Pressed);
+}
+
+void InputMapperTests::
+    twoDifferentPhysicalKeysAliasedToTheSameCommandAreTrackedIndependently() {
+  InputMapper mapper;
+  // Up and W are both bound to FocusUp by default; holding one must
+  // never affect the other's independent held-key state.
+  const auto upPressed = mapper.processKey(key(Qt::Key_Up), true, false);
+  QVERIFY(upPressed.has_value());
+  const auto wPressed = mapper.processKey(key(Qt::Key_W), true, false);
+  QVERIFY(wPressed.has_value());
+
+  // A duplicate press of either individual key (without its own release)
+  // is still a stray duplicate for *that* key.
+  QVERIFY(!mapper.processKey(key(Qt::Key_Up), true, false).has_value());
+  QVERIFY(!mapper.processKey(key(Qt::Key_W), true, false).has_value());
+
+  // Releasing Up must not affect W's still-held state, and vice versa.
+  const auto upReleased = mapper.processKey(key(Qt::Key_Up), false, false);
+  QVERIFY(upReleased.has_value());
+  QCOMPARE(upReleased->phase, CommandPhase::Released);
+
+  const auto wRepeated = mapper.processKey(key(Qt::Key_W), true, true);
+  QVERIFY(wRepeated.has_value());
+  QCOMPARE(wRepeated->phase, CommandPhase::Repeated);
+
+  const auto wReleased = mapper.processKey(key(Qt::Key_W), false, false);
+  QVERIFY(wReleased.has_value());
+  QCOMPARE(wReleased->phase, CommandPhase::Released);
+}
+
+void InputMapperTests::
+    clearHeldKeysForgetsArmedHoldsWithoutDispatchingAndAllowsAFreshPress() {
+  InputMapper mapper;
+  const auto pressed = mapper.processKey(key(Qt::Key_Up), true, false);
+  QVERIFY(pressed.has_value());
+
+  // clearHeldKeys() itself never returns anything to dispatch -- there
+  // is nothing here to assert a "no dispatch" outcome against beyond the
+  // fact that it compiles/returns void, but the key behavioral guarantee
+  // is exercised below: the still-physically-held Up key is now treated
+  // as fully released.
+  mapper.clearHeldKeys();
+
+  // A fresh, non-auto-repeat press of the same key (with no real release
+  // ever having been observed) must be treated as a brand-new hold, not
+  // a suppressed stray duplicate.
+  const auto freshPress = mapper.processKey(key(Qt::Key_Up), true, false);
+  QVERIFY(freshPress.has_value());
+  QCOMPARE(freshPress->phase, CommandPhase::Pressed);
+
+  // And an auto-repeat/release for what would have been the *old* hold,
+  // had it not been cleared, must not resurrect it: this is exactly a
+  // fresh hold now, so it behaves like any other normal one.
+  const auto released = mapper.processKey(key(Qt::Key_Up), false, false);
+  QVERIFY(released.has_value());
+  QCOMPARE(released->phase, CommandPhase::Released);
 }
 
 QTEST_APPLESS_MAIN(InputMapperTests)

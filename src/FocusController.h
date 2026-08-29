@@ -116,7 +116,13 @@ public:
   // the same zone (by registration order), then std::nullopt (no node
   // focused) if the zone is now empty. Also purges |id| from the modal
   // stack's return targets (falling back the same way for any modal
-  // entry that pointed at it) and from zone-last-focused memory.
+  // entry that pointed at it) and from zone-last-focused memory. If this
+  // removes the last remaining node of |id|'s zone, that zone id is also
+  // pruned from the internal zone-cycle order (see cycleZone) so it no
+  // longer takes part in zone cycling and does not grow that order
+  // without bound across many dynamically-created/destroyed zones; a
+  // later registerNode() for that same zone id treats it as a brand-new
+  // zone, appended at the current end of the order.
   void removeNode(const QString &id, const QString &fallbackId = {});
 
   [[nodiscard]] bool hasNode(const QString &id) const;

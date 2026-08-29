@@ -18,7 +18,17 @@ import QtQuick.Layouts
 // renders static, fixed fixture content. No virtual cursor, no pointer
 // simulation: focus rectangles are drawn purely from
 // Item.activeFocus, which itself only ever changes via
-// forceActiveFocus() below.
+// forceActiveFocus() below -- every delegate below sets
+// activeFocusOnTab: false so Qt's own native Tab-key focus chain can
+// never move activeFocus on its own: that would let semantic focus
+// (FocusController.currentFocusId) and real Qt active focus silently
+// diverge (a visible focus rectangle only Tab moved, with the next
+// semantic direction then jumping from the wrong node) since Tab is not
+// bound to any SemanticCommand. Every element remains reachable by
+// keyboard regardless, via the semantic focus/zone-cycle commands (see
+// InputMapper's defaults), each of which does drive real activeFocus
+// through this same reflection, so this stays fully keyboard/AT-SPI
+// accessible without a second, unsynchronized focus path.
 ApplicationWindow {
     id: root
 
@@ -112,7 +122,7 @@ ApplicationWindow {
                         color: activeFocus ? "#ede1c3" : "#35504f"
                         width: activeFocus ? 3 : 1
                     }
-                    activeFocusOnTab: true
+                    activeFocusOnTab: false
 
                     Accessible.role: Accessible.Button
                     Accessible.name: boardDelegate.modelData.label
@@ -177,7 +187,7 @@ ApplicationWindow {
                             color: activeFocus ? "#ede1c3" : "#35504f"
                             width: activeFocus ? 3 : 1
                         }
-                        activeFocusOnTab: true
+                        activeFocusOnTab: false
 
                         Accessible.role: Accessible.Button
                         Accessible.name: handDelegate.modelData.label
@@ -220,7 +230,7 @@ ApplicationWindow {
                     color: activeFocus ? "#ede1c3" : "#35504f"
                     width: activeFocus ? 3 : 1
                 }
-                activeFocusOnTab: true
+                activeFocusOnTab: false
 
                 Accessible.role: Accessible.StaticText
                 Accessible.name: qsTr("Log Entry")

@@ -42,6 +42,11 @@ void InputRouter::uninstall() {
     installedTarget_->removeEventFilter(this);
   }
   installedTarget_.clear();
+  // See the class comment: once uninstalled, this router can never
+  // observe a real KeyRelease for whatever was held while it was
+  // installed, so forget it now rather than let it leak into a later
+  // install() on a different (or the same) target.
+  mapper_.clearHeldKeys();
 }
 
 bool InputRouter::isInstalled() const { return !installedTarget_.isNull(); }
@@ -58,14 +63,37 @@ bool InputRouter::eventFilter(QObject *watched, QEvent *event) {
     return QObject::eventFilter(watched, event);
   }
 
+  switch (event->type()) {
+  case QEvent::FocusOut:
+  case QEvent::WindowDeactivate:
+  case QEvent::ApplicationDeactivate:
+    // See the class comment: the platform can drop a key's real release
+    // once focus/activation is lost, so forget all held-key state here
+    // (without dispatching anything) rather than risk a permanently
+    // stuck hold. These event types are never consumed -- only
+    // KeyPress/KeyRelease ever are (see below).
+    mapper_.clearHeldKeys();
+    return QObject::eventFilter(watched, event);
+  default:
+    break;
+  }
+
   if (event->type() != QEvent::KeyPress &&
       event->type() != QEvent::KeyRelease) {
     return QObject::eventFilter(watched, event);
   }
 
   auto *keyEvent = static_cast<QKeyEvent *>(event);
+  // Qt::KeypadModifier records that a key came from the numeric keypad --
+  // it is device-origin information, not a remappable modifier
+  // combination like Ctrl/Shift/Alt/Meta, and no default or user binding
+  // ever includes it. Real keypad Enter events carry it alongside
+  // Qt::NoModifier, which would otherwise never match the plain
+  // PhysicalKey{Key_Enter, NoModifier} binding and make keypad Enter
+  // permanently unreachable; stripping just this one bit fixes that
+  // without affecting any other modifier-based remap.
   const PhysicalKey physicalKey{static_cast<Qt::Key>(keyEvent->key()),
-                                keyEvent->modifiers()};
+                                keyEvent->modifiers() & ~Qt::KeypadModifier};
   const bool isPress = event->type() == QEvent::KeyPress;
 
   // Known ahead of calling processKey() so a dedup-suppressed transition

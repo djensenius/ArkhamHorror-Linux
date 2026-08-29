@@ -60,6 +60,11 @@ private slots:
   void snapshotRestorationIsDeterministicAndRepeatable();
   void geometryFallbackIsOptInAndNeverUsedByDefault();
   void currentFocusChangedFiresOnlyOnActualChange();
+  void reentrantSignalEmissionSeesEachEmissionsOwnValueNotTheFinalMutatedOne();
+  void
+  restoreSnapshotAlwaysWritesZoneMemoryForTheTargetEvenWhenAlreadyFocused();
+  void
+  removedEmptyZoneIsPrunedFromCycleOrderAndReappearsAtTheEndIfReintroduced();
 };
 
 void FocusControllerTests::movesFocusAlongExplicitAdjacency() {
@@ -415,6 +420,166 @@ void FocusControllerTests::currentFocusChangedFiresOnlyOnActualChange() {
 
   QVERIFY(controller.moveFocus(FocusDirection::Right));
   QCOMPARE(spy.count(), 1);
+}
+
+void FocusControllerTests::
+    reentrantSignalEmissionSeesEachEmissionsOwnValueNotTheFinalMutatedOne() {
+  // A direct-connected slot that reenters (calls moveFocus() again
+  // before the outer emission's later-connected slots have run) must
+  // never make those later slots observe the already-mutated final
+  // value: currentFocusChanged() must carry each emission's own value,
+  // never a live reference to the mutable member.
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.setInitialFocus(QStringLiteral("board.nw"));
+
+  bool reentered = false;
+  QVector<QString> secondObserverSeen;
+  // Connected first: reenters exactly once, on the outer emission for
+  // "board.ne", by moving focus again (triggering a fully-nested emit
+  // for "board.se") before returning.
+  QObject::connect(&controller, &FocusController::currentFocusChanged,
+                   &controller, [&](const QString &id) {
+                     if (!reentered && id == QStringLiteral("board.ne")) {
+                       reentered = true;
+                       QVERIFY(controller.moveFocus(FocusDirection::Down));
+                     }
+                   });
+  // Connected second: for the OUTER emission, this must still run *after*
+  // the nested emission has fully completed (Qt direct connections invoke
+  // slots in connection order within a single activate() call), and must
+  // see the value that was current when the *outer* emission started
+  // ("board.ne"), not the value the nested reentrant call already moved
+  // on to ("board.se").
+  QObject::connect(
+      &controller, &FocusController::currentFocusChanged, &controller,
+      [&](const QString &id) { secondObserverSeen.push_back(id); });
+
+  QVERIFY(controller.moveFocus(FocusDirection::Right));
+
+  QCOMPARE(secondObserverSeen, (QVector<QString>{QStringLiteral("board.se"),
+                                                 QStringLiteral("board.ne")}));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.se"));
+}
+
+void FocusControllerTests::
+    restoreSnapshotAlwaysWritesZoneMemoryForTheTargetEvenWhenAlreadyFocused() {
+  FocusController controller;
+  // Registration order matters here: hand.card1 is registered first (and
+  // is later removed), so firstRegisteredNodeId()'s fallback lands on
+  // board.nw once hand.card1 no longer exists.
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  registerBoardZone(controller);
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("log.entry"), QStringLiteral("log"), {}});
+
+  controller.setInitialFocus(QStringLiteral("board.se"));
+  // board -> hand, remembering board.se as board's last-focused node and
+  // hand.card1 as hand's.
+  QVERIFY(controller.cycleZone(false));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+
+  const FocusSnapshot snap = controller.snapshot();
+  QCOMPARE(snap.focusedId, QStringLiteral("hand.card1"));
+  QCOMPARE(snap.zoneLastFocused.value(QStringLiteral("board")),
+           QStringLiteral("board.se"));
+
+  // Remove the snapshot's focused node entirely (hand becomes empty and
+  // is pruned from zoneOrder_ -- see the zone-pruning test -- which is
+  // irrelevant to this bug but incidental to this exact setup).
+  controller.removeNode(QStringLiteral("hand.card1"));
+
+  // Set up the exact coincidence the bug depends on: manually put focus
+  // on precisely the id restoreSnapshot's fallback logic is about to
+  // land on (board.nw, since hand.card1 -- registration order 0 -- no
+  // longer exists, the next-lowest surviving registration order is
+  // board.nw), *before* calling restoreSnapshot.
+  QVERIFY(controller.setInitialFocus(QStringLiteral("board.nw")));
+
+  controller.restoreSnapshot(snap);
+  // The fallback target is exactly what was already live, so
+  // setCurrentFocus()'s own "no actual change" guard fires internally --
+  // but restoreSnapshot() must still have deterministically written
+  // board's zone memory to reflect the *actual new* focus (board.nw),
+  // not left it as whatever the snapshot's rebuild loop restored from the
+  // old recorded memory (board.se).
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Cycle away from "board" and back: this must land on board.nw (the
+  // correctly-updated zone memory), never on the stale board.se from the
+  // snapshot's own zoneLastFocused (which would prove the update was
+  // skipped).
+  QVERIFY(controller.cycleZone(true)); // board -> log
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(false)); // log -> board
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Repeated restoration of the exact same snapshot, from this new live
+  // state (which now again coincidentally matches the fallback target),
+  // must still produce the exact same deterministic result -- no
+  // history-dependent drift across repeated restorations.
+  controller.restoreSnapshot(snap);
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+  QVERIFY(controller.cycleZone(true));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(false));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+}
+
+void FocusControllerTests::
+    removedEmptyZoneIsPrunedFromCycleOrderAndReappearsAtTheEndIfReintroduced() {
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  controller.setInitialFocus(QStringLiteral("board.nw"));
+
+  // zoneOrder_ so far: [board, hand].
+  QVERIFY(controller.cycleZone(true));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  QVERIFY(controller.cycleZone(true));
+  // Only two zones exist, so cycling forward again wraps back to board.
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Removing hand's only node empties the zone entirely: it must be
+  // pruned from the cycle order (not merely skipped), so with only one
+  // populated zone left, cycling is a pure no-op.
+  controller.removeNode(QStringLiteral("hand.card1"));
+  QVERIFY(!controller.cycleZone(true));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Introduce a third zone, then re-register a node under the *same*
+  // "hand" zone id: it must be treated as a brand-new zone appended at
+  // the current end of the cycle order (after "log"), not reinserted at
+  // its original position (which was right after "board").
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("log.entry"), QStringLiteral("log"), {}});
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card2"), QStringLiteral("hand"), {}});
+
+  QVERIFY(controller.cycleZone(true)); // board -> log
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(true)); // log -> hand
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card2"));
+  QVERIFY(controller.cycleZone(true)); // hand -> board (wraps)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // A repeated remove/re-add cycle behaves exactly the same way each
+  // time: still pruned once empty, still appended at the (new) end when
+  // reintroduced again.
+  controller.removeNode(QStringLiteral("hand.card2"));
+  QVERIFY(controller.cycleZone(true)); // board -> log (hand pruned again)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(true)); // log -> board (only two zones left)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card3"), QStringLiteral("hand"), {}});
+  QVERIFY(controller.cycleZone(true)); // board -> log
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("log.entry"));
+  QVERIFY(controller.cycleZone(true)); // log -> hand (re-appended at the end)
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card3"));
 }
 
 QTEST_APPLESS_MAIN(FocusControllerTests)
