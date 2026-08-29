@@ -3,6 +3,7 @@
 #include <QLatin1StringView>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <string_view>
 
 using namespace Qt::StringLiterals;
@@ -79,6 +80,16 @@ ValueOrError<int> requireIntValue(const QJsonValue &v, QStringView path) {
     return failure(
         QStringLiteral("%1: expected integer, got non-integral number")
             .arg(path));
+  // A value that is integral in IEEE-754 double terms can still fall
+  // outside int's representable range (e.g. 1e300); casting such a value
+  // via static_cast<int> is undefined behavior, so reject it explicitly
+  // rather than truncating/wrapping.
+  if (d < static_cast<double>(std::numeric_limits<int>::min()) ||
+      d > static_cast<double>(std::numeric_limits<int>::max()))
+    return failure(
+        QStringLiteral("%1: integer %2 is out of range for a 32-bit int")
+            .arg(path)
+            .arg(d, 0, 'f', 0));
   return static_cast<int>(d);
 }
 
@@ -133,15 +144,10 @@ optionalInt(const QJsonObject &obj, QLatin1StringView key, QStringView path) {
   const QJsonValue v = obj.value(key);
   if (v.isUndefined() || v.isNull())
     return std::optional<int>{};
-  if (!v.isDouble())
-    return failure(
-        QStringLiteral("%1: expected integer, got %2").arg(path, typeName(v)));
-  const double d = v.toDouble();
-  if (std::trunc(d) != d)
-    return failure(
-        QStringLiteral("%1: expected integer, got non-integral number")
-            .arg(path));
-  return std::optional<int>{static_cast<int>(d)};
+  auto result = requireIntValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<int>{*result};
 }
 
 ValueOrError<std::optional<bool>>
@@ -186,16 +192,10 @@ ValueOrError<std::optional<int>> requireNullableInt(const QJsonObject &obj,
   case FieldPresence::Present:
     break;
   }
-  const QJsonValue v = obj.value(key);
-  if (!v.isDouble())
-    return failure(
-        QStringLiteral("%1: expected integer, got %2").arg(path, typeName(v)));
-  const double d = v.toDouble();
-  if (std::trunc(d) != d)
-    return failure(
-        QStringLiteral("%1: expected integer, got non-integral number")
-            .arg(path));
-  return std::optional<int>{static_cast<int>(d)};
+  auto result = requireIntValue(obj.value(key), path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<int>{*result};
 }
 
 ValueOrError<QUuid> decodeUuid(const QJsonValue &v, QStringView path) {

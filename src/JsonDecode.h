@@ -10,6 +10,7 @@
 #include <QStringView>
 #include <QUuid>
 #include <array>
+#include <limits>
 #include <optional>
 
 namespace Arkham::Json {

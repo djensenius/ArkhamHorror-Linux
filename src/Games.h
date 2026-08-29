@@ -145,6 +145,11 @@ struct GameState {
   // value that could not be interpreted can still be logged/displayed and
   // re-encoded without inventing a tag.
   QString unknownTag;
+  // Unknown only: the raw "contents" value the unrecognized tag object
+  // carried, if any (Undefined if it had none), preserved verbatim -- like
+  // CampaignOption's own unknown-tag handling -- so re-encoding an unknown
+  // state can never silently drop part of what the server sent.
+  QJsonValue unknownContents{QJsonValue::Undefined};
 
   [[nodiscard]] static ValueOrError<GameState> fromJson(const QJsonValue &v,
                                                         QStringView path);

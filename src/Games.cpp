@@ -366,7 +366,9 @@ ValueOrError<GameState> GameState::fromJson(const QJsonValue &v,
     return GameState{.kind = Kind::Active};
   if (tag == "IsOver"_L1)
     return GameState{.kind = Kind::Over};
-  return GameState{.kind = Kind::Unknown, .unknownTag = tag};
+  return GameState{.kind = Kind::Unknown,
+                   .unknownTag = tag,
+                   .unknownContents = obj.value("contents"_L1)};
 }
 
 QJsonObject GameState::toJson() const {
@@ -383,8 +385,12 @@ QJsonObject GameState::toJson() const {
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsActive")}};
   case Kind::Over:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsOver")}};
-  case Kind::Unknown:
-    return QJsonObject{{QStringLiteral("tag"), unknownTag}};
+  case Kind::Unknown: {
+    QJsonObject obj{{QStringLiteral("tag"), unknownTag}};
+    if (!unknownContents.isUndefined())
+      obj.insert(QStringLiteral("contents"), unknownContents);
+    return obj;
+  }
   }
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }

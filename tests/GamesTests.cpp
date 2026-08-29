@@ -21,6 +21,7 @@ private slots:
 
   // GameState forward compatibility ─────────────────────────────────────────
   void unknownGameStateTagPreservedAndRoundTrips();
+  void unknownGameStateTagWithContentsPreservedAndRoundTrips();
 
   // GameListRow success/error ambiguity ──────────────────────────────────────
   void rowWithErrorKeyIsAlwaysFailureRegardlessOfOtherKeys();
@@ -195,6 +196,29 @@ void GamesTests::unknownGameStateTagPreservedAndRoundTrips() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind, GameState::Kind::Unknown);
   QCOMPARE(result->unknownTag, QStringLiteral("IsSuspended"));
+  QVERIFY(result->unknownContents.isUndefined());
+  QCOMPARE(result->toJson(), obj);
+}
+
+void GamesTests::unknownGameStateTagWithContentsPreservedAndRoundTrips() {
+  // A future GameState variant may carry a "contents" payload of any shape
+  // (matching the tagged-object encoding Pending/ChooseDecks already use);
+  // it must round-trip losslessly rather than being silently dropped.
+  const QJsonObject obj{
+      {QStringLiteral("tag"), QStringLiteral("IsSuspended")},
+      {QStringLiteral("contents"),
+       QJsonObject{{QStringLiteral("reason"), QStringLiteral("maintenance")}}},
+  };
+  const auto result = GameState::fromJson(obj, u"gameState");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->kind, GameState::Kind::Unknown);
+  QCOMPARE(result->unknownTag, QStringLiteral("IsSuspended"));
+  QVERIFY(!result->unknownContents.isUndefined());
+  QCOMPARE(result->unknownContents.toObject()
+               .value(QStringLiteral("reason"))
+               .toString(),
+           QStringLiteral("maintenance"));
   QCOMPARE(result->toJson(), obj);
 }
 
