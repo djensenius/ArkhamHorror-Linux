@@ -164,6 +164,107 @@ void AssetLocatorTests::defaultConstructedAssetBaseRejected() {
   QCOMPARE(result.error().code, AssetErrorCode::InvalidAssetBase);
 }
 
+// Review item 3: asset-specific raw-string path hardening layered ON TOP
+// of the shared UrlValidator policy (never a fork/weakening of it -- see
+// ValidatedAssetSource::fromRaw() in AssetTypes.cpp). Every row here
+// exercises ValidatedAssetSource::fromRaw() directly (not through a full
+// AssetKey/resolveCandidates() round trip) since that is the exact
+// function under test.
+void AssetLocatorTests::
+    assetBasePathRejectsDotSegmentsAndEncodedVariants_data() {
+  QTest::addColumn<QString>("rawBase");
+  QTest::addColumn<bool>("expectValid");
+
+  QTest::newRow("valid-no-path")
+      << QStringLiteral("https://assets.example.com") << true;
+  QTest::newRow("valid-reverse-proxy-prefix")
+      << QStringLiteral("https://example.com/cdn/assets") << true;
+  QTest::newRow("literal-dot-segment")
+      << QStringLiteral("https://example.com/a/../b") << false;
+  QTest::newRow("literal-dot-only-segment")
+      << QStringLiteral("https://example.com/a/./b") << false;
+  QTest::newRow("trailing-dotdot-segment")
+      << QStringLiteral("https://example.com/a/..") << false;
+  QTest::newRow("percent-encoded-dotdot-lowercase")
+      << QStringLiteral("https://example.com/a/%2e%2e/b") << false;
+  QTest::newRow("percent-encoded-dotdot-uppercase")
+      << QStringLiteral("https://example.com/a/%2E%2E/b") << false;
+  QTest::newRow("percent-encoded-dotdot-mixed-case")
+      << QStringLiteral("https://example.com/a/%2e%2E/b") << false;
+  QTest::newRow("double-encoded-dotdot")
+      << QStringLiteral("https://example.com/a/%252e%252e/b") << false;
+  QTest::newRow("percent-encoded-separator-smuggles-dotdot-segment")
+      << QStringLiteral("https://example.com/a%2f..%2fb") << false;
+  QTest::newRow("literal-backslash")
+      << QStringLiteral("https://example.com/a\\b") << false;
+  QTest::newRow("percent-encoded-backslash")
+      << QStringLiteral("https://example.com/a%5cb") << false;
+  QTest::newRow("percent-encoded-control-character")
+      << QStringLiteral("https://example.com/a%00b") << false;
+  QTest::newRow("reverse-proxy-prefix-then-escape")
+      << QStringLiteral("https://example.com/cdn/../etc") << false;
+}
+
+void AssetLocatorTests::assetBasePathRejectsDotSegmentsAndEncodedVariants() {
+  QFETCH(QString, rawBase);
+  QFETCH(bool, expectValid);
+
+  const AssetOutcome<ValidatedAssetSource> result =
+      ValidatedAssetSource::fromRaw(rawBase);
+  if (expectValid) {
+    QVERIFY2(bool(result),
+             qPrintable(result ? QString() : result.error().message));
+  } else {
+    QVERIFY(!result);
+    QCOMPARE(result.error().code, AssetErrorCode::InvalidAssetBase);
+  }
+}
+
+// Review item 3: "https://host:443" and "https://host" (and the http:80
+// equivalent) must resolve to the EXACT SAME normalizedUrl() -- included
+// verbatim in every cache-namespace derivation -- so two spellings of the
+// same server never split into two disjoint cache namespaces. A
+// non-default port must never be silently dropped.
+void AssetLocatorTests::assetBaseCanonicalizesAwayExplicitDefaultPort_data() {
+  QTest::addColumn<QString>("rawBaseA");
+  QTest::addColumn<QString>("rawBaseB");
+  QTest::addColumn<bool>("expectEqual");
+
+  QTest::newRow("https-explicit-443-matches-implicit")
+      << QStringLiteral("https://example.com:443")
+      << QStringLiteral("https://example.com") << true;
+  QTest::newRow("http-explicit-80-matches-implicit-loopback")
+      << QStringLiteral("http://localhost:80")
+      << QStringLiteral("http://localhost") << true;
+  QTest::newRow("https-non-default-port-preserved-distinct")
+      << QStringLiteral("https://example.com:8443")
+      << QStringLiteral("https://example.com") << false;
+  QTest::newRow("https-explicit-443-with-path-matches")
+      << QStringLiteral("https://example.com:443/cdn")
+      << QStringLiteral("https://example.com/cdn") << true;
+}
+
+void AssetLocatorTests::assetBaseCanonicalizesAwayExplicitDefaultPort() {
+  QFETCH(QString, rawBaseA);
+  QFETCH(QString, rawBaseB);
+  QFETCH(bool, expectEqual);
+
+  const AssetOutcome<ValidatedAssetSource> a =
+      ValidatedAssetSource::fromRaw(rawBaseA);
+  const AssetOutcome<ValidatedAssetSource> b =
+      ValidatedAssetSource::fromRaw(rawBaseB);
+  QVERIFY2(bool(a), qPrintable(a ? QString() : a.error().message));
+  QVERIFY2(bool(b), qPrintable(b ? QString() : b.error().message));
+
+  if (expectEqual) {
+    QCOMPARE(a->normalizedUrl(), b->normalizedUrl());
+    QVERIFY(*a == *b);
+  } else {
+    QVERIFY(a->normalizedUrl() != b->normalizedUrl());
+    QVERIFY(!(*a == *b));
+  }
+}
+
 void AssetLocatorTests::hostileIdentifiersRejected_data() {
   QTest::addColumn<QString>("identifier");
   QTest::addColumn<bool>("expectValid");

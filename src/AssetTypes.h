@@ -229,8 +229,15 @@ public:
   [[nodiscard]] bool isValid() const noexcept { return m_valid; }
 
   // Precondition: isValid(). The normalised base URL (scheme + host +
-  // optional port + optional clean path prefix) exactly as
-  // UrlValidator::validateCustomUrl() returned it.
+  // optional port + optional clean path prefix), built from
+  // UrlValidator::validateCustomUrl()'s result with two additional,
+  // asset-specific (additive, never weaker) transforms applied by
+  // fromRaw(): an explicit default port (443 for https, 80 for http) is
+  // stripped so two spellings of the same server share one cache
+  // namespace, and the raw path is independently rejected if it contains
+  // any literal or percent-encoded (including double-encoded) dot
+  // segment, backslash, or control character. Non-default ports and path
+  // case are always preserved exactly.
   [[nodiscard]] const QUrl &normalizedUrl() const noexcept { return m_url; }
 
   [[nodiscard]] bool

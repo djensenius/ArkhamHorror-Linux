@@ -23,6 +23,12 @@ private slots:
 
   void defaultConstructedAssetBaseRejected();
 
+  void assetBasePathRejectsDotSegmentsAndEncodedVariants_data();
+  void assetBasePathRejectsDotSegmentsAndEncodedVariants();
+
+  void assetBaseCanonicalizesAwayExplicitDefaultPort_data();
+  void assetBaseCanonicalizesAwayExplicitDefaultPort();
+
   void hostileIdentifiersRejected_data();
   void hostileIdentifiersRejected();
 
