@@ -180,7 +180,9 @@ std::optional<QString> resolveArtCodeForSide(AssetSide side,
   case AssetSide::Front:
     return strippedIdentifier;
   case AssetSide::Back:
-    return strippedIdentifier + u'b';
+    // Handled entirely by resolveBackCandidates() before this function is
+    // ever reached for AssetSide::Back -- see resolveCandidates().
+    Q_UNREACHABLE_RETURN(std::nullopt);
   case AssetSide::AlternateFront:
     // altFrontImage(): `src.replace(/(\d)\.avif$/, '$1a.avif')` -- only
     // ever produces a candidate when the base code ends in a digit.
@@ -235,10 +237,18 @@ QString buildRelativePath(const AssetKey &key, const QString &artCode,
   case AssetCategory::SlotIcon:
     return "img/arkham/slots/"_L1 + artCode + u'.' + ext;
   case AssetCategory::HomebrewSet:
-    // homebrewSetImagePath() in Cards.vue: the SAME identifier is used as
-    // both the per-homebrew directory and the file name.
-    return "img/arkham/homebrew/"_L1 + artCode + "/sets/"_L1 + artCode + u'.' +
-           ext;
+    // Real call sites (GameRow.vue, CampaignLogChaosBagChanges.vue,
+    // XpBreakdown.vue, ContinueCampaign.vue) all parse a compound
+    // colon-delimited slug into two INDEPENDENT captures -- a campaign/
+    // homebrew namespace and a set id -- building
+    // "homebrew/{namespace}/sets/{setId}.png". `homebrewNamespace` and
+    // `identifier` (artCode) are validated independently by
+    // resolveCandidates(); a caller MAY legitimately pass the same string
+    // for both (the single campaign-icon special case), but the type
+    // never collapses them into one field the way HomebrewBox's single
+    // per-campaign cover art does.
+    return "img/arkham/homebrew/"_L1 + key.homebrewNamespace + "/sets/"_L1 +
+           artCode + u'.' + ext;
   case AssetCategory::HomebrewBox:
     // ChooseMode.vue homebrew branch: same identifier used twice, as
     // above.
@@ -275,6 +285,258 @@ qsizetype identifierMaxLengthFor(AssetCategory category) {
   default:
     return kOfficialIdentifierMaxLength;
   }
+}
+
+// Maximum length for a homebrew-authored custom-back filename (stem plus
+// extension); community-authored but never unbounded.
+constexpr qsizetype kCustomBackFilenameMaxLength = 140;
+
+// Parses/validates a CardBackKind::CustomBack filename ("{identifier-
+// grammar-stem}.{avif|jpg|png}", used verbatim as the on-CDN file name)
+// and returns the AssetFormat its extension implies, or std::nullopt if
+// the filename is empty, too long, has no recognised extension, or its
+// stem fails the same strict identifier grammar every other path segment
+// in this file uses (which itself forbids '.', so a second embedded dot
+// is rejected here exactly as any other disallowed character would be).
+std::optional<AssetFormat> parseCustomBackFilename(const QString &filename) {
+  if (filename.isEmpty() || filename.size() > kCustomBackFilenameMaxLength) {
+    return std::nullopt;
+  }
+  const qsizetype dot = filename.lastIndexOf(u'.');
+  if (dot <= 0 || dot == filename.size() - 1) {
+    return std::nullopt;
+  }
+  const QString stem = filename.left(dot);
+  const QString ext = filename.mid(dot + 1);
+  if (!isValidIdentifier(stem, kCustomBackFilenameMaxLength)) {
+    return std::nullopt;
+  }
+  if (ext == "avif"_L1) {
+    return AssetFormat::Avif;
+  }
+  if (ext == "jpg"_L1) {
+    return AssetFormat::Jpeg;
+  }
+  if (ext == "png"_L1) {
+    return AssetFormat::Png;
+  }
+  return std::nullopt;
+}
+
+// Resolves an AssetSide::Back request. Kept structurally separate from
+// the Front/AlternateFront/ResolvedFront/MutatedFront pipeline below
+// because CardBackKind's field-applicability rules (which of identifier/
+// otherSideIdentifier/customBackFilename/homebrewNamespace are required
+// vs. must-be-empty) differ per kind, unlike every other side, which
+// always uses exactly `identifier` -- see CardBackKind's doc comment in
+// AssetTypes.h for the exact source citation per branch.
+AssetOutcome<QVector<AssetCandidate>>
+resolveBackCandidates(const AssetKey &key, const QUrl &normalizedBase) {
+  if (key.category != AssetCategory::Card &&
+      key.category != AssetCategory::HomebrewCard) {
+    return AssetError{
+        AssetErrorCode::InvalidSideForCategory,
+        QStringLiteral("only Card and HomebrewCard assets may specify "
+                       "AssetSide::Back"),
+    };
+  }
+  if (!key.backKind.has_value()) {
+    return AssetError{
+        AssetErrorCode::InvalidBackKind,
+        QStringLiteral("AssetSide::Back requires backKind to be set"),
+    };
+  }
+  const CardBackKind kind = *key.backKind;
+  const bool isFixedGenericPath = kind == CardBackKind::GenericEncounterBack ||
+                                  kind == CardBackKind::GenericPlayerBack;
+  const bool isCustomBack = kind == CardBackKind::CustomBack;
+  const bool isOtherSide = kind == CardBackKind::ExplicitOtherSide;
+  const bool isSameCodeDriven =
+      !isFixedGenericPath && !isCustomBack && !isOtherSide;
+
+  if (isSameCodeDriven) {
+    if (!isValidIdentifier(key.identifier,
+                           identifierMaxLengthFor(key.category))) {
+      return AssetError{
+          AssetErrorCode::InvalidIdentifier,
+          QStringLiteral("asset identifier is empty, too long, or contains "
+                         "a character outside [A-Za-z0-9_-]"),
+      };
+    }
+  } else if (!key.identifier.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidIdentifier,
+        QStringLiteral("identifier must be empty for this backKind"),
+    };
+  }
+
+  if (isOtherSide) {
+    if (!isValidIdentifier(key.otherSideIdentifier,
+                           identifierMaxLengthFor(key.category))) {
+      return AssetError{
+          AssetErrorCode::InvalidOtherSideIdentifier,
+          QStringLiteral("otherSideIdentifier is empty, too long, or "
+                         "contains a character outside [A-Za-z0-9_-]"),
+      };
+    }
+  } else if (!key.otherSideIdentifier.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidOtherSideIdentifier,
+        QStringLiteral("otherSideIdentifier must be empty unless backKind "
+                       "== ExplicitOtherSide"),
+    };
+  }
+
+  std::optional<AssetFormat> customFormat;
+  if (isCustomBack) {
+    customFormat = parseCustomBackFilename(key.customBackFilename);
+    if (!customFormat.has_value()) {
+      return AssetError{
+          AssetErrorCode::InvalidCustomBackFilename,
+          QStringLiteral("customBackFilename must be "
+                         "\"{identifier-grammar}.{avif|jpg|png}\""),
+      };
+    }
+  } else if (!key.customBackFilename.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidCustomBackFilename,
+        QStringLiteral("customBackFilename must be empty unless backKind "
+                       "== CustomBack"),
+    };
+  }
+
+  if (isFixedGenericPath) {
+    if (!key.homebrewNamespace.isEmpty()) {
+      return AssetError{
+          AssetErrorCode::InvalidHomebrewNamespace,
+          QStringLiteral("homebrewNamespace must be empty for a generic "
+                         "encounter/player back"),
+      };
+    }
+  } else if (key.category == AssetCategory::HomebrewCard) {
+    if (!isValidHomebrewNamespace(key.homebrewNamespace,
+                                  kHomebrewIdentifierMaxLength)) {
+      return AssetError{
+          AssetErrorCode::InvalidHomebrewNamespace,
+          QStringLiteral("HomebrewCard requires a valid homebrewNamespace"),
+      };
+    }
+  } else if (!key.homebrewNamespace.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidHomebrewNamespace,
+        QStringLiteral("homebrewNamespace must be empty for this category"),
+    };
+  }
+
+  if (!key.mutationId.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidMutationId,
+        QStringLiteral("mutationId must be empty for AssetSide::Back"),
+    };
+  }
+
+  const AssetFormat expectedFormat =
+      isFixedGenericPath
+          ? AssetFormat::Jpeg
+          : (isCustomBack ? *customFormat
+                          : AssetLocator::canonicalFormatFor(key.category));
+  if (key.format != expectedFormat) {
+    return AssetError{
+        AssetErrorCode::FormatMismatchForCategory,
+        QStringLiteral("this back kind is always served as %1, not the "
+                       "declared format")
+            .arg(assetFormatExtension(expectedFormat)),
+    };
+  }
+
+  QVector<AssetCandidate> candidates;
+  QSet<QString> seenUrls;
+  auto tryAppend = [&](const QString &relativePath) {
+    const QUrl url = joinBaseAndPath(normalizedBase, relativePath);
+    const QString urlString = url.toString(QUrl::FullyEncoded);
+    if (seenUrls.contains(urlString)) {
+      return;
+    }
+    seenUrls.insert(urlString);
+    candidates.append(AssetCandidate{url, QString(), false, expectedFormat});
+  };
+
+  if (isFixedGenericPath) {
+    // ENCOUNTER_BACK/PLAYER_BACK constants in cardArt.ts: single fixed
+    // global path, no per-card identifier, no locale variants.
+    const QString filename = kind == CardBackKind::GenericEncounterBack
+                                 ? QStringLiteral("back_encounter.jpg")
+                                 : QStringLiteral("back_player.jpg");
+    tryAppend("img/arkham/backs/"_L1 + filename);
+    if (candidates.isEmpty()) {
+      return AssetError{AssetErrorCode::NoCandidates, QStringLiteral("")};
+    }
+    return candidates;
+  }
+
+  if (isCustomBack) {
+    // meta.customBack, used verbatim as the file name under backs/.
+    tryAppend("img/arkham/backs/"_L1 + key.customBackFilename);
+    if (candidates.isEmpty()) {
+      return AssetError{AssetErrorCode::NoCandidates, QStringLiteral("")};
+    }
+    return candidates;
+  }
+
+  // SameCodeAppendB / SameCodeStripTrailingAThenAppendB / SameAsFront /
+  // ExplicitOtherSide: all resolve to a card-code-shaped artCode and reuse
+  // the exact same locale-digest + English-candidate rules a Front
+  // request for that artCode would use (no alternate-front fallback,
+  // which is only ever produced for an actual Front request).
+  QString artCode;
+  if (isOtherSide) {
+    artCode = stripLeadingCardCodePrefix(key.otherSideIdentifier);
+  } else {
+    const QString strippedIdentifier =
+        stripLeadingCardCodePrefix(key.identifier);
+    switch (kind) {
+    case CardBackKind::SameCodeAppendB:
+      artCode = strippedIdentifier + u'b';
+      break;
+    case CardBackKind::SameCodeStripTrailingAThenAppendB: {
+      QString base = strippedIdentifier;
+      if (base.endsWith(u'a')) {
+        base.chop(1);
+      }
+      artCode = base + u'b';
+      break;
+    }
+    case CardBackKind::SameAsFront:
+      artCode = strippedIdentifier;
+      break;
+    default:
+      Q_UNREACHABLE();
+    }
+  }
+
+  const QString relBase =
+      key.category == AssetCategory::HomebrewCard
+          ? ("homebrew/"_L1 + key.homebrewNamespace + "/cards/"_L1)
+          : "cards/"_L1;
+  const QString ext = assetFormatExtension(expectedFormat);
+
+  if (!key.locale.isEmpty() && key.locale != "en"_L1) {
+    const QString webLocale = AssetLocaleDigest::webLocaleFor(key.locale);
+    if (!webLocale.isEmpty() && AssetLocaleDigest::hasLocalizedVariant(
+                                    webLocale, key.category, artCode)) {
+      tryAppend("img/arkham/"_L1 + webLocale + u'/' + relBase + artCode + u'.' +
+                ext);
+    }
+  }
+  tryAppend("img/arkham/"_L1 + relBase + artCode + u'.' + ext);
+
+  if (candidates.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::NoCandidates,
+        QStringLiteral("no candidates could be resolved for this asset key"),
+    };
+  }
+  return candidates;
 }
 
 } // namespace
@@ -320,6 +582,22 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
   }
   const QUrl &normalizedBase = key.assetBase.normalizedUrl();
 
+  // Back-side validation is structurally different (see CardBackKind) --
+  // dispatch to a dedicated helper before the generic identifier/
+  // homebrewNamespace/mutationId checks below, which assume a normal
+  // card-code-shaped request that always uses exactly `identifier`.
+  if (key.side == AssetSide::Back) {
+    return resolveBackCandidates(key, normalizedBase);
+  }
+  if (key.backKind.has_value() || !key.otherSideIdentifier.isEmpty() ||
+      !key.customBackFilename.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidBackKind,
+        QStringLiteral("backKind/otherSideIdentifier/customBackFilename "
+                       "must be empty unless side == Back"),
+    };
+  }
+
   if (!isValidIdentifier(key.identifier,
                          identifierMaxLengthFor(key.category))) {
     return AssetError{
@@ -339,13 +617,15 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
   }
 
   const bool wantsHomebrewNamespace =
-      key.category == AssetCategory::HomebrewCard;
+      key.category == AssetCategory::HomebrewCard ||
+      key.category == AssetCategory::HomebrewSet;
   if (wantsHomebrewNamespace) {
     if (!isValidHomebrewNamespace(key.homebrewNamespace,
                                   kHomebrewIdentifierMaxLength)) {
       return AssetError{
           AssetErrorCode::InvalidHomebrewNamespace,
-          QStringLiteral("HomebrewCard requires a valid homebrewNamespace"),
+          QStringLiteral("HomebrewCard/HomebrewSet requires a valid "
+                         "homebrewNamespace"),
       };
     }
   } else if (!key.homebrewNamespace.isEmpty()) {
@@ -413,7 +693,8 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
       return;
     }
     seenUrls.insert(urlString);
-    candidates.append(AssetCandidate{url, isoLocale, isAlternateFrontFallback});
+    candidates.append(
+        AssetCandidate{url, isoLocale, isAlternateFrontFallback, key.format});
   };
 
   // 1. Localized candidate, but ONLY if the digest confirms it exists.

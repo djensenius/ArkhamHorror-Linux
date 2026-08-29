@@ -53,6 +53,37 @@ AssetKey makeKey(const QString &rawBase, AssetCategory category,
   return key;
 }
 
+// Builds an AssetSide::Back AssetKey. Unlike makeKey() above, `format`
+// has no single per-category default (see CardBackKind's doc comment in
+// AssetTypes.h -- generic/custom backs are NOT always the category's
+// canonicalFormatFor()), so it is always explicit here.
+AssetKey makeBackKey(const QString &rawBase, AssetCategory category,
+                     CardBackKind backKind, AssetFormat format,
+                     const QString &identifier = QString(),
+                     const QString &otherSideIdentifier = QString(),
+                     const QString &customBackFilename = QString(),
+                     const QString &homebrewNamespace = QString(),
+                     const QString &locale = QString()) {
+  const AssetOutcome<ValidatedAssetSource> base =
+      ValidatedAssetSource::fromRaw(rawBase);
+  if (!base) {
+    qFatal("makeBackKey() fixture base URL failed validation: %s",
+           qPrintable(base.error().message));
+  }
+  AssetKey key;
+  key.assetBase = *base;
+  key.category = category;
+  key.side = AssetSide::Back;
+  key.backKind = backKind;
+  key.identifier = identifier;
+  key.otherSideIdentifier = otherSideIdentifier;
+  key.customBackFilename = customBackFilename;
+  key.homebrewNamespace = homebrewNamespace;
+  key.locale = locale;
+  key.format = format;
+  return key;
+}
+
 } // namespace
 
 void AssetLocatorTests::baseUrlPolicyMatchesSharedTable_data() {
@@ -208,10 +239,6 @@ void AssetLocatorTests::goldenCanonicalPaths_data() {
       << int(C::Card) << int(S::Front) << QStringLiteral("c01001") << QString()
       << QString() << base + QStringLiteral("/img/arkham/cards/01001.avif");
 
-  QTest::newRow("card-back")
-      << int(C::Card) << int(S::Back) << QStringLiteral("01001") << QString()
-      << QString() << base + QStringLiteral("/img/arkham/cards/01001b.avif");
-
   QTest::newRow("card-alternate-front-direct")
       << int(C::Card) << int(S::AlternateFront) << QStringLiteral("01001")
       << QString() << QString()
@@ -262,10 +289,28 @@ void AssetLocatorTests::goldenCanonicalPaths_data() {
       << QStringLiteral("mycampaign") << QString()
       << base + QStringLiteral("/img/arkham/homebrew/mycampaign/cards/1.avif");
 
-  QTest::newRow("homebrew-set-identifier-reused-twice")
-      << int(C::HomebrewSet) << int(S::Front) << QStringLiteral("myset")
-      << QString() << QString()
-      << base + QStringLiteral("/img/arkham/homebrew/myset/sets/myset.png");
+  // Review item 2: HomebrewSet must use INDEPENDENTLY validated namespace
+  // (homebrewNamespace) and set-id (identifier) fields -- never the same
+  // string reused for both like HomebrewBox's single per-campaign cover
+  // art below.
+  QTest::newRow("homebrew-set-independent-namespace-and-set-id")
+      << int(C::HomebrewSet) << int(S::Front)
+      << QStringLiteral("electric-nightmare") << QStringLiteral("dark-matter")
+      << QString()
+      << base + QStringLiteral("/img/arkham/homebrew/dark-matter/sets/"
+                               "electric-nightmare.png");
+
+  // The one real special case (GameRow.vue's campaignIcon: a raw
+  // ":{homebrewId}" ID with no second colon) happens to reuse the SAME
+  // string for both namespace and set-id -- but that is the CALLER
+  // passing the same value twice, not a structural same-field reuse in
+  // the type, so this row exercises it via two independently-validated
+  // fields that just happen to be equal.
+  QTest::newRow("homebrew-set-campaign-icon-special-case")
+      << int(C::HomebrewSet) << int(S::Front) << QStringLiteral("mycampaign")
+      << QStringLiteral("mycampaign") << QString()
+      << base + QStringLiteral(
+                    "/img/arkham/homebrew/mycampaign/sets/mycampaign.png");
 
   QTest::newRow("homebrew-box-identifier-reused-twice")
       << int(C::HomebrewBox) << int(S::Front) << QStringLiteral("mybox")
@@ -337,6 +382,20 @@ void AssetLocatorTests::homebrewNamespaceValidated_data() {
       << int(C::HomebrewCard) << QStringLiteral("my-campaign_1") << true;
   QTest::newRow("non-homebrew-category-with-namespace-rejected")
       << int(C::Card) << QStringLiteral("should-not-be-here") << false;
+  // Review item 2: HomebrewSet now independently requires/validates its
+  // own homebrewNamespace exactly like HomebrewCard (previously it had no
+  // namespace field at all and silently reused `identifier` for both the
+  // directory and file name).
+  QTest::newRow("homebrew-set-missing-namespace")
+      << int(C::HomebrewSet) << QString() << false;
+  QTest::newRow("homebrew-set-hostile-namespace")
+      << int(C::HomebrewSet) << QStringLiteral("../etc") << false;
+  QTest::newRow("homebrew-set-colon-namespace")
+      << int(C::HomebrewSet) << QStringLiteral("a:b") << false;
+  QTest::newRow("homebrew-set-uppercase-namespace")
+      << int(C::HomebrewSet) << QStringLiteral("MyCampaign") << false;
+  QTest::newRow("homebrew-set-valid-namespace")
+      << int(C::HomebrewSet) << QStringLiteral("my-campaign_1") << true;
 }
 
 void AssetLocatorTests::homebrewNamespaceValidated() {
@@ -355,6 +414,41 @@ void AssetLocatorTests::homebrewNamespaceValidated() {
   } else {
     QVERIFY(!result);
     QCOMPARE(result.error().code, AssetErrorCode::InvalidHomebrewNamespace);
+  }
+}
+
+// Review item 2: HomebrewSet's own set-id (identifier) is independently
+// validated with the SAME strict grammar every other category's
+// identifier uses, so it also rejects traversal/colon/separator hostile
+// input -- not merely accepted verbatim because the namespace field is
+// (now correctly) present.
+void AssetLocatorTests::homebrewSetIdentifierRejected_data() {
+  QTest::addColumn<QString>("identifier");
+  QTest::addColumn<bool>("expectValid");
+
+  QTest::newRow("valid") << QStringLiteral("electric-nightmare") << true;
+  QTest::newRow("empty") << QString() << false;
+  QTest::newRow("path-traversal") << QStringLiteral("../etc/passwd") << false;
+  QTest::newRow("nested-slash") << QStringLiteral("a/b") << false;
+  QTest::newRow("colon") << QStringLiteral("a:b") << false;
+  QTest::newRow("percent-encoded") << QStringLiteral("a%2e%2e") << false;
+}
+
+void AssetLocatorTests::homebrewSetIdentifierRejected() {
+  QFETCH(QString, identifier);
+  QFETCH(bool, expectValid);
+
+  const AssetKey key = makeKey(kDefaultBase(), AssetCategory::HomebrewSet,
+                               identifier, AssetSide::Front, QString(),
+                               std::nullopt, QStringLiteral("dark-matter"));
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  if (expectValid) {
+    QVERIFY2(bool(result),
+             qPrintable(result ? QString() : result.error().message));
+  } else {
+    QVERIFY(!result);
+    QCOMPARE(result.error().code, AssetErrorCode::InvalidIdentifier);
   }
 }
 
@@ -543,8 +637,10 @@ void AssetLocatorTests::alternateFrontFallbackOnlyForFrontCardSide() {
   QVERIFY(bool(frontResult));
   QVERIFY(frontResult->last().isAlternateFrontFallback);
 
-  const AssetKey back = makeKey(kDefaultBase(), AssetCategory::Card,
-                                QStringLiteral("valid01"), AssetSide::Back);
+  const AssetKey back =
+      makeBackKey(kDefaultBase(), AssetCategory::Card,
+                  CardBackKind::SameCodeStripTrailingAThenAppendB,
+                  AssetFormat::Avif, QStringLiteral("valid01"));
   const AssetOutcome<QVector<AssetCandidate>> backResult =
       AssetLocator::resolveCandidates(back);
   QVERIFY(bool(backResult));
@@ -568,4 +664,209 @@ void AssetLocatorTests::candidatesAreDedupedAndBounded() {
     QVERIFY2(!seen.contains(urlString), qPrintable(urlString));
     seen.insert(urlString);
   }
+}
+
+// Review item 1: every CardBackKind branch, golden-tested against the
+// exact real web client transform it ports (see CardBackKind's doc
+// comment in AssetTypes.h for the source citation per branch) -- in
+// particular, the "01121ab" branches below are the REAL, correct
+// behavior for EnemyType/StoryType-shaped backs, while "01121b" is the
+// REAL, correct behavior for Act/Agenda/Scenario/Investigator-shaped
+// backs. Both are exercised so a future regression can never collapse
+// them back into a single blind "append b" rule.
+void AssetLocatorTests::cardBackKindGoldenPaths_data() {
+  QTest::addColumn<int>("backKind");
+  QTest::addColumn<QString>("identifier");
+  QTest::addColumn<QString>("otherSideIdentifier");
+  QTest::addColumn<QString>("customBackFilename");
+  QTest::addColumn<QString>("homebrewNamespace");
+  QTest::addColumn<int>("format");
+  QTest::addColumn<QString>("expectedUrl");
+
+  using K = CardBackKind;
+  using F = AssetFormat;
+  const QString base = kDefaultBase();
+
+  QTest::newRow("same-code-append-b-trailing-a-preserved")
+      << int(K::SameCodeAppendB) << QStringLiteral("01121a") << QString()
+      << QString() << QString() << int(F::Avif)
+      << base + QStringLiteral("/img/arkham/cards/01121ab.avif");
+
+  QTest::newRow("same-code-strip-trailing-a-then-append-b")
+      << int(K::SameCodeStripTrailingAThenAppendB) << QStringLiteral("01121a")
+      << QString() << QString() << QString() << int(F::Avif)
+      << base + QStringLiteral("/img/arkham/cards/01121b.avif");
+
+  QTest::newRow("same-code-strip-trailing-a-no-trailing-a-present")
+      << int(K::SameCodeStripTrailingAThenAppendB) << QStringLiteral("01001")
+      << QString() << QString() << QString() << int(F::Avif)
+      << base + QStringLiteral("/img/arkham/cards/01001b.avif");
+
+  QTest::newRow("explicit-other-side-independent-code")
+      << int(K::ExplicitOtherSide) << QString() << QStringLiteral("c01002")
+      << QString() << QString() << int(F::Avif)
+      << base + QStringLiteral("/img/arkham/cards/01002.avif");
+
+  QTest::newRow("same-as-front-location-type")
+      << int(K::SameAsFront) << QStringLiteral("01003") << QString()
+      << QString() << QString() << int(F::Avif)
+      << base + QStringLiteral("/img/arkham/cards/01003.avif");
+
+  QTest::newRow("generic-encounter-back-fixed-jpeg-path")
+      << int(K::GenericEncounterBack) << QString() << QString() << QString()
+      << QString() << int(F::Jpeg)
+      << base + QStringLiteral("/img/arkham/backs/back_encounter.jpg");
+
+  QTest::newRow("generic-player-back-fixed-jpeg-path")
+      << int(K::GenericPlayerBack) << QString() << QString() << QString()
+      << QString() << int(F::Jpeg)
+      << base + QStringLiteral("/img/arkham/backs/back_player.jpg");
+
+  QTest::newRow("custom-back-verbatim-filename-jpg")
+      << int(K::CustomBack) << QString() << QString()
+      << QStringLiteral("my-homebrew-back.jpg") << QString() << int(F::Jpeg)
+      << base + QStringLiteral("/img/arkham/backs/my-homebrew-back.jpg");
+
+  QTest::newRow("custom-back-verbatim-filename-png")
+      << int(K::CustomBack) << QString() << QString()
+      << QStringLiteral("my-homebrew-back.png") << QString() << int(F::Png)
+      << base + QStringLiteral("/img/arkham/backs/my-homebrew-back.png");
+
+  QTest::newRow("same-code-append-b-homebrew-namespace")
+      << int(K::SameCodeAppendB) << QStringLiteral("c1") << QString()
+      << QString() << QStringLiteral("mycampaign") << int(F::Avif)
+      << base + QStringLiteral("/img/arkham/homebrew/mycampaign/cards/1b.avif");
+}
+
+void AssetLocatorTests::cardBackKindGoldenPaths() {
+  QFETCH(int, backKind);
+  QFETCH(QString, identifier);
+  QFETCH(QString, otherSideIdentifier);
+  QFETCH(QString, customBackFilename);
+  QFETCH(QString, homebrewNamespace);
+  QFETCH(int, format);
+  QFETCH(QString, expectedUrl);
+
+  const AssetCategory category = homebrewNamespace.isEmpty()
+                                     ? AssetCategory::Card
+                                     : AssetCategory::HomebrewCard;
+  const AssetKey key = makeBackKey(
+      kDefaultBase(), category, CardBackKind(backKind), AssetFormat(format),
+      identifier, otherSideIdentifier, customBackFilename, homebrewNamespace);
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY2(bool(result),
+           qPrintable(result ? QString() : result.error().message));
+  QVERIFY(!result->isEmpty());
+  QCOMPARE(result->first().url.toString(QUrl::FullyEncoded), expectedUrl);
+  QCOMPARE(int(result->first().format), format);
+}
+
+// Review item 1: each CardBackKind requires exactly one of identifier/
+// otherSideIdentifier/customBackFilename (or none, for the two generic
+// fixed backs) -- supplying the WRONG field for a given kind, or leaving
+// the required one empty, must be rejected rather than silently ignored.
+void AssetLocatorTests::cardBackFieldApplicabilityRejected_data() {
+  QTest::addColumn<int>("backKind");
+  QTest::addColumn<QString>("identifier");
+  QTest::addColumn<QString>("otherSideIdentifier");
+  QTest::addColumn<QString>("customBackFilename");
+  QTest::addColumn<int>("expectedError");
+
+  using K = CardBackKind;
+  using E = AssetErrorCode;
+
+  QTest::newRow("same-code-append-b-missing-identifier")
+      << int(K::SameCodeAppendB) << QString() << QString() << QString()
+      << int(E::InvalidIdentifier);
+  QTest::newRow("same-code-append-b-stray-other-side")
+      << int(K::SameCodeAppendB) << QStringLiteral("01001")
+      << QStringLiteral("01002") << QString()
+      << int(E::InvalidOtherSideIdentifier);
+  QTest::newRow("explicit-other-side-missing")
+      << int(K::ExplicitOtherSide) << QString() << QString() << QString()
+      << int(E::InvalidOtherSideIdentifier);
+  QTest::newRow("explicit-other-side-stray-identifier")
+      << int(K::ExplicitOtherSide) << QStringLiteral("01001")
+      << QStringLiteral("01002") << QString() << int(E::InvalidIdentifier);
+  QTest::newRow("custom-back-missing-filename")
+      << int(K::CustomBack) << QString() << QString() << QString()
+      << int(E::InvalidCustomBackFilename);
+  QTest::newRow("custom-back-malformed-no-extension")
+      << int(K::CustomBack) << QString() << QString()
+      << QStringLiteral("noextension") << int(E::InvalidCustomBackFilename);
+  QTest::newRow("custom-back-traversal-filename")
+      << int(K::CustomBack) << QString() << QString()
+      << QStringLiteral("../etc/passwd.jpg")
+      << int(E::InvalidCustomBackFilename);
+  QTest::newRow("custom-back-unsupported-extension")
+      << int(K::CustomBack) << QString() << QString()
+      << QStringLiteral("back.gif") << int(E::InvalidCustomBackFilename);
+  QTest::newRow("generic-encounter-back-stray-identifier")
+      << int(K::GenericEncounterBack) << QStringLiteral("01001") << QString()
+      << QString() << int(E::InvalidIdentifier);
+  QTest::newRow("same-as-front-stray-custom-back")
+      << int(K::SameAsFront) << QStringLiteral("01001") << QString()
+      << QStringLiteral("x.jpg") << int(E::InvalidCustomBackFilename);
+}
+
+void AssetLocatorTests::cardBackFieldApplicabilityRejected() {
+  QFETCH(int, backKind);
+  QFETCH(QString, identifier);
+  QFETCH(QString, otherSideIdentifier);
+  QFETCH(QString, customBackFilename);
+  QFETCH(int, expectedError);
+
+  // format is irrelevant here (field-applicability errors are returned
+  // before format is ever checked); pass a plausible value per kind so
+  // the earlier applicability check under test is what actually fires.
+  const AssetFormat format =
+      (CardBackKind(backKind) == CardBackKind::GenericEncounterBack ||
+       CardBackKind(backKind) == CardBackKind::GenericPlayerBack)
+          ? AssetFormat::Jpeg
+          : AssetFormat::Avif;
+  const AssetKey key =
+      makeBackKey(kDefaultBase(), AssetCategory::Card, CardBackKind(backKind),
+                  format, identifier, otherSideIdentifier, customBackFilename);
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY(!result);
+  QCOMPARE(int(result.error().code), expectedError);
+}
+
+void AssetLocatorTests::cardBackRequiresBackKind() {
+  const AssetKey key = makeKey(kDefaultBase(), AssetCategory::Card,
+                               QStringLiteral("01001"), AssetSide::Back);
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY(!result);
+  QCOMPARE(result.error().code, AssetErrorCode::InvalidBackKind);
+}
+
+void AssetLocatorTests::nonBackSideRejectsBackFields() {
+  AssetKey key = makeKey(kDefaultBase(), AssetCategory::Card,
+                         QStringLiteral("01001"), AssetSide::Front);
+  key.backKind = CardBackKind::SameCodeAppendB;
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY(!result);
+  QCOMPARE(result.error().code, AssetErrorCode::InvalidBackKind);
+}
+
+// The reviewer's specific concern: a blind "code + b" locator would turn
+// "01121a" into the NONEXISTENT "01121ab" even for Act/Agenda/Scenario/
+// Investigator-shaped cards, which actually resolve to "01121b". This
+// asserts SameCodeStripTrailingAThenAppendB never produces "01121ab".
+void AssetLocatorTests::cardBackNonexistentTrailingAbRejected() {
+  const AssetKey key =
+      makeBackKey(kDefaultBase(), AssetCategory::Card,
+                  CardBackKind::SameCodeStripTrailingAThenAppendB,
+                  AssetFormat::Avif, QStringLiteral("01121a"));
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY2(bool(result),
+           qPrintable(result ? QString() : result.error().message));
+  const QString url = result->first().url.toString(QUrl::FullyEncoded);
+  QVERIFY2(!url.endsWith(QStringLiteral("01121ab.avif")), qPrintable(url));
+  QVERIFY(url.endsWith(QStringLiteral("01121b.avif")));
 }

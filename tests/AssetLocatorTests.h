@@ -35,6 +35,9 @@ private slots:
   void homebrewNamespaceValidated_data();
   void homebrewNamespaceValidated();
 
+  void homebrewSetIdentifierRejected_data();
+  void homebrewSetIdentifierRejected();
+
   void mutationIdValidated_data();
   void mutationIdValidated();
 
@@ -51,4 +54,14 @@ private slots:
 
   void alternateFrontFallbackOnlyForFrontCardSide();
   void candidatesAreDedupedAndBounded();
+
+  void cardBackKindGoldenPaths_data();
+  void cardBackKindGoldenPaths();
+
+  void cardBackFieldApplicabilityRejected_data();
+  void cardBackFieldApplicabilityRejected();
+
+  void cardBackRequiresBackKind();
+  void nonBackSideRejectsBackFields();
+  void cardBackNonexistentTrailingAbRejected();
 };

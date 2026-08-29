@@ -377,8 +377,17 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
     return; // cancelled/destroyed before this queued call ran
   }
   Operation &operation = it.value();
+  // Item 1 follow-on: a cached entry's expected format is the CANDIDATE's
+  // format (see AssetCandidate::format), not the logical key's -- a
+  // CardBackKind::GenericEncounterBack/GenericPlayerBack/CustomBack
+  // candidate is fetched/decoded/quarantined against its own format,
+  // which can differ from AssetLocator::canonicalFormatFor(key.category).
+  const AssetFormat expectedFormat =
+      operation.candidateIndex < operation.candidates.size()
+          ? operation.candidates[operation.candidateIndex].format
+          : operation.key.format;
   AssetOutcome<AssetCache::CachedEntry> outcome =
-      ensureDecoded(std::move(entry), operation.key.format, cacheKey);
+      ensureDecoded(std::move(entry), expectedFormat, cacheKey);
 
   if (outcome) {
     // Review item 6: only promote if no other, more recently issued
@@ -451,7 +460,7 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
 
   QPointer<AssetRequestCoordinator> self(this);
   operation.fetchHandle = m_fetcher.fetch(
-      candidate.url, operation.key.format, {},
+      candidate.url, candidate.format, {},
       [self, operationId, expectedGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {
@@ -557,7 +566,7 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
 
   QPointer<AssetRequestCoordinator> self(this);
   operation.fetchHandle = m_fetcher.fetch(
-      candidate.url, operation.key.format, conditional,
+      candidate.url, candidate.format, conditional,
       [self, operationId, expectedGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {

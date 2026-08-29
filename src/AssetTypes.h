@@ -31,10 +31,65 @@ enum class AssetCategory {
 // representation.
 enum class AssetSide {
   Front,
-  Back,
+  Back,           // Requires AssetKey::backKind to be set; see CardBackKind.
   AlternateFront, // Parallel/alternate-art front.
   ResolvedFront,  // The resolved side of a card that flips when resolved.
   MutatedFront,   // Sticker-mutated card art.
+};
+
+// Card-back resolution strategy, ported exactly from the real web
+// client's own type-driven switch (frontend/src/arkham/cardArt.ts,
+// isBackPrimary()/cardBackImage()) rather than guessed from the front
+// code's shape: the correct back transform depends on the card's TYPE,
+// `doubleSided` flag, `otherSide` field, and `meta.customBack` field --
+// game data this locator does not itself have access to. The CALLER
+// (a future game-state-aware asset-request layer) is responsible for
+// selecting the correct CardBackKind for a given card exactly as the
+// real client's switch does; AssetLocator only executes the
+// already-decided transform deterministically, and validates that the
+// fields required by the chosen kind (and only those) are populated. It
+// never re-derives a card's type from its identifier's shape, so it can
+// never blindly turn e.g. "01121a" into the nonexistent "01121ab".
+enum class CardBackKind {
+  // isBackPrimary()/no-cardType placeholder path: append 'b' to the
+  // (leading-'c'-stripped) `identifier` verbatim, with NO trailing-letter
+  // stripping (e.g. "01121a" -> "01121ab"). Used for: cards with no known
+  // cardType (unimplemented placeholders), and EnemyType/StoryType cards
+  // with doubleSided == true.
+  SameCodeAppendB,
+  // ActType/AgendaType/ScenarioType/InvestigatorType (any), and any other
+  // doubleSided type not covered by SameCodeAppendB/SameAsFront: strip
+  // one trailing literal 'a' from `identifier` if present, then append
+  // 'b' (e.g. "01121a" -> "01121b", NOT "01121ab").
+  SameCodeStripTrailingAThenAppendB,
+  // `otherSide` is set: the back is a wholly different, explicitly-named
+  // card code (AssetKey::otherSideIdentifier, leading-'c'-stripped by
+  // AssetLocator exactly like `identifier`), resolved via the same
+  // art-code/locale/candidate rules as a Front request for that other
+  // code. `identifier` must be empty; `otherSideIdentifier` is required.
+  ExplicitOtherSide,
+  // LocationType, doubleSided == true: the "back" IS the front's own art
+  // -- `identifier` resolves to itself, unchanged.
+  SameAsFront,
+  // Generic shared encounter-card back (non-double-sided encounter-type
+  // cards with no meta.customBack): a single fixed path/format
+  // ("img/arkham/backs/back_encounter.jpg") with no per-card identifier
+  // at all. `identifier`/`otherSideIdentifier`/`customBackFilename`/
+  // `homebrewNamespace` must all be empty.
+  GenericEncounterBack,
+  // Generic shared player-card back (non-double-sided player-type cards
+  // with no meta.customBack): a single fixed path/format
+  // ("img/arkham/backs/back_player.jpg"). Same emptiness requirements as
+  // GenericEncounterBack.
+  GenericPlayerBack,
+  // Homebrew-provided custom back (meta.customBack): AssetKey::
+  // customBackFilename is used verbatim (including its own extension) as
+  // the file name under "img/arkham/backs/", never re-derived from
+  // `identifier`. `identifier`/`otherSideIdentifier`/`homebrewNamespace`
+  // must all be empty; `customBackFilename` is required and its own
+  // extension (not AssetKey::format's category default) determines the
+  // expected image format.
+  CustomBack,
 };
 
 // Encoded image formats this client is willing to request/decode. SVG and
@@ -70,13 +125,23 @@ enum class AssetErrorCode {
                             // that must not carry one.
   InvalidMutationId, // mutationId is missing/invalid for MutatedFront, or
                      // non-empty for any other side.
-  FormatMismatchForCategory, // key.format does not match the fixed,
-                             // caller-non-configurable format the real CDN
-                             // serves for this category (see
-                             // AssetLocator::canonicalFormatFor()).
-  NoCandidates,              // Locator produced zero candidates for this key.
-  NotFound,                  // Every candidate returned a definitive 404.
-  Transport,                 // Connection/TLS/generic network failure.
+  InvalidBackKind,   // side == Back with no backKind set, or (category,
+                     // backKind) is not Card/HomebrewCard-compatible; see
+                     // CardBackKind.
+  InvalidOtherSideIdentifier, // otherSideIdentifier is missing/invalid for
+                              // CardBackKind::ExplicitOtherSide, or
+                              // non-empty for any other backKind.
+  InvalidCustomBackFilename,  // customBackFilename is missing/malformed
+                              // (must be "{identifier-grammar}.{avif|jpg|
+                              // png}") for CardBackKind::CustomBack, or
+                              // non-empty for any other backKind.
+  FormatMismatchForCategory,  // key.format does not match the fixed,
+                              // caller-non-configurable format the real CDN
+                              // serves for this category (see
+                              // AssetLocator::canonicalFormatFor()).
+  NoCandidates,               // Locator produced zero candidates for this key.
+  NotFound,                   // Every candidate returned a definitive 404.
+  Transport,                  // Connection/TLS/generic network failure.
   RedirectRejected,    // A 3xx was returned; redirects are never followed.
   UnexpectedStatus,    // Any other non-2xx, non-404 status.
   ResponseTooLarge,    // Encoded body exceeded the configured byte cap.
@@ -204,12 +269,17 @@ private:
 // `locale` is a short BCP-47-ish language subtag (e.g. "it"); empty or
 // "en" both mean "no localisation, use the English/default asset".
 //
-// `homebrewNamespace` is the homebrew campaign namespace segment used ONLY
-// by AssetCategory::HomebrewCard (the real CDN nests homebrew card art
-// under a per-campaign directory: "homebrew/{namespace}/cards/{code}...");
-// it must be empty for every other category, including HomebrewSet/
-// HomebrewBox, whose real paths reuse `identifier` itself as both the
-// directory and file name and therefore need no separate field.
+// `homebrewNamespace` is the homebrew campaign namespace segment. Used by
+// AssetCategory::HomebrewCard (nests homebrew card art under a
+// per-campaign directory: "homebrew/{namespace}/cards/{code}...") and by
+// AssetCategory::HomebrewSet (nests a homebrew encounter-set icon under
+// "homebrew/{namespace}/sets/{setId}...", where `identifier` supplies the
+// independently-validated set id -- the real client's campaign-namespace
+// and per-set-id slugs are two genuinely distinct captures of a compound
+// colon-delimited identifier, never the same field reused twice). Must be
+// empty for every other category, including HomebrewBox, whose real path
+// reuses `identifier` itself as both the directory and file name (a
+// single cover-art image per homebrew campaign, not one of several).
 //
 // `mutationId` is the arbitrary, backend-assigned per-instance sticker-
 // mutation identifier used ONLY when `side == AssetSide::MutatedFront`
@@ -218,13 +288,22 @@ private:
 // identifier grammar as `identifier` before it is ever placed in a URL
 // path segment.
 //
+// `backKind`/`otherSideIdentifier`/`customBackFilename` are used ONLY
+// when `side == AssetSide::Back`; see CardBackKind for exactly which of
+// these three fields (if any) each kind requires, and which must stay
+// empty. `backKind` must be std::nullopt, and both string fields empty,
+// for every side other than Back.
+//
 // `format` is validated, never trusted verbatim for path-building: the
 // real CDN serves a single fixed format per category (e.g. always AVIF
-// for card art, never caller-selectable), so AssetLocator rejects any key
-// whose declared format does not match AssetLocator::canonicalFormatFor
-// (category) with AssetErrorCode::FormatMismatchForCategory instead of
-// silently overriding it -- a silent override would desync the URL
-// extension from the Content-Type/magic-byte expectation
+// for card art, never caller-selectable) -- except CardBackKind::
+// CustomBack, whose format is instead derived from customBackFilename's
+// own extension, and CardBackKind::GenericEncounterBack/
+// GenericPlayerBack, which are always JPEG regardless of category -- so
+// AssetLocator rejects any key whose declared format does not match the
+// one it independently derives (AssetErrorCode::FormatMismatchForCategory)
+// instead of silently overriding it -- a silent override would desync the
+// URL extension from the Content-Type/magic-byte expectation
 // AssetNetworkFetcher validates the response against.
 struct AssetKey {
   ValidatedAssetSource assetBase;
@@ -234,6 +313,9 @@ struct AssetKey {
   QString locale;
   QString homebrewNamespace;
   QString mutationId;
+  std::optional<CardBackKind> backKind;
+  QString otherSideIdentifier;
+  QString customBackFilename;
   AssetFormat format{AssetFormat::Jpeg};
 
   [[nodiscard]] bool operator==(const AssetKey &other) const noexcept {
@@ -241,7 +323,10 @@ struct AssetKey {
            identifier == other.identifier && side == other.side &&
            locale == other.locale &&
            homebrewNamespace == other.homebrewNamespace &&
-           mutationId == other.mutationId && format == other.format;
+           mutationId == other.mutationId && backKind == other.backKind &&
+           otherSideIdentifier == other.otherSideIdentifier &&
+           customBackFilename == other.customBackFilename &&
+           format == other.format;
   }
 };
 
@@ -252,15 +337,27 @@ struct AssetKey {
 // attempt; `isAlternateFrontFallback` marks the final alternate-front
 // fallback candidate (only ever produced for Card/Front requests) so
 // callers/tests can assert the fallback chain shape without re-deriving it
-// from the URL text.
+// from the URL text. `format` is the exact image format this SPECIFIC
+// candidate is expected to be served as -- almost always equal to
+// AssetKey::format/AssetLocator::canonicalFormatFor(key.category), but
+// deliberately independent of it: CardBackKind::GenericEncounterBack/
+// GenericPlayerBack candidates are always JPEG and CardBackKind::
+// CustomBack candidates carry whatever format their own filename
+// extension implies, both regardless of the requesting key's category.
+// AssetNetworkFetcher/AssetRequestCoordinator validate each fetched
+// candidate against ITS OWN `format`, never the key's, so a generic/
+// custom back can never be mistakenly checked against e.g. AVIF magic
+// bytes.
 struct AssetCandidate {
   QUrl url;
   QString locale;
   bool isAlternateFrontFallback{false};
+  AssetFormat format{AssetFormat::Jpeg};
 
   [[nodiscard]] bool operator==(const AssetCandidate &other) const noexcept {
     return url == other.url && locale == other.locale &&
-           isAlternateFrontFallback == other.isAlternateFrontFallback;
+           isAlternateFrontFallback == other.isAlternateFrontFallback &&
+           format == other.format;
   }
 };
 
