@@ -124,6 +124,17 @@ jobs:
         # rather than only by this runner happening to have a working
         # ldconfig.
         run: bash packaging/tests/test_find_bundled_libsecret.sh
+      - name: Test codec license/notice bundling logic
+        # Exercises bundle_codec_notices() (used by build-appimage.sh
+        # below, review round-3 item 17) against synthetic fake ".so"
+        # files in a temporary directory: only-libavif, libavif plus
+        # multiple codec backends, mandatory libavif missing (must fail,
+        # no partial bundling), a recognized codec library present with
+        # no corresponding notice source (must fail loudly rather than
+        # silently ship unattributed), and bundled notice content
+        # actually matching the checked-in third_party/ source. Hermetic
+        # (no AppImage/network dependency).
+        run: bash packaging/tests/test_bundle_codec_notices.sh
       - name: Test dependency-closure auditor against a synthetic ELF chain
         # Builds a small local three-library chain (root -> mid -> leaf)
         # with `cc`, then proves audit_dependency_closure.py: resolves a
@@ -351,6 +362,69 @@ jobs:
           avif_name="$(basename "$avif_lib")"
           echo "Auditing the real bundled libavif closure (codec backends included)..."
           python3 packaging/audit_dependency_closure.py "$avif_lib_dir" --root "$avif_name"
+      - name: Verify every bundled codec library ships its required license notice
+        # Review round-3 item 17: linuxdeploy's automatic ldd-based
+        # bundling has no notion of license attribution, so nothing
+        # bundles libavif's (or its AV1 codec backend's) required
+        # BSD/Apache notice text alongside the .so files themselves --
+        # this repository's own build-appimage.sh does that explicitly
+        # via bundle_codec_notices() (already unit-tested in isolation
+        # above). This step is the end-to-end proof against the REAL
+        # produced AppImage: for every one of the known codec library
+        # name patterns bundle_codec_notices() recognizes, if a matching
+        # .so is actually present in the extracted AppImage, its notice
+        # directory must also be present under
+        # usr/share/doc/ArkhamHorror/third_party/<name>/ with non-empty
+        # content -- never assume a notice "must have" shipped via some
+        # Ubuntu package doc path, since an AppImage bundles libraries as
+        # bare .so files with no accompanying package metadata at all.
+        # libavif itself is asserted unconditionally (it is a mandatory
+        # dependency of every build).
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          doc_root="$extracted/usr/share/doc/ArkhamHorror/third_party"
+
+          declare -A codec_globs=(
+            [libavif]='libavif.so*'
+            [dav1d]='libdav1d.so*'
+            [libaom]='libaom.so*'
+            [libgav1]='libgav1.so*'
+            [rav1e]='librav1e.so*'
+            [svt-av1]='libSvtAv1*.so*'
+            [libyuv]='libyuv.so*'
+          )
+
+          fail=0
+          for name in "${!codec_globs[@]}"; do
+            glob="${codec_globs[$name]}"
+            found="$(find "$extracted" -name "$glob" -print -quit)"
+            is_mandatory=0
+            [[ "$name" == "libavif" ]] && is_mandatory=1
+
+            if [[ -z "$found" && "$is_mandatory" -eq 0 ]]; then
+              echo "No bundled '$name' library found (glob '$glob') -- skipping its notice check."
+              continue
+            fi
+            if [[ -z "$found" && "$is_mandatory" -eq 1 ]]; then
+              echo "Mandatory codec library '$name' (glob '$glob') was not bundled." >&2
+              fail=1
+              continue
+            fi
+
+            echo "Found bundled '$name': $found -- verifying its notice is present."
+            license_path="$doc_root/$name/LICENSE"
+            if [[ ! -s "$license_path" ]]; then
+              echo "Bundled '$name' has no non-empty LICENSE at $license_path" >&2
+              fail=1
+            fi
+          done
+
+          if [[ "$fail" -ne 0 ]]; then
+            echo "One or more bundled codec libraries are missing their required license notice." >&2
+            exit 1
+          fi
+          echo "Every bundled codec library's required license notice is present."
       - name: Verify the bundled libavif decodes AVIF images with no host codec fallback
         # Complementary to the static closure audit above (mirroring the
         # libsecret dlopen() no-host-fallback proof further below): builds

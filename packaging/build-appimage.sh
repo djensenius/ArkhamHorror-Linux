@@ -7,6 +7,8 @@ app_dir="$repo_root/AppDir"
 
 # shellcheck source=packaging/lib/find_bundled_libsecret.sh
 source "$repo_root/packaging/lib/find_bundled_libsecret.sh"
+# shellcheck source=packaging/lib/bundle_codec_notices.sh
+source "$repo_root/packaging/lib/bundle_codec_notices.sh"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "AppImage packaging requires x86_64 Linux." >&2
@@ -152,6 +154,17 @@ export LINUXDEPLOY_PLUGIN_QT="$qt_plugin"
 # headless SteamOS/CI-like environments -- without changing anything
 # about normal interactive use, which still defaults to "xcb".
 export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
+# Deliberately split into two linuxdeploy invocations (populate, then
+# package) rather than one combined "--output appimage" call: which AV1
+# codec backend(s) (dav1d/aom/gav1/rav1e/SVT-AV1/libyuv) end up bundled
+# alongside libavif is only known once linuxdeploy's automatic ldd-based
+# dependency resolution has actually run and populated "$app_dir/usr/lib"
+# -- review round-3 item 17 requires every one of those actually-bundled
+# codec libraries to ship with its required license/notice text, so
+# bundle_codec_notices() below must run (and be allowed to fail the build
+# loudly on an unrecognized/missing notice) strictly between the
+# "populate" and "package" phases, before the final .AppImage is ever
+# produced.
 "$linuxdeploy" \
   --appdir "$app_dir" \
   --desktop-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.desktop" \
@@ -161,5 +174,19 @@ export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
   --library "$libgccs_so" \
   --library "$libstdcxx_so" \
   --library "$libz_so" \
-  --plugin qt \
-  --output appimage
+  --plugin qt
+
+bundled_search_root="$app_dir/usr"
+[[ -d "$bundled_search_root" ]] || {
+  echo "linuxdeploy did not populate the expected $bundled_search_root." >&2
+  exit 2
+}
+bundle_codec_notices "$bundled_search_root" "$repo_root/third_party" "$doc_dir" || {
+  echo "Failed to bundle required codec library license/notice text --" \
+    "see the message(s) above. This is a hard failure: a codec library" \
+    "must never ship inside the AppImage without its required" \
+    "attribution." >&2
+  exit 2
+}
+
+"$linuxdeploy" --appdir "$app_dir" --output appimage

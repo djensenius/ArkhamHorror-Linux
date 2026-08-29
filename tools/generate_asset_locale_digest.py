@@ -326,12 +326,16 @@ def _clang_format(rendered: str) -> tuple[str, bool]:
     would need a manual `clang-format -i` pass, and --check would keep
     reporting the checked-in (already clang-formatted) header as "stale"
     purely due to line-wrapping differences, never actual data drift.
-    Falls back to the unformatted text (rather than failing outright) if
-    clang-format isn't on PATH -- or is on PATH but fails to run to
-    completion (a broken install, missing shared libs, a crash, etc.) --
-    since --check's real drift signal is the embedded SHA-256 hashes, and
-    CI's separate format:check job independently enforces formatting
-    regardless.
+    Falls back to returning the unformatted text (rather than raising)
+    if clang-format isn't on PATH -- or is on PATH but fails to run to
+    completion (a broken install, missing shared libs, a crash, etc.):
+    plain (non---check) generation mode still writes SOME output rather
+    than aborting outright, and CI's separate format:check job
+    independently enforces formatting regardless. --check itself, on the
+    other hand, now fails closed whenever `formatted_ok` comes back False
+    (see main()) rather than trusting a weaker comparison that cannot be
+    made meaningful without a real formatter run -- see review round-3
+    item 16.
 
     Returns (text, formatted_ok): `formatted_ok` is True only when
     clang-format actually ran to completion and its output is being
@@ -361,27 +365,6 @@ def _clang_format(rendered: str) -> tuple[str, bool]:
     return result.stdout, True
 
 
-def _extract_embedded_hashes(header_text: str) -> tuple[str | None, dict[str, str]]:
-    """Extracts the kManifestJsonSha256 and per-locale kSourceFileHashes
-    embedded in an already-generated header, or (None, {}) if missing/
-    malformed. Used by --check to validate drift by hash alone when
-    clang-format isn't available to make a full-text comparison
-    meaningful (see _clang_format's docstring): a checked-in header need
-    only be formatting-different, not data-different, to make a raw text
-    compare report a false positive.
-    """
-    manifest_match = re.search(
-        r'kManifestJsonSha256\[\]\s*=\s*"([0-9a-f]{64})"', header_text
-    )
-    manifest_hash = manifest_match.group(1) if manifest_match else None
-    source_hashes: dict[str, str] = {}
-    for locale_match in re.finditer(
-        r'\{"([a-z]+)",\s*"([0-9a-f]{64})"\}', header_text
-    ):
-        source_hashes[locale_match.group(1)] = locale_match.group(2)
-    return manifest_hash, source_hashes
-
-
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -393,11 +376,6 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     manifest = _load_manifest()
-    expected_manifest_sha256 = hashlib.sha256(MANIFEST_JSON.read_bytes()).hexdigest()
-    expected_source_sha256 = {
-        locale: entry["sha256"]
-        for locale, entry in manifest["provenance"]["sourceFiles"].items()
-    }
     rendered, formatted_ok = _clang_format(render_header(manifest))
 
     if args.check:
@@ -406,26 +384,37 @@ def main(argv: list[str]) -> int:
             if GENERATED_HEADER.exists()
             else ""
         )
-        # Copilot review: this must key off whether clang-format actually
-        # ran to completion (`formatted_ok`), not merely whether the
-        # binary was found on PATH. A present-but-broken install (missing
-        # shared libs, crash, etc.) has clang-format on PATH yet still
-        # falls back to unformatted `rendered` text inside
-        # _clang_format() -- keying off PATH presence alone would then
-        # run the full-text comparison below against unformatted output,
-        # reporting a checked-in (already clang-formatted) header as
-        # falsely stale even though the actual data (the embedded
-        # hashes) has not drifted at all.
-        if formatted_ok:
-            is_stale = current != rendered
-        else:
-            embedded_manifest_hash, embedded_source_hashes = _extract_embedded_hashes(
-                current
+        # Review round-3 item 16: a hash-only comparison when
+        # clang-format is unavailable can be fooled by a HAND-EDITED
+        # generated header whose embedded kManifestJsonSha256/
+        # kSourceFileHashes comments were left untouched but whose actual
+        # kEntries[] rows were mutated (e.g. a single locale's artCode
+        # silently changed) -- those embedded hashes describe the INPUT
+        # (the manifest + source files), never the OUTPUT rows this
+        # script itself renders, so comparing them alone proves nothing
+        # about whether the checked-in file's rows still match what
+        # render_header() actually produces. Rather than trust that
+        # weaker signal, --check now FAILS CLOSED whenever clang-format
+        # did not actually run to completion (`formatted_ok` is False):
+        # CI's format job and `mise run setup:macos` both always install
+        # clang-format, so this path is never exercised there in
+        # practice, and a local run missing it is directed to install it
+        # rather than silently trusting a comparison that cannot detect
+        # this exact class of tampering.
+        if not formatted_ok:
+            print(
+                "clang-format is required for --check (it was not found on "
+                "PATH, or was found but failed to run to completion) -- "
+                "install it (see `mise run setup:macos`, or `apt-get "
+                "install clang-format` as CI does) and re-run --check. A "
+                "hash-only fallback comparison cannot detect a hand-edited "
+                "generated header whose embedded hashes were left stale "
+                "while its actual data rows were mutated, so this script "
+                "no longer attempts one.",
+                file=sys.stderr,
             )
-            is_stale = (
-                embedded_manifest_hash != expected_manifest_sha256
-                or embedded_source_hashes != expected_source_sha256
-            )
+            return 1
+        is_stale = current != rendered
         if is_stale:
             print(
                 f"{GENERATED_HEADER} is stale; run "
