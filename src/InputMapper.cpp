@@ -208,7 +208,7 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
 
 void InputMapper::clearHeldKeys() { heldKeys_.clear(); }
 
-bool InputMapper::isPhysicalKeyHeld(const Qt::Key key) const {
+bool InputMapper::isArmedKeyHeld(const Qt::Key key) const {
   const auto it = heldKeys_.constFind(key);
   return it != heldKeys_.constEnd() && it.value().has_value();
 }

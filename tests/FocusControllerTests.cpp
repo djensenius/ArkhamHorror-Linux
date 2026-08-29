@@ -66,6 +66,7 @@ private slots:
   void
   removedEmptyZoneIsPrunedFromCycleOrderAndReappearsAtTheEndIfReintroduced();
   void reregisteringANodeIntoADifferentZonePrunesTheOldZoneOnceItIsEmpty();
+  void pruningAnEmptyZoneAlsoForgetsItsLastFocusedMemory();
 };
 
 void FocusControllerTests::movesFocusAlongExplicitAdjacency() {
@@ -634,6 +635,48 @@ void FocusControllerTests::
   QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card2"));
   QVERIFY(controller.cycleZone(true)); // hand -> board (wraps)
   QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+}
+
+void FocusControllerTests::pruningAnEmptyZoneAlsoForgetsItsLastFocusedMemory() {
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  controller.setInitialFocus(QStringLiteral("board.nw"));
+
+  // Visiting "hand" records hand.card1 as its last-focused node in
+  // zoneLastFocused_.
+  QVERIFY(controller.cycleZone(true));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  QVERIFY(
+      controller.snapshot().zoneLastFocused.contains(QStringLiteral("hand")));
+
+  QVERIFY(controller.cycleZone(false));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Re-registering hand's only node into a different zone empties
+  // "hand" and prunes it from zoneOrder_ (see the test above); the
+  // snapshot must also no longer contain a "hand" entry in
+  // zoneLastFocused -- otherwise that memory would linger forever
+  // (never cleared, since no removeNode() call for hand.card1 itself
+  // ever occurs here) even though "hand" can no longer be cycled to.
+  controller.registerNode(FocusNodeSpec{
+      QStringLiteral("hand.card1"), QStringLiteral("archive"), {}});
+  QVERIFY(
+      !controller.snapshot().zoneLastFocused.contains(QStringLiteral("hand")));
+
+  // The same must hold for a zone emptied via outright node removal,
+  // not just re-registration into another zone.
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("log.entry"), QStringLiteral("log"), {}});
+  QVERIFY(controller.cycleZone(true)); // board -> archive
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  QVERIFY(controller.snapshot().zoneLastFocused.contains(
+      QStringLiteral("archive")));
+
+  controller.removeNode(QStringLiteral("hand.card1"));
+  QVERIFY(!controller.snapshot().zoneLastFocused.contains(
+      QStringLiteral("archive")));
 }
 
 QTEST_APPLESS_MAIN(FocusControllerTests)

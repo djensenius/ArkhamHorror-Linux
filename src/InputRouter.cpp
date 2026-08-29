@@ -109,11 +109,11 @@ bool InputRouter::eventFilter(QObject *watched, QEvent *event) {
   // duplicate transition whose *current* modifiers no longer match any
   // binding (e.g. Ctrl+Z is held, then a duplicate Z arrives with Ctrl
   // no longer down) must still be recognized as owned via
-  // isPhysicalKeyHeld() -- checked before processKey() runs, since a
+  // isArmedKeyHeld() -- checked before processKey() runs, since a
   // release can make the key no longer held by the time processKey()
   // returns.
   const bool isOwnedKey = mapper_.commandFor(physicalKey).has_value() ||
-                          mapper_.isPhysicalKeyHeld(physicalKey.key);
+                          mapper_.isArmedKeyHeld(physicalKey.key);
 
   const std::optional<DispatchedCommand> dispatched =
       mapper_.processKey(physicalKey, isPress, keyEvent->isAutoRepeat());

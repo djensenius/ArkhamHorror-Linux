@@ -287,7 +287,7 @@ void InputRouterTests::
 
   // A genuinely stray release afterwards -- the hold has already ended,
   // so this key is no longer "owned" by any measure (neither
-  // commandFor() nor isPhysicalKeyHeld()) -- must NOT be consumed,
+  // commandFor() nor isArmedKeyHeld()) -- must NOT be consumed,
   // confirming the held-key-identity check only extends ownership for
   // the duration of an actual hold, not forever.
   QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_Z));

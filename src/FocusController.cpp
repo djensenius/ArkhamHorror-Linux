@@ -349,6 +349,14 @@ void FocusController::pruneZoneIfEmpty(const QString &zoneId) {
       [&zoneId](const Node &node) { return node.zoneId == zoneId; });
   if (!zoneStillHasNodes) {
     zoneOrder_.removeAll(zoneId);
+    // Also forget this zone's last-focused memory: cycleZone() already
+    // double-checks zoneOf(remembered) == targetZone before trusting a
+    // remembered id (so a stale entry here could never actually be
+    // *used* for the wrong zone), but leaving it behind regardless would
+    // let zoneLastFocused_ grow without bound across many dynamically
+    // emptied/re-emptied zones, exactly the unbounded-growth problem
+    // zoneOrder_ pruning above already guards against.
+    zoneLastFocused_.remove(zoneId);
   }
 }
 

@@ -202,7 +202,7 @@ public:
   // *current* modifiers no longer match any binding can still belong
   // to a physical key this mapper already owns for the rest of its
   // hold.
-  [[nodiscard]] bool isPhysicalKeyHeld(Qt::Key key) const;
+  [[nodiscard]] bool isArmedKeyHeld(Qt::Key key) const;
 
 private:
   // Per-held-key state: a key present in |heldKeys_| is physically held
