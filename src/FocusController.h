@@ -103,15 +103,32 @@ public:
   // overwrites its previous adjacency/zone -- last registration always
   // wins, never merges -- which is exactly how an explicit-adjacency
   // conflict ("tie") between two registrations for the same id is
-  // resolved. Registering a node already tracked as a zone's
-  // last-focused entry has no separate special case: that memory simply
-  // continues to refer to the same id, now with its new adjacency. If
-  // this re-registration moves the node OUT of its previous zone (a
-  // different zoneId than before) and that was the zone's last member,
-  // the old zone id is pruned from the internal zone-cycle order, exactly
-  // like removeNode() below -- re-registering a node into a new zone must
-  // uphold the same "zoneOrder_ never retains an empty zone" invariant as
-  // actually removing it.
+  // resolved.
+  //
+  // Same-zone re-registration (zoneId unchanged): zone last-focused
+  // memory is left completely untouched -- if it referred to this id
+  // before, it simply continues to refer to the same id, now with its
+  // new adjacency; if it referred to some other id, that is unaffected.
+  //
+  // Cross-zone re-registration (a different zoneId than the node's
+  // previous one) has three additional, distinct observable effects:
+  //   1. If the previous zone's last-focused memory pointed at this
+  //      exact id, that now-stale entry is erased -- the node has moved
+  //      away, so the previous zone must stop remembering it as
+  //      focused there.
+  //   2. If that was the previous zone's last member node, the zone id
+  //      is also pruned from the internal zone-cycle order, exactly
+  //      like removeNode() below -- re-registering a node into a new
+  //      zone must uphold the same "zoneOrder_ never retains an empty
+  //      zone" invariant as actually removing it.
+  //   3. If this id is the currently-focused node (i.e. it just moved
+  //      zones without its identity or focus changing, so
+  //      setCurrentFocus()'s own bookkeeping never ran for this move),
+  //      the new zone's last-focused memory is set to this id -- so the
+  //      new zone's memory reflects the live current focus rather than
+  //      staying stale or absent. If the node is not currently focused,
+  //      the new zone's last-focused memory is left as-is (no entry is
+  //      created for it).
   void registerNode(const FocusNodeSpec &spec);
 
   // Removes |id| from the graph. If it was the current focus, focus falls
