@@ -6,7 +6,7 @@ dependency of the ArkhamHorror-Linux client's AppImage packaging:
 - **Name:** zlib
 - **Upstream:** https://zlib.net/
 - **License:** zlib (see `LICENSE`, reproduced verbatim from upstream)
-- **Copyright:** (C) 1995-2025 Jean-loup Gailly and Mark Adler
+- **Copyright:** (C) 1995-2026 Jean-loup Gailly and Mark Adler
 
 ## Why this may be bundled
 

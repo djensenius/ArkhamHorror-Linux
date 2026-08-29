@@ -4,10 +4,12 @@
 #include "MockHttpServer.h"
 
 #include <QBuffer>
+#include <QCoreApplication>
 #include <QImage>
 #include <QImageReader>
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
+#include <QProcess>
 #include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QTest>
@@ -1880,4 +1882,34 @@ void AssetNetworkFetcherTests::validConfigurationFactorySucceeds() {
   const auto result = AssetNetworkFetcher::create();
   QVERIFY2(result.has_value(), qPrintable(result.error().message));
   QVERIFY((*result)->isValid());
+}
+
+void AssetNetworkFetcherTests::
+    jpegDecodeWarningDetectorFatalFallbackTerminatesProcessLikeQtDefaultHandler() {
+  // Regression test for a review comment on ScopedJpegDecodeWarningDetector
+  // (src/AssetNetworkFetcher.cpp): its no-previous-handler fallback used to
+  // only fprintf() a fatal message to stderr and continue running, silently
+  // changing Qt's documented default-handler semantics (a real qFatal()
+  // call always terminates the process). Testing that in-process would
+  // crash this very test binary, so this spawns THIS SAME test executable
+  // as a subprocess with a dedicated sentinel argument that main() (see
+  // AssetTestsMain.cpp) recognises and, instead of running any QTest
+  // suite, calls the test-only hook directly -- proving the subprocess is
+  // actually terminated abnormally rather than exiting cleanly.
+  QProcess process;
+  process.setProgram(QCoreApplication::applicationFilePath());
+  process.setArguments(
+      {QStringLiteral("--test-only-trigger-jpeg-fatal-abort")});
+  process.start();
+  QVERIFY2(process.waitForStarted(5000), "subprocess failed to start");
+  QVERIFY2(process.waitForFinished(10000),
+           "subprocess did not terminate within the timeout");
+
+  // A real qFatal() with no installed message handler aborts (SIGABRT on
+  // POSIX platforms); the pre-fix fallback would instead have printed the
+  // message and returned normally out of the test-only hook, which is
+  // marked [[noreturn]] and would itself be undefined behaviour if it fell
+  // through -- either way, the correct, fixed behaviour is an abnormal
+  // (crashed) exit, never QProcess::NormalExit.
+  QCOMPARE(process.exitStatus(), QProcess::CrashExit);
 }

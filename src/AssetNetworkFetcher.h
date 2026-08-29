@@ -327,6 +327,19 @@ public:
   decodeAndValidate(const QByteArray &encodedBytes,
                     AssetFormat expectedFormat) const;
 
+  // Test-only hook for a subprocess-based test proving
+  // ScopedJpegDecodeWarningDetector's no-previous-handler fallback
+  // replicates Qt's real default message handler's fatal-message
+  // semantics (process termination), not just its stderr-printing
+  // behaviour. This deliberately calls qFatal() from inside the
+  // detector's scope and therefore ALWAYS terminates the calling
+  // process -- it must only ever be invoked from a short-lived
+  // subprocess a test spawns specifically to observe that termination
+  // (see AssetNetworkFetcherTests.cpp), never from the normal in-process
+  // test binary flow.
+  [[noreturn]] static void
+  triggerJpegDecodeWarningDetectorFatalMessageForTesting();
+
 private:
   struct Pending {
     QNetworkReply *reply{nullptr};

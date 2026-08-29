@@ -21,6 +21,7 @@
 #include <QtAssert>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -357,12 +358,22 @@ private:
     } else {
       // No prior custom handler was installed (Qt's own built-in default
       // handler was in effect): there is no public API to invoke that
-      // default handler directly, so approximate its stderr-printing
-      // behaviour closely enough that messages are never silently
-      // dropped just because this scope happened to be the first
-      // handler ever installed by this process.
+      // default handler directly, so approximate its behaviour closely
+      // enough that messages are never silently dropped just because
+      // this scope happened to be the first handler ever installed by
+      // this process. Critically, Qt's real default handler does not
+      // merely print QtFatalMsg to stderr -- it terminates the process
+      // (see qlogging.cpp's qDefaultMessageHandler(), which calls
+      // std::abort() after printing a fatal message). Silently
+      // continuing execution past a qFatal() call inside this scope
+      // would be a genuine, dangerous change to Qt's documented logging
+      // semantics, so the fatal case is replicated exactly here.
       fprintf(stderr, "%s: %s\n",
               context.category ? context.category : "default", qPrintable(msg));
+      if (type == QtFatalMsg) {
+        fflush(stderr);
+        std::abort();
+      }
     }
   }
 
@@ -371,6 +382,19 @@ private:
   static inline bool s_active = false;
   static inline bool s_sawJpegPluginMessage = false;
 };
+
+} // namespace
+
+[[noreturn]] void
+AssetNetworkFetcher::triggerJpegDecodeWarningDetectorFatalMessageForTesting() {
+  ScopedJpegDecodeWarningDetector detector;
+  qFatal("AssetNetworkFetcher test-only fatal message: proving "
+         "ScopedJpegDecodeWarningDetector's no-previous-handler fallback "
+         "terminates the process exactly like Qt's real default handler "
+         "would");
+}
+
+namespace {
 
 // Round-4 review item 8: an independent, deterministic CRC-32 (ISO 3309 /
 // zlib / PNG-standard polynomial 0xEDB88320) implementation. Qt's own

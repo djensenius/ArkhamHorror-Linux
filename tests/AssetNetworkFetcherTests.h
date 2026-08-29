@@ -72,4 +72,6 @@ private slots:
   invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing_data();
   void invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing();
   void validConfigurationFactorySucceeds();
+  void
+  jpegDecodeWarningDetectorFatalFallbackTerminatesProcessLikeQtDefaultHandler();
 };
