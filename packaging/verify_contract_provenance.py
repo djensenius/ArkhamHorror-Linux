@@ -240,7 +240,22 @@ def compute_schema_closure(
             )
         data = tree.blob_bytes(path)
         discovered[path] = data
-        for match in _REF_RE.finditer(data.decode("utf-8", errors="replace")):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # errors="replace" would silently substitute U+FFFD for
+            # invalid bytes and keep scanning, which could mask corrupted
+            # or non-UTF-8 schema bytes and compute an incorrect (missing
+            # or corrupted) $ref closure -- weakening the exact provenance
+            # guarantee this script exists to provide. Fail fast instead;
+            # verify()'s caller already turns a RuntimeError here into a
+            # clean failure description rather than an unhandled
+            # traceback.
+            raise RuntimeError(
+                f"{path}: schema is not valid UTF-8 ({exc}); refusing to "
+                "scan it for $ref"
+            ) from exc
+        for match in _REF_RE.finditer(text):
             target = _resolve_schema_ref(path, match.group(1))
             if target is not None and target not in discovered:
                 pending.append(target)

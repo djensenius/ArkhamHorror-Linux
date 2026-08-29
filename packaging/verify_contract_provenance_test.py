@@ -91,6 +91,18 @@ class ClosureTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             vcp.compute_governed_paths(tree)
 
+    def test_invalid_utf8_schema_bytes_rejected(self):
+        # A schema containing a byte sequence that is not valid UTF-8 must
+        # be a hard failure (RuntimeError), never silently decoded with a
+        # replacement character (which could mask corrupted bytes and
+        # compute an incorrect, or merely coincidentally-still-correct,
+        # $ref closure).
+        blobs = _baseline_blobs()
+        blobs["contracts/schemas/catalog.schema.json"] = b'{"$defs": {"x": \xff\xfe}}'
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
     def test_ref_path_traversal_escape_rejected(self):
         blobs = _baseline_blobs()
         blobs["contracts/schemas/catalog.schema.json"] = (

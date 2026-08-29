@@ -672,8 +672,25 @@ ValueOrError<QString> scientificShow(double value, QStringView path) {
   if (!expText.empty() && expText.front() == '+')
     expText.remove_prefix(1);
   int scientificExponent = 0;
-  std::from_chars(expText.data(), expText.data() + expText.size(),
-                  scientificExponent);
+  const auto expConv = std::from_chars(
+      expText.data(), expText.data() + expText.size(), scientificExponent);
+  // expText is exactly the exponent substring std::to_chars(...,
+  // chars_format::scientific) itself just emitted a few lines above (with
+  // only a leading '+' stripped), so this parse can never legitimately
+  // fail for the finite `absValue` guaranteed by the isfinite() check
+  // above. Unlike the two Q_ASSERTs above (compiled out in release), a
+  // discarded from_chars failure here would silently leave
+  // scientificExponent at its default-initialized 0 and let this
+  // function emit an incorrect wire number with no indication anything
+  // went wrong -- check it explicitly and return a typed failure instead,
+  // matching this function's own ValueOrError<QString> contract, so a
+  // standard-library-specific quirk this invariant did not anticipate can
+  // never masquerade as a valid encoded value.
+  if (expConv.ec != std::errc{} ||
+      expConv.ptr != expText.data() + expText.size())
+    return failure(
+        QStringLiteral("%1: internal error formatting number's exponent")
+            .arg(path));
 
   std::string digits;
   digits.reserve(mantissa.size());
