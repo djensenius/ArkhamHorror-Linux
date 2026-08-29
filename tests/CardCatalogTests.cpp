@@ -195,7 +195,11 @@ void CardCatalogTests::missingArtRejected() {
   })"_L1);
   const auto result = CardDef::fromJson(obj, u"card");
   QVERIFY(!result.has_value());
-  QVERIFY(result.error().contains(QStringLiteral("art")));
+  // Asserts the exact, clearer "missing required field" phrasing (shared
+  // with requireRawField/requireNullable*) rather than the less specific
+  // "expected string, got missing" a bare value-type check would produce.
+  QCOMPARE(result.error(),
+           QStringLiteral("card.art: missing required field \"art\""));
 }
 
 void CardCatalogTests::emptyArtRejected() {
