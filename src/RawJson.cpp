@@ -410,7 +410,6 @@ private:
     ++m_pos; // '{'
     Value v;
     v.m_kind = Value::Kind::Object;
-    QSet<QString> seenKeys;
     skipWhitespace();
     if (!atEnd() && peek() == '}') {
       ++m_pos;
@@ -423,9 +422,8 @@ private:
       auto key = parseStringText();
       if (!key)
         return Failure{key.error()};
-      if (seenKeys.contains(*key))
+      if (v.m_objectIndex.contains(*key))
         return failAt(QStringLiteral("duplicate object key '%1'").arg(*key));
-      seenKeys.insert(*key);
       skipWhitespace();
       if (atEnd() || peek() != ':')
         return failAt("expected ':' after object key");
@@ -436,6 +434,7 @@ private:
         return Failure{value.error()};
       if (v.m_object.size() >= m_limits.maxObjectMembers)
         return failAt("object exceeds the maximum allowed member count");
+      v.m_objectIndex.insert(*key, v.m_object.size());
       v.m_object.append({std::move(*key), std::move(*value)});
       skipWhitespace();
       if (atEnd())
@@ -462,21 +461,16 @@ ValueOrError<Value> Value::parse(QByteArrayView bytes, QStringView path,
 bool Value::contains(QLatin1StringView key) const {
   if (m_kind != Kind::Object)
     return false;
-  for (const auto &[k, v] : m_object) {
-    if (k == key)
-      return true;
-  }
-  return false;
+  return m_objectIndex.contains(QString(key));
 }
 
 Value Value::value(QLatin1StringView key) const {
   if (m_kind != Kind::Object)
     return {};
-  for (const auto &[k, v] : m_object) {
-    if (k == key)
-      return v;
-  }
-  return {};
+  const auto it = m_objectIndex.constFind(QString(key));
+  if (it == m_objectIndex.constEnd())
+    return {};
+  return m_object[*it].second;
 }
 
 QStringList Value::keys() const {
@@ -564,6 +558,16 @@ Value Value::makeArray(QList<Value> elements) {
 Value Value::makeObject(QList<std::pair<QString, Value>> members) {
   Value v;
   v.m_kind = Kind::Object;
+  v.m_objectIndex.reserve(members.size());
+  for (qsizetype i = 0; i < members.size(); ++i) {
+    // First-occurrence wins for a transiently duplicate-keyed input (an
+    // invalid state toJsonBytes()'s own duplicate-key check rejects
+    // before it could ever be re-serialized), matching contains()/
+    // value()'s previous linear-scan behavior of returning the first
+    // match exactly.
+    if (!v.m_objectIndex.contains(members[i].first))
+      v.m_objectIndex.insert(members[i].first, i);
+  }
   v.m_object = std::move(members);
   return v;
 }

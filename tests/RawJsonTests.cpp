@@ -44,6 +44,13 @@ private slots:
   void rejectsExcessiveNestingDepth();
   void acceptsEmptyArrayAndObject();
   void objectAccessorsFindPresentKeysAndMissAbsentOnes();
+  // Review round 5 (RawJson.cpp:476 HIGH finding): contains()/value() must
+  // remain correct once backed by an index rather than a linear scan,
+  // including for a member count near ParseLimits::production()'s
+  // maxObjectMembers default and for the (invalid, but constructible via
+  // makeObject()) transient duplicate-key case toJsonBytes() rejects.
+  void objectAccessorLookupIsCorrectAcrossManyMembers();
+  void makeObjectDuplicateKeyResolvesToFirstOccurrence();
   void toQJsonConvertsEveryKind();
   void skipsLeadingAndTrailingWhitespace();
 
@@ -309,6 +316,60 @@ void RawJsonTests::objectAccessorsFindPresentKeysAndMissAbsentOnes() {
   QVERIFY(!value.contains("absent"_L1));
   QVERIFY(value.value("present"_L1).isNumber());
   QVERIFY(value.value("absent"_L1).isUndefined());
+}
+
+void RawJsonTests::objectAccessorLookupIsCorrectAcrossManyMembers() {
+  // Exercises a member count close to ParseLimits::production()'s
+  // maxObjectMembers default (100k) so an index-backed contains()/value()
+  // is proven correct (not merely fast) at realistic worst-case size:
+  // every key must resolve to its own distinct value, the last-inserted
+  // key must be found exactly like the first, and an absent key must
+  // still correctly report "not found" rather than colliding with a
+  // present one.
+  constexpr qsizetype kMemberCount = 50'000;
+  QList<std::pair<QString, Value>> members;
+  members.reserve(kMemberCount);
+  for (qsizetype i = 0; i < kMemberCount; ++i) {
+    members.append({QStringLiteral("key%1").arg(i),
+                    Value::makeNumber(RawNumber::fromInt64(i))});
+  }
+  const Value obj = Value::makeObject(members);
+  QCOMPARE(obj.members().size(), kMemberCount);
+  QVERIFY(obj.contains(QLatin1StringView("key0")));
+  QCOMPARE(obj.value(QLatin1StringView("key0")).toRawNumber().literal(),
+           QStringLiteral("0"));
+  const QByteArray lastKeyUtf8 =
+      QStringLiteral("key%1").arg(kMemberCount - 1).toUtf8();
+  const QLatin1StringView lastKeyView(lastKeyUtf8.constData());
+  QVERIFY(obj.contains(lastKeyView));
+  QCOMPARE(obj.value(lastKeyView).toRawNumber().literal(),
+           QString::number(kMemberCount - 1));
+  QVERIFY(!obj.contains(QLatin1StringView("not-present")));
+  QVERIFY(obj.value(QLatin1StringView("not-present")).isUndefined());
+  // A middle key, to confirm the index is not merely correct at the two
+  // extremes.
+  const QByteArray midKeyUtf8 =
+      QStringLiteral("key%1").arg(kMemberCount / 2).toUtf8();
+  const QLatin1StringView midKeyView(midKeyUtf8.constData());
+  QCOMPARE(obj.value(midKeyView).toRawNumber().literal(),
+           QString::number(kMemberCount / 2));
+}
+
+void RawJsonTests::makeObjectDuplicateKeyResolvesToFirstOccurrence() {
+  // makeObject() (unlike Value::parse(), which rejects duplicate keys
+  // outright) can transiently construct an object with a duplicate key;
+  // this state cannot survive toJsonBytes() (see
+  // toJsonBytesRejectsDuplicateObjectKeys()), but contains()/value() must
+  // still behave exactly as the pre-index linear scan did: the first
+  // occurrence wins, never the last.
+  QList<std::pair<QString, Value>> members{
+      {QStringLiteral("a"), Value::makeString(QStringLiteral("first"))},
+      {QStringLiteral("b"), Value::makeNull()},
+      {QStringLiteral("a"), Value::makeString(QStringLiteral("second"))},
+  };
+  const Value obj = Value::makeObject(members);
+  QVERIFY(obj.contains("a"_L1));
+  QCOMPARE(obj.value("a"_L1).toString(), QStringLiteral("first"));
 }
 
 void RawJsonTests::toQJsonConvertsEveryKind() {

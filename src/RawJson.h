@@ -4,6 +4,7 @@
 
 #include <QByteArray>
 #include <QByteArrayView>
+#include <QHash>
 #include <QJsonValue>
 #include <QLatin1StringView>
 #include <QList>
@@ -210,7 +211,13 @@ public:
   [[nodiscard]] const QList<Value> &toArray() const noexcept { return m_array; }
 
   // Object accessors. Duplicate keys are rejected during parsing (see
-  // Value::parse()), so every key maps to at most one value.
+  // Value::parse()), so every key maps to at most one value. contains()/
+  // value() are average-case O(1) via an index built once alongside
+  // m_object (see m_objectIndex below), not a linear scan: ParseLimits
+  // permits an object up to maxObjectMembers (100k by default) entries,
+  // and a decode path performing its fixed handful of named-field lookups
+  // against a single adversarially-padded object must not degrade to
+  // O(members) per lookup.
   [[nodiscard]] bool contains(QLatin1StringView key) const;
   // Undefined if the object has no such key, or *this is not an object.
   [[nodiscard]] Value value(QLatin1StringView key) const;
@@ -296,6 +303,15 @@ private:
   QString m_string;
   QList<Value> m_array;
   QList<std::pair<QString, Value>> m_object;
+  // key -> index into m_object, built once (by makeObject()/Parser, the
+  // only two places an Object-kind Value is constructed) rather than
+  // lazily, so it needs no `mutable` state and stays a plain deterministic
+  // function of m_object for operator==() purposes. A key present more
+  // than once (a transiently-constructible but invalid state that
+  // toJsonBytes()/parse() both reject -- see their duplicate-key checks)
+  // maps to its first occurrence, matching contains()/value()'s prior
+  // linear-scan behavior exactly.
+  QHash<QString, qsizetype> m_objectIndex;
 };
 
 } // namespace Arkham::Json

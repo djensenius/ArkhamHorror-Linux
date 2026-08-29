@@ -200,10 +200,17 @@ public:
   // Unknown only: the complete raw decoded object (its "tag" and, if
   // present, "contents", plus any additive sibling key a future backend
   // release adds alongside them), preserved verbatim as a lossless
-  // Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue, so a huge
-  // numeric literal or duplicate-key-bearing payload this client cannot
-  // interpret still round-trips byte-exact and no additive key beside
-  // "contents" is silently dropped by toJson().
+  // Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue, so no
+  // additive key beside "contents" is silently dropped. This is the only
+  // representation this class guarantees round-trips byte-exact
+  // (including a huge numeric literal or duplicate-key-bearing payload
+  // this client cannot interpret): use unknownRaw().toJsonBytes() (or
+  // decode it further yourself) whenever exactness beyond a double's
+  // 2^53/int64 range matters. toJson() below is a QJsonObject-typed
+  // convenience for the Unknown case only as exact as
+  // Json::Value::toQJson() itself is (see its doc comment in RawJson.h):
+  // an exact-int64 numeric literal survives, but anything requiring more
+  // precision than QJsonValue's double-backed storage allows does not.
   [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
@@ -412,9 +419,16 @@ public:
   // if present, "contents", plus any additive sibling key a future
   // backend release adds alongside them), preserved verbatim as a
   // lossless Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue,
-  // so a huge numeric literal or duplicate-key-bearing payload this
-  // client cannot interpret still round-trips byte-exact and no additive
-  // key beside "contents" is silently dropped by toJson().
+  // so no additive key beside "contents" is silently dropped. This is the
+  // only representation this class guarantees round-trips byte-exact
+  // (including a huge numeric literal or duplicate-key-bearing payload
+  // this client cannot interpret): use unknownRaw().toJsonBytes() (or
+  // decode it further yourself) whenever exactness beyond a double's
+  // 2^53/int64 range matters. toJson() below is a QJsonObject-typed
+  // convenience for the Unknown case only as exact as
+  // Json::Value::toQJson() itself is (see its doc comment in RawJson.h):
+  // an exact-int64 numeric literal survives, but anything requiring more
+  // precision than QJsonValue's double-backed storage allows does not.
   [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
