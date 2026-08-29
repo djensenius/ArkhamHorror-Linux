@@ -70,7 +70,9 @@ private slots:
   void diskHitRevalidationServesStaleOnNon404Failure();
   void diskHitRevalidationCoalescesConcurrentIdenticalRequests();
   void diskHitAfterRestartDecodesOnDemandAndPublishesToMemory();
+  void concurrentIdenticalRequestsForADiskHitCoalesceIntoASingleDecode();
   void malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork();
+  void diskCachedAvifSequenceIsQuarantinedAndRefetchedFromNetwork();
   void quarantineRefetchFailureSurfacesFreshErrorWithoutLooping();
   void unsupportedCodecIsNeverQuarantineWorthy();
   void delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry();

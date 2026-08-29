@@ -898,12 +898,22 @@ void AssetNetworkFetcherTests::avifRealFixtureAlwaysDecodesViaLibavif() {
   QVERIFY(!(**result).asset->decodedImage.isNull());
 }
 
-void AssetNetworkFetcherTests::avifImageSequenceIsRejectedAsUnsupportedCodec() {
-  // Review item 6: a genuine, validly-encoded AVIF image SEQUENCE
-  // (decoder->imageCount > 1, i.e. an "avis"-brand animation) must be
-  // rejected outright rather than silently decoding only its first
-  // frame -- this project only ever serves/consumes a single still
-  // image per asset candidate.
+void AssetNetworkFetcherTests::avifImageSequenceIsRejectedAsMalformedImage() {
+  // Review item 6 / round-4 item 10: a genuine, validly-encoded AVIF
+  // image SEQUENCE (decoder->imageCount > 1, i.e. an "avis"-brand
+  // animation) must be rejected outright rather than silently decoding
+  // only its first frame -- this project only ever serves/consumes a
+  // single still image per asset candidate. Classified as
+  // MalformedImage, NOT UnsupportedCodec: this build's libavif backend
+  // fully supports decoding this exact bytestream -- the multi-image
+  // structure itself violates this project's single-still-image
+  // contract, an integrity/content-policy failure rather than a genuine
+  // codec-support gap. AssetRequestCoordinator's quarantine logic (review
+  // item 9) treats the two completely differently: MalformedImage
+  // quarantines a disk hit and retries the SAME candidate as a network
+  // miss, whereas UnsupportedCodec never does, because reserving it for
+  // multi-image AVIF would let a permanently-multi-image resource poison
+  // a disk entry forever with no way to ever resolve it by quarantining.
   MockHttpServer server;
   MockHttpServer::Response response;
   response.contentType = "image/avif";
@@ -918,7 +928,7 @@ void AssetNetworkFetcherTests::avifImageSequenceIsRejectedAsUnsupportedCodec() {
 
   QVERIFY(result.has_value());
   QVERIFY(!bool(*result));
-  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
 }
 
 void AssetNetworkFetcherTests::

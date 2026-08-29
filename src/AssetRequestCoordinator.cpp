@@ -118,6 +118,41 @@ AssetRequestCoordinator::~AssetRequestCoordinator() {
 
 AssetRequestCoordinator::RequestHandle
 AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
+  // Review round-4 item 6: join an already in-flight operation for the
+  // EXACT SAME canonicalized AssetKey (see canonicalOperationKey()) FIRST
+  // -- strictly before any cache lookup (memory or disk) is even
+  // attempted, and strictly before AssetLocator::resolveCandidates() is
+  // called again for this key. Previously, coalescing was only checked
+  // on the revalidation and network-fetch paths below; a plain cache hit
+  // (memory OR disk-with-no-validators) instead unconditionally created
+  // its OWN brand-new Operation and queued its OWN independent
+  // ensureDecoded() call (see registerCacheHitCompletion()) for every
+  // single request() call, even when several concurrent calls named the
+  // exact same AssetKey and would clearly resolve to the exact same
+  // cached bytes. Two (or a burst of many) concurrent QML-driven
+  // requests for the same still-image asset -- e.g. the same card's art
+  // requested by several simultaneously-visible UI elements before the
+  // first request's queued completion has even run -- would therefore
+  // each independently perform a full, expensive decode of the same
+  // near-32-megapixel image in parallel, multiplying peak memory/CPU
+  // cost by the number of concurrent callers instead of doing the work
+  // once and fanning the single result out to every consumer. Checking
+  // here, before ANY of that work begins, means every one of those
+  // concurrent calls (regardless of whether the eventual path turns out
+  // to be a memory hit, a disk hit, a conditional revalidation, or a
+  // fresh network fetch) shares exactly one Operation and therefore
+  // exactly one decode/fetch, with every consumer's callback appended to
+  // that same operation's consumer list (see completeOperation()).
+  const QString opKey = canonicalOperationKey(key);
+  if (const std::optional<quint64> existingOperationId =
+          findInFlightOperation(opKey)) {
+    const quint64 handleId = m_nextHandle++;
+    Operation &existing = m_operations[*existingOperationId];
+    existing.consumers.append(Consumer{handleId, std::move(callback)});
+    m_handleToOperation.insert(handleId, *existingOperationId);
+    return RequestHandle{handleId};
+  }
+
   const AssetOutcome<QVector<AssetCandidate>> candidatesResult =
       AssetLocator::resolveCandidates(key);
   if (!candidatesResult) {
@@ -183,22 +218,11 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
       // forever: this is the only production code path that actually
       // exercises AssetNetworkFetcher::ConditionalHeaders end-to-end.
       //
-      // Coalesce with an already in-flight identical request (revalidation
-      // or otherwise) before starting a new one: without this check, two
-      // concurrent request() calls for the same AssetKey that both land on
-      // this disk-hit-with-validators path would each issue their own
-      // conditional GET, silently bypassing the coordinator's coalescing
-      // guarantee.
-      const QString opKey = canonicalOperationKey(key);
-      if (const std::optional<quint64> existingOperationId =
-              findInFlightOperation(opKey)) {
-        const quint64 handleId = m_nextHandle++;
-        Operation &existing = m_operations[*existingOperationId];
-        existing.consumers.append(Consumer{handleId, std::move(callback)});
-        m_handleToOperation.insert(handleId, *existingOperationId);
-        return RequestHandle{handleId};
-      }
-
+      // No coalescing check is needed here: request() already confirmed,
+      // strictly before this cache lookup ran at all, that no operation
+      // for this exact opKey is currently in flight (see the top of this
+      // function, review round-4 item 6) -- nothing synchronous between
+      // that check and here can have started one.
       const quint64 handleId = m_nextHandle++;
       const quint64 operationId = m_nextOperationId++;
       Operation operation;
@@ -242,17 +266,10 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
                            "(negative cache)")}));
   }
 
-  const QString opKey = canonicalOperationKey(key);
   const quint64 handleId = m_nextHandle++;
-
-  // Coalesce with an already-in-flight identical request, if one exists.
-  if (const std::optional<quint64> existingOperationId =
-          findInFlightOperation(opKey)) {
-    Operation &existing = m_operations[*existingOperationId];
-    existing.consumers.append(Consumer{handleId, std::move(callback)});
-    m_handleToOperation.insert(handleId, *existingOperationId);
-    return RequestHandle{handleId};
-  }
+  // No coalescing check is needed here either -- see the top of this
+  // function (review round-4 item 6): `opKey` was already confirmed not
+  // in flight before any of the cache-lookup loop above ever ran.
 
   const quint64 operationId = m_nextOperationId++;
   Operation operation;

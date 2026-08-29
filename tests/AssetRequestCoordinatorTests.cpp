@@ -138,6 +138,89 @@ QByteArray encodeAvifFixture(int width, int height) {
   return bytes;
 }
 
+// A real, validly-encoded multi-image ("avis"-brand) AVIF fixture --
+// mirrors AssetNetworkFetcherTests.cpp's encodeAvifSequenceFixture()
+// exactly (this file needs its own copy: that one is file-local to its
+// own anonymous namespace). Used by
+// diskCachedAvifSequenceIsQuarantinedAndRefetchedFromNetwork() below
+// (review round-4 item 10) to prove that a disk-cached entry whose bytes
+// decode to a multi-image AVIF is quarantined (MalformedImage -- see
+// AssetAvifDecoder.cpp's imageCount != 1 branch) and refetched over the
+// network exactly like any other malformed disk entry, rather than
+// permanently poisoning the key or -- wrongly, before round-4 item 10 --
+// being reported as UnsupportedCodec and never quarantined at all despite
+// the bytes being perfectly decodable by this build's libavif backend.
+QByteArray encodeAvifSequenceFixture(int frameCount) {
+  constexpr int kWidth = 4;
+  constexpr int kHeight = 4;
+  avifImage *image =
+      avifImageCreate(kWidth, kHeight, /*depth=*/8, AVIF_PIXEL_FORMAT_YUV420);
+  if (image == nullptr) {
+    qFatal("encodeAvifSequenceFixture() failed to allocate an avifImage");
+  }
+  avifRGBImage rgb;
+  avifRGBImageSetDefaults(&rgb, image);
+  rgb.format = AVIF_RGB_FORMAT_RGBA;
+  rgb.depth = 8;
+  (void)avifRGBImageAllocatePixels(&rgb);
+  if (rgb.pixels == nullptr) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifSequenceFixture() failed to allocate RGB pixels");
+  }
+  for (uint32_t row = 0; row < rgb.height; ++row) {
+    uint8_t *line = rgb.pixels + static_cast<size_t>(row) * rgb.rowBytes;
+    for (uint32_t col = 0; col < rgb.width; ++col) {
+      uint8_t *pixel = line + static_cast<size_t>(col) * 4;
+      pixel[0] = 0x10;
+      pixel[1] = 0x20;
+      pixel[2] = 0x30;
+      pixel[3] = 0xFF;
+    }
+  }
+  const avifResult toYuvResult = avifImageRGBToYUV(image, &rgb);
+  avifRGBImageFreePixels(&rgb);
+  if (toYuvResult != AVIF_RESULT_OK) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifSequenceFixture() failed to convert RGB to YUV: %s",
+           avifResultToString(toYuvResult));
+  }
+
+  avifEncoder *encoder = avifEncoderCreate();
+  if (encoder == nullptr) {
+    avifImageDestroy(image);
+    qFatal("encodeAvifSequenceFixture() failed to allocate an avifEncoder");
+  }
+  encoder->speed = AVIF_SPEED_FASTEST;
+  encoder->timescale = 30;
+
+  avifResult addResult = AVIF_RESULT_OK;
+  for (int frame = 0; frame < frameCount; ++frame) {
+    addResult = avifEncoderAddImage(encoder, image, /*durationInTimescales=*/1,
+                                    AVIF_ADD_IMAGE_FLAG_NONE);
+    if (addResult != AVIF_RESULT_OK) {
+      break;
+    }
+  }
+  avifImageDestroy(image);
+  if (addResult != AVIF_RESULT_OK) {
+    avifEncoderDestroy(encoder);
+    qFatal("encodeAvifSequenceFixture() failed to add a frame: %s",
+           avifResultToString(addResult));
+  }
+
+  avifRWData output = AVIF_DATA_EMPTY;
+  const avifResult finishResult = avifEncoderFinish(encoder, &output);
+  avifEncoderDestroy(encoder);
+  if (finishResult != AVIF_RESULT_OK) {
+    qFatal("encodeAvifSequenceFixture() failed to finish: %s",
+           avifResultToString(finishResult));
+  }
+  QByteArray bytes(reinterpret_cast<const char *>(output.data),
+                   static_cast<int>(output.size));
+  avifRWDataFree(&output);
+  return bytes;
+}
+
 // A real Card AssetKey (unlike makeKey()'s default SetIcon), for the two
 // alternate-front-fallback tests below, which exercise Card-only
 // candidate-list behaviour (see AssetLocator::resolveCandidates()'s
@@ -1570,6 +1653,85 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
+    concurrentIdenticalRequestsForADiskHitCoalesceIntoASingleDecode() {
+  // Review round-4 item 6: previously, coalescing (findInFlightOperation())
+  // was only ever consulted on the revalidation and network-fetch paths;
+  // a plain cache hit (memory OR disk-with-no-validators) unconditionally
+  // created its OWN new Operation and queued its OWN independent
+  // ensureDecoded() call for every single request() call, even when
+  // several concurrent calls named the exact same AssetKey. This
+  // reproduces exactly that burst -- two request() calls for the same
+  // key, issued back-to-back before either's queued completion has run,
+  // against a disk-only entry (no decodedImage yet, simulating a
+  // post-restart disk hit exactly like
+  // diskHitAfterRestartDecodesOnDemandAndPublishesToMemory() above) --
+  // and asserts there is only ONE in-flight operation (and therefore only
+  // one decode) shared by both consumers, not two independent ones.
+  MockHttpServer server;
+  // No response registered: this request must be served entirely from
+  // the disk cache, with no network round trip at all -- if coalescing
+  // regressed such that either consumer somehow fell through to a
+  // network fetch, MockHttpServer would report a 404 for the
+  // unregistered path and this test would fail via a non-decoded error
+  // result.
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(6, 6);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(6, 6);
+  cache.store(cacheKey, preSeeded);
+
+  // A fresh AssetCache instance pointed at the same directory (empty
+  // memory) forces both requests through the disk-hit path.
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  int completions = 0;
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  coordinator.request(key, [&](Result r) {
+    ++completions;
+    resultA = std::move(r);
+  });
+  // Issued immediately after, before either request's queued completion
+  // has run: must join the SAME underlying operation rather than
+  // performing a second, independent disk read + decode.
+  coordinator.request(key, [&](Result r) {
+    ++completions;
+    resultB = std::move(r);
+  });
+
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 1);
+
+  QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
+
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           0);
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QVERIFY2(!(**resultA).decodedImage.isNull(),
+           "a successful disk-hit result must never carry a null "
+           "decodedImage");
+  QVERIFY2(!(**resultB).decodedImage.isNull(),
+           "a successful disk-hit result must never carry a null "
+           "decodedImage");
+  QCOMPARE((**resultA).decodedImage.size(), QSize(6, 6));
+  QCOMPARE((**resultB).decodedImage.size(), QSize(6, 6));
+}
+
+void AssetRequestCoordinatorTests::
     malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork() {
   // Review item 9 (self-consistent invalid disk entry poisons forever):
   // a disk hit whose stored bytes can no longer actually decode (magic-
@@ -1624,6 +1786,63 @@ void AssetRequestCoordinatorTests::
 
   // The quarantined malformed bytes were genuinely replaced on disk, not
   // merely masked by a memory-only success.
+  const auto onDisk = restartedCache.lookupDisk(cacheKey);
+  QVERIFY(onDisk.has_value());
+  QCOMPARE(onDisk->dimensions, QSize(6, 6));
+  QVERIFY(onDisk->encodedBytes != preSeeded.encodedBytes);
+}
+
+void AssetRequestCoordinatorTests::
+    diskCachedAvifSequenceIsQuarantinedAndRefetchedFromNetwork() {
+  // Review round-4 item 10: a disk-cached AVIF entry whose bytes decode
+  // to a valid multi-image ("avis"-brand) container must be classified
+  // MalformedImage (see AssetAvifDecoder.cpp's imageCount != 1 branch,
+  // fixed this round), which IS quarantine-worthy (isQuarantineWorthy()),
+  // NOT UnsupportedCodec (which never quarantines valid-but-undecodable-
+  // by-this-build bytes). Before this fix, a multi-image AVIF wrongly
+  // classified as UnsupportedCodec would never be quarantined/evicted --
+  // this same corrupt-shaped entry would poison every future request for
+  // this key forever, since isQuarantineWorthy() explicitly never treats
+  // UnsupportedCodec as eligible for eviction+retry. This proves it is
+  // instead evicted and the exact same candidate retried as a genuine
+  // network miss, exactly like any other malformed disk entry.
+  MockHttpServer server;
+  MockHttpServer::Response fresh;
+  fresh.contentType = "image/avif";
+  fresh.body = encodeAvifFixture(6, 6);
+  server.setResponse(QStringLiteral("/img/arkham/cards/valid01.avif"), fresh);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodeAvifSequenceFixture(3);
+  preSeeded.contentType = QStringLiteral("image/avif");
+  preSeeded.dimensions = QSize(4, 4);
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/cards/valid01.avif")), 1);
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).dimensions, QSize(6, 6));
+  QVERIFY(!(**result).decodedImage.isNull());
+
   const auto onDisk = restartedCache.lookupDisk(cacheKey);
   QVERIFY(onDisk.has_value());
   QCOMPARE(onDisk->dimensions, QSize(6, 6));

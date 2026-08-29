@@ -80,22 +80,34 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
                   .arg(QString::fromLatin1(avifResultToString(result)))});
   }
 
-  // Review item 6: this project only ever serves/decodes a SINGLE still
-  // AVIF image (the "avif" major/compatible brand, `imageCount == 1`).
-  // An animated/sequence AVIF ("avis", or a still-image container that
-  // nonetheless declares more than one coded image) is rejected outright
-  // -- decoding only its first frame and silently discarding the rest
-  // would misrepresent a multi-frame asset as if it were the single
-  // canonical image, which the CDN never actually serves for card art
-  // but a hostile/misconfigured server could still attempt to send.
-  // `imageCount` is authoritative only after avifDecoderParse() has
-  // already succeeded, so this check is placed strictly after it (and,
-  // like the dimension check just below, strictly before
-  // avifDecoderNextImage() ever decodes a single pixel).
+  // Review item 6 / round-4 item 10: this project only ever serves/
+  // decodes a SINGLE still AVIF image (the "avif" major/compatible
+  // brand, `imageCount == 1`). An animated/sequence AVIF ("avis", or a
+  // still-image container that nonetheless declares more than one coded
+  // image) is rejected outright -- decoding only its first frame and
+  // silently discarding the rest would misrepresent a multi-frame asset
+  // as if it were the single canonical image, which the CDN never
+  // actually serves for card art but a hostile/misconfigured server
+  // could still attempt to send. `imageCount` is authoritative only
+  // after avifDecoderParse() has already succeeded, so this check is
+  // placed strictly after it (and, like the dimension check just below,
+  // strictly before avifDecoderNextImage() ever decodes a single pixel).
+  //
+  // Classified as MalformedImage, NOT UnsupportedCodec: this build's
+  // libavif backend is fully capable of decoding this bytestream -- the
+  // stream itself violates this project's single-still-image contract,
+  // which is an integrity/content-policy failure, not a "this runtime
+  // lacks a decoder for this format" one. AssetRequestCoordinator's
+  // quarantine-and-refetch handling (review round-4 item 9/10) treats
+  // MalformedImage as a corrupt/self-inconsistent disk/network entry
+  // eligible for quarantine + a single retry as a network miss, whereas
+  // UnsupportedCodec is reserved for a genuine, permanent, build-wide
+  // decoder-absence outcome that quarantining a specific cached entry
+  // could never resolve by retrying.
   if (decoder->imageCount != 1) {
     avifDecoderDestroy(decoder);
     return AssetOutcome<QImage>(AssetError{
-        AssetErrorCode::UnsupportedCodec,
+        AssetErrorCode::MalformedImage,
         QStringLiteral("AVIF image sequences/animations (imageCount=%1) "
                        "are not supported; only a single still image is "
                        "accepted")

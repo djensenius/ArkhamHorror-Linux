@@ -43,7 +43,7 @@ private slots:
   void jpegWithStuffedFFBytesInScanDataStillDecodesWhenComplete();
   void jpegTrailingDataAfterGenuineEoiIsRejected();
   void avifRealFixtureAlwaysDecodesViaLibavif();
-  void avifImageSequenceIsRejectedAsUnsupportedCodec();
+  void avifImageSequenceIsRejectedAsMalformedImage();
   void avifMalformedContainerIsReportedAsMalformedImage();
   void avifDimensionBombIsRejectedBeforeAnyPixelDecodeOrAllocation();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
