@@ -176,13 +176,20 @@ def _clang_format(rendered: str) -> str:
     clang_format = shutil.which("clang-format")
     if clang_format is None:
         return rendered
-    result = subprocess.run(
-        [clang_format, "--assume-filename=AssetLocaleDigestData.generated.h"],
-        input=rendered,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            [clang_format, "--assume-filename=AssetLocaleDigestData.generated.h"],
+            input=rendered,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        # clang-format was found on PATH but failed to run to completion
+        # (a broken install, missing shared libs, a crash, etc.) -- honour
+        # the same fallback-to-unformatted-output promise as the "not on
+        # PATH at all" case above rather than letting the script abort.
+        return rendered
     return result.stdout
 
 
