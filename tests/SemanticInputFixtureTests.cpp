@@ -134,6 +134,11 @@ private slots:
   realKeyEventsThroughTheInstalledRouterDriveFocusAndTheQmlFixtureEndToEnd();
   void unboundKeyEventsThroughTheInstalledRouterNeverMoveFocus();
   void tabAndBacktabNeverDivergeSemanticFocusFromRealQmlActiveFocus();
+  void textEntryFieldSuspendsSemanticDispatchAndHandlesKeysNatively();
+  void leavingTextEntryResumesSemanticMappingWithoutDuplicateOrStuckDispatch();
+  void switchingToTextEntryMidHoldClearsTheHoldSoItsReleaseIsNotDispatched();
+  void explicitOverrideSuspendsSemanticDispatchEvenWithoutTextEntryFocus();
+  void destroyingTheWindowWhileTextEntrySuspendedNeverCrashesOrDispatches();
 
 private:
   std::unique_ptr<QQmlApplicationEngine> engine_;
@@ -412,6 +417,231 @@ void SemanticInputFixtureTests::
   auto *ne = itemsById.value(QStringLiteral("board.ne")).value<QQuickItem *>();
   QVERIFY(ne != nullptr);
   QTRY_VERIFY(ne->hasActiveFocus());
+}
+
+void SemanticInputFixtureTests::
+    textEntryFieldSuspendsSemanticDispatchAndHandlesKeysNatively() {
+  // Regression test for the production text-entry gate: qml/
+  // SemanticInputFixture.qml's textEntryField is a real QtQuick.Controls
+  // TextField, wholly outside the semantic focus graph. While it holds
+  // real Qt active focus, InputRouter's automatic Qt::ImEnabled
+  // detection must suspend semantic dispatch entirely -- including the
+  // reserved Escape key -- so every one of these default-bound keys
+  // (see InputMapper::resetToDefaults()) reaches the field's own native
+  // text/cursor/editing handling instead.
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  auto *textField =
+      window_->findChild<QQuickItem *>(QStringLiteral("textEntryField"));
+  QVERIFY(textField != nullptr);
+
+  QAccessibleInterface *iface =
+      QAccessible::queryAccessibleInterface(textField);
+  QVERIFY(iface != nullptr);
+  QCOMPARE(iface->text(QAccessible::Name), QStringLiteral("Notes"));
+
+  QVERIFY(!router_->isTextEntrySuspended());
+  textField->forceActiveFocus();
+  QTRY_VERIFY(textField->hasActiveFocus());
+  QVERIFY(router_->isTextEntrySuspended());
+
+  QSignalSpy spy(router_.get(), &InputRouter::commandDispatched);
+
+  // W/A/S/D are FocusUp/FocusLeft/FocusDown/FocusRight by default; here
+  // they must simply type letters into the field.
+  QTest::keyClick(window_, Qt::Key_W);
+  QTest::keyClick(window_, Qt::Key_A);
+  QTest::keyClick(window_, Qt::Key_S);
+  QTest::keyClick(window_, Qt::Key_D);
+  QCOMPARE(textField->property("text").toString(), QStringLiteral("wasd"));
+
+  // Space is PrimaryAction by default; here it must type a space.
+  QTest::keyClick(window_, Qt::Key_Space);
+  QCOMPARE(textField->property("text").toString(), QStringLiteral("wasd "));
+
+  // Backspace has no semantic binding, but is exactly the kind of
+  // ordinary editing key the gate exists to protect: it must reach the
+  // field's native handling.
+  QTest::keyClick(window_, Qt::Key_Backspace);
+  QCOMPARE(textField->property("text").toString(), QStringLiteral("wasd"));
+
+  // Arrow keys are FocusRight/FocusLeft by default; here they must move
+  // the text cursor, not semantic focus, and must not alter the text.
+  QTest::keyClick(window_, Qt::Key_Left);
+  QTest::keyClick(window_, Qt::Key_Left);
+  QTest::keyClick(window_, Qt::Key_Right);
+  QCOMPARE(textField->property("text").toString(), QStringLiteral("wasd"));
+
+  // Return is PrimaryAction by default; here it must be left to the
+  // field (TextField has no default Enter side effect beyond its own
+  // accepted() signal), never a semantic dispatch.
+  QTest::keyClick(window_, Qt::Key_Return);
+  QCOMPARE(textField->property("text").toString(), QStringLiteral("wasd"));
+
+  // Escape/Back is reserved and normally always consumed -- but per the
+  // documented text-entry policy, reserved keys are NOT exempted from
+  // suspension: while a text control owns focus, Escape must pass
+  // through unconsumed rather than being interpreted as
+  // SecondaryOwnAction, and must not delete the field's text or dismiss
+  // anything on this router's behalf.
+  QTest::keyClick(window_, Qt::Key_Escape);
+  QCOMPARE(textField->property("text").toString(), QStringLiteral("wasd"));
+
+  QCOMPARE(spy.count(), 0);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+}
+
+void SemanticInputFixtureTests::
+    leavingTextEntryResumesSemanticMappingWithoutDuplicateOrStuckDispatch() {
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  auto *textField =
+      window_->findChild<QQuickItem *>(QStringLiteral("textEntryField"));
+  QVERIFY(textField != nullptr);
+  const QVariantMap itemsById = window_->property("itemsById").toMap();
+  auto *nw = itemsById.value(QStringLiteral("board.nw")).value<QQuickItem *>();
+  auto *ne = itemsById.value(QStringLiteral("board.ne")).value<QQuickItem *>();
+  QVERIFY(nw != nullptr);
+  QVERIFY(ne != nullptr);
+  QTRY_VERIFY(nw->hasActiveFocus());
+
+  textField->forceActiveFocus();
+  QTRY_VERIFY(textField->hasActiveFocus());
+  QVERIFY(router_->isTextEntrySuspended());
+
+  QSignalSpy spy(router_.get(), &InputRouter::commandDispatched);
+  QTest::keyClick(window_, Qt::Key_Right);
+  QCOMPARE(spy.count(), 0);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+
+  // Simulates a host returning real Qt active focus to a semantic
+  // delegate (e.g. the user clicked a board tile): automatic detection
+  // must notice this with no explicit setSemanticInputSuspended() call
+  // at all.
+  nw->forceActiveFocus();
+  QTRY_VERIFY(nw->hasActiveFocus());
+  QVERIFY(!router_->isTextEntrySuspended());
+
+  QTest::keyClick(window_, Qt::Key_Right);
+  // A full keyClick dispatches twice -- one Pressed, one Released, per
+  // CommandPhase's documented press/release contract (see
+  // InputMapper.h) -- not once; this is the same convention every
+  // existing InputRouterTests keyClick assertion already follows.
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.ne"));
+  QTRY_VERIFY(ne->hasActiveFocus());
+
+  // A further key click dispatches exactly twice more -- proving nothing
+  // about the earlier suppressed Right press was queued or replayed
+  // once suspension lifted.
+  QTest::keyClick(window_, Qt::Key_Left);
+  QCOMPARE(spy.count(), 4);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+}
+
+void SemanticInputFixtureTests::
+    switchingToTextEntryMidHoldClearsTheHoldSoItsReleaseIsNotDispatched() {
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  auto *textField =
+      window_->findChild<QQuickItem *>(QStringLiteral("textEntryField"));
+  QVERIFY(textField != nullptr);
+  const QVariantMap itemsById = window_->property("itemsById").toMap();
+  auto *nw = itemsById.value(QStringLiteral("board.nw")).value<QQuickItem *>();
+  auto *ne = itemsById.value(QStringLiteral("board.ne")).value<QQuickItem *>();
+  QVERIFY(nw != nullptr);
+  QVERIFY(ne != nullptr);
+  QTRY_VERIFY(nw->hasActiveFocus());
+
+  QSignalSpy spy(router_.get(), &InputRouter::commandDispatched);
+
+  QTest::keyPress(window_, Qt::Key_Right);
+  QCOMPARE(spy.count(), 1);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.ne"));
+
+  // Switch real Qt active focus to the text field while Right is still
+  // physically held (e.g. a pointer click into the field mid-hold): the
+  // hold must be forgotten immediately, not merely ignored for future
+  // presses.
+  textField->forceActiveFocus();
+  QTRY_VERIFY(textField->hasActiveFocus());
+  QVERIFY(router_->isTextEntrySuspended());
+
+  QTest::keyRelease(window_, Qt::Key_Right);
+  QCOMPARE(spy.count(), 1); // No Released dispatched: the hold was cleared.
+
+  // Returning to a semantic delegate and pressing Right fresh must work
+  // exactly like any ordinary press -- proving no stale armed/held state
+  // survived the suspend transition to swallow it.
+  ne->forceActiveFocus();
+  QTRY_VERIFY(ne->hasActiveFocus());
+  QVERIFY(!router_->isTextEntrySuspended());
+
+  QTest::keyClick(window_, Qt::Key_Right);
+  // A full keyClick after the hold was cleared is an ordinary fresh
+  // press+release, dispatching twice (Pressed, then Released) -- see
+  // the comment on the earlier keyClick in
+  // leavingTextEntryResumesSemanticMappingWithoutDuplicateOrStuckDispatch.
+  QCOMPARE(spy.count(), 3);
+}
+
+void SemanticInputFixtureTests::
+    explicitOverrideSuspendsSemanticDispatchEvenWithoutTextEntryFocus() {
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  const QVariantMap itemsById = window_->property("itemsById").toMap();
+  auto *nw = itemsById.value(QStringLiteral("board.nw")).value<QQuickItem *>();
+  QVERIFY(nw != nullptr);
+  QTRY_VERIFY(nw->hasActiveFocus());
+  QVERIFY(!router_->isTextEntrySuspended());
+
+  QSignalSpy spy(router_.get(), &InputRouter::commandDispatched);
+
+  // No text control has real Qt focus at all here -- automatic detection
+  // alone would report "not suspended" -- yet an explicit host override
+  // must still suspend everything, exactly like real text entry would.
+  router_->setSemanticInputSuspended(true);
+  QVERIFY(router_->isTextEntrySuspended());
+  QTest::keyClick(window_, Qt::Key_Right);
+  QCOMPARE(spy.count(), 0);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.nw"));
+
+  router_->setSemanticInputSuspended(false);
+  QVERIFY(!router_->isTextEntrySuspended());
+  QTest::keyClick(window_, Qt::Key_Right);
+  // Ordinary keyClick dispatches twice (Pressed, then Released) -- see
+  // the comment on the earlier keyClick in
+  // leavingTextEntryResumesSemanticMappingWithoutDuplicateOrStuckDispatch.
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(focus_->currentFocusId(), QStringLiteral("board.ne"));
+}
+
+void SemanticInputFixtureTests::
+    destroyingTheWindowWhileTextEntrySuspendedNeverCrashesOrDispatches() {
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  auto *textField =
+      window_->findChild<QQuickItem *>(QStringLiteral("textEntryField"));
+  QVERIFY(textField != nullptr);
+
+  textField->forceActiveFocus();
+  QTRY_VERIFY(textField->hasActiveFocus());
+  QVERIFY(router_->isTextEntrySuspended());
+
+  QSignalSpy spy(router_.get(), &InputRouter::commandDispatched);
+  QVERIFY(router_->isInstalled());
+
+  // Destroys the QML root window/textEntryField entirely while text
+  // entry is suspended -- exercising exactly the same
+  // targetDestroyed-while-installed seam as
+  // routerNoticesWhenItsTargetIsDestroyedExternally() in
+  // InputRouterTests, but with the suspension gate active. Not crashing
+  // is itself part of what this test asserts.
+  engine_.reset();
+  QVERIFY(!router_->isInstalled());
+  QCOMPARE(spy.count(), 0);
+  window_ = nullptr;
 }
 
 QTEST_MAIN(SemanticInputFixtureTests)

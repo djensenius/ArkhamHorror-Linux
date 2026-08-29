@@ -57,6 +57,12 @@ private slots:
   void installingANewTargetForgetsHeldKeysFromThePreviousTarget();
   void targetDestructionWhileHeldDoesNotLeakStaleHeldStateIntoALaterInstall();
   void keypadEnterIsReachableDespiteItsKeypadModifier();
+  void
+  textEntrySuspensionDefaultsToDisabledButAutomaticDetectionDefaultsToEnabled();
+  void
+  explicitTextEntrySuspensionBlocksDispatchForOrdinaryAndReservedKeysAlike();
+  void suspendingMidHoldClearsTheHoldSoItsReleaseIsNotDispatched();
+  void disablingAutomaticDetectionLeavesExplicitSuspensionAsTheOnlyGate();
 
 private:
   void assertLifecycleEventClearsHeldKeys(QEvent::Type eventType);
@@ -466,6 +472,127 @@ void InputRouterTests::keypadEnterIsReachableDespiteItsKeypadModifier() {
                   Qt::KeypadModifier));
   QCOMPARE(spy.count(), 2);
   QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Released);
+}
+
+void InputRouterTests::
+    textEntrySuspensionDefaultsToDisabledButAutomaticDetectionDefaultsToEnabled() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QVERIFY(!router.isTextEntrySuspended());
+  QVERIFY(!router.isSemanticInputExplicitlySuspended());
+  QVERIFY(router.isAutomaticTextEntryDetectionEnabled());
+}
+
+void InputRouterTests::
+    explicitTextEntrySuspensionBlocksDispatchForOrdinaryAndReservedKeysAlike() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+
+  // Sanity: with nothing suspended, W (a default FocusUp alias) and
+  // Escape (reserved) both dispatch normally.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_W));
+  QCOMPARE(spy.count(), 1);
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_W));
+  QCOMPARE(spy.count(), 2);
+
+  router.setSemanticInputSuspended(true);
+  QVERIFY(router.isTextEntrySuspended());
+  QVERIFY(router.isSemanticInputExplicitlySuspended());
+
+  // While suspended, an ordinary bound letter (W/FocusUp) must be
+  // treated exactly like an unbound key: never consumed, never
+  // dispatched -- this is the production text-entry gate.
+  QVERIFY(!sendKey(&target, QEvent::KeyPress, Qt::Key_W));
+  QCOMPARE(spy.count(), 2);
+  QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_W));
+  QCOMPARE(spy.count(), 2);
+
+  // Reserved keys are NOT exempted while suspended: this router must not
+  // decide what Escape/Back/Menu mean while a text control owns focus.
+  QVERIFY(!sendKey(&target, QEvent::KeyPress, Qt::Key_Escape));
+  QCOMPARE(spy.count(), 2);
+  QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_Escape));
+  QCOMPARE(spy.count(), 2);
+
+  router.setSemanticInputSuspended(false);
+  QVERIFY(!router.isTextEntrySuspended());
+
+  // Resuming restores completely normal dispatch for a brand-new press.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_W));
+  QCOMPARE(spy.count(), 3);
+  QCOMPARE(spy.constLast().at(0).value<SemanticCommand>(),
+           SemanticCommand::FocusUp);
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_W));
+  QCOMPARE(spy.count(), 4);
+}
+
+void InputRouterTests::
+    suspendingMidHoldClearsTheHoldSoItsReleaseIsNotDispatched() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+
+  // Press and hold W: this arms a FocusUp hold exactly like any other
+  // bound key.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_W));
+  QCOMPARE(spy.count(), 1);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+
+  // Suspending mid-hold (e.g. the user clicked into a text field while
+  // still physically holding W) must forget that hold immediately --
+  // not just start ignoring *new* presses -- so the eventual release
+  // event (which arrives while still suspended) is not misinterpreted
+  // as belonging to a command this router no longer owns.
+  router.setSemanticInputSuspended(true);
+  QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_W));
+  QCOMPARE(spy.count(), 1);
+
+  router.setSemanticInputSuspended(false);
+
+  // A fresh press afterwards must start a brand-new hold and dispatch
+  // normally -- proving no stale armed state survived the suspend/
+  // resume round trip to swallow this press instead.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_W));
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Pressed);
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_W));
+  QCOMPARE(spy.count(), 3);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Released);
+}
+
+void InputRouterTests::
+    disablingAutomaticDetectionLeavesExplicitSuspensionAsTheOnlyGate() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  // With no QGuiApplication instance (this test binary is
+  // QTEST_GUILESS_MAIN), automatic detection can never actually observe
+  // a focused text control regardless of whether it is enabled --
+  // toggling it here must not affect isTextEntrySuspended() at all while
+  // the explicit override is untouched.
+  QVERIFY(!router.isTextEntrySuspended());
+  router.setAutomaticTextEntryDetectionEnabled(false);
+  QVERIFY(!router.isAutomaticTextEntryDetectionEnabled());
+  QVERIFY(!router.isTextEntrySuspended());
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_W));
+  QCOMPARE(spy.count(), 1);
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_W));
+  QCOMPARE(spy.count(), 2);
+
+  router.setAutomaticTextEntryDetectionEnabled(true);
+  QVERIFY(router.isAutomaticTextEntryDetectionEnabled());
+  QVERIFY(!router.isTextEntrySuspended());
 }
 
 QTEST_GUILESS_MAIN(InputRouterTests)

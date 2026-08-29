@@ -66,9 +66,38 @@ namespace Arkham {
 // transition fall through to default Qt key handling could re-trigger a
 // side effect (e.g. Qt's own Tab-key focus-chain handling) for a key this
 // router already owns, even though no new command is dispatched for it.
-// A key event whose physical key is not bound at all is never consumed,
-// so ordinary text input and any other default key handling keep
-// working normally.
+// A key event whose physical key is not bound at all is never consumed.
+//
+// Text entry: many default bindings (see InputMapper::resetToDefaults())
+// are ordinary alphanumeric letters -- W/A/S/D, X, H, P, I, L, Q, E, J,
+// Y, C, R, 0, etc. -- chosen to match generic-controller/Steam Input
+// conventions. Installed on a real window, this router would otherwise
+// unconditionally intercept every one of those keys at the event-filter
+// level *before* a focused native/QML text-entry control (TextField,
+// TextInput, TextArea, a SpinBox's editable text, ...) ever sees them,
+// making it impossible to type ordinary text into any such control while
+// this router is installed. isTextEntrySuspended() below is the
+// production gate for this: while it reports true, every KeyPress/
+// KeyRelease is treated exactly like an event for an unbound key --
+// never consumed, never dispatched, regardless of any binding, including
+// the three reserved keys -- so a focused text control (and Qt's own
+// default key handling generally) behaves exactly as if this router were
+// not installed at all. There are two independent, ORed ways this can
+// become true; see their own doc comments below for the full contract:
+// setSemanticInputSuspended() (an explicit host-driven override) and
+// setAutomaticTextEntryDetectionEnabled() (automatic per-event detection
+// via Qt's own input-method query mechanism, on by default). Because
+// this codebase has no separate device-specific input path (see
+// InputMapper.h: generic-controller/Steam Input events arrive as
+// ordinary QKeyEvents, including Qt::Key_Gamepad*, through this exact
+// same filter), suspension applies uniformly to keyboard- and
+// controller-sourced events alike -- the simplest safe policy, so a
+// controller cannot "type" semantic commands into a focused text field
+// either. Reserved Escape/Back/Menu are also suspended: while a text
+// control owns focus, this router does not decide what Escape/Back
+// means (e.g. discarding entered text vs. dismissing a dialog vs. doing
+// nothing) -- that decision is left entirely to the focused control /
+// host, exactly as it would be with no InputRouter installed.
 class InputRouter final : public QObject {
   Q_OBJECT
 
@@ -89,6 +118,64 @@ public:
   [[nodiscard]] bool isInstalled() const;
   [[nodiscard]] QObject *installedTarget() const;
 
+  // True if semantic-command dispatch is currently suspended for every
+  // physical key -- see the class comment's "Text entry" section. This
+  // is the logical OR of isSemanticInputExplicitlySuspended() and a live
+  // automatic-detection check (only performed when
+  // isAutomaticTextEntryDetectionEnabled() is true), so it can change
+  // from one call to the next purely because focus moved, with no
+  // setter having been called at all.
+  [[nodiscard]] bool isTextEntrySuspended() const;
+
+  // Explicit host-driven override, independent of automatic detection.
+  // Defaults to false (not suspended). Set this true for a text-entry
+  // surface automatic detection cannot see on its own (e.g. a plain
+  // QObject/QWidget with no Qt input-method-query support), or whenever a
+  // host wants full manual control regardless of what is currently
+  // focused. Setting this false does not disable automatic detection --
+  // isTextEntrySuspended() still ORs both together. Held/armed key state
+  // is cleared immediately (without dispatching anything) whenever this
+  // call actually changes the *effective* (OR'd) suspended state, so a
+  // hold spanning the transition can never later swallow a stray
+  // release or silently eat the next unrelated press. Safe to call at
+  // any time, including with nothing installed.
+  void setSemanticInputSuspended(bool suspended);
+  [[nodiscard]] bool isSemanticInputExplicitlySuspended() const;
+
+  // Automatic per-event detection of a focused text-entry control, using
+  // Qt's own input-method query mechanism: a QInputMethodQueryEvent
+  // requesting Qt::ImEnabled is sent synchronously to whichever focus
+  // object Qt itself currently considers focused for input-method
+  // purposes, each time eventFilter() considers a KeyPress/KeyRelease.
+  // That focus object is installedTarget()'s own QWindow::focusObject()
+  // when installedTarget() is a QWindow (for a QQuickWindow target this
+  // is the focused QQuickItem, which is not necessarily
+  // installedTarget() itself) -- this instance-level accessor reflects
+  // the window's own Qt Quick scene-graph focus regardless of real
+  // platform-level window activation, unlike the static
+  // QGuiApplication::focusObject(), which stays null under an
+  // unactivated/offscreen window (as in this project's own headless
+  // tests, and potentially some embedded/composited real deployments)
+  // even though the window's scene genuinely has an active focus item.
+  // QGuiApplication::focusObject() is used as a fallback for a
+  // non-QWindow installedTarget(), or when the target's own
+  // focusObject() is null. A focus object that never overrides input-
+  // method handling (an ordinary non-text QQuickItem, or no focus object
+  // at all, or no QGuiApplication instance at all -- e.g. under
+  // QTEST_GUILESS_MAIN) safely reports "not enabled" rather than
+  // suspending. Enabled by default; disable this if a host wants total
+  // manual control via setSemanticInputSuspended() alone. Deliberately
+  // does NOT depend on any on-screen/virtual-keyboard visibility signal:
+  // that is compositor/platform-specific, can lag arbitrarily far behind
+  // the actual focus change, and never appears at all on a desktop/
+  // Steam-Deck-desktop-mode session with a physical keyboard attached --
+  // an unreliable proxy for "the focused control currently wants raw key
+  // events routed to it instead of semantic commands." Held/armed key
+  // state is cleared immediately whenever this call actually changes the
+  // effective suspended state, exactly like setSemanticInputSuspended().
+  void setAutomaticTextEntryDetectionEnabled(bool enabled);
+  [[nodiscard]] bool isAutomaticTextEntryDetectionEnabled() const;
+
 signals:
   void commandDispatched(Arkham::SemanticCommand command,
                          Arkham::CommandPhase phase);
@@ -97,9 +184,22 @@ protected:
   bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+  // Recomputes the effective (OR'd) suspended state from the current
+  // explicit override and (if enabled) a fresh automatic-detection
+  // query, and clears held/armed key state iff the result differs from
+  // the last-known value -- called from every public setter above (so a
+  // host-driven change takes effect immediately) and from eventFilter()
+  // itself right before handling each KeyPress/KeyRelease (so a focus
+  // change with no setter call still clears stale held state no later
+  // than the very next key event).
+  void refreshTextEntrySuspension();
+
   InputMapper &mapper_;
   QPointer<QObject> installedTarget_;
   bool destroying_ = false;
+  bool explicitlySuspended_ = false;
+  bool automaticDetectionEnabled_ = true;
+  bool effectiveSuspended_ = false;
 };
 
 } // namespace Arkham

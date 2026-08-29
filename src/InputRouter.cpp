@@ -1,10 +1,60 @@
 #include "InputRouter.h"
 
 #include <QCoreApplication>
+#include <QGuiApplication>
+#include <QInputMethodQueryEvent>
 #include <QKeyEvent>
 #include <QThread>
+#include <QWindow>
 
 namespace Arkham {
+
+namespace {
+
+// Whether the object Qt itself currently considers focused for input-
+// method purposes accepts text entry right now, per Qt's own input-
+// method query mechanism (the same one virtual keyboards use to decide
+// whether to show themselves). Prefers the installed target window's own
+// QWindow::focusObject() (an *instance* method, available without any
+// QtQuick dependency: QWindow is QtGui) over the static
+// QGuiApplication::focusObject(), because the static accessor only
+// reflects QGuiApplication::focusWindow() -- i.e. real platform-level
+// window activation -- which offscreen/headless test environments and
+// some embedded/composited setups (Gamescope included) never grant, even
+// though the window's own Qt Quick scene graph already has a perfectly
+// real, correct activeFocusItem. Falling back to the static accessor
+// keeps this correct for non-QWindow install() targets and for real,
+// actually-activated windows where both agree. Safe to call with no
+// QGuiApplication instance at all (e.g. under QTEST_GUILESS_MAIN, which
+// only creates a QCoreApplication): qobject_cast fails cleanly in that
+// case rather than risking undefined behavior from calling a
+// QGuiApplication:: static through an instance that is not actually one.
+// Equally safe when there is a QGuiApplication but no current focus
+// object, or a focus object that never overrides input-method handling
+// (an ordinary non-text QQuickItem): QInputMethodQueryEvent::value()
+// returns a default-constructed (invalid) QVariant for any query the
+// receiver never set, and QVariant().toBool() is false.
+bool focusedObjectAcceptsTextEntry(QObject *installedTarget) {
+  auto *guiApp = qobject_cast<QGuiApplication *>(QCoreApplication::instance());
+  if (guiApp == nullptr) {
+    return false;
+  }
+  QObject *focusObject = nullptr;
+  if (auto *window = qobject_cast<QWindow *>(installedTarget)) {
+    focusObject = window->focusObject();
+  }
+  if (focusObject == nullptr) {
+    focusObject = guiApp->focusObject();
+  }
+  if (focusObject == nullptr) {
+    return false;
+  }
+  QInputMethodQueryEvent query(Qt::ImEnabled);
+  QCoreApplication::sendEvent(focusObject, &query);
+  return query.value(Qt::ImEnabled).toBool();
+}
+
+} // namespace
 
 InputRouter::InputRouter(InputMapper &mapper, QObject *parent)
     : QObject(parent), mapper_(mapper) {}
@@ -53,6 +103,52 @@ bool InputRouter::isInstalled() const { return !installedTarget_.isNull(); }
 
 QObject *InputRouter::installedTarget() const { return installedTarget_; }
 
+bool InputRouter::isTextEntrySuspended() const {
+  return explicitlySuspended_ ||
+         (automaticDetectionEnabled_ &&
+          focusedObjectAcceptsTextEntry(installedTarget_));
+}
+
+void InputRouter::setSemanticInputSuspended(const bool suspended) {
+  explicitlySuspended_ = suspended;
+  refreshTextEntrySuspension();
+}
+
+bool InputRouter::isSemanticInputExplicitlySuspended() const {
+  return explicitlySuspended_;
+}
+
+void InputRouter::setAutomaticTextEntryDetectionEnabled(const bool enabled) {
+  automaticDetectionEnabled_ = enabled;
+  refreshTextEntrySuspension();
+}
+
+bool InputRouter::isAutomaticTextEntryDetectionEnabled() const {
+  return automaticDetectionEnabled_;
+}
+
+void InputRouter::refreshTextEntrySuspension() {
+  // Deliberately recomputes the same OR'd expression isTextEntrySuspended()
+  // itself evaluates, rather than reusing any cached value: the sole
+  // purpose of this helper is bookkeeping (clearing held/armed state
+  // exactly on a transition), never to serve as the public getter's
+  // backing store -- isTextEntrySuspended() must always reflect the
+  // live state, even between key events, so a caller can observe a
+  // focus-driven change the moment it asks, not just after the next key
+  // arrives.
+  const bool newSuspended = isTextEntrySuspended();
+  if (newSuspended == effectiveSuspended_) {
+    return;
+  }
+  effectiveSuspended_ = newSuspended;
+  // See the class comment on setSemanticInputSuspended(): a hold
+  // spanning a suspend/resume transition must never survive it, or a
+  // stale release/next press could be mishandled once the transition
+  // has already changed which physical keys this router is allowed to
+  // touch.
+  mapper_.clearHeldKeys();
+}
+
 bool InputRouter::eventFilter(QObject *watched, QEvent *event) {
   // Guards against dispatching from an event that was already queued (via
   // postEvent, or simply pending in the queue) before uninstall()/
@@ -81,6 +177,22 @@ bool InputRouter::eventFilter(QObject *watched, QEvent *event) {
   if (event->type() != QEvent::KeyPress &&
       event->type() != QEvent::KeyRelease) {
     return QObject::eventFilter(watched, event);
+  }
+
+  // Recomputed fresh before every KeyPress/KeyRelease decision, not just
+  // when a setter is called: automatic detection depends on whatever Qt
+  // currently considers the focus object, which can change (e.g. a
+  // TextField gaining active focus) with no notification to this router
+  // at all. This also guarantees held/armed state is cleared no later
+  // than the very next key event after any such change -- see
+  // refreshTextEntrySuspension()'s own comment.
+  refreshTextEntrySuspension();
+  if (effectiveSuspended_) {
+    // Text entry owns this key: treat it exactly like an event for a
+    // key this mapper has never heard of, regardless of any binding --
+    // including the three reserved keys (see the class comment's "Text
+    // entry" section for why Escape/Back/Menu are not exempted here).
+    return false;
   }
 
   auto *keyEvent = static_cast<QKeyEvent *>(event);

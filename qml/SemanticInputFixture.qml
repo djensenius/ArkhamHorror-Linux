@@ -248,7 +248,46 @@ ApplicationWindow {
         }
     }
 
+    // A real native Qt text control, deliberately outside the semantic
+    // focus graph: it is never passed to registerItem()/itemsById, never
+    // reachable via any FocusController zone/directional command. Like
+    // every semantic delegate above, activeFocusOnTab is explicitly
+    // false: TextField is the only Control in this window whose default
+    // is true, so leaving it untouched would make an unbound Tab press
+    // from any semantic delegate move real Qt active focus here while
+    // FocusController's currentFocusId stayed unchanged -- precisely the
+    // semantic/native focus divergence this fixture must never exhibit
+    // (see tabAndBacktabNeverDivergeSemanticFocusFromRealQmlActiveFocus).
+    // Real text entry is instead entered via an explicit
+    // forceActiveFocus() call (see SemanticInputFixtureTests.cpp's
+    // textEntry* tests), representing whatever production mechanism
+    // (mouse click, an explicit command) hands it focus outside this
+    // slice's scope. Its sole purpose once focused is to exercise
+    // InputRouter's text-entry suspension gate end-to-end: while it
+    // holds real Qt active focus, InputMapper's ordinary default
+    // bindings (W/A/S/D/Space/Return/Backspace/arrows/etc.) must reach
+    // its own native key handling instead of being consumed as semantic
+    // commands -- see the router's "Text entry" class comment.
+    TextField {
+        id: textEntryField
+
+        objectName: "textEntryField"
+        activeFocusOnTab: false
+        anchors {
+            bottom: focusedLabel.top
+            horizontalCenter: parent.horizontalCenter
+            margins: 16
+        }
+        width: 320
+        placeholderText: qsTr("Notes")
+
+        Accessible.role: Accessible.EditableText
+        Accessible.name: qsTr("Notes")
+    }
+
     Label {
+        id: focusedLabel
+
         anchors {
             bottom: parent.bottom
             horizontalCenter: parent.horizontalCenter
