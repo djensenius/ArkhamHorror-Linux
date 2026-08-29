@@ -68,7 +68,8 @@ struct TokenEnvelopeParseResult {
 // result. |raw| must already be known non-empty/non-whitespace-only --
 // callers are expected to have handled that degenerate case themselves
 // (see QtKeychainTokenStore::readToken(), which maps an entirely blank
-// stored value to a BackendError before this function is ever called).
+// stored value to TokenStoreOutcome::Malformed before this function is
+// ever called).
 [[nodiscard]] TokenEnvelopeParseResult parseTokenEnvelope(const QString &raw);
 
 } // namespace Arkham

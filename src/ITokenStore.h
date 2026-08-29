@@ -40,10 +40,18 @@ enum class TokenStoreOutcome {
                    ///< proven, so -- exactly like BindingMismatch -- no token
                    ///< is ever returned; it must be treated as
                    ///< cleanup-required, never auto-migrated or trusted.
-  Malformed,       ///< readToken() found an entry that declares this store's
-                   ///< envelope format but fails strict structural parsing
-                   ///< (unsupported version, corrupt framing, truncated
-                   ///< content). No token is ever returned; treated as
+  Malformed,       ///< readToken() found an entry that either declares this
+                   ///< store's envelope format but fails strict structural
+                   ///< parsing (unsupported version, corrupt framing,
+                   ///< truncated content, or a token portion that is empty,
+                   ///< whitespace-only, has leading/trailing whitespace, or
+                   ///< contains a control character -- see
+                   ///< TokenEnvelope.h's own doc comment on why this
+                   ///< grammar check is included here), or is an entirely
+                   ///< blank/whitespace-only raw payload that predates any
+                   ///< envelope framing at all. Both are definitively
+                   ///< corrupt/tampered data, never a transient backend
+                   ///< issue. No token is ever returned; treated as
                    ///< cleanup-required exactly like BindingMismatch/
                    ///< LegacyUnbound.
 };
