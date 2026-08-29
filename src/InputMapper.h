@@ -155,23 +155,32 @@ public:
   //    keep returning std::nullopt for the rest of that hold, rather
   //    than emitting a Repeated or Released with no preceding
   //    dispatched Pressed for that same hold.
+  //  - Conversely, once a hold *is* armed (its Pressed was dispatched
+  //    for some command), every later Repeated/Released for that same
+  //    hold always reports that exact same command -- captured at
+  //    press time -- even if the key is remapped to a different
+  //    command or unbound entirely before it is released. A single
+  //    physical hold can never appear to change or lose its command
+  //    partway through.
   [[nodiscard]] std::optional<DispatchedCommand>
   processKey(const PhysicalKey &physicalKey, bool isPress, bool isAutoRepeat);
 
 private:
   // Per-held-key state: a key present in |heldKeys_| is physically held
-  // down regardless of whether it is currently bound to a command.
-  // |Armed| additionally means a Pressed was actually dispatched for
-  // this specific hold; only an Armed hold may go on to dispatch
-  // Repeated/Released, so a key that was unbound at press time (and
-  // only became bound later, mid-hold, via remap()) can never emit a
-  // Repeated or Released with no matching Pressed -- it stays silent
-  // for the rest of that hold instead, preserving the Pressed/
-  // Repeated*/Released contract documented on CommandPhase.
-  enum class HoldState { Unarmed, Armed };
-
+  // down regardless of whether it is currently bound to a command. A
+  // present-but-empty optional means the hold is *unarmed* (it was
+  // unbound at press time); a present value means the hold is armed
+  // and is the exact command captured at press time, reused verbatim
+  // for every later Repeated/Released of this same hold regardless of
+  // any remap()/unbind() that happens while the key is still held. Only
+  // an armed hold may go on to dispatch Repeated/Released, so a key
+  // that was unbound at press time (and only became bound later,
+  // mid-hold, via remap()) can never emit a Repeated or Released with
+  // no matching Pressed -- it stays silent for the rest of that hold
+  // instead, preserving the Pressed/Repeated*/Released contract
+  // documented on CommandPhase.
   QHash<PhysicalKey, SemanticCommand> bindings_;
-  QHash<PhysicalKey, HoldState> heldKeys_;
+  QHash<PhysicalKey, std::optional<SemanticCommand>> heldKeys_;
 
   static bool isReservedKey(const PhysicalKey &physicalKey);
 };

@@ -26,6 +26,8 @@ private slots:
   void strayReleaseWithoutAPriorPressIsDeduped();
   void autoRepeatBeforeAnyRealPressIsDeduped();
   void bindingAKeyMidHoldNeverProducesARepeatedOrReleasedWithoutAPressed();
+  void rebindingAnArmedHeldKeyStillReleasesTheOriginallyDispatchedCommand();
+  void unbindingAnArmedHeldKeyStillReleasesTheOriginallyDispatchedCommand();
   void resetToDefaultsClearsHeldStateAndCustomBindings();
   void modifiersDistinguishOtherwiseIdenticalKeys();
 
@@ -239,6 +241,69 @@ void InputMapperTests::
   QCOMPARE(repeated->phase, CommandPhase::Repeated);
   const auto released = mapper.processKey(f1, false, false);
   QVERIFY(released.has_value());
+  QCOMPARE(released->phase, CommandPhase::Released);
+}
+
+void InputMapperTests::
+    rebindingAnArmedHeldKeyStillReleasesTheOriginallyDispatchedCommand() {
+  InputMapper mapper;
+  // Up is bound to FocusUp by default; press it so the hold is armed
+  // with FocusUp specifically.
+  const PhysicalKey up = key(Qt::Key_Up);
+  const auto pressed = mapper.processKey(up, true, false);
+  QVERIFY(pressed.has_value());
+  QCOMPARE(pressed->command, SemanticCommand::FocusUp);
+
+  // Remap the same physical key to an entirely different command while
+  // it is still physically held (unbind first, since remap() refuses to
+  // steal a key already bound to a different command).
+  QVERIFY(mapper.unbind(up));
+  QVERIFY(!mapper.remap(up, SemanticCommand::Undo).has_value());
+  QCOMPARE(mapper.commandFor(up), SemanticCommand::Undo);
+
+  // Every later phase of *this same hold* must keep reporting the
+  // command that was actually dispatched at press time (FocusUp), never
+  // the new binding (Undo): a single physical hold can never appear to
+  // change which command it belongs to partway through.
+  const auto repeated = mapper.processKey(up, true, true);
+  QVERIFY(repeated.has_value());
+  QCOMPARE(repeated->command, SemanticCommand::FocusUp);
+  QCOMPARE(repeated->phase, CommandPhase::Repeated);
+
+  const auto released = mapper.processKey(up, false, false);
+  QVERIFY(released.has_value());
+  QCOMPARE(released->command, SemanticCommand::FocusUp);
+  QCOMPARE(released->phase, CommandPhase::Released);
+
+  // A fresh press after the release correctly reports the new binding.
+  const auto freshPress = mapper.processKey(up, true, false);
+  QVERIFY(freshPress.has_value());
+  QCOMPARE(freshPress->command, SemanticCommand::Undo);
+}
+
+void InputMapperTests::
+    unbindingAnArmedHeldKeyStillReleasesTheOriginallyDispatchedCommand() {
+  InputMapper mapper;
+  const PhysicalKey up = key(Qt::Key_Up);
+  const auto pressed = mapper.processKey(up, true, false);
+  QVERIFY(pressed.has_value());
+  QCOMPARE(pressed->command, SemanticCommand::FocusUp);
+
+  // Unbind the key entirely while it is still physically held.
+  QVERIFY(mapper.unbind(up));
+  QVERIFY(!mapper.commandFor(up).has_value());
+
+  // The already-dispatched Pressed for this hold still gets its
+  // matching Released (and would still get Repeated, if repeated)
+  // reporting the originally-dispatched command, even though the key is
+  // now completely unbound.
+  const auto repeated = mapper.processKey(up, true, true);
+  QVERIFY(repeated.has_value());
+  QCOMPARE(repeated->command, SemanticCommand::FocusUp);
+
+  const auto released = mapper.processKey(up, false, false);
+  QVERIFY(released.has_value());
+  QCOMPARE(released->command, SemanticCommand::FocusUp);
   QCOMPARE(released->phase, CommandPhase::Released);
 }
 

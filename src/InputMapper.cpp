@@ -159,30 +159,32 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
       // A repeat can never establish new held-state on its own, and can
       // never continue a hold that never actually had a dispatched
       // Pressed (e.g. the key was unbound for the whole press so far):
-      // it must follow a real press that itself produced a Pressed.
-      if (!currentlyHeld || heldIt.value() != HoldState::Armed) {
+      // it must follow a real press that itself produced a Pressed. It
+      // always reuses that same armed command, even if the key has
+      // since been remapped or unbound, so this hold's phases can never
+      // disagree about which command they belong to.
+      if (!currentlyHeld || !heldIt.value().has_value()) {
         return std::nullopt;
       }
-    } else {
-      if (currentlyHeld) {
-        // Stray duplicate press without an intervening release (e.g.
-        // across a focus-loss/regrab): suppressed, held state unchanged.
-        return std::nullopt;
-      }
-      heldKeys_.insert(physicalKey, HoldState::Unarmed);
+      return DispatchedCommand{*heldIt.value(), CommandPhase::Repeated};
     }
 
+    if (currentlyHeld) {
+      // Stray duplicate press without an intervening release (e.g.
+      // across a focus-loss/regrab): suppressed, held state unchanged.
+      return std::nullopt;
+    }
+
+    // Look the command up once, at press time, and arm the hold with
+    // exactly that result (which may be std::nullopt if unbound); every
+    // later Repeated/Released for this same hold reuses this same
+    // stored value rather than re-querying the current bindings.
     const auto command = commandFor(physicalKey);
+    heldKeys_.insert(physicalKey, command);
     if (!command.has_value()) {
       return std::nullopt;
     }
-    if (!isAutoRepeat) {
-      // Only a real press arms the hold; this is what lets a later
-      // repeat/release for this same hold actually dispatch.
-      heldKeys_.insert(physicalKey, HoldState::Armed);
-    }
-    return DispatchedCommand{*command, isAutoRepeat ? CommandPhase::Repeated
-                                                    : CommandPhase::Pressed};
+    return DispatchedCommand{*command, CommandPhase::Pressed};
   }
 
   // Release.
@@ -190,23 +192,19 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
     // Stray release (never pressed, or already released): suppressed.
     return std::nullopt;
   }
-  const bool wasArmed = heldIt.value() == HoldState::Armed;
+  const std::optional<SemanticCommand> armedCommand = heldIt.value();
   // Remove rather than store an unheld marker: a key that's not held has
   // no useful state to remember, so this keeps heldKeys_ bounded to only
   // the keys currently pressed instead of growing for every key ever
   // seen over the process lifetime.
   heldKeys_.remove(physicalKey);
-  if (!wasArmed) {
+  if (!armedCommand.has_value()) {
     // This hold never had a dispatched Pressed (it was unbound for the
     // entire press), so it must not dispatch a Released either.
     return std::nullopt;
   }
 
-  const auto command = commandFor(physicalKey);
-  if (!command.has_value()) {
-    return std::nullopt;
-  }
-  return DispatchedCommand{*command, CommandPhase::Released};
+  return DispatchedCommand{*armedCommand, CommandPhase::Released};
 }
 
 } // namespace Arkham
