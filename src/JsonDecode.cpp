@@ -379,6 +379,56 @@ ValueOrError<QString> scientificShow(double value, QStringView path) {
   return negative ? u'-' + out : out;
 }
 
+namespace {
+// JSON string-escapes `key` for splicing as an object member name.
+// QLatin1StringView's bytes are Latin-1 code units, so every byte value is
+// numerically identical to its Unicode code point (U+0000-U+00FF); any
+// byte outside printable, non-quote/backslash ASCII is therefore safe (and
+// exact) to emit as a `\u00XX` escape rather than a raw byte, which keeps
+// the result valid UTF-8 JSON regardless of what the caller's key
+// contains.
+QByteArray escapeJsonKeyBytes(QLatin1StringView key) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  QByteArray out;
+  out.reserve(key.size());
+  for (const char rawChar : key) {
+    const auto ch = static_cast<unsigned char>(rawChar);
+    switch (ch) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\b':
+      out += "\\b";
+      break;
+    case '\f':
+      out += "\\f";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    default:
+      if (ch < 0x20 || ch >= 0x7F) {
+        out += "\\u00";
+        out += kHex[(ch >> 4) & 0xF];
+        out += kHex[ch & 0xF];
+      } else {
+        out += static_cast<char>(ch);
+      }
+    }
+  }
+  return out;
+}
+} // namespace
+
 QByteArray spliceRawJsonMember(const QJsonObject &obj, QLatin1StringView key,
                                QByteArrayView rawValueBytes) {
   QByteArray bytes = QJsonDocument(obj).toJson(QJsonDocument::Compact);
@@ -388,7 +438,7 @@ QByteArray spliceRawJsonMember(const QJsonObject &obj, QLatin1StringView key,
   if (!obj.isEmpty())
     bytes += ',';
   bytes += '"';
-  bytes += QByteArrayView(key.data(), key.size());
+  bytes += escapeJsonKeyBytes(key);
   bytes += "\":";
   bytes += rawValueBytes;
   bytes += '}';

@@ -213,8 +213,15 @@ template <typename Enum, std::size_t N>
 // as an additional object member -- bypassing QJsonValue for that member's
 // value entirely, so a value QJsonValue cannot represent exactly (e.g. an
 // arbitrary-precision JSON number literal spliced in by a caller building
-// on RawJson.h) can still be encoded byte-exact. `obj` must not already
-// contain `key`.
+// on RawJson.h) can still be encoded byte-exact. `key` itself is JSON
+// string-escaped before splicing (quotes/backslashes/control characters
+// are backslash-escaped; any byte outside printable ASCII is emitted as a
+// `\u00XX` escape, which is exact for QLatin1StringView since every
+// Latin-1 byte value is numerically identical to its Unicode code point)
+// -- callers are not required to pass a literal/pre-escaped key. `obj`
+// must not already contain `key`. `rawValueBytes` is trusted verbatim and
+// is the caller's responsibility to have already validated as syntactically
+// valid JSON (see e.g. RawJson.h's strict parser).
 [[nodiscard]] QByteArray spliceRawJsonMember(const QJsonObject &obj,
                                              QLatin1StringView key,
                                              QByteArrayView rawValueBytes);

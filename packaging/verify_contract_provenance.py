@@ -76,7 +76,9 @@ def _read_governed_digests(repo_root: Path) -> list[tuple[str, str]]:
 
 
 def _read_pinned_commit(repo_root: Path) -> str:
-    pin = json.loads((repo_root / "contracts" / "contract-pin.json").read_text())
+    pin = json.loads(
+        (repo_root / "contracts" / "contract-pin.json").read_text(encoding="utf-8")
+    )
     commit = pin["backendCommit"]
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise RuntimeError(

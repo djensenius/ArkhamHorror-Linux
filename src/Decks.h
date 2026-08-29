@@ -28,15 +28,22 @@ struct ExternalDeckId {
   ExternalDeckIdTag tag{ExternalDeckIdTag::Absent};
   // Populated only when tag == Text.
   QString text;
-  // Populated only when tag == Number: the number's exact JSON literal
-  // text (sign/digits/fraction/exponent verbatim, never rounded through a
-  // double). ArkhamDB is known to hand out deck ids past double's
-  // exact-integer range (2^53), so fromObject()/toJson() below -- which
-  // must operate on an already-parsed QJsonValue/QJsonObject and therefore
-  // cannot recover precision QJsonDocument has already destroyed -- are
-  // only a best-effort fallback; fromRawBytes()/toJsonBytes() are this
-  // type's genuinely lossless entry points and should be preferred by any
-  // caller that has the original bytes.
+  // Populated only when tag == Number: the number's JSON literal text
+  // (sign/digits/fraction/exponent), reconstructed via
+  // Json::RawNumber::literal()/Json::scientificShow() without ever
+  // rounding through a double, so arbitrary-precision integers past
+  // double's exact-integer range (2^53) -- which ArkhamDB is known to hand
+  // out as deck ids -- round-trip exactly. This is precision-preserving,
+  // not necessarily byte-for-byte: RawNumber::literal() always spells the
+  // exponent marker lowercase ('e') and omits a redundant leading '+' on a
+  // positive exponent, so a source literal spelled e.g. "1E+5" is
+  // canonicalized to "1e5" here (same numeric value, different spelling).
+  // fromObject()/toJson() below -- which must operate on an
+  // already-parsed QJsonValue/QJsonObject and therefore cannot recover
+  // precision QJsonDocument has already destroyed -- are only a
+  // best-effort fallback; fromRawBytes()/toJsonBytes() are this type's
+  // genuinely lossless (up to the canonicalization above) entry points
+  // and should be preferred by any caller that has the original bytes.
   QString numberLiteral;
 
   // Reads the "id" key directly from obj (needs the whole object, not just
@@ -56,7 +63,8 @@ struct ExternalDeckId {
   [[nodiscard]] QJsonValue toJson() const;
   // The exact JSON literal to splice into a byte-level encode for this id
   // (used by DeckListInput::toJsonBytes()); only meaningful for tag ==
-  // Number, where it returns numberLiteral verbatim.
+  // Number, where it returns numberLiteral (see that field's doc comment
+  // on the precision-vs-verbatim distinction).
   [[nodiscard]] const QString &toJsonLiteral() const { return numberLiteral; }
 
   friend bool operator==(const ExternalDeckId &,
@@ -101,8 +109,9 @@ struct DeckListInput {
   fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
   // Precision-preserving equivalent of toJson(): identical bytes except
-  // `id`'s numeric variant is spliced in verbatim from its exact source
-  // literal rather than re-encoded through a double.
+  // `id`'s numeric variant is spliced in from its canonicalized source
+  // literal (see ExternalDeckId::numberLiteral) rather than re-encoded
+  // through a double.
   [[nodiscard]] QByteArray toJsonBytes() const;
 
   friend bool operator==(const DeckListInput &,

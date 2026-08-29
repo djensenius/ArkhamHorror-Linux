@@ -44,6 +44,8 @@ private slots:
   void externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly();
   void toJsonBytesRejectsInvalidNumberLiteralInsteadOfSplicingItRaw();
   void toJsonBytesRejectsInjectionAttemptInNumberLiteral();
+  void spliceRawJsonMemberEscapesQuotesAndBackslashesInKey();
+  void spliceRawJsonMemberEscapesControlAndNonAsciiBytesInKey();
   void createDeckRequestFromRawBytesPreservesEveryIdVariantExactly();
 
   // sideSlots malformed/absent behavior ──────────────────────────────────────
@@ -437,6 +439,48 @@ void DecksTests::toJsonBytesRejectsInjectionAttemptInNumberLiteral() {
   QVERIFY(reparsed->isObject());
   QVERIFY(!reparsed->contains("evil"_L1));
   QVERIFY(!reencoded.contains("evil"));
+}
+
+void DecksTests::spliceRawJsonMemberEscapesQuotesAndBackslashesInKey() {
+  // spliceRawJsonMember() is a public, reusable helper -- it must not
+  // trust its `key` argument to already be a syntactically-safe JSON
+  // string. A key containing an embedded quote or backslash must be
+  // escaped rather than splicing those bytes in raw (which would either
+  // terminate the key string early, corrupting the object, or attach
+  // meaning to the following bytes as escape sequences).
+  const QJsonObject obj{{QStringLiteral("existing"), 1}};
+  const QByteArray bytes =
+      Json::spliceRawJsonMember(obj, R"("evil":true,"x)"_L1, "42");
+  auto reparsed = Json::Value::parse(bytes, u"reencoded");
+  if (!reparsed)
+    QFAIL(qPrintable(QStringLiteral("spliceRawJsonMember() produced invalid "
+                                    "JSON: %1")
+                         .arg(reparsed.error())));
+  QVERIFY(reparsed->isObject());
+  // The escaped key round-trips as a single member whose *value* is 42 --
+  // not as an injected top-level "evil" member.
+  QVERIFY(!reparsed->contains("evil"_L1));
+  QCOMPARE(reparsed->value(R"("evil":true,"x)"_L1).toRawNumber().literal(),
+           QStringLiteral("42"));
+}
+
+void DecksTests::spliceRawJsonMemberEscapesControlAndNonAsciiBytesInKey() {
+  // A key containing a raw newline or a Latin-1 byte above ASCII must
+  // still produce valid, well-formed UTF-8 JSON bytes: both must be
+  // \u-escaped rather than emitted verbatim.
+  const QJsonObject obj;
+  const QByteArray bytes =
+      Json::spliceRawJsonMember(obj, QLatin1StringView("line\nbreak"), "1");
+  auto reparsed = Json::Value::parse(bytes, u"reencoded");
+  if (!reparsed)
+    QFAIL(qPrintable(QStringLiteral("spliceRawJsonMember() produced invalid "
+                                    "JSON: %1")
+                         .arg(reparsed.error())));
+  QVERIFY(reparsed->isObject());
+  QCOMPARE(reparsed->value("line\nbreak"_L1).toRawNumber().literal(),
+           QStringLiteral("1"));
+  // The raw control byte must not appear unescaped in the output bytes.
+  QVERIFY(!bytes.contains('\n'));
 }
 
 void DecksTests::createDeckRequestFromRawBytesPreservesEveryIdVariantExactly() {
