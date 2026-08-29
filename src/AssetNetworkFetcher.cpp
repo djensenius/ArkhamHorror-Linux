@@ -283,6 +283,16 @@ void AssetNetworkFetcher::handleReadyRead(quint64 handle) {
     // Content-Length to be.
     pending.buffer.append(chunk.left(remaining));
     pending.overflowed = true;
+    // Stop the per-request timeout timer here, not just in
+    // handleFinished() once the abort's finished() signal is actually
+    // delivered: abort() does not guarantee finished() fires
+    // synchronously, so without this a timeout whose interval elapses in
+    // that gap would fire first and misreport this exact
+    // ResponseTooLarge outcome as a generic Transport (timeout) error
+    // instead.
+    if (pending.timer) {
+      pending.timer->stop();
+    }
     pending.reply->abort();
     return;
   }
