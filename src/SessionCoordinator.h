@@ -197,9 +197,11 @@ public slots:
   void start();
 
   // Switches to a different loaded profile. Persists the new selection
-  // before using it; if persistence fails, the current profile/session is
-  // left completely untouched and ProfileStorageFailure is reported (the
-  // failed switch never silently "succeeds"). On successful persistence,
+  // before using it; if persistence fails, the selected profile and any
+  // existing session/identity are left unchanged (the failed switch never
+  // silently "succeeds"), while the failure is itself reported via a
+  // ProfileStorageFailure state/diagnostic transition for retry. On
+  // successful persistence,
   // cancels any in-flight authentication request, discards the current
   // capability probe instance, advances the operation generation (so any
   // still-in-flight, uncancellable token-store completion for the previous

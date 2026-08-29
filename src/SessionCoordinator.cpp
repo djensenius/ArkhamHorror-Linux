@@ -225,8 +225,9 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
   }
 
   // Persist the new selection BEFORE using it. A failure here must never
-  // pretend the switch succeeded: the current profile/session are left
-  // completely untouched.
+  // pretend the switch succeeded: the selected profile and any existing
+  // session/identity remain unchanged, while the failure is reported via
+  // an observable ProfileStorageFailure state/diagnostic transition below.
   const auto saveResult = m_profileStore.saveSelectedProfileId(profileId);
   if (!saveResult) {
     m_retryAction = [this, profileId] { switchProfile(profileId); };
