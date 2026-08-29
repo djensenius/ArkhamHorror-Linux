@@ -624,9 +624,26 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
   const quint64 expectedGeneration =
       issueCacheKeyGeneration(AssetCache::cacheKeyFor(candidate.url));
 
+  // Review round-4 item 1: the network transport's fetch() no longer
+  // accepts a bare QUrl at all (see AssetFetchUrl's class comment in
+  // AssetNetworkFetcher.h) -- every candidate URL, even one produced by
+  // this project's own trusted AssetLocator, must still pass through the
+  // same validating factory every other caller does. A real candidate
+  // always satisfies it trivially; this can only fail if AssetLocator's
+  // own resolution logic ever regresses, in which case failing this one
+  // operation closed with a typed error is correct and safe -- never a
+  // silent fall-through to an unvalidated fetch.
+  const AssetOutcome<AssetFetchUrl> validatedUrl =
+      AssetFetchUrl::validate(candidate.url);
+  if (!validatedUrl) {
+    completeOperation(operationId, AssetOutcome<AssetCache::CachedEntry>(
+                                       validatedUrl.error()));
+    return;
+  }
+
   QPointer<AssetRequestCoordinator> self(this);
   operation.fetchHandle = m_fetcher.fetch(
-      candidate.url, candidate.format, {},
+      *validatedUrl, candidate.format, {},
       [self, operationId, expectedGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {
@@ -737,9 +754,18 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
   conditional.etag = staleEntry.etag;
   conditional.lastModified = staleEntry.lastModified;
 
+  // Review round-4 item 1: see startCandidate()'s identical comment.
+  const AssetOutcome<AssetFetchUrl> validatedUrl =
+      AssetFetchUrl::validate(candidate.url);
+  if (!validatedUrl) {
+    completeOperation(operationId, AssetOutcome<AssetCache::CachedEntry>(
+                                       validatedUrl.error()));
+    return;
+  }
+
   QPointer<AssetRequestCoordinator> self(this);
   operation.fetchHandle = m_fetcher.fetch(
-      candidate.url, candidate.format, conditional,
+      *validatedUrl, candidate.format, conditional,
       [self, operationId, expectedGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {

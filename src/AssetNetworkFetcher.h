@@ -19,6 +19,38 @@ class QTimer;
 
 namespace Arkham {
 
+// Review round-4 item 1: the ONLY way AssetNetworkFetcher::fetch() can be
+// reached at all -- a QUrl by itself, however innocuous-looking, is never
+// an acceptable fetch() argument. An AssetFetchUrl cannot be default- or
+// copy-constructed from an arbitrary QUrl: its only public constructor
+// path is the validating factory validate(), which reuses this project's
+// existing shared transport-security policy exactly (see
+// isSecureOrLoopbackAuthTransport() in AuthTransportSecurity.h, already
+// used for the same purpose elsewhere) rather than forking a weaker,
+// asset-only reimplementation of "is this URL safe to request": https is
+// permitted to any host; http is permitted ONLY to an exact canonical
+// loopback spelling; a URL carrying userinfo, a missing host, a query
+// string, or a fragment is rejected outright. A real AssetCandidate::url
+// (built by AssetLocator from an already-validated ValidatedAssetSource
+// plus a hardened relative path -- see AssetTypes.cpp/AssetLocator.cpp)
+// always trivially satisfies this policy; an arbitrary, forged, or
+// otherwise unvalidated URL -- passed directly to fetch() by a future or
+// buggy call site, bypassing AssetLocator entirely -- can never become an
+// AssetFetchUrl in the first place, so it can never reach this class's
+// QNetworkAccessManager at all. There is no bypass constructor, public or
+// private, other than validate().
+class AssetFetchUrl {
+public:
+  [[nodiscard]] static AssetOutcome<AssetFetchUrl> validate(const QUrl &url);
+
+  [[nodiscard]] const QUrl &url() const { return m_url; }
+
+private:
+  explicit AssetFetchUrl(QUrl url) : m_url(std::move(url)) {}
+
+  QUrl m_url;
+};
+
 // Dedicated, credential-free HTTP fetcher for asset candidate URLs.
 //
 // Isolation and transport-security posture (deliberately mirrors
@@ -174,8 +206,10 @@ public:
   create(Limits limits = {},
          std::chrono::milliseconds timeout = kDefaultTimeout,
          QObject *parent = nullptr);
-  // Test/composition factory: borrows an externally-owned, isolated
+  // TEST-ONLY factory: borrows an externally-owned, isolated
   // QNetworkAccessManager (e.g. one pointed at a loopback test server).
+  // See the constructor of the same signature below for why production/
+  // composition code must never call this.
   [[nodiscard]] static AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>
   create(QNetworkAccessManager &nam, Limits limits = {},
          std::chrono::milliseconds timeout = kDefaultTimeout,
@@ -197,10 +231,24 @@ public:
   explicit AssetNetworkFetcher(
       Limits limits = {}, std::chrono::milliseconds timeout = kDefaultTimeout,
       QObject *parent = nullptr);
-  // Test constructor: borrows an externally-owned, isolated
+  // TEST-ONLY constructor: borrows an externally-owned, isolated
   // QNetworkAccessManager (e.g. one pointed at a loopback test server).
   // See the production constructor's comment above for the same
   // fail-closed-not-throwing configuration-validation behaviour.
+  //
+  // Review round-4 item 1: production/composition code must always use
+  // the owned-manager constructor (or create()) above, never this one.
+  // The borrowed manager is not this class's own object: this
+  // constructor still forces QNetworkProxy::NoProxy on it once here (see
+  // the .cpp), but fetch() ALSO re-asserts NoProxy immediately before
+  // every individual request precisely because a caller retaining its
+  // own live reference to the same borrowed manager could otherwise
+  // reconfigure its proxy at any later point, silently reintroducing
+  // exactly the credential/proxy leak this class exists to prevent. This
+  // constructor exists purely so tests can point a fetcher at an
+  // in-process loopback MockHttpServer without needing a real, separate
+  // QNetworkAccessManager per test case; it must never be reachable from
+  // any real application wiring.
   explicit AssetNetworkFetcher(
       QNetworkAccessManager &nam, Limits limits = {},
       std::chrono::milliseconds timeout = kDefaultTimeout,
@@ -222,23 +270,34 @@ public:
     return *m_configurationError;
   }
 
-  // Issues a GET for `url`, validating the response against `expectedFormat`
-  // as described in the class comment. `conditional` may be empty for a
-  // plain unconditional fetch. While this fetcher is alive, `callback` is
-  // invoked exactly once, asynchronously (never synchronously from within
-  // this call), with either the fetched result or a typed error. If this
-  // AssetNetworkFetcher is destroyed while the request is still pending,
-  // delivery is suppressed entirely (see the destructor) -- callers must
-  // not depend on `callback` firing once destruction is possible.
+  // Issues a GET for `fetchUrl.url()`, validating the response against
+  // `expectedFormat` as described in the class comment. `conditional` may
+  // be empty for a plain unconditional fetch. While this fetcher is
+  // alive, `callback` is invoked exactly once, asynchronously (never
+  // synchronously from within this call), with either the fetched result
+  // or a typed error. If this AssetNetworkFetcher is destroyed while the
+  // request is still pending, delivery is suppressed entirely (see the
+  // destructor) -- callers must not depend on `callback` firing once
+  // destruction is possible.
   //
-  // The returned handle is invalid (FetchHandle::isValid() == false) when
-  // `url`'s scheme is anything other than http/https: that request is
-  // rejected before any network operation begins, so there is nothing
-  // for cancel() to intercept, and `callback` will still fire with
+  // Review round-4 item 1: `fetchUrl` is an AssetFetchUrl, not a bare
+  // QUrl -- see that class's comment above. This is the structural
+  // enforcement point: there is no overload of fetch() anywhere that
+  // accepts an unvalidated QUrl, so an arbitrary or forged URL can never
+  // reach this method's QNetworkAccessManager at all, regardless of
+  // caller. A defence-in-depth scheme re-check still runs inside fetch()
+  // itself (see the .cpp) purely as a belt-and-braces safeguard against
+  // a hypothetical future bug in AssetFetchUrl::validate(); it can never
+  // actually trigger given AssetFetchUrl's construction invariant today.
+  //
+  // The returned handle is invalid (FetchHandle::isValid() == false) in
+  // that defence-in-depth case: that request is rejected before any
+  // network operation begins, so there is nothing for cancel() to
+  // intercept, and `callback` will still fire with
   // AssetErrorCode::UnsupportedScheme regardless of whether cancel() is
   // ever called on the returned handle. For every other request, the
   // returned handle is valid and eligible for cancel().
-  FetchHandle fetch(const QUrl &url, AssetFormat expectedFormat,
+  FetchHandle fetch(const AssetFetchUrl &fetchUrl, AssetFormat expectedFormat,
                     ConditionalHeaders conditional, FetchCallback callback);
 
   // Cancels a specific in-flight fetch. An invalid, stale, or unknown

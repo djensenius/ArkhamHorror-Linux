@@ -14,8 +14,23 @@
 #include <avif/avif.h>
 #include <cstring>
 #include <optional>
+#include <type_traits>
 
 using namespace Arkham;
+
+// Review round-4 item 1, compile-time proof: AssetFetchUrl has no public
+// constructor an arbitrary caller could invoke -- std::is_constructible_v
+// correctly evaluates accessibility (a private constructor makes the
+// expression ill-formed, which the trait reports as "not constructible"
+// rather than a hard compile error), so this statically documents and
+// enforces that no code anywhere -- test or production -- can construct
+// an AssetFetchUrl directly from a QUrl without going through the
+// validating validate() factory.
+static_assert(!std::is_constructible_v<AssetFetchUrl, QUrl>,
+              "AssetFetchUrl must not be constructible from an arbitrary "
+              "QUrl outside AssetFetchUrl::validate()");
+static_assert(!std::is_default_constructible_v<AssetFetchUrl>,
+              "AssetFetchUrl must not be default-constructible");
 
 namespace {
 
@@ -236,6 +251,22 @@ QByteArray patchAvifIspeBoxDimensions(const QByteArray &original, quint32 width,
   return patched;
 }
 
+// Review round-4 item 1: every direct fetch() call site in this file must
+// validate first, exactly like production code -- there is no overload
+// that accepts a bare QUrl. Every URL this test suite ever passes here is
+// a real loopback MockHttpServer URL, so a validation failure is always
+// a test bug; qFatal() for the same reason fetchAndWait()'s timeout
+// branch does.
+AssetFetchUrl mustValidate(const QUrl &url) {
+  AssetOutcome<AssetFetchUrl> validated = AssetFetchUrl::validate(url);
+  if (!validated) {
+    qFatal("mustValidate() was given a URL that failed "
+           "AssetFetchUrl::validate(): %s",
+           qPrintable(validated.error().message));
+  }
+  return *validated;
+}
+
 // Fetches synchronously (from the test's point of view) by pumping the
 // event loop until the callback fires or `timeoutMs` elapses. A timeout
 // here is always a test bug, never an expected outcome -- rather than
@@ -249,8 +280,21 @@ std::optional<Outcome>
 fetchAndWait(AssetNetworkFetcher &fetcher, const QUrl &url, AssetFormat format,
              AssetNetworkFetcher::ConditionalHeaders conditional = {},
              int timeoutMs = 5000) {
+  // Review round-4 item 1: fetch() no longer accepts a bare QUrl (see
+  // AssetFetchUrl's class comment) -- every test call site must validate
+  // first too, exactly like production code. Every URL this test suite's
+  // helper is ever called with is a real loopback MockHttpServer URL, so
+  // a validation failure here is always a test bug, not an expected
+  // outcome -- qFatal() for the same reason the timeout branch below
+  // does.
+  const AssetOutcome<AssetFetchUrl> validated = AssetFetchUrl::validate(url);
+  if (!validated) {
+    qFatal("fetchAndWait() was given a URL that failed "
+           "AssetFetchUrl::validate(): %s",
+           qPrintable(validated.error().message));
+  }
   std::optional<Outcome> result;
-  fetcher.fetch(url, format, conditional,
+  fetcher.fetch(*validated, format, conditional,
                 [&result](Outcome outcome) { result = std::move(outcome); });
   if (!QTest::qWaitFor([&result]() { return result.has_value(); }, timeoutMs)) {
     qFatal("fetchAndWait() timed out after %dms waiting for the fetch "
@@ -286,20 +330,17 @@ void AssetNetworkFetcherTests::successfulFetchNeverSendsCookiesOrAuthHeader() {
 
 void AssetNetworkFetcherTests::
     nonHttpSchemeIsRejectedAsUnsupportedSchemeWithoutTouchingNetwork() {
-  // Copilot review (round 26, high severity): AssetNetworkFetcher is
-  // documented as an HTTP(S)-only fetcher, but fetch() previously passed
-  // any URL straight to QNetworkAccessManager::get() with no scheme
-  // check of its own -- relying entirely on AssetLocator's
-  // UrlValidator::validateCustomUrl() gate upstream to keep non-http(s)
-  // schemes out. A future caller that ever invoked this class directly
-  // with an unvalidated URL (e.g. file://) could read arbitrary local
-  // filesystem contents rather than fetching over the network. This
-  // test proves the fetcher now fails closed on its own, independent of
-  // any upstream validation: a real, existing local file containing
-  // known "secret" bytes is never read at all -- the call fails with
-  // the typed UnsupportedScheme error, and the local file's content is
-  // never surfaced as a (mis-sniffed, but still leaked) successful
-  // result.
+  // Review round-4 item 1: AssetNetworkFetcher::fetch() no longer
+  // accepts a bare QUrl at all (see AssetFetchUrl's class comment in
+  // AssetNetworkFetcher.h) -- there is no overload, public or private,
+  // that would let this file:// URL reach fetch() in the first place.
+  // This test now proves the STRONGER claim directly at the validation
+  // boundary: AssetFetchUrl::validate() itself rejects a non-http(s)
+  // scheme with the typed UnsupportedScheme error, so a real, existing
+  // local file containing known "secret" bytes is never read at all --
+  // there is no fetch() call, no QNetworkAccessManager involvement, and
+  // no possibility of the local file's content ever being surfaced as a
+  // (mis-sniffed, but still leaked) successful result.
   QTemporaryFile localFile;
   QVERIFY(localFile.open());
   const QByteArray secretBytes = QByteArrayLiteral("not-a-real-image-secret");
@@ -308,33 +349,85 @@ void AssetNetworkFetcherTests::
   const QUrl fileUrl = QUrl::fromLocalFile(localFile.fileName());
   QCOMPARE(fileUrl.scheme(), QStringLiteral("file"));
 
-  QNetworkAccessManager nam;
-  AssetNetworkFetcher fetcher(nam);
-  std::optional<AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult>>
-      result;
-  const AssetNetworkFetcher::FetchHandle handle = fetcher.fetch(
-      fileUrl, AssetFormat::Png, {},
-      [&result](
-          AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> outcome) {
-        result = std::move(outcome);
-      });
-  // Copilot review (round 29, medium severity): a scheme rejection is
-  // dispatched before any network operation exists for cancel() to
-  // intercept, so the returned handle must be invalid -- this documents
-  // (and lets callers detect, via isValid() alone) that cancel() could
-  // never actually have cancelled this queued UnsupportedScheme
-  // delivery, rather than silently returning a "valid" handle whose
-  // cancel() contract (invoke Cancelled exactly once) can never actually
-  // be honoured.
-  QVERIFY(!handle.isValid());
-  // cancel() on an invalid handle must remain a safe no-op: it must not
-  // crash and must not prevent the queued UnsupportedScheme callback
-  // from still firing exactly once below.
-  fetcher.cancel(handle);
-  QVERIFY(QTest::qWaitFor([&result]() { return result.has_value(); }, 5000));
+  const AssetOutcome<AssetFetchUrl> validated =
+      AssetFetchUrl::validate(fileUrl);
+  QVERIFY(!validated);
+  QCOMPARE(validated.error().code, AssetErrorCode::UnsupportedScheme);
+}
 
-  QVERIFY(!bool(*result));
-  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedScheme);
+void AssetNetworkFetcherTests::
+    candidateUrlPolicyRejectsUserinfoQueryFragmentAndNonLoopbackHttp_data() {
+  QTest::addColumn<QString>("urlString");
+  QTest::addColumn<AssetErrorCode>("expectedCode");
+
+  QTest::newRow("http-nonloopback-host")
+      << QStringLiteral("http://example.com/a.png")
+      << AssetErrorCode::InvalidCandidateUrl;
+  QTest::newRow("http-lan-host") << QStringLiteral("http://192.168.1.5/a.png")
+                                 << AssetErrorCode::InvalidCandidateUrl;
+  QTest::newRow("userinfo-present")
+      << QStringLiteral("https://user:pass@example.com/a.png")
+      << AssetErrorCode::InvalidCandidateUrl;
+  QTest::newRow("userinfo-present-on-loopback-http")
+      << QStringLiteral("http://user:pass@127.0.0.1/a.png")
+      << AssetErrorCode::InvalidCandidateUrl;
+  QTest::newRow("query-present")
+      << QStringLiteral("https://example.com/a.png?x=1")
+      << AssetErrorCode::InvalidCandidateUrl;
+  QTest::newRow("fragment-present")
+      << QStringLiteral("https://example.com/a.png#frag")
+      << AssetErrorCode::InvalidCandidateUrl;
+  // Deliberately NOT tested here: "http://127.1/a.png" and other
+  // ambiguous numeric-loopback spellings. AssetFetchUrl::validate()
+  // necessarily operates on an already-QUrl-parsed candidate URL (every
+  // real candidate comes from AssetLocator, which only ever builds a
+  // path on top of an already-normalised base) -- and QUrl parsing
+  // itself silently canonicalises "127.1" into "127.0.0.1" before this
+  // function ever sees it (see AuthTransportSecurity.h's extensive
+  // comment on isCleartextAuthAllowedForRawInput()). That raw-text
+  // ambiguity defence already lives, and is already tested, at the
+  // correct layer: UrlValidator::validateCustomUrl(), which
+  // ValidatedAssetSource::fromRaw() calls against the ORIGINAL raw base
+  // URL string before any QUrl round-trip -- see AssetLocatorTests.cpp's
+  // asset-base validation tests.
+}
+
+void AssetNetworkFetcherTests::
+    candidateUrlPolicyRejectsUserinfoQueryFragmentAndNonLoopbackHttp() {
+  // Review round-4 item 1: proves AssetFetchUrl::validate() actually
+  // reuses the shared transport policy (not a weaker asset-only
+  // reimplementation) -- every one of these forgery attempts that a
+  // "only check the scheme" fetch() implementation would have let
+  // through is rejected here, before fetch() is ever reachable at all.
+  QFETCH(QString, urlString);
+  QFETCH(AssetErrorCode, expectedCode);
+
+  const QUrl url(urlString, QUrl::StrictMode);
+  QVERIFY(url.isValid());
+  const AssetOutcome<AssetFetchUrl> validated = AssetFetchUrl::validate(url);
+  QVERIFY(!validated);
+  QCOMPARE(validated.error().code, expectedCode);
+}
+
+void AssetNetworkFetcherTests::
+    candidateUrlPolicyAcceptsLoopbackHttpAndArbitraryHttpsHost() {
+  // Companion positive case: a real resolved-candidate-shaped URL (https
+  // to any host, or http to an exact canonical loopback spelling, no
+  // userinfo/query/fragment) is accepted and round-trips unchanged.
+  const QUrl httpsUrl(QStringLiteral("https://cdn.example.com/img/a.png"),
+                      QUrl::StrictMode);
+  const AssetOutcome<AssetFetchUrl> validatedHttps =
+      AssetFetchUrl::validate(httpsUrl);
+  QVERIFY2(bool(validatedHttps), qPrintable(validatedHttps.error().message));
+  QCOMPARE(validatedHttps->url(), httpsUrl);
+
+  const QUrl loopbackUrl(QStringLiteral("http://127.0.0.1:9999/img/a.png"),
+                         QUrl::StrictMode);
+  const AssetOutcome<AssetFetchUrl> validatedLoopback =
+      AssetFetchUrl::validate(loopbackUrl);
+  QVERIFY2(bool(validatedLoopback),
+           qPrintable(validatedLoopback.error().message));
+  QCOMPARE(validatedLoopback->url(), loopbackUrl);
 }
 
 void AssetNetworkFetcherTests::manualRedirectPolicyRejectsEvery3xx_data() {
@@ -1302,12 +1395,12 @@ void AssetNetworkFetcherTests::cancelInvokesCallbackExactlyOnceWithCancelled() {
 
   int callCount = 0;
   std::optional<Outcome> result;
-  const auto handle =
-      fetcher.fetch(server.baseUrlFor(QStringLiteral("/slow.png")),
-                    AssetFormat::Png, {}, [&](Outcome outcome) {
-                      ++callCount;
-                      result = std::move(outcome);
-                    });
+  const auto handle = fetcher.fetch(
+      mustValidate(server.baseUrlFor(QStringLiteral("/slow.png"))),
+      AssetFormat::Png, {}, [&](Outcome outcome) {
+        ++callCount;
+        result = std::move(outcome);
+      });
 
   fetcher.cancel(handle);
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
@@ -1343,11 +1436,12 @@ void AssetNetworkFetcherTests::timeoutFiresExactlyOnceAndCleansUpItsTimer() {
 
   int callCount = 0;
   std::optional<Outcome> result;
-  fetcher.fetch(server.baseUrlFor(QStringLiteral("/never-completes.png")),
-                AssetFormat::Png, {}, [&](Outcome outcome) {
-                  ++callCount;
-                  result = std::move(outcome);
-                });
+  fetcher.fetch(
+      mustValidate(server.baseUrlFor(QStringLiteral("/never-completes.png"))),
+      AssetFormat::Png, {}, [&](Outcome outcome) {
+        ++callCount;
+        result = std::move(outcome);
+      });
 
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
   QVERIFY(!bool(*result));
@@ -1377,7 +1471,7 @@ void AssetNetworkFetcherTests::destructionNeverInvokesStaleCallback() {
   QNetworkAccessManager nam;
   {
     AssetNetworkFetcher fetcher(nam);
-    fetcher.fetch(server.baseUrlFor(QStringLiteral("/slow2.png")),
+    fetcher.fetch(mustValidate(server.baseUrlFor(QStringLiteral("/slow2.png"))),
                   AssetFormat::Png, {},
                   [&callbackFired](Outcome) { callbackFired = true; });
     // fetcher is destroyed here, mid-flight.
@@ -1430,6 +1524,49 @@ void AssetNetworkFetcherTests::
            "bogus application proxy instead of connecting directly");
   QVERIFY2(bool(*result), qPrintable(result->error().message));
   QCOMPARE(server.requestCount(QStringLiteral("/direct.png")), 1);
+  QVERIFY(!server.anyRequestEverHadHeader(
+      QByteArrayLiteral("proxy-authorization")));
+}
+
+void AssetNetworkFetcherTests::
+    borrowedManagerProxyReconfiguredAfterConstructionIsStillOverridden() {
+  // Review round-4 item 1: the constructor's one-time
+  // `m_nam.setProxy(QNetworkProxy::NoProxy)` call is not sufficient on
+  // its own for a borrowed (externally-owned) manager, because the
+  // caller retains its own live reference to the exact same object and
+  // can reconfigure its proxy at ANY later point -- including after
+  // AssetNetworkFetcher's constructor already ran. This test proves the
+  // fix: fetch() re-asserts NoProxy immediately before every single
+  // request, so even a proxy set on the borrowed manager well after
+  // construction (and immediately before this specific fetch() call)
+  // can never actually be used.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(4, 4, "PNG");
+  server.setResponse(QStringLiteral("/toctou.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+
+  // Reconfigure the BORROWED manager's proxy well after construction --
+  // this is exactly the gap a one-time constructor-only NoProxy call
+  // would leave open.
+  nam.setProxy(QNetworkProxy(QNetworkProxy::HttpProxy,
+                             QStringLiteral("203.0.113.2"), 1, // TEST-NET-3,
+                             QStringLiteral("proxyuser"),      // unroutable
+                             QStringLiteral("proxypass")));
+
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/toctou.png")),
+                   AssetFormat::Png, {}, /*timeoutMs=*/5000);
+
+  QVERIFY2(result.has_value(),
+           "request never completed -- AssetNetworkFetcher appears to "
+           "have actually attempted to route through the unreachable "
+           "post-construction proxy instead of connecting directly");
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE(server.requestCount(QStringLiteral("/toctou.png")), 1);
   QVERIFY(!server.anyRequestEverHadHeader(
       QByteArrayLiteral("proxy-authorization")));
 }

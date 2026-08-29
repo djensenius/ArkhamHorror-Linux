@@ -1,6 +1,7 @@
 #include "AssetNetworkFetcher.h"
 
 #include "AssetAvifDecoder.h"
+#include "AuthTransportSecurity.h"
 
 #include <QAuthenticator>
 #include <QBuffer>
@@ -22,6 +23,49 @@
 using namespace Qt::StringLiterals;
 
 namespace Arkham {
+
+AssetOutcome<AssetFetchUrl> AssetFetchUrl::validate(const QUrl &url) {
+  // Checked first, and reported with the specific UnsupportedScheme code
+  // (rather than folding it into the generic InvalidCandidateUrl below),
+  // purely to preserve a precise, distinguishable error for this common
+  // case -- exactly as AssetNetworkFetcher::fetch() itself used to report
+  // it before this validation moved here.
+  const QString scheme = url.scheme();
+  if (scheme != "http"_L1 && scheme != "https"_L1) {
+    return AssetError{
+        AssetErrorCode::UnsupportedScheme,
+        QStringLiteral("only http and https URLs may be fetched")};
+  }
+  // Reuses AuthTransportSecurity's already shared, already-tested
+  // transport-safety predicate exactly (see isSecureOrLoopbackAuthTransport()'s
+  // doc comment in AuthTransportSecurity.h) rather than forking a
+  // second, asset-specific reimplementation of the same policy: https is
+  // permitted to any host; http is permitted ONLY to an exact canonical
+  // loopback spelling; any userinfo component or missing host is
+  // rejected regardless of scheme.
+  if (!isSecureOrLoopbackAuthTransport(url)) {
+    return AssetError{
+        AssetErrorCode::InvalidCandidateUrl,
+        QStringLiteral("URL is not a valid https (any host) or http "
+                       "(canonical-loopback-only) fetch target, or carries "
+                       "credentials")};
+  }
+  // Neither a query string nor a fragment is ever legitimately part of a
+  // resolved asset candidate URL -- matching
+  // UrlValidator::validateCustomUrl()'s policy for the same reason (see
+  // UrlValidator.cpp).
+  if (url.hasQuery()) {
+    return AssetError{
+        AssetErrorCode::InvalidCandidateUrl,
+        QStringLiteral("fetch URL must not contain a query string (?...)")};
+  }
+  if (!url.fragment().isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidCandidateUrl,
+        QStringLiteral("fetch URL must not contain a fragment (#...)")};
+  }
+  return AssetFetchUrl(url);
+}
 
 namespace {
 
@@ -416,10 +460,9 @@ AssetNetworkFetcher::~AssetNetworkFetcher() {
   m_pending.clear();
 }
 
-AssetNetworkFetcher::FetchHandle
-AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
-                           ConditionalHeaders conditional,
-                           FetchCallback callback) {
+AssetNetworkFetcher::FetchHandle AssetNetworkFetcher::fetch(
+    const AssetFetchUrl &fetchUrl, AssetFormat expectedFormat,
+    ConditionalHeaders conditional, FetchCallback callback) {
   // Review item 7: an invalid configuration (see validateConfiguration())
   // fails every fetch() the exact same way UnsupportedScheme does below:
   // queued, never synchronous, and without ever touching
@@ -440,16 +483,13 @@ AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
     return FetchHandle{};
   }
 
-  // Fail closed on any scheme other than http/https. This class is
-  // documented (and, via AssetLocator's UrlValidator::validateCustomUrl()
-  // gate, currently only ever invoked) as an HTTP(S)-only fetcher -- but
-  // QNetworkAccessManager itself happily services other schemes it
-  // supports (e.g. file://, qrc://). Without this explicit, independent
-  // check here, a future caller that ever passed this class an
-  // unvalidated URL (bypassing AssetLocator) could read arbitrary local
-  // files rather than fetching over the network. Checked and dispatched
-  // BEFORE any QNetworkRequest/QNetworkReply is created, so a rejected
-  // scheme never reaches QNetworkAccessManager at all.
+  const QUrl &url = fetchUrl.url();
+  // Defence-in-depth only: AssetFetchUrl::validate() already guarantees
+  // the scheme is http/https (see AssetNetworkFetcher.h's class comment)
+  // -- this branch cannot be reached by any caller using the public API
+  // as designed. Retained purely so a hypothetical future bug in
+  // validate() would still fail closed here rather than ever reaching
+  // QNetworkAccessManager with an unexpected scheme.
   const QString scheme = url.scheme();
   if (scheme != QStringLiteral("http") && scheme != QStringLiteral("https")) {
     QPointer<AssetNetworkFetcher> self(this);
@@ -480,6 +520,18 @@ AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
     // an already-completed request.
     return FetchHandle{};
   }
+
+  // Review round-4 item 1: re-assert NoProxy immediately before every
+  // single request, not just once in the constructor. For the owned
+  // manager (the only path production/composition code may use) this is
+  // a harmless no-op re-application. For a TEST-ONLY borrowed manager,
+  // this closes a TOCTOU gap: a test (or, if this constructor were ever
+  // misused, a caller in the same process) holding its own reference to
+  // the same QNetworkAccessManager could otherwise reconfigure its proxy
+  // at any point after construction, silently reintroducing exactly the
+  // credential/proxy leak the constructor's one-time NoProxy call was
+  // meant to prevent.
+  m_nam.setProxy(QNetworkProxy::NoProxy);
 
   QNetworkRequest request(url);
   applyCommonRequestSettings(request);

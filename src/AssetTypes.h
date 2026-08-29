@@ -167,6 +167,17 @@ enum class AssetErrorCode {
                         // validation (non-positive/overflow-risking
                         // values); every fetch() on such a fetcher fails
                         // with this instead of ever touching the network.
+  InvalidCandidateUrl,  // Review round-4 item 1: AssetFetchUrl::validate()
+                        // rejected a URL that had the right scheme but
+                        // failed some other part of the shared transport
+                        // policy reused from AuthTransportSecurity /
+                        // UrlValidator (missing host, userinfo present,
+                        // http to a non-loopback host, or a query string/
+                        // fragment present). A legitimately resolved
+                        // AssetCandidate can never trigger this; it exists
+                        // to fail closed if any future or forged call
+                        // site ever tries to fetch a URL that did not
+                        // come from AssetLocator's validated resolution.
 };
 
 struct AssetError {

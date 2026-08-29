@@ -12,79 +12,36 @@ namespace Arkham {
 
 namespace {
 
-bool isHexDigit(QChar c) {
-  const char16_t u = c.unicode();
-  return (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'f') ||
-         (u >= u'A' && u <= u'F');
-}
-
-int hexValue(QChar c) {
-  const char16_t u = c.unicode();
-  if (u >= u'0' && u <= u'9') {
-    return u - u'0';
-  }
-  if (u >= u'a' && u <= u'f') {
-    return 10 + (u - u'a');
-  }
-  return 10 + (u - u'A');
-}
-
-// Iteratively percent-decodes `input`, case-insensitively, for up to a
-// small bounded number of passes -- so a double- or even triple-encoded
-// dot segment or separator (e.g. "%252e%252e" -> "%2e%2e" -> "..", or
-// "%252f" -> "%2f" -> "/") cannot evade a single-pass check. Malformed
-// "%" sequences (not followed by exactly two hex digits) are left
-// verbatim; only complete, well-formed escapes are ever decoded. The pass
-// bound (5) is generous for any realistic input while still terminating
-// deterministically on adversarial "%25%25%25...".
-QString iterativelyPercentDecoded(const QString &input) {
-  QString current = input;
-  for (int pass = 0; pass < 5; ++pass) {
-    QString next;
-    next.reserve(current.size());
-    bool changed = false;
-    qsizetype i = 0;
-    while (i < current.size()) {
-      if (current[i] == u'%' && i + 2 < current.size() &&
-          isHexDigit(current[i + 1]) && isHexDigit(current[i + 2])) {
-        const int value =
-            hexValue(current[i + 1]) * 16 + hexValue(current[i + 2]);
-        next += QChar(value);
-        i += 3;
-        changed = true;
-      } else {
-        next += current[i];
-        ++i;
-      }
-    }
-    current = next;
-    if (!changed) {
-      break;
-    }
-  }
-  return current;
-}
-
-// Review item 3: raw-string path validation, run against the exact
-// caller-supplied base URL text (never a QUrl that has already parsed/
-// decoded it -- see ValidatedAssetSource's class comment in AssetTypes.h
-// for why that evidence must not be destroyed first). Decodes the ENTIRE
-// path portion iteratively before splitting on '/', so a percent-encoded
-// separator (e.g. "%2f") cannot smuggle an extra segment boundary past a
-// naive split-then-decode order. Rejects: any literal or (after full
-// decoding) percent-encoded "." or ".." path segment, any literal or
-// decoded backslash, and any literal or decoded control character.
+// Review round-4 item 2: earlier revisions of this function iteratively
+// percent-decoded the raw path (bounded to 5 passes) before checking for
+// dot segments/backslashes/control characters, to catch multiply-encoded
+// traversal attempts (e.g. "%252e%252e" -> "..") that a single decode
+// pass would miss. That is provably still bypassable in principle by an
+// arbitrarily deep encoding depth beyond the chosen pass bound, and it
+// also had to accept and silently normalize completely benign-looking
+// escapes (e.g. "%41" -> "A") as a side effect of being a *decoder*
+// rather than a *validator*. An asset base path is a short, operator-
+// configured literal string (never end-user input, never something that
+// legitimately needs percent-encoding) -- so the simplest, provably
+// complete policy is to reject the presence of the '%' character
+// anywhere in the raw path outright, before any decoding is attempted at
+// all. This has no legitimate false-positive cost (a real asset base
+// path never needs a literal '%' either) and closes the entire class of
+// "how many passes is enough" bypasses in one step, at any encoding
+// depth.
 bool rawPathIsHostile(const QString &rawPath) {
-  const QString decoded = iterativelyPercentDecoded(rawPath);
-  if (decoded.contains(u'\\')) {
+  if (rawPath.contains(u'%')) {
     return true;
   }
-  for (const QChar c : decoded) {
+  if (rawPath.contains(u'\\')) {
+    return true;
+  }
+  for (const QChar c : rawPath) {
     if (c.category() == QChar::Other_Control) {
       return true;
     }
   }
-  const QStringList segments = decoded.split(u'/');
+  const QStringList segments = rawPath.split(u'/');
   for (const QString &segment : segments) {
     if (segment == "."_L1 || segment == ".."_L1) {
       return true;

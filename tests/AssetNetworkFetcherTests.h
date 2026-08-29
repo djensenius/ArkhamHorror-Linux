@@ -24,6 +24,9 @@ class AssetNetworkFetcherTests final : public QObject {
 private slots:
   void successfulFetchNeverSendsCookiesOrAuthHeader();
   void nonHttpSchemeIsRejectedAsUnsupportedSchemeWithoutTouchingNetwork();
+  void candidateUrlPolicyRejectsUserinfoQueryFragmentAndNonLoopbackHttp_data();
+  void candidateUrlPolicyRejectsUserinfoQueryFragmentAndNonLoopbackHttp();
+  void candidateUrlPolicyAcceptsLoopbackHttpAndArbitraryHttpsHost();
   void manualRedirectPolicyRejectsEvery3xx_data();
   void manualRedirectPolicyRejectsEvery3xx();
   void notFoundMapsToNotFoundError();
@@ -58,6 +61,7 @@ private slots:
   void timeoutFiresExactlyOnceAndCleansUpItsTimer();
   void destructionNeverInvokesStaleCallback();
   void applicationProxyWithCredentialsIsNeverUsedOrLeaked();
+  void borrowedManagerProxyReconfiguredAfterConstructionIsStillOverridden();
   void
   invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing_data();
   void invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing();

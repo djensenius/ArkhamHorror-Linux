@@ -203,6 +203,23 @@ void AssetLocatorTests::
       << QStringLiteral("https://example.com/a%00b") << false;
   QTest::newRow("reverse-proxy-prefix-then-escape")
       << QStringLiteral("https://example.com/cdn/../etc") << false;
+  // Review round-4 item 2: the policy is now "reject ANY literal '%' in
+  // the raw path", not "decode and then inspect". A completely benign-
+  // looking escape that decodes to an ordinary letter ("%41" -> "A") must
+  // be rejected exactly like a hostile one -- there is no allowlist of
+  // "safe" escapes, because an asset base path never legitimately needs
+  // percent-encoding at all.
+  QTest::newRow("percent-encoded-benign-alias")
+      << QStringLiteral("https://example.com/a%41b") << false;
+  QTest::newRow("percent-sign-alone")
+      << QStringLiteral("https://example.com/a%b") << false;
+  QTest::newRow("percent-encoded-arbitrary-deep-nesting")
+      << QStringLiteral(
+             "https://example.com/a/"
+             "%2525252525252525252525252e%2525252525252525252525252e/b")
+      << false;
+  QTest::newRow("malformed-percent-not-followed-by-hex")
+      << QStringLiteral("https://example.com/a%zzb") << false;
 }
 
 void AssetLocatorTests::assetBasePathRejectsDotSegmentsAndEncodedVariants() {
