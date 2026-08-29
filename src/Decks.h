@@ -104,12 +104,17 @@ public:
   // enclosing object entirely, not insert some sentinel value); calling
   // this for Kind::Absent returns a default-constructed Json::Value
   // (Kind::Undefined) defensively (never crashes), never
-  // Json::Value::makeNull(), so any attempt to serialize it standalone
-  // fails loudly via Json::Value::toJsonBytes() rejecting Kind::Undefined
-  // -- but relying on that is still a caller bug, since composing an
-  // Undefined fragment into an enclosing object silently omits the key
-  // rather than encoding an explicit null for what should have been
-  // omitted entirely.
+  // Json::Value::makeNull(). Relying on that is still a caller bug: every
+  // outbound request encoder in this codebase composes this fragment
+  // into an enclosing Json::Value object and serializes it via the
+  // canonical Json::Value::toJsonBytes()/toExactQJson() (see RawJson.h/
+  // .cpp), and both reject a nested Kind::Undefined member with a typed
+  // failure rather than silently dropping the key -- so forgetting this
+  // precondition fails loudly at encode time, it does not silently omit
+  // the field. (Only the separate, non-canonical, display/log-only
+  // Json::Value::toQJson() conversion would silently drop such a member,
+  // matching QJsonObject::insert()'s own documented behavior for
+  // QJsonValue::Undefined; no outbound request encoder uses that path.)
   [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const ExternalDeckId &,

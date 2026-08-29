@@ -44,6 +44,17 @@ QString hexSha256(const QByteArray &bytes) {
   return QString::fromLatin1(
       QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
 }
+
+// QSet<QString>::values() has no defined/stable iteration order, so a
+// failure message built directly from it would list the same offending
+// paths in a different order from one run (or platform) to the next,
+// making diagnostics harder to diff/compare. Sorting first makes the
+// message deterministic without changing which paths are reported.
+QString sortedJoined(const QSet<QString> &values) {
+  QStringList sorted(values.begin(), values.end());
+  sorted.sort();
+  return sorted.join(QStringLiteral(", "));
+}
 } // namespace
 
 void ContractDriftTests::everyGovernedFileMatchesItsPinnedDigest() {
@@ -191,16 +202,14 @@ void ContractDriftTests::
            qPrintable(
                QStringLiteral("file(s) present on disk with no digest-table "
                               "entry (added without vendoring provenance?): %1")
-                   .arg(QStringList(onDiskOnly.values())
-                            .join(QStringLiteral(", ")))));
+                   .arg(sortedJoined(onDiskOnly))));
 
   const QSet<QString> tabledOnly = tabled - onDisk;
   QVERIFY2(
       tabledOnly.isEmpty(),
       qPrintable(QStringLiteral("digest-table entry(ies) with no file on disk "
                                 "(removed without updating the table?): %1")
-                     .arg(QStringList(tabledOnly.values())
-                              .join(QStringLiteral(", ")))));
+                     .arg(sortedJoined(tabledOnly))));
 }
 
 QTEST_APPLESS_MAIN(ContractDriftTests)
