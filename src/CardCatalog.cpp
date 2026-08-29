@@ -209,25 +209,22 @@ decodeEnumArray(const Obj &obj, QLatin1StringView key, QStringView path,
   return result;
 }
 
+// Raw-AST counterpart of encodeEnumArray() in Games.cpp, for
+// CardDef::toRawJson(). Fails (rather than crashing via
+// Json::encodeClosedEnum()'s former Q_UNREACHABLE) if any element is a
+// closed-enum value fabricated via static_cast from outside its real
+// range -- see Json::encodeClosedEnum()'s doc comment in JsonDecode.h.
 template <typename Enum, std::size_t N>
-QJsonArray encodeEnumArray(
-    const QList<Enum> &values,
-    const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
-  QJsonArray result;
-  for (const Enum value : values)
-    result.append(Json::encodeClosedEnum(value, table));
-  return result;
-}
-
-// Raw-AST counterpart of encodeEnumArray() above, for CardDef::toRawJson().
-template <typename Enum, std::size_t N>
-Json::Value encodeEnumArrayRaw(
+ValueOrError<Json::Value> encodeEnumArrayRaw(
     const QList<Enum> &values,
     const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
   QList<Json::Value> result;
-  for (const Enum value : values)
-    result.append(
-        Json::Value::makeString(Json::encodeClosedEnum(value, table)));
+  for (qsizetype i = 0; i < values.size(); ++i) {
+    auto encoded = Json::encodeClosedEnum(values.at(i), table);
+    if (!encoded)
+      return failure(QStringLiteral("[%1]: %2").arg(i).arg(encoded.error()));
+    result.append(Json::Value::makeString(*encoded));
+  }
   return Json::Value::makeArray(result);
 }
 
@@ -386,7 +383,11 @@ ValueOrError<QMap<QString, QString>> decodeAlternateErrata(const Obj &obj,
 
 } // namespace
 
-SkillIcon SkillIcon::skillType(SkillType type) {
+ValueOrError<SkillIcon> SkillIcon::skillType(SkillType type) {
+  auto encoded = Json::encodeClosedEnum(type, kSkillTypeTable);
+  if (!encoded)
+    return failure(
+        QStringLiteral("SkillIcon::skillType: %1").arg(encoded.error()));
   SkillIcon result;
   result.m_tag = SkillIconTag::SkillIcon;
   result.m_skill = type;
@@ -469,24 +470,30 @@ ValueOrError<SkillIcon> SkillIcon::fromValueImpl(const V &v, QStringView path) {
   return result;
 }
 
-QJsonObject SkillIcon::toJson() const {
-  return toRawJson().toQJson().toObject();
+ValueOrError<QJsonObject> SkillIcon::toJson() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toQJson().toObject();
 }
 
-Json::Value SkillIcon::toRawJson() const {
+ValueOrError<Json::Value> SkillIcon::toRawJson() const {
   switch (m_tag) {
-  case SkillIconTag::SkillIcon:
+  case SkillIconTag::SkillIcon: {
     // m_skill is guaranteed populated here: the only way to construct a
     // SkillIcon with tag == SkillIcon is the skillType() factory, which
     // always sets it, and the private constructor/fromJson never leave it
     // unset for this tag -- no runtime guard is needed or appropriate.
+    auto encoded = Json::encodeClosedEnum(*m_skill, kSkillTypeTable);
+    if (!encoded)
+      return failure(
+          QStringLiteral("SkillIcon::toRawJson: %1").arg(encoded.error()));
     return Json::Value::makeObject({
         {QStringLiteral("tag"),
          Json::Value::makeString(QStringLiteral("SkillIcon"))},
-        {QStringLiteral("contents"),
-         Json::Value::makeString(
-             Json::encodeClosedEnum(*m_skill, kSkillTypeTable))},
+        {QStringLiteral("contents"), Json::Value::makeString(*encoded)},
     });
+  }
   case SkillIconTag::WildIcon:
     return Json::Value::makeObject(
         {{QStringLiteral("tag"),
@@ -498,11 +505,14 @@ Json::Value SkillIcon::toRawJson() const {
   case SkillIconTag::Unknown:
     return m_unknownRaw;
   }
-  Q_UNREACHABLE_RETURN(Json::Value{});
+  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
 }
 
 ValueOrError<QByteArray> SkillIcon::toJsonBytes() const {
-  return toRawJson().toJsonBytes();
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
 }
 
 CardCost CardCost::staticCost(qint64 amount) {
@@ -1429,17 +1439,24 @@ ValueOrError<QList<CardDef>> decodeCatalogFromRawBytes(QByteArrayView bytes,
   return result;
 }
 
-QJsonObject CardDef::toJson() const { return toRawJson().toQJson().toObject(); }
+ValueOrError<QJsonObject> CardDef::toJson() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toQJson().toObject();
+}
 
-Json::Value CardDef::toRawJson() const {
+ValueOrError<Json::Value> CardDef::toRawJson() const {
   QList<std::pair<QString, Json::Value>> members;
   const auto insert = [&members](QLatin1StringView key, Json::Value value) {
     members.append({QString(key), std::move(value)});
   };
   insert("cardCode"_L1, Json::Value::makeString(cardCode.value()));
   insert("name"_L1, name.toRawJson());
-  insert("cardType"_L1, Json::Value::makeString(
-                            Json::encodeClosedEnum(cardType, kCardTypeTable)));
+  auto cardTypeEncoded = Json::encodeClosedEnum(cardType, kCardTypeTable);
+  if (!cardTypeEncoded)
+    return failure(QStringLiteral("cardType: %1").arg(cardTypeEncoded.error()));
+  insert("cardType"_L1, Json::Value::makeString(*cardTypeEncoded));
   insert("art"_L1, Json::Value::makeString(art));
 
   if (revealedName)
@@ -1449,16 +1466,27 @@ Json::Value CardDef::toRawJson() const {
   if (level)
     insert("level"_L1,
            Json::Value::makeNumber(Json::RawNumber::fromInt64(*level)));
-  if (cardSubType)
-    insert("cardSubType"_L1, Json::Value::makeString(Json::encodeClosedEnum(
-                                 *cardSubType, kCardSubTypeTable)));
-  if (!classSymbols.isEmpty())
-    insert("classSymbols"_L1,
-           encodeEnumArrayRaw(classSymbols, kClassSymbolTable));
+  if (cardSubType) {
+    auto encoded = Json::encodeClosedEnum(*cardSubType, kCardSubTypeTable);
+    if (!encoded)
+      return failure(QStringLiteral("cardSubType: %1").arg(encoded.error()));
+    insert("cardSubType"_L1, Json::Value::makeString(*encoded));
+  }
+  if (!classSymbols.isEmpty()) {
+    auto encoded = encodeEnumArrayRaw(classSymbols, kClassSymbolTable);
+    if (!encoded)
+      return failure(QStringLiteral("classSymbols: %1").arg(encoded.error()));
+    insert("classSymbols"_L1, *encoded);
+  }
   if (!skills.isEmpty()) {
     QList<Json::Value> arr;
-    for (const SkillIcon &icon : skills)
-      arr.append(icon.toRawJson());
+    for (qsizetype i = 0; i < skills.size(); ++i) {
+      auto encoded = skills.at(i).toRawJson();
+      if (!encoded)
+        return failure(
+            QStringLiteral("skills[%1]: %2").arg(i).arg(encoded.error()));
+      arr.append(*encoded);
+    }
     insert("skills"_L1, Json::Value::makeArray(arr));
   }
   if (!cardTraits.isEmpty()) {
@@ -1473,9 +1501,12 @@ Json::Value CardDef::toRawJson() const {
       arr.append(Json::Value::makeString(trait));
     insert("revealedCardTraits"_L1, Json::Value::makeArray(arr));
   }
-  if (revelation)
-    insert("revelation"_L1, Json::Value::makeString(Json::encodeClosedEnum(
-                                *revelation, kRevelationTable)));
+  if (revelation) {
+    auto encoded = Json::encodeClosedEnum(*revelation, kRevelationTable);
+    if (!encoded)
+      return failure(QStringLiteral("revelation: %1").arg(encoded.error()));
+    insert("revelation"_L1, Json::Value::makeString(*encoded));
+  }
   if (victoryPoints)
     insert("victoryPoints"_L1,
            Json::Value::makeNumber(Json::RawNumber::fromInt64(*victoryPoints)));
@@ -1506,8 +1537,12 @@ Json::Value CardDef::toRawJson() const {
   if (stage)
     insert("stage"_L1,
            Json::Value::makeNumber(Json::RawNumber::fromInt64(*stage)));
-  if (!cardSlots.isEmpty())
-    insert("slots"_L1, encodeEnumArrayRaw(cardSlots, kSlotTypeTable));
+  if (!cardSlots.isEmpty()) {
+    auto encoded = encodeEnumArrayRaw(cardSlots, kSlotTypeTable);
+    if (!encoded)
+      return failure(QStringLiteral("slots: %1").arg(encoded.error()));
+    insert("slots"_L1, *encoded);
+  }
   if (!alternateCardCodes.isEmpty()) {
     QList<Json::Value> arr;
     for (const CardCode &code : alternateCardCodes)
@@ -1533,9 +1568,12 @@ Json::Value CardDef::toRawJson() const {
     insert("beforeEffect"_L1, Json::Value::makeBool(*beforeEffect));
   if (otherSide)
     insert("otherSide"_L1, Json::Value::makeString(otherSide->value()));
-  if (whenDiscarded)
-    insert("whenDiscarded"_L1, Json::Value::makeString(Json::encodeClosedEnum(
-                                   *whenDiscarded, kWhenDiscardedTable)));
+  if (whenDiscarded) {
+    auto encoded = Json::encodeClosedEnum(*whenDiscarded, kWhenDiscardedTable);
+    if (!encoded)
+      return failure(QStringLiteral("whenDiscarded: %1").arg(encoded.error()));
+    insert("whenDiscarded"_L1, Json::Value::makeString(*encoded));
+  }
   if (canCommitWhenNoIcons)
     insert("canCommitWhenNoIcons"_L1,
            Json::Value::makeBool(*canCommitWhenNoIcons));
@@ -1547,9 +1585,13 @@ Json::Value CardDef::toRawJson() const {
       arr.append(Json::Value::makeString(tag));
     insert("tags"_L1, Json::Value::makeArray(arr));
   }
-  if (!outOfPlayEffects.isEmpty())
-    insert("outOfPlayEffects"_L1,
-           encodeEnumArrayRaw(outOfPlayEffects, kOutOfPlayEffectTable));
+  if (!outOfPlayEffects.isEmpty()) {
+    auto encoded = encodeEnumArrayRaw(outOfPlayEffects, kOutOfPlayEffectTable);
+    if (!encoded)
+      return failure(
+          QStringLiteral("outOfPlayEffects: %1").arg(encoded.error()));
+    insert("outOfPlayEffects"_L1, *encoded);
+  }
   if (health)
     insert("health"_L1, health->toRawJson());
   if (fight)
@@ -1565,8 +1607,15 @@ Json::Value CardDef::toRawJson() const {
     for (auto it = alternateSkills.constBegin();
          it != alternateSkills.constEnd(); ++it) {
       QList<Json::Value> arr;
-      for (const SkillIcon &icon : it.value())
-        arr.append(icon.toRawJson());
+      for (qsizetype i = 0; i < it.value().size(); ++i) {
+        auto encoded = it.value().at(i).toRawJson();
+        if (!encoded)
+          return failure(QStringLiteral("alternateSkills[%1][%2]: %3")
+                             .arg(it.key())
+                             .arg(i)
+                             .arg(encoded.error()));
+        arr.append(*encoded);
+      }
       alternateSkillsMembers.append({it.key(), Json::Value::makeArray(arr)});
     }
     insert("alternateSkills"_L1,
@@ -1611,7 +1660,10 @@ Json::Value CardDef::toRawJson() const {
 }
 
 ValueOrError<QByteArray> CardDef::toJsonBytes() const {
-  return toRawJson().toJsonBytes();
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
 }
 
 } // namespace Arkham

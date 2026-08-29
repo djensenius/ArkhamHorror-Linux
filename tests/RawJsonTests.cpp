@@ -23,6 +23,7 @@ private slots:
   void preservesHugeNegativeExponentLiteralExactly();
   void preservesNegativeZeroSignAndValue();
   void toInt64RejectsFractionalAndExponentLiterals();
+  void defaultConstructedRawNumberIsCanonicalZeroNotVacuous();
   void rejectsDuplicateObjectKeys();
   void rejectsEscapeEquivalentDuplicateObjectKeys();
   void acceptsDistinctKeysThatAreNotEscapeEquivalent();
@@ -221,6 +222,42 @@ void RawJsonTests::preservesNegativeZeroSignAndValue() {
 void RawJsonTests::toInt64RejectsFractionalAndExponentLiterals() {
   QVERIFY(!mustParse("1.0").toRawNumber().toInt64().has_value());
   QVERIFY(!mustParse("1e2").toRawNumber().toInt64().has_value());
+}
+
+void RawJsonTests::defaultConstructedRawNumberIsCanonicalZeroNotVacuous() {
+  // Round 6 review: a default-constructed RawNumber previously left every
+  // digit string empty, so toExactInt64() vacuously reported 0 (its "every
+  // digit is zero" loop trivially holds over an empty string) while
+  // toJsonBytes() correctly rejected that same digit-less value as
+  // unrepresentable ("number has no digits") -- an inconsistency directly
+  // observable via Value::makeNumber(RawNumber{}). The default must now be
+  // the canonical "0" literal, consistent across every accessor.
+  const RawNumber number;
+  QVERIFY(!number.isNegative());
+  QVERIFY(!number.hasFraction());
+  QVERIFY(!number.hasExponent());
+  QCOMPARE(number.integerDigits(), u"0"_s);
+  QCOMPARE(number.literal(), u"0"_s);
+  QVERIFY(number.toInt64().has_value());
+  QCOMPARE(*number.toInt64(), 0LL);
+  QVERIFY(number.toExactInt64().has_value());
+  QCOMPARE(*number.toExactInt64(), 0LL);
+  QCOMPARE(number.toDouble(), 0.0);
+
+  // The value must actually be encodable -- unlike the old vacuous-zero
+  // state, which toExactInt64() called valid but toJsonBytes() rejected.
+  const Value value = Value::makeNumber(number);
+  const auto bytes = value.toJsonBytes();
+  QVERIFY(bytes.has_value());
+  QCOMPARE(*bytes, QByteArrayLiteral("0"));
+  const auto reparsed = Value::parse(*bytes, u"test");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QCOMPARE(*reparsed, value);
+
+  // fromInt64(0) must agree exactly with the default (both are the
+  // canonical zero literal, not merely equal-valued).
+  QCOMPARE(RawNumber::fromInt64(0), number);
 }
 
 void RawJsonTests::rejectsDuplicateObjectKeys() {

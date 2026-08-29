@@ -343,14 +343,16 @@ objectMembers(const Json::Value &obj);
 // Fails if `obj` carries any key other than those listed in `allowed`.
 // For a schema branch whose additionalProperties is false -- specifically
 // a known tagged union's exact "tag"/"contents" shape (SkillIcon/CardCost/
-// GameValue/GameState's known branches) -- this rejects an unexpected
-// extra key rather than silently accepting it and then re-emitting only
-// the keys this client models, dropping the rest. Deliberately NOT used
-// for this client's forward-compatible, additive-field-tolerant response
-// objects (e.g. CardDef, GameListRow's success shape): those intentionally
-// ignore unknown keys per this client's documented read policy -- adding
-// exact-key enforcement there would silently reject a wire response this
-// policy says must still decode. Generic over Obj (QJsonObject or
+// GameValue/GameState's known branches), and closed/fixed-shape summary
+// objects used to positively disambiguate a response's shape (GameListRow's
+// success row and its nested scenario/campaign/investigator summaries) --
+// this rejects an unexpected extra key rather than silently accepting it
+// and then re-emitting only the keys this client models, dropping the
+// rest. Deliberately NOT used for CardDef/CardName: those are genuinely
+// evolving named entities where this client's documented read policy
+// intentionally ignores unknown additive keys for forward compatibility;
+// adding exact-key enforcement there would silently reject a wire response
+// this policy says must still decode. Generic over Obj (QJsonObject or
 // Json::Value, see RawJson.h) via objectMembers() above.
 template <typename Obj>
 [[nodiscard]] ValueOrError<bool>
@@ -401,18 +403,30 @@ template <typename Enum, typename V, std::size_t N>
 }
 
 // Encodes a closed enum back to its wire string using the same table
-// `decodeClosedEnum` was given. `value` is always expected to be present in
-// `table` since closed enums can only ever be constructed via
-// `decodeClosedEnum` or a table-covered literal.
+// `decodeClosedEnum` was given. `value` is ordinarily always present in
+// `table` since a value produced via `decodeClosedEnum` (or one of this
+// codebase's own validating factories, e.g. CampaignOption::knownOption())
+// can never be anything else -- but unlike decode, an encode-time caller
+// can also reach this function with a value obtained no other way than
+// `static_cast<Enum>(someOutOfRangeInt)` against a public enum-typed
+// request field/factory parameter this class cannot itself validate at
+// construction (round 6 review: `Difficulty(999)`,
+// `KnownCampaignOption(999)`, etc., previously reached Q_UNREACHABLE here
+// -- UB in an optimized build, an assert-abort in a debug one, either way
+// a crash on public-API misuse). Returning a typed failure instead makes
+// every caller -- transitively, every toJson()/toRawJson()/toJsonBytes()
+// this function is reachable from -- fail cleanly rather than crash.
 template <typename Enum, std::size_t N>
-[[nodiscard]] QString encodeClosedEnum(
+[[nodiscard]] ValueOrError<QString> encodeClosedEnum(
     Enum value,
     const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
   for (const auto &[wire, candidate] : table) {
     if (candidate == value)
       return QString(wire);
   }
-  Q_UNREACHABLE_RETURN(QString());
+  return failure(QStringLiteral(
+      "encodeClosedEnum: value has no corresponding wire representation "
+      "in this closed enum's table"));
 }
 
 } // namespace Arkham::Json

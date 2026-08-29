@@ -41,6 +41,16 @@ private slots:
   // real production entry points (decodeGameListFromRawBytes/
   // GameListRow::fromRawBytes), not merely GameState in isolation.
   void gameListRowFromRawBytesPreservesUnknownGameStateHugeNestedNumber();
+  // Round-9/10 item 4: the ENCODE side must be equally lossless, not just
+  // decode -- a GameListRow (and the whole encodeGameList array) built
+  // from an Unknown gameState carrying a numeric literal beyond
+  // IEEE-754 double's exact-integer range must reproduce that exact
+  // literal via toJsonBytes()/encodeGameListToJsonBytes(), never through
+  // the QJsonObject-typed toJson()/encodeGameList() convenience.
+  void
+  gameListRowToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode();
+  void
+  encodeGameListToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode();
   void decodeGameListFromRawBytesMatchesQJsonPathOnSameFixture();
   void decodeGameListFromRawBytesRejectsDuplicateObjectKey();
 
@@ -62,7 +72,12 @@ private slots:
   void rowWithBareErrorKeyIsFailure();
   void rowCombiningErrorWithAnyOtherKeyIsRejectedNotFailure();
   void rowWithoutErrorKeyAttemptsFullDecode();
-  void gameListRowSuccessToleratesAdditiveTopLevelField();
+  // Round-9 item 5: supersedes the prior tolerant behavior for this
+  // specific closed, shape-discriminating success row (see
+  // gameListRowSuccessRejectsAdditiveTopLevelField below).
+  void gameListRowSuccessRejectsAdditiveTopLevelField();
+  void gameListRowNestedScenarioRejectsAdditiveField();
+  void gameListRowNestedInvestigatorRejectsAdditiveField();
 
   // game-lifecycle.json fixture entries ──────────────────────────────────────
   void decodesCreateGameFromFixture();
@@ -102,6 +117,17 @@ private slots:
   campaignOptionRawBytesPreserveHugeNestedNumericLiteralInUnknownContents();
   void
   campaignOptionToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode();
+  // Round-9/10 item 3: a KNOWN tag's decoded response object can also carry
+  // an explicit "contents": null and/or a future additive sibling key --
+  // just as an unrecognized tag can (see the two tests above) -- and that
+  // must survive too rather than only Kind::Unknown's raw object; it must
+  // also prevent toRequestOption() from narrowing, since resubmitting
+  // would silently drop what was actually decoded. A CLEAN CampaignOption
+  // built via knownOption() (no additive raw) narrows successfully, so
+  // the refusal is specific to the additive-field instance, not a
+  // blanket rejection of every Known option.
+  void
+  knownCampaignOptionWithAdditiveFieldPreservesRawButCannotNarrowToRequest();
 
   // campaignId/scenarioId invariant ──────────────────────────────────────────
   void campaignWithStartingScenarioAccepted();
@@ -139,6 +165,27 @@ private slots:
   void chooseDeckRawBytesPreserveExactNumericDeckIdAndSideSlots();
   void chooseDeckRawBytesDistinguishAbsentAndNullDeckId();
   void claimSeatRoundTrips();
+
+  // Round-9 item 6: encodeClosedEnum() now returns a typed failure rather
+  // than Q_UNREACHABLE_RETURN when given an enum value fabricated via
+  // static_cast from outside its real range. Every public struct field or
+  // factory that ultimately reaches an encodeClosedEnum() call is audited
+  // here: aggregate structs (InvestigatorSummary/ScenarioSummary/
+  // CampaignSummary/CreateGameRequest) have public fields a caller can
+  // mutate directly after a valid decode, so their toJson() must be the
+  // one to catch it; CampaignOption/CampaignOptionRequest's knownOption()
+  // factory validates at construction time instead (mirroring SkillIcon's
+  // skillType() in CardCatalogTests).
+  void investigatorSummaryToJsonRejectsOutOfRangeClassSymbol();
+  void scenarioSummaryToJsonRejectsOutOfRangeDifficulty();
+  void campaignSummaryToJsonRejectsOutOfRangeDifficulty();
+  void campaignSummaryToJsonRejectsOutOfRangeCurrentCampaignMode();
+  void createGameRequestToJsonRejectsOutOfRangeDifficulty();
+  void createGameRequestToJsonRejectsOutOfRangeMultiplayerVariant();
+  void createGameRequestToJsonRejectsOutOfRangeAsIfRuling();
+  void createGameRequestToJsonRejectsOutOfRangeUltimatumOrBoonInArray();
+  void campaignOptionKnownOptionFactoryRejectsOutOfRangeEnumValue();
+  void campaignOptionRequestKnownOptionFactoryRejectsOutOfRangeEnumValue();
 };
 
 namespace {
@@ -191,7 +238,10 @@ void GamesTests::decodesPendingRowFromFixture() {
   QCOMPARE(*result->multiplayerVariant(), MultiplayerVariant::Solo);
   QVERIFY(!result->hasOpenSeats());
 
-  QCOMPARE(result->toJson(), rows.at(0).toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, rows.at(0).toObject());
 }
 
 void GamesTests::decodesChooseDecksRowFromFixture() {
@@ -218,7 +268,10 @@ void GamesTests::decodesChooseDecksRowFromFixture() {
   QCOMPARE(*result->multiplayerVariant(), MultiplayerVariant::WithFriends);
   QVERIFY(result->hasOpenSeats());
 
-  QCOMPARE(result->toJson(), rows.at(1).toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, rows.at(1).toObject());
 }
 
 void GamesTests::decodesActiveRowFromFixture() {
@@ -227,7 +280,10 @@ void GamesTests::decodesActiveRowFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->gameState()->kind(), GameState::Kind::Active);
-  QCOMPARE(result->toJson(), rows.at(2).toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, rows.at(2).toObject());
 }
 
 void GamesTests::decodesOverRowFromFixture() {
@@ -236,7 +292,10 @@ void GamesTests::decodesOverRowFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->gameState()->kind(), GameState::Kind::Over);
-  QCOMPARE(result->toJson(), rows.at(3).toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, rows.at(3).toObject());
 }
 
 void GamesTests::decodesFailureRowFromFixture() {
@@ -246,7 +305,10 @@ void GamesTests::decodesFailureRowFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind(), GameListRow::Kind::Failure);
   QCOMPARE(result->error(), QStringLiteral("Contract fixture failed to load."));
-  QCOMPARE(result->toJson(), rows.at(4).toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, rows.at(4).toObject());
 }
 
 void GamesTests::decodeGameListRoundTripsWholeFixtureByteExact() {
@@ -255,7 +317,10 @@ void GamesTests::decodeGameListRoundTripsWholeFixtureByteExact() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->size(), 5);
-  QCOMPARE(encodeGameList(*result), rows);
+  auto encoded = encodeGameList(*result);
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, rows);
 }
 
 void GamesTests::
@@ -278,6 +343,64 @@ void GamesTests::
   QCOMPARE(result->gameState()->kind(), GameState::Kind::Unknown);
   QCOMPARE(result->gameState()->unknownTag(), QStringLiteral("IsSuspended"));
   QCOMPARE(result->gameState()
+               ->unknownContents()
+               .value(QLatin1StringView("since"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("9007199254740993"));
+}
+
+void GamesTests::
+    gameListRowToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode() {
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"id\":\"00000000-0000-0000-0000-000000000099\",\"scenario\":null,"
+      "\"campaign\":null,\"gameState\":{\"tag\":\"IsSuspended\",\"contents\":"
+      "{\"since\":9007199254740993}},\"name\":\"Row\",\"investigators\":[],"
+      "\"otherInvestigators\":[],\"multiplayerVariant\":\"Solo\","
+      "\"hasOpenSeats\":false}");
+  const auto decoded = GameListRow::fromRawBytes(bytes, u"row");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+
+  // toJson()/QJsonObject is intentionally lossy here (double-backed), so
+  // this proves ONLY toJsonBytes() (routing gameState through
+  // GameState::toRawJson(), not toJson()) survives the huge literal.
+  const auto encoded = decoded->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  const auto reparsed = GameListRow::fromRawBytes(*encoded, u"row");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QCOMPARE(reparsed->gameState()
+               ->unknownContents()
+               .value(QLatin1StringView("since"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("9007199254740993"));
+}
+
+void GamesTests::
+    encodeGameListToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode() {
+  const QByteArray bytes = QByteArrayLiteral(
+      "[{\"id\":\"00000000-0000-0000-0000-000000000099\",\"scenario\":null,"
+      "\"campaign\":null,\"gameState\":{\"tag\":\"IsSuspended\",\"contents\":"
+      "{\"since\":9007199254740993}},\"name\":\"Row\",\"investigators\":[],"
+      "\"otherInvestigators\":[],\"multiplayerVariant\":\"Solo\","
+      "\"hasOpenSeats\":false}]");
+  const auto decoded = decodeGameListFromRawBytes(bytes, u"rows");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  QCOMPARE(decoded->size(), 1);
+
+  const auto encoded = encodeGameListToJsonBytes(*decoded);
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  const auto reparsed = decodeGameListFromRawBytes(*encoded, u"rows");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QCOMPARE(reparsed->size(), 1);
+  QCOMPARE(reparsed->at(0)
+               .gameState()
                ->unknownContents()
                .value(QLatin1StringView("since"))
                .toRawNumber()
@@ -568,23 +691,67 @@ void GamesTests::rowWithoutErrorKeyAttemptsFullDecode() {
            qPrintable(result.error()));
 }
 
-void GamesTests::gameListRowSuccessToleratesAdditiveTopLevelField() {
-  // Round-8 item 7 clarifies: unlike a tagged union's fixed 1-2 key
-  // branch shape (see gameStateKnownBranchesRejectExtraKey /
-  // extraKeyOnKnown*BranchRejected in CardCatalogTests), a named-field
-  // response summary object like a successful GameListRow legitimately
-  // gains new fields over time and must keep ignoring them per this
-  // client's documented forward-compatibility read policy -- it must NOT
-  // be made to reject an extra key the way a tagged branch does.
+void GamesTests::gameListRowSuccessRejectsAdditiveTopLevelField() {
+  // Round-9 item 5 supersedes round-8 item 7 for this specific shape: the
+  // pinned schema's gameDetails def is additionalProperties:false, and
+  // this closed shape is what positively disambiguates a success row from
+  // a failure row -- unlike CardDef's genuinely evolving named entity, an
+  // additive/unknown top-level key here must be rejected, not tolerated.
   const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
   QJsonObject withExtra = rows.at(0).toObject();
   withExtra.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
   const auto result = GameListRow::fromJson(withExtra, u"row");
-  if (!result)
-    QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->kind(), GameListRow::Kind::Success);
-  QCOMPARE(result->id()->value(),
-           QStringLiteral("00000000-0000-0000-0000-000000000003"));
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("futureField")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::gameListRowNestedScenarioRejectsAdditiveField() {
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  // Find a row with a non-null scenario to attach the extra field to.
+  QJsonObject withExtra;
+  for (const auto &rowValue : rows) {
+    QJsonObject row = rowValue.toObject();
+    if (row.value(QStringLiteral("scenario")).isObject()) {
+      withExtra = row;
+      break;
+    }
+  }
+  QVERIFY2(!withExtra.isEmpty(),
+           "fixture must contain at least one row with a non-null scenario");
+  QJsonObject scenario = withExtra.value(QStringLiteral("scenario")).toObject();
+  scenario.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
+  withExtra.insert(QStringLiteral("scenario"), scenario);
+  const auto result = GameListRow::fromJson(withExtra, u"row");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("futureField")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::gameListRowNestedInvestigatorRejectsAdditiveField() {
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  QJsonObject withExtra;
+  for (const auto &rowValue : rows) {
+    QJsonObject row = rowValue.toObject();
+    if (!row.value(QStringLiteral("investigators")).toArray().isEmpty()) {
+      withExtra = row;
+      break;
+    }
+  }
+  QVERIFY2(
+      !withExtra.isEmpty(),
+      "fixture must contain at least one row with a non-empty investigators "
+      "array");
+  QJsonArray investigators =
+      withExtra.value(QStringLiteral("investigators")).toArray();
+  QJsonObject investigator = investigators.at(0).toObject();
+  investigator.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
+  investigators.replace(0, investigator);
+  withExtra.insert(QStringLiteral("investigators"), investigators);
+  const auto result = GameListRow::fromJson(withExtra, u"row");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("futureField")),
+           qPrintable(result.error()));
 }
 
 void GamesTests::decodesCreateGameFromFixture() {
@@ -888,7 +1055,10 @@ void GamesTests::unknownCampaignOptionWithContentsPreservedAndRoundTrips() {
   QCOMPARE(result->text(), QStringLiteral("SomeFutureOption"));
   QCOMPARE(result->unknownContents(),
            toRawJson(QJsonValue(QStringLiteral("payload"))));
-  QCOMPARE(result->toJson(), obj);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void GamesTests::unknownCampaignOptionWithoutContentsPreservedAndRoundTrips() {
@@ -899,16 +1069,24 @@ void GamesTests::unknownCampaignOptionWithoutContentsPreservedAndRoundTrips() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind(), CampaignOption::Kind::Unknown);
   QVERIFY(result->unknownContents().isUndefined());
-  QCOMPARE(result->toJson(), obj);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void GamesTests::knownCampaignOptionRoundTrips() {
-  const CampaignOption option =
+  const auto optionResult =
       CampaignOption::knownOption(KnownCampaignOption::TakeTheNecronomicon);
-  QCOMPARE(option.toJson(),
-           (QJsonObject{{QStringLiteral("tag"),
-                         QStringLiteral("TakeTheNecronomicon")}}));
-  const auto decoded = CampaignOption::fromJson(option.toJson(), u"option");
+  if (!optionResult)
+    QFAIL(qPrintable(optionResult.error()));
+  const CampaignOption option = *optionResult;
+  auto encoded = option.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, (QJsonObject{{QStringLiteral("tag"),
+                                   QStringLiteral("TakeTheNecronomicon")}}));
+  const auto decoded = CampaignOption::fromJson(*encoded, u"option");
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
   QVERIFY(*decoded == option);
@@ -920,7 +1098,10 @@ void GamesTests::campaignVariantOptionRoundTrips() {
   const QJsonObject expected{
       {QStringLiteral("tag"), QStringLiteral("CampaignVariant")},
       {QStringLiteral("contents"), QStringLiteral("return-to")}};
-  QCOMPARE(option.toJson(), expected);
+  auto encoded = option.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, expected);
 }
 
 void GamesTests::unknownCampaignOptionCannotBeMistakenForKnownOption() {
@@ -934,8 +1115,11 @@ void GamesTests::unknownCampaignOptionCannotBeMistakenForKnownOption() {
   // There is no public factory that lets calling code fabricate an
   // Unknown-kind option directly -- knownOption()/variantOption() are the
   // only constructors besides fromJson.
-  QVERIFY(*decoded !=
-          CampaignOption::knownOption(KnownCampaignOption::Cheated));
+  const auto cheated =
+      CampaignOption::knownOption(KnownCampaignOption::Cheated);
+  if (!cheated)
+    QFAIL(qPrintable(cheated.error()));
+  QVERIFY(*decoded != *cheated);
 }
 
 void GamesTests::unknownCampaignOptionCannotBeSubmittedAsRequestOption() {
@@ -951,14 +1135,23 @@ void GamesTests::unknownCampaignOptionCannotBeSubmittedAsRequestOption() {
 }
 
 void GamesTests::knownCampaignOptionNarrowsToRequestOption() {
-  const CampaignOption known =
+  const auto knownResult =
       CampaignOption::knownOption(KnownCampaignOption::TakeTheNecronomicon);
+  if (!knownResult)
+    QFAIL(qPrintable(knownResult.error()));
+  const CampaignOption known = *knownResult;
   const auto narrowed = known.toRequestOption(u"option");
   if (!narrowed)
     QFAIL(qPrintable(narrowed.error()));
   QCOMPARE(narrowed->kind(), CampaignOptionRequest::Kind::Known);
   QCOMPARE(*narrowed->known(), KnownCampaignOption::TakeTheNecronomicon);
-  QCOMPARE(narrowed->toJson(), known.toJson());
+  auto narrowedEncoded = narrowed->toJson();
+  if (!narrowedEncoded)
+    QFAIL(qPrintable(narrowedEncoded.error()));
+  auto knownEncoded = known.toJson();
+  if (!knownEncoded)
+    QFAIL(qPrintable(knownEncoded.error()));
+  QCOMPARE(*narrowedEncoded, *knownEncoded);
 
   const CampaignOption variant =
       CampaignOption::variantOption(QStringLiteral("return-to"));
@@ -967,7 +1160,13 @@ void GamesTests::knownCampaignOptionNarrowsToRequestOption() {
     QFAIL(qPrintable(narrowedVariant.error()));
   QCOMPARE(narrowedVariant->kind(), CampaignOptionRequest::Kind::Variant);
   QCOMPARE(narrowedVariant->text(), QStringLiteral("return-to"));
-  QCOMPARE(narrowedVariant->toJson(), variant.toJson());
+  auto narrowedVariantEncoded = narrowedVariant->toJson();
+  if (!narrowedVariantEncoded)
+    QFAIL(qPrintable(narrowedVariantEncoded.error()));
+  auto variantEncoded = variant.toJson();
+  if (!variantEncoded)
+    QFAIL(qPrintable(variantEncoded.error()));
+  QCOMPARE(*narrowedVariantEncoded, *variantEncoded);
 }
 
 void GamesTests::campaignOptionRequestRejectsUnrecognizedTag() {
@@ -995,10 +1194,12 @@ void GamesTests::
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind(), CampaignOption::Kind::Unknown);
   QCOMPARE(result->text(), QStringLiteral("SomeFutureOption"));
-  QVERIFY(result->unknownRaw().isObject());
-  QVERIFY(
-      result->unknownRaw().value(QLatin1StringView("isSuspended")).toBool());
-  QCOMPARE(QJsonDocument(result->toJson()).toJson(QJsonDocument::Compact),
+  QVERIFY(result->rawJson().isObject());
+  QVERIFY(result->rawJson().value(QLatin1StringView("isSuspended")).toBool());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(QJsonDocument(*encoded).toJson(QJsonDocument::Compact),
            QJsonDocument::fromJson(bytes).toJson(QJsonDocument::Compact));
 }
 
@@ -1054,6 +1255,49 @@ void GamesTests::
                .toRawNumber()
                .literal(),
            QStringLiteral("1e300"));
+}
+
+void GamesTests::
+    knownCampaignOptionWithAdditiveFieldPreservesRawButCannotNarrowToRequest() {
+  const QJsonObject obj{
+      {QStringLiteral("tag"), QStringLiteral("TakeTheNecronomicon")},
+      {QStringLiteral("contents"), QJsonValue()},
+      {QStringLiteral("isSuspended"), true},
+  };
+  const auto decoded = CampaignOption::fromJson(obj, u"option");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  QCOMPARE(decoded->kind(), CampaignOption::Kind::Known);
+  QCOMPARE(*decoded->known(), KnownCampaignOption::TakeTheNecronomicon);
+  QVERIFY(decoded->rawJson().isObject());
+  QVERIFY(decoded->rawJson().value(QLatin1StringView("isSuspended")).toBool());
+  QVERIFY(decoded->rawJson().value(QLatin1StringView("contents")).isNull());
+
+  // The complete raw object (including the explicit null "contents" and
+  // the additive "isSuspended") re-encodes byte-exact ...
+  auto encoded = decoded->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
+
+  // ... but toRequestOption() refuses to narrow past that loss: resubmitting
+  // this instance as a request would silently drop "contents"/"isSuspended".
+  const auto narrowed = decoded->toRequestOption(u"option");
+  QVERIFY(!narrowed);
+
+  // A CLEAN CampaignOption for the very same known tag, built via
+  // knownOption() (no additive raw at all), still narrows successfully --
+  // the refusal above is specific to the additive-field instance, not a
+  // blanket rejection of Known options in general.
+  const auto clean =
+      CampaignOption::knownOption(KnownCampaignOption::TakeTheNecronomicon);
+  if (!clean)
+    QFAIL(qPrintable(clean.error()));
+  const auto cleanNarrowed = clean->toRequestOption(u"option");
+  if (!cleanNarrowed)
+    QFAIL(qPrintable(cleanNarrowed.error()));
+  QCOMPARE(cleanNarrowed->kind(), CampaignOptionRequest::Kind::Known);
+  QCOMPARE(*cleanNarrowed->known(), KnownCampaignOption::TakeTheNecronomicon);
 }
 
 void GamesTests::campaignWithStartingScenarioAccepted() {
@@ -1543,6 +1787,139 @@ void GamesTests::claimSeatRoundTrips() {
       .investigatorId = *InvestigatorRef::parse(QStringLiteral("c01001"))};
   QCOMPARE(request.toJson(), (QJsonObject{{QStringLiteral("investigatorId"),
                                            QStringLiteral("c01001")}}));
+}
+
+void GamesTests::investigatorSummaryToJsonRejectsOutOfRangeClassSymbol() {
+  const QJsonObject obj{
+      {QStringLiteral("id"), QStringLiteral("c06001")},
+      {QStringLiteral("classSymbol"), QStringLiteral("Guardian")},
+  };
+  auto result = InvestigatorSummary::fromJson(obj, u"investigator");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->classSymbol = static_cast<ClassSymbol>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("classSymbol")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::scenarioSummaryToJsonRejectsOutOfRangeDifficulty() {
+  const QJsonObject obj{
+      {QStringLiteral("id"), QStringLiteral("c01104")},
+      {QStringLiteral("difficulty"), QStringLiteral("Easy")},
+      {QStringLiteral("name"),
+       QJsonObject{{QStringLiteral("title"), QStringLiteral("X")},
+                   {QStringLiteral("subtitle"), QJsonValue()}}},
+      {QStringLiteral("variant"), QJsonValue()},
+  };
+  auto result = ScenarioSummary::fromJson(obj, u"scenario");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->difficulty = static_cast<Difficulty>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("difficulty")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::campaignSummaryToJsonRejectsOutOfRangeDifficulty() {
+  const QJsonObject obj{
+      {QStringLiteral("id"), QStringLiteral("06")},
+      {QStringLiteral("difficulty"), QStringLiteral("Easy")},
+      {QStringLiteral("currentCampaignMode"), QJsonValue()},
+  };
+  auto result = CampaignSummary::fromJson(obj, u"campaign");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->difficulty = static_cast<Difficulty>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("difficulty")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::campaignSummaryToJsonRejectsOutOfRangeCurrentCampaignMode() {
+  const QJsonObject obj{
+      {QStringLiteral("id"), QStringLiteral("06")},
+      {QStringLiteral("difficulty"), QStringLiteral("Easy")},
+      {QStringLiteral("currentCampaignMode"), QJsonValue()},
+  };
+  auto result = CampaignSummary::fromJson(obj, u"campaign");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->currentCampaignMode = static_cast<CampaignPart>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("currentCampaignMode")),
+           qPrintable(encoded.error()));
+}
+
+namespace {
+CreateGameRequest minimalCreateGameRequest() {
+  return CreateGameRequest{
+      .playerCount = 1,
+      .campaignOrScenario =
+          CampaignOrScenario::scenario(*ScenarioId::parse(u"01104"_s)),
+      .difficulty = Difficulty::Easy,
+      .campaignName = QStringLiteral("X"),
+      .multiplayerVariant = MultiplayerVariant::Solo,
+  };
+}
+} // namespace
+
+void GamesTests::createGameRequestToJsonRejectsOutOfRangeDifficulty() {
+  auto request = minimalCreateGameRequest();
+  request.difficulty = static_cast<Difficulty>(999);
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("difficulty")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::createGameRequestToJsonRejectsOutOfRangeMultiplayerVariant() {
+  auto request = minimalCreateGameRequest();
+  request.multiplayerVariant = static_cast<MultiplayerVariant>(999);
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("multiplayerVariant")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::createGameRequestToJsonRejectsOutOfRangeAsIfRuling() {
+  auto request = minimalCreateGameRequest();
+  request.asIfRuling = static_cast<AsIfRulingValue>(999);
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("asIfRuling")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::
+    createGameRequestToJsonRejectsOutOfRangeUltimatumOrBoonInArray() {
+  auto request = minimalCreateGameRequest();
+  request.ultimatumsAndBoons = {static_cast<UltimatumOrBoon>(999)};
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("ultimatumsAndBoons")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::campaignOptionKnownOptionFactoryRejectsOutOfRangeEnumValue() {
+  // CampaignOption's only way to reach Kind::Known is knownOption() (the
+  // constructor is private), so it alone must reject a static_cast
+  // fabricated outside KnownCampaignOption's real range -- typed failure,
+  // not Q_UNREACHABLE_RETURN inside a later toJson() encode.
+  const auto result =
+      CampaignOption::knownOption(static_cast<KnownCampaignOption>(999));
+  QVERIFY(!result.has_value());
+}
+
+void GamesTests::
+    campaignOptionRequestKnownOptionFactoryRejectsOutOfRangeEnumValue() {
+  const auto result =
+      CampaignOptionRequest::knownOption(static_cast<KnownCampaignOption>(999));
+  QVERIFY(!result.has_value());
 }
 
 QTEST_APPLESS_MAIN(GamesTests)

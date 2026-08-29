@@ -554,6 +554,47 @@ QJsonValue Value::toQJson() const {
   return QJsonValue(QJsonValue::Undefined);
 }
 
+ValueOrError<QJsonValue> Value::toExactQJson() const {
+  switch (m_kind) {
+  case Kind::Undefined:
+  case Kind::Null:
+  case Kind::Bool:
+  case Kind::String:
+    // None of these carry any numeric-precision concern; identical to
+    // toQJson() above.
+    return toQJson();
+  case Kind::Number:
+    if (auto exact = m_number.toExactInt64())
+      return QJsonValue(*exact);
+    return failure(
+        QStringLiteral(
+            "Value::toExactQJson: numeric literal \"%1\" cannot be represented "
+            "exactly as a QJsonValue; use toJsonBytes()/the raw AST instead")
+            .arg(m_number.literal()));
+  case Kind::Array: {
+    QJsonArray array;
+    for (qsizetype i = 0; i < m_array.size(); ++i) {
+      auto element = m_array.at(i).toExactQJson();
+      if (!element)
+        return failure(QStringLiteral("[%1]: %2").arg(i).arg(element.error()));
+      array.append(*element);
+    }
+    return QJsonValue(array);
+  }
+  case Kind::Object: {
+    QJsonObject object;
+    for (const auto &[k, v] : m_object) {
+      auto value = v.toExactQJson();
+      if (!value)
+        return failure(QStringLiteral("%1: %2").arg(k, value.error()));
+      object.insert(k, *value);
+    }
+    return QJsonValue(object);
+  }
+  }
+  return QJsonValue(QJsonValue::Undefined);
+}
+
 Value Value::makeNull() {
   Value v;
   v.m_kind = Kind::Null;

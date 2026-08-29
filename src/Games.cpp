@@ -187,12 +187,18 @@ ValueOrError<std::optional<Enum>> optionalClosedEnum(
 }
 
 template <typename Enum, std::size_t N>
-QJsonArray encodeEnumArray(
+ValueOrError<QJsonArray> encodeEnumArray(
     const QList<Enum> &values,
     const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
   QJsonArray result;
-  for (const Enum value : values)
-    result.append(Json::encodeClosedEnum(value, table));
+  for (qsizetype i = 0; i < values.size(); ++i) {
+    auto encoded = Json::encodeClosedEnum(values.at(i), table);
+    if (!encoded)
+      return failure(QStringLiteral("encodeEnumArray[%1]: %2")
+                         .arg(i)
+                         .arg(encoded.error()));
+    result.append(*encoded);
+  }
   return result;
 }
 
@@ -282,6 +288,14 @@ investigatorSummaryFromValueImpl(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
+  // The pinned schema's `investigator` def is additionalProperties:false;
+  // unlike CardDef's deliberate forward-compat leniency, this closed,
+  // fixed-shape summary object enforces its exact key set (round-9 item 5).
+  auto exactKeys =
+      Json::requireExactKeys(obj, {"id"_L1, "classSymbol"_L1}, path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
+
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return CardCode::fromJson(v, p); });
@@ -306,6 +320,13 @@ ValueOrError<ScenarioSummary> scenarioSummaryFromValueImpl(const V &v,
   if (!objResult)
     return failure(objResult.error());
   const auto &obj = *objResult;
+
+  // Closed, fixed-shape summary object (additionalProperties:false in the
+  // pinned schema) -- enforce its exact key set (round-9 item 5).
+  auto exactKeys = Json::requireExactKeys(
+      obj, {"id"_L1, "difficulty"_L1, "name"_L1, "variant"_L1}, path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
 
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
@@ -344,6 +365,13 @@ ValueOrError<CampaignSummary> campaignSummaryFromValueImpl(const V &v,
     return failure(objResult.error());
   const auto &obj = *objResult;
 
+  // Closed, fixed-shape summary object (additionalProperties:false in the
+  // pinned schema) -- enforce its exact key set (round-9 item 5).
+  auto exactKeys = Json::requireExactKeys(
+      obj, {"id"_L1, "difficulty"_L1, "currentCampaignMode"_L1}, path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
+
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return CampaignId::fromJson(v, p); });
@@ -381,11 +409,15 @@ InvestigatorSummary::fromJson(const Json::Value &v, QStringView path) {
   return investigatorSummaryFromValueImpl(v, path);
 }
 
-QJsonObject InvestigatorSummary::toJson() const {
+ValueOrError<QJsonObject> InvestigatorSummary::toJson() const {
+  auto classSymbolEncoded =
+      Json::encodeClosedEnum(classSymbol, kClassSymbolTable);
+  if (!classSymbolEncoded)
+    return failure(
+        QStringLiteral("classSymbol: %1").arg(classSymbolEncoded.error()));
   return QJsonObject{
       {QStringLiteral("id"), id.toJson()},
-      {QStringLiteral("classSymbol"),
-       Json::encodeClosedEnum(classSymbol, kClassSymbolTable)},
+      {QStringLiteral("classSymbol"), *classSymbolEncoded},
   };
 }
 
@@ -399,11 +431,14 @@ ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const Json::Value &v,
   return scenarioSummaryFromValueImpl(v, path);
 }
 
-QJsonObject ScenarioSummary::toJson() const {
+ValueOrError<QJsonObject> ScenarioSummary::toJson() const {
+  auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
+  if (!difficultyEncoded)
+    return failure(
+        QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
   return QJsonObject{
       {QStringLiteral("id"), id.toJson()},
-      {QStringLiteral("difficulty"),
-       Json::encodeClosedEnum(difficulty, kDifficultyTable)},
+      {QStringLiteral("difficulty"), *difficultyEncoded},
       {QStringLiteral("name"), name.toJson()},
       {QStringLiteral("variant"),
        variant ? QJsonValue(*variant) : QJsonValue(QJsonValue::Null)},
@@ -420,15 +455,24 @@ ValueOrError<CampaignSummary> CampaignSummary::fromJson(const Json::Value &v,
   return campaignSummaryFromValueImpl(v, path);
 }
 
-QJsonObject CampaignSummary::toJson() const {
+ValueOrError<QJsonObject> CampaignSummary::toJson() const {
+  auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
+  if (!difficultyEncoded)
+    return failure(
+        QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
+  QJsonValue currentCampaignModeValue = QJsonValue(QJsonValue::Null);
+  if (currentCampaignMode) {
+    auto currentCampaignModeEncoded =
+        Json::encodeClosedEnum(*currentCampaignMode, kCampaignPartTable);
+    if (!currentCampaignModeEncoded)
+      return failure(QStringLiteral("currentCampaignMode: %1")
+                         .arg(currentCampaignModeEncoded.error()));
+    currentCampaignModeValue = QJsonValue(*currentCampaignModeEncoded);
+  }
   return QJsonObject{
       {QStringLiteral("id"), id.toJson()},
-      {QStringLiteral("difficulty"),
-       Json::encodeClosedEnum(difficulty, kDifficultyTable)},
-      {QStringLiteral("currentCampaignMode"),
-       currentCampaignMode ? QJsonValue(Json::encodeClosedEnum(
-                                 *currentCampaignMode, kCampaignPartTable))
-                           : QJsonValue(QJsonValue::Null)},
+      {QStringLiteral("difficulty"), *difficultyEncoded},
+      {QStringLiteral("currentCampaignMode"), currentCampaignModeValue},
   };
 }
 
@@ -658,6 +702,23 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
     return GameListRow::failed(*error);
   }
 
+  // The pinned schema's `gameDetails` (success) def is
+  // additionalProperties:false. Unlike CardDef's deliberate forward-compat
+  // additive-field leniency (a documented policy choice for evolving card
+  // data), this is a fixed, closed contract shape used to positively
+  // disambiguate a success row from a failure row -- an additive/unknown
+  // top-level field here is a contract violation, not a forward-compat
+  // signal to tolerate (round-9 item 5; supersedes this file's prior
+  // additive-tolerant behavior for this specific shape).
+  auto exactKeys = Json::requireExactKeys(
+      obj,
+      {"id"_L1, "scenario"_L1, "campaign"_L1, "gameState"_L1, "name"_L1,
+       "investigators"_L1, "otherInvestigators"_L1, "multiplayerVariant"_L1,
+       "hasOpenSeats"_L1},
+      path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
+
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return GameId::fromJson(v, p); });
@@ -735,9 +796,10 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
                               *multiplayerVariant, *hasOpenSeats);
 }
 
-QJsonObject GameListRow::toJson() const {
+ValueOrError<Json::Value> GameListRow::toRawJson() const {
   if (m_kind == Kind::Failure)
-    return QJsonObject{{QStringLiteral("error"), m_error}};
+    return Json::Value::makeObject(
+        {{QStringLiteral("error"), Json::Value::makeString(m_error)}});
 
   // No invariant check is needed here: success() is the only way to build
   // a Kind::Success instance, and it always populates id/gameState/
@@ -745,29 +807,102 @@ QJsonObject GameListRow::toJson() const {
   // construction -- there is no qFatal()/Q_ASSERT()-guarded fallback
   // anywhere in this file; every tagged/sum-type toJson() in this
   // codebase is unconditionally safe by construction instead.
-  QJsonObject obj;
-  obj.insert(QStringLiteral("id"), m_id->toJson());
-  obj.insert(QStringLiteral("scenario"), m_scenario
-                                             ? QJsonValue(m_scenario->toJson())
-                                             : QJsonValue(QJsonValue::Null));
-  obj.insert(QStringLiteral("campaign"), m_campaign
-                                             ? QJsonValue(m_campaign->toJson())
-                                             : QJsonValue(QJsonValue::Null));
-  obj.insert(QStringLiteral("gameState"), m_gameState->toJson());
-  obj.insert(QStringLiteral("name"), m_name);
-  QJsonArray investigatorsArr;
-  for (const auto &investigator : m_investigators)
-    investigatorsArr.append(investigator.toJson());
-  obj.insert(QStringLiteral("investigators"), investigatorsArr);
-  QJsonArray otherArr;
-  for (const auto &investigator : m_otherInvestigators)
-    otherArr.append(investigator.toJson());
-  obj.insert(QStringLiteral("otherInvestigators"), otherArr);
-  obj.insert(
-      QStringLiteral("multiplayerVariant"),
-      Json::encodeClosedEnum(*m_multiplayerVariant, kMultiplayerVariantTable));
-  obj.insert(QStringLiteral("hasOpenSeats"), m_hasOpenSeats);
-  return obj;
+  QList<std::pair<QString, Json::Value>> members;
+  const auto insert = [&members](QLatin1StringView key, Json::Value value) {
+    members.append({QString(key), std::move(value)});
+  };
+
+  auto idRaw = Json::Value::fromQJson(m_id->toJson());
+  if (!idRaw)
+    return failure(QStringLiteral("id: %1").arg(idRaw.error()));
+  insert("id"_L1, *idRaw);
+
+  if (m_scenario) {
+    auto scenarioEncoded = m_scenario->toJson();
+    if (!scenarioEncoded)
+      return failure(
+          QStringLiteral("scenario: %1").arg(scenarioEncoded.error()));
+    auto scenarioRaw = Json::Value::fromQJson(*scenarioEncoded);
+    if (!scenarioRaw)
+      return failure(QStringLiteral("scenario: %1").arg(scenarioRaw.error()));
+    insert("scenario"_L1, *scenarioRaw);
+  } else {
+    insert("scenario"_L1, Json::Value::makeNull());
+  }
+  if (m_campaign) {
+    auto campaignEncoded = m_campaign->toJson();
+    if (!campaignEncoded)
+      return failure(
+          QStringLiteral("campaign: %1").arg(campaignEncoded.error()));
+    auto campaignRaw = Json::Value::fromQJson(*campaignEncoded);
+    if (!campaignRaw)
+      return failure(QStringLiteral("campaign: %1").arg(campaignRaw.error()));
+    insert("campaign"_L1, *campaignRaw);
+  } else {
+    insert("campaign"_L1, Json::Value::makeNull());
+  }
+  // The reason this method exists distinct from toJson(): route gameState
+  // through GameState::toRawJson() (lossless Json::Value AST), not its
+  // QJsonObject-typed toJson() (double-backed) -- so an Unknown tag's
+  // numeric literal outside IEEE-754 double's exact-integer range
+  // survives an encode-then-reparse round trip through this row, not
+  // merely through GameState in isolation.
+  insert("gameState"_L1, m_gameState->toRawJson());
+  insert("name"_L1, Json::Value::makeString(m_name));
+
+  QList<Json::Value> investigatorsArr;
+  for (qsizetype i = 0; i < m_investigators.size(); ++i) {
+    auto encoded = m_investigators.at(i).toJson();
+    if (!encoded)
+      return failure(
+          QStringLiteral("investigators[%1]: %2").arg(i).arg(encoded.error()));
+    auto raw = Json::Value::fromQJson(*encoded);
+    if (!raw)
+      return failure(
+          QStringLiteral("investigators[%1]: %2").arg(i).arg(raw.error()));
+    investigatorsArr.append(*raw);
+  }
+  insert("investigators"_L1, Json::Value::makeArray(investigatorsArr));
+
+  QList<Json::Value> otherArr;
+  for (qsizetype i = 0; i < m_otherInvestigators.size(); ++i) {
+    auto encoded = m_otherInvestigators.at(i).toJson();
+    if (!encoded)
+      return failure(QStringLiteral("otherInvestigators[%1]: %2")
+                         .arg(i)
+                         .arg(encoded.error()));
+    auto raw = Json::Value::fromQJson(*encoded);
+    if (!raw)
+      return failure(
+          QStringLiteral("otherInvestigators[%1]: %2").arg(i).arg(raw.error()));
+    otherArr.append(*raw);
+  }
+  insert("otherInvestigators"_L1, Json::Value::makeArray(otherArr));
+
+  auto multiplayerVariantEncoded =
+      Json::encodeClosedEnum(*m_multiplayerVariant, kMultiplayerVariantTable);
+  if (!multiplayerVariantEncoded)
+    return failure(QStringLiteral("multiplayerVariant: %1")
+                       .arg(multiplayerVariantEncoded.error()));
+  insert("multiplayerVariant"_L1,
+         Json::Value::makeString(*multiplayerVariantEncoded));
+  insert("hasOpenSeats"_L1, Json::Value::makeBool(m_hasOpenSeats));
+
+  return Json::Value::makeObject(members);
+}
+
+ValueOrError<QJsonObject> GameListRow::toJson() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toQJson().toObject();
+}
+
+ValueOrError<QByteArray> GameListRow::toJsonBytes() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
 }
 
 namespace {
@@ -822,14 +957,46 @@ decodeGameListFromRawBytes(QByteArrayView bytes, QStringView path) {
   return decodeGameListFromRawJson(*parsed, path);
 }
 
-QJsonArray encodeGameList(const QList<GameListRow> &rows) {
+ValueOrError<QJsonArray> encodeGameList(const QList<GameListRow> &rows) {
   QJsonArray result;
-  for (const auto &row : rows)
-    result.append(row.toJson());
+  for (qsizetype i = 0; i < rows.size(); ++i) {
+    auto encoded = rows.at(i).toJson();
+    if (!encoded)
+      return failure(
+          QStringLiteral("rows[%1]: %2").arg(i).arg(encoded.error()));
+    result.append(*encoded);
+  }
   return result;
 }
 
-CampaignOption CampaignOption::knownOption(KnownCampaignOption option) {
+ValueOrError<Json::Value>
+encodeGameListToRawJson(const QList<GameListRow> &rows) {
+  QList<Json::Value> result;
+  result.reserve(rows.size());
+  for (qsizetype i = 0; i < rows.size(); ++i) {
+    auto encoded = rows.at(i).toRawJson();
+    if (!encoded)
+      return failure(
+          QStringLiteral("rows[%1]: %2").arg(i).arg(encoded.error()));
+    result.append(*encoded);
+  }
+  return Json::Value::makeArray(result);
+}
+
+ValueOrError<QByteArray>
+encodeGameListToJsonBytes(const QList<GameListRow> &rows) {
+  auto raw = encodeGameListToRawJson(rows);
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
+}
+
+ValueOrError<CampaignOption>
+CampaignOption::knownOption(KnownCampaignOption option) {
+  auto encoded = Json::encodeClosedEnum(option, kKnownCampaignOptionTable);
+  if (!encoded)
+    return failure(
+        QStringLiteral("CampaignOption::knownOption: %1").arg(encoded.error()));
   CampaignOption result;
   result.m_kind = Kind::Known;
   result.m_known = option;
@@ -875,6 +1042,19 @@ ValueOrError<CampaignOption> CampaignOption::fromValueImpl(const V &v,
     return failure(tagResult.error());
   const QString &tag = *tagResult;
 
+  // Captured once and preserved for EVERY kind below, not merely
+  // Kind::Unknown: round 6's review found a known tag's response object
+  // can carry additive/nullable fields (e.g. an explicit "contents": null
+  // beside a nullary option, or a future sibling key) this client does
+  // not model just as easily as an unrecognized tag can, and those must
+  // survive too rather than being silently discarded at decode time.
+  // toRequestOption() below inspects this to refuse narrowing past any
+  // such loss instead of quietly resubmitting a "cleaner" request than
+  // what was actually decoded.
+  auto rawResult = toLosslessRaw(v);
+  if (!rawResult)
+    return failure(QStringLiteral("%1: %2").arg(path, rawResult.error()));
+
   if (tag == "CampaignVariant"_L1) {
     auto contents = Json::requireString(obj, "contents"_L1,
                                         Json::joinPath(path, u"contents"));
@@ -883,6 +1063,7 @@ ValueOrError<CampaignOption> CampaignOption::fromValueImpl(const V &v,
     CampaignOption result;
     result.m_kind = Kind::Variant;
     result.m_text = *contents;
+    result.m_raw = *rawResult;
     return result;
   }
 
@@ -891,6 +1072,7 @@ ValueOrError<CampaignOption> CampaignOption::fromValueImpl(const V &v,
       CampaignOption result;
       result.m_kind = Kind::Known;
       result.m_known = option;
+      result.m_raw = *rawResult;
       return result;
     }
   }
@@ -900,48 +1082,99 @@ ValueOrError<CampaignOption> CampaignOption::fromValueImpl(const V &v,
   // additive sibling key a future backend adds alongside "tag"/"contents"
   // survives too, and toJson() below re-emits it byte-for-byte rather than
   // reconstructing only the two keys this client currently knows about.
-  auto rawResult = toLosslessRaw(v);
-  if (!rawResult)
-    return failure(QStringLiteral("%1: %2").arg(path, rawResult.error()));
   CampaignOption result;
   result.m_kind = Kind::Unknown;
   result.m_text = tag;
-  result.m_unknownRaw = *rawResult;
+  result.m_raw = *rawResult;
   return result;
 }
 
-QJsonObject CampaignOption::toJson() const {
-  return toRawJson().toQJson().toObject();
+ValueOrError<QJsonObject> CampaignOption::toJson() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toQJson().toObject();
 }
 
-Json::Value CampaignOption::toRawJson() const {
+ValueOrError<Json::Value> CampaignOption::toRawJson() const {
+  // A decoded instance (m_raw populated for Known/Variant/Unknown alike,
+  // see fromValueImpl above) re-emits its complete original raw object
+  // verbatim, so an additive sibling key or an explicit "contents": null
+  // beside a known nullary tag survives a full round trip -- not merely
+  // the "tag"/m_known this client itself derived from it. Only an
+  // instance built via knownOption()/variantOption() (m_raw left
+  // Undefined; nothing decoded to preserve) falls through to
+  // reconstructing the minimal shape below.
+  if (!m_raw.isUndefined())
+    return m_raw;
   switch (m_kind) {
-  case Kind::Known:
+  case Kind::Known: {
+    auto encoded = Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable);
+    if (!encoded)
+      return failure(
+          QStringLiteral("CampaignOption::toRawJson: %1").arg(encoded.error()));
     return Json::Value::makeObject(
-        {{QStringLiteral("tag"), Json::Value::makeString(Json::encodeClosedEnum(
-                                     *m_known, kKnownCampaignOptionTable))}});
+        {{QStringLiteral("tag"), Json::Value::makeString(*encoded)}});
+  }
   case Kind::Variant:
     return Json::Value::makeObject(
         {{QStringLiteral("tag"),
           Json::Value::makeString(QStringLiteral("CampaignVariant"))},
          {QStringLiteral("contents"), Json::Value::makeString(m_text)}});
   case Kind::Unknown:
-    return m_unknownRaw;
+    // Unreachable: Kind::Unknown is only ever produced by fromValueImpl
+    // above, which always populates m_raw and is therefore already
+    // handled by the isUndefined() check -- there is no public factory
+    // that can construct an Unknown instance with m_raw left Undefined.
+    return failure(
+        QStringLiteral("CampaignOption::toRawJson: unknown option with no "
+                       "raw object to encode"));
   }
-  Q_UNREACHABLE_RETURN(Json::Value{});
+  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
 }
 
 ValueOrError<QByteArray> CampaignOption::toJsonBytes() const {
-  return toRawJson().toJsonBytes();
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
 }
 
 ValueOrError<CampaignOptionRequest>
 CampaignOption::toRequestOption(QStringView path) const {
   switch (m_kind) {
-  case Kind::Known:
+  case Kind::Known: {
+    if (m_raw.isObject()) {
+      auto exact = Json::requireExactKeys(m_raw, {"tag"_L1}, path);
+      if (!exact) {
+        QString knownName = QStringLiteral("<unrepresentable>");
+        if (auto encoded =
+                Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable))
+          knownName = *encoded;
+        return failure(
+            QStringLiteral(
+                "%1: known campaign option \"%2\" carries additive/unexpected "
+                "field(s) beyond \"tag\" and cannot be narrowed to a request "
+                "without silently discarding them (%3)")
+                .arg(path, knownName, exact.error()));
+      }
+    }
     return CampaignOptionRequest::knownOption(*m_known);
-  case Kind::Variant:
+  }
+  case Kind::Variant: {
+    if (m_raw.isObject()) {
+      auto exact =
+          Json::requireExactKeys(m_raw, {"tag"_L1, "contents"_L1}, path);
+      if (!exact)
+        return failure(
+            QStringLiteral(
+                "%1: campaign variant option carries additive/unexpected "
+                "field(s) beyond \"tag\"/\"contents\" and cannot be narrowed "
+                "to a request without silently discarding them (%2)")
+                .arg(path, exact.error()));
+    }
     return CampaignOptionRequest::variantOption(m_text);
+  }
   case Kind::Unknown:
     return failure(QStringLiteral("%1: cannot submit unrecognized campaign "
                                   "option \"%2\" in a request")
@@ -950,8 +1183,12 @@ CampaignOption::toRequestOption(QStringView path) const {
   Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
 }
 
-CampaignOptionRequest
+ValueOrError<CampaignOptionRequest>
 CampaignOptionRequest::knownOption(KnownCampaignOption option) {
+  auto encoded = Json::encodeClosedEnum(option, kKnownCampaignOptionTable);
+  if (!encoded)
+    return failure(QStringLiteral("CampaignOptionRequest::knownOption: %1")
+                       .arg(encoded.error()));
   CampaignOptionRequest result;
   result.m_kind = Kind::Known;
   result.m_known = option;
@@ -990,6 +1227,12 @@ CampaignOptionRequest::fromValueImpl(const V &v, QStringView path) {
   const QString &tag = *tagResult;
 
   if (tag == "CampaignVariant"_L1) {
+    // Direct request decode enforces the exact closed shape too: a
+    // request-bound value has no additive-field tolerance, forward-
+    // compatible or otherwise.
+    auto exact = Json::requireExactKeys(obj, {"tag"_L1, "contents"_L1}, path);
+    if (!exact)
+      return failure(exact.error());
     auto contents = Json::requireString(obj, "contents"_L1,
                                         Json::joinPath(path, u"contents"));
     if (!contents)
@@ -997,9 +1240,14 @@ CampaignOptionRequest::fromValueImpl(const V &v, QStringView path) {
     return CampaignOptionRequest::variantOption(*contents);
   }
 
-  for (const auto &[wire, option] : kKnownCampaignOptionTable)
-    if (tag == wire)
+  for (const auto &[wire, option] : kKnownCampaignOptionTable) {
+    if (tag == wire) {
+      auto exact = Json::requireExactKeys(obj, {"tag"_L1}, path);
+      if (!exact)
+        return failure(exact.error());
       return CampaignOptionRequest::knownOption(option);
+    }
+  }
 
   // Unlike CampaignOption, a request-bound value has no forward-compatible
   // fallback: an unrecognized tag is a hard decode failure here.
@@ -1007,18 +1255,21 @@ CampaignOptionRequest::fromValueImpl(const V &v, QStringView path) {
                      .arg(path, tag));
 }
 
-QJsonObject CampaignOptionRequest::toJson() const {
+ValueOrError<QJsonObject> CampaignOptionRequest::toJson() const {
   switch (m_kind) {
-  case Kind::Known:
-    return QJsonObject{
-        {QStringLiteral("tag"),
-         Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable)}};
+  case Kind::Known: {
+    auto encoded = Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable);
+    if (!encoded)
+      return failure(QStringLiteral("CampaignOptionRequest::toJson: %1")
+                         .arg(encoded.error()));
+    return QJsonObject{{QStringLiteral("tag"), *encoded}};
+  }
   case Kind::Variant:
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("CampaignVariant")},
         {QStringLiteral("contents"), m_text}};
   }
-  Q_UNREACHABLE_RETURN(QJsonObject{});
+  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
 }
 
 CampaignOrScenario CampaignOrScenario::campaign(CampaignId id) {
@@ -1265,24 +1516,44 @@ ValueOrError<QJsonObject> CreateGameRequest::toJson() const {
   obj.insert(QStringLiteral("deckIds"), deckIdsArr);
   obj.insert(QStringLiteral("playerCount"), playerCount);
   campaignOrScenario.insertInto(obj);
-  obj.insert(QStringLiteral("difficulty"),
-             Json::encodeClosedEnum(difficulty, kDifficultyTable));
+  auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
+  if (!difficultyEncoded)
+    return failure(
+        QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
+  obj.insert(QStringLiteral("difficulty"), *difficultyEncoded);
   obj.insert(QStringLiteral("campaignName"), campaignName);
-  obj.insert(
-      QStringLiteral("multiplayerVariant"),
-      Json::encodeClosedEnum(multiplayerVariant, kMultiplayerVariantTable));
+  auto multiplayerVariantEncoded =
+      Json::encodeClosedEnum(multiplayerVariant, kMultiplayerVariantTable);
+  if (!multiplayerVariantEncoded)
+    return failure(QStringLiteral("multiplayerVariant: %1")
+                       .arg(multiplayerVariantEncoded.error()));
+  obj.insert(QStringLiteral("multiplayerVariant"), *multiplayerVariantEncoded);
   obj.insert(QStringLiteral("includeTarotReadings"), includeTarotReadings);
   QJsonArray optionsArr;
-  for (const auto &option : options)
-    optionsArr.append(option.toJson());
+  for (qsizetype i = 0; i < options.size(); ++i) {
+    auto encoded = options.at(i).toJson();
+    if (!encoded)
+      return failure(
+          QStringLiteral("options[%1]: %2").arg(i).arg(encoded.error()));
+    optionsArr.append(*encoded);
+  }
   obj.insert(QStringLiteral("options"), optionsArr);
   if (strictAsIfAt)
     obj.insert(QStringLiteral("strictAsIfAt"), *strictAsIfAt);
-  if (asIfRuling)
-    obj.insert(QStringLiteral("asIfRuling"),
-               Json::encodeClosedEnum(*asIfRuling, kAsIfRulingTable));
-  obj.insert(QStringLiteral("ultimatumsAndBoons"),
-             encodeEnumArray(ultimatumsAndBoons, kUltimatumOrBoonTable));
+  if (asIfRuling) {
+    auto asIfRulingEncoded =
+        Json::encodeClosedEnum(*asIfRuling, kAsIfRulingTable);
+    if (!asIfRulingEncoded)
+      return failure(
+          QStringLiteral("asIfRuling: %1").arg(asIfRulingEncoded.error()));
+    obj.insert(QStringLiteral("asIfRuling"), *asIfRulingEncoded);
+  }
+  auto ultimatumsAndBoonsEncoded =
+      encodeEnumArray(ultimatumsAndBoons, kUltimatumOrBoonTable);
+  if (!ultimatumsAndBoonsEncoded)
+    return failure(QStringLiteral("ultimatumsAndBoons: %1")
+                       .arg(ultimatumsAndBoonsEncoded.error()));
+  obj.insert(QStringLiteral("ultimatumsAndBoons"), *ultimatumsAndBoonsEncoded);
   obj.insert(QStringLiteral("achievementsEnabled"), achievementsEnabled);
   return obj;
 }

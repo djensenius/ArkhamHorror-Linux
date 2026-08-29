@@ -74,11 +74,16 @@ private slots:
   void nullaryCardCostTagWithContentsRejected();
   void nullaryGameValueTagWithContentsRejected();
   void nullarySkillIconTagWithContentsRejected();
-  // Round-8 item 7: additionalProperties:false on a known tagged-union
-  // branch's exact {"tag","contents"}/{"tag"} shape means an extra
-  // sibling key is malformed input, not a forward-compat additive field
-  // (unlike CardDef/GameListRow's success shape -- see
-  // gameListRowSuccessToleratesAdditiveTopLevelField below).
+  // Round-8 item 7 / round-9 item 5: additionalProperties:false on a known
+  // tagged-union branch's exact {"tag","contents"}/{"tag"} shape means an
+  // extra sibling key is malformed input, not a forward-compat additive
+  // field. Unlike CardDef -- a genuinely evolving named entity this client
+  // deliberately keeps additive-tolerant (see
+  // unknownAdditiveTopLevelFieldIgnored below) -- GameListRow's success
+  // shape and its nested summary objects are ALSO now exact-key-enforced
+  // (round-9 item 5), since that closed shape is what positively
+  // disambiguates a success row from a failure row; see
+  // gameListRowSuccessRejectsAdditiveTopLevelField in GamesTests.cpp.
   void extraKeyOnKnownCardCostBranchRejected();
   void extraKeyOnKnownGameValueBranchRejected();
   void extraKeyOnKnownSkillIconBranchRejected();
@@ -128,6 +133,24 @@ private slots:
   // literal on reparse.
   void toJsonBytesPreservesNumericPrecisionInUnconstrainedFieldsOnEncode();
   void toJsonBytesPreservesUnknownTaggedUnionPrecisionOnEncode();
+
+  // Round-9 item 6: encodeClosedEnum() now returns a typed failure rather
+  // than Q_UNREACHABLE_RETURN when given an enum value fabricated via
+  // static_cast from outside its real range -- this is reachable through
+  // any public field/factory of a closed-enum-carrying type, never a
+  // JSON-decode-only concern. skillType() validates at construction time
+  // (the class has no other way to reach a populated m_skill), while
+  // CardDef's enum fields are public struct members a caller can mutate
+  // directly after a valid decode, so toJson()/toRawJson() must be the
+  // ones to catch it.
+  void skillTypeFactoryRejectsOutOfRangeEnumValue();
+  void cardDefToJsonRejectsOutOfRangeCardType();
+  void cardDefToJsonRejectsOutOfRangeCardSubType();
+  void cardDefToJsonRejectsOutOfRangeClassSymbolInArray();
+  void cardDefToJsonRejectsOutOfRangeRevelation();
+  void cardDefToJsonRejectsOutOfRangeCardSlotInArray();
+  void cardDefToJsonRejectsOutOfRangeOutOfPlayEffectInArray();
+  void cardDefToJsonRejectsOutOfRangeWhenDiscarded();
 };
 
 namespace {
@@ -190,7 +213,10 @@ void CardCatalogTests::decodesFullCardFromFixture() {
 
   // Byte-faithful round trip (QJsonObject equality is key-set and value
   // exact, independent only of key ordering).
-  QCOMPARE(result->toJson(), cards.at(0).toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, cards.at(0).toObject());
 }
 
 void CardCatalogTests::decodesHomebrewCardFromFixture() {
@@ -216,7 +242,10 @@ void CardCatalogTests::decodesHomebrewCardFromFixture() {
   QCOMPARE(*result->healthDamage->singleAmount(), qint64(1));
   QVERIFY(!result->sanityDamage.has_value());
 
-  QCOMPARE(result->toJson(), homebrew.at(0).toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, homebrew.at(0).toObject());
 }
 
 void CardCatalogTests::decodesMinimalInvestigatorCardFromFixture() {
@@ -240,7 +269,10 @@ void CardCatalogTests::decodesMinimalInvestigatorCardFromFixture() {
   QVERIFY(result->skills.isEmpty());
   QVERIFY(result->cardSlots.isEmpty());
 
-  QCOMPARE(result->toJson(), card.toObject());
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, card.toObject());
 }
 
 void CardCatalogTests::missingCardCodeRejected() {
@@ -577,7 +609,10 @@ void CardCatalogTests::allSkillIconVariantsRoundTrip() {
     if (!r)
       QFAIL(qPrintable(r.error()));
     QCOMPARE(*r->skill(), skill);
-    QCOMPARE(r->toJson(), obj);
+    auto encoded = r->toJson();
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    QCOMPARE(*encoded, obj);
   }
 
   for (const auto &tag : {"WildIcon"_L1, "WildMinusIcon"_L1}) {
@@ -586,7 +621,10 @@ void CardCatalogTests::allSkillIconVariantsRoundTrip() {
     if (!r)
       QFAIL(qPrintable(r.error()));
     QVERIFY(!r->skill().has_value());
-    QCOMPARE(r->toJson(), obj);
+    auto encoded = r->toJson();
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    QCOMPARE(*encoded, obj);
   }
 
   const QJsonObject badSkillPayload{
@@ -648,7 +686,10 @@ void CardCatalogTests::unrecognizedSkillIconTagPreservedNotRejected() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tag(), SkillIconTag::Unknown);
   QVERIFY(result->unknownRaw() == toRawJson(obj));
-  QCOMPARE(result->toJson(), obj);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void CardCatalogTests::nullaryCardCostTagWithContentsRejected() {
@@ -925,7 +966,10 @@ void CardCatalogTests::unknownAdditiveTopLevelFieldIgnored() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->cardCode.value(), QStringLiteral("c00001"));
   // Re-encoding never reproduces a field this client never modeled.
-  QVERIFY(!result->toJson().contains(
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY(!encoded->contains(
       QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")));
 }
 
@@ -946,7 +990,10 @@ void CardCatalogTests::unconstrainedFieldsPreservedVerbatim() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->meta == toRawJson(QJsonValue(rawMeta)));
-  QCOMPARE(result->toJson().value(QStringLiteral("meta")).toObject(), rawMeta);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->value(QStringLiteral("meta")).toObject(), rawMeta);
 }
 
 void CardCatalogTests::bondedWithRoundTrips() {
@@ -967,7 +1014,10 @@ void CardCatalogTests::bondedWithRoundTrips() {
   QCOMPARE(result->bondedWith.size(), 2);
   QCOMPARE(result->bondedWith.at(0).first, qint64(2));
   QCOMPARE(result->bondedWith.at(0).second.value(), QStringLiteral("c00002"));
-  QCOMPARE(result->toJson(), obj);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void CardCatalogTests::alternateSkillsAndErrataRoundTrip() {
@@ -993,7 +1043,10 @@ void CardCatalogTests::alternateSkillsAndErrataRoundTrip() {
   QCOMPARE(result->alternateSkills.value(QStringLiteral("c00002")).size(), 1);
   QCOMPARE(result->alternateErrata.value(QStringLiteral("c00002")),
            QStringLiteral("Errata text"));
-  QCOMPARE(result->toJson(), obj);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void CardCatalogTests::explicitNullForNonNullableIntFieldRejected() {
@@ -1082,9 +1135,11 @@ void CardCatalogTests::absentNonNullableScalarFieldsDecodeToNullopt() {
   QVERIFY(!result->commitTrigger.has_value());
   QVERIFY(!result->errata.has_value());
   // Round trip stays byte-faithful: none of these absent fields reappear.
-  const QJsonObject encoded = result->toJson();
-  QVERIFY(!encoded.contains(QStringLiteral("level")));
-  QVERIFY(!encoded.contains(QStringLiteral("errata")));
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY(!encoded->contains(QStringLiteral("level")));
+  QVERIFY(!encoded->contains(QStringLiteral("errata")));
 }
 
 void CardCatalogTests::wrongOuterTypeForArrayFieldRejected_data() {
@@ -1175,7 +1230,10 @@ void CardCatalogTests::
   QVERIFY(result->commitRestrictions ==
           toRawJson(QJsonValue(rawCommitRestrictions)));
   QVERIFY(result->meta == toRawJson(QJsonValue(rawMeta)));
-  QCOMPARE(result->toJson(), obj);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void CardCatalogTests::duplicateClassSymbolsRejected() {
@@ -1238,7 +1296,10 @@ void CardCatalogTests::duplicateTagsAllowedNoUniquenessConstraint() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tags.size(), 2);
-  QCOMPARE(result->toJson(), obj);
+  auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void CardCatalogTests::rawBytesPreserveNumericPrecisionInUnconstrainedFields() {
@@ -1420,6 +1481,92 @@ void CardCatalogTests::
   QCOMPARE(
       gvReparsed->value("contents"_L1).toArray().at(0).toRawNumber().literal(),
       QStringLiteral("9007199254740993"));
+}
+
+void CardCatalogTests::skillTypeFactoryRejectsOutOfRangeEnumValue() {
+  // SkillIcon has a private constructor: skillType() is the only way to
+  // populate m_skill, so it alone must reject a static_cast fabricated
+  // outside SkillType's real range -- typed failure, not
+  // Q_UNREACHABLE_RETURN inside the later toJson()/toRawJson() encode.
+  const auto result = SkillIcon::skillType(static_cast<SkillType>(999));
+  QVERIFY(!result.has_value());
+}
+
+void CardCatalogTests::cardDefToJsonRejectsOutOfRangeCardType() {
+  auto result = CardDef::fromJson(minimalCardObject(), u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->cardType = static_cast<CardType>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("cardType")),
+           qPrintable(encoded.error()));
+}
+
+void CardCatalogTests::cardDefToJsonRejectsOutOfRangeCardSubType() {
+  auto result = CardDef::fromJson(minimalCardObject(), u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->cardSubType = static_cast<CardSubType>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("cardSubType")),
+           qPrintable(encoded.error()));
+}
+
+void CardCatalogTests::cardDefToJsonRejectsOutOfRangeClassSymbolInArray() {
+  auto result = CardDef::fromJson(minimalCardObject(), u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->classSymbols = {static_cast<ClassSymbol>(999)};
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("classSymbols")),
+           qPrintable(encoded.error()));
+}
+
+void CardCatalogTests::cardDefToJsonRejectsOutOfRangeRevelation() {
+  auto result = CardDef::fromJson(minimalCardObject(), u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->revelation = static_cast<Revelation>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("revelation")),
+           qPrintable(encoded.error()));
+}
+
+void CardCatalogTests::cardDefToJsonRejectsOutOfRangeCardSlotInArray() {
+  auto result = CardDef::fromJson(minimalCardObject(), u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->cardSlots = {static_cast<SlotType>(999)};
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("slots")),
+           qPrintable(encoded.error()));
+}
+
+void CardCatalogTests::cardDefToJsonRejectsOutOfRangeOutOfPlayEffectInArray() {
+  auto result = CardDef::fromJson(minimalCardObject(), u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->outOfPlayEffects = {static_cast<OutOfPlayEffect>(999)};
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("outOfPlayEffects")),
+           qPrintable(encoded.error()));
+}
+
+void CardCatalogTests::cardDefToJsonRejectsOutOfRangeWhenDiscarded() {
+  auto result = CardDef::fromJson(minimalCardObject(), u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  result->whenDiscarded = static_cast<WhenDiscarded>(999);
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("whenDiscarded")),
+           qPrintable(encoded.error()));
 }
 
 QTEST_APPLESS_MAIN(CardCatalogTests)

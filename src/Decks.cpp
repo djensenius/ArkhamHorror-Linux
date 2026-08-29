@@ -545,8 +545,22 @@ ValueOrError<QJsonObject> DeckListInput::toJson() const {
     return failure(slotsError);
   QJsonObject obj;
   obj.insert(QStringLiteral("slots"), encodeCardQuantityMapInput(cardSlots));
-  if (!sideSlots.isUndefined())
-    obj.insert(QStringLiteral("sideSlots"), sideSlots.toQJson());
+  if (!sideSlots.isUndefined()) {
+    // toExactQJson() (not toQJson()) so a sideSlots quantity/nested value
+    // this client cannot decode is a typed failure here, rather than
+    // toJson() silently rounding it through toQJson()'s IEEE-754 double
+    // fallback -- see DeckListInput::toJson()'s doc comment in Decks.h and
+    // Value::toExactQJson()'s doc comment in RawJson.h. Prefer
+    // toRawJson()/toJsonBytes() (always lossless) when precision beyond
+    // this actually matters; toJson() remains a QJsonObject-typed
+    // convenience that now refuses to lie about exactness instead of
+    // silently rounding.
+    auto exactSideSlots = sideSlots.toExactQJson();
+    if (!exactSideSlots)
+      return failure(
+          QStringLiteral("sideSlots: %1").arg(exactSideSlots.error()));
+    obj.insert(QStringLiteral("sideSlots"), *exactSideSlots);
+  }
   obj.insert(QStringLiteral("investigator_code"), investigatorCode.value());
   if (investigatorName)
     obj.insert(QStringLiteral("investigator_name"), *investigatorName);

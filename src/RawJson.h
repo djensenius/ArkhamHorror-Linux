@@ -119,7 +119,20 @@ struct ParseLimits {
 // double could represent.
 class RawNumber {
 public:
-  RawNumber() = default;
+  // Default-constructs the canonical "0" literal, not an unrepresentable
+  // empty-digit state. Value's non-Number Kinds still need RawNumber to be
+  // default-constructible (see m_number below), but leaving integerDigits()
+  // empty by default made toExactInt64() vacuously return 0 (its "all
+  // digits are zero" loop trivially holds over an empty digit string)
+  // while toJsonBytes()'s number encoder correctly rejected that very same
+  // digit-less value as unrepresentable ("number has no digits") -- an
+  // inconsistency directly observable by any caller default-constructing a
+  // RawNumber. A canonical zero closes that gap: literal()/toJsonBytes()
+  // both emit "0", and toExactInt64() returns 0 for the same reason (an
+  // all-zero coefficient), so every publicly reachable RawNumber -- this
+  // default, a parsed literal, or fromInt64()'s output -- is consistently
+  // valid and round-trips through toJsonBytes() without exception.
+  RawNumber() : m_intDigits(QStringLiteral("0")) {}
 
   [[nodiscard]] bool isNegative() const noexcept { return m_negative; }
   [[nodiscard]] bool hasFraction() const noexcept {
@@ -260,6 +273,21 @@ public:
   // a value returns the identical qint64, unlike a value constructed from
   // a double).
   [[nodiscard]] QJsonValue toQJson() const;
+  // Recursive, fallible counterpart of toQJson() above: identical
+  // conversion, except a Number node whose literal is not exactly
+  // representable as a qint64 (a genuine fraction, or an integral value
+  // outside qint64's range -- see RawNumber::toExactInt64()) is a typed
+  // failure that propagates out of the whole conversion, rather than
+  // toQJson()'s silent fallback to a rounding IEEE-754 double. Intended
+  // for a request-bound "convenience QJsonValue" caller that has no other
+  // reason to reach for the raw AST/byte APIs directly but still must
+  // never submit a silently-rounded number: prefer toJsonBytes()/the raw
+  // AST itself whenever the canonical wire representation is what
+  // actually matters, since this is still QJsonValue-backed and therefore
+  // strictly less capable than the AST for anything besides numbers (e.g.
+  // it cannot represent a lone UTF-16 surrogate any more than toQJson()
+  // can -- see Value::toJsonBytes()'s doc comment).
+  [[nodiscard]] ValueOrError<QJsonValue> toExactQJson() const;
 
   friend bool operator==(const Value &, const Value &) = default;
 

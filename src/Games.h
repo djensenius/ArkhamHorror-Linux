@@ -106,7 +106,7 @@ struct InvestigatorSummary {
   // nested investigators/otherInvestigators arrays.
   [[nodiscard]] static ValueOrError<InvestigatorSummary>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const InvestigatorSummary &,
                          const InvestigatorSummary &) = default;
@@ -133,7 +133,7 @@ struct ScenarioSummary {
   // Json::Value overload doc comment above.
   [[nodiscard]] static ValueOrError<ScenarioSummary>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const ScenarioSummary &,
                          const ScenarioSummary &) = default;
@@ -157,7 +157,7 @@ struct CampaignSummary {
   // Json::Value overload doc comment above.
   [[nodiscard]] static ValueOrError<CampaignSummary>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const CampaignSummary &,
                          const CampaignSummary &) = default;
@@ -315,7 +315,18 @@ public:
   // runs, and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<GameListRow>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // Canonical byte-level encode: composes the lossless AST directly (see
+  // RawJson.h), routing gameState through GameState::toRawJson() rather
+  // than its QJsonObject-typed toJson() -- so an Unknown gameState's
+  // numeric literal outside IEEE-754 double's exact-integer range
+  // survives an encode-then-reparse round trip through this *aggregate*,
+  // not merely GameState in isolation. toJson() above remains a
+  // QJsonObject-typed convenience only as exact as Json::Value::toQJson()
+  // allows (see its doc comment in RawJson.h) and is implemented in terms
+  // of this.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   // Success-only accessors (Kind::Success only; unset/empty for Failure).
@@ -384,7 +395,17 @@ decodeGameListFromRawJson(const Json::Value &v, QStringView path);
 // decodes via decodeGameListFromRawJson() above.
 [[nodiscard]] ValueOrError<QList<GameListRow>>
 decodeGameListFromRawBytes(QByteArrayView bytes, QStringView path);
-[[nodiscard]] QJsonArray encodeGameList(const QList<GameListRow> &rows);
+[[nodiscard]] ValueOrError<QJsonArray>
+encodeGameList(const QList<GameListRow> &rows);
+// Canonical byte-level encode: composes the lossless AST directly (see
+// RawJson.h), routing each row through GameListRow::toRawJson() rather
+// than its QJsonObject-typed toJson() -- so an unrecognized gameState's
+// exact numeric literal survives an encode-then-reparse round trip
+// through the *whole list*, not merely one row's GameState in isolation.
+[[nodiscard]] ValueOrError<Json::Value>
+encodeGameListToRawJson(const QList<GameListRow> &rows);
+[[nodiscard]] ValueOrError<QByteArray>
+encodeGameListToJsonBytes(const QList<GameListRow> &rows);
 
 // createGameRequest's known `options` entries (Arkham.Campaign.Option's
 // CampaignOption, minus its one payload-carrying constructor,
@@ -441,7 +462,17 @@ class CampaignOption {
 public:
   enum class Kind { Known, Variant, Unknown };
 
-  [[nodiscard]] static CampaignOption knownOption(KnownCampaignOption option);
+  // Fails if `option` is not one of kKnownCampaignOptionTable's entries:
+  // unlike a decode (which only ever iterates that same table and can
+  // never produce an out-of-table value), this factory accepts an
+  // arbitrary caller-supplied KnownCampaignOption -- including one
+  // fabricated via static_cast from a value outside the enum's real
+  // range -- so it must validate rather than trust its argument. This is
+  // what makes toJson()/toRawJson()'s encodeClosedEnum() call below
+  // provably safe: a CampaignOption's m_known, once set, is always
+  // table-valid.
+  [[nodiscard]] static ValueOrError<CampaignOption>
+  knownOption(KnownCampaignOption option);
   [[nodiscard]] static CampaignOption variantOption(QString contents);
 
   [[nodiscard]] static ValueOrError<CampaignOption>
@@ -458,13 +489,16 @@ public:
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<CampaignOption>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: composes the lossless AST directly (see
   // RawJson.h) -- toJson() above is now implemented in terms of this --
-  // so unknownRaw()'s complete original object survives an
-  // encode-then-decode round trip byte-exact via toJsonBytes(), not
-  // merely as closely as Json::Value::toQJson() allows.
-  [[nodiscard]] Json::Value toRawJson() const;
+  // so rawJson()'s complete original object survives an encode-then-
+  // decode round trip byte-exact via toJsonBytes(), not merely as
+  // closely as Json::Value::toQJson() allows. Fails only if this
+  // instance's KnownCampaignOption was fabricated via static_cast from an
+  // out-of-table value bypassing knownOption()'s validation (impossible
+  // through any public API this class itself exposes).
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
@@ -474,43 +508,70 @@ public:
   // Variant's contents (Kind::Variant) or the unrecognized tag string
   // (Kind::Unknown); empty for Kind::Known.
   [[nodiscard]] const QString &text() const noexcept { return m_text; }
-  // Kind::Unknown only: the complete raw decoded object (its "tag" and,
-  // if present, "contents", plus any additive sibling key a future
-  // backend release adds alongside them), preserved verbatim as a
-  // lossless Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue,
-  // so no additive key beside "contents" is silently dropped. This is the
-  // only representation this class guarantees round-trips byte-exact
-  // (including a huge numeric literal this client cannot interpret): use
-  // unknownRaw().toJsonBytes() (or decode it further yourself) whenever
+  // The complete raw decoded object -- "tag" and, if present, "contents",
+  // plus any additive sibling key a future backend release adds alongside
+  // them -- preserved verbatim as a lossless Json::Value (see RawJson.h)
+  // for EVERY kind this instance decoded as (Known and Variant, not only
+  // Unknown): a known tag's response object can carry additive/nullable
+  // fields this client does not model just as easily as an unrecognized
+  // one can, and round 6's review requires those survive too, not merely
+  // the recognized tag/contents. Undefined if this instance was built via
+  // knownOption()/variantOption() rather than decoded from JSON (there is
+  // no "original wire object" to preserve in that case). This is the only
+  // representation guaranteed to round-trip byte-exact (including a huge
+  // numeric literal this client cannot interpret): use
+  // rawJson().toJsonBytes() (or decode it further yourself) whenever
   // exactness beyond a double's 2^53/int64 range matters. Note that a
   // duplicate object key anywhere in the payload is rejected by
   // Json::Value::parse() itself (see RawJson.cpp) and therefore never
   // reaches this representation in the first place. toJson() below is a
-  // QJsonObject-typed convenience for the Unknown case only as exact as
-  // Json::Value::toQJson() itself is (see its doc comment in RawJson.h):
-  // an exact-int64 numeric literal survives, but anything requiring more
-  // precision than QJsonValue's double-backed storage allows does not.
-  [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
-    return m_unknownRaw;
-  }
-  // Convenience view derived from unknownRaw(): the raw "contents" the
-  // unrecognized tag object carried, if any (Undefined if it had none).
-  // Never the source of truth for encoding -- toJson()/unknownRaw() are.
+  // QJsonObject-typed convenience only as exact as Json::Value::toQJson()
+  // itself is (see its doc comment in RawJson.h): an exact-int64 numeric
+  // literal survives, but anything requiring more precision than
+  // QJsonValue's double-backed storage allows does not.
+  [[nodiscard]] const Json::Value &rawJson() const noexcept { return m_raw; }
+  // Convenience view derived from rawJson(): the raw "contents" the
+  // decoded object carried, if any (Undefined if it had none or this
+  // instance was not decoded from JSON). Never the source of truth for
+  // encoding -- toJson()/rawJson() are. Named for its original (and still
+  // primary) use identifying an unrecognized tag's payload; Kind::Known's
+  // KnownCampaignOption constructors are all nullary per the pinned
+  // backend (see kKnownCampaignOptionTable), so a Known instance's
+  // rawJson() ordinarily has no "contents" key at all -- one appearing
+  // there (even null) is itself the additive-field case toRequestOption()
+  // below refuses to silently narrow past.
   [[nodiscard]] Json::Value unknownContents() const {
-    return m_unknownRaw.isObject()
-               ? m_unknownRaw.value(QLatin1StringView("contents"))
-               : Json::Value{};
+    return m_raw.isObject() ? m_raw.value(QLatin1StringView("contents"))
+                            : Json::Value{};
   }
 
   // Narrows this decoded (possibly Kind::Unknown) option down to the closed
   // CampaignOptionRequest a createGameRequest may actually submit. Fails
   // for Kind::Unknown: an option this client could not interpret must
   // never be silently resubmitted as if the server already understood it.
+  // Also fails for Kind::Known/Kind::Variant whenever this instance was
+  // decoded from a raw object whose keys are not *exactly* the closed
+  // request shape (just "tag" for Known; "tag" and "contents" for
+  // Variant) -- e.g. an explicit "contents": null beside a known nullary
+  // tag, or any additive sibling key -- rather than silently discarding
+  // whatever this client could not interpret and resubmitting a
+  // deceptively "clean" request. A CampaignOption built via
+  // knownOption()/variantOption() (rawJson() Undefined, nothing to lose)
+  // always narrows successfully.
   [[nodiscard]] ValueOrError<CampaignOptionRequest>
   toRequestOption(QStringView path) const;
 
-  friend bool operator==(const CampaignOption &,
-                         const CampaignOption &) = default;
+  friend bool operator==(const CampaignOption &lhs, const CampaignOption &rhs) {
+    // Deliberately excludes rawJson(): equality reflects this option's
+    // logical value (kind/known/text), not which exact bytes happened to
+    // accompany a particular decode -- knownOption(X) and a fresh decode
+    // of X's canonical {"tag": ...} must compare equal even though only
+    // the latter populates rawJson(). toRequestOption()'s additive-field
+    // refusal (not operator==) is what protects a decode's extra raw data
+    // from being silently discarded.
+    return lhs.m_kind == rhs.m_kind && lhs.m_known == rhs.m_known &&
+           lhs.m_text == rhs.m_text;
+  }
 
 private:
   CampaignOption() = default;
@@ -526,7 +587,7 @@ private:
   Kind m_kind{Kind::Unknown};
   std::optional<KnownCampaignOption> m_known;
   QString m_text;
-  Json::Value m_unknownRaw;
+  Json::Value m_raw;
 };
 
 // createGameRequest.options's actual element type. Unlike CampaignOption
@@ -541,13 +602,18 @@ class CampaignOptionRequest {
 public:
   enum class Kind { Known, Variant };
 
-  [[nodiscard]] static CampaignOptionRequest
+  // Fails if `option` is not one of kKnownCampaignOptionTable's entries
+  // (see CampaignOption::knownOption()'s identical rationale above).
+  [[nodiscard]] static ValueOrError<CampaignOptionRequest>
   knownOption(KnownCampaignOption option);
   [[nodiscard]] static CampaignOptionRequest variantOption(QString contents);
 
   // Fails on any tag this client does not recognize (including
-  // "CampaignVariant" with a non-string contents) -- there is no
-  // forward-compatible fallback for a request-bound value.
+  // "CampaignVariant" with a non-string contents), or on any recognized
+  // tag whose object carries a key beyond the exact closed request shape
+  // (just "tag" for a known option; "tag" and "contents" for
+  // "CampaignVariant") -- there is no forward-compatible fallback for a
+  // request-bound value.
   [[nodiscard]] static ValueOrError<CampaignOptionRequest>
   fromJson(const QJsonValue &v, QStringView path);
   // Canonical byte-level decode overload: identical logic (shared via a
@@ -557,7 +623,7 @@ public:
   // without dropping to QJsonValue for this element type.
   [[nodiscard]] static ValueOrError<CampaignOptionRequest>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   [[nodiscard]] std::optional<KnownCampaignOption> known() const noexcept {
