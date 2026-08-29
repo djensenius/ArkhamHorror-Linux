@@ -212,6 +212,44 @@ public:
     return m_operations.size();
   }
 
+  // Review round-4 item 7: observable sizes of the three per-cache-key
+  // maps (m_negative404, m_cacheKeyGeneration, m_cacheKeyIssuedGeneration)
+  // that pruneStaleCacheKeyState() bounds -- see its declaration comment
+  // for the pruning contract. Test-only; lets a high-cardinality test
+  // assert these maps stay bounded (proportional to currently-in-flight
+  // + recently-active cache keys) rather than growing without limit for
+  // the coordinator's entire process lifetime.
+  [[nodiscard]] int negative404RecordCountForTesting() const {
+    return m_negative404.size();
+  }
+  [[nodiscard]] int cacheKeyGenerationStateCountForTesting() const {
+    return m_cacheKeyGeneration.size() + m_cacheKeyIssuedGeneration.size();
+  }
+  // Test-only exposure of the private hasNegative404() predicate itself,
+  // for asserting a specific cache key's record was (or was not) evicted
+  // by pruning, independent of the aggregate counts above.
+  [[nodiscard]] bool hasNegative404ForTesting(const QString &cacheKey) const {
+    return hasNegative404(cacheKey);
+  }
+
+  // Review round-4 item 7: force an immediate prune (production code
+  // only ever prunes opportunistically, at the end of
+  // completeOperation()) so a test can assert the post-prune bound
+  // deterministically without depending on exactly how many operations
+  // happen to have completed.
+  void pruneStaleCacheKeyStateForTesting() { pruneStaleCacheKeyState(); }
+
+  // Review round-4 item 7: override the production
+  // kMaxTrackedNegative404Entries ceiling so a high-cardinality test can
+  // exercise the hard-cap eviction path (as opposed to lazy TTL-expiry
+  // pruning) with a small, fast number of distinct candidates instead of
+  // needing thousands of real network round trips to reach the
+  // production-sized cap. Test-only; production code always uses the
+  // compiled-in default (see the constructor).
+  void setMaxTrackedNegative404EntriesForTesting(int maxEntries) {
+    m_maxTrackedNegative404Entries = maxEntries;
+  }
+
   // Review round-3 item 13: replaces the real monotonic (steady_clock)
   // clock used to expire negative-404 records with a caller-supplied
   // function, so tests can deterministically simulate TTL expiry without
@@ -388,6 +426,48 @@ private:
   // finish first.
   [[nodiscard]] bool tryApplyCacheKeyMutation(const QString &cacheKey,
                                               quint64 issuedGeneration);
+  // Review round-4 item 7: the exact set of cache keys some CURRENTLY
+  // in-flight operation might still complete against right now -- i.e.
+  // every distinct AssetCache::cacheKeyFor() value that could still be
+  // the `cacheKey` argument of a future tryApplyCacheKeyMutation()/
+  // recordNegative404() call reachable from an operation already present
+  // in m_operations. One entry per operation: its current candidate's
+  // resolved cache key (or revalidationCacheKey while revalidating).
+  // pruneStaleCacheKeyState() treats every key in this set as pinned --
+  // never erased from m_negative404/m_cacheKeyGeneration/
+  // m_cacheKeyIssuedGeneration -- regardless of TTL/generation state.
+  [[nodiscard]] QSet<QString> activeInFlightCacheKeys() const;
+  // Review round-4 item 7: bounds m_negative404/m_cacheKeyGeneration/
+  // m_cacheKeyIssuedGeneration, which previously retained one entry per
+  // DISTINCT cache key ever observed for this coordinator's entire
+  // process lifetime (a long play session touching thousands of distinct
+  // card arts would grow all three without limit). Called opportunistically
+  // at the end of every completeOperation() -- the natural point at which
+  // an operation stops being "in-flight" and its cache key becomes a
+  // pruning candidate.
+  //
+  // A key is erased from m_negative404 once its record is expired or
+  // superseded (mirrors hasNegative404()'s own "no longer authoritative"
+  // condition, just swept here instead of left in place indefinitely)
+  // AND it is not in activeInFlightCacheKeys(). A key is erased from
+  // m_cacheKeyGeneration/m_cacheKeyIssuedGeneration once it is not in
+  // activeInFlightCacheKeys() AND no (still-valid) m_negative404 record
+  // for it survives the sweep above.
+  //
+  // Safety argument ("operation-owned epoch" survives pruning): every
+  // completion lambda that could ever call tryApplyCacheKeyMutation()/
+  // recordNegative404() for a cache key FIRST looks its own operationId
+  // up in m_operations and returns immediately if it is missing (see
+  // completeOperation(), which erases the operation the instant it
+  // completes, before any further async work). Consequently, once ALL
+  // operations referencing a cache key have completed and been erased --
+  // exactly the condition activeInFlightCacheKeys() excludes -- no future
+  // completion can ever reach these maps for that key again, so resetting
+  // its generation counters back to the "never seen" (0) baseline is
+  // indistinguishable from having never touched that key at all. A key
+  // remaining active is never pruned, so an in-flight operation's own
+  // eventual CAS check always sees its true, unbroken generation history.
+  void pruneStaleCacheKeyState();
   // Review round-3 item 12: the ONE path every candidate-list transition
   // (the very first look at an untried candidate, and every subsequent
   // advance past a definitive 404/quarantine) routes through, so a
@@ -452,6 +532,20 @@ private:
   // hasNegative404()'s comment for the TTL/generation expiry.
   QHash<QString, Negative404Entry> m_negative404;
   static constexpr qint64 kNegative404TtlMs = 5 * 60 * 1000; // 5 minutes
+  // Review round-4 item 7: a hard ceiling on the number of DISTINCT
+  // unexpired negative-404 records retained at once, independent of
+  // kNegative404TtlMs. pruneStaleCacheKeyState()'s lazy-expiry sweep
+  // alone only removes ALREADY-expired records, so it cannot bound the
+  // (unrealistic, but not impossible) case of an enormous number of
+  // distinct candidates all 404ing within the same TTL window; this cap
+  // evicts the soonest-to-expire non-pinned record(s) once exceeded.
+  // Chosen generously relative to any real card/asset catalogue's size.
+  // A member (not a bare compile-time constant) so
+  // setMaxTrackedNegative404EntriesForTesting() can shrink it for a fast,
+  // deterministic high-cardinality test; production code never changes
+  // it from this default.
+  static constexpr int kMaxTrackedNegative404Entries = 4096;
+  int m_maxTrackedNegative404Entries = kMaxTrackedNegative404Entries;
   // Review round-3 item 13: the monotonic clock negative-404 expiry is
   // measured against -- steady_clock in production (see the .cpp),
   // replaceable via setMonotonicNowForTesting() above. Deliberately NOT

@@ -84,6 +84,9 @@ private slots:
   void
   laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond();
   void queuedStaleDiskDecodeNeverMutatesANewerLiveMemoryEntry();
+  // Review round-4 items 5, 7.
+  void newer404TombstonesOlderCachedEntryAcrossTtlExpiryAndRestart();
+  void negative404AndGenerationStateStayBoundedUnderHighCardinality();
 
 private:
   QString m_tempDirPath;

@@ -355,6 +355,93 @@ bool AssetRequestCoordinator::tryApplyCacheKeyMutation(
   return true;
 }
 
+QSet<QString> AssetRequestCoordinator::activeInFlightCacheKeys() const {
+  QSet<QString> active;
+  for (auto it = m_operations.constBegin(); it != m_operations.constEnd();
+       ++it) {
+    const Operation &operation = it.value();
+    if (operation.isRevalidation) {
+      if (!operation.revalidationCacheKey.isEmpty()) {
+        active.insert(operation.revalidationCacheKey);
+      }
+      continue;
+    }
+    if (operation.candidateIndex >= 0 &&
+        operation.candidateIndex < operation.candidates.size()) {
+      active.insert(AssetCache::cacheKeyFor(
+          operation.candidates[operation.candidateIndex].url));
+    }
+  }
+  return active;
+}
+
+void AssetRequestCoordinator::pruneStaleCacheKeyState() {
+  const QSet<QString> active = activeInFlightCacheKeys();
+  const qint64 now = m_monotonicNowMs();
+
+  // See the declaration comment: a negative-404 record is prunable once
+  // it is no longer authoritative (expired, or superseded by a
+  // different generation having since been applied) -- the same
+  // condition hasNegative404() already checks lazily -- AND its cache
+  // key is not pinned by any still-in-flight operation.
+  for (auto it = m_negative404.begin(); it != m_negative404.end();) {
+    const bool stillAuthoritative =
+        it->generation == m_cacheKeyGeneration.value(it.key(), 0) &&
+        now < it->expiresAtMonotonicMs;
+    if (!stillAuthoritative && !active.contains(it.key())) {
+      it = m_negative404.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // Review round-4 item 7: enforce the hard ceiling even when every
+  // surviving record is individually still within its TTL -- evict the
+  // soonest-to-expire non-pinned record(s) first (a reasonable,
+  // deterministic proxy for "oldest" given these records carry no
+  // separate last-access timestamp) until back at or under the cap, or
+  // until every remaining record is pinned by an in-flight operation
+  // (in which case the cap is temporarily, unavoidably exceeded by
+  // however many operations are genuinely still in flight).
+  while (m_negative404.size() > m_maxTrackedNegative404Entries) {
+    auto oldestIt = m_negative404.end();
+    for (auto it = m_negative404.begin(); it != m_negative404.end(); ++it) {
+      if (active.contains(it.key())) {
+        continue;
+      }
+      if (oldestIt == m_negative404.end() ||
+          it->expiresAtMonotonicMs < oldestIt->expiresAtMonotonicMs) {
+        oldestIt = it;
+      }
+    }
+    if (oldestIt == m_negative404.end()) {
+      break;
+    }
+    m_negative404.erase(oldestIt);
+  }
+
+  // Generation-tracking state for a cache key is prunable once nothing
+  // still needs to compare against it: no in-flight operation is pinning
+  // it, and no surviving (just-swept, still-authoritative) negative-404
+  // record depends on it either.
+  for (auto it = m_cacheKeyGeneration.begin();
+       it != m_cacheKeyGeneration.end();) {
+    if (!active.contains(it.key()) && !m_negative404.contains(it.key())) {
+      it = m_cacheKeyGeneration.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = m_cacheKeyIssuedGeneration.begin();
+       it != m_cacheKeyIssuedGeneration.end();) {
+    if (!active.contains(it.key()) && !m_negative404.contains(it.key())) {
+      it = m_cacheKeyIssuedGeneration.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 AssetOutcome<AssetCache::CachedEntry>
 AssetRequestCoordinator::ensureDecoded(AssetCache::CachedEntry entry,
                                        AssetFormat format) {
@@ -671,7 +758,28 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
             // fetch was issued, this 404 -- observed against an older
             // view of the world -- must not resurrect a negative record
             // over it.
+            //
+            // Review round-4 item 5: this 404 must ALSO tombstone
+            // (invalidate()) any cache entry that may already exist for
+            // this exact cache key -- e.g. a genuinely older still-valid
+            // 200 published by a DIFFERENT, cross-logical-key operation
+            // that happens to resolve to the identical candidate URL
+            // (see the class comment's "Cross-logical-key races"
+            // paragraph), or a 200 published by an earlier-issued but
+            // slower-to-complete operation on this SAME candidate.
+            // Previously only startRevalidation()'s 404 path did this;
+            // this first-try path recorded a negative-404 record
+            // alongside an untouched stale 200 entry, which
+            // hasNegative404() correctly hid for as long as the record's
+            // TTL lasted -- but once that TTL expired, request()'s
+            // ordinary cache lookup would find and serve the
+            // never-actually-evicted stale entry again, resurrecting
+            // content the origin has since authoritatively confirmed
+            // gone. Invalidating here, exactly like the revalidation
+            // path already does, closes that gap unconditionally rather
+            // than relying on the negative-404 TTL alone.
             if (self->tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
+              self->m_cache.invalidate(cacheKey);
               self->recordNegative404(cacheKey, expectedGeneration);
             }
             if (operation.candidateIndex + 1 < operation.candidates.size()) {
@@ -907,6 +1015,15 @@ void AssetRequestCoordinator::completeOperation(
   }
   Operation operation = std::move(it.value());
   m_operations.erase(it);
+  // Review round-4 item 7: this operation has just stopped being
+  // in-flight -- its (or any other now-inactive operation's) cache key(s)
+  // may now be prunable from m_negative404/m_cacheKeyGeneration/
+  // m_cacheKeyIssuedGeneration. See pruneStaleCacheKeyState()'s
+  // declaration comment for the full safety argument; called here,
+  // opportunistically, rather than on a timer, so these maps' sizes stay
+  // proportional to currently- and recently-active cache keys without
+  // any separate scheduling machinery.
+  pruneStaleCacheKeyState();
   // The consumer handle must remain valid for cancel() until the queued
   // delivery below actually runs (see the class comment): simply erasing
   // it from m_handleToOperation here, with nothing replacing it, would

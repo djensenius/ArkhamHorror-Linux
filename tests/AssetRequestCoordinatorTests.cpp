@@ -2516,3 +2516,253 @@ void AssetRequestCoordinatorTests::
   QVERIFY(!memoryHit->decodedImage.isNull());
   QCOMPARE(memoryHit->decodedImage.size(), QSize(16, 16));
 }
+
+void AssetRequestCoordinatorTests::
+    newer404TombstonesOlderCachedEntryAcrossTtlExpiryAndRestart() {
+  // Review round-4 item 5 ("newer unconditional 404 records negative
+  // but doesn't invalidate older cached 200; after TTL old
+  // resurrects"). Previously, startCandidate()'s definitive-404 branch
+  // called recordNegative404() but never m_cache.invalidate(cacheKey)
+  // (unlike startRevalidation()'s equivalent branch, which always did).
+  // A still-cached 200 for the exact same cache key -- published by a
+  // DIFFERENT, cross-logical-key, genuinely CONCURRENT operation
+  // (locale-only difference, same candidate URL -- an ordinary
+  // sequential second request would just be served straight from that
+  // now-cached 200 entry without ever reaching the network again, so
+  // this scenario needs two operations racing while BOTH are still
+  // genuinely in flight, like
+  // laterIssuedOperationPublishesOverEarlierIssuedEvenWhenItCompletesSecond
+  // below) -- was therefore left completely untouched by the newer
+  // operation's later negative-404 recording: hasNegative404() correctly
+  // HID it for as long as the negative record's TTL lasted, but once
+  // that TTL lazily expired, an ordinary cache lookup would find and
+  // serve the never-actually-evicted stale entry again, resurrecting
+  // content the origin has since authoritatively confirmed gone.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+
+  // keyA is issued FIRST and given a FAST 200; keyB is issued SECOND
+  // (only once the server has fully received A's request, so B's own
+  // request() call -- which runs its cache-miss check synchronously,
+  // before any further event-loop pumping -- is guaranteed to observe
+  // the SAME "nothing cached yet" state A itself saw) and given a
+  // SLOW-dripped 404, so A is guaranteed to complete (and apply: 200,
+  // issuance 1) well before B (404, issuance 2). This is the ONE
+  // completion order that actually exercises the item-5 fix: an
+  // ALREADY-applied older 200 that a genuinely later-issued 404 must
+  // still tombstone. (The reverse order -- B's 404 applying before A's
+  // 200 even arrives -- would instead just exercise the ALREADY-fixed
+  // round-3 item 14 CAS refusing A's now-stale 200 outright, never
+  // populating the cache in the first place, which would prove nothing
+  // about invalidate() being called here.)
+  MockHttpServer::Response fastOk;
+  fastOk.contentType = "image/png";
+  fastOk.body = encodePng(8, 8);
+  server.setResponse(path, fastOk);
+
+  MockHttpServer::Response slowNotFound;
+  slowNotFound.status = 404;
+  slowNotFound.reasonPhrase = "Not Found";
+  slowNotFound.slowDrip = true;
+  slowNotFound.chunkSize = 4096;
+  slowNotFound.chunkDelayMs = 200;
+  bool swapped = false;
+  QObject::connect(
+      &server, &MockHttpServer::requestHandled, &server,
+      [&](const QString &firedPath) {
+        if (firedPath == path && !swapped) {
+          swapped = true;
+          server.setResponse(path, slowNotFound);
+        }
+      },
+      Qt::QueuedConnection);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  auto cache = std::make_unique<AssetCache>(cacheConfig);
+  auto coordinator = std::make_unique<AssetRequestCoordinator>(*cache, fetcher);
+
+  qint64 fakeNowMs = 1'000'000;
+  coordinator->setMonotonicNowForTesting([&]() { return fakeNowMs; });
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidatesA = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidatesA));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidatesA->first().url);
+
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+
+  coordinator->request(keyA, [&](Result r) { resultA = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return swapped; }, 5000));
+  QCOMPARE(server.requestCount(path), 1);
+
+  coordinator->request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
+  QCOMPARE(server.requestCount(path), 2);
+
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QCOMPARE((**resultA).encodedBytes, fastOk.body);
+  QVERIFY(!bool(*resultB));
+  QCOMPARE(resultB->error().code, AssetErrorCode::NotFound);
+
+  // The decisive assertion for the FIX: A's own consumer still
+  // genuinely observed its own fetched 200 bytes (never itself
+  // corrupted/blocked), but the SHARED cache entry must be gone
+  // IMMEDIATELY once B's later-issued, newer 404 applies -- never
+  // merely masked by the negative-404 record.
+  QVERIFY(!cache->lookupDisk(cacheKey).has_value());
+
+  // Still well within the negative-404 TTL: keyA must observe NotFound
+  // (from the negative record, no new network round trip) -- never a
+  // resurrected stale success.
+  fakeNowMs += 60'000; // +1 minute, TTL is 5 minutes
+  std::optional<Result> resultAAgain;
+  coordinator->request(keyA, [&](Result r) { resultAAgain = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return resultAAgain.has_value(); }, 5000));
+  QVERIFY(!bool(*resultAAgain));
+  QCOMPARE(resultAAgain->error().code, AssetErrorCode::NotFound);
+  QCOMPARE(server.requestCount(path), 2); // no new network round trip
+
+  // Past the negative-404 TTL: the record has lazily expired, but (with
+  // the fix) the underlying cache entry was ALREADY evicted above, so
+  // this must genuinely re-check the network -- never silently
+  // resurrect the long-gone cached 200 bytes.
+  fakeNowMs += 6 * 60'000; // +6 more minutes -- past the 5-minute TTL
+  std::optional<Result> resultAPastTtl;
+  coordinator->request(keyA, [&](Result r) { resultAPastTtl = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return resultAPastTtl.has_value(); }, 5000));
+  QVERIFY(!bool(*resultAPastTtl));
+  QCOMPARE(resultAPastTtl->error().code, AssetErrorCode::NotFound);
+  QCOMPARE(server.requestCount(path), 3); // genuinely re-tried
+
+  // Simulated restart: a brand-new AssetCache/AssetRequestCoordinator
+  // pair backed by the SAME on-disk directory must never find a
+  // resurrected stale entry either -- invalidate() deletes the disk
+  // files themselves (see AssetCache::invalidate()), not merely an
+  // in-memory record that a restart would naturally drop anyway.
+  coordinator.reset();
+  cache.reset();
+  AssetCache restartedCache(cacheConfig);
+  QVERIFY(!restartedCache.lookupDisk(cacheKey).has_value());
+}
+
+void AssetRequestCoordinatorTests::
+    negative404AndGenerationStateStayBoundedUnderHighCardinality() {
+  // Review round-4 item 7 ("m_negative404, issuedGeneration/
+  // currentGeneration retain every candidate forever"). Previously
+  // hasNegative404() was a purely lazy, read-only check: an
+  // expired/superseded record was simply left in m_negative404 forever
+  // (never swept), and m_cacheKeyGeneration/m_cacheKeyIssuedGeneration
+  // gained one permanent entry per DISTINCT cache key ever observed for
+  // the coordinator's entire process lifetime. A long play session
+  // touching many thousands of distinct card arts would grow all three
+  // maps without limit.
+  //
+  // This drives many DISTINCT candidates (distinct identifiers => distinct
+  // resolved URLs => distinct cache keys) to a definitive 404, one at a
+  // time (each fully completed before the next is issued, so none is
+  // ever "in flight" and pinned by activeInFlightCacheKeys() by the time
+  // the next one starts), then asserts the coordinator's own observable
+  // counters never grow anywhere near the full candidate count -- proving
+  // pruneStaleCacheKeyState() (called opportunistically at the end of
+  // every completeOperation()) actually bounds these maps rather than
+  // merely documenting an intent to.
+  //
+  // Every candidate's negative-404 TTL is still fully alive throughout
+  // (the fake monotonic clock never advances), so it is specifically the
+  // HARD CAP (kMaxTrackedNegative404Entries) -- not lazy TTL-based
+  // expiry -- that must bound growth here. The production cap (4096) is
+  // deliberately overridden down to a small test value via
+  // setMaxTrackedNegative404EntriesForTesting() so this test can drive
+  // enough distinct candidates to exceed it using a handful of fast
+  // local round trips rather than thousands of real ones.
+  MockHttpServer server;
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+
+  constexpr int kTestCap = 5;
+  constexpr int kCandidateCount = kTestCap * 4;
+  for (int i = 0; i < kCandidateCount; ++i) {
+    server.setResponse(QStringLiteral("/img/arkham/sets/icon%1.png").arg(i),
+                       notFound);
+  }
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  coordinator.setMaxTrackedNegative404EntriesForTesting(kTestCap);
+
+  qint64 fakeNowMs = 1'000'000;
+  coordinator.setMonotonicNowForTesting([&]() { return fakeNowMs; });
+
+  for (int i = 0; i < kCandidateCount; ++i) {
+    const AssetKey key =
+        makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                QStringLiteral("icon%1").arg(i));
+    std::optional<Result> result;
+    coordinator.request(key, [&](Result r) { result = std::move(r); });
+    QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+    QVERIFY(!bool(*result));
+    QCOMPARE(result->error().code, AssetErrorCode::NotFound);
+    // Advance the fake clock by a tiny, strictly-increasing amount
+    // between iterations (still nowhere near kNegative404TtlMs) purely
+    // so each record's expiresAtMonotonicMs is distinct and strictly
+    // increasing with insertion order -- making the cap's "evict
+    // soonest-to-expire first" tie-breaking deterministic (earliest
+    // inserted == soonest to expire == first evicted) for this test's
+    // later assertion about specifically icon0.
+    ++fakeNowMs;
+    // completeOperation() prunes opportunistically after every single
+    // completion above, so the cap is enforced continuously, never only
+    // at the very end.
+    QVERIFY2(coordinator.negative404RecordCountForTesting() <= kTestCap,
+             qPrintable(QStringLiteral("negative404 record count %1 exceeded "
+                                       "the %2 test cap after candidate %3")
+                            .arg(coordinator.negative404RecordCountForTesting())
+                            .arg(kTestCap)
+                            .arg(i)));
+  }
+
+  QCOMPARE(coordinator.negative404RecordCountForTesting(), kTestCap);
+  // Generation-tracking state is bounded by the SAME cap (each surviving
+  // negative404 record pins exactly one cacheKeyGeneration and one
+  // cacheKeyIssuedGeneration entry; nothing else is pinned once every
+  // operation above has fully completed).
+  QCOMPARE(coordinator.cacheKeyGenerationStateCountForTesting(), kTestCap * 2);
+
+  // Stale-completion safety after eviction: a fresh request for one of
+  // the EARLIEST (necessarily evicted, since only the most recent
+  // kTestCap records can possibly have survived) candidates must still
+  // behave correctly -- it re-checks the network (its negative record
+  // was evicted by the cap) and gets a fresh, correct NotFound, never a
+  // crash or a wrongly-resurrected/duplicated result.
+  const AssetKey earlyKeyAgain =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+              QStringLiteral("icon0"));
+  QVERIFY(!coordinator.hasNegative404ForTesting(AssetCache::cacheKeyFor(
+      AssetLocator::resolveCandidates(earlyKeyAgain)->first().url)));
+  std::optional<Result> earlyResultAgain;
+  coordinator.request(earlyKeyAgain,
+                      [&](Result r) { earlyResultAgain = std::move(r); });
+  QVERIFY(
+      QTest::qWaitFor([&]() { return earlyResultAgain.has_value(); }, 5000));
+  QVERIFY(!bool(*earlyResultAgain));
+  QCOMPARE(earlyResultAgain->error().code, AssetErrorCode::NotFound);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/icon0.png")),
+           2); // once originally, once again after its record was evicted
+}
