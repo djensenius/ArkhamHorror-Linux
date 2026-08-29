@@ -44,8 +44,11 @@ public:
 
   ~QtKeychainTokenStore() override;
 
-  void readToken(const QString &profileId, ResultCallback callback) override;
+  void readToken(const QString &profileId,
+                 const QString &expectedEndpointIdentity,
+                 ResultCallback callback) override;
   void saveToken(const QString &profileId, const QString &token,
+                 const QString &endpointIdentity,
                  ResultCallback callback) override;
   void deleteToken(const QString &profileId, ResultCallback callback) override;
 

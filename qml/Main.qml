@@ -21,6 +21,22 @@ ApplicationWindow {
     property color gold: "#b7944c"
     required property string configuredServer
 
+    // Prefers the coordinator's actual selected profile once one has been
+    // loaded (see SessionCoordinator::selectedProfileBaseUrl); only falls
+    // back to the static |configuredServer| initial property (the hosted
+    // default) before the coordinator has started, or in --smoke-test
+    // where sessionCoordinator is never registered at all. This avoids the
+    // "Connect" card ever showing a server other than the one actually in
+    // use. Never displays a password, token, or Authorization header --
+    // only a public server URL.
+    // qmllint disable unqualified
+    function connectDetail() {
+        if (typeof sessionCoordinator !== "undefined" && sessionCoordinator && sessionCoordinator.selectedProfileBaseUrl.length > 0)
+            return sessionCoordinator.selectedProfileBaseUrl;
+        return root.configuredServer;
+    }
+    // qmllint enable unqualified
+
     background: Rectangle {
         gradient: Gradient {
             GradientStop {
@@ -69,7 +85,7 @@ ApplicationWindow {
                 model: [
                     {
                         title: qsTr("Connect"),
-                        detail: root.configuredServer
+                        detail: root.connectDetail()
                     },
                     {
                         title: qsTr("Browse fixtures"),
@@ -147,6 +163,21 @@ ApplicationWindow {
 
         Item {
             Layout.fillHeight: true
+        }
+
+        Label {
+            // sessionCoordinator is only registered as a context property
+            // during normal startup (see AppBootstrap.h / main.cpp); it is
+            // deliberately absent in --smoke-test, so this guards against
+            // referencing an undeclared identifier rather than assuming it
+            // always exists. Only ever shows non-secret state/server
+            // metadata: never a password, token, or Authorization header.
+            // qmllint disable unqualified
+            text: typeof sessionCoordinator !== "undefined" && sessionCoordinator ? qsTr("%1 — %2").arg(sessionCoordinator.stateDescription).arg(sessionCoordinator.selectedProfileDisplayName) : ""
+            // qmllint enable unqualified
+            visible: text.length > 0
+            color: root.gold
+            font.pixelSize: 16
         }
 
         Label {

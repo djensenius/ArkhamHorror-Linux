@@ -28,6 +28,7 @@
 #include "NetworkAuthenticationClient.h"
 #include "ServerProfile.h"
 #include "StrictLoopbackUrlTable.h"
+#include "TokenContentTestData.h"
 #include "UrlValidator.h"
 
 using namespace Arkham;
@@ -200,6 +201,10 @@ private slots:
   void whoAmISendsExactAuthorizationHeader();
   void whoAmIRejectsEmptyToken();
   void whoAmIRejectsTokenWithControlCharacters();
+  void whoAmIRejectsEveryInvalidSharedTableToken_data();
+  void whoAmIRejectsEveryInvalidSharedTableToken();
+  void authenticateResponseWithInvalidTokenIsMalformedPayload_data();
+  void authenticateResponseWithInvalidTokenIsMalformedPayload();
   void requestsDisableCookiesAndAuthReuse();
   void requestsSetManualRedirectPolicy();
   void requestsSetCacheBypassAttributes();
@@ -424,6 +429,90 @@ void AuthClientTests::whoAmIRejectsTokenWithControlCharacters() {
   // The diagnostic must never echo the offending token/header value.
   QVERIFY(!result->diagnostic.contains(tokenFragment));
   QVERIFY(!result->diagnostic.contains(injectedHeaderName));
+}
+
+void AuthClientTests::whoAmIRejectsEveryInvalidSharedTableToken_data() {
+  QTest::addColumn<QString>("token");
+  for (const auto &row : Arkham::Test::tokenContentRows()) {
+    if (!row.expectValid) {
+      QTest::newRow(row.name) << row.token;
+    }
+  }
+}
+
+void AuthClientTests::whoAmIRejectsEveryInvalidSharedTableToken() {
+  // Every row this shared table (also driving TokenStoreTests.cpp's and
+  // SessionCoordinatorTests.cpp's equivalent tests) calls invalid must be
+  // rejected here too, before any request is constructed: "direct whoAmI
+  // input" admission enforces the exact same isValidTokenContent() check
+  // as every other trust boundary (see src/TokenValidation.h), not merely
+  // the narrower empty/control-character cases covered by the two
+  // dedicated tests above.
+  QFETCH(QString, token);
+  StubNetworkAccessManager nam;
+  NetworkAuthenticationClient client(nam);
+
+  const auto result = runAndWait<CurrentUser>(
+      [&](std::function<void(AuthResult<CurrentUser>)> cb) {
+        return client.whoAmI(ServerProfile::hostedDefault(), token,
+                             std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::InvalidInput);
+  QVERIFY(nam.requests().isEmpty());
+}
+
+void AuthClientTests::
+    authenticateResponseWithInvalidTokenIsMalformedPayload_data() {
+  QTest::addColumn<QString>("token");
+  for (const auto &row : Arkham::Test::tokenContentRows()) {
+    if (!row.expectValid) {
+      QTest::newRow(row.name) << row.token;
+    }
+  }
+}
+
+void AuthClientTests::authenticateResponseWithInvalidTokenIsMalformedPayload() {
+  // A 2xx /authenticate response whose "token" field fails
+  // isValidTokenContent() must decode as MalformedPayload, never as a
+  // usable Success -- otherwise a value like " valid-jwt " (which trims
+  // to non-blank) could be admitted into an Authorization header and
+  // persisted, only to be classified Malformed and deleted on the very
+  // next restore. This exercises the actual production decode path
+  // (AuthToken::fromJson() via classifyReply()), not merely
+  // isValidTokenContent() in isolation.
+  QFETCH(QString, token);
+  // QJsonDocument encodes control characters as their exact \uXXXX escape
+  // (never raw bytes), so every row -- including embedded CR/LF/NUL --
+  // round-trips through JSON exactly, without needing any row-specific
+  // escaping here.
+  const QJsonObject body{{QStringLiteral("token"), token}};
+  const QByteArray json = QJsonDocument(body).toJson(QJsonDocument::Compact);
+
+  StubNetworkAccessManager nam;
+  nam.enqueue(200, json);
+  NetworkAuthenticationClient client(nam);
+
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            ServerProfile::hostedDefault(),
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::MalformedPayload);
+  QVERIFY(!result->value.has_value());
+  // The diagnostic is always the fixed, static, secret-free message
+  // AuthModels.cpp's AuthToken::fromJson() returns for this exact
+  // failure -- never a value derived from (and so never accidentally
+  // containing, whether by design or by unlucky substring coincidence)
+  // the offending token itself.
+  QCOMPARE(result->diagnostic,
+           QStringLiteral("response field \"token\" is not a usable token"));
 }
 
 void AuthClientTests::requestsDisableCookiesAndAuthReuse() {
