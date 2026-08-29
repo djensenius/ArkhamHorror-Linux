@@ -52,6 +52,8 @@ private slots:
   void cycleZoneWithNoCurrentFocusLandsOnARealFirstOrLastZone();
   void modalPushAndPopReturnsToExactPriorFocus();
   void nestedModalsUnwindInReverseOrder();
+  void popModalPreservesAnIntentionallyEmptyReturnTarget();
+  void restoreSnapshotPreservesAnIntentionallyEmptyModalReturnTarget();
   void removingCurrentlyFocusedNodeFallsBackToExplicitFallback();
   void removingCurrentlyFocusedNodeFallsBackToNeighborThenZone();
   void removingCurrentlyFocusedNodeWithNoFallbackClearsFocus();
@@ -67,6 +69,7 @@ private slots:
   removedEmptyZoneIsPrunedFromCycleOrderAndReappearsAtTheEndIfReintroduced();
   void reregisteringANodeIntoADifferentZonePrunesTheOldZoneOnceItIsEmpty();
   void pruningAnEmptyZoneAlsoForgetsItsLastFocusedMemory();
+  void reregisteringANodeIntoADifferentNonEmptyZoneForgetsItsStaleZoneMemory();
 };
 
 void FocusControllerTests::movesFocusAlongExplicitAdjacency() {
@@ -242,6 +245,91 @@ void FocusControllerTests::nestedModalsUnwindInReverseOrder() {
   QVERIFY(!controller.isModalActive());
 
   QVERIFY(!controller.popModal());
+}
+
+void FocusControllerTests::popModalPreservesAnIntentionallyEmptyReturnTarget() {
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(FocusNodeSpec{
+      QStringLiteral("prompt.confirm"), QStringLiteral("prompt"), {}});
+  // No setInitialFocus(): currentFocusId() starts empty, so pushModal()
+  // below records an intentionally-empty return target -- there was
+  // never any "prior focus" to return to.
+  QCOMPARE(controller.currentFocusId(), QString());
+
+  QVERIFY(controller.pushModal(QStringLiteral("prompt.confirm")));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("prompt.confirm"));
+
+  // popModal() must restore the exact prior (empty) state, not silently
+  // pick an arbitrary node just because an empty return target also
+  // fails a "does this node still exist" check.
+  QVERIFY(controller.popModal());
+  QCOMPARE(controller.currentFocusId(), QString());
+  QVERIFY(!controller.isModalActive());
+}
+
+void FocusControllerTests::
+    restoreSnapshotPreservesAnIntentionallyEmptyModalReturnTarget() {
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(FocusNodeSpec{
+      QStringLiteral("prompt.confirm"), QStringLiteral("prompt"), {}});
+  QVERIFY(controller.pushModal(QStringLiteral("prompt.confirm")));
+
+  FocusSnapshot snap = controller.snapshot();
+  QCOMPARE(snap.modalStack.size(), 1);
+  QCOMPARE(snap.modalStack.first().second, QString());
+
+  // Restoring into a controller that currently has real focus set must
+  // still reproduce the snapshot's own intentionally-empty return
+  // target for the modal level -- restoreSnapshot() must not invent a
+  // fallback node for an empty (not merely invalid) return target.
+  FocusController other;
+  registerBoardZone(other);
+  other.registerNode(FocusNodeSpec{
+      QStringLiteral("prompt.confirm"), QStringLiteral("prompt"), {}});
+  other.setInitialFocus(QStringLiteral("board.se"));
+
+  other.restoreSnapshot(snap);
+  QCOMPARE(other.currentFocusId(), QStringLiteral("prompt.confirm"));
+  QVERIFY(other.popModal());
+  QCOMPARE(other.currentFocusId(), QString());
+}
+
+void FocusControllerTests::
+    reregisteringANodeIntoADifferentNonEmptyZoneForgetsItsStaleZoneMemory() {
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card2"), QStringLiteral("hand"), {}});
+  controller.setInitialFocus(QStringLiteral("board.nw"));
+
+  // Visiting "hand" remembers hand.card1 (registered first) as its
+  // last-focused node.
+  QVERIFY(controller.cycleZone(true));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  QVERIFY(controller.cycleZone(false));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+
+  // Re-register hand.card1 into a different zone. "hand" still has
+  // hand.card2, so it is NOT pruned from zoneOrder_ -- this must not be
+  // confused with the reregisteringANodeIntoADifferentZonePrunesTheOld
+  // ZoneOnceItIsEmpty test above, which covers the fully-emptied case.
+  // The snapshot must no longer claim hand.card1 (which has moved away)
+  // as "hand"'s last-focused node.
+  controller.registerNode(FocusNodeSpec{
+      QStringLiteral("hand.card1"), QStringLiteral("archive"), {}});
+  const FocusSnapshot snap = controller.snapshot();
+  QVERIFY(snap.zoneLastFocused.contains(QStringLiteral("hand")) == false ||
+          snap.zoneLastFocused.value(QStringLiteral("hand")) !=
+              QStringLiteral("hand.card1"));
+
+  // Cycling back into "hand" must land on the real remaining node
+  // (hand.card2), never on the now-departed hand.card1.
+  QVERIFY(controller.cycleZone(true));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card2"));
 }
 
 void FocusControllerTests::

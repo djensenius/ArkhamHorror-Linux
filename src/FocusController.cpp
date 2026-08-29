@@ -49,6 +49,19 @@ void FocusController::registerNode(const FocusNodeSpec &spec) {
   // regardless of whether it emptied via removal or via re-registration
   // into a new zone.
   if (wasRegistered && previousZoneId != spec.zoneId) {
+    // Also forget a stale zoneLastFocused_ entry for the old zone if it
+    // was remembering exactly this node: the node has now moved away, so
+    // that memory no longer describes a node actually in previousZoneId.
+    // cycleZone()/restoreSnapshot() already double-check
+    // zoneOf(remembered) == zone before trusting a remembered id, so this
+    // could never cause a *wrong* focus target on its own -- but leaving
+    // it behind would make snapshot() report an inconsistent zone->id
+    // pair for previousZoneId even while the zone still has other, live
+    // nodes (pruneZoneIfEmpty() below only clears this when the zone
+    // becomes entirely empty, which is not guaranteed here).
+    if (zoneLastFocused_.value(previousZoneId) == spec.id) {
+      zoneLastFocused_.remove(previousZoneId);
+    }
     pruneZoneIfEmpty(previousZoneId);
   }
 }
@@ -249,7 +262,13 @@ bool FocusController::popModal() {
   }
   const auto entry = modalStack_.takeLast();
   const QString &returnToId = entry.second;
-  if (!returnToId.isEmpty() && nodes_.contains(returnToId)) {
+  if (returnToId.isEmpty()) {
+    // This modal was pushed while there was no current focus at all
+    // (e.g. the very first thing the app did was open a modal): restore
+    // that exact "no focus" state rather than silently jumping to an
+    // arbitrary node, which would be a different, unrequested outcome.
+    setCurrentFocus(QString());
+  } else if (nodes_.contains(returnToId)) {
     setCurrentFocus(returnToId);
   } else {
     setCurrentFocus(firstRegisteredNodeId());
@@ -282,8 +301,17 @@ void FocusController::restoreSnapshot(const FocusSnapshot &snapshot) {
       // level entirely rather than leaving a dangling modal.
       continue;
     }
-    const QString returnTo =
-        nodes_.contains(entry.second) ? entry.second : firstRegisteredNodeId();
+    // An empty entry.second means this modal level was pushed while
+    // there was no current focus at all -- preserve that exact
+    // intentional "no return target" state (matching popModal()'s
+    // handling) rather than silently replacing it with an arbitrary
+    // node just because an empty string also happens to fail
+    // nodes_.contains(). A non-empty but now-invalid target (its node
+    // was removed) still falls back to firstRegisteredNodeId().
+    const QString returnTo = entry.second.isEmpty() ? QString()
+                             : nodes_.contains(entry.second)
+                                 ? entry.second
+                                 : firstRegisteredNodeId();
     modalStack_.push_back({entry.first, returnTo});
   }
 
