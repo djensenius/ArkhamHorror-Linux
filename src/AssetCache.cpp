@@ -183,14 +183,6 @@ bool fsyncSaveFileBeforeCommit(QSaveFile &file) {
 // fsyncSaveFileBeforeCommit() above). Called once after the manifest
 // swap -- the single atomic pointer flip that actually publishes a new
 // generation -- commits, so that publication itself survives a crash
-// immediately following it.
-// fsyncs the directory entry `dirPath` itself: on POSIX, a file rename
-// (as QSaveFile::commit() performs) is only durable across a crash once
-// the directory's own metadata update is flushed, independent of the
-// renamed file's own content already being synced (see
-// fsyncSaveFileBeforeCommit() above). Called once after the manifest
-// swap -- the single atomic pointer flip that actually publishes a new
-// generation -- commits, so that publication itself survives a crash
 // immediately following it. Review round-3 item 10: returns whether the
 // fsync itself actually succeeded (open+fsync both) -- a caller (store())
 // must NEVER proceed to reclaim the previous generation's files as if
