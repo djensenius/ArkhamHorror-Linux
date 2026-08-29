@@ -105,6 +105,14 @@ public:
     Authenticating,           ///< signIn() request in flight.
     Registering,              ///< registerAccount() request in flight.
     SignedIn,                 ///< A validated session is active.
+    SigningOut,               ///< signOut() has enqueued a durable token
+                              ///< deletion that has not yet succeeded.
+                              ///< Installed synchronously before the
+                              ///< deletion is enqueued so a reentrant or
+                              ///< duplicate signOut() call (m_state is no
+                              ///< longer SignedIn) is a safe no-op rather
+                              ///< than bumping the generation or enqueuing
+                              ///< a second deletion.
     Incompatible,             ///< The server failed compatibility evaluation.
     SecureStorageUnavailable, ///< The secure token store is locked,
                               ///< unavailable, denied access, rejected
@@ -206,12 +214,22 @@ public slots:
   void registerAccount(const QString &email, const QString &username,
                        const QString &password);
 
-  // Only usable while SignedIn. Cancels any in-flight session network work,
-  // enqueues a durable token deletion for the current profile, and becomes
-  // SignedOut only once that deletion succeeds. On deletion failure, the
-  // signed-in identity is preserved and the coordinator reports
-  // SecureStorageUnavailable with an actionable retry(); it never claims
-  // SignedOut while a token might still remain in the secure store.
+  // Only usable while SignedIn. Synchronously transitions to SigningOut
+  // (before enqueuing anything), cancels any in-flight session network
+  // work, enqueues a durable token deletion for the current profile, and
+  // becomes SignedOut only once that deletion succeeds. Because the
+  // SigningOut transition happens first and m_state is no longer SignedIn
+  // once it is delivered, a reentrant (from within the stateChanged()
+  // emission) or merely duplicate signOut() call is a safe, idempotent
+  // no-op: it can never bump the generation or enqueue a second deletion.
+  // On deletion failure, the signed-in identity is preserved and the
+  // coordinator reports SecureStorageUnavailable with an actionable
+  // retry(); it never claims SignedOut while a token might still remain in
+  // the secure store. If the profile is switched away from while a
+  // deletion is pending or has failed, the obligation to delete is
+  // retained for that profile (see the FIFO/credential-epoch machinery
+  // below) and is enforced again before any future restore/auth/save for
+  // it, independent of the coordinator's current generation/selection.
   void signOut();
 
   // Re-runs whatever stage most recently failed (profile load/save,
@@ -240,6 +258,34 @@ private:
     // safely skipped without dispatching it. Read/Delete are never
     // epoch-gated -- see invalidateProfileCredential()'s class comment.
     quint64 admissionEpoch{0};
+    // Unique for the lifetime of this logical operation: assigned once at
+    // enqueue time and never changed, even across repeated retries of a
+    // stalled head op (see retryStuckProfileTokenOp()). Lets a completion
+    // callback (see ProfileTokenDispatch/startFrontTokenOp()) prove it is
+    // reporting on the op that is actually still at the head of the
+    // queue, rather than a later one that has since replaced it.
+    quint64 opId{0};
+  };
+
+  // Per-profile bookkeeping for the single ITokenStore operation (if any)
+  // currently dispatched to the real store for that profile's queue head.
+  // inFlight is the central guard that keeps at most one real store call
+  // outstanding per profile at a time: startFrontTokenOp() refuses to
+  // dispatch anything while it is true, so a duplicate/racing call (e.g.
+  // retryStuckProfileTokenOp() invoked twice before the first retry
+  // attempt's callback has fired, or start()/switchProfile() re-reaching
+  // the same stalled retry path) can never issue a second concurrent
+  // operation for the same profile. attemptId is bumped on every dispatch
+  // (including re-dispatching the same opId on retry) so a completion
+  // callback can distinguish "the attempt I was issued for" from any
+  // later attempt, even when the logical op ID is unchanged; a callback
+  // whose captured (opId, attemptId) no longer matches this state (or
+  // whose opId no longer matches the queue's actual head) is a stale or
+  // duplicate invocation and must not dequeue/advance/invoke anything.
+  struct ProfileTokenDispatch {
+    bool inFlight{false};
+    quint64 opId{0};
+    quint64 attemptId{0};
   };
 
   void setState(State state, QString diagnostic = {});
@@ -285,7 +331,8 @@ private:
   // same-profile operation (read, save, or another delete) until the
   // deletion is retried (see retryStuckProfileTokenOp()) and succeeds --
   // generation only ever suppresses *state* mutation, never this
-  // durable-cleanup bookkeeping.
+  // durable-cleanup bookkeeping. See ProfileTokenDispatch above for how
+  // concurrent/duplicate dispatch of that same stalled head is prevented.
   void enqueueTokenOp(const QString &profileId, TokenOpKind kind, QString token,
                       ITokenStore::ResultCallback onComplete);
   void startFrontTokenOp(const QString &profileId);
@@ -374,6 +421,19 @@ private:
   AuthRequestHandle m_pendingAuthHandle;
 
   QHash<QString, QQueue<TokenOp>> m_tokenQueues;
+
+  // Monotonically increasing counters used to stamp every TokenOp/dispatch
+  // attempt with a unique identity (see TokenOp::opId and
+  // ProfileTokenDispatch above). Coordinator-wide rather than per-profile:
+  // uniqueness only needs to hold within a single profile's queue, but a
+  // single shared counter is simpler and still trivially sufficient.
+  quint64 m_nextTokenOpId{1};
+  quint64 m_nextTokenAttemptId{1};
+
+  // Per-profile record of the single ITokenStore call (if any) currently
+  // outstanding for that profile's queue head. See ProfileTokenDispatch
+  // and startFrontTokenOp() for the concurrency guard this provides.
+  QHash<QString, ProfileTokenDispatch> m_tokenDispatch;
 };
 
 } // namespace Arkham

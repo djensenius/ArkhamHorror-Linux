@@ -38,7 +38,17 @@ The current walking skeleton establishes:
   invalidates the session: if so, a compensating delete is reserved behind
   it in FIFO order so an abandoned token is never left stored, and a
   required deletion that fails is left durably blocking that profile's
-  queue (never silently dropped) until a retry succeeds. Every emission
+  queue (never silently dropped) until a retry succeeds. Each queued token
+  operation carries a unique operation ID, and each per-profile dispatch
+  tracks an in-flight attempt ID: central dispatch refuses to redispatch a
+  profile's head operation while one attempt is already outstanding, and a
+  completion is only ever applied to the queue if it matches both IDs --
+  so a duplicate retry, an overlapping `retry()` call, or a replayed/stale
+  store callback can never redispatch concurrently or corrupt a later,
+  unrelated operation's result. An explicit `SigningOut` state is set
+  synchronously before `signOut()`'s durable delete is enqueued, so a
+  reentrant or ordinary duplicate `signOut()` call while one is already in
+  flight is a safe no-op rather than a second enqueued deletion. Every emission
   that can reenter the coordinator (`stateChanged`, `currentUserChanged`,
   `selectedProfileChanged`) is guarded so a directly-connected reentrant
   `switchProfile()`/`start()`/`signOut()`/destruction during that emission

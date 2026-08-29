@@ -46,6 +46,8 @@ QString SessionCoordinator::stateDescription() const {
     return QStringLiteral("Creating account");
   case State::SignedIn:
     return QStringLiteral("Signed in");
+  case State::SigningOut:
+    return QStringLiteral("Signing out");
   case State::Incompatible:
     return QStringLiteral("Server incompatible");
   case State::SecureStorageUnavailable:
@@ -123,13 +125,20 @@ void SessionCoordinator::start() {
 
   QPointer<SessionCoordinator> self(this);
   clearCurrentUser();
+  if (!self || generation != self->m_generation) {
+    // A directly-connected currentUserChanged() handler reentrantly called
+    // start()/switchProfile()/signOut(), or destroyed the coordinator,
+    // while clearCurrentUser()'s emission was being delivered: `this` may
+    // already be dangling and |generation| is no longer current, so
+    // setState() below must never run.
+    return;
+  }
   setState(State::Loading);
   if (!self || generation != self->m_generation) {
-    // A directly-connected currentUserChanged()/stateChanged() handler
-    // reentrantly called start()/switchProfile()/signOut(), or destroyed
-    // the coordinator, while one of the above was being delivered: never
-    // let this now-superseded call continue with a stale local
-    // |generation| and possibly-destroyed |this|.
+    // Same check again for setState()'s own stateChanged() emission: a
+    // handler reentrantly triggered by *this* emission could equally
+    // destroy the coordinator or supersede |generation| before the
+    // remainder of start() runs below.
     return;
   }
 
@@ -646,6 +655,12 @@ void SessionCoordinator::handleFreshTokenResult(
 
 void SessionCoordinator::signOut() {
   if (m_state != State::SignedIn || !m_currentProfile.has_value()) {
+    // Also covers a signOut() already in progress: the very first call to
+    // reach this point transitions to SigningOut below before enqueuing
+    // anything, so a reentrant call (from within that transition's
+    // stateChanged() emission) or a merely duplicate call sees m_state !=
+    // SignedIn here and is rejected as a safe, idempotent no-op -- it can
+    // never bump the generation again or enqueue a second deletion.
     return;
   }
   cancelPendingAuthRequest();
@@ -660,6 +675,17 @@ void SessionCoordinator::signOut() {
   ++m_generation;
   const quint64 generation = m_generation;
   QPointer<SessionCoordinator> self(this);
+  setState(State::SigningOut);
+  if (!self || generation != self->m_generation) {
+    // A directly-connected stateChanged() handler reentrantly called
+    // start()/switchProfile()/signOut() again, or destroyed the
+    // coordinator, while this emission was being delivered: never enqueue
+    // a deletion for a session that is no longer current (or `this` that
+    // may no longer exist). Note the reentrant signOut() case above is
+    // itself already rejected by the guard at the top of this function,
+    // since m_state was set to SigningOut before the emission.
+    return;
+  }
   enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
                  [self, generation, profileId](TokenStoreResult result) {
                    if (!self) {
@@ -720,6 +746,7 @@ void SessionCoordinator::enqueueTokenOp(
   const bool wasEmpty = queue.isEmpty();
   TokenOp op{kind, std::move(token), std::move(onComplete)};
   op.admissionEpoch = profileCredentialEpoch(profileId);
+  op.opId = m_nextTokenOpId++;
   queue.enqueue(std::move(op));
   if (wasEmpty) {
     startFrontTokenOp(profileId);
@@ -731,6 +758,18 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
   if (queueIt == m_tokenQueues.end() || queueIt->isEmpty()) {
     return;
   }
+
+  // Central dispatch guard: refuse to issue a second real ITokenStore call
+  // for this profile while one is already outstanding. Without this, a
+  // duplicate retryStuckProfileTokenOp() call (e.g. two rapid retry()
+  // invocations, or start()/switchProfile() re-reaching the same stalled
+  // retry path before the first attempt's callback has fired) could
+  // dispatch the same stalled head operation twice concurrently.
+  ProfileTokenDispatch &dispatch = m_tokenDispatch[profileId];
+  if (dispatch.inFlight) {
+    return;
+  }
+
   const TokenOp &op = queueIt->head();
 
   if (op.kind == TokenOpKind::Save &&
@@ -758,16 +797,44 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
 
   const TokenOpKind kind = op.kind;
   const QString token = op.token;
+  const quint64 opId = op.opId;
+  const quint64 attemptId = m_nextTokenAttemptId++;
+  dispatch.inFlight = true;
+  dispatch.opId = opId;
+  dispatch.attemptId = attemptId;
 
   QPointer<SessionCoordinator> self(this);
-  auto onResult = [self, profileId](TokenStoreResult result) {
+  auto onResult = [self, profileId, opId, attemptId](TokenStoreResult result) {
     if (!self) {
       return;
     }
-    const auto it = self->m_tokenQueues.find(profileId);
-    if (it == self->m_tokenQueues.end() || it->isEmpty()) {
-      return; // should not happen; defensive
+    // Match BOTH the dispatch record (proving this is the specific attempt
+    // that was actually issued, not a stale/duplicate invocation of an
+    // older attempt or an attempt for an op that has since been
+    // superseded) AND the queue's current head opId (proving the op this
+    // attempt was for is still the one waiting to be completed, not
+    // already dequeued/replaced by a prior, correctly-processed
+    // completion). Either mismatch means this callback must be silently
+    // discarded: it must never pop/advance the queue or feed its result
+    // to a different operation's continuation.
+    const auto dispatchIt = self->m_tokenDispatch.find(profileId);
+    if (dispatchIt == self->m_tokenDispatch.end() || !dispatchIt->inFlight ||
+        dispatchIt->opId != opId || dispatchIt->attemptId != attemptId) {
+      return;
     }
+    const auto it = self->m_tokenQueues.find(profileId);
+    if (it == self->m_tokenQueues.end() || it->isEmpty() ||
+        it->head().opId != opId) {
+      return; // defensive; should not happen given the guard above
+    }
+
+    // Clear the in-flight record exactly once, before any further
+    // processing below, so a genuinely new dispatch (e.g. a retry issued
+    // from within the continuation invoked further down) is free to
+    // proceed and so a subsequent duplicate/stale invocation of this same
+    // completion is rejected by the guard above rather than reprocessed.
+    dispatchIt->inFlight = false;
+
     const TokenOpKind finishedKind = it->head().kind;
     const bool deleteFailed = finishedKind == TokenOpKind::Delete &&
                               result.outcome != TokenStoreOutcome::Success;
@@ -775,9 +842,10 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
       // A required Delete must never be silently abandoned: leave it at
       // the head of the FIFO (un-dequeued) so it durably blocks every
       // later same-profile operation until retryStuckProfileTokenOp()
-      // successfully re-dispatches this exact op. Its onComplete is still
-      // invoked (below) so the caller can surface the failure/retry
-      // action, but the FIFO does not advance.
+      // successfully re-dispatches this exact op (same opId, new
+      // attemptId). Its onComplete is still invoked (below) so the caller
+      // can surface the failure/retry action, but the FIFO does not
+      // advance.
       self->m_profileFifoStalled.insert(
           profileId,
           result.diagnostic.isEmpty()
@@ -796,6 +864,7 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
     const bool hasMore = !it->isEmpty();
     if (it->isEmpty()) {
       self->m_tokenQueues.erase(it);
+      self->m_tokenDispatch.remove(profileId);
     }
     // Invoke the completed operation's continuation before starting the
     // next queued operation for this profile, so completion order always
@@ -829,10 +898,19 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
 }
 
 void SessionCoordinator::retryStuckProfileTokenOp(const QString &profileId) {
+  // Only meaningful for a profile whose head op is actually stalled (a
+  // failed required Delete); a stray call otherwise is a safe no-op.
+  if (!m_profileFifoStalled.contains(profileId)) {
+    return;
+  }
   // The stuck op's original onComplete closure is still installed at the
-  // head of the queue (it was never dequeued on failure); simply
-  // re-dispatching the front op re-runs the exact same operation with the
-  // exact same continuation -- no need to reconstruct or re-enqueue it.
+  // head of the queue (it was never dequeued on failure); re-dispatching
+  // the front op re-runs the exact same logical operation (same opId,
+  // fresh attemptId) with the exact same continuation -- no need to
+  // reconstruct or re-enqueue it. startFrontTokenOp()'s own inFlight guard
+  // ensures that if a previous retry attempt for this same stalled op is
+  // still outstanding, this call is a no-op rather than a second
+  // concurrent dispatch.
   startFrontTokenOp(profileId);
 }
 
