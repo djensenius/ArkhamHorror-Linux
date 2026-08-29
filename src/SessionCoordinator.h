@@ -387,27 +387,60 @@ private:
   // ITokenStore.
   void invalidateProfileCredential(const QString &profileId);
 
-  // Emits stateChanged() and then, IF the coordinator actually had a
-  // current user beforehand, currentUserChanged() -- but ONLY IF
-  // |generation| is still current after EACH emission. The caller must
-  // have already assigned m_state/m_diagnostic and cleared m_currentUser
-  // BEFORE calling this (see clearCurrentUserAndSetStateIfCurrent() and
-  // start()/switchProfile()'s use of it): both fields are therefore
-  // already coherent together at the moment of the FIRST notification, so
-  // a directly-connected handler reentrantly calling switchProfile(),
-  // start(), signOut(), or destroying the coordinator during EITHER
-  // signal never observes a hybrid snapshot (e.g. the new/cleared state
-  // together with the old identity, or vice versa) -- only the complete
-  // new transition snapshot, or (if superseded) nothing further at all.
-  // Returns false (having made no further visible change) if superseded
-  // or destroyed at either point.
-  bool publishClearedUserState(QPointer<SessionCoordinator> &self,
-                               quint64 generation, bool hadUser);
+  // Emits stateChanged() and then, if |notifyUser| (resp. |notifyProfile|)
+  // is true, currentUserChanged() (resp. selectedProfileChanged()), in
+  // that fixed order. The caller must have already assigned every
+  // corresponding member variable (m_state/m_diagnostic always; the
+  // cleared/new m_currentUser iff |notifyUser|; m_selectedProfileId/
+  // m_currentProfile iff |notifyProfile|) BEFORE calling this, so every
+  // field is already coherent together at the moment of the FIRST
+  // notification: a directly-connected handler reentrantly calling
+  // switchProfile(), start(), signOut(), or destroying the coordinator
+  // during ANY of these signals never observes a hybrid snapshot (e.g.
+  // the new/cleared state together with the old identity or profile, or
+  // vice versa) -- only the complete new transition snapshot.
+  //
+  // Every signal below is unconditionally delivered once its field has
+  // been committed, REGARDLESS of whether an earlier signal in this same
+  // batch reentrantly triggers another transition that changes
+  // |generation|: once a member variable has been mutated, the
+  // corresponding Q_PROPERTY notify signal is owed and must fire while
+  // the QObject remains alive, or a binding on that property (QML or
+  // C++) would otherwise never learn the getter's value actually
+  // changed. A prior version of this function stopped delivering further
+  // signals the moment |generation| no longer matched, silently dropping
+  // an owed notification for a real, already-committed mutation whenever
+  // an earlier signal in the batch reentrantly triggered a nested
+  // transition -- this was itself the bug, not a safety feature: nothing
+  // about generation staleness makes a committed property mutation any
+  // less real or any less deserving of its notify signal. If a nested
+  // transition further mutates the same property again before a later
+  // signal in this batch is delivered, that later signal simply reflects
+  // whatever is currently in the member variable when it fires (notify
+  // signals carry no value; Qt property bindings always re-read via the
+  // getter), which is exactly the up-to-date value a binding needs.
+  //
+  // Only actual destruction (the QPointer going null) may skip a
+  // still-owed signal below, since a destroyed QObject cannot safely
+  // emit anything and nothing can observe it either; checked after EVERY
+  // individual emission, never combined with (or replaced by) the
+  // generation check. The returned bool reflects ONLY whether
+  // |generation| is still current once the entire notification batch has
+  // been delivered (false if destroyed at any point, or if superseded);
+  // every caller uses it solely to decide whether to start any FURTHER
+  // asynchronous side effect (probe/network/store) afterward -- never to
+  // decide whether to notify, since notification has unconditionally
+  // already happened above by the time this returns.
+  bool publishTransitionSnapshot(QPointer<SessionCoordinator> &self,
+                                 quint64 generation, bool notifyUser,
+                                 bool notifyProfile);
 
   // Assigns the coherent (state, cleared-user) snapshot and then publishes
-  // it via publishClearedUserState() above, but only if |generation| is
-  // still current at the moment of the call. Every field that changes as
-  // part of this transition is assigned BEFORE either signal is emitted.
+  // it via publishTransitionSnapshot() above (with notifyProfile=false;
+  // this pattern never itself changes the selected profile), but only if
+  // |generation| is still current at the moment of the call. Every field
+  // that changes as part of this transition is assigned BEFORE either
+  // signal is emitted.
   bool clearCurrentUserAndSetStateIfCurrent(quint64 generation, State state,
                                             QString diagnostic = {});
 
@@ -415,8 +448,9 @@ private:
   // above, but for the "apply a freshly-known user, then transition to
   // SignedIn" pattern (credential restore's whoami success path): the new
   // user and the new state are both assigned before stateChanged() is
-  // emitted, and currentUserChanged() is only emitted (and only if
-  // |generation| is still current) afterward.
+  // emitted, and currentUserChanged() is unconditionally delivered
+  // afterward (see publishTransitionSnapshot()'s contract) provided the
+  // coordinator is still alive.
   bool applyCurrentUserAndSetStateIfCurrent(quint64 generation,
                                             const CurrentUser &user,
                                             State state);

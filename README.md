@@ -64,21 +64,44 @@ The current walking skeleton establishes:
   identity, and, for `switchProfile()`, the new selected profile itself
   (persisted to storage first) -- together, BEFORE emitting any of
   `stateChanged()`/`currentUserChanged()`/`selectedProfileChanged()`, with
-  a lifetime/generation checkpoint after each individual emission. A
-  directly-connected reentrant observer of any of these signals therefore
-  only ever sees one complete, coherent snapshot (either the full old one,
-  if reentered before the transition began, or the full new one) and never
-  a hybrid -- e.g. never the new profile's identity paired with the old
-  session's stale `SignedIn` state, and never a persisted selection that
-  has diverged from the in-memory one because a reentrant call superseded
-  the transition partway through. Every emission that can reenter the
+  destruction check (never a generation check) between each individual
+  emission -- see the next paragraph for why. A directly-connected
+  reentrant observer of any of these signals therefore only ever sees one
+  complete, coherent snapshot (either the full old one, if reentered
+  before the transition began, or the full new one) and never a hybrid --
+  e.g. never the new profile's identity paired with the old session's
+  stale `SignedIn` state, and never a persisted selection that has
+  diverged from the in-memory one because a reentrant call superseded the
+  transition partway through. Every emission that can reenter the
   coordinator (`stateChanged`, `currentUserChanged`,
   `selectedProfileChanged`) is guarded so a directly-connected reentrant
   `switchProfile()`/`start()`/`signOut()`/destruction during that emission
   can never dispatch a request for an abandoned profile, dereference a
   stale/destroyed probe, delete the wrong profile's token, or resurrect a
   superseded state. Its properties/signals never expose a password,
-  token, or `Authorization` header. The
+  token, or `Authorization` header. Once a transition has assigned its
+  observable fields, every notify signal it owes (`stateChanged`, and
+  `currentUserChanged`/`selectedProfileChanged` where applicable) is
+  delivered in full via a single shared publication helper
+  (`publishTransitionSnapshot()`) -- checked only for coordinator
+  destruction between emissions, never for a nested reentrant transition
+  having changed the generation in the meantime. A nested/reentrant
+  transition changing the generation mid-batch only ever gates *further*
+  asynchronous side effects afterward (such as starting a new capability
+  probe), never whether an already-committed field's change is announced;
+  a directly-connected observer can therefore never observe a stale,
+  un-notified value merely because another transition interrupted the
+  first one's own signal delivery. (A nested transition's own signals for
+  the same property may be delivered before the interrupted outer
+  transition's now-redundant, still-current-value delivery of that same
+  property -- an accepted, tested duplicate, never a dropped notification.)
+  Credential-restore additionally enforces at most one logical restore
+  read queued or in-flight per profile, in every FIFO state (not only once
+  a delete has already failed): repeated `start()` calls while a restore
+  read is merely in-flight, or while an ordinary not-yet-failed delete or
+  save is ahead of it in that profile's queue, rebind the single queued
+  read's continuation to the newest call rather than enqueueing a
+  duplicate read against the OS secret store. The
   production composition (`AppSessionComposition`) and the hermetic
   `--smoke-test` gate (`AppBootstrap`) ensure smoke-test runs never
   construct the coordinator or touch QSettings/the network/the keychain.

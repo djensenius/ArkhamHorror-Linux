@@ -117,7 +117,7 @@ void SessionCoordinator::start() {
 
   // Assign the complete new (Loading, cleared-identity) snapshot together
   // BEFORE either notification is emitted below (see
-  // publishClearedUserState()'s contract): a directly-connected handler
+  // publishTransitionSnapshot()'s contract): a directly-connected handler
   // reentrantly calling switchProfile()/start()/signOut() from either
   // emission must see state()==Loading and currentUser()==nil already
   // coherent together, never a stale SignedIn alongside an already-
@@ -130,8 +130,9 @@ void SessionCoordinator::start() {
   m_diagnostic.clear();
 
   QPointer<SessionCoordinator> self(this);
-  if (!publishClearedUserState(self, generation, hadUser)) {
-    return; // superseded or destroyed while either signal was delivered
+  if (!publishTransitionSnapshot(self, generation, hadUser,
+                                 /*notifyProfile=*/false)) {
+    return; // destroyed, or superseded (both signals above still fired)
   }
 
   const auto profilesResult = m_profileStore.loadProfiles();
@@ -262,14 +263,20 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
   // already been persisted to storage above, leaving the persisted
   // selection (the new profile) permanently split from the in-memory
   // selection (reverted to the old profile). With every field already
-  // assigned here, EVERY notification below -- selectedProfileChanged(),
-  // stateChanged(), and currentUserChanged() -- carries the complete new
-  // snapshot from the very first one: a reentrant observer of any of them
-  // sees state()==Loading, currentUser()==nil, and selectedProfileId()
-  // already the NEW profile, all together. signOut() (which requires
-  // state()==SignedIn) can therefore never fire reentrantly from within
-  // this transition at all, so it can never observe -- or act on -- a
-  // hybrid of old and new identity.
+  // assigned here, EVERY notification below -- stateChanged(),
+  // currentUserChanged(), and selectedProfileChanged() -- carries the
+  // complete new snapshot from the very first one: a reentrant observer
+  // of any of them sees state()==Loading, currentUser()==nil, and
+  // selectedProfileId() already the NEW profile, all together. signOut()
+  // (which requires state()==SignedIn) can therefore never fire
+  // reentrantly from within this transition at all, so it can never
+  // observe -- or act on -- a hybrid of old and new identity. All three
+  // signals are delivered by the single publishTransitionSnapshot() call
+  // below -- including selectedProfileChanged(), which a previous version
+  // emitted separately AFTER that call returned, so a nested transition
+  // triggered by an earlier signal in the batch could make the
+  // superseded-generation check skip it entirely even though
+  // m_selectedProfileId/m_currentProfile had already been committed.
   const bool hadUser = m_currentUser.has_value();
   m_currentUser.reset();
   m_state = State::Loading;
@@ -278,13 +285,9 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
   m_currentProfile = *it;
 
   QPointer<SessionCoordinator> self(this);
-  if (!publishClearedUserState(self, generation, hadUser)) {
-    return; // superseded or destroyed while either signal was delivered
-  }
-
-  emit selectedProfileChanged();
-  if (!self || generation != self->m_generation) {
-    return; // superseded while selectedProfileChanged() was being delivered
+  if (!publishTransitionSnapshot(self, generation, hadUser,
+                                 /*notifyProfile=*/true)) {
+    return; // destroyed, or superseded (all signals above still fired)
   }
 
   startProbe();
@@ -384,28 +387,44 @@ void SessionCoordinator::startCredentialRestore() {
     // resolve the deletion, not silently wait forever with no actionable
     // feedback.
     m_retryAction = [this, profileId] { retryStuckProfileTokenOp(profileId); };
+  }
 
-    // Avoid piling up redundant restore reads behind the still-stalled
-    // head: repeated start()/switchProfile() calls back to the same
-    // stalled profile would otherwise each enqueue another Read behind
-    // the stuck Delete, causing unbounded queue growth and duplicate
-    // secure-store I/O once the delete is finally retried. Only a Read
-    // can ever be queued behind a stalled Delete (see
-    // invalidateProfileCredential(); signIn()/registerAccount()/signOut()
-    // are all no-ops while this profile's state is
-    // SecureStorageUnavailable), so if the queue already holds more than
-    // just the stalled head, its tail is exactly one such already-queued
-    // Read: rebind its continuation to this call's (current) generation
-    // instead of enqueuing a second one. The previously queued
-    // continuation's own generation is necessarily stale by now -- this
-    // function is only reached again via a fresh start()/switchProfile()
-    // that re-derives |generation| from the (already possibly bumped)
-    // m_generation -- so it would have been a silent no-op once
-    // dispatched anyway.
-    const auto queueIt = m_tokenQueues.find(profileId);
-    if (queueIt != m_tokenQueues.end() && queueIt->size() > 1) {
-      (*queueIt)[queueIt->size() - 1].onComplete = std::move(onComplete);
-      return;
+  // Enforce at most ONE logical restore Read queued or in flight for this
+  // profile at any time, in EVERY FIFO state -- not merely while stalled
+  // behind a failed Delete. Repeated start()/switchProfile() calls back
+  // to the same profile while its queue head is still an in-flight Read,
+  // or a Save/Delete that has not (yet, or ever) failed, would otherwise
+  // each enqueue ANOTHER Read behind whatever is running, causing
+  // unbounded queue growth and duplicate secure-store I/O once the head
+  // eventually completes. Only a Read is ever queued for credential
+  // restore purposes (signIn()/registerAccount()/signOut() are all no-ops
+  // while this profile is not yet SignedOut/SignedIn), so at most one can
+  // ever be present; search for it (it may be the in-flight head itself,
+  // or queued behind a still-pending Save/Delete chain) and rebind its
+  // continuation to this call's (current) generation instead of enqueuing
+  // a second one.
+  //
+  // Rebinding only ever mutates TokenOp::onComplete -- never opId or
+  // attemptId -- so it cannot affect startFrontTokenOp()'s dispatch
+  // guard or a completion's own attempt matching. This is also safe to do
+  // while the Read is ALREADY dispatched to the real store: the
+  // in-flight completion closure (see startFrontTokenOp()) captures only
+  // (profileId, opId, attemptId), and looks up the queue's CURRENT head
+  // op's onComplete only at the moment it actually completes -- never a
+  // continuation captured by value back when the op was first dispatched
+  // -- so a rebind applied here after dispatch, but before completion,
+  // still takes effect. The previously-installed continuation's own
+  // generation is necessarily stale by now -- this function is only
+  // reached again via a fresh start()/switchProfile() that re-derives
+  // |generation| from the (already possibly bumped) m_generation -- so it
+  // would have been a silent no-op once dispatched anyway.
+  const auto queueIt = m_tokenQueues.find(profileId);
+  if (queueIt != m_tokenQueues.end()) {
+    for (int i = 0; i < queueIt->size(); ++i) {
+      if ((*queueIt)[i].kind == TokenOpKind::Read) {
+        (*queueIt)[i].onComplete = std::move(onComplete);
+        return;
+      }
     }
   }
   enqueueTokenOp(profileId, TokenOpKind::Read, QString(),
@@ -1059,24 +1078,41 @@ void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
                  });
 }
 
-bool SessionCoordinator::publishClearedUserState(
-    QPointer<SessionCoordinator> &self, quint64 generation, bool hadUser) {
-  // Precondition (enforced by every caller): m_state/m_diagnostic and the
-  // cleared m_currentUser have ALREADY been assigned before this runs, so
-  // the very first signal emitted below already carries the complete,
-  // coherent new snapshot -- never the old state/identity paired with the
-  // other field's new value.
+bool SessionCoordinator::publishTransitionSnapshot(
+    QPointer<SessionCoordinator> &self, quint64 generation, bool notifyUser,
+    bool notifyProfile) {
+  // Precondition (enforced by every caller): m_state/m_diagnostic, and
+  // whichever of m_currentUser (iff |notifyUser|) / m_selectedProfileId
+  // and m_currentProfile (iff |notifyProfile|) are part of this
+  // transition, have ALREADY been assigned before this runs, so the very
+  // first signal emitted below already carries the complete, coherent new
+  // snapshot -- never the old state/identity/profile paired with another
+  // field's new value.
   emit stateChanged();
-  if (!self || generation != self->m_generation) {
-    return false; // superseded while stateChanged() was being delivered
+  if (!self) {
+    return false; // destroyed while stateChanged() was being delivered
   }
-  if (hadUser) {
+  if (notifyUser) {
     emit currentUserChanged();
-    if (!self || generation != self->m_generation) {
-      return false; // superseded while currentUserChanged() was delivered
+    if (!self) {
+      return false; // destroyed while currentUserChanged() was delivered
     }
   }
-  return true;
+  if (notifyProfile) {
+    emit selectedProfileChanged();
+    if (!self) {
+      return false; // destroyed while selectedProfileChanged() was delivered
+    }
+  }
+  // Every notification owed by this transition has now been delivered in
+  // full, unconditionally, regardless of whether an earlier signal above
+  // reentrantly triggered a nested transition that changed |generation|
+  // (see this method's declaration in SessionCoordinator.h for why that
+  // must never suppress an already-committed property's notify signal).
+  // This return value is therefore consulted ONLY by the caller's
+  // decision to start a further asynchronous side effect (e.g.
+  // startProbe()) -- never to decide whether the signals above fired.
+  return generation == self->m_generation;
 }
 
 bool SessionCoordinator::clearCurrentUserAndSetStateIfCurrent(
@@ -1085,7 +1121,7 @@ bool SessionCoordinator::clearCurrentUserAndSetStateIfCurrent(
     return false;
   }
   // Assign the complete new (state, cleared-identity) snapshot together,
-  // BEFORE either signal is emitted: see publishClearedUserState()'s
+  // BEFORE either signal is emitted: see publishTransitionSnapshot()'s
   // contract. This is what makes a synchronously-completing ITokenStore
   // (see signOut()'s deletion path) safe -- a reentrant handler observing
   // either emission below sees the target state (e.g. SignedOut) and the
@@ -1096,7 +1132,8 @@ bool SessionCoordinator::clearCurrentUserAndSetStateIfCurrent(
   m_state = state;
   m_diagnostic = std::move(diagnostic);
   QPointer<SessionCoordinator> self(this);
-  return publishClearedUserState(self, generation, hadUser);
+  return publishTransitionSnapshot(self, generation, hadUser,
+                                   /*notifyProfile=*/false);
 }
 
 bool SessionCoordinator::applyCurrentUserAndSetStateIfCurrent(
@@ -1111,12 +1148,8 @@ bool SessionCoordinator::applyCurrentUserAndSetStateIfCurrent(
   m_state = state;
   m_diagnostic.clear();
   QPointer<SessionCoordinator> self(this);
-  emit stateChanged();
-  if (!self || generation != self->m_generation) {
-    return false; // superseded while stateChanged() was being delivered
-  }
-  emit currentUserChanged();
-  return !self.isNull() && generation == self->m_generation;
+  return publishTransitionSnapshot(self, generation, /*notifyUser=*/true,
+                                   /*notifyProfile=*/false);
 }
 
 } // namespace Arkham
