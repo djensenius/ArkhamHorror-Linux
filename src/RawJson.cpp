@@ -704,15 +704,21 @@ void appendJsonEncodedString(QByteArray &out, const QString &s) {
 } // namespace
 
 ValueOrError<QByteArray> Value::toJsonBytes(const ParseLimits &limits) const {
-  return toJsonBytesInner(limits, 0);
+  qsizetype totalNodes = 0;
+  return toJsonBytesInner(limits, 0, totalNodes);
 }
 
 ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
-                                                 int depth) const {
+                                                 int depth,
+                                                 qsizetype &totalNodes) const {
   if (depth > limits.maxDepth)
     return failure(QStringLiteral(
         "Json::Value::toJsonBytes: nesting depth exceeds the maximum "
         "allowed"));
+  if (++totalNodes > limits.maxTotalNodes)
+    return failure(QStringLiteral(
+        "Json::Value::toJsonBytes: document exceeds the maximum allowed "
+        "total node count"));
   switch (m_kind) {
   case Kind::Undefined:
     return failure(QStringLiteral(
@@ -732,8 +738,23 @@ ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
     if (m_number.integerDigits().isEmpty())
       return failure(
           QStringLiteral("Json::Value::toJsonBytes: number has no digits"));
+    // Mirrors Parser::parseNumber()'s own per-part digit-count check: a
+    // programmatically-built RawNumber must not be able to emit an
+    // unbounded literal (e.g. via RawNumber::fromInt64() composed with a
+    // pathological fraction/exponent no parse() would ever have accepted)
+    // any more than a parsed one can.
+    if (m_number.integerDigits().size() > limits.maxNumberDigits ||
+        m_number.fractionDigits().size() > limits.maxNumberDigits ||
+        m_number.exponentDigits().size() > limits.maxNumberDigits)
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: number literal exceeds the maximum "
+          "allowed digit count"));
     return m_number.literal().toUtf8();
   case Kind::String: {
+    if (m_string.size() > limits.maxStringLength)
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: string exceeds the maximum allowed "
+          "length"));
     QByteArray out;
     appendJsonEncodedString(out, m_string);
     return out;
@@ -749,7 +770,7 @@ ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
       if (!first)
         out += ',';
       first = false;
-      auto encoded = element.toJsonBytesInner(limits, depth + 1);
+      auto encoded = element.toJsonBytesInner(limits, depth + 1, totalNodes);
       if (!encoded)
         return failure(encoded.error());
       out += *encoded;
@@ -766,6 +787,10 @@ ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
     bool first = true;
     QSet<QString> seenKeys;
     for (const auto &[key, value] : m_object) {
+      if (key.size() > limits.maxStringLength)
+        return failure(QStringLiteral(
+            "Json::Value::toJsonBytes: object key exceeds the maximum "
+            "allowed length"));
       // Mirrors Value::parse()'s own duplicate-key rejection: a
       // programmatically-built AST must not be able to emit a duplicate
       // object key any more than a parsed one can (see the class comment
@@ -781,7 +806,7 @@ ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
       first = false;
       appendJsonEncodedString(out, key);
       out += ':';
-      auto encoded = value.toJsonBytesInner(limits, depth + 1);
+      auto encoded = value.toJsonBytesInner(limits, depth + 1, totalNodes);
       if (!encoded)
         return failure(encoded.error());
       out += *encoded;

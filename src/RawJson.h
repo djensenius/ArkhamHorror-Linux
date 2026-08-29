@@ -43,21 +43,24 @@
 
 namespace Arkham::Json {
 
-// Resource bounds enforced by Value::parse() (and, symmetrically, by
-// Value::toJsonBytes() against a programmatically-built AST): a network
-// response is not yet in scope for this client, but the parser is the
-// canonical boundary every governed fixture and future wire caller must go
-// through, so it is bounded unconditionally rather than trusting an outer
-// layer that does not exist yet. production() below is deliberately
-// generous relative to every fixture and real game-list/catalog response
-// this client currently decodes (megabytes of headroom on size, hundreds
-// of headroom on element counts) while still rejecting the pathological
-// inputs each field guards against (a single-token flood, a deeply nested
-// bomb, an unbounded number literal). Tests may construct a tighter
-// ParseLimits to exercise each boundary without needing to build
-// gigabyte-scale fixtures.
+// Resource bounds enforced by Value::parse(), and -- for every field
+// except maxInputBytes, which is meaningless against an AST already
+// resident in memory rather than a byte stream still being read -- also
+// symmetrically enforced by Value::toJsonBytes() against a
+// programmatically-built AST: a network response is not yet in scope for
+// this client, but the parser is the canonical boundary every governed
+// fixture and future wire caller must go through, so it is bounded
+// unconditionally rather than trusting an outer layer that does not exist
+// yet. production() below is deliberately generous relative to every
+// fixture and real game-list/catalog response this client currently
+// decodes (megabytes of headroom on size, hundreds of headroom on element
+// counts) while still rejecting the pathological inputs each field guards
+// against (a single-token flood, a deeply nested bomb, an unbounded number
+// literal). Tests may construct a tighter ParseLimits to exercise each
+// boundary without needing to build gigabyte-scale fixtures.
 struct ParseLimits {
-  // Total input size, checked once before parsing begins.
+  // Total input size, checked once before parsing begins. Parse-only:
+  // toJsonBytes() has no equivalent input byte stream to bound.
   qsizetype maxInputBytes = 16 * 1024 * 1024;
   // Maximum array/object nesting depth (mirrors the previous hardcoded
   // kMaxNestingDepth, now a configurable field with the same default).
@@ -270,16 +273,21 @@ public:
   // Serializes this value back to bytes per RFC 8259, exactly (RawNumber
   // literals are emitted via RawNumber::literal(), never rounded through a
   // double; strings are UTF-8 encoded with only the characters RFC 8259
-  // requires escaped). Bounds recursion/element counts per `limits`
-  // exactly like parse(), so a pathological programmatically-built AST
-  // (e.g. one nested past `limits.maxDepth`) cannot recurse unboundedly or
-  // crash -- it fails with a typed error instead.
+  // requires escaped). Bounds recursion depth, array/object element
+  // counts, string/key length, number-literal digit counts, and total
+  // node count per `limits` exactly like parse() (every ParseLimits field
+  // except maxInputBytes, which has no meaning against an already
+  // in-memory AST), so a pathological programmatically-built AST (e.g.
+  // one nested past `limits.maxDepth`, or containing a single
+  // multi-megabyte string) cannot recurse unboundedly, emit unbounded
+  // output, or crash -- it fails with a typed error instead.
   [[nodiscard]] ValueOrError<QByteArray>
   toJsonBytes(const ParseLimits &limits = ParseLimits::production()) const;
 
 private:
   [[nodiscard]] ValueOrError<QByteArray>
-  toJsonBytesInner(const ParseLimits &limits, int depth) const;
+  toJsonBytesInner(const ParseLimits &limits, int depth,
+                   qsizetype &totalNodes) const;
   friend class Parser;
 
   Kind m_kind{Kind::Undefined};

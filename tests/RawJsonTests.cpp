@@ -80,6 +80,20 @@ private slots:
   void parseLimitsRejectsObjectExceedingMaxObjectMembers();
   void parseLimitsRejectsTotalNodesExceedingMaxTotalNodes();
   void toJsonBytesRejectsDepthExceedingLimitOnProgrammaticAst();
+
+  // toJsonBytes() must bound every ParseLimits field symmetrically with
+  // parse() (except maxInputBytes, which has no meaning for an
+  // already-in-memory AST) so a pathological programmatically-built AST
+  // cannot emit unbounded output any more than a malicious input document
+  // can be parsed (review round 4 finding: RawJson.h's doc comment
+  // overstated this before toJsonBytesInner() actually enforced it).
+  void toJsonBytesRejectsStringExceedingMaxStringLength();
+  void toJsonBytesRejectsObjectKeyExceedingMaxStringLength();
+  void toJsonBytesRejectsNumberExceedingMaxNumberDigits();
+  void toJsonBytesRejectsArrayExceedingMaxArrayElements();
+  void toJsonBytesRejectsObjectExceedingMaxObjectMembers();
+  void toJsonBytesRejectsTotalNodesExceedingMaxTotalNodes();
+  void toJsonBytesAcceptsValuesExactlyAtEveryLimitBoundary();
 };
 
 namespace {
@@ -559,6 +573,108 @@ void RawJsonTests::toJsonBytesRejectsDepthExceedingLimitOnProgrammaticAst() {
   const Value nested = Value::makeArray(
       {Value::makeArray({Value::makeNumber(RawNumber::fromInt64(1))})});
   QVERIFY(!nested.toJsonBytes(limits).has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsStringExceedingMaxStringLength() {
+  ParseLimits limits;
+  limits.maxStringLength = 3;
+  QVERIFY(
+      Value::makeString(QStringLiteral("abc")).toJsonBytes(limits).has_value());
+  QVERIFY(!Value::makeString(QStringLiteral("abcd"))
+               .toJsonBytes(limits)
+               .has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsObjectKeyExceedingMaxStringLength() {
+  ParseLimits limits;
+  limits.maxStringLength = 3;
+  QList<std::pair<QString, Value>> okMembers{
+      {QStringLiteral("abc"), Value::makeNull()}};
+  QVERIFY(Value::makeObject(okMembers).toJsonBytes(limits).has_value());
+  QList<std::pair<QString, Value>> tooLongMembers{
+      {QStringLiteral("abcd"), Value::makeNull()}};
+  QVERIFY(!Value::makeObject(tooLongMembers).toJsonBytes(limits).has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsNumberExceedingMaxNumberDigits() {
+  ParseLimits limits;
+  limits.maxNumberDigits = 3;
+  QVERIFY(Value::makeNumber(RawNumber::fromInt64(123))
+              .toJsonBytes(limits)
+              .has_value());
+  QVERIFY(!Value::makeNumber(RawNumber::fromInt64(1234))
+               .toJsonBytes(limits)
+               .has_value());
+
+  auto tooManyFractionDigits = Value::parse("1.1234", u"test");
+  QVERIFY(tooManyFractionDigits.has_value());
+  QVERIFY(!tooManyFractionDigits->toJsonBytes(limits).has_value());
+
+  auto tooManyExponentDigits = Value::parse("1e1234", u"test");
+  QVERIFY(tooManyExponentDigits.has_value());
+  QVERIFY(!tooManyExponentDigits->toJsonBytes(limits).has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsArrayExceedingMaxArrayElements() {
+  ParseLimits limits;
+  limits.maxArrayElements = 2;
+  QVERIFY(Value::makeArray({Value::makeNull(), Value::makeNull()})
+              .toJsonBytes(limits)
+              .has_value());
+  QVERIFY(!Value::makeArray(
+               {Value::makeNull(), Value::makeNull(), Value::makeNull()})
+               .toJsonBytes(limits)
+               .has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsObjectExceedingMaxObjectMembers() {
+  ParseLimits limits;
+  limits.maxObjectMembers = 1;
+  QList<std::pair<QString, Value>> oneMember{
+      {QStringLiteral("a"), Value::makeNull()}};
+  QVERIFY(Value::makeObject(oneMember).toJsonBytes(limits).has_value());
+  QList<std::pair<QString, Value>> twoMembers{
+      {QStringLiteral("a"), Value::makeNull()},
+      {QStringLiteral("b"), Value::makeNull()}};
+  QVERIFY(!Value::makeObject(twoMembers).toJsonBytes(limits).has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsTotalNodesExceedingMaxTotalNodes() {
+  ParseLimits limits;
+  limits.maxArrayElements = 100;
+  limits.maxTotalNodes = 3;
+  const Value twoElements =
+      Value::makeArray({Value::makeNull(), Value::makeNull()});
+  QVERIFY(twoElements.toJsonBytes(limits).has_value());
+  const Value threeElements = Value::makeArray(
+      {Value::makeNull(), Value::makeNull(), Value::makeNull()});
+  QVERIFY(!threeElements.toJsonBytes(limits).has_value());
+}
+
+void RawJsonTests::toJsonBytesAcceptsValuesExactlyAtEveryLimitBoundary() {
+  // Every limit's exact boundary value must still serialize successfully;
+  // only boundary+1 should fail (see the paired rejects* tests above),
+  // proving toJsonBytesInner()'s checks use the same off-by-one semantics
+  // as Parser's (`> limits.field`, not `>= limits.field`).
+  ParseLimits limits;
+  limits.maxDepth = 2;
+  limits.maxStringLength = 3;
+  limits.maxNumberDigits = 3;
+  limits.maxArrayElements = 2;
+  limits.maxObjectMembers = 2;
+  limits.maxTotalNodes = 100;
+
+  QList<std::pair<QString, Value>> members{
+      {QStringLiteral("abc"), Value::makeString(QStringLiteral("abc"))},
+      {QStringLiteral("num"), Value::makeNumber(RawNumber::fromInt64(123))},
+  };
+  const Value obj =
+      Value::makeArray({Value::makeObject(members), Value::makeNull()});
+  auto bytes = obj.toJsonBytes(limits);
+  QVERIFY(bytes.has_value());
+  auto reparsed = Value::parse(*bytes, u"test");
+  QVERIFY(reparsed.has_value());
+  QCOMPARE(*reparsed, obj);
 }
 
 QTEST_APPLESS_MAIN(RawJsonTests)
