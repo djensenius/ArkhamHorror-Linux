@@ -63,6 +63,19 @@ void FocusController::registerNode(const FocusNodeSpec &spec) {
       zoneLastFocused_.remove(previousZoneId);
     }
     pruneZoneIfEmpty(previousZoneId);
+
+    // If this node is the one currently focused, it has just moved into
+    // spec.zoneId without its identity changing, so setCurrentFocus()'s
+    // own zoneLastFocused_ bookkeeping (which only runs on an actual
+    // identity change) never ran for this move. Without this, zone
+    // memory for spec.zoneId would stay stale/absent even though the
+    // live currentFocusId_ genuinely belongs to it now, making later
+    // cycleZone()/snapshot() calls for spec.zoneId depend on whichever
+    // node was last focused there before -- or nothing at all -- rather
+    // than the node actually focused right now.
+    if (currentFocusId_ == spec.id) {
+      zoneLastFocused_.insert(spec.zoneId, spec.id);
+    }
   }
 }
 

@@ -70,6 +70,8 @@ private slots:
   void reregisteringANodeIntoADifferentZonePrunesTheOldZoneOnceItIsEmpty();
   void pruningAnEmptyZoneAlsoForgetsItsLastFocusedMemory();
   void reregisteringANodeIntoADifferentNonEmptyZoneForgetsItsStaleZoneMemory();
+  void
+  reregisteringTheCurrentlyFocusedNodeIntoADifferentZoneUpdatesThatZonesMemory();
 };
 
 void FocusControllerTests::movesFocusAlongExplicitAdjacency() {
@@ -330,6 +332,44 @@ void FocusControllerTests::
   // (hand.card2), never on the now-departed hand.card1.
   QVERIFY(controller.cycleZone(true));
   QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card2"));
+}
+
+void FocusControllerTests::
+    reregisteringTheCurrentlyFocusedNodeIntoADifferentZoneUpdatesThatZonesMemory() {
+  // Regression test: re-registering the node that is *currently
+  // focused* into a different zone must populate zoneLastFocused_ for
+  // its new zone -- setCurrentFocus()'s own zoneLastFocused_ bookkeeping
+  // never runs here, since currentFocusId_ itself does not change (only
+  // the node's zoneId does), so registerNode() must do this update
+  // itself or the new zone's memory would stay stale/absent even though
+  // the live current focus genuinely belongs to it now.
+  FocusController controller;
+  registerBoardZone(controller);
+  controller.registerNode(
+      FocusNodeSpec{QStringLiteral("hand.card1"), QStringLiteral("hand"), {}});
+  controller.setInitialFocus(QStringLiteral("board.nw"));
+
+  // Focus a node, then re-register that same, still-focused node into a
+  // brand-new zone it was never a member of before.
+  QVERIFY(controller.cycleZone(true));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+  controller.registerNode(FocusNodeSpec{
+      QStringLiteral("hand.card1"), QStringLiteral("archive"), {}});
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
+
+  // The new zone's memory must already reflect the currently-focused
+  // node, deterministically, with no further focus change required.
+  const FocusSnapshot snap = controller.snapshot();
+  QVERIFY(snap.zoneLastFocused.contains(QStringLiteral("archive")));
+  QCOMPARE(snap.zoneLastFocused.value(QStringLiteral("archive")),
+           QStringLiteral("hand.card1"));
+
+  // Cycling away and back into "archive" must land on hand.card1 using
+  // that freshly-recorded memory, not some stale/absent entry.
+  QVERIFY(controller.cycleZone(false));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("board.nw"));
+  QVERIFY(controller.cycleZone(false));
+  QCOMPARE(controller.currentFocusId(), QStringLiteral("hand.card1"));
 }
 
 void FocusControllerTests::
