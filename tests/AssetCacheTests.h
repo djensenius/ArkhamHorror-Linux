@@ -24,6 +24,7 @@ private slots:
   void mismatchedPayloadMetadataPairIsRepaired();
   void strayFileNotMatchingKeyShapeIsRemoved();
   void quotaEvictsOldestAccessFirstDownToLowWaterMark();
+  void storeSkipsFullReapSweepWhenComfortablyUnderQuota();
   void touchAfterNotModifiedRefreshesLastAccessAndHeaders();
   void restartingWithSameDirectorySeesPriorEntries();
 

@@ -177,6 +177,40 @@ void AssetCacheTests::quotaEvictsOldestAccessFirstDownToLowWaterMark() {
   QVERIFY(cache.lookupDisk(keys.last()).has_value());
 }
 
+void AssetCacheTests::storeSkipsFullReapSweepWhenComfortablyUnderQuota() {
+  // Regression/behavior-pin for a review finding: store() must not
+  // unconditionally run the expensive full reap/validate sweep (which
+  // re-reads and re-hashes every cached payload) on every single call --
+  // only once actual disk usage passes the 90% high-water mark. This
+  // proves the guard actually SKIPS the sweep (not merely that skipping
+  // it would be harmless): a stray file dropped into the cache directory
+  // survives an unrelated, comfortably-under-quota store() call
+  // untouched, and is only cleaned up once the sweep is explicitly
+  // invoked (the same public reapAndEnforceQuota() escape hatch used at
+  // startup, and automatically once quota IS exceeded, per
+  // quotaEvictsOldestAccessFirstDownToLowWaterMark above).
+  AssetCache cache(configFor(m_tempDirPath, 10 * 1024 * 1024));
+
+  const QString strayPath =
+      m_tempDirPath + QStringLiteral("/not-a-valid-key.tmp");
+  {
+    QFile stray(strayPath);
+    QVERIFY(stray.open(QIODevice::WriteOnly));
+    stray.write("leftover");
+  }
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/tiny.png")));
+  cache.store(key, makeEntry(QByteArrayLiteral("tiny-bytes")));
+
+  QVERIFY2(QFile::exists(strayPath),
+           "store() must skip the full reap sweep while disk usage is "
+           "comfortably under the high-water mark");
+
+  cache.reapAndEnforceQuota();
+  QVERIFY(!QFile::exists(strayPath));
+}
+
 void AssetCacheTests::touchAfterNotModifiedRefreshesLastAccessAndHeaders() {
   AssetCache cache(configFor(m_tempDirPath));
   const QString key = AssetCache::cacheKeyFor(

@@ -268,7 +268,24 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
     }
   }
 
-  reapAndEnforceQuota();
+  // A cheap, stat-only usage check (diskUsageBytes(): sums QFileInfo::size()
+  // across the directory, no payload reads or re-hashing) gates the much
+  // more expensive full reap/validate sweep below: reapAndEnforceQuota()
+  // re-reads and re-hashes EVERY cached payload to validate its
+  // payload/metadata pair, which makes it O(N * entry_size) over the whole
+  // cache -- unconditionally running that on every single store() call
+  // would make each individual asset store's cost scale with total cache
+  // size, not just that one asset's size. The constructor already runs one
+  // unconditional sweep at startup (to repair anything a prior crash left
+  // as an orphan/half-written pair), so skipping the sweep here whenever
+  // usage is still comfortably under quota never leaves genuine corruption
+  // undetected forever -- only until either this check trips or the next
+  // process start.
+  const qint64 highWaterMark =
+      static_cast<qint64>(m_config.diskMaxBytes * kHighWaterMarkFraction);
+  if (diskUsageBytes() > highWaterMark) {
+    reapAndEnforceQuota();
+  }
 }
 
 void AssetCache::touchAfterNotModified(const QString &key,

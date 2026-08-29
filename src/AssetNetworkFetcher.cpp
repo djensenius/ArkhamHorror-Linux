@@ -73,35 +73,47 @@ QString normalizeContentType(const QString &raw) {
   return mediaType.trimmed().toLower();
 }
 
-const char *qtImageFormatName(AssetFormat format) {
-  switch (format) {
-  case AssetFormat::Avif:
-    return "avif";
-  case AssetFormat::Jpeg:
-    return "jpeg";
-  case AssetFormat::Png:
-    return "png";
-  }
-  Q_UNREACHABLE_RETURN("");
-}
+// Whether Qt's installed image plugins can decode `format`, and (if so)
+// which exact plugin-key spelling QImageReader should be constructed
+// with. These two questions are answered together, from the SAME
+// QImageReader::supportedImageFormats() snapshot, specifically so the
+// format-hint given to QImageReader can never diverge from the spelling
+// that was actually confirmed supported: a fixed hint independent of this
+// check (e.g. always "jpeg") could pass the support check on a Qt build
+// that only registers the OTHER JPEG key ("jpg") yet still fail to
+// decode, since QImageReader's format hint is matched by exact plugin key.
+// JPEG is checked/hinted under both of Qt's registered plugin keys
+// ("jpeg" and "jpg" -- both are advertised by the stock qjpeg plugin, but
+// a build could plausibly register only one). AVIF/PNG have exactly one
+// Qt key each.
+struct QtCodecSupport {
+  bool supported{false};
+  QByteArray formatHint;
+};
 
-// Whether Qt's installed image plugins can decode `format`. JPEG support is
-// checked under both of Qt's registered plugin keys ("jpeg" and "jpg" --
-// both are advertised by the stock qjpeg plugin, but relying on a single
-// exact spelling risks a false UnsupportedCodec on any Qt build/plugin set
-// that only registers the other one). AVIF/PNG have exactly one Qt key.
-bool isQtImageFormatSupported(AssetFormat format) {
+QtCodecSupport resolveQtCodecSupport(AssetFormat format) {
   const QList<QByteArray> supported = QImageReader::supportedImageFormats();
   switch (format) {
   case AssetFormat::Avif:
-    return supported.contains(QByteArrayLiteral("avif"));
+    return {supported.contains(QByteArrayLiteral("avif")),
+            QByteArrayLiteral("avif")};
   case AssetFormat::Jpeg:
-    return supported.contains(QByteArrayLiteral("jpeg")) ||
-           supported.contains(QByteArrayLiteral("jpg"));
+    if (supported.contains(QByteArrayLiteral("jpeg"))) {
+      return {true, QByteArrayLiteral("jpeg")};
+    }
+    if (supported.contains(QByteArrayLiteral("jpg"))) {
+      return {true, QByteArrayLiteral("jpg")};
+    }
+    // Neither key is registered: report unsupported. The hint value here
+    // is never actually used to construct a QImageReader in that case
+    // (the caller checks `supported` first), but is filled in for
+    // completeness.
+    return {false, QByteArrayLiteral("jpeg")};
   case AssetFormat::Png:
-    return supported.contains(QByteArrayLiteral("png"));
+    return {supported.contains(QByteArrayLiteral("png")),
+            QByteArrayLiteral("png")};
   }
-  Q_UNREACHABLE_RETURN(false);
+  Q_UNREACHABLE_RETURN((QtCodecSupport{}));
 }
 
 void applyCommonRequestSettings(QNetworkRequest &request) {
@@ -415,18 +427,21 @@ void AssetNetworkFetcher::handleFinished(quint64 handle) {
     return;
   }
 
-  QBuffer buffer;
-  buffer.setData(body);
-  buffer.open(QIODevice::ReadOnly);
-  QImageReader reader(&buffer, qtImageFormatName(pendingCopy.expectedFormat));
+  const QtCodecSupport codecSupport =
+      resolveQtCodecSupport(pendingCopy.expectedFormat);
 
-  if (!isQtImageFormatSupported(pendingCopy.expectedFormat)) {
+  if (!codecSupport.supported) {
     emitResult(AssetError{
         AssetErrorCode::UnsupportedCodec,
         QStringLiteral("no installed Qt image plugin can decode this "
                        "asset's format")});
     return;
   }
+
+  QBuffer buffer;
+  buffer.setData(body);
+  buffer.open(QIODevice::ReadOnly);
+  QImageReader reader(&buffer, codecSupport.formatHint);
 
   const QSize declaredSize = reader.size();
   if (!declaredSize.isValid() || declaredSize.width() <= 0 ||
