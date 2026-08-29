@@ -2,10 +2,11 @@
 // IProfileStore/ICapabilityProbe/ITokenStore/IAuthenticationClient
 // implementations. No live service, keyring, or network connection is used.
 //
-// FakeTokenStore doubles as an invariant checker: it fails fatally if two
-// operations are ever in flight for the same profile ID at once, which is
-// exactly the per-profile FIFO guarantee SessionCoordinator must uphold
-// (see SessionCoordinator::enqueueTokenOp).
+// FakeTokenStore doubles as an invariant checker: it records (via a plain
+// overlappingDispatchCount() counter, not a fatal error) whenever two
+// operations are ever in flight for the same profile ID at once, which
+// would violate the per-profile FIFO guarantee SessionCoordinator must
+// uphold (see SessionCoordinator::enqueueTokenOp / startFrontTokenOp).
 
 #include <QCoreApplication>
 #include <QDeadlineTimer>
