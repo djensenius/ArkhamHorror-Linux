@@ -281,12 +281,17 @@ public:
   // toQJson()'s silent fallback to a rounding IEEE-754 double. Intended
   // for a request-bound "convenience QJsonValue" caller that has no other
   // reason to reach for the raw AST/byte APIs directly but still must
-  // never submit a silently-rounded number: prefer toJsonBytes()/the raw
-  // AST itself whenever the canonical wire representation is what
-  // actually matters, since this is still QJsonValue-backed and therefore
-  // strictly less capable than the AST for anything besides numbers (e.g.
-  // it cannot represent a lone UTF-16 surrogate any more than toQJson()
-  // can -- see Value::toJsonBytes()'s doc comment).
+  // never submit a silently-rounded/altered request: unlike toQJson(),
+  // this enforces the *same* invariants as toJsonBytes() (see its own doc
+  // comment) end-to-end -- a duplicate object key, a lone UTF-16 surrogate
+  // in any string or key, a nesting depth/array-or-object size/total-node
+  // count past ParseLimits::production(), and a Kind::Undefined value
+  // nested inside an array element or object member (as opposed to the
+  // whole top-level value itself, which legitimately stays Undefined --
+  // see e.g. DeckListInput::toJson()'s guarded sideSlots call) are every
+  // one a typed failure here, never a silently altered/truncated
+  // QJsonValue tree. Still prefer toJsonBytes()/the raw AST directly
+  // whenever the canonical wire representation is what actually matters.
   [[nodiscard]] ValueOrError<QJsonValue> toExactQJson() const;
 
   friend bool operator==(const Value &, const Value &) = default;
@@ -348,6 +353,12 @@ private:
   [[nodiscard]] ValueOrError<QByteArray>
   toJsonBytesInner(const ParseLimits &limits, int depth,
                    qsizetype &totalNodes) const;
+  // Shared recursive body for toExactQJson() above; see its doc comment
+  // for the full list of invariants enforced (duplicate keys, embedded
+  // Undefined, lone surrogates, ParseLimits bounds).
+  [[nodiscard]] ValueOrError<QJsonValue>
+  toExactQJsonInner(const ParseLimits &limits, int depth,
+                    qsizetype &totalNodes) const;
   friend class Parser;
 
   Kind m_kind{Kind::Undefined};

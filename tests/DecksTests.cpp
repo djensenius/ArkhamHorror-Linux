@@ -33,6 +33,31 @@ private slots:
   void decodesValidationErrorsFromFixture();
   void decodesValidationSuccessFromFixture();
   void decodesOperationErrorFromFixture();
+  // Round-10-cumulative-review item 5: decks.schema.json's deckList/deck/
+  // deckValidationError/deckOperationError are each additionalProperties:
+  // false; an unrecognized top-level key on any of them is now a hard
+  // decode failure rather than silently accepted-and-discarded. Also adds
+  // the canonical raw-byte entry points DeckValidationError/
+  // DeckValidationResult/DeckOperationError previously lacked entirely
+  // (fromJson()-only before this round), proving they decode a fixture
+  // identically through both paths and reject a duplicate/escape-
+  // equivalent-duplicate key before any nested decode runs.
+  void deckListExtraTopLevelFieldRejected();
+  void deckExtraTopLevelFieldRejected();
+  void deckValidationErrorExtraTopLevelFieldRejected();
+  void deckOperationErrorExtraTopLevelFieldRejected();
+  void deckValidationErrorFromRawBytesMatchesFromJsonOnSameFixture();
+  void deckValidationResultFromRawBytesMatchesFromJsonOnErrorsFixture();
+  void deckOperationErrorFromRawBytesMatchesFromJsonOnSameFixture();
+  void deckValidationErrorEscapedDuplicateTagKeyRejectedThroughRawBytes();
+  // Round-10-cumulative-review item 2: FetchDeckRequest was QJson-only and
+  // could silently encode an invalid lone/mismatched UTF-16 surrogate in
+  // `url` (Qt's QJsonValue(QString) constructor performs no validation at
+  // all); the new canonical toJsonBytes()/toRawJson() pair rejects this
+  // with a typed failure instead, exactly like every other outbound
+  // request's byte encoder.
+  void fetchDeckRequestToJsonBytesRejectsLoneSurrogateInUrl();
+  void fetchDeckRequestToJsonBytesRoundTripsFixtureUrlExactly();
 
   // ExternalDeckId: string/integer/decimal/null preservation ───────────────
   void externalIdAbsentPreserved();
@@ -113,6 +138,15 @@ private slots:
   // still be rejected at encode time.
   void deckListInputToJsonRejectsProgrammaticEmptyCardSlotsKey();
   void deckListInputToJsonBytesRejectsProgrammaticEmptyCardSlotsKey();
+  // Round-10-cumulative-review item 1: sideSlots.toExactQJson() (see
+  // Value::toExactQJson()'s hardened invariants in RawJson.cpp/.h) must
+  // reject a malicious raw AST rather than silently producing a
+  // normal-looking-but-altered QJsonObject; proven here through
+  // DeckListInput::toJson() and through the enclosing CreateDeckRequest
+  // public request type it composes into.
+  void deckListInputToJsonRejectsSideSlotsWithNestedUndefined();
+  void deckListInputToJsonRejectsSideSlotsWithDuplicateKey();
+  void createDeckRequestToJsonRejectsMaliciousSideSlots();
 };
 
 namespace {
@@ -345,6 +379,135 @@ void DecksTests::decodesOperationErrorFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->errorMsg, QStringLiteral("Could not sync deck"));
   QCOMPARE(result->toJson(), v.toObject());
+}
+
+void DecksTests::deckListExtraTopLevelFieldRejected() {
+  QJsonObject obj = decksFixture().value("normalizedDeckList"_L1).toObject();
+  obj.insert(QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1);
+  const auto result = DeckList::fromJson(obj, u"normalizedDeckList");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(
+               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
+           qPrintable(result.error()));
+}
+
+void DecksTests::deckExtraTopLevelFieldRejected() {
+  QJsonObject obj = decksFixture().value("deck"_L1).toObject();
+  obj.insert(QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1);
+  const auto result = Deck::fromJson(obj, u"deck");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(
+               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
+           qPrintable(result.error()));
+}
+
+void DecksTests::deckValidationErrorExtraTopLevelFieldRejected() {
+  const QJsonObject obj{
+      {QStringLiteral("tag"), QStringLiteral("UnimplementedCard")},
+      {QStringLiteral("contents"), QStringLiteral("c99999")},
+      {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1},
+  };
+  const auto result = DeckValidationError::fromJson(obj, u"validationError");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(
+               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
+           qPrintable(result.error()));
+}
+
+void DecksTests::deckOperationErrorExtraTopLevelFieldRejected() {
+  const QJsonObject obj{
+      {QStringLiteral("errorMsg"), QStringLiteral("Could not sync deck")},
+      {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1},
+  };
+  const auto result = DeckOperationError::fromJson(obj, u"operationError");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(
+               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
+           qPrintable(result.error()));
+}
+
+void DecksTests::deckValidationErrorFromRawBytesMatchesFromJsonOnSameFixture() {
+  const QJsonObject fixture = decksFixture();
+  const QJsonValue v = fixture.value("validationErrors"_L1).toArray().at(0);
+  const QByteArray bytes =
+      QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact);
+  const auto viaJson = DeckValidationError::fromJson(v, u"validationError");
+  const auto viaRawBytes =
+      DeckValidationError::fromRawBytes(bytes, u"validationError");
+  if (!viaJson)
+    QFAIL(qPrintable(viaJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QVERIFY(*viaJson == *viaRawBytes);
+}
+
+void DecksTests::
+    deckValidationResultFromRawBytesMatchesFromJsonOnErrorsFixture() {
+  const QJsonObject fixture = decksFixture();
+  const QJsonValue v = fixture.value("validationErrors"_L1);
+  const QByteArray bytes =
+      QJsonDocument(v.toArray()).toJson(QJsonDocument::Compact);
+  const auto viaJson = DeckValidationResult::fromJson(v, u"validationErrors");
+  const auto viaRawBytes =
+      DeckValidationResult::fromRawBytes(bytes, u"validationErrors");
+  if (!viaJson)
+    QFAIL(qPrintable(viaJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QVERIFY(*viaJson == *viaRawBytes);
+}
+
+void DecksTests::deckOperationErrorFromRawBytesMatchesFromJsonOnSameFixture() {
+  const QJsonObject fixture = decksFixture();
+  const QJsonValue v = fixture.value("operationError"_L1);
+  const QByteArray bytes =
+      QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact);
+  const auto viaJson = DeckOperationError::fromJson(v, u"operationError");
+  const auto viaRawBytes =
+      DeckOperationError::fromRawBytes(bytes, u"operationError");
+  if (!viaJson)
+    QFAIL(qPrintable(viaJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QVERIFY(*viaJson == *viaRawBytes);
+}
+
+void DecksTests::
+    deckValidationErrorEscapedDuplicateTagKeyRejectedThroughRawBytes() {
+  // "\u0074ag" decodes to the same text as "tag"; Json::Value::parse()
+  // itself rejects this as a duplicate key (see
+  // RawJsonTests::rejectsEscapeEquivalentDuplicateObjectKeys()) before any
+  // DeckValidationError-specific decoding runs, proven here through its
+  // production fromRawBytes() entry point.
+  const QByteArray bytes = R"({"tag":"UnimplementedCard","contents":"c99999",)"
+                           R"("\u0074ag":"UnimplementedCard"})";
+  const auto result =
+      DeckValidationError::fromRawBytes(bytes, u"validationError");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(u"duplicate"_s), qPrintable(result.error()));
+}
+
+void DecksTests::fetchDeckRequestToJsonBytesRejectsLoneSurrogateInUrl() {
+  QString lone;
+  lone += QChar(0xD800);
+  const FetchDeckRequest request{.url = lone};
+  const auto bytes = request.toJsonBytes();
+  QVERIFY(!bytes.has_value());
+}
+
+void DecksTests::fetchDeckRequestToJsonBytesRoundTripsFixtureUrlExactly() {
+  const QJsonObject fixture = decksFixture();
+  const auto decoded =
+      FetchDeckRequest::fromJson(fixture.value("fetchDeck"_L1), u"fetchDeck");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  const auto bytes = decoded->toJsonBytes();
+  if (!bytes)
+    QFAIL(qPrintable(bytes.error()));
+  const auto reparsed = FetchDeckRequest::fromRawBytes(*bytes, u"fetchDeck");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QVERIFY(*reparsed == *decoded);
 }
 
 void DecksTests::externalIdAbsentPreserved() {
@@ -1188,6 +1351,60 @@ void DecksTests::
   QVERIFY(!requestEncoded.has_value());
   QVERIFY2(requestEncoded.error().contains(QStringLiteral("slots")),
            qPrintable(requestEncoded.error()));
+}
+
+void DecksTests::deckListInputToJsonRejectsSideSlotsWithNestedUndefined() {
+  // sideSlots is a public Json::Value field; a caller can build this raw
+  // AST by hand (decode never produces a nested Undefined), so
+  // DeckListInput::toJson() itself -- not just the parser -- must refuse
+  // it rather than have the nested key silently vanish through
+  // QJsonObject::insert().
+  DeckListInput input{
+      .sideSlots = Json::Value::makeObject(
+          {{QStringLiteral("present"), Json::Value::makeBool(true)},
+           {QStringLiteral("vanishes"), Json::Value{}}}),
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+  };
+  const auto encoded = input.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("sideSlots")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckListInputToJsonRejectsSideSlotsWithDuplicateKey() {
+  DeckListInput input{
+      .sideSlots = Json::Value::makeObject(
+          {{QStringLiteral("c01001"),
+            Json::Value::makeNumber(Json::RawNumber::fromInt64(1))},
+           {QStringLiteral("c01001"),
+            Json::Value::makeNumber(Json::RawNumber::fromInt64(2))}}),
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+  };
+  const auto encoded = input.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("sideSlots")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::createDeckRequestToJsonRejectsMaliciousSideSlots() {
+  // Proves the rejection reaches the actual public outbound request type
+  // this client sends over the wire, not merely DeckListInput in
+  // isolation.
+  const DeckListInput input{
+      .sideSlots = Json::Value::makeObject(
+          {{QStringLiteral("present"), Json::Value::makeBool(true)},
+           {QStringLiteral("vanishes"), Json::Value{}}}),
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+  };
+  const CreateDeckRequest request{
+      .deckId = QStringLiteral("external-1"),
+      .deckName = QStringLiteral("X"),
+      .deckList = input,
+  };
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
 }
 
 QTEST_APPLESS_MAIN(DecksTests)

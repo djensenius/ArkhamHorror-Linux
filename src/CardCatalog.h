@@ -379,23 +379,17 @@ private:
 // Required fields are cardCode, name, cardType, and art; every other field is
 // optional, decoding to std::nullopt / an empty container when absent.
 //
-// Deliberate additive-field policy: any top-level object key this type
-// does not itself model is silently ignored by fromJson()/fromRawJson(),
-// not rejected -- even though the vendored catalog.schema.json actually
-// declares `additionalProperties: false` for cardDef. This is a
-// deliberate CLIENT policy divergence from the schema's own strictness,
-// not something the schema itself specifies: intentional
-// forward-compatible leniency for a read-only response type -- CardDef is
-// decoded from the card catalog endpoint and is never itself re-encoded as part
-// of an outbound request, so tolerating a field this client version does not
-// yet recognize carries no outbound-safety risk (contrast with e.g.
-// CampaignOption/CampaignOptionRequest's split, where only the closed *Request
-// side must reject anything unrecognized because it IS submitted). Every field
-// this type does model is still validated exactly: a known field's wrong JSON
-// type, a required field's absence, or a malformed value for a field with real
-// constraints (duplicate uniqueItems entries, wrong outer array/object shape,
-// etc.) is a hard decode failure, never silently dropped into "absent" -- only
-// genuinely *unrecognized* keys are ignored. The schema types
+// Exact-key policy (round-10-cumulative-review item 4, superseding this
+// type's earlier, now-removed leniency): a top-level object key this type
+// does not itself model is a hard decode failure, not silently ignored --
+// matching the vendored catalog.schema.json's own `additionalProperties:
+// false` for cardDef literally rather than pre-emptively working around a
+// hypothetical future backend field this client has not yet modeled. Every
+// field this type does model is likewise still validated exactly: a known
+// field's wrong JSON type, a required field's absence, or a malformed value
+// for a field with real constraints (duplicate uniqueItems entries, wrong
+// outer array/object shape, etc.) is a hard decode failure, never silently
+// dropped into "absent". The schema types
 // level/victoryPoints/vengeancePoints/overrideActionPlayableIfCriteriaMet/
 // permanent/encounterSet/encounterSetQuantity/unique/doubleSided/
 // exceptional/playableFromDiscard/stage/grantedXp/canReplace/

@@ -96,6 +96,15 @@ private slots:
   // stores as a double, silently losing a bit of precision before this
   // client's code ever sees it) still recovers the exact qint64.
   void createGameRequestFromRawBytesPreservesPlayerCountBeyondDoublePrecision();
+  // Round-10-cumulative-review item 2: CreateGameRequest::toJson() embeds
+  // `campaignName` (an unconstrained QString) via a raw QJsonValue(QString)
+  // construction with zero validation; toJsonBytes() must reject a
+  // lone/mismatched UTF-16 surrogate there instead, and still round-trip a
+  // well-formed request exactly through the raw AST (deckIds/options/
+  // campaignId/scenarioId all included, not merely a subset).
+  void createGameRequestToJsonBytesRejectsLoneSurrogateInCampaignName();
+  void
+  createGameRequestFromRawBytesRoundTripsThroughToJsonBytesPreservingEveryField();
   void decodesChooseDeckFromFixture();
   void decodesContinueWithoutUpgradeFromFixture();
   void decodesClaimSeatFromFixture();
@@ -164,7 +173,19 @@ private slots:
   void chooseDeckWithDeckListRoundTrips();
   void chooseDeckRawBytesPreserveExactNumericDeckIdAndSideSlots();
   void chooseDeckRawBytesDistinguishAbsentAndNullDeckId();
+  // Round-10-cumulative-review item 1 (companion to DecksTests'
+  // identically-motivated tests): ChooseDeckRequest::toJson() splices
+  // deckList's sideSlots through the now-hardened
+  // Value::toExactQJson() -- a nested Kind::Undefined member or a
+  // duplicate key inside a programmatically-built sideSlots AST must be
+  // rejected here too, not merely on DeckListInput in isolation.
+  void chooseDeckRequestToJsonRejectsSideSlotsWithNestedUndefined();
   void claimSeatRoundTrips();
+  // Round-10-cumulative-review item 2: ClaimSeatRequest was entirely
+  // QJson-only (fromJson()/toJson(), no raw-byte entry points at all)
+  // and toJson() embedded investigatorId with zero surrogate validation.
+  void claimSeatRequestFromRawBytesMatchesFromJsonOnSameFixture();
+  void claimSeatRequestToJsonBytesRejectsLoneSurrogateInInvestigatorId();
 
   // Round-9 item 6: encodeClosedEnum() now returns a typed failure rather
   // than Q_UNREACHABLE_RETURN when given an enum value fabricated via
@@ -891,6 +912,59 @@ void GamesTests::
     QFAIL(qPrintable(viaLegacyPath.error()));
   QVERIFY(viaLegacyPath->playerCount != viaRawBytes->playerCount);
   QCOMPARE(viaLegacyPath->playerCount, qint64{9007199254740992LL});
+}
+
+void GamesTests::
+    createGameRequestToJsonBytesRejectsLoneSurrogateInCampaignName() {
+  const QJsonObject fixture = lifecycleFixture();
+  const auto decoded = CreateGameRequest::fromJson(
+      fixture.value("createGame"_L1), u"createGame");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  CreateGameRequest request = *decoded;
+
+  QString lone;
+  lone += QChar(0xD800);
+  request.campaignName = lone;
+  const auto encoded = request.toJsonBytes();
+  QVERIFY(!encoded.has_value());
+
+  // A well-formed campaignName still encodes fine (proves the rejection
+  // above is specific to the lone surrogate, not every campaignName).
+  request.campaignName = QStringLiteral("Contract campaign");
+  const auto validEncoded = request.toJsonBytes();
+  if (!validEncoded)
+    QFAIL(qPrintable(validEncoded.error()));
+}
+
+void GamesTests::
+    createGameRequestFromRawBytesRoundTripsThroughToJsonBytesPreservingEveryField() {
+  // Exercises every field this request models (deckIds with a present and
+  // an absent entry, playerCount, campaignId/scenarioId, difficulty,
+  // campaignName, multiplayerVariant, includeTarotReadings, options
+  // (both Known and Variant kinds), strictAsIfAt, asIfRuling,
+  // ultimatumsAndBoons, achievementsEnabled) through the canonical raw
+  // decode -> raw encode -> raw decode round trip, proving toRawJson()/
+  // toJsonBytes() is not merely a partial encoder covering a subset.
+  const QJsonObject fixture = lifecycleFixture();
+  const QJsonValue createGame = fixture.value("createGame"_L1);
+  const QByteArray bytes =
+      QJsonDocument(withoutKey(createGame.toObject(), "unknownField"_L1))
+          .toJson(QJsonDocument::Compact);
+
+  const auto decoded = CreateGameRequest::fromRawBytes(bytes, u"createGame");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+
+  const auto reencodedBytes = decoded->toJsonBytes();
+  if (!reencodedBytes)
+    QFAIL(qPrintable(reencodedBytes.error()));
+
+  const auto reparsed =
+      CreateGameRequest::fromRawBytes(*reencodedBytes, u"createGame");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QVERIFY(*reparsed == *decoded);
 }
 
 void GamesTests::createGameDefaultsAndNullDefaultsDecodeIdentically() {
@@ -1782,11 +1856,69 @@ void GamesTests::chooseDeckRawBytesDistinguishAbsentAndNullDeckId() {
   QCOMPARE(*encodedAbsentId, absentIdBytes);
 }
 
+void GamesTests::chooseDeckRequestToJsonRejectsSideSlotsWithNestedUndefined() {
+  // sideSlots is a public Json::Value field on DeckListInput; a caller can
+  // build this raw AST by hand (decode never produces a nested
+  // Undefined), so ChooseDeckRequest::toJson()/toJsonBytes() -- which
+  // splice deckList's sideSlots through Value::toExactQJson() -- must
+  // refuse it here too, not merely on DeckListInput in isolation (see
+  // DecksTests::deckListInputToJsonRejectsSideSlotsWithNestedUndefined()).
+  const DeckListInput deckList{
+      .sideSlots = Json::Value::makeObject(
+          {{QStringLiteral("present"), Json::Value::makeBool(true)},
+           {QStringLiteral("vanishes"), Json::Value{}}}),
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+  };
+  const ChooseDeckRequest request{
+      .investigatorId = *InvestigatorRef::parse(QStringLiteral("01001")),
+      .deckList = deckList,
+  };
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = request.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
 void GamesTests::claimSeatRoundTrips() {
   const ClaimSeatRequest request{
       .investigatorId = *InvestigatorRef::parse(QStringLiteral("c01001"))};
   QCOMPARE(request.toJson(), (QJsonObject{{QStringLiteral("investigatorId"),
                                            QStringLiteral("c01001")}}));
+}
+
+void GamesTests::claimSeatRequestFromRawBytesMatchesFromJsonOnSameFixture() {
+  const QJsonObject fixture = lifecycleFixture();
+  const QJsonValue v = fixture.value("claimSeat"_L1);
+  const QByteArray bytes =
+      QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact);
+
+  const auto viaJson = ClaimSeatRequest::fromJson(v, u"claimSeat");
+  const auto viaRawBytes = ClaimSeatRequest::fromRawBytes(bytes, u"claimSeat");
+  if (!viaJson)
+    QFAIL(qPrintable(viaJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QVERIFY(*viaJson == *viaRawBytes);
+
+  // The canonical byte encoder also round-trips this fixture's
+  // investigatorId exactly.
+  const auto encoded = viaRawBytes->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  const auto reparsed = ClaimSeatRequest::fromRawBytes(*encoded, u"claimSeat");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QVERIFY(*reparsed == *viaRawBytes);
+}
+
+void GamesTests::
+    claimSeatRequestToJsonBytesRejectsLoneSurrogateInInvestigatorId() {
+  QString lone;
+  lone += QChar(0xD800);
+  const ClaimSeatRequest request{.investigatorId =
+                                     *InvestigatorRef::parse(lone)};
+  const auto encoded = request.toJsonBytes();
+  QVERIFY(!encoded.has_value());
 }
 
 void GamesTests::investigatorSummaryToJsonRejectsOutOfRangeClassSymbol() {

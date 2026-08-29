@@ -627,6 +627,15 @@ public:
   [[nodiscard]] static ValueOrError<CampaignOptionRequest>
   fromJson(const Json::Value &v, QStringView path);
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // Canonical byte-level encode (round-10-cumulative-review item 2):
+  // composes the lossless AST directly (see RawJson.h) rather than
+  // toJson()'s QJsonObject, so a "CampaignVariant" `contents` string
+  // containing a lone/mismatched UTF-16 surrogate is a typed failure at
+  // Value::toJsonBytes() rather than ever silently embedded as invalid
+  // UTF-8. This is what CreateGameRequest::toRawJson() below composes its
+  // "options" array from -- toJson() remains display/log/test-only.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   [[nodiscard]] std::optional<KnownCampaignOption> known() const noexcept {
@@ -682,6 +691,15 @@ public:
   // either the real id or explicit JSON null) into `obj`, matching the
   // fixture's own encoding (both keys always present).
   void insertInto(QJsonObject &obj) const;
+  // Canonical byte-level equivalent of insertInto() (round-10-cumulative-
+  // review item 2): appends the same two keys, built directly as
+  // Json::Value strings/null rather than QJsonValue, so
+  // CreateGameRequest::toJsonBytes() can reject a campaignId/scenarioId
+  // containing a lone/mismatched UTF-16 surrogate instead of silently
+  // embedding invalid UTF-8 -- neither id is currently UUID-backed (see
+  // CampaignId/ScenarioId's NonEmptyString<Tag> definition in
+  // Identifiers.h), so this is not a hypothetical concern.
+  void insertRawInto(QList<std::pair<QString, Json::Value>> &members) const;
 
   [[nodiscard]] bool isCampaign() const noexcept {
     return m_campaignId.has_value();
@@ -755,6 +773,18 @@ struct CreateGameRequest {
   // bypass that invariant and emit a wire value the backend -- and this
   // client's own decoder -- would reject.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // Canonical byte-level encode (round-10-cumulative-review item 2):
+  // composes the lossless AST directly (see RawJson.h) rather than
+  // toJson()'s QJsonObject -- `campaignName` is an unconstrained QString a
+  // caller can set to anything, and toJson() previously embedded it via a
+  // raw QJsonValue(QString) construction with zero validation -- so a
+  // lone/mismatched UTF-16 surrogate anywhere in this request (including
+  // nested inside campaignName or a CampaignOptionRequest's variant
+  // contents) is now a typed failure at Value::toJsonBytes() rather than
+  // ever silently emitted as invalid UTF-8. Shares the same
+  // deckIds-null-uuid validation as toJson() above.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const CreateGameRequest &,
                          const CreateGameRequest &) = default;
@@ -803,7 +833,25 @@ struct ClaimSeatRequest {
 
   [[nodiscard]] static ValueOrError<ClaimSeatRequest>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via decodeInvestigatorRefValue's dispatch-shim pair, see
+  // Games.cpp), operating directly on the lossless AST (see RawJson.h).
+  [[nodiscard]] static ValueOrError<ClaimSeatRequest>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<ClaimSeatRequest>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level encode (round-10-cumulative-review item 2):
+  // composes the lossless AST directly (see RawJson.h) -- investigatorId
+  // is an unconstrained (non-empty) QString a caller can set to anything,
+  // and toJson() previously embedded it via a raw QJsonValue(QString)
+  // construction with zero validation -- so a lone/mismatched UTF-16
+  // surrogate is now a typed failure at Value::toJsonBytes() rather than
+  // ever silently emitted as invalid UTF-8.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const ClaimSeatRequest &,
                          const ClaimSeatRequest &) = default;

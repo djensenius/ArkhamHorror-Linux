@@ -554,16 +554,74 @@ QJsonValue Value::toQJson() const {
   return QJsonValue(QJsonValue::Undefined);
 }
 
-ValueOrError<QJsonValue> Value::toExactQJson() const {
+namespace {
+// Shared with appendJsonEncodedString()'s own surrogate handling below:
+// true iff `s` contains a high surrogate with no immediately-following
+// low surrogate, or a low surrogate with no immediately-preceding
+// (already-consumed) high surrogate. A QString -- unlike Value::parse()'s
+// own input -- can be constructed programmatically to hold such an
+// ill-formed code unit (e.g. via QString::fromRawData() or by slicing a
+// valid string between a surrogate pair); toExactQJson() must reject one
+// exactly like toJsonBytes() does, rather than silently building a
+// QJsonValue no downstream UTF-8 serializer could faithfully encode.
+[[nodiscard]] bool hasLoneSurrogate(const QString &s) {
+  for (qsizetype i = 0; i < s.size(); ++i) {
+    const QChar ch = s[i];
+    if (ch.isHighSurrogate()) {
+      if (i + 1 < s.size() && s[i + 1].isLowSurrogate()) {
+        ++i;
+        continue;
+      }
+      return true;
+    }
+    if (ch.isLowSurrogate())
+      return true;
+  }
+  return false;
+}
+} // namespace
+
+ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
+                                                  int depth,
+                                                  qsizetype &totalNodes) const {
+  // Mirrors toJsonBytesInner()'s own bookkeeping exactly (see its doc
+  // comment / definition below): every node -- scalar or container --
+  // counts once against maxTotalNodes, and every array/object nesting
+  // level counts against maxDepth, so a pathological or adversarially
+  // deep/wide programmatically-built AST cannot recurse unboundedly or
+  // exhaust memory converting it to a QJsonValue tree, any more than it
+  // could serializing straight to bytes.
+  if (++totalNodes > limits.maxTotalNodes)
+    return failure(QStringLiteral(
+        "Value::toExactQJson: total node count exceeds the configured "
+        "limit"));
   switch (m_kind) {
   case Kind::Undefined:
+    // Only meaningful at the top level (the whole value is absent; see
+    // toExactQJson() below) -- a nested occurrence is rejected by the
+    // Array/Object cases below, which never call back in here for an
+    // Undefined child without checking the result first.
+    return QJsonValue(QJsonValue::Undefined);
   case Kind::Null:
+    return QJsonValue(QJsonValue::Null);
   case Kind::Bool:
+    return QJsonValue(m_bool);
   case Kind::String:
-    // None of these carry any numeric-precision concern; identical to
-    // toQJson() above.
-    return toQJson();
+    if (m_string.size() > limits.maxStringLength)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: string exceeds the configured maximum "
+          "length"));
+    if (hasLoneSurrogate(m_string))
+      return failure(QStringLiteral(
+          "Value::toExactQJson: string contains a lone UTF-16 surrogate "
+          "code unit, which cannot be encoded as valid UTF-8"));
+    return QJsonValue(m_string);
   case Kind::Number:
+    // Preserve full int64 precision whenever the literal is mathematically
+    // integral and in range (see RawNumber::toExactInt64()); every other
+    // literal (a genuine decimal, or an integral value outside qint64's
+    // range) has no exact QJsonValue representation, so this is a typed
+    // failure rather than toQJson()'s silent double-rounding fallback.
     if (auto exact = m_number.toExactInt64())
       return QJsonValue(*exact);
     return failure(
@@ -572,27 +630,100 @@ ValueOrError<QJsonValue> Value::toExactQJson() const {
             "exactly as a QJsonValue; use toJsonBytes()/the raw AST instead")
             .arg(m_number.literal()));
   case Kind::Array: {
+    if (depth >= limits.maxDepth)
+      return failure(
+          QStringLiteral("Value::toExactQJson: nesting depth exceeds the "
+                         "configured maximum"));
+    if (m_array.size() > limits.maxArrayElements)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: array exceeds the configured maximum "
+          "element count"));
     QJsonArray array;
     for (qsizetype i = 0; i < m_array.size(); ++i) {
-      auto element = m_array.at(i).toExactQJson();
+      auto element =
+          m_array.at(i).toExactQJsonInner(limits, depth + 1, totalNodes);
       if (!element)
         return failure(QStringLiteral("[%1]: %2").arg(i).arg(element.error()));
+      if (element->isUndefined())
+        // An array element can never be Undefined in valid JSON (unlike an
+        // object key, there is no way to "omit" one array slot -- the
+        // element must be null or absent entirely by shortening the
+        // array); embedding one anyway would need QJsonArray::append() to
+        // silently drop or corrupt the index, exactly the kind of silent
+        // data loss this function exists to prevent.
+        return failure(
+            QStringLiteral(
+                "[%1]: cannot represent an embedded Undefined value inside an "
+                "array")
+                .arg(i));
       array.append(*element);
     }
     return QJsonValue(array);
   }
   case Kind::Object: {
+    if (depth >= limits.maxDepth)
+      return failure(
+          QStringLiteral("Value::toExactQJson: nesting depth exceeds the "
+                         "configured maximum"));
+    if (m_object.size() > limits.maxObjectMembers)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: object exceeds the configured maximum "
+          "member count"));
     QJsonObject object;
+    QSet<QString> seenKeys;
+    seenKeys.reserve(m_object.size());
     for (const auto &[k, v] : m_object) {
-      auto value = v.toExactQJson();
+      if (k.size() > limits.maxStringLength)
+        return failure(QStringLiteral(
+            "Value::toExactQJson: object key exceeds the configured "
+            "maximum length"));
+      if (hasLoneSurrogate(k))
+        return failure(QStringLiteral(
+            "Value::toExactQJson: object key contains a lone UTF-16 "
+            "surrogate code unit, which cannot be encoded as valid UTF-8"));
+      // Unlike toJsonBytesInner()'s own duplicate-key check (which rejects
+      // during *serialization*), this guards conversion to an in-memory
+      // QJsonObject: QJsonObject::insert() silently overwrites an existing
+      // key rather than erroring, so without this check a
+      // programmatically-built Value with a repeated key (a transiently
+      // constructible but invalid state -- see makeObject()'s own doc
+      // comment) would let toExactQJson() quietly keep only the *last*
+      // occurrence's value, an entirely different (and silently
+      // corrupted) result from toJsonBytes()'s typed rejection of the
+      // same input.
+      if (seenKeys.contains(k))
+        return failure(
+            QStringLiteral("Value::toExactQJson: duplicate object key '%1'")
+                .arg(k));
+      seenKeys.insert(k);
+      auto value = v.toExactQJsonInner(limits, depth + 1, totalNodes);
       if (!value)
         return failure(QStringLiteral("%1: %2").arg(k, value.error()));
+      if (value->isUndefined())
+        // Unlike this function's own top-level Undefined case (see above),
+        // a *nested* Undefined member has no valid JSON spelling: Qt's
+        // QJsonObject::insert() silently drops the key entirely for an
+        // Undefined value rather than storing an explicit placeholder, so
+        // without this check the key -- and whatever it represented --
+        // would vanish from the result with no error and no trace,
+        // changing the represented data as surely as the duplicate-key
+        // collapse above.
+        return failure(
+            QStringLiteral(
+                "%1: cannot represent an embedded Undefined value inside an "
+                "object")
+                .arg(k));
       object.insert(k, *value);
     }
     return QJsonValue(object);
   }
   }
   return QJsonValue(QJsonValue::Undefined);
+}
+
+ValueOrError<QJsonValue> Value::toExactQJson() const {
+  qsizetype totalNodes = 0;
+  return toExactQJsonInner(ParseLimits::production(), 0, totalNodes);
 }
 
 Value Value::makeNull() {
@@ -1011,16 +1142,28 @@ std::optional<qint64> RawNumber::toExactInt64() const {
     }
   }
   if (allZero) {
-    // Still require the exponent digit string (if any) to parse to *some*
-    // qint64 magnitude, so a genuinely malformed/unparseable exponent
-    // (defense in depth -- Value::parse() should already have rejected
-    // one exceeding maxNumberDigits at the syntax level) is not silently
-    // treated as if it were a valid, merely-irrelevant one.
+    // m_expDigits (when m_hasExponent is set) is only ever populated by
+    // the friend Parser as a bounded (<= maxNumberDigits), non-empty,
+    // all-ASCII-digit string -- see parseNumber() above -- so it is
+    // always syntactically valid *regardless* of whether its magnitude
+    // happens to fit in qint64. A zero coefficient is exactly 0 for any
+    // such (however large) exponent -- e.g. "0e9223372036854775808" or
+    // "-0e9223372036854775808", both one past qint64's own range and
+    // rejected by the nonzero path below, yet still exact zero per the
+    // pinned backend's Aeson Scientific decoder. Do NOT require the
+    // exponent to itself parse as a qint64 (the previous check here):
+    // that incorrectly rejected an out-of-qint64-range-but-otherwise-
+    // valid exponent on a value whose magnitude never depends on it.
+    // Defense in depth: still verify non-empty/all-digit syntax, so a
+    // hypothetical future caller constructing a malformed m_expDigits by
+    // some other means cannot get a silent 0 out of this shortcut.
     if (m_hasExponent) {
-      bool ok = false;
-      m_expDigits.toLongLong(&ok);
-      if (!ok)
+      if (m_expDigits.isEmpty())
         return std::nullopt;
+      for (const QChar c : m_expDigits) {
+        if (c.unicode() < u'0' || c.unicode() > u'9')
+          return std::nullopt;
+      }
     }
     return qint64(0);
   }

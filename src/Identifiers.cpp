@@ -24,6 +24,19 @@ ValueOrError<CardName> cardNameFromValueImpl(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
+  // catalog.schema.json's `name` definition is additionalProperties:false
+  // with exactly {"title","subtitle"} (round-10-cumulative-review item 4:
+  // reversing this client's earlier, now-superseded policy of tolerating
+  // an unknown key here for CardDef-style forward compatibility --
+  // CardName is a small, fully pinned, contract-closed shape, not an
+  // evolving entity, and is reused identically wherever the contract
+  // embeds it, e.g. game-list.schema.json's scenario/investigator
+  // summaries, so this one check covers every call site).
+  auto exactKeys =
+      Json::requireExactKeys(obj, {"title"_L1, "subtitle"_L1}, path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
+
   auto titleResult =
       Json::requireString(obj, "title"_L1, Json::joinPath(path, u"title"));
   if (!titleResult)

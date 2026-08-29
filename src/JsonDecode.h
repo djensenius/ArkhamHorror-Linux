@@ -343,16 +343,18 @@ objectMembers(const Json::Value &obj);
 // Fails if `obj` carries any key other than those listed in `allowed`.
 // For a schema branch whose additionalProperties is false -- specifically
 // a known tagged union's exact "tag"/"contents" shape (SkillIcon/CardCost/
-// GameValue/GameState's known branches), and closed/fixed-shape summary
+// GameValue/GameState's known branches), closed/fixed-shape summary
 // objects used to positively disambiguate a response's shape (GameListRow's
-// success row and its nested scenario/campaign/investigator summaries) --
-// this rejects an unexpected extra key rather than silently accepting it
-// and then re-emitting only the keys this client models, dropping the
-// rest. Deliberately NOT used for CardDef/CardName: those are genuinely
-// evolving named entities where this client's documented read policy
-// intentionally ignores unknown additive keys for forward compatibility;
-// adding exact-key enforcement there would silently reject a wire response
-// this policy says must still decode. Generic over Obj (QJsonObject or
+// success row and its nested scenario/campaign/investigator summaries),
+// and every other pinned-contract shape whose schema likewise declares
+// `additionalProperties: false` (CardDef/CardName -- as of
+// round-10-cumulative-review item 4, superseding this client's earlier
+// policy of tolerating an unknown key on those two specifically; a future
+// backend field not yet modeled here is now a hard decode error, matching
+// the pinned schema literally rather than pre-emptively working around a
+// hypothetical future revision) -- this rejects an unexpected extra key
+// rather than silently accepting it and then re-emitting only the keys
+// this client models, dropping the rest. Generic over Obj (QJsonObject or
 // Json::Value, see RawJson.h) via objectMembers() above.
 template <typename Obj>
 [[nodiscard]] ValueOrError<bool>

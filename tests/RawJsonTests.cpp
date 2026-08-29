@@ -70,6 +70,13 @@ private slots:
   // parseable) e is.
   void toExactInt64RejectsNonzeroCoefficientWithHugeExponentWithoutOverflow();
   void toExactInt64ZeroCoefficientWithHugeExponentIsExactZero();
+  // Round 12: the previous zero-coefficient shortcut also required the
+  // exponent digit string to itself parse as a qint64 magnitude, silently
+  // *rejecting* an otherwise-valid (all-digit, within maxNumberDigits)
+  // exponent past qint64's own range -- even though a zero coefficient is
+  // exactly 0 regardless of how large that exponent is. This must now
+  // accept such exponents on both sides of zero's range boundary.
+  void toExactInt64ZeroCoefficientAcceptsExponentBeyondQint64Range();
   void fromInt64RoundTripsFullRange();
   void toQJsonPreservesInt64ExactlyBeyondDoublePrecision();
   void fromQJsonConvertsQJsonTreeRecursively();
@@ -132,6 +139,27 @@ private slots:
   void toJsonBytesRejectsLoneSurrogateNestedInsideArray();
   void toJsonBytesAcceptsValidSurrogatePairInStringAndKey();
   void parseAcceptsEverySerializerSuccess();
+
+  // Round 12 item 1: toExactQJson() previously checked only numeric
+  // exactness, silently diverging from toJsonBytes() for every other
+  // invariant a programmatically-built AST could violate -- a duplicate
+  // object key collapsed via QJsonObject::insert() (keeping only the last
+  // occurrence) rather than a typed failure, a Kind::Undefined value
+  // nested inside an array/object silently vanishing from the result
+  // (Qt's QJsonObject::insert()/QJsonArray::append() drop an Undefined
+  // value rather than storing a placeholder), a lone UTF-16 surrogate
+  // passing straight into an in-memory QJsonValue with no error, and
+  // unbounded recursion/size with no ParseLimits enforcement at all. Each
+  // must now be a typed failure, exactly mirroring toJsonBytes().
+  void toExactQJsonRejectsDuplicateObjectKey();
+  void toExactQJsonRejectsUndefinedNestedInsideObject();
+  void toExactQJsonRejectsUndefinedNestedInsideArray();
+  void toExactQJsonAcceptsTopLevelUndefined();
+  void toExactQJsonRejectsLoneSurrogateInStringValue();
+  void toExactQJsonRejectsLoneSurrogateInObjectKey();
+  void toExactQJsonRejectsDepthExceedingLimitOnProgrammaticAst();
+  void toExactQJsonRejectsArrayExceedingMaxArrayElements();
+  void toExactQJsonAcceptsValidNestedAstAndPreservesExactInt64();
 };
 
 namespace {
@@ -540,6 +568,33 @@ void RawJsonTests::toExactInt64ZeroCoefficientWithHugeExponentIsExactZero() {
   // A zero coefficient spelled with a fractional part, still exactly
   // zero.
   QCOMPARE(*mustParse("0.000e9223372036854775807").toRawNumber().toExactInt64(),
+           0LL);
+}
+
+void RawJsonTests::
+    toExactInt64ZeroCoefficientAcceptsExponentBeyondQint64Range() {
+  // "9223372036854775808" is INT64_MAX+1 -- one past qint64's positive
+  // range -- yet a zero coefficient times any finite power of ten is
+  // still exactly 0. The previous implementation additionally required
+  // the exponent digit string itself to parse as a qint64 (via
+  // QString::toLongLong()), which fails for this exact literal, so it
+  // incorrectly rejected an otherwise-valid zero. Same for the exact
+  // magnitude boundary one past qint64::min's own bound.
+  QCOMPARE(*mustParse("0e9223372036854775808").toRawNumber().toExactInt64(),
+           0LL);
+  QCOMPARE(*mustParse("-0e9223372036854775808").toRawNumber().toExactInt64(),
+           0LL);
+  // Far beyond even that -- a 40-digit exponent, still comfortably within
+  // ParseLimits::maxNumberDigits's default of 64 -- must likewise short-
+  // circuit to exact 0 without attempting (and having to reject) any
+  // magnitude-fitting arithmetic on the exponent itself.
+  QCOMPARE(*mustParse("0e1000000000000000000000000000000000000")
+                .toRawNumber()
+                .toExactInt64(),
+           0LL);
+  QCOMPARE(*mustParse("0.00e1000000000000000000000000000000000000")
+                .toRawNumber()
+                .toExactInt64(),
            0LL);
 }
 
@@ -1087,6 +1142,115 @@ void RawJsonTests::parseAcceptsEverySerializerSuccess() {
       QFAIL(qPrintable(reparsed.error()));
     QCOMPARE(*reparsed, value);
   }
+}
+
+void RawJsonTests::toExactQJsonRejectsDuplicateObjectKey() {
+  // Round 12 item 1: previously silently collapsed to the *last*
+  // occurrence via QJsonObject::insert() -- a different, silently
+  // corrupted result from toJsonBytes()'s typed rejection of the exact
+  // same input. Must now fail exactly like toJsonBytes() does (see
+  // toJsonBytesRejectsDuplicateObjectKeys() above).
+  QList<std::pair<QString, Value>> members{
+      {QStringLiteral("a"), Value::makeNull()},
+      {QStringLiteral("a"), Value::makeBool(true)},
+  };
+  const Value obj = Value::makeObject(members);
+  QVERIFY(!obj.toExactQJson().has_value());
+}
+
+void RawJsonTests::toExactQJsonRejectsUndefinedNestedInsideObject() {
+  // Round 12 item 1: previously the key vanished entirely from the
+  // resulting QJsonObject with no error at all (Qt's QJsonObject::insert()
+  // drops an Undefined value instead of storing a placeholder) -- a
+  // silent, undetectable change to the represented data. Must now fail.
+  QList<std::pair<QString, Value>> members{
+      {QStringLiteral("present"), Value::makeBool(true)},
+      {QStringLiteral("vanishes"), Value{}},
+  };
+  const Value obj = Value::makeObject(members);
+  QVERIFY(!obj.toExactQJson().has_value());
+}
+
+void RawJsonTests::toExactQJsonRejectsUndefinedNestedInsideArray() {
+  const Value nested = Value::makeArray({Value::makeBool(true), Value{}});
+  QVERIFY(!nested.toExactQJson().has_value());
+}
+
+void RawJsonTests::toExactQJsonAcceptsTopLevelUndefined() {
+  // Unlike a *nested* Undefined (rejected above), the whole top-level
+  // value legitimately stays Undefined -- e.g. DeckListInput::toJson()
+  // only calls sideSlots.toExactQJson() after checking
+  // !sideSlots.isUndefined(), but a direct top-level call must still
+  // succeed and report Undefined, matching toQJson()'s behavior.
+  auto result = Value{}.toExactQJson();
+  QVERIFY(result.has_value());
+  QVERIFY(result->isUndefined());
+}
+
+void RawJsonTests::toExactQJsonRejectsLoneSurrogateInStringValue() {
+  // Round 12 item 1: toQJson()/the old toExactQJson() would happily embed
+  // a lone surrogate straight into a QJsonValue with no error at all
+  // (QJsonValue itself does not validate string content); the surrogate
+  // would only surface as invalid UTF-8 later, whenever some other code
+  // path serialized that QJsonValue to actual bytes. Must now fail here,
+  // exactly like toJsonBytes() does for the same string.
+  QString lone;
+  lone += QChar(0xD800);
+  QVERIFY(!Value::makeString(lone).toExactQJson().has_value());
+}
+
+void RawJsonTests::toExactQJsonRejectsLoneSurrogateInObjectKey() {
+  QString lone;
+  lone += QChar(0xDC00);
+  QList<std::pair<QString, Value>> members{{lone, Value::makeNull()}};
+  QVERIFY(!Value::makeObject(members).toExactQJson().has_value());
+}
+
+void RawJsonTests::toExactQJsonRejectsDepthExceedingLimitOnProgrammaticAst() {
+  // Round 12 item 1: the old toExactQJson() recursed with no depth bound
+  // at all -- a deeply nested programmatically-built AST (never possible
+  // via parse(), which already bounds depth) could exhaust the stack.
+  // ParseLimits::production()'s default maxDepth (64) is used internally
+  // by toExactQJson() (it takes no explicit limits parameter), so nest
+  // comfortably past that default rather than a tiny custom limit.
+  Value nested = Value::makeNumber(RawNumber::fromInt64(1));
+  for (int i = 0; i < ParseLimits::production().maxDepth + 8; ++i)
+    nested = Value::makeArray({nested});
+  QVERIFY(!nested.toExactQJson().has_value());
+}
+
+void RawJsonTests::toExactQJsonRejectsArrayExceedingMaxArrayElements() {
+  // Same rationale as
+  // toExactQJsonRejectsDepthExceedingLimitOnProgrammaticAst(): production()'s
+  // default maxArrayElements (20,000) applies internally.
+  QList<Value> elements;
+  elements.reserve(ParseLimits::production().maxArrayElements + 1);
+  for (qsizetype i = 0; i < ParseLimits::production().maxArrayElements + 1; ++i)
+    elements.append(Value::makeNull());
+  QVERIFY(!Value::makeArray(elements).toExactQJson().has_value());
+}
+
+void RawJsonTests::toExactQJsonAcceptsValidNestedAstAndPreservesExactInt64() {
+  // Ordinary, well-formed, moderately nested input must still succeed and
+  // preserve full int64 precision -- proving the hardening above rejects
+  // only genuinely invalid/oversized input, not normal usage.
+  QList<std::pair<QString, Value>> inner{
+      {QStringLiteral("big"),
+       Value::makeNumber(RawNumber::fromInt64(9223372036854775807LL))},
+      {QStringLiteral("text"), Value::makeString(QStringLiteral("hello"))},
+  };
+  const Value obj = Value::makeArray(
+      {Value::makeObject(inner), Value::makeNull(), Value::makeBool(false)});
+  auto result = obj.toExactQJson();
+  QVERIFY(result.has_value());
+  const QJsonArray array = result->toArray();
+  QCOMPARE(array.size(), 3);
+  QCOMPARE(array.at(0).toObject().value(QStringLiteral("big")).toInteger(),
+           9223372036854775807LL);
+  QCOMPARE(array.at(0).toObject().value(QStringLiteral("text")).toString(),
+           QStringLiteral("hello"));
+  QVERIFY(array.at(1).isNull());
+  QCOMPARE(array.at(2).toBool(), false);
 }
 
 QTEST_APPLESS_MAIN(RawJsonTests)

@@ -1,6 +1,10 @@
+#include <QElapsedTimer>
 #include <QFile>
 #include <QJsonDocument>
 #include <QtTest>
+
+#include <algorithm>
+#include <limits>
 
 #include "CardCatalog.h"
 #include "RawJson.h"
@@ -77,19 +81,28 @@ private slots:
   // Round-8 item 7 / round-9 item 5: additionalProperties:false on a known
   // tagged-union branch's exact {"tag","contents"}/{"tag"} shape means an
   // extra sibling key is malformed input, not a forward-compat additive
-  // field. Unlike CardDef -- a genuinely evolving named entity this client
-  // deliberately keeps additive-tolerant (see
-  // unknownAdditiveTopLevelFieldIgnored below) -- GameListRow's success
-  // shape and its nested summary objects are ALSO now exact-key-enforced
-  // (round-9 item 5), since that closed shape is what positively
-  // disambiguates a success row from a failure row; see
-  // gameListRowSuccessRejectsAdditiveTopLevelField in GamesTests.cpp.
+  // field. GameListRow's success shape and its nested summary objects are
+  // ALSO exact-key-enforced (round-9 item 5), since that closed shape is
+  // what positively disambiguates a success row from a failure row; see
+  // gameListRowSuccessRejectsAdditiveTopLevelField in GamesTests.cpp. As of
+  // round-10-cumulative-review item 4, CardDef/CardName are exact-key-
+  // enforced too (see extraTopLevelFieldOnCardDefRejected below),
+  // superseding this type's own earlier additive-tolerant policy.
   void extraKeyOnKnownCardCostBranchRejected();
   void extraKeyOnKnownGameValueBranchRejected();
   void extraKeyOnKnownSkillIconBranchRejected();
 
-  // Forward compatibility ────────────────────────────────────────────────────
-  void unknownAdditiveTopLevelFieldIgnored();
+  // Forward compatibility / exact-key enforcement ─────────────────────────────
+  void extraTopLevelFieldOnCardDefRejected();
+  void extraTopLevelFieldOnCardNameRejected();
+  // Round-10-cumulative-review item 4's own wording: prove the check runs
+  // on the canonical raw-byte decode path with an extra-key value that
+  // cannot survive a QJson-collapsed representation intact (an exact
+  // integer outside qint64's positive range), and that CardDef's required
+  // "art" key participates in the same escape-equivalent-duplicate-key
+  // protection every other aggregate gets for free from Json::Value::parse().
+  void extraTopLevelFieldWithExactNumberRejectedThroughRawBytes();
+  void escapeEquivalentDuplicateTopLevelKeyRejectedForCardDef();
   void unconstrainedFieldsPreservedVerbatim();
 
   // Collections ──────────────────────────────────────────────────────────────
@@ -114,6 +127,7 @@ private slots:
   void duplicateCardTraitsRejected();
   void duplicateRevealedCardTraitsRejected();
   void duplicateTagsAllowedNoUniquenessConstraint();
+  void largeUniqueCardTraitsDecodesSubQuadratically();
 
   // Canonical byte-level decode (lossless Json::Value AST, see RawJson.h):
   // fromRawJson()/fromRawBytes() must never round-trip through QJsonValue,
@@ -953,7 +967,12 @@ void CardCatalogTests::rawPayloadCardCostFactoriesValidateContents() {
   }
 }
 
-void CardCatalogTests::unknownAdditiveTopLevelFieldIgnored() {
+void CardCatalogTests::extraTopLevelFieldOnCardDefRejected() {
+  // Round-10-cumulative-review item 4: catalog.schema.json's cardDef
+  // definition is additionalProperties:false; an unrecognized top-level
+  // key is now a hard decode failure rather than silently ignored (see
+  // CardCatalog.h's updated doc comment) -- this inverts the previous
+  // "ignored" acceptance test of the same name.
   const QJsonObject obj = parseJson(R"({
     "cardCode": "c00001",
     "name": {"title": "X", "subtitle": null},
@@ -962,15 +981,74 @@ void CardCatalogTests::unknownAdditiveTopLevelFieldIgnored() {
     "aFutureFieldThisClientHasNeverHeardOf": {"anything": [1, 2, 3]}
   })"_L1);
   const auto result = CardDef::fromJson(obj, u"card");
-  if (!result)
-    QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->cardCode.value(), QStringLiteral("c00001"));
-  // Re-encoding never reproduces a field this client never modeled.
-  auto encoded = result->toJson();
-  if (!encoded)
-    QFAIL(qPrintable(encoded.error()));
-  QVERIFY(!encoded->contains(
-      QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")));
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(
+               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
+           qPrintable(result.error()));
+}
+
+void CardCatalogTests::extraTopLevelFieldOnCardNameRejected() {
+  // catalog.schema.json's `name` definition is additionalProperties:false
+  // with exactly {"title","subtitle"} -- reused verbatim wherever this
+  // client decodes a card name, including CardDef's own name/revealedName
+  // fields and (per the round-10 finding's own text) game-list's
+  // scenario/investigator summaries; asserted directly on
+  // CardName::fromJson() here so the check is proven at its single source
+  // of truth rather than only transitively through CardDef.
+  const QJsonObject obj{
+      {QStringLiteral("title"), QStringLiteral("X")},
+      {QStringLiteral("subtitle"), QJsonValue()},
+      {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"),
+       QStringLiteral("anything")},
+  };
+  const auto result = CardName::fromJson(obj, u"name");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(
+               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
+           qPrintable(result.error()));
+}
+
+void CardCatalogTests::
+    extraTopLevelFieldWithExactNumberRejectedThroughRawBytes() {
+  // Proves the exact-key check runs on the canonical raw-byte decode path
+  // (never a QJsonValue-collapsed copy first): the extra key's value,
+  // 9223372036854775809, is one past qint64::max and therefore cannot be
+  // represented exactly as either a QJsonValue::Double or a qint64. If
+  // this rejection somehow ran against a QJson-collapsed representation
+  // instead of the lossless raw AST, the conversion itself would already
+  // have failed or silently rounded before this check ever saw the key.
+  const QByteArray bytes = R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "aFutureFieldThisClientHasNeverHeardOf": 9223372036854775809
+  })";
+  const auto result = CardDef::fromRawBytes(bytes, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(
+               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
+           qPrintable(result.error()));
+}
+
+void CardCatalogTests::
+    escapeEquivalentDuplicateTopLevelKeyRejectedForCardDef() {
+  // "\u0061rt" decodes to the same text as the required "art" key;
+  // Json::Value::parse() itself rejects this as a duplicate key (see
+  // RawJsonTests::rejectsEscapeEquivalentDuplicateObjectKeys()) before any
+  // CardDef-specific decoding runs, proving this generic protection
+  // extends through CardDef::fromRawBytes()'s aggregate boundary, not
+  // merely a standalone RawJson unit test.
+  const QByteArray bytes = R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "\u0061rt": "2"
+  })";
+  const auto result = CardDef::fromRawBytes(bytes, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(u"duplicate"_s), qPrintable(result.error()));
 }
 
 void CardCatalogTests::unconstrainedFieldsPreservedVerbatim() {
@@ -1300,6 +1378,122 @@ void CardCatalogTests::duplicateTagsAllowedNoUniquenessConstraint() {
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
+}
+
+void CardCatalogTests::largeUniqueCardTraitsDecodesSubQuadratically() {
+  // Regression for a reviewer-identified quadratic-time bug: decodeStringSet()
+  // (backing cardTraits/revealedCardTraits, both schema "uniqueItems":true)
+  // previously tracked "already seen" values via repeated
+  // QStringList::contains() scans -- O(n) per insertion, O(n^2) overall --
+  // additionally worst-cased by a long *shared* prefix (each comparison
+  // must scan almost the entire string before finding the differing
+  // suffix, denying operator==() any early-mismatch/differing-length
+  // short-circuit). Fixed to track membership via QSet<QString> (amortized
+  // O(1) per insertion) while still returning results in first-seen order.
+  //
+  // This proves the fix's *asymptotic* behavior rather than depending on
+  // any one machine's absolute timing (which would be flaky across CI
+  // runners of different speeds): decode a small (N) and 4x-larger (4N)
+  // batch of unique, equal-length, long-common-prefix trait strings, and
+  // assert the measured time ratio lands close to the ~4x linear growth
+  // an O(n) implementation exhibits -- nowhere near the ~16x an O(n^2)
+  // implementation would show for the same 4x size increase. The minimum
+  // of several repeated measurements is used per size (standard technique
+  // for suppressing OS-scheduling/cache-warmup noise), and an untimed
+  // warm-up run precedes measurement.
+  constexpr int prefixLength = 400;
+  constexpr int smallCount = 800;
+  constexpr int largeCount = smallCount * 4;
+  constexpr int suffixWidth = 7;
+
+  const QByteArray prefix(prefixLength, 'a');
+  auto traitFor = [&](int index) {
+    return prefix + QByteArray::number(index).rightJustified(suffixWidth, '0');
+  };
+
+  auto makePayload = [&](int count) {
+    QByteArray json =
+        "{\"cardCode\":\"c00001\",\"name\":{\"title\":\"X\",\"subtitle\":null},"
+        "\"cardType\":\"AssetType\",\"art\":\"1\",\"cardTraits\":[";
+    for (int i = 0; i < count; ++i) {
+      if (i > 0)
+        json += ',';
+      json += '"';
+      json += traitFor(i);
+      json += '"';
+    }
+    json += "]}";
+    return json;
+  };
+
+  const QByteArray smallPayload = makePayload(smallCount);
+  const QByteArray largePayload = makePayload(largeCount);
+
+  auto decodeOnce = [](const QByteArray &payload) -> CardDef {
+    // qFatal (not QFAIL) here follows this file's existing convention (see
+    // the toRawJson() helper above) for a lambda that must unconditionally
+    // return a value: this is test-fixture construction that must not
+    // fail, never production code, and QFAIL's implicit `return;` cannot
+    // coexist with a non-void lambda return type.
+    auto result = CardDef::fromRawBytes(payload, u"card");
+    if (!result)
+      qFatal("card decode must not fail in this performance regression "
+             "fixture: %s",
+             qPrintable(result.error()));
+    return *result;
+  };
+
+  // Untimed warm-up: absorbs first-touch page faults, allocator growth,
+  // and branch-prediction warmup so the timed runs below measure steady-
+  // state decode cost, not one-time setup overhead.
+  decodeOnce(largePayload);
+
+  constexpr int repeats = 5;
+  auto measureMinNanos = [&](const QByteArray &payload) {
+    qint64 best = std::numeric_limits<qint64>::max();
+    for (int i = 0; i < repeats; ++i) {
+      QElapsedTimer timer;
+      timer.start();
+      decodeOnce(payload);
+      best = std::min(best, timer.nsecsElapsed());
+    }
+    return best;
+  };
+
+  const qint64 smallNanos = measureMinNanos(smallPayload);
+  const qint64 largeNanos = measureMinNanos(largePayload);
+
+  QVERIFY2(smallNanos > 0 && largeNanos > 0,
+           "timer resolution too coarse to measure a nonzero duration");
+
+  const double ratio = double(largeNanos) / double(smallNanos);
+
+  // Linear growth predicts ~4x; quadratic predicts ~16x. 8x sits at the
+  // geometric midpoint, comfortably separating the two while tolerating
+  // ordinary measurement noise.
+  QVERIFY2(
+      ratio < 8.0,
+      qPrintable(
+          QStringLiteral(
+              "decodeStringSet() appears superlinear again: a 4x cardTraits "
+              "size increase (%1 -> %2) produced a %3x time increase "
+              "(small=%4ns, large=%5ns); expected close to linear ~4x, "
+              "would be ~16x for the old O(n^2) QStringList::contains() "
+              "implementation")
+              .arg(smallCount)
+              .arg(largeCount)
+              .arg(ratio, 0, 'f', 2)
+              .arg(smallNanos)
+              .arg(largeNanos)));
+
+  // Correctness alongside the performance assertion: every trait must
+  // still decode losslessly with no coalescing/truncation of the large
+  // unique set.
+  const auto largeResult = decodeOnce(largePayload);
+  QCOMPARE(largeResult.cardTraits.size(), largeCount);
+  QCOMPARE(largeResult.cardTraits.first(), QString::fromLatin1(traitFor(0)));
+  QCOMPARE(largeResult.cardTraits.last(),
+           QString::fromLatin1(traitFor(largeCount - 1)));
 }
 
 void CardCatalogTests::rawBytesPreserveNumericPrecisionInUnconstrainedFields() {

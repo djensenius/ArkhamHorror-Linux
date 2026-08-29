@@ -85,6 +85,18 @@ ValueOrError<DeckList> decodeDeckList(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
+  // decks.schema.json's `deckList` (the backend-normalized shape) is
+  // additionalProperties:false with exactly these nine keys, all
+  // `required` (round-10-cumulative-review item 5).
+  auto exactKeys = Json::requireExactKeys(
+      obj,
+      {"slots"_L1, "sideSlots"_L1, "investigator_code"_L1,
+       "investigator_name"_L1, "meta"_L1, "taboo_id"_L1, "url"_L1, "id"_L1,
+       "name"_L1},
+      path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
+
   auto cardSlots =
       decodeCardQuantityMap(obj, "slots"_L1, Json::joinPath(path, u"slots"));
   if (!cardSlots)
@@ -351,6 +363,16 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
   if (!objResult)
     return failure(objResult.error());
   const auto &obj = *objResult;
+
+  // decks.schema.json's `deck` is additionalProperties:false with exactly
+  // these six required keys (round-10-cumulative-review item 5).
+  auto exactKeys =
+      Json::requireExactKeys(obj,
+                             {"id"_L1, "userId"_L1, "url"_L1, "name"_L1,
+                              "investigatorName"_L1, "list"_L1},
+                             path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
 
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
@@ -748,8 +770,11 @@ ValueOrError<QByteArray> CreateDeckRequest::toJsonBytes() const {
   return Json::Value::makeObject(std::move(members)).toJsonBytes();
 }
 
-ValueOrError<FetchDeckRequest> FetchDeckRequest::fromJson(const QJsonValue &v,
-                                                          QStringView path) {
+// Shared decode body for FetchDeckRequest::fromJson()/fromRawJson(): V is
+// QJsonValue or Json::Value.
+template <typename V>
+ValueOrError<FetchDeckRequest> decodeFetchDeckRequest(const V &v,
+                                                      QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
@@ -760,16 +785,55 @@ ValueOrError<FetchDeckRequest> FetchDeckRequest::fromJson(const QJsonValue &v,
   return FetchDeckRequest{.url = *url};
 }
 
+ValueOrError<FetchDeckRequest> FetchDeckRequest::fromJson(const QJsonValue &v,
+                                                          QStringView path) {
+  return decodeFetchDeckRequest(v, path);
+}
+
+ValueOrError<FetchDeckRequest>
+FetchDeckRequest::fromRawJson(const Json::Value &v, QStringView path) {
+  return decodeFetchDeckRequest(v, path);
+}
+
+ValueOrError<FetchDeckRequest>
+FetchDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  return fromRawJson(*raw, path);
+}
+
 QJsonObject FetchDeckRequest::toJson() const {
   return QJsonObject{{QStringLiteral("url"), url}};
 }
 
-ValueOrError<DeckValidationError>
-DeckValidationError::fromJson(const QJsonValue &v, QStringView path) {
+ValueOrError<Json::Value> FetchDeckRequest::toRawJson() const {
+  return Json::Value::makeObject(
+      {{QStringLiteral("url"), Json::Value::makeString(url)}});
+}
+
+ValueOrError<QByteArray> FetchDeckRequest::toJsonBytes() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
+}
+
+// Shared decode body for DeckValidationError::fromJson()/fromRawJson(): V
+// is QJsonValue or Json::Value.
+template <typename V>
+ValueOrError<DeckValidationError> decodeDeckValidationError(const V &v,
+                                                            QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
+
+  // decks.schema.json's deckValidationError is additionalProperties:false
+  // with exactly {"tag","contents"} (round-10-cumulative-review item 5).
+  auto exactKeys = Json::requireExactKeys(obj, {"tag"_L1, "contents"_L1}, path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
 
   auto tag = Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
   if (!tag)
@@ -777,14 +841,30 @@ DeckValidationError::fromJson(const QJsonValue &v, QStringView path) {
   if (*tag != "UnimplementedCard"_L1)
     return failure(
         QStringLiteral("%1.tag: unrecognized value \"%2\"").arg(path, *tag));
-  auto cardCode =
-      Json::requireField(obj, "contents"_L1, Json::joinPath(path, u"contents"),
-                         [](const QJsonValue &v, QStringView p) {
-                           return CardCode::fromJson(v, p);
-                         });
+  auto cardCode = Json::requireField(
+      obj, "contents"_L1, Json::joinPath(path, u"contents"),
+      [](const auto &v, QStringView p) { return CardCode::fromJson(v, p); });
   if (!cardCode)
     return failure(cardCode.error());
   return DeckValidationError{.cardCode = *cardCode};
+}
+
+ValueOrError<DeckValidationError>
+DeckValidationError::fromJson(const QJsonValue &v, QStringView path) {
+  return decodeDeckValidationError(v, path);
+}
+
+ValueOrError<DeckValidationError>
+DeckValidationError::fromRawJson(const Json::Value &v, QStringView path) {
+  return decodeDeckValidationError(v, path);
+}
+
+ValueOrError<DeckValidationError>
+DeckValidationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  return fromRawJson(*raw, path);
 }
 
 QJsonObject DeckValidationError::toJson() const {
@@ -794,21 +874,38 @@ QJsonObject DeckValidationError::toJson() const {
   };
 }
 
-static ValueOrError<QList<DeckValidationError>>
-decodeDeckValidationResultItems(const QJsonValue &v, QStringView path) {
+// Shared decode body for DeckValidationResult::fromJson()/fromRawJson():
+// V is QJsonValue or Json::Value. Each element decodes through
+// decodeDeckValidationError<V>, so a duplicate/extra key nested inside any
+// one entry is caught on the canonical byte-level path without ever
+// collapsing the whole array to QJsonValue first.
+template <typename V>
+ValueOrError<QList<DeckValidationError>>
+decodeDeckValidationResultItems(const V &v, QStringView path) {
   auto arrResult = Json::requireArray(v, path);
   if (!arrResult)
     return failure(arrResult.error());
   QList<DeckValidationError> result;
   result.reserve(arrResult->size());
   for (qsizetype i = 0; i < arrResult->size(); ++i) {
-    auto item = DeckValidationError::fromJson((*arrResult)[i],
-                                              Json::indexPath(path, i));
+    auto item =
+        decodeDeckValidationError((*arrResult)[i], Json::indexPath(path, i));
     if (!item)
       return failure(item.error());
     result.append(*item);
   }
   return result;
+}
+
+template <typename V>
+ValueOrError<DeckValidationResult>
+decodeDeckValidationResult(const V &v, QStringView path) {
+  auto items = decodeDeckValidationResultItems(v, path);
+  if (!items)
+    return failure(items.error());
+  if (items->isEmpty())
+    return DeckValidationResult::success();
+  return DeckValidationResult::errors(*items);
 }
 
 DeckValidationResult DeckValidationResult::success() {
@@ -831,12 +928,20 @@ DeckValidationResult::errors(QList<DeckValidationError> errors) {
 
 ValueOrError<DeckValidationResult>
 DeckValidationResult::fromJson(const QJsonValue &v, QStringView path) {
-  auto items = decodeDeckValidationResultItems(v, path);
-  if (!items)
-    return failure(items.error());
-  if (items->isEmpty())
-    return DeckValidationResult::success();
-  return DeckValidationResult::errors(*items);
+  return decodeDeckValidationResult(v, path);
+}
+
+ValueOrError<DeckValidationResult>
+DeckValidationResult::fromRawJson(const Json::Value &v, QStringView path) {
+  return decodeDeckValidationResult(v, path);
+}
+
+ValueOrError<DeckValidationResult>
+DeckValidationResult::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  return fromRawJson(*raw, path);
 }
 
 QJsonArray DeckValidationResult::toJson() const {
@@ -846,16 +951,45 @@ QJsonArray DeckValidationResult::toJson() const {
   return arr;
 }
 
-ValueOrError<DeckOperationError>
-DeckOperationError::fromJson(const QJsonValue &v, QStringView path) {
+// Shared decode body for DeckOperationError::fromJson()/fromRawJson(): V
+// is QJsonValue or Json::Value.
+template <typename V>
+ValueOrError<DeckOperationError> decodeDeckOperationError(const V &v,
+                                                          QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  auto errorMsg = Json::requireString(*objResult, "errorMsg"_L1,
+  const auto &obj = *objResult;
+
+  // decks.schema.json's deckOperationError is additionalProperties:false
+  // with exactly {"errorMsg"} (round-10-cumulative-review item 5).
+  auto exactKeys = Json::requireExactKeys(obj, {"errorMsg"_L1}, path);
+  if (!exactKeys)
+    return failure(exactKeys.error());
+
+  auto errorMsg = Json::requireString(obj, "errorMsg"_L1,
                                       Json::joinPath(path, u"errorMsg"));
   if (!errorMsg)
     return failure(errorMsg.error());
   return DeckOperationError{.errorMsg = *errorMsg};
+}
+
+ValueOrError<DeckOperationError>
+DeckOperationError::fromJson(const QJsonValue &v, QStringView path) {
+  return decodeDeckOperationError(v, path);
+}
+
+ValueOrError<DeckOperationError>
+DeckOperationError::fromRawJson(const Json::Value &v, QStringView path) {
+  return decodeDeckOperationError(v, path);
+}
+
+ValueOrError<DeckOperationError>
+DeckOperationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  return fromRawJson(*raw, path);
 }
 
 QJsonObject DeckOperationError::toJson() const {

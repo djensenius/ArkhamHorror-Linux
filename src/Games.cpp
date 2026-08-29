@@ -1272,6 +1272,32 @@ ValueOrError<QJsonObject> CampaignOptionRequest::toJson() const {
   Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
 }
 
+ValueOrError<Json::Value> CampaignOptionRequest::toRawJson() const {
+  switch (m_kind) {
+  case Kind::Known: {
+    auto encoded = Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable);
+    if (!encoded)
+      return failure(QStringLiteral("CampaignOptionRequest::toRawJson: %1")
+                         .arg(encoded.error()));
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"), Json::Value::makeString(*encoded)}});
+  }
+  case Kind::Variant:
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"),
+          Json::Value::makeString(QStringLiteral("CampaignVariant"))},
+         {QStringLiteral("contents"), Json::Value::makeString(m_text)}});
+  }
+  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
+}
+
+ValueOrError<QByteArray> CampaignOptionRequest::toJsonBytes() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
+}
+
 CampaignOrScenario CampaignOrScenario::campaign(CampaignId id) {
   CampaignOrScenario result;
   result.m_campaignId = std::move(id);
@@ -1350,6 +1376,16 @@ void CampaignOrScenario::insertInto(QJsonObject &obj) const {
   obj.insert(QStringLiteral("scenarioId"), m_scenarioId
                                                ? m_scenarioId->toJson()
                                                : QJsonValue(QJsonValue::Null));
+}
+
+void CampaignOrScenario::insertRawInto(
+    QList<std::pair<QString, Json::Value>> &members) const {
+  members.append({QStringLiteral("campaignId"),
+                  m_campaignId ? Json::Value::makeString(m_campaignId->value())
+                               : Json::Value::makeNull()});
+  members.append({QStringLiteral("scenarioId"),
+                  m_scenarioId ? Json::Value::makeString(m_scenarioId->value())
+                               : Json::Value::makeNull()});
 }
 
 template <typename V>
@@ -1558,6 +1594,89 @@ ValueOrError<QJsonObject> CreateGameRequest::toJson() const {
   return obj;
 }
 
+ValueOrError<Json::Value> CreateGameRequest::toRawJson() const {
+  QList<Json::Value> deckIdsArr;
+  deckIdsArr.reserve(deckIds.size());
+  for (qsizetype i = 0; i < deckIds.size(); ++i) {
+    const auto &id = deckIds.at(i);
+    if (id && id->isNull())
+      return failure(
+          QStringLiteral("deckIds[%1]: must not be the null uuid").arg(i));
+    deckIdsArr.append(
+        id ? Json::Value::makeString(id->toString(QUuid::WithoutBraces))
+           : Json::Value::makeNull());
+  }
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("deckIds"), Json::Value::makeArray(deckIdsArr)},
+      {QStringLiteral("playerCount"),
+       Json::Value::makeNumber(Json::RawNumber::fromInt64(playerCount))},
+  };
+  campaignOrScenario.insertRawInto(members);
+  auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
+  if (!difficultyEncoded)
+    return failure(
+        QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
+  members.append({QStringLiteral("difficulty"),
+                  Json::Value::makeString(*difficultyEncoded)});
+  members.append(
+      {QStringLiteral("campaignName"), Json::Value::makeString(campaignName)});
+  auto multiplayerVariantEncoded =
+      Json::encodeClosedEnum(multiplayerVariant, kMultiplayerVariantTable);
+  if (!multiplayerVariantEncoded)
+    return failure(QStringLiteral("multiplayerVariant: %1")
+                       .arg(multiplayerVariantEncoded.error()));
+  members.append({QStringLiteral("multiplayerVariant"),
+                  Json::Value::makeString(*multiplayerVariantEncoded)});
+  members.append({QStringLiteral("includeTarotReadings"),
+                  Json::Value::makeBool(includeTarotReadings)});
+  QList<Json::Value> optionsArr;
+  optionsArr.reserve(options.size());
+  for (qsizetype i = 0; i < options.size(); ++i) {
+    auto encoded = options.at(i).toRawJson();
+    if (!encoded)
+      return failure(
+          QStringLiteral("options[%1]: %2").arg(i).arg(encoded.error()));
+    optionsArr.append(*encoded);
+  }
+  members.append(
+      {QStringLiteral("options"), Json::Value::makeArray(optionsArr)});
+  if (strictAsIfAt)
+    members.append(
+        {QStringLiteral("strictAsIfAt"), Json::Value::makeBool(*strictAsIfAt)});
+  if (asIfRuling) {
+    auto asIfRulingEncoded =
+        Json::encodeClosedEnum(*asIfRuling, kAsIfRulingTable);
+    if (!asIfRulingEncoded)
+      return failure(
+          QStringLiteral("asIfRuling: %1").arg(asIfRulingEncoded.error()));
+    members.append({QStringLiteral("asIfRuling"),
+                    Json::Value::makeString(*asIfRulingEncoded)});
+  }
+  QList<Json::Value> ultimatumsAndBoonsArr;
+  ultimatumsAndBoonsArr.reserve(ultimatumsAndBoons.size());
+  for (qsizetype i = 0; i < ultimatumsAndBoons.size(); ++i) {
+    auto encoded =
+        Json::encodeClosedEnum(ultimatumsAndBoons.at(i), kUltimatumOrBoonTable);
+    if (!encoded)
+      return failure(QStringLiteral("ultimatumsAndBoons[%1]: %2")
+                         .arg(i)
+                         .arg(encoded.error()));
+    ultimatumsAndBoonsArr.append(Json::Value::makeString(*encoded));
+  }
+  members.append({QStringLiteral("ultimatumsAndBoons"),
+                  Json::Value::makeArray(ultimatumsAndBoonsArr)});
+  members.append({QStringLiteral("achievementsEnabled"),
+                  Json::Value::makeBool(achievementsEnabled)});
+  return Json::Value::makeObject(std::move(members));
+}
+
+ValueOrError<QByteArray> CreateGameRequest::toJsonBytes() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
+}
+
 // Dispatch-shim pair for InvestigatorRef (see CardCatalog.cpp/Decks.cpp for
 // the same pattern's rationale): picks InvestigatorRef::fromJson()'s
 // QJsonValue-taking body, or a hand-written Json::Value equivalent, based
@@ -1687,26 +1806,63 @@ ValueOrError<QByteArray> ChooseDeckRequest::toJsonBytes() const {
   return Json::Value::makeObject(std::move(members)).toJsonBytes();
 }
 
+// Shared decode body for ClaimSeatRequest::fromJson()/fromRawJson(): Obj is
+// QJsonObject or Json::Value, matching decodeChooseDeckRequest's pattern
+// above and reusing the same decodeInvestigatorRefValue dispatch-shim
+// pair.
+template <typename Obj>
+ValueOrError<ClaimSeatRequest> decodeClaimSeatRequest(const Obj &obj,
+                                                      QStringView path) {
+  auto investigatorId = Json::requireField(
+      obj, "investigatorId"_L1, Json::joinPath(path, u"investigatorId"),
+      [](const auto &v, QStringView p) {
+        return decodeInvestigatorRefValue(v, p);
+      });
+  if (!investigatorId)
+    return failure(investigatorId.error());
+  return ClaimSeatRequest{.investigatorId = *investigatorId};
+}
+
 ValueOrError<ClaimSeatRequest> ClaimSeatRequest::fromJson(const QJsonValue &v,
                                                           QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-
-  auto investigatorId = Json::requireField(
-      *objResult, "investigatorId"_L1, Json::joinPath(path, u"investigatorId"),
-      [](const QJsonValue &fv, QStringView p) {
-        return InvestigatorRef::fromJson(fv, p);
-      });
-  if (!investigatorId)
-    return failure(investigatorId.error());
-
-  return ClaimSeatRequest{.investigatorId = *investigatorId};
+  return decodeClaimSeatRequest(*objResult, path);
 }
 
 QJsonObject ClaimSeatRequest::toJson() const {
   return QJsonObject{
       {QStringLiteral("investigatorId"), investigatorId.toJson()}};
+}
+
+ValueOrError<ClaimSeatRequest>
+ClaimSeatRequest::fromRawJson(const Json::Value &v, QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  return decodeClaimSeatRequest(*objResult, path);
+}
+
+ValueOrError<ClaimSeatRequest>
+ClaimSeatRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto raw = Json::Value::parse(bytes, path);
+  if (!raw)
+    return failure(raw.error());
+  return fromRawJson(*raw, path);
+}
+
+ValueOrError<Json::Value> ClaimSeatRequest::toRawJson() const {
+  return Json::Value::makeObject(
+      {{QStringLiteral("investigatorId"),
+        Json::Value::makeString(investigatorId.value())}});
+}
+
+ValueOrError<QByteArray> ClaimSeatRequest::toJsonBytes() const {
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
 }
 
 ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,

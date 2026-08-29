@@ -298,7 +298,29 @@ struct FetchDeckRequest {
 
   [[nodiscard]] static ValueOrError<FetchDeckRequest>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a template, see Decks.cpp). fetchDeckRequest's own
+  // additionalProperties is explicitly `true` in decks.schema.json, unlike
+  // deckList/deck/deckValidationError/deckOperationError, so this
+  // deliberately does NOT enforce an exact key set here.
+  [[nodiscard]] static ValueOrError<FetchDeckRequest>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` per RFC 8259 exactly and decodes via fromRawJson()
+  // above.
+  [[nodiscard]] static ValueOrError<FetchDeckRequest>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Precision-preserving/canonical equivalent of toJson()
+  // (round-10-cumulative-review item 2): unlike toJson() -- a QJsonObject
+  // convenience whose `url` is embedded via a raw QJsonValue(QString)
+  // construction with no validation -- this composes a Json::Value AST
+  // directly and serializes it via Value::toJsonBytes(), which rejects a
+  // lone/mismatched UTF-16 surrogate in `url` with a typed failure rather
+  // than ever emitting invalid UTF-8 (see RawJson.h's
+  // appendJsonEncodedString()). This is the canonical outbound encoder any
+  // networking code should use; toJson() remains display/log/test-only.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const FetchDeckRequest &,
                          const FetchDeckRequest &) = default;
@@ -311,6 +333,19 @@ struct DeckValidationError {
 
   [[nodiscard]] static ValueOrError<DeckValidationError>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a template, see Decks.cpp), operating directly on the
+  // lossless AST (see RawJson.h) and enforcing decks.schema.json's
+  // deckValidationError's exact {"tag","contents"} shape
+  // (additionalProperties:false) rather than accepting-and-discarding an
+  // extra key (round-10-cumulative-review item 5).
+  [[nodiscard]] static ValueOrError<DeckValidationError>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h),
+  // rejecting a duplicate object key (including an escape-equivalent one)
+  // before any nested decode runs, and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<DeckValidationError>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const DeckValidationError &,
@@ -343,6 +378,16 @@ public:
 
   [[nodiscard]] static ValueOrError<DeckValidationResult>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode: each element decodes through
+  // DeckValidationError::fromRawJson() (see its doc comment), so a
+  // duplicate/extra key nested inside any one entry is caught before this
+  // client ever collapses the whole array to QJsonValue first.
+  [[nodiscard]] static ValueOrError<DeckValidationResult>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<DeckValidationResult>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonArray toJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
@@ -370,6 +415,17 @@ struct DeckOperationError {
 
   [[nodiscard]] static ValueOrError<DeckOperationError>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode: enforces decks.schema.json's
+  // deckOperationError's exact {"errorMsg"} shape
+  // (additionalProperties:false) rather than accepting-and-discarding an
+  // extra key (round-10-cumulative-review item 5).
+  [[nodiscard]] static ValueOrError<DeckOperationError>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h),
+  // rejecting a duplicate object key before any nested decode runs, and
+  // decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<DeckOperationError>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const DeckOperationError &,
