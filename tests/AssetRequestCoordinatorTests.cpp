@@ -1384,14 +1384,21 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
-    unsupportedCodecOnDecodeOnDemandSurfacesTypedError() {
-  // A disk hit whose stored bytes can no longer actually decode (e.g. the
-  // installed Qt build lost the relevant codec plugin since this entry
-  // was originally cached, or the bytes were corrupted in a way the
-  // sha256 payload check does not itself catch) must surface a typed
-  // AssetError from ensureDecoded()'s on-demand decode -- never silently
-  // complete with a null image, and never crash.
+    malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork() {
+  // Review item 9 (self-consistent invalid disk entry poisons forever):
+  // a disk hit whose stored bytes can no longer actually decode (magic-
+  // byte mismatch here; corruption the payload's own sha256 check does
+  // not itself catch, since that check only proves internal
+  // self-consistency, not that the bytes are a genuine image) must NOT
+  // simply surface a typed error and leave the same doomed entry cached
+  // forever -- it must be quarantined (evicted from both memory and
+  // disk) and the SAME candidate retried as a genuine network miss. When
+  // that retry succeeds, the fresh bytes replace the quarantined ones.
   MockHttpServer server;
+  MockHttpServer::Response fresh;
+  fresh.contentType = "image/png";
+  fresh.body = encodePng(6, 6);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), fresh);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -1406,8 +1413,8 @@ void AssetRequestCoordinatorTests::
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
 
   AssetCache::CachedEntry preSeeded;
-  // Not real PNG bytes: on-demand decode must fail with a typed error
-  // rather than a null-image "success".
+  // Not real PNG bytes: on-demand decode must fail, not silently succeed
+  // with a null image.
   preSeeded.encodedBytes = QByteArrayLiteral("not-actually-a-png");
   preSeeded.contentType = QStringLiteral("image/png");
   preSeeded.dimensions = QSize(4, 4);
@@ -1420,6 +1427,115 @@ void AssetRequestCoordinatorTests::
   coordinator.request(key, [&](Result r) { result = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
 
+  // The retry genuinely happened over the network exactly once, and
+  // succeeded with the FRESH bytes -- never the original malformed ones,
+  // and never a hang/hard failure.
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+  QVERIFY(bool(*result));
+  QCOMPARE((**result).dimensions, QSize(6, 6));
+  QVERIFY(!(**result).decodedImage.isNull());
+
+  // The quarantined malformed bytes were genuinely replaced on disk, not
+  // merely masked by a memory-only success.
+  const auto onDisk = restartedCache.lookupDisk(cacheKey);
+  QVERIFY(onDisk.has_value());
+  QCOMPARE(onDisk->dimensions, QSize(6, 6));
+  QVERIFY(onDisk->encodedBytes != preSeeded.encodedBytes);
+}
+
+void AssetRequestCoordinatorTests::
+    quarantineRefetchFailureSurfacesFreshErrorWithoutLooping() {
+  // Companion to the success case above: if the network refetch
+  // triggered by quarantining a malformed disk entry ALSO fails (here,
+  // a definitive 404), the operation completes with THAT fresh, genuine
+  // outcome -- never the stale decode error, and never a second retry
+  // (no infinite quarantine loop): exactly one network request is made.
+  MockHttpServer server;
+  MockHttpServer::Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), notFound);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = QByteArrayLiteral("not-actually-a-png");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
   QVERIFY(!bool(*result));
-  QCOMPARE(result->error().code, AssetErrorCode::MagicBytesMismatch);
+  // The fresh network outcome (NotFound), not the original decode error
+  // (MagicBytesMismatch), is what the caller observes.
+  QCOMPARE(result->error().code, AssetErrorCode::NotFound);
+  QVERIFY(!restartedCache.lookupDisk(cacheKey).has_value());
+}
+
+void AssetRequestCoordinatorTests::
+    unsupportedCodecDecodeFailureNeverQuarantinesValidBytes() {
+  // Review item 9's explicit carve-out: AssetErrorCode::UnsupportedCodec
+  // means the cached bytes are still perfectly valid -- this process
+  // simply has no installed decoder for them right now (this build/CI
+  // environment has no Qt AVIF plugin; see minimalAvifFtypBox()'s
+  // comment) -- so, unlike a genuine integrity/format/limits failure,
+  // this must NEVER evict the entry or trigger a network retry.
+  MockHttpServer server;
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  // Genuinely AVIF-shaped (passes magic-byte sniffing) but undecodable in
+  // this environment -- NOT malformed/corrupt bytes.
+  preSeeded.encodedBytes = minimalAvifFtypBox();
+  preSeeded.contentType = QStringLiteral("image/avif");
+  preSeeded.dimensions = QSize(4, 4);
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  // No network round trip at all: the cache hit's own decode failure was
+  // never treated as grounds for a retry.
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/cards/valid01.avif")), 0);
+  // The still-valid bytes were never evicted.
+  const auto onDisk = restartedCache.lookupDisk(cacheKey);
+  QVERIFY(onDisk.has_value());
+  QCOMPARE(onDisk->encodedBytes, preSeeded.encodedBytes);
 }

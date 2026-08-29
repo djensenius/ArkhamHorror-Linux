@@ -19,7 +19,16 @@
 // evicts the entry and advances candidates exactly like a first-time
 // miss, and any OTHER revalidation failure still serves the stale entry
 // rather than erroring or advancing -- "stale-if-error"), negative-404
-// record scoping, and stale-callback/destruction safety.
+// record scoping, and stale-callback/destruction safety. Also covers
+// review item 9: a disk-cached entry whose bytes fail a fresh
+// format/magic/decode/dimension/pixel-budget re-check (never simply
+// trusted forever) is quarantined -- evicted from both memory and disk
+// -- and the same candidate retried exactly once as a genuine network
+// miss, whether that retry succeeds (fresh bytes replace the quarantined
+// ones) or fails (the retry's own fresh error surfaces, never a repeat
+// or a loop); AssetErrorCode::UnsupportedCodec is the sole carve-out,
+// since it means the cached bytes are still valid and must never be
+// evicted for lack of an installed decoder.
 class AssetRequestCoordinatorTests final : public QObject {
   Q_OBJECT
 
@@ -49,7 +58,9 @@ private slots:
   void diskHitRevalidationServesStaleOnNon404Failure();
   void diskHitRevalidationCoalescesConcurrentIdenticalRequests();
   void diskHitAfterRestartDecodesOnDemandAndPublishesToMemory();
-  void unsupportedCodecOnDecodeOnDemandSurfacesTypedError();
+  void malformedDiskEntryIsQuarantinedAndRefetchedFromNetwork();
+  void quarantineRefetchFailureSurfacesFreshErrorWithoutLooping();
+  void unsupportedCodecDecodeFailureNeverQuarantinesValidBytes();
 
 private:
   QString m_tempDirPath;

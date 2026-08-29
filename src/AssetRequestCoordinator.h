@@ -190,6 +190,22 @@ private:
   RequestHandle
   registerImmediateCompletion(const AssetKey &key, ResultCallback callback,
                               AssetOutcome<AssetCache::CachedEntry> result);
+  // Registers a real Operation (with the full candidate vector and the
+  // exact index the cache hit was found at, exactly like the ordinary
+  // network-fetch path) for a cache-hit result that still needs
+  // ensureDecoded() to run, then defers to completeCacheReadOrQuarantine()
+  // via a queued invocation -- see that method's comment for why a cache
+  // hit cannot simply be resolved synchronously via
+  // registerImmediateCompletion() (review item 9: a decode/integrity
+  // failure discovered here must be able to quarantine the entry and
+  // retry the SAME candidate over the network, which registerImmediate
+  // Completion's fixed pre-computed AssetOutcome cannot express).
+  RequestHandle registerCacheHitCompletion(const AssetKey &key,
+                                           ResultCallback callback,
+                                           QVector<AssetCandidate> candidates,
+                                           int candidateIndex,
+                                           AssetCache::CachedEntry entry,
+                                           QString cacheKey);
   // Finds an already in-flight operation (revalidation or ordinary
   // candidate fetch) whose AssetKey canonicalizes to the same opKey, so a
   // new request() call can attach as an additional consumer instead of
@@ -213,6 +229,43 @@ private:
   [[nodiscard]] AssetOutcome<AssetCache::CachedEntry>
   ensureDecoded(AssetCache::CachedEntry entry, AssetFormat format,
                 const QString &cacheKey);
+  // Review item 9: true for exactly the ensureDecoded()/decodeAndValidate()
+  // failure codes that mean the CACHED BYTES THEMSELVES are now known bad
+  // against a fresh, current-limits re-check (wrong magic/content-type,
+  // failed decode, or exceeding the currently-configured dimension/pixel
+  // caps) -- as opposed to UnsupportedCodec, which means the bytes are
+  // still perfectly valid but this process currently has no installed
+  // decoder for them (e.g. an AVIF plugin not present); those valid bytes
+  // must never be quarantined/deleted, since a future process (or later
+  // in this same process's life, if plugins are ever discovered late)
+  // could still decode them successfully.
+  [[nodiscard]] static bool isQuarantineWorthy(AssetErrorCode code);
+  // Shared by every code path that hands a CACHE-SOURCED entry (never a
+  // freshly-fetched one, which always already carries a decoded image --
+  // see ensureDecoded()'s comment) to a consumer: runs ensureDecoded(),
+  // and on a quarantine-worthy failure (see isQuarantineWorthy()), evicts
+  // BOTH the memory and disk generation for `cacheKey` via
+  // AssetCache::invalidate() and retries the SAME candidate
+  // (operation.candidates[operation.candidateIndex]) as a genuine network
+  // miss via startCandidate() -- exactly once: startCandidate()'s own
+  // fetch-completion handler does not call back into this method, so a
+  // decode failure on the freshly-refetched bytes (if any) completes via
+  // the ordinary network-fetch-failure path instead of looping. Any other
+  // failure (including UnsupportedCodec) completes the operation with
+  // that error, unchanged, without touching the cache entry at all. On
+  // success, `promoteOnSuccess` additionally publishes the now-decoded
+  // entry into the memory cache via AssetCache::promoteToMemory() -- only
+  // needed by the post-304-revalidation caller, whose entry was
+  // deliberately withheld from memory promotion until this exact
+  // revalidation happened (see AssetCache::lookupDisk()'s comment); the
+  // plain cache-hit callers pass promoteOnSuccess=false because
+  // ensureDecoded() already republishes the decoded image in place via
+  // AssetCache::updateMemoryDecodedImage() for an entry already resident
+  // in memory.
+  void completeCacheReadOrQuarantine(quint64 operationId,
+                                     AssetCache::CachedEntry entry,
+                                     const QString &cacheKey,
+                                     bool promoteOnSuccess);
   void startCandidate(quint64 operationId);
   void startRevalidation(quint64 operationId);
   void completeOperation(quint64 operationId,

@@ -118,20 +118,26 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
 
     // A same-process memory hit was already validated during this
     // process's own lifetime: serve it with no network round trip at all.
+    // Routed through registerCacheHitCompletion() (review item 9), not
+    // ensureDecoded() + registerImmediateCompletion() directly: a
+    // decode/integrity failure discovered here must be able to quarantine
+    // this exact entry and retry the SAME candidate over the network
+    // rather than permanently poisoning this key with a fixed, pre-
+    // computed failure outcome.
     if (auto hit = m_cache.lookupMemory(cacheKey)) {
-      return registerImmediateCompletion(
-          key, std::move(callback),
-          ensureDecoded(std::move(*hit), key.format, cacheKey));
+      return registerCacheHitCompletion(key, std::move(callback), candidates,
+                                        candidateIndex, std::move(*hit),
+                                        cacheKey);
     }
 
     if (auto hit = m_cache.lookupDisk(cacheKey)) {
       AssetCache::CachedEntry entry = *hit;
       if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
         // Nothing to conditionally revalidate against: serve as-is,
-        // exactly like a memory hit.
-        return registerImmediateCompletion(
-            key, std::move(callback),
-            ensureDecoded(std::move(entry), key.format, cacheKey));
+        // exactly like a memory hit (see the comment above).
+        return registerCacheHitCompletion(key, std::move(callback), candidates,
+                                          candidateIndex, std::move(entry),
+                                          cacheKey);
       }
 
       // A disk hit carrying validators is revalidated with a real
@@ -296,6 +302,103 @@ AssetRequestCoordinator::registerImmediateCompletion(
   return RequestHandle{handleId};
 }
 
+AssetRequestCoordinator::RequestHandle
+AssetRequestCoordinator::registerCacheHitCompletion(
+    const AssetKey &key, ResultCallback callback,
+    QVector<AssetCandidate> candidates, int candidateIndex,
+    AssetCache::CachedEntry entry, QString cacheKey) {
+  const quint64 handleId = m_nextHandle++;
+  const quint64 operationId = m_nextOperationId++;
+
+  Operation operation;
+  operation.key = key;
+  // The full candidate vector and this exact index are kept (not just
+  // discarded after the cache hit) so that a quarantine discovered
+  // inside completeCacheReadOrQuarantine() below can retry precisely
+  // this SAME candidate via the ordinary startCandidate() network path,
+  // exactly like a first-time miss would -- see that method's comment.
+  operation.candidates = std::move(candidates);
+  operation.candidateIndex = candidateIndex;
+  operation.consumers.append(Consumer{handleId, std::move(callback)});
+  m_operations.insert(operationId, std::move(operation));
+  m_handleToOperation.insert(handleId, operationId);
+
+  QPointer<AssetRequestCoordinator> self(this);
+  QMetaObject::invokeMethod(
+      this,
+      [self, operationId, entry = std::move(entry),
+       cacheKey = std::move(cacheKey)]() mutable {
+        if (self) {
+          self->completeCacheReadOrQuarantine(operationId, std::move(entry),
+                                              cacheKey,
+                                              /*promoteOnSuccess=*/false);
+        }
+      },
+      Qt::QueuedConnection);
+
+  return RequestHandle{handleId};
+}
+
+bool AssetRequestCoordinator::isQuarantineWorthy(AssetErrorCode code) {
+  switch (code) {
+  case AssetErrorCode::MagicBytesMismatch:
+  case AssetErrorCode::MalformedImage:
+  case AssetErrorCode::DimensionTooLarge:
+  case AssetErrorCode::PixelBudgetExceeded:
+  case AssetErrorCode::CacheCorrupt:
+    return true;
+  default:
+    // In particular, AssetErrorCode::UnsupportedCodec is deliberately
+    // excluded: the bytes are still perfectly valid, this process simply
+    // has no installed decoder for them right now (see the header
+    // comment) -- never quarantine/delete valid bytes for that reason.
+    return false;
+  }
+}
+
+void AssetRequestCoordinator::completeCacheReadOrQuarantine(
+    quint64 operationId, AssetCache::CachedEntry entry, const QString &cacheKey,
+    bool promoteOnSuccess) {
+  auto it = m_operations.find(operationId);
+  if (it == m_operations.end()) {
+    return; // cancelled/destroyed before this queued call ran
+  }
+  Operation &operation = it.value();
+  AssetOutcome<AssetCache::CachedEntry> outcome =
+      ensureDecoded(std::move(entry), operation.key.format, cacheKey);
+
+  if (outcome) {
+    if (promoteOnSuccess) {
+      m_cache.promoteToMemory(cacheKey, *outcome);
+    }
+    completeOperation(operationId, std::move(outcome));
+    return;
+  }
+
+  if (!isQuarantineWorthy(outcome.error().code)) {
+    completeOperation(operationId, std::move(outcome));
+    return;
+  }
+
+  // Review item 9: this exact cached generation just failed a format/
+  // magic/decode/dimension/pixel-budget re-check against CURRENT limits
+  // -- it must never be served again as-is, and never silently keep
+  // failing every future request for the same key forever. Evict both
+  // the memory and disk state for this exact resolved-candidate cache
+  // key, then retry precisely the SAME candidate as a genuine network
+  // miss. isRevalidation/staleEntry are reset first so the retry goes
+  // through the ordinary unconditional-fetch path (startCandidate()),
+  // never back into startRevalidation() for bytes that no longer exist
+  // anywhere. A decode failure on the freshly-refetched bytes (if any)
+  // completes via startCandidate()'s own normal fetch-failure handling,
+  // which never re-enters this method -- so a bad origin resource can
+  // fail at most once more, never loop.
+  m_cache.invalidate(cacheKey);
+  operation.isRevalidation = false;
+  operation.staleEntry.reset();
+  startCandidate(operationId);
+}
+
 void AssetRequestCoordinator::startCandidate(quint64 operationId) {
   auto it = m_operations.find(operationId);
   if (it == m_operations.end()) {
@@ -432,16 +535,18 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         // cached, already-displayed art disappear, and none of these
         // outcomes is proof the resource is actually gone. This is
         // "as-is" only in the sense that the cached payload bytes are
-        // never re-fetched or rewritten; ensureDecoded() below can still
-        // surface its own typed error (e.g. the on-disk bytes no longer
-        // decode because the installed codec plugins changed, or the
-        // payload was corrupted) instead of a decoded image -- that is a
-        // genuine, independent failure of the cached entry itself, not a
-        // failure of this revalidation attempt.
+        // never re-fetched or rewritten by THIS revalidation attempt;
+        // completeCacheReadOrQuarantine() below can still discover its
+        // own independent, genuine failure of the cached entry itself
+        // (e.g. the on-disk bytes no longer decode against current
+        // limits/codec support) and, for a quarantine-worthy one (review
+        // item 9), evict this entry and retry the same candidate as a
+        // fresh network miss instead of serving the same doomed stale
+        // bytes forever.
         if (!result) {
-          self->completeOperation(
-              operationId, self->ensureDecoded(stale, operation.key.format,
-                                               operation.revalidationCacheKey));
+          self->completeCacheReadOrQuarantine(operationId, stale,
+                                              operation.revalidationCacheKey,
+                                              /*promoteOnSuccess=*/false);
           return;
         }
 
@@ -454,29 +559,28 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
           self->m_cache.touchAfterNotModified(operation.revalidationCacheKey,
                                               result->refreshedEtag,
                                               result->refreshedLastModified);
-          AssetOutcome<AssetCache::CachedEntry> outcome = self->ensureDecoded(
-              stale, operation.key.format, operation.revalidationCacheKey);
-          if (outcome) {
-            // A validator-carrying disk hit is normally withheld from
-            // memory promotion (see lookupDisk()) until it has actually
-            // been revalidated -- this 304 IS that revalidation, so the
-            // (now-decoded) entry is unconditionally promoted, letting a
-            // subsequent same-process request for the same key
-            // short-circuit via lookupMemory() instead of repeating the
-            // conditional GET.
-            self->m_cache.promoteToMemory(operation.revalidationCacheKey,
-                                          *outcome);
-          }
-          self->completeOperation(operationId, std::move(outcome));
+          // A validator-carrying disk hit is normally withheld from
+          // memory promotion (see lookupDisk()) until it has actually
+          // been revalidated -- this 304 IS that revalidation, so
+          // completeCacheReadOrQuarantine() is asked to unconditionally
+          // promote the (now-decoded) entry on success, letting a
+          // subsequent same-process request for the same key
+          // short-circuit via lookupMemory() instead of repeating the
+          // conditional GET. On a quarantine-worthy decode failure
+          // instead (review item 9), the just-touched metadata/payload
+          // are evicted again and the same candidate is retried fresh.
+          self->completeCacheReadOrQuarantine(operationId, stale,
+                                              operation.revalidationCacheKey,
+                                              /*promoteOnSuccess=*/true);
           return;
         }
 
         if (!result->asset.has_value()) {
           // Defensive only: AssetNetworkFetcher never returns
           // notModified==false with an empty asset.
-          self->completeOperation(
-              operationId, self->ensureDecoded(stale, operation.key.format,
-                                               operation.revalidationCacheKey));
+          self->completeCacheReadOrQuarantine(operationId, stale,
+                                              operation.revalidationCacheKey,
+                                              /*promoteOnSuccess=*/false);
           return;
         }
 
