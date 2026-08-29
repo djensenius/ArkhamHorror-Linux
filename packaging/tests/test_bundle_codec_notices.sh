@@ -30,7 +30,11 @@ work_dir="$(mktemp -d 2>/dev/null || mktemp -d -t bundle_codec_notices_test)"
 trap 'rm -rf "$work_dir"' EXIT
 
 fail() {
-  echo "FAIL: $1" >&2
+  # Print every argument, not just the first -- some call sites (e.g.
+  # case 4 below) pass a message split across multiple arguments, and
+  # silently dropping everything after $1 would hide the actual failure
+  # reason from CI output.
+  echo "FAIL: $*" >&2
   exit 1
 }
 
@@ -111,6 +115,16 @@ if bundle_codec_notices "$case4_lib_dir" "$case4_third_party_dir" "$case4_doc_di
   fail "case 4: bundle_codec_notices must fail when a bundled codec library" \
     "has no corresponding notice source"
 fi
+# The "no partial bundling" guarantee: libavif's own notice source IS
+# valid here (only libgav1's is missing), so a naive copy-as-you-go
+# implementation would have already installed libavif's LICENSE before
+# reaching libgav1's validation failure. Every candidate must be
+# validated before any file is copied, so NOTHING may be bundled at all.
+[[ -d "$case4_doc_dir" ]] \
+  && find "$case4_doc_dir" -mindepth 1 -print -quit | grep -q . \
+  && fail "case 4: no notices (not even libavif's, which is individually" \
+    "valid) may be partially bundled when a later candidate fails validation"
+true
 
 # --- Case 5: bundled notice content matches the checked-in source -------
 case5_lib_dir="$work_dir/case5/lib"

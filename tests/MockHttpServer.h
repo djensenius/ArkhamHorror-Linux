@@ -85,13 +85,15 @@ public:
   // Lower-cased header name -> value, for the LAST request received at
   // `path` (sufficient for the "no cookie/auth header ever sent" and
   // "conditional headers arrived correctly" assertions these tests need).
-  [[nodiscard]] QHash<QByteArray, QByteArray> lastRequestHeaders(const QString &path) const;
+  [[nodiscard]] QHash<QByteArray, QByteArray>
+  lastRequestHeaders(const QString &path) const;
   // True iff ANY request to ANY path, ever, carried this (lower-cased)
   // header name -- tracked via a running set of every header name seen
   // across every request this server has ever handled (NOT merely the
   // last request per path), so an assertion that a header is never sent
   // cannot be defeated by a later request to the same path omitting it.
-  [[nodiscard]] bool anyRequestEverHadHeader(const QByteArray &lowerHeaderName) const;
+  [[nodiscard]] bool
+  anyRequestEverHadHeader(const QByteArray &lowerHeaderName) const;
 
   // Number of bytes of a slowDrip response body actually flushed to the
   // socket for the most recent request at `path`, even if the client
@@ -118,7 +120,8 @@ private:
   void onReadyRead(QTcpSocket *socket);
   void onDisconnected(QTcpSocket *socket);
   void tryParseAndRespond(Connection &connection);
-  void writeResponse(QTcpSocket *socket, const QString &path, const Response &response,
+  void writeResponse(QTcpSocket *socket, const QString &path,
+                     const Response &response,
                      const QHash<QByteArray, QByteArray> &requestHeaders);
   void writeSlowDrip(QTcpSocket *socket, const QString &path, QByteArray body,
                      int chunkSize, int chunkDelayMs);

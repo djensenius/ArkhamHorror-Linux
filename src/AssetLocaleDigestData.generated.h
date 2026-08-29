@@ -31,7 +31,7 @@ struct LocaleMapEntry {
 };
 
 inline constexpr LocaleMapEntry kLocaleMap[] = {
-    {"it", "ita"}, {"fr", "fr"}, {"es", "es"}, {"ko", "ko"}, {"zh", "zh"},
+    {"es", "es"}, {"fr", "fr"}, {"it", "ita"}, {"ko", "ko"}, {"zh", "zh"},
 };
 
 struct DigestEntry {

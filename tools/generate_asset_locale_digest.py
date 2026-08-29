@@ -281,7 +281,14 @@ def render_header(manifest: dict) -> str:
     lines.append("};")
     lines.append("")
     lines.append("inline constexpr LocaleMapEntry kLocaleMap[] = {")
-    for locale, mapped in locale_map.items():
+    # Sort by ISO locale key rather than relying on dict/JSON insertion
+    # order: a semantically-equivalent reordering of localeMap in the
+    # manifest (which JSON/dict iteration preserves as-is) would
+    # otherwise produce a different generated header for identical
+    # data, breaking the determinism this generator is required to
+    # guarantee.
+    for locale in sorted(locale_map):
+        mapped = locale_map[locale]
         lines.append(f'    {{"{_escape(locale)}", "{_escape(mapped)}"}},')
     lines.append("};")
     lines.append("")

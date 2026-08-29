@@ -37,12 +37,14 @@
 # packaging bug, not a legitimate "backend not used" case) -- every other
 # name in the table is genuinely optional, since which AV1 backend(s) the
 # system libavif package pulls in varies by distro/version. Returns
-# non-zero (without partially bundling a mix of some-but-not-all
-# licenses) if libavif's own bundled library or its notice source
-# directory cannot be found, or if a recognized codec backend library is
-# found bundled but this repository has no corresponding notice source
-# for it -- fail loudly here rather than silently ship an unattributed
-# binary dependency.
+# non-zero (WITHOUT bundling any notices at all -- every candidate is
+# validated before any file is copied, so a failure partway through
+# validation can never leave a partial some-but-not-all mix of notices on
+# disk) if libavif's own bundled library or its notice source directory
+# cannot be found, or if a recognized codec backend library is found
+# bundled but this repository has no corresponding notice source for it --
+# fail loudly here rather than silently ship an unattributed binary
+# dependency.
 bundle_codec_notices() {
   local bundled_lib_search_root="$1"
   local third_party_root="$2"
@@ -63,31 +65,13 @@ bundle_codec_notices() {
     [libyuv]='libyuv.so*'
   )
 
-  _bundle_one_codec_notice() {
-    local name="$1"
-    local notice_src="$third_party_root/$name"
-    if [[ ! -d "$notice_src" ]]; then
-      echo "bundle_codec_notices: no notice source at $notice_src for" \
-        "bundled codec library '$name'." >&2
-      return 1
-    fi
-    local dest="$doc_dest_dir/third_party/$name"
-    mkdir -p "$dest"
-    local any_file=0
-    local f
-    for f in "$notice_src"/*; do
-      [[ -f "$f" ]] || continue
-      install -Dm644 "$f" "$dest/$(basename "$f")"
-      any_file=1
-    done
-    if [[ "$any_file" -ne 1 ]]; then
-      echo "bundle_codec_notices: $notice_src has no notice files to bundle" \
-        "for '$name'." >&2
-      return 1
-    fi
-    return 0
-  }
-
+  # Phase 1: work out which names actually need bundling, and VALIDATE
+  # every one of their notice sources up front, without copying a single
+  # file yet. This is what makes the "no partial bundling" guarantee
+  # above true: every possible validation failure below happens strictly
+  # before phase 2's first `install -Dm644` call, so a mid-list failure
+  # can never leave some names' notices copied and others missing.
+  local -a names_to_bundle=()
   local name
   for name in "${mandatory_names[@]}"; do
     local glob="${globs[$name]}"
@@ -98,16 +82,49 @@ bundle_codec_notices() {
         "(glob '$glob') was not found bundled under $bundled_lib_search_root." >&2
       return 1
     fi
-    _bundle_one_codec_notice "$name" || return 1
+    names_to_bundle+=("$name")
   done
-
   for name in "${optional_names[@]}"; do
     local glob="${globs[$name]}"
     local found
     found="$(find "$bundled_lib_search_root" -name "$glob" -print -quit 2>/dev/null || true)"
     if [[ -n "$found" ]]; then
-      _bundle_one_codec_notice "$name" || return 1
+      names_to_bundle+=("$name")
     fi
+  done
+
+  local notice_src dest f
+  for name in "${names_to_bundle[@]}"; do
+    notice_src="$third_party_root/$name"
+    if [[ ! -d "$notice_src" ]]; then
+      echo "bundle_codec_notices: no notice source at $notice_src for" \
+        "bundled codec library '$name'." >&2
+      return 1
+    fi
+    local has_file=0
+    for f in "$notice_src"/*; do
+      if [[ -f "$f" ]]; then
+        has_file=1
+        break
+      fi
+    done
+    if [[ "$has_file" -ne 1 ]]; then
+      echo "bundle_codec_notices: $notice_src has no notice files to bundle" \
+        "for '$name'." >&2
+      return 1
+    fi
+  done
+
+  # Phase 2: every candidate validated successfully -- now, and only
+  # now, actually copy files.
+  for name in "${names_to_bundle[@]}"; do
+    notice_src="$third_party_root/$name"
+    dest="$doc_dest_dir/third_party/$name"
+    mkdir -p "$dest"
+    for f in "$notice_src"/*; do
+      [[ -f "$f" ]] || continue
+      install -Dm644 "$f" "$dest/$(basename "$f")"
+    done
   done
 
   return 0

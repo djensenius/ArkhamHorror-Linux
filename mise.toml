@@ -65,7 +65,7 @@ if command -v brew >/dev/null 2>&1; then
     CLANG_FORMAT="$LLVM18_PREFIX/bin/clang-format"
   fi
 fi
-"$CLANG_FORMAT" --dry-run --Werror src/*.cpp src/*.h tests/*.cpp
+"$CLANG_FORMAT" --dry-run --Werror src/*.cpp src/*.h tests/*.cpp tests/*.h
 for file in qml/*.qml; do
   formatted="$(mktemp)"
   qmlformat "$file" > "$formatted"

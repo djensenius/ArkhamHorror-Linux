@@ -30,7 +30,14 @@ QString categoryLabel(AssetCategory category) {
   case AssetCategory::HomebrewBox:
     return QStringLiteral("homebrew box");
   }
-  return QStringLiteral("asset");
+  // Consistent with every other AssetCategory switch in this codebase
+  // (see AssetLocator.cpp's categoryRoot()/canonicalExtensionFor()/etc.):
+  // no `default:` case, so adding a new AssetCategory enumerator without
+  // updating this function is a compile-time -Wswitch warning rather
+  // than a silently-wrong runtime fallback string, and Q_UNREACHABLE()
+  // additionally traps it immediately in debug builds if the warning is
+  // ever missed.
+  Q_UNREACHABLE_RETURN(QStringLiteral("asset"));
 }
 
 // The base accessible description text this request is "carrying", per
