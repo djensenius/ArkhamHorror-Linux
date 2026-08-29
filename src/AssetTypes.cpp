@@ -109,9 +109,9 @@ ValidatedAssetSource::fromRaw(const QString &rawInput) {
   if (rawPathIsHostile(rawPath)) {
     return AssetError{
         AssetErrorCode::InvalidAssetBase,
-        QStringLiteral("asset base path must not contain a dot segment, "
-                       "backslash, or control character (literal or "
-                       "percent-encoded)"),
+        QStringLiteral("asset base path must not contain a literal '%' "
+                       "character, a dot segment, a backslash, or a "
+                       "control character"),
     };
   }
 

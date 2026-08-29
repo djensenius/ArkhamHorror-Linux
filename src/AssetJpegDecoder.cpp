@@ -12,6 +12,7 @@
 #include <jpeglib.h>
 
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
 
 namespace Arkham {
@@ -21,13 +22,19 @@ namespace {
 // Every piece of per-decode state lives here, as a plain stack local
 // (never static, never shared) -- see AssetJpegDecoder.h's header comment
 // for why this is what actually fixes the concurrency bug the previous
-// ScopedJpegDecodeWarningDetector had. A pointer to this struct is threaded
-// through libjpeg's own cinfo.client_data / cinfo.err (a
-// JpegErrorManager::pub base, so libjpeg's C callbacks can safely
-// reinterpret_cast the jpeg_error_mgr* they receive back to this struct
-// via a plain base-pointer cast -- pub is required to be the FIRST member,
-// exactly mirroring libjpeg's own documented "subclassing" idiom for
-// jpeg_error_mgr).
+// ScopedJpegDecodeWarningDetector had. A pointer to this struct is
+// threaded through libjpeg's own cinfo.client_data -- a field libjpeg
+// defines and documents specifically for carrying arbitrary per-call
+// caller state, safe to read back with a plain static_cast regardless of
+// this struct's own layout. This deliberately does NOT reinterpret_cast
+// cinfo->err (the jpeg_error_mgr*) back to this struct via a "pub is the
+// first member" base-pointer trick: while JpegErrorManager likely still
+// qualifies as a standard-layout type even with a QString member (that
+// C-style idiom's pointer-interconvertibility guarantee is about the
+// STRUCT's own shape, not its members' types), relying on that is
+// needlessly fragile and easy to invalidate by a future member reordering
+// or addition -- client_data exists in libjpeg's own public API
+// precisely so callers never need to reason about this at all.
 struct JpegErrorManager {
   jpeg_error_mgr pub;
   jmp_buf setjmpBuffer;
@@ -46,7 +53,7 @@ struct JpegErrorManager {
 // reaching the end of this function without longjmp()ing would itself be
 // a bug -- it always does.
 void jpegErrorExit(j_common_ptr cinfo) {
-  auto *errorManager = reinterpret_cast<JpegErrorManager *>(cinfo->err);
+  auto *errorManager = static_cast<JpegErrorManager *>(cinfo->client_data);
   char buffer[JMSG_LENGTH_MAX];
   (*cinfo->err->format_message)(cinfo, buffer);
   errorManager->fatalMessage = QString::fromLatin1(buffer);
@@ -79,6 +86,28 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   cinfo.err = jpeg_std_error(&errorManager.pub);
   errorManager.pub.error_exit = jpegErrorExit;
   errorManager.pub.output_message = jpegOutputMessageNoop;
+  cinfo.client_data = &errorManager;
+
+  // Deliberately a raw, manually `free()`d buffer -- NOT a QImage or any
+  // other C++ type with a non-trivial destructor. [csetjmp.syn] makes it
+  // undefined behavior for a setjmp/longjmp pair to skip past the point
+  // where a non-trivial destructor for some automatic object would
+  // otherwise run (exactly as if replacing them with catch/throw would
+  // invoke it): every libjpeg call below this setjmp() checkpoint can
+  // fail via error_exit() -> longjmp(), unwinding straight back to the
+  // `if (setjmp(...))` below WITHOUT running any destructor for an
+  // object that was constructed after this point. A raw pointer has no
+  // destructor at all, so nothing is skipped -- worst case on any
+  // failure path is a `free()` a few lines below reclaiming it, which
+  // every exit path (including the recovery branch itself) does. It is
+  // declared `volatile` because it (unlike `errorManager`/`cinfo`, whose
+  // addresses are taken and passed to other functions, which forces the
+  // compiler to keep them memory-resident regardless) is read directly,
+  // by name, inside the very `if (setjmp(...))` recovery branch below
+  // after being assigned only via ordinary (non-pointer) code further
+  // down in this same function -- exactly the shape the standard calls
+  // out as otherwise indeterminate after a longjmp.
+  unsigned char *volatile scanlineBuffer = nullptr;
 
   // Canonical libjpeg usage (see libjpeg's own documented example.c):
   // the setjmp() checkpoint must be established BEFORE
@@ -88,6 +117,7 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   // this single `if`.
   if (setjmp(errorManager.setjmpBuffer)) {
     const QString message = errorManager.fatalMessage;
+    std::free(scanlineBuffer);
     jpeg_destroy_decompress(&cinfo);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
@@ -155,24 +185,29 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
 
   jpeg_start_decompress(&cinfo);
 
-  QImage image(static_cast<int>(cinfo.output_width),
-               static_cast<int>(cinfo.output_height), QImage::Format_RGB888);
-  if (image.isNull()) {
+  const int outWidth = static_cast<int>(cinfo.output_width);
+  const int outHeight = static_cast<int>(cinfo.output_height);
+  // A tightly-packed (no padding) row stride: this raw buffer is never
+  // handed to Qt directly, so it has none of QImage's own per-platform
+  // scanline-alignment requirements -- those are applied once, below,
+  // when copying into the real QImage after every libjpeg call that
+  // could possibly longjmp() has already returned successfully.
+  const size_t rowStride = static_cast<size_t>(outWidth) * 3;
+  scanlineBuffer = static_cast<unsigned char *>(
+      std::malloc(rowStride * static_cast<size_t>(outHeight)));
+  if (!scanlineBuffer) {
     jpeg_destroy_decompress(&cinfo);
-    return AssetOutcome<QImage>(
-        AssetError{AssetErrorCode::MalformedImage,
-                   QStringLiteral("Failed to allocate a QImage for the "
-                                  "decoded JPEG's dimensions")});
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::MalformedImage,
+        QStringLiteral(
+            "Failed to allocate a scanline buffer for the decoded JPEG's "
+            "dimensions")});
   }
 
-  // QImage::Format_RGB888 rows are NOT guaranteed to be tightly packed
-  // (width * 3 bytes) -- QImage pads each scanline's stride for
-  // alignment. image.scanLine(row) always returns the correct
-  // per-row destination regardless of that padding, so decoding directly
-  // into it row-by-row (rather than assuming a compact width*height*3
-  // buffer) is required for correctness on every platform/Qt build.
   while (cinfo.output_scanline < cinfo.output_height) {
-    JSAMPROW rowPointer[1] = {image.scanLine(cinfo.output_scanline)};
+    JSAMPROW rowPointer[1] = {scanlineBuffer +
+                              static_cast<size_t>(cinfo.output_scanline) *
+                                  rowStride};
     jpeg_read_scanlines(&cinfo, rowPointer, 1);
   }
 
@@ -191,7 +226,12 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   const long numWarnings = errorManager.pub.num_warnings;
   jpeg_destroy_decompress(&cinfo);
 
+  // Every libjpeg call that could possibly reach error_exit() -> longjmp()
+  // has now returned normally: no further code path in this function can
+  // ever reach the setjmp() checkpoint above, so constructing a C++
+  // object with a non-trivial destructor (QImage) from here on is safe.
   if (numWarnings > 0) {
+    std::free(scanlineBuffer);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
         QStringLiteral("libjpeg recovered from %1 corrupt-data warning(s) "
@@ -199,6 +239,25 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
                        "never accepted")
             .arg(numWarnings)});
   }
+
+  QImage image(outWidth, outHeight, QImage::Format_RGB888);
+  if (image.isNull()) {
+    std::free(scanlineBuffer);
+    return AssetOutcome<QImage>(
+        AssetError{AssetErrorCode::MalformedImage,
+                   QStringLiteral("Failed to allocate a QImage for the "
+                                  "decoded JPEG's dimensions")});
+  }
+  // QImage::Format_RGB888 rows are NOT guaranteed to be tightly packed
+  // (width * 3 bytes) -- QImage pads each scanline's stride for
+  // alignment, so each row is copied individually via scanLine() rather
+  // than assuming a single compact width*height*3 memcpy is valid.
+  for (int row = 0; row < outHeight; ++row) {
+    std::memcpy(image.scanLine(row),
+                scanlineBuffer + static_cast<size_t>(row) * rowStride,
+                rowStride);
+  }
+  std::free(scanlineBuffer);
 
   return AssetOutcome<QImage>(std::move(image));
 }

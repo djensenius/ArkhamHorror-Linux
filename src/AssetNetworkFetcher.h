@@ -120,22 +120,31 @@ private:
 //      (AssetErrorCode::MagicBytesMismatch otherwise) -- a server lying
 //      about Content-Type is caught even if declared correctly by
 //      coincidence, and vice versa.
-//   3. QImageReader::size() is inspected BEFORE any decode is attempted
-//      for JPEG/PNG (AVIF's equivalent dimension check happens inside
-//      AssetAvifDecoder.cpp, against parsed-but-not-yet-decoded container
-//      metadata -- see decodeAndValidate()'s AVIF branch below); each
-//      dimension is capped at `limits.maxDimensionPixels` and
+//   3. The declared dimensions are inspected BEFORE any decode is
+//      attempted, against parsed-but-not-yet-fully-decoded container
+//      metadata -- for PNG this is still `QImageReader::size()`; for AVIF
+//      and JPEG it is read directly from libavif's/libjpeg's own header
+//      parse (see AssetAvifDecoder.cpp/AssetJpegDecoder.cpp respectively,
+//      dispatched from decodeAndValidate()'s per-format branches below).
+//      Each dimension is capped at `limits.maxDimensionPixels` and
 //      width*height (computed in 64-bit, never overflowing) is capped at
 //      `limits.maxTotalPixels`, rejecting a dimension/pixel bomb before a
 //      single pixel is decoded.
 //   4. Only then is the image actually decoded: AVIF goes directly
-//      through libavif's own C API (AssetAvifDecoder.h), a required
-//      build/runtime dependency, never through Qt's plugin registry.
-//      JPEG/PNG still go through QImageReader; if the installed Qt build
-//      has no plugin capable of decoding one of those two formats, this
-//      is reported as the distinct AssetErrorCode::UnsupportedCodec
-//      rather than the generic AssetErrorCode::MalformedImage used for a
-//      truncated/corrupt body of an otherwise-supported format.
+//      through libavif's own C API (AssetAvifDecoder.h) and JPEG goes
+//      directly through libjpeg's own C API (AssetJpegDecoder.h) -- both
+//      required build/runtime dependencies, never through Qt's plugin
+//      registry (JPEG moved off QImageReader in PR #18's cumulative
+//      review at 14cf8de6: the previous QImageReader-based path's only
+//      way to detect libjpeg silently recovering from corrupt/incomplete
+//      entropy-coded scan data relied on a process-global Qt message
+//      handler, unsafe under concurrent/reentrant decode -- see
+//      decodeJpegImage()'s own comments). Only PNG still goes through
+//      QImageReader; if the installed Qt build has no plugin capable of
+//      decoding it, this is reported as the distinct
+//      AssetErrorCode::UnsupportedCodec rather than the generic
+//      AssetErrorCode::MalformedImage used for a truncated/corrupt PNG
+//      body.
 //
 // Every async callback is guarded by a QPointer and an exact per-request
 // handle so a reply belonging to an old, cancelled, or superseded request
@@ -175,9 +184,17 @@ public:
   static constexpr int kMaxAllowedDimensionPixels = 65536;
   static constexpr qint64 kMaxAllowedTotalPixels = 4'000'000'000LL;
   // QTimer ultimately stores its interval as a plain `int` millisecond
-  // count; bounding the configured timeout here (well under INT_MAX,
-  // ~24.8 days) keeps `timer->start(m_timeout)` overflow-free on every
-  // platform without ever silently truncating a caller's requested value.
+  // count. `QTimer::start(int)` takes its argument in milliseconds as a
+  // plain `int`, so any value up to `INT_MAX` milliseconds (~24.8 days)
+  // would itself be representable there -- but this constant is bounded
+  // far more tightly, to exactly 24 hours (24 * 60 * 60 * 1000 ms), which
+  // is a deliberately small, sane per-request network timeout ceiling,
+  // not merely "whatever avoids overflowing `int`". Being far below
+  // `INT_MAX` is simply a bonus consequence of that 24-hour policy
+  // choice, not the reason for it; the actual overflow-freedom guarantee
+  // comes from `timeout` additionally being validated as a small,
+  // positive, explicitly-bounded value before ever reaching
+  // `timer->start(m_timeout)`.
   static constexpr std::chrono::milliseconds kMaxAllowedTimeout{24LL * 60 * 60 *
                                                                 1000};
 

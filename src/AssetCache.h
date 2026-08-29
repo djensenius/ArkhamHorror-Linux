@@ -26,12 +26,22 @@ namespace Arkham {
 // remote-controlled string ever becomes a local path component.
 //
 // On disk (review item 8), each entry is published as an immutable,
-// content-addressed GENERATION plus one small mutable pointer:
-//   {key}.{generation}.bin        -- raw encoded bytes (generation is the
-//                                    SHA-256 hex of those exact bytes).
+// uniquely-identified GENERATION plus one small mutable pointer:
+//   {key}.{generation}.bin        -- raw encoded bytes (generation is a
+//                                    unique, unpredictable per-transaction
+//                                    identifier -- see
+//                                    mintGenerationIdLocked()'s comment --
+//                                    NEVER a hash of these bytes; the
+//                                    payload's own SHA-256 is instead
+//                                    recorded separately, as pure integrity
+//                                    metadata, in the .meta.json file
+//                                    below).
 //   {key}.{generation}.meta.json  -- versioned metadata for that exact
-//                                    generation (its own "sha256" field
-//                                    always equals `generation`).
+//                                    generation (its "sha256" field is the
+//                                    payload's content hash, used only to
+//                                    verify integrity on every read/reap --
+//                                    it is never the generation identifier
+//                                    itself).
 //   {key}.manifest.json           -- the ONE mutable file: which
 //                                    generation is currently "live" for
 //                                    this key.
@@ -40,25 +50,32 @@ namespace Arkham {
 // and only once BOTH commit does the manifest itself get rewritten (also
 // QSaveFile + fsync) to point at the new generation; the containing
 // directory is then fsync'd too, so the rename that publishes the new
-// manifest is itself durable. Because a generation's filename is
-// content-addressed, publishing generation N+1 for a key that already has
-// generation N NEVER touches generation N's files at all until AFTER the
-// manifest swap has fully committed -- at every crash boundary before
-// that swap commits, the manifest (if it exists) still names the old,
-// completely intact generation; at every boundary at or after it, the
-// manifest names the new, completely intact generation. A read (or the
-// startup/periodic reapAndEnforceQuota() sweep) always re-hashes the
-// generation's payload and compares it against that generation's own
-// metadata before trusting it, so even a manifest that somehow survives
-// pointing at an incomplete/corrupt generation is never served -- and any
-// generation whose files exist but are NOT the one the manifest currently
-// names (an orphan left by a crash between publishing a new generation
-// and cleaning up the old one, or between writing a new generation's
-// files and ever reaching the manifest swap) is reclaimed by the reap
-// sweep. A crash therefore always resolves deterministically to either
-// the complete old generation or the complete new one -- never a
-// half-valid mix of the two -- and metadata/manifest commit failure
-// always preserves whatever generation was already live.
+// manifest is itself durable. Because a generation's filename identity is
+// a fresh, unique mint for every store() transaction -- NEVER derived
+// from the payload's own bytes (round-4/5 review item 4: a
+// content-addressed generation id would let a same-bytes-but-new-metadata
+// replacement silently rewrite an already-live, in-use generation's files
+// in place, so a concurrent reader or a failed/partial cleanup of that
+// "replacement" could corrupt or delete the still-live generation) --
+// publishing a new generation for a key that already has one NEVER
+// touches the old generation's files at all until AFTER the manifest swap
+// has fully committed -- at every crash boundary before that swap
+// commits, the manifest (if it exists) still names the old, completely
+// intact generation; at every boundary at or after it, the manifest names
+// the new, completely intact generation. A read (or the startup/periodic
+// reapAndEnforceQuota() sweep) always re-hashes the generation's payload
+// and compares it against that generation's own metadata before trusting
+// it, so even a manifest that somehow survives pointing at an
+// incomplete/corrupt generation is never served -- and any generation
+// whose files exist but are NOT the one the manifest currently names (an
+// orphan left by a crash between publishing a new generation and cleaning
+// up the old one, or between writing a new generation's files and ever
+// reaching the manifest swap) is reclaimed by the reap sweep. A crash
+// therefore always resolves deterministically to either the complete old
+// generation or the complete new one -- never a half-valid mix of the
+// two, and never a same-bytes replacement silently mutating a live file
+// in place -- and metadata/manifest commit failure always preserves
+// whatever generation was already live.
 //
 // Metadata (not filesystem atime, which many container/build
 // environments mount with atime updates disabled or coarsened) drives
