@@ -149,7 +149,20 @@ public:
                      QObject *parent = nullptr);
   ~SessionCoordinator() override;
 
-  [[nodiscard]] State state() const noexcept { return m_state; }
+  // Not always m_state verbatim: see hasBlockingOrphanCleanup()'s doc
+  // comment. For as long as a durably-failed required secure-store
+  // deletion for some OTHER profile than the one currently selected (or
+  // no profile at all) remains unresolved, this deliberately reports
+  // SecureStorageUnavailable instead, regardless of the CURRENT profile's
+  // own, genuinely-progressing underlying state -- which keeps advancing
+  // in the background via the ordinary mutateState()/setState() calls
+  // throughout this class and becomes visible again automatically, with
+  // no separate "resume" step anywhere, the instant the last such
+  // obligation clears. When the currently selected profile IS the one
+  // with the outstanding obligation (the common single-profile case),
+  // this override does not apply and the real, live-transitioning
+  // m_state is returned exactly as before.
+  [[nodiscard]] State state() const noexcept;
   // Static, secret-free, human-readable label for state(). Never derived
   // from any server- or user-supplied text.
   [[nodiscard]] QString stateDescription() const;
@@ -160,8 +173,11 @@ public:
   // QNetworkReply/QJsonParseError errorString()) already sanitized by
   // IAuthenticationClient/ITokenStore/ICapabilityProbe. Never contains a
   // response body, request body, password, token, or Authorization
-  // header.
-  [[nodiscard]] QString diagnostic() const { return m_diagnostic; }
+  // header. Subject to the same orphan-cleanup override as state() above
+  // (see hasBlockingOrphanCleanup()): while it applies, this reports the
+  // oldest unresolved obligation's own static diagnostic instead of
+  // m_diagnostic.
+  [[nodiscard]] QString diagnostic() const;
 
   [[nodiscard]] QString selectedProfileId() const {
     return m_selectedProfileId;
@@ -254,9 +270,19 @@ public slots:
   // coordinator's current generation/selection.
   void signOut();
 
-  // Re-runs whatever stage most recently failed (profile load/save,
-  // capability probe, restored-credential read/whoami, or a pending
-  // sign-out deletion). A safe no-op if nothing is retryable.
+  // If ANY profile -- selected or not, current or since-removed --  has a
+  // durably-failed required secure-store deletion still outstanding (see
+  // m_stalledProfileOrder), retries the OLDEST such obligation exclusively
+  // (retryStuckProfileTokenOp()), regardless of m_retryAction below and
+  // regardless of whether that profile is currently selected. Only once
+  // no such obligation remains does this fall back to whatever single
+  // action m_retryAction currently holds (profile load/save, capability
+  // probe, or restored-credential read/whoami failure for the CURRENT
+  // profile). This priority is what makes an orphaned profile's cleanup
+  // obligation impossible to silently lose or starve: it can never be
+  // superseded by a later start()/switchProfile()/probe retry for a
+  // different profile, since those only ever touch m_retryAction, never
+  // m_stalledProfileOrder. A safe no-op if nothing is retryable at all.
   void retry();
 
 signals:
@@ -474,15 +500,20 @@ private:
   // generation only ever suppresses *state* mutation, never this
   // durable-cleanup bookkeeping. See ProfileTokenDispatch above for how
   // concurrent/duplicate dispatch of that same stalled head is prevented.
-  // The actionable retry() action and the visible SecureStorageUnavailable
-  // state on such a failure are themselves installed centrally, inside
-  // startFrontTokenOp()'s own completion handling, gated only on whether
-  // |profileId| is still the coordinator's *current* profile -- never on
-  // whatever UI generation happened to be current when the failed op was
-  // originally enqueued. A per-call onComplete continuation's own
-  // generation guard would otherwise permanently lose the retry action if
-  // the same op fails again after the profile was switched away from and
-  // back (or start() restarted) in between.
+  // The failure is recorded centrally, inside startFrontTokenOp()'s own
+  // completion handling, via markProfileCleanupStalled() -- entirely
+  // independent of whatever UI generation happened to be current when the
+  // failed op was originally enqueued, AND independent of whether
+  // |profileId| is the coordinator's *current* profile: retry() always
+  // targets the oldest such obligation across every profile (see
+  // m_stalledProfileOrder), never only the current one. A per-call
+  // onComplete continuation's own generation guard would otherwise
+  // permanently lose the retry action if the same op fails again after the
+  // profile was switched away from and back (or start() restarted) in
+  // between. When |profileId| additionally happens to be the current
+  // profile, its own real state is ALSO directly set to
+  // SecureStorageUnavailable (see startFrontTokenOp()), matching this
+  // class's existing single-profile behavior exactly.
   void enqueueTokenOp(const QString &profileId, TokenOpKind kind, QString token,
                       QString endpointIdentity,
                       ITokenStore::ResultCallback onComplete);
@@ -538,13 +569,29 @@ private:
 
   // Called from start() immediately before the freshly loaded profile
   // list replaces |previousProfiles| (the OLD m_profiles from the prior
-  // start()), for EVERY retained/removed profile ID other than
-  // |selectedId| (whose own endpoint-change detection and cleanup is
-  // handled exclusively by mutateSelectedProfile(), via the very same
-  // invalidateProfileCredentialForEndpointChange() this function also
-  // uses -- calling it a second time here for the selected ID would
-  // double-bump its epoch and reserve a redundant second required
-  // Delete).
+  // start()) -- and, critically, BEFORE mutateSelectedProfile() ever runs
+  // for this same reload -- for EVERY retained/removed profile ID with NO
+  // exception: unlike an earlier version of this function, it no longer
+  // skips whichever ID is about to become newly selected. Centralizing
+  // reconciliation this way closes a race that a "selected ID is handled
+  // elsewhere, by mutateSelectedProfile()" split could not: an in-flight
+  // restore Read for a profile that is not yet (or no longer) selected
+  // could otherwise be rebound to a newer generation once that SAME
+  // profile becomes newly selected in this very reload, bypassing the
+  // required Delete entirely, because neither this function (which used
+  // to skip it) nor mutateSelectedProfile() (which only ever compared the
+  // OLD selected ID against itself) ever compared THAT profile's own old
+  // and new endpoint. Running this uniformly for every retained/removed
+  // ID first, strictly before any selection changes or Read rebinding can
+  // occur, guarantees the required Delete is always reserved ahead of any
+  // later restore Read for that ID, regardless of whether it was
+  // previously selected, is newly selected, or is never selected at all.
+  // mutateSelectedProfile() (called afterwards, from start()) therefore
+  // no longer performs any credential-epoch invalidation of its own for
+  // the same reason -- doing so here AND there for the same ID would
+  // double-bump its epoch and reserve a redundant second required Delete,
+  // which is also what continues to guarantee "one delete, not two" when
+  // the selected profile's own endpoint changes.
   //
   // This closes the credential-scope gap that purely selected-profile,
   // in-memory epoch tracking cannot: an UNselected profile's persisted
@@ -557,16 +604,16 @@ private:
   // (removed from persisted storage -- its entry, if any, is now
   // unreachable through the ordinary selected-profile restore flow and
   // would otherwise be orphaned forever), this reserves the exact same
-  // required-Delete cleanup that an endpoint change on the SELECTED
-  // profile gets. A name-only change, or no prior record at all (a
-  // brand-new or re-added ID), triggers no cleanup here -- a re-added ID
-  // relies purely on ITokenStore's own durable envelope-binding check
-  // (see ITokenStore.h) the next time it is actually selected and read,
-  // since there is no in-memory "old" record to meaningfully compare it
-  // against.
-  void reconcileOtherProfileCredentialsOnReload(
+  // required-Delete cleanup, in deterministic |newProfiles|/
+  // |previousProfiles| list order. A name-only change, or no prior record
+  // at all (a brand-new or re-added ID), triggers no cleanup here -- a
+  // re-added ID relies purely on ITokenStore's own durable
+  // envelope-binding check (see ITokenStore.h) the next time it is
+  // actually selected and read, since there is no in-memory "old" record
+  // to meaningfully compare it against.
+  void reconcileAllProfileCredentialsOnReload(
       const QList<ServerProfile> &previousProfiles,
-      const QList<ServerProfile> &newProfiles, const QString &selectedId);
+      const QList<ServerProfile> &newProfiles);
 
   // Assigns the coherent (state, cleared-user) snapshot via
   // mutateState()/mutateCurrentUser() (so every field that changes as
@@ -646,8 +693,93 @@ private:
   // retryStuckProfileTokenOp()). Maps profileId to a static, secret-free
   // diagnostic describing the block, so a later switch back to that
   // profile (or a fresh credential restore for it) can immediately
-  // surface it rather than silently waiting behind it forever.
+  // surface it rather than silently waiting behind it forever. Always
+  // kept in exact 1:1 sync with m_stalledProfileOrder below -- an ID
+  // appears in one if and only if it appears in the other -- via
+  // markProfileCleanupStalled()/clearProfileCleanupStalled(), the only
+  // two functions that ever mutate either.
   QHash<QString, QString> m_profileFifoStalled;
+
+  // FIFO order in which profiles most recently became durably stalled
+  // (see m_profileFifoStalled above). A QHash has no defined iteration
+  // order, so this is what lets retry()/hasBlockingOrphanCleanup() always
+  // target and present the OLDEST unresolved obligation deterministically
+  // -- regardless of how many profiles are simultaneously stalled or
+  // which one happens to be currently selected. A profileId appears here
+  // at most once: appended the moment it first becomes stalled, removed
+  // the moment its stalled Delete finally succeeds or reports NotFound
+  // (an equally successful outcome; see startFrontTokenOp()), and never
+  // reordered in between.
+  QList<QString> m_stalledProfileOrder;
+
+  // True exactly when state()/diagnostic() must report the oldest
+  // unresolved orphan-cleanup obligation (see m_stalledProfileOrder)
+  // instead of the real, live m_state/m_diagnostic: there is at least one
+  // outstanding obligation, AND it does not belong to the profile
+  // currently selected (including the case where no profile is currently
+  // selected at all). When the obligation instead belongs to the
+  // currently selected profile -- the common single-profile-stall case --
+  // this deliberately returns false, because that case is already fully,
+  // correctly handled by startFrontTokenOp()/startCredentialRestore()
+  // directly setting the real m_state/m_diagnostic to
+  // SecureStorageUnavailable, exactly as before this override existed;
+  // overriding it a second time here would only hide that profile's own
+  // genuine, live transitions from callers that legitimately need to
+  // observe them (e.g. tests synchronizing on real progress via
+  // state()). For any OTHER, unselected/orphaned profile's failure,
+  // nothing else would ever make it visible, so this override is what
+  // does -- coarsely and deliberately (a security-first, "some cleanup is
+  // required somewhere" presentation), without needing to reconstruct or
+  // cache whatever the current profile's own state would otherwise have
+  // been: since the real m_state/m_diagnostic fields are never touched by
+  // this override (only read around it), the current profile's own flow
+  // keeps genuinely progressing in the background the entire time this
+  // returns true, and becomes visible again automatically -- with no
+  // separate "resume" step anywhere -- the instant it no longer does.
+  [[nodiscard]] bool hasBlockingOrphanCleanup() const noexcept {
+    return !m_stalledProfileOrder.isEmpty() &&
+           (!m_currentProfile.has_value() ||
+            m_stalledProfileOrder.first() != m_currentProfile->profileId());
+  }
+
+  // Records |profileId| as newly (or still) durably stalled behind a
+  // failed required deletion: inserts/refreshes its diagnostic in
+  // m_profileFifoStalled and appends it to m_stalledProfileOrder if not
+  // already present (idempotent -- a repeat failure of an already-tracked
+  // profile only refreshes its stored diagnostic). Deliberately
+  // independent of m_currentProfile: an unselected or since-removed
+  // profile's own failed cleanup is tracked here exactly the same as the
+  // currently selected profile's. Because this can change what
+  // hasBlockingOrphanCleanup() above computes -- e.g. this is the first
+  // obligation ever recorded, so it immediately becomes the head an
+  // unselected/no-longer-selected profile's failure newly overrides
+  // state()/diagnostic() for the first time -- it compares the publicly
+  // EXPOSED (state(), diagnostic()) tuple before and after, and bumps
+  // m_stateRevision.mutation plus publishes via publishDirtyProperties()
+  // if -- and only if -- that exposed tuple actually changed. Creates its
+  // own local QPointer for that publish; a caller-owned QPointer to this
+  // same coordinator is independently, correctly nulled if this
+  // reentrantly triggers destruction, exactly like setState() elsewhere
+  // in this class.
+  void markProfileCleanupStalled(const QString &profileId,
+                                 const QString &failureDiagnostic);
+
+  // Clears |profileId|'s stalled-cleanup obligation (called on a Delete
+  // succeeding or reporting NotFound -- see startFrontTokenOp() -- both
+  // equally successful outcomes), removing it from both
+  // m_profileFifoStalled and m_stalledProfileOrder; a safe no-op if
+  // |profileId| was not tracked. For the same reason as
+  // markProfileCleanupStalled() above, compares the exposed (state(),
+  // diagnostic()) tuple before and after and publishes only if resolving
+  // this specific obligation changed what is externally visible -- e.g.
+  // it was the head and a NEXT obligation now becomes visible in its
+  // place, or it was the LAST outstanding obligation and the current
+  // profile's own real, already-progressed underlying state becomes
+  // visible again. Resolving a non-head obligation (one queued behind an
+  // still-unresolved earlier failure for a different profile) is
+  // deliberately silent: the head remains displayed/retried first,
+  // unaffected.
+  void clearProfileCleanupStalled(const QString &profileId);
 
   std::function<void()> m_retryAction;
 

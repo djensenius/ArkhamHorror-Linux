@@ -47,13 +47,16 @@ The current walking skeleton establishes:
   store callback can never redispatch concurrently or corrupt a later,
   unrelated operation's result. A required deletion's actionable `retry()`
   action and its visible `SecureStorageUnavailable` state are installed
-  centrally (inside the FIFO dispatcher itself, gated only on whether the
-  profile is still the one currently selected), not by the original
-  per-call continuation, so a retry does not silently become
-  un-actionable merely because the UI switched away and back (or
-  restarted) while it was outstanding. `signOut()` reserves (enqueues) its
-  durable delete FIRST and only then publishes the explicit `SigningOut`
-  state -- and only if still `SignedIn` -- so a directly-connected
+  centrally (inside the FIFO dispatcher itself, tracked per-profile
+  independent of current selection -- see "Orphan credential-cleanup
+  visibility" below), not by the original per-call continuation, so a
+  retry does not silently become un-actionable merely because the UI
+  switched away and back (or restarted) while it was outstanding, and an
+  unselected or removed profile's own failed deletion remains just as
+  visible and retryable as the current profile's. `signOut()` reserves
+  (enqueues) its durable delete FIRST and only then publishes the explicit
+  `SigningOut` state -- and only if still `SignedIn` -- so a
+  directly-connected
   reentrant observer of that transition can never cause the deletion
   itself to be dropped; once published, a reentrant or ordinary duplicate
   `signOut()` call while one is already in flight is a safe no-op rather
@@ -209,18 +212,53 @@ runs, which a purely at-rest binding check alone cannot prevent, since
 both mechanisms address different threat windows.
 
 Finally, on every profile-store reload, `SessionCoordinator` compares the
-OLD and NEW records for *every* retained profile UUID -- not only the
-selected one -- via `reconcileOtherProfileCredentialsOnReload()`. Any
-retained profile whose credential-endpoint identity changed, and any
+OLD and NEW records for *every* retained profile UUID -- including one
+that is about to become newly selected in this very reload, not only one
+that stays unselected or was already current -- via
+`reconcileAllProfileCredentialsOnReload()`, called strictly before the new
+profile list replaces the old one and before selection is ever updated.
+Any retained profile whose credential-endpoint identity changed, and any
 profile present before the reload but absent afterward (removed from
 persisted storage), has its credential epoch invalidated and a required
-deletion reserved immediately, so an unselected profile's stale,
-old-endpoint-bound (or now-orphaned) secure-store entry is proactively
-cleaned up rather than left reachable only if and when that profile is
-later selected. A name-only change to an unselected profile triggers no
-such cleanup. The selected profile's own endpoint-change detection
-remains the sole responsibility of `mutateSelectedProfile()`, so it is
-never invalidated twice for the same reload.
+deletion reserved immediately -- so a profile that both changes endpoint
+and becomes newly selected on the same reload is never skipped, and an
+unselected profile's stale, old-endpoint-bound (or now-orphaned) secure-
+store entry is proactively cleaned up rather than left reachable only if
+and when that profile is later selected. A name-only change triggers no
+such cleanup. Because this one function now covers every retained ID,
+`mutateSelectedProfile()` itself performs no credential-epoch
+invalidation of its own -- it is concerned only with observable-equality
+(display name/URL) bookkeeping for QML notification purposes -- so no ID
+is ever invalidated twice for the same reload, regardless of whether it
+was previously selected, is newly selected here, or is never selected in
+this process run.
+
+### Orphan credential-cleanup visibility, independent of selection
+
+A required deletion reserved for a profile that is *not* the one
+currently selected (an unselected endpoint change, or a profile removed
+from persisted storage entirely) must remain just as actionable as one
+for the current profile: `SessionCoordinator` tracks every profile with
+an outstanding required-deletion failure in a small FIFO-ordered list
+(`m_stalledProfileOrder`), independent of `m_profileFifoStalled`'s
+per-profile diagnostic map. Whenever this list is non-empty *and* its
+oldest (first-failed) entry is not the currently selected profile, the
+public `state()`/`diagnostic()` getters transparently report that
+obligation (`SecureStorageUnavailable` plus its diagnostic) instead of
+the current profile's own, genuinely still-progressing state -- and
+`retry()` always resolves that oldest obligation first, regardless of
+`m_currentProfile`, before ever falling back to the current profile's own
+installed retry action. This is a pure *read-time* override: the
+selected profile's own underlying state and background progress (probe,
+restore, sign-in) are never structurally paused or altered by another
+profile's failure, and become visible again automatically, with no
+separate "resume" step, the instant every such obligation clears (in FIFO
+order) -- because the override only ever masks what is read, never what
+is written. Switching profiles, restarting, or reprobing can therefore
+never silently lose or hide one of these obligations, and multiple
+simultaneous failures across different removed/unselected profiles each
+remain independently visible and retryable in the order they first
+failed.
 
 ## Prerequisites
 

@@ -31,8 +31,25 @@ SessionCoordinator::~SessionCoordinator() {
   ++m_generation;
 }
 
+SessionCoordinator::State SessionCoordinator::state() const noexcept {
+  return hasBlockingOrphanCleanup() ? State::SecureStorageUnavailable : m_state;
+}
+
+QString SessionCoordinator::diagnostic() const {
+  if (hasBlockingOrphanCleanup()) {
+    return m_profileFifoStalled.value(m_stalledProfileOrder.first());
+  }
+  return m_diagnostic;
+}
+
+// stateDescription() is a static label FOR state() (see its own Q_PROPERTY
+// NOTIFY, the same stateChanged() as state() itself), so it must switch on
+// the same possibly-overridden value state() returns -- never the raw
+// m_state -- or it could report e.g. "Signed in" while state() itself
+// simultaneously reports SecureStorageUnavailable for an orphaned
+// profile's unresolved cleanup.
 QString SessionCoordinator::stateDescription() const {
-  switch (m_state) {
+  switch (state()) {
   case State::Loading:
     return QStringLiteral("Loading");
   case State::ProbingCapabilities:
@@ -128,42 +145,24 @@ void SessionCoordinator::mutateSelectedProfile(const QString &profileId,
     // before ever reaching here, so a same-ID call that DOES reach this
     // point with different content only ever comes from a reload, never
     // from switchProfile() re-targeting itself.
+    //
+    // Credential-endpoint invalidation for THIS id (and every other
+    // retained/removed id) is handled exclusively, and unconditionally of
+    // selection, by reconcileAllProfileCredentialsOnReload(), called by
+    // start() BEFORE m_profiles is replaced and therefore strictly before
+    // this function ever runs (see its own doc comment for why the two
+    // must never both invalidate the same id). This function is left
+    // concerned only with observable-equality bookkeeping for QML
+    // notification purposes.
     const ServerProfile &previous = *m_currentProfile;
-    // hasEquivalentEndpoint() and full observable equality are
-    // deliberately DIFFERENT questions. hasEquivalentEndpoint() only
-    // decides whether a stored credential may still safely be used
-    // against the freshly loaded record (it normalises away, e.g., an
-    // explicit default port spelled out where it was previously
-    // omitted) -- it must NEVER be used to decide whether the exposed
-    // selectedProfile* getters/QML bindings have anything new to
-    // observe. baseUrl() is compared here via plain QUrl equality (the
-    // exact same encoded representation exposed by selectedProfileBaseUrl()
-    // and handed to the probe/auth client), which correctly distinguishes
-    // e.g. "https://host" from "https://host:443" even though both name
-    // the same credential-scoped endpoint.
-    const bool sameCredentialEndpoint = previous.hasEquivalentEndpoint(profile);
     const bool observableUnchanged =
         previous.displayName() == profile.displayName() &&
         previous.baseUrl() == profile.baseUrl();
     if (observableUnchanged) {
-      // A genuinely different endpoint always changes at least one of
-      // scheme/host/port/path, which the QUrl equality above would also
-      // catch, so reaching this early return already implies
-      // sameCredentialEndpoint is true: no required credential
-      // invalidation is ever silently skipped by returning here.
       return;
     }
     m_currentProfile = profile;
     ++m_selectedProfileRevision.mutation;
-    if (!sameCredentialEndpoint) {
-      // A credential stored for this profileId() was scoped to the OLD
-      // endpoint and must never be read, sent, or saved against the new
-      // one -- a credential-equivalent reload (sameCredentialEndpoint ==
-      // true above -- e.g. only the display name changed, or the port
-      // was merely spelled out explicitly) is safe to keep the existing
-      // token for and falls through without reaching this branch at all.
-      invalidateProfileCredentialForEndpointChange(profileId);
-    }
     return;
   }
   if (profileId == m_selectedProfileId) {
@@ -295,14 +294,18 @@ void SessionCoordinator::start() {
   // std::move()-ing the container invalidates iterators into it, so |it|
   // must never be dereferenced after the move below.
   const ServerProfile selectedProfile = *it;
-  // Reconcile every OTHER profile's credential against this reload BEFORE
-  // m_profiles is overwritten below, while the OLD records are still
-  // available for comparison via the current value of m_profiles itself.
-  // The selected profile's own endpoint-change detection/cleanup is
-  // handled exclusively by mutateSelectedProfile() just below (see
-  // reconcileOtherProfileCredentialsOnReload()'s own doc comment for why
-  // running both for the same ID would double-invalidate it).
-  reconcileOtherProfileCredentialsOnReload(m_profiles, profiles, selectedId);
+  // Reconcile EVERY retained/removed profile's credential against this
+  // reload BEFORE m_profiles is overwritten below, while the OLD records
+  // are still available for comparison via the current value of
+  // m_profiles itself -- and strictly before mutateSelectedProfile() just
+  // below can ever run, so a profile that is ABOUT TO become newly
+  // selected in this very reload is reconciled here too, not skipped (see
+  // reconcileAllProfileCredentialsOnReload()'s own doc comment). This
+  // ordering is what guarantees a required Delete for such a profile is
+  // always reserved ahead of any later restore Read for it, regardless of
+  // whether it was previously selected, is newly selected here, or is
+  // never selected at all in this process run.
+  reconcileAllProfileCredentialsOnReload(m_profiles, profiles);
   m_profiles = std::move(profiles);
   mutateSelectedProfile(selectedId, selectedProfile);
   if (!publishDirtyProperties(self)) {
@@ -487,10 +490,13 @@ void SessionCoordinator::startCredentialRestore() {
       };
   if (stalled) {
     // A previously-failed required deletion for this profile is still
-    // durably blocking its FIFO (see startFrontTokenOp()); retry() must
-    // resolve the deletion, not silently wait forever with no actionable
-    // feedback.
-    m_retryAction = [this, profileId] { retryStuckProfileTokenOp(profileId); };
+    // durably blocking its FIFO (see startFrontTokenOp()); retry() now
+    // always resolves the oldest outstanding deletion obligation across
+    // every profile before falling back to m_retryAction (see retry()'s
+    // own doc comment and m_stalledProfileOrder), so this profile's
+    // obligation -- already recorded there the moment it first failed --
+    // remains fully actionable via retry() without needing its own
+    // dedicated m_retryAction assignment here.
   }
 
   // Enforce at most ONE logical restore Read queued or in flight for this
@@ -960,6 +966,18 @@ void SessionCoordinator::handleSignOutDeletionResult(
 // ─── Retry ───────────────────────────────────────────────────────────────
 
 void SessionCoordinator::retry() {
+  if (!m_stalledProfileOrder.isEmpty()) {
+    // An outstanding required-deletion obligation for ANY profile always
+    // takes priority over m_retryAction below, regardless of whether that
+    // profile is currently selected: see m_stalledProfileOrder's own doc
+    // comment and retry()'s declaration in the header. Deliberately does
+    // NOT consume/touch m_retryAction here, so whatever single action it
+    // currently holds for the CURRENT profile's own, unrelated failure
+    // (if any) remains intact underneath, unaffected by this profile's
+    // resolution.
+    retryStuckProfileTokenOp(m_stalledProfileOrder.first());
+    return;
+  }
   auto action = std::exchange(m_retryAction, nullptr);
   if (action) {
     action();
@@ -1107,41 +1125,44 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
               ? QStringLiteral("A required secure-store deletion failed "
                                "and must be retried.")
               : result.diagnostic;
-      self->m_profileFifoStalled.insert(profileId, stallDiagnostic);
 
       // Copy the head op's continuation BEFORE any signal emission below:
-      // setState() emits stateChanged() synchronously, and a directly-
-      // connected handler could destroy this coordinator entirely, which
-      // would invalidate `self->m_tokenQueues` (and therefore `it`, an
-      // iterator into it) out from under us. Everything this branch still
-      // needs from the queue is captured here, up front, while `self` and
-      // `it` are both still known-good.
+      // markProfileCleanupStalled()/setState() below may emit
+      // synchronously, and a directly-connected handler could destroy
+      // this coordinator entirely, which would invalidate
+      // `self->m_tokenQueues` (and therefore `it`, an iterator into it)
+      // out from under us. Everything this branch still needs from the
+      // queue is captured here, up front, while `self` and `it` are both
+      // still known-good.
       const ITokenStore::ResultCallback onComplete = it->head().onComplete;
 
-      // Retryability for a required delete must derive from this durable
-      // per-profile FIFO/stalled state, not from whatever UI generation
-      // originally enqueued the op: an op's onComplete continuation below
-      // is a fixed closure captured once at enqueue time, so if the
-      // coordinator's generation has since moved on (e.g. the profile was
-      // switched away from and back, or start() restarted while this
-      // retry was in flight), that continuation's own generation check
-      // would otherwise silently drop the retry action forever even
-      // though this profile may still be the one currently selected. Make
-      // this profile's retry() action authoritative here instead,
-      // unconditionally, whenever it is still the current profile --
-      // regardless of |generation|. If the UI has moved to a different
-      // profile, no state is published here; the obligation itself (via
-      // m_profileFifoStalled) remains and is enforced/surfaced again by
-      // startCredentialRestore() the next time this profile becomes
-      // current.
+      // Track this profile's cleanup obligation in FIFO order,
+      // unconditionally of whether it is the coordinator's currently
+      // selected profile: this alone is what keeps an orphaned/unselected
+      // profile's failure visible (via state()/diagnostic()'s
+      // hasBlockingOrphanCleanup() override) and retryable (via retry()),
+      // survives any later start()/switchProfile() call for a *different*
+      // profile without ever being lost, and derives its retryability
+      // from this durable per-profile FIFO/stalled state rather than
+      // whatever UI generation originally enqueued the op (an op's
+      // onComplete continuation below is a fixed closure captured once at
+      // enqueue time and would otherwise silently lose the ability to
+      // retry if the coordinator's generation has since moved on -- e.g.
+      // the profile was switched away from and back, or start()
+      // restarted while this retry was in flight).
+      self->markProfileCleanupStalled(profileId, stallDiagnostic);
+      if (!self) {
+        return;
+      }
+
       if (self->m_currentProfile.has_value() &&
           self->m_currentProfile->profileId() == profileId) {
-        self->m_retryAction = [self, profileId] {
-          if (!self) {
-            return;
-          }
-          self->retryStuckProfileTokenOp(profileId);
-        };
+        // This profile's OWN flow is the one directly affected: surface
+        // the failure through its ordinary, real state too (the
+        // orphan-cleanup override above does not apply while this
+        // profile is itself the one selected -- see
+        // hasBlockingOrphanCleanup()'s doc comment), exactly as before
+        // this profile-independent tracking existed.
         self->setState(State::SecureStorageUnavailable, stallDiagnostic);
       }
 
@@ -1163,12 +1184,24 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
       return;
     }
 
-    self->m_profileFifoStalled.remove(profileId);
     TokenOp finishedOp = it->dequeue();
     const bool hasMore = !it->isEmpty();
     if (it->isEmpty()) {
       self->m_tokenQueues.erase(it);
       self->m_tokenDispatch.remove(profileId);
+    }
+    // Clear this profile's cleanup obligation (if any) only now that `it`
+    // is no longer needed for anything below: clearProfileCleanupStalled()
+    // may itself publish a notification, and a directly-connected handler
+    // could reentrantly mutate self->m_tokenQueues[profileId] again (e.g.
+    // enqueue a fresh operation), which must never be allowed to
+    // invalidate an iterator this function still depends on. `finishedOp`
+    // and `hasMore`, already captured above as plain values, remain valid
+    // regardless.
+    self->clearProfileCleanupStalled(profileId);
+    if (!self) {
+      return; // destroyed while a resolved-obligation notification was
+              // delivered
     }
     // Invoke the completed operation's continuation before starting the
     // next queued operation for this profile, so completion order always
@@ -1217,6 +1250,56 @@ void SessionCoordinator::retryStuckProfileTokenOp(const QString &profileId) {
   // still outstanding, this call is a no-op rather than a second
   // concurrent dispatch.
   startFrontTokenOp(profileId);
+}
+
+void SessionCoordinator::markProfileCleanupStalled(
+    const QString &profileId, const QString &failureDiagnostic) {
+  const State oldExposedState = state();
+  const QString oldExposedDiagnostic = diagnostic();
+  m_profileFifoStalled.insert(profileId, failureDiagnostic);
+  if (!m_stalledProfileOrder.contains(profileId)) {
+    m_stalledProfileOrder.append(profileId);
+  }
+  if (state() == oldExposedState && diagnostic() == oldExposedDiagnostic) {
+    // Either this profile was already tracked and remains behind an
+    // earlier, still-unresolved obligation for a DIFFERENT profile (which
+    // stays displayed/retried first, unaffected), or it is the currently
+    // selected profile (whose own real setState() call, made by the
+    // caller alongside this one, is what actually surfaces it -- see
+    // hasBlockingOrphanCleanup()'s doc comment). Either way, nothing
+    // externally observable changed as a direct result of THIS call.
+    return;
+  }
+  ++m_stateRevision.mutation;
+  QPointer<SessionCoordinator> self(this);
+  publishDirtyProperties(self);
+}
+
+void SessionCoordinator::clearProfileCleanupStalled(const QString &profileId) {
+  if (!m_profileFifoStalled.contains(profileId)) {
+    return; // not tracked; nothing to clear, nothing to notify
+  }
+  const State oldExposedState = state();
+  const QString oldExposedDiagnostic = diagnostic();
+  m_profileFifoStalled.remove(profileId);
+  m_stalledProfileOrder.removeOne(profileId);
+  if (state() == oldExposedState && diagnostic() == oldExposedDiagnostic) {
+    // Resolving a non-head obligation (queued behind an earlier,
+    // still-unresolved failure for a different profile) is deliberately
+    // silent: the head remains displayed/retried first, unaffected. This
+    // is also the outcome when the CURRENT profile's own stall resolves
+    // (see hasBlockingOrphanCleanup()): the caller's own success path
+    // (e.g. handleSignOutDeletionResult()) is what surfaces that via the
+    // real m_state, not this override.
+    return;
+  }
+  // This WAS the head of an orphan-cleanup override: either a NEXT
+  // obligation now becomes visible in its place, or -- if none remain --
+  // the current profile's own real, already-progressed underlying state
+  // becomes visible again, automatically, with no further action needed.
+  ++m_stateRevision.mutation;
+  QPointer<SessionCoordinator> self(this);
+  publishDirtyProperties(self);
 }
 
 void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
@@ -1309,9 +1392,9 @@ void SessionCoordinator::invalidateProfileCredentialForEndpointChange(
                  });
 }
 
-void SessionCoordinator::reconcileOtherProfileCredentialsOnReload(
+void SessionCoordinator::reconcileAllProfileCredentialsOnReload(
     const QList<ServerProfile> &previousProfiles,
-    const QList<ServerProfile> &newProfiles, const QString &selectedId) {
+    const QList<ServerProfile> &newProfiles) {
   QHash<QString, ServerProfile> previousById;
   previousById.reserve(previousProfiles.size());
   for (const ServerProfile &previous : previousProfiles) {
@@ -1323,14 +1406,6 @@ void SessionCoordinator::reconcileOtherProfileCredentialsOnReload(
   for (const ServerProfile &fresh : newProfiles) {
     const QString id = fresh.profileId();
     newIds.insert(id);
-    if (id == selectedId) {
-      // The selected profile's own endpoint-change detection and cleanup
-      // is handled exclusively by mutateSelectedProfile(), called right
-      // after this function returns (see start()); invalidating it here
-      // too would double-bump its endpoint epoch and reserve a redundant
-      // second required Delete for the very same stale token.
-      continue;
-    }
     const auto previousIt = previousById.constFind(id);
     if (previousIt == previousById.constEnd()) {
       // Brand-new or re-added ID: no prior in-memory record exists to
@@ -1348,7 +1423,7 @@ void SessionCoordinator::reconcileOtherProfileCredentialsOnReload(
 
   for (const ServerProfile &previous : previousProfiles) {
     const QString id = previous.profileId();
-    if (id == selectedId || newIds.contains(id)) {
+    if (newIds.contains(id)) {
       continue;
     }
     // Removed from persisted storage entirely: its secure-store entry (if

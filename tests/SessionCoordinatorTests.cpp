@@ -707,6 +707,24 @@ private slots:
   void staleUntrustedTokenDeleteCallbackReplayCannotCorruptSubsequentRestore();
   void diagnosticsNeverContainEndpointIdentityForBindingOutcomes();
 
+  // Centralized all-profile reconciliation covering the NEWLY selected ID
+  // (not just old-current/unselected) on a single reload.
+  void
+  newlySelectedProfileEndpointChangeInSameReloadStillReservesRequiredDeleteBeforeFreshRead();
+  void
+  newlySelectedProfileEndpointChangeQueuedNotInFlightOldReadStillBlockedByRequiredDelete();
+  void
+  multipleChangedProfilesOnReloadThatAlsoSelectsOneOfThemReserveCleanupDeterministically();
+  void
+  repeatedStartWhileNewlySelectedProfileEndpointChangeDedupesOnlyFreshRead();
+
+  // Orphan credential-cleanup-failure visibility/retry independent of
+  // current selection.
+  void
+  removedProfileDeleteFailureIsVisibleAndRetryableWhileDifferentProfileRemainsCurrent();
+  void
+  twoRemovedProfilesWithIndependentDeleteFailuresRetryFifoOrderAndStaleCallbackCannotClearWrongOne();
+
   // Destruction
   void destructionSuppressesProbeCompletion();
   void destructionSuppressesTokenStoreCompletion();
@@ -1444,11 +1462,17 @@ void SessionCoordinatorTests::
   QVERIFY(actualSelected == customProfile->profileId());
 
   // The delete now fails, arriving for a session/generation that is no
-  // longer current. It must still durably stall this profile's FIFO.
+  // longer current. It must still durably stall this profile's FIFO --
+  // and, per this round's fix, that failure must be visible/actionable
+  // even though the profile that failed is NOT the one currently
+  // selected: state()/diagnostic() report the orphaned obligation
+  // (SecureStorageUnavailable) rather than the currently-selected
+  // profile's own, genuinely still-progressing ProbingCapabilities.
   h.tokenStore.complete(profileId, backendErrorResult());
   QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
   QCOMPARE(h.coordinator->state(),
-           SessionCoordinator::State::ProbingCapabilities);
+           SessionCoordinator::State::SecureStorageUnavailable);
+  QVERIFY(h.coordinator->selectedProfileId() == customProfile->profileId());
 
   // Returning to the original profile must immediately surface the
   // still-unresolved required deletion rather than silently proceeding.
@@ -4675,7 +4699,7 @@ void SessionCoordinatorTests::
 // in-memory epoch map empty). These tests exercise SessionCoordinator's
 // reaction to the ITokenStore-level outcomes that model that durable
 // verification (BindingMismatch/LegacyUnbound/Malformed), and its
-// all-profile reload comparison (reconcileOtherProfileCredentialsOnReload).
+// all-profile reload comparison (reconcileAllProfileCredentialsOnReload).
 
 void SessionCoordinatorTests::
     restoreReadReceivesExpectedEndpointIdentityMatchingSelectedProfile() {
@@ -4951,7 +4975,7 @@ void SessionCoordinatorTests::
   // Simulates a profileId() being removed on one reload and later
   // re-added (e.g. re-imported, or re-created by the server) with a
   // DIFFERENT endpoint. Across that gap,
-  // reconcileOtherProfileCredentialsOnReload() deliberately has no prior
+  // reconcileAllProfileCredentialsOnReload() deliberately has no prior
   // in-memory record to compare against for a "new" ID (see its own doc
   // comment) -- so NO in-memory epoch ever protects this profile. Only the
   // durable per-entry envelope binding inside ITokenStore (modelled here by the
@@ -4991,7 +5015,7 @@ void SessionCoordinatorTests::
   }));
 
   // Reload 2: B is re-added under the SAME UUID with a DIFFERENT
-  // endpoint. reconcileOtherProfileCredentialsOnReload() sees this as a
+  // endpoint. reconcileAllProfileCredentialsOnReload() sees this as a
   // brand-new ID (no previous record survived reload 1's removal), so it
   // intentionally does not bump any in-memory epoch for B here.
   const auto profileB2 = ServerProfile::customWithId(
@@ -5199,11 +5223,13 @@ void SessionCoordinatorTests::
       pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
 
-  // Exactly ONE required Delete is reserved for this endpoint change:
-  // reconcileOtherProfileCredentialsOnReload() explicitly excludes the
-  // selected profile ID (see its own doc comment) so it is never
-  // double-invalidated alongside mutateSelectedProfile()'s own,
-  // independent detection of the very same endpoint change.
+  // Exactly ONE required Delete is reserved for this endpoint change, even
+  // though this profile IS the (about-to-remain) selected one:
+  // reconcileAllProfileCredentialsOnReload() now centrally covers EVERY
+  // retained ID -- including the selected one -- so mutateSelectedProfile()
+  // was deliberately stripped of its own, now-redundant endpoint-change
+  // detection to guarantee this single source of truth never
+  // double-invalidates the same change.
   QVERIFY(pumpEventsUntil(
       [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   int deleteCount = 0;
@@ -5368,6 +5394,593 @@ void SessionCoordinatorTests::
   QVERIFY(!h.coordinator->diagnostic().contains(sentinelUrl));
   QVERIFY(!h.coordinator->diagnostic().contains(
       profile->credentialEndpointIdentity()));
+}
+
+// ─── Centralized all-profile reconciliation: newly-selected ID ──────────
+//
+// reconcileAllProfileCredentialsOnReload() runs over EVERY retained ID --
+// including one that is ABOUT to become newly selected in this very
+// reload -- strictly before mutateSelectedProfile() ever assigns
+// m_currentProfile/m_selectedProfileId to it. These tests exercise the
+// exact race from review: an in-flight restore Read for a profile that
+// was PREVIOUSLY selected (then switched away from) must never be
+// rebound to a fresh continuation once that same profileId() reloads
+// with BOTH a changed endpoint AND renewed selection in one reload.
+
+void SessionCoordinatorTests::
+    newlySelectedProfileEndpointChangeInSameReloadStillReservesRequiredDeleteBeforeFreshRead() {
+  Harness h;
+  const QString idA = QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  const QString idB = QStringLiteral("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  const QString oldUrlB = QStringLiteral("https://b-old.example.test");
+  const QString newUrlB = QStringLiteral("https://b-new.example.test/app");
+  const auto profileA = ServerProfile::customWithId(
+      idA, QStringLiteral("A"), QStringLiteral("https://a.example.test"));
+  const auto profileB1 =
+      ServerProfile::customWithId(idB, QStringLiteral("B"), oldUrlB);
+  QVERIFY(profileA.has_value());
+  QVERIFY(profileB1.has_value());
+  h.profileStore.profiles = {*profileA, *profileB1};
+  h.profileStore.selectedId = idB;
+
+  // Boot with B selected: its restore Read dispatches and is held in
+  // flight (never completed).
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+  QCOMPARE(h.tokenStore.calls.first().kind, QStringLiteral("read"));
+  QCOMPARE(h.tokenStore.calls.first().profileId, idB);
+
+  // The UI switches to A while B's Read is still outstanding. B's Read is
+  // never cancelled/aborted -- it remains queued/in-flight exactly as
+  // before, now simply abandoned by selection.
+  h.coordinator->switchProfile(idA);
+  QCOMPARE(h.coordinator->selectedProfileId(), idA);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idA] { return h.tokenStore.hasPending(idA); }));
+  h.tokenStore.complete(idA, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  // ONE persisted reload both changes B's canonical endpoint AND
+  // re-selects B -- exactly the review's trigger.
+  const auto profileB2 =
+      ServerProfile::customWithId(idB, QStringLiteral("B"), newUrlB);
+  QVERIFY(profileB2.has_value());
+  h.profileStore.profiles[1] = *profileB2;
+  h.profileStore.selectedId = idB;
+  // Baseline: A's own read (call index 1) has already completed by now;
+  // only calls made from this point on are relevant to the race below.
+  const int baseline = h.tokenStore.calls.size();
+  QCOMPARE(baseline, 2);
+
+  h.coordinator->start();
+  QCOMPARE(h.coordinator->selectedProfileId(), idB);
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), newUrlB);
+
+  // The new B probe (for the NEW endpoint) completes BEFORE the old B
+  // Read ever does.
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  // Nothing new has touched the real store yet: the required Delete and
+  // any fresh Read are both merely queued behind the still-in-flight old
+  // Read.
+  QCOMPARE(h.tokenStore.calls.size(), baseline);
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  // NOW the old (stale) B Read finally completes, returning a token that
+  // was scoped to B's OLD endpoint.
+  const QString oldToken = QStringLiteral("old-b-endpoint-token");
+  h.tokenStore.complete(idB, successReadResult(oldToken));
+
+  // Zero whoami/auth requests of any kind may ever carry this token: the
+  // stale Read's own (permanently superseded-generation) continuation
+  // must discard it. The required Delete for B's old-endpoint token
+  // dispatches next.
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), baseline + 1);
+  QCOMPARE(h.tokenStore.calls.at(baseline).kind, QStringLiteral("delete"));
+  QCOMPARE(h.tokenStore.calls.at(baseline).profileId, idB);
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  // The required Delete succeeds...
+  h.tokenStore.complete(idB, successWriteResult());
+
+  // ...and ONLY NOW does a distinct FRESH Read (for B's new endpoint)
+  // ever dispatch.
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), baseline + 2);
+  QCOMPARE(h.tokenStore.calls.at(baseline + 1).kind, QStringLiteral("read"));
+  QCOMPARE(h.tokenStore.calls.at(baseline + 1).endpointIdentity,
+           profileB2->credentialEndpointIdentity());
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  const QString newToken = QStringLiteral("new-b-endpoint-token");
+  h.tokenStore.complete(idB, successReadResult(newToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::WhoAmI);
+  QVERIFY(h.authClient.calls.first().token == newToken);
+  QCOMPARE(h.authClient.calls.first().profile.baseUrl().toString(), newUrlB);
+  h.authClient.completeUser(
+      1,
+      userSuccess(QStringLiteral("ivan"), QStringLiteral("ivan@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+}
+
+void SessionCoordinatorTests::
+    newlySelectedProfileEndpointChangeQueuedNotInFlightOldReadStillBlockedByRequiredDelete() {
+  // Same trigger, but B's stale Read is only QUEUED (never yet
+  // dispatched to the real store) at the moment of the reload, because a
+  // required Delete for B (from an earlier, already-resolved sign-out)
+  // occupies the FIFO head. The centralized reconciliation must still
+  // reserve exactly one NEW required Delete for the endpoint change
+  // behind that stale queued Read, never in front of it.
+  Harness h;
+  const QString idA = QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  const QString idB = QStringLiteral("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  const QString oldUrlB = QStringLiteral("https://b-old.example.test");
+  const QString newUrlB = QStringLiteral("https://b-new.example.test");
+  const auto profileA = ServerProfile::customWithId(
+      idA, QStringLiteral("A"), QStringLiteral("https://a.example.test"));
+  const auto profileB1 =
+      ServerProfile::customWithId(idB, QStringLiteral("B"), oldUrlB);
+  QVERIFY(profileA.has_value());
+  QVERIFY(profileB1.has_value());
+  h.profileStore.profiles = {*profileA, *profileB1};
+  h.profileStore.selectedId = idB;
+  bootToSignedIn(h, QStringLiteral("b-token"));
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+  const int authBaseline = h.authClient.calls.size();
+
+  // Sign out while B is selected: this dispatches a Delete (which we hold
+  // in flight -- never completed) and queues a fresh restore Read behind
+  // it.
+  h.coordinator->signOut();
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
+
+  // Switch to A while B's Delete is in flight and B's restore Read is
+  // merely queued behind it (never dispatched).
+  h.coordinator->switchProfile(idA);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idA] { return h.tokenStore.hasPending(idA); }));
+  h.tokenStore.complete(idA, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  // ONE reload both changes B's endpoint and re-selects B, while B's
+  // sign-out Delete is STILL in flight and its queued restore Read has
+  // STILL never dispatched.
+  const auto profileB2 =
+      ServerProfile::customWithId(idB, QStringLiteral("B"), newUrlB);
+  QVERIFY(profileB2.has_value());
+  h.profileStore.profiles[1] = *profileB2;
+  h.profileStore.selectedId = idB;
+  const int baseline = h.tokenStore.calls.size();
+  h.coordinator->start();
+  QCOMPARE(h.coordinator->selectedProfileId(), idB);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+
+  // No new store call is dispatched yet: B's original sign-out Delete is
+  // still occupying the FIFO head. The endpoint-change required Delete
+  // and the fresh Read are both merely queued behind it, never
+  // dispatched early.
+  QCOMPARE(h.tokenStore.calls.size(), baseline);
+
+  // The original sign-out Delete completes...
+  h.tokenStore.complete(idB, successWriteResult());
+  // ...and the endpoint-change required Delete dispatches next -- NOT the
+  // stale queued restore Read.
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), baseline + 1);
+  QCOMPARE(h.tokenStore.calls.at(baseline).kind, QStringLiteral("delete"));
+  QCOMPARE(h.authClient.calls.size(), authBaseline);
+  h.tokenStore.complete(idB, notFoundResult());
+
+  // Only now does a fresh Read (for B's new endpoint) ever dispatch.
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), baseline + 2);
+  QCOMPARE(h.tokenStore.calls.at(baseline + 1).kind, QStringLiteral("read"));
+  QCOMPARE(h.tokenStore.calls.at(baseline + 1).endpointIdentity,
+           profileB2->credentialEndpointIdentity());
+  h.tokenStore.complete(idB, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QCOMPARE(h.authClient.calls.size(), authBaseline);
+}
+
+void SessionCoordinatorTests::
+    multipleChangedProfilesOnReloadThatAlsoSelectsOneOfThemReserveCleanupDeterministically() {
+  // Multiple profiles change endpoint on the same reload, one of them
+  // (C) also becoming newly selected in that same reload. Every changed
+  // ID must reserve exactly one required Delete, processed in
+  // deterministic (persisted-list) order, regardless of which one is
+  // about to become selected.
+  Harness h;
+  const QString idA = QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  const QString idB = QStringLiteral("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  const QString idC = QStringLiteral("cccccccc-cccc-cccc-cccc-cccccccccccc");
+  const auto profileA = ServerProfile::customWithId(
+      idA, QStringLiteral("A"), QStringLiteral("https://a.example.test"));
+  const auto profileB1 = ServerProfile::customWithId(
+      idB, QStringLiteral("B"), QStringLiteral("https://b-old.example.test"));
+  const auto profileC1 = ServerProfile::customWithId(
+      idC, QStringLiteral("C"), QStringLiteral("https://c-old.example.test"));
+  QVERIFY(profileA.has_value());
+  QVERIFY(profileB1.has_value());
+  QVERIFY(profileC1.has_value());
+  h.profileStore.profiles = {*profileA, *profileB1, *profileC1};
+  h.profileStore.selectedId = idA;
+  h.bootToSignedOut();
+  QCOMPARE(h.tokenStore.calls.size(), 1); // only A touched so far.
+
+  const auto profileB2 = ServerProfile::customWithId(
+      idB, QStringLiteral("B"), QStringLiteral("https://b-new.example.test"));
+  const auto profileC2 = ServerProfile::customWithId(
+      idC, QStringLiteral("C"), QStringLiteral("https://c-new.example.test"));
+  QVERIFY(profileB2.has_value());
+  QVERIFY(profileC2.has_value());
+  // Both B and C change endpoint; C ALSO becomes newly selected; A is
+  // unchanged and stays deselected.
+  h.profileStore.profiles = {*profileA, *profileB2, *profileC2};
+  h.profileStore.selectedId = idC;
+
+  h.coordinator->start();
+  QCOMPARE(h.coordinator->selectedProfileId(), idC);
+  // Both B and C reserve exactly one required Delete each, dispatched in
+  // persisted-list order (B before C) -- deterministic regardless of
+  // which one is newly selected.
+  QVERIFY(h.tokenStore.hasPending(idB));
+  QVERIFY(h.tokenStore.hasPending(idC));
+  int bDeletes = 0;
+  int cDeletes = 0;
+  int firstDeleteIndexB = -1;
+  int firstDeleteIndexC = -1;
+  for (int i = 0; i < h.tokenStore.calls.size(); ++i) {
+    const auto &call = h.tokenStore.calls.at(i);
+    if (call.profileId == idB) {
+      QCOMPARE(call.kind, QStringLiteral("delete"));
+      ++bDeletes;
+      if (firstDeleteIndexB < 0) {
+        firstDeleteIndexB = i;
+      }
+    }
+    if (call.profileId == idC) {
+      QCOMPARE(call.kind, QStringLiteral("delete"));
+      ++cDeletes;
+      if (firstDeleteIndexC < 0) {
+        firstDeleteIndexC = i;
+      }
+    }
+  }
+  QCOMPARE(bDeletes, 1);
+  QCOMPARE(cDeletes, 1);
+  QVERIFY(firstDeleteIndexB < firstDeleteIndexC);
+
+  // C's own selection/probe/restore must not proceed ahead of its own
+  // required Delete: no whoami/auth call may exist yet.
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  h.tokenStore.complete(idB, notFoundResult());
+  h.tokenStore.complete(idC, successWriteResult());
+
+  // C's fresh restore Read (for its NEW endpoint) only dispatches after
+  // its own required Delete resolves, once C's own probe (dispatched
+  // for the newly-selected profile) also completes.
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idC] {
+    return h.tokenStore.calls.size() == 4 &&
+           h.tokenStore.calls.last().profileId == idC;
+  }));
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("read"));
+  QCOMPARE(h.tokenStore.calls.last().endpointIdentity,
+           profileC2->credentialEndpointIdentity());
+  h.tokenStore.complete(idC, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QVERIFY(h.authClient.calls.isEmpty());
+}
+
+void SessionCoordinatorTests::
+    repeatedStartWhileNewlySelectedProfileEndpointChangeDedupesOnlyFreshRead() {
+  // Once the newly-selected profile's stale Read/required-Delete/fresh-
+  // Read chain is established, calling start() again repeatedly must
+  // dedupe: no additional stale Read is created, and at most one fresh
+  // (current-epoch) restore Read is ever queued for it.
+  Harness h;
+  const QString idA = QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  const QString idB = QStringLiteral("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  const QString oldUrlB = QStringLiteral("https://b-old.example.test");
+  const QString newUrlB = QStringLiteral("https://b-new.example.test");
+  const auto profileA = ServerProfile::customWithId(
+      idA, QStringLiteral("A"), QStringLiteral("https://a.example.test"));
+  const auto profileB1 =
+      ServerProfile::customWithId(idB, QStringLiteral("B"), oldUrlB);
+  QVERIFY(profileA.has_value());
+  QVERIFY(profileB1.has_value());
+  h.profileStore.profiles = {*profileA, *profileB1};
+  h.profileStore.selectedId = idB;
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), 1); // stale old Read, held in flight
+
+  h.coordinator->switchProfile(idA);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idA] { return h.tokenStore.hasPending(idA); }));
+  h.tokenStore.complete(idA, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  const auto profileB2 =
+      ServerProfile::customWithId(idB, QStringLiteral("B"), newUrlB);
+  QVERIFY(profileB2.has_value());
+  h.profileStore.profiles[1] = *profileB2;
+  h.profileStore.selectedId = idB;
+  const int baseline = h.tokenStore.calls.size();
+
+  // Call start() repeatedly for the same reload -- each call re-derives
+  // the same (already-applied) endpoint change; it must not reserve a
+  // second required Delete nor enqueue a second fresh Read.
+  h.coordinator->start();
+  h.coordinator->start();
+  h.coordinator->start();
+  QCOMPARE(h.coordinator->selectedProfileId(), idB);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), baseline); // still only the stale Read
+
+  h.tokenStore.complete(idB, notFoundResult()); // stale Read resolves inertly
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), baseline + 1);
+  QCOMPARE(h.tokenStore.calls.at(baseline).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(idB, successWriteResult());
+
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.size(), baseline + 2);
+  QCOMPARE(h.tokenStore.calls.at(baseline + 1).kind, QStringLiteral("read"));
+  h.tokenStore.complete(idB, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  // Exactly one fresh Read for B's NEW endpoint, despite three redundant
+  // start() calls (the one earlier stale Read, for the OLD endpoint, is
+  // the only other read ever issued for B).
+  int freshReadsForB = 0;
+  for (int i = baseline; i < h.tokenStore.calls.size(); ++i) {
+    if (h.tokenStore.calls.at(i).profileId == idB &&
+        h.tokenStore.calls.at(i).kind == QStringLiteral("read")) {
+      ++freshReadsForB;
+    }
+  }
+  QCOMPARE(freshReadsForB, 1);
+}
+
+// ─── Orphan credential-cleanup-failure visibility independent of
+// current selection ───────────────────────────────────────────────────────
+//
+// A required Delete's failure must be visible/actionable via
+// state()/diagnostic() and retry() even when the profile that failed is
+// NOT the one currently selected -- tracked via m_stalledProfileOrder,
+// surfaced by hasBlockingOrphanCleanup() only while it is non-empty and
+// its head differs from the current selection (see state()/diagnostic()
+// and markProfileCleanupStalled()/clearProfileCleanupStalled() in
+// SessionCoordinator.cpp for the exact mechanism).
+
+void SessionCoordinatorTests::
+    removedProfileDeleteFailureIsVisibleAndRetryableWhileDifferentProfileRemainsCurrent() {
+  Harness h;
+  const QString idA = QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  const QString idB = QStringLiteral("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  const auto profileA = ServerProfile::customWithId(
+      idA, QStringLiteral("A"), QStringLiteral("https://a.example.test"));
+  const auto profileB = ServerProfile::customWithId(
+      idB, QStringLiteral("B"), QStringLiteral("https://b.example.test"));
+  QVERIFY(profileA.has_value());
+  QVERIFY(profileB.has_value());
+  h.profileStore.profiles = {*profileA, *profileB};
+  h.profileStore.selectedId = idA;
+  h.bootToSignedOut();
+  QCOMPARE(h.tokenStore.calls.size(), 1); // only A's own restore so far.
+
+  // B is removed from persisted storage while A remains selected: its
+  // orphaned secure entry is proactively, durably deleted.
+  h.profileStore.profiles = {*profileA};
+  h.coordinator->start();
+  QVERIFY(h.tokenStore.hasPending(idB));
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
+  QCOMPARE(h.tokenStore.calls.last().profileId, idB);
+
+  // The Delete for the REMOVED, non-current profile fails. This must be
+  // visible via state()/diagnostic() -- not silently swallowed just
+  // because A (not B) is the current selection.
+  h.tokenStore.complete(idB, backendErrorResult());
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+  QVERIFY(!h.coordinator->diagnostic().isEmpty());
+  // The actual selection is untouched by this override.
+  QCOMPARE(h.coordinator->selectedProfileId(), idA);
+
+  // Switching away and back, and calling start() again, must not lose
+  // this obligation. Restarting A's own flow (a side effect of start()
+  // unconditionally re-probing the current profile) must still be
+  // allowed to proceed normally in the background -- it is only its
+  // VISIBILITY that the still-pending B obligation masks.
+  h.coordinator->start();
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+  QCOMPARE(h.coordinator->selectedProfileId(), idA);
+  // No duplicate Delete dispatch was created by the repeated start().
+  int bDeleteCount = 0;
+  for (const auto &call : h.tokenStore.calls) {
+    if (call.profileId == idB) {
+      ++bDeleteCount;
+    }
+  }
+  QCOMPARE(bDeleteCount, 1);
+
+  // Let A's own (masked, but still genuinely progressing) restart reach
+  // SignedOut in the background.
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idA] { return h.tokenStore.hasPending(idA); }));
+  h.tokenStore.complete(idA, notFoundResult());
+  // A's real underlying state is now SignedOut, but it stays masked:
+  // the still-unresolved B obligation is still the oldest/head one.
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+
+  // retry() targets the exact orphaned profile (B), not A's own
+  // (unrelated, already-resolved) flow.
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
+  QCOMPARE(h.tokenStore.calls.last().profileId, idB);
+
+  // Repeated failure stays actionable -- it does not silently clear or
+  // get replaced.
+  h.tokenStore.complete(idB, backendErrorResult());
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+
+  // A final retry succeeds: the obligation clears, and A's own
+  // already-progressed flow (which was never structurally blocked in the
+  // background) becomes visible/resumes.
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  h.tokenStore.complete(idB, successWriteResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QVERIFY(h.authClient.calls.isEmpty());
+  QCOMPARE(h.coordinator->selectedProfileId(), idA);
+}
+
+void SessionCoordinatorTests::
+    twoRemovedProfilesWithIndependentDeleteFailuresRetryFifoOrderAndStaleCallbackCannotClearWrongOne() {
+  Harness h;
+  const QString idA = QStringLiteral("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  const QString idB = QStringLiteral("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  const QString idC = QStringLiteral("cccccccc-cccc-cccc-cccc-cccccccccccc");
+  const auto profileA = ServerProfile::customWithId(
+      idA, QStringLiteral("A"), QStringLiteral("https://a.example.test"));
+  const auto profileB = ServerProfile::customWithId(
+      idB, QStringLiteral("B"), QStringLiteral("https://b.example.test"));
+  const auto profileC = ServerProfile::customWithId(
+      idC, QStringLiteral("C"), QStringLiteral("https://c.example.test"));
+  QVERIFY(profileA.has_value());
+  QVERIFY(profileB.has_value());
+  QVERIFY(profileC.has_value());
+  h.profileStore.profiles = {*profileA, *profileB, *profileC};
+  h.profileStore.selectedId = idA;
+  h.bootToSignedOut();
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  // Both B and C are removed on the same reload; A remains selected.
+  // This restart also causes A's own (unrelated) capability probe to
+  // reissue -- drain and complete it here so A's own background progress
+  // is not confused with this test's B/C-focused assertions below.
+  h.profileStore.profiles = {*profileA};
+  h.coordinator->start();
+  QVERIFY(h.tokenStore.hasPending(idB));
+  QVERIFY(h.tokenStore.hasPending(idC));
+  QCOMPARE(h.tokenStore.calls.size(),
+           3); // A's earlier read, B delete, C delete
+  QCOMPARE(h.tokenStore.calls.at(1).profileId, idB);
+  QCOMPARE(h.tokenStore.calls.at(2).profileId, idC);
+
+  // Both fail independently.
+  h.tokenStore.complete(idB, backendErrorResult());
+  h.tokenStore.complete(idC, backendErrorResult());
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+  QCOMPARE(h.coordinator->selectedProfileId(), idA);
+
+  // Let A's own (masked, but still genuinely progressing) restart reach
+  // SignedOut in the background, so it is ready to become visible again
+  // the instant both B and C's obligations resolve below.
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h, idA] { return h.tokenStore.hasPending(idA); }));
+  h.tokenStore.complete(idA, notFoundResult());
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+
+  // retry() must resolve B (the FIFO head, first to fail) before C: a
+  // stale replayed callback for the already-completed FIRST B attempt
+  // must not clear C's still-pending obligation, nor B's own NEW attempt.
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, idB] { return h.tokenStore.hasPending(idB); }));
+  QCOMPARE(h.tokenStore.calls.last().profileId, idB);
+  QVERIFY(!h.tokenStore.hasPending(idC)); // C's retry has not begun yet
+
+  // Replay B's FIRST (already-completed, stale) failure callback: this
+  // must be inert -- it cannot corrupt B's new in-flight retry attempt,
+  // nor clear any obligation.
+  h.tokenStore.replayLastCompletion(idB);
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+  QVERIFY(h.tokenStore.hasPending(idB)); // B's genuine new attempt unaffected
+
+  // B's genuine new retry attempt now succeeds: B's obligation clears,
+  // but C's independent obligation remains, still fully visible.
+  h.tokenStore.complete(idB, successWriteResult());
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+
+  // retry() now targets C.
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, idC] { return h.tokenStore.hasPending(idC); }));
+  QCOMPARE(h.tokenStore.calls.last().profileId, idC);
+  h.tokenStore.complete(idC, successWriteResult());
+
+  // Both obligations resolved: A's own already-progressed flow becomes
+  // visible/resumes.
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QVERIFY(h.authClient.calls.isEmpty());
+  QCOMPARE(h.coordinator->selectedProfileId(), idA);
 }
 
 // ─── Secret-free diagnostics ──────────────────────────────────────────────
