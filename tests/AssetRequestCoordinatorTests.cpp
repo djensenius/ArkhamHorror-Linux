@@ -25,8 +25,14 @@ QByteArray encodePng(int width, int height) {
   QBuffer buffer(&bytes);
   buffer.open(QIODevice::WriteOnly);
   const bool ok = image.save(&buffer, "png");
-  Q_ASSERT(ok);
-  Q_UNUSED(ok);
+  // Copilot review: Q_ASSERT compiles out in release builds, which would
+  // silently turn a fixture-encoding failure here into a confusing
+  // downstream test failure instead of a clear, immediate diagnosis.
+  // qFatal() is enforced in every build configuration.
+  if (!ok) {
+    qFatal("encodePng() failed to encode a %dx%d test fixture image", width,
+           height);
+  }
   return bytes;
 }
 

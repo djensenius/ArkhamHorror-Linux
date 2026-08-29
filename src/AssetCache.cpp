@@ -47,19 +47,32 @@ constexpr qint64 kMaxSinglePayloadBytesOnDisk = 20LL * 1024 * 1024;
 constexpr qint64 kMaxMetadataBytesOnDisk = 64 * 1024;
 
 // Verifies `payloadFile`'s on-disk size against `expectedSize` (from
-// metadata) and an absolute hard ceiling BEFORE ever calling readAll().
-// A corrupted, truncated, or locally-planted payload file can be
-// arbitrarily large; blindly loading it into memory just to discover a
-// size mismatch afterward is itself an unbounded-allocation / DoS
-// surface, so this rejects on the cheap stat alone whenever the file
-// cannot possibly be a valid entry, never touching its contents.
+// metadata) and an absolute hard ceiling BEFORE ever calling read(), THEN
+// reads at most `expectedSize + 1` bytes rather than trusting the
+// earlier size() stat and calling readAll(): a corrupted, truncated, or
+// locally-planted payload file can change size between the stat above
+// and the read below (e.g. concurrent local tampering, or a special
+// file whose size() cannot be trusted), so bounding the read itself --
+// not just the pre-read stat -- is what actually prevents an unbounded
+// allocation here. Reading exactly one byte more than `expectedSize`
+// lets a file that grew past the expected size be rejected by comparing
+// the actual byte count read against `expectedSize`, without ever
+// allocating for more than `expectedSize + 1` bytes regardless of what
+// the file claims or how large it has become.
 std::optional<QByteArray> readVerifiedPayload(QFile &payloadFile,
                                               qint64 expectedSize) {
   if (expectedSize < 0 || expectedSize > kMaxSinglePayloadBytesOnDisk ||
       payloadFile.size() != expectedSize) {
     return std::nullopt;
   }
-  return payloadFile.readAll();
+  const QByteArray bytes = payloadFile.read(expectedSize + 1);
+  if (bytes.size() != expectedSize) {
+    // Either short (truncated mid-read) or exactly expectedSize + 1 (the
+    // file grew since the size() check above) -- neither is the exact,
+    // verified payload this cache promises to serve.
+    return std::nullopt;
+  }
+  return bytes;
 }
 
 // Every valid entry filename matches exactly this shape: a 64-character
@@ -162,14 +175,28 @@ AssetCache::readMetadata(const QString &key) const {
   if (!file.open(QIODevice::ReadOnly)) {
     return std::nullopt;
   }
-  // Reject on the cheap stat alone, before ever calling readAll(): see
+  // Reject on the cheap stat alone, before ever calling read(): see
   // kMaxMetadataBytesOnDisk's comment above. A corrupted or
   // locally-planted metadata file can claim an arbitrary size regardless
   // of what its (if any) JSON content actually is.
   if (file.size() < 0 || file.size() > kMaxMetadataBytesOnDisk) {
     return std::nullopt;
   }
-  const QByteArray raw = file.readAll();
+  // Copilot review: bound the READ itself, not just the preceding stat --
+  // readAll() would trust file.size() implicitly, but the file can grow
+  // between the stat above and this read (concurrent local tampering, or
+  // a special file whose size() cannot be trusted). Reading at most
+  // kMaxMetadataBytesOnDisk + 1 bytes means this can never allocate more
+  // than that regardless of how large the file has actually become by
+  // the time this read runs; a JSON document can never legitimately need
+  // the extra byte, so no valid metadata file is ever affected.
+  const QByteArray raw = file.read(kMaxMetadataBytesOnDisk + 1);
+  if (raw.size() > kMaxMetadataBytesOnDisk) {
+    // The file grew past the cap between the stat above and this read --
+    // fail closed rather than attempting to parse a file this large as
+    // JSON.
+    return std::nullopt;
+  }
   const QJsonDocument doc = QJsonDocument::fromJson(raw);
   if (!doc.isObject()) {
     return std::nullopt;

@@ -24,16 +24,30 @@ QByteArray encodeImage(int width, int height, const char *format) {
   QBuffer buffer(&bytes);
   buffer.open(QIODevice::WriteOnly);
   const bool ok = image.save(&buffer, format);
-  Q_ASSERT(ok);
-  Q_UNUSED(ok);
+  // Copilot review: Q_ASSERT compiles out in release builds, which would
+  // silently turn a fixture-encoding failure here into a confusing
+  // downstream test failure (an empty/garbage `bytes` fed to the fetcher)
+  // instead of a clear, immediate diagnosis. qFatal() is enforced in
+  // every build configuration.
+  if (!ok) {
+    qFatal("encodeImage() failed to encode a %dx%d test fixture image as "
+           "%s",
+           width, height, format);
+  }
   return bytes;
 }
 
 using Outcome = AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult>;
 
 // Fetches synchronously (from the test's point of view) by pumping the
-// event loop until the callback fires or `timeoutMs` elapses. Returns
-// std::nullopt on a timeout (a test bug, never an expected outcome).
+// event loop until the callback fires or `timeoutMs` elapses. A timeout
+// here is always a test bug, never an expected outcome -- rather than
+// returning std::nullopt and relying on every call site to check
+// has_value() before dereferencing (a silent crash risk for any call
+// site that ever forgot to), aborts deterministically via qFatal(),
+// enforced in every build configuration, exactly like this test suite's
+// other "must never silently continue" invariants (see
+// MockHttpServer::run()'s qFatal() on listen failure).
 std::optional<Outcome>
 fetchAndWait(AssetNetworkFetcher &fetcher, const QUrl &url, AssetFormat format,
              AssetNetworkFetcher::ConditionalHeaders conditional = {},
@@ -41,7 +55,11 @@ fetchAndWait(AssetNetworkFetcher &fetcher, const QUrl &url, AssetFormat format,
   std::optional<Outcome> result;
   fetcher.fetch(url, format, conditional,
                 [&result](Outcome outcome) { result = std::move(outcome); });
-  (void)QTest::qWaitFor([&result]() { return result.has_value(); }, timeoutMs);
+  if (!QTest::qWaitFor([&result]() { return result.has_value(); }, timeoutMs)) {
+    qFatal("fetchAndWait() timed out after %dms waiting for the fetch "
+           "callback to fire",
+           timeoutMs);
+  }
   return result;
 }
 
