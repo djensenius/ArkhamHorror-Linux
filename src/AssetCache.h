@@ -47,6 +47,21 @@ namespace Arkham {
 // by reapAndEnforceQuota(), which evicts oldest-access entries once disk
 // usage exceeds the 90% high-water mark, down to the 75% low-water mark.
 // Quota accounting always sums payload + metadata file sizes together.
+//
+// Symlink safety: a configured cache directory that is ALREADY a symlink
+// at construction time is rejected outright -- disk I/O is disabled for
+// this instance's entire lifetime (m_diskCacheDisabled), so nothing is
+// ever read, written, or deleted through it. Within an otherwise-genuine
+// cache directory (which this class exclusively owns), the periodic
+// repair sweep (reapAndEnforceQuota()) never follows a symlink to decide
+// whether to recurse into it: a symlink node found directly inside the
+// cache root is unlinked itself (its target is never touched), and any
+// genuine subdirectory is removed using descriptor-relative, no-follow
+// primitives (openat/fstatat.../unlinkat with O_NOFOLLOW/
+// AT_SYMLINK_NOFOLLOW; see safeRemoveTree() in the .cpp) so that neither
+// the original listing nor a symlink substituted in afterwards (a
+// rename/replace race) can ever cause a deletion to escape outside this
+// cache's own real files and directories.
 class AssetCache {
 public:
   struct Config {
@@ -165,6 +180,15 @@ public:
   [[nodiscard]] qint64 diskUsageBytes() const;
   [[nodiscard]] int diskEntryCount() const;
 
+  // True if disk I/O has been permanently disabled for this instance
+  // because the configured cache directory was already a symlink at
+  // construction time (see the constructor / class comment). Exposed
+  // only so tests can assert the disabled state directly rather than
+  // inferring it indirectly.
+  [[nodiscard]] bool isDiskCacheDisabledForTesting() const {
+    return m_diskCacheDisabled;
+  }
+
 private:
   struct DiskMetadata {
     QString key;
@@ -187,6 +211,7 @@ private:
   readMetadata(const QString &key) const;
   void deleteEntry(const QString &key) const;
 
+  bool m_diskCacheDisabled{false};
   Config m_config;
   QString m_directory;
   mutable QMutex m_mutex;

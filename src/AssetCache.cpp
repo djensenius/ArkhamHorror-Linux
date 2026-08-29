@@ -17,6 +17,14 @@
 #include <utility>
 #include <vector>
 
+#if defined(Q_OS_UNIX)
+#include <cerrno>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 using namespace Qt::StringLiterals;
 
 namespace Arkham {
@@ -107,6 +115,98 @@ QString defaultCacheDirectory() {
   return base + QStringLiteral("/assets/v1");
 }
 
+#if defined(Q_OS_UNIX)
+// Descriptor-relative, no-follow recursive delete (review item 7): every
+// decision about whether an entry is a directory to recurse into, a file
+// to unlink, or a symlink node to unlink-but-never-follow is made via
+// fstatat(..., AT_SYMLINK_NOFOLLOW) -- an lstat-equivalent that never
+// resolves the final path component -- and every actual filesystem
+// mutation (openat/unlinkat) is relative to an already-open directory
+// file descriptor rather than a re-resolved path string. Critically,
+// descending into a subdirectory uses openat(..., O_NOFOLLOW): if the
+// entry was replaced by a symlink between the fstatat() check above and
+// this open (a rename/replace TOCTOU race), the open itself fails
+// (ELOOP) rather than silently following the attacker-controlled
+// indirection -- there is no window in which a path string is
+// re-resolved from the filesystem root.
+//
+// A symlink node encountered anywhere in the tree is unlinked (removed)
+// itself; its target, wherever it points, is NEVER opened, stat'd
+// through, or touched in any way. A hard-linked regular file is just an
+// ordinary directory entry here: unlinkat() drops only that one link,
+// never recursing into or otherwise treating a hardlink specially.
+bool safeRemoveEntryAt(int parentFd, const char *name);
+
+bool safeRemoveDirectoryContentsAt(int dirFd) {
+  DIR *dirStream = fdopendir(dirFd);
+  if (!dirStream) {
+    ::close(dirFd);
+    return false;
+  }
+  bool allOk = true;
+  errno = 0;
+  while (struct dirent *entry = readdir(dirStream)) {
+    if (qstrcmp(entry->d_name, ".") == 0 || qstrcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+    if (!safeRemoveEntryAt(dirFd, entry->d_name)) {
+      allOk = false;
+    }
+    errno = 0;
+  }
+  closedir(dirStream); // also closes dirFd
+  return allOk;
+}
+
+bool safeRemoveEntryAt(int parentFd, const char *name) {
+  struct stat st{};
+  if (fstatat(parentFd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+    return errno == ENOENT; // already gone: nothing left to do
+  }
+  if (S_ISDIR(st.st_mode)) {
+    const int childFd =
+        openat(parentFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (childFd < 0) {
+      // Either genuinely not a directory anymore (replaced by a
+      // symlink between the fstatat() above and here) or some other
+      // open failure -- either way, refuse to proceed rather than
+      // guessing.
+      return false;
+    }
+    if (!safeRemoveDirectoryContentsAt(childFd)) {
+      return false;
+    }
+    return unlinkat(parentFd, name, AT_REMOVEDIR) == 0 || errno == ENOENT;
+  }
+  // A regular file, or a symlink node itself (S_ISLNK): unlinkat()
+  // without AT_REMOVEDIR removes the directory ENTRY, never resolving or
+  // following it even when it names a symlink.
+  return unlinkat(parentFd, name, 0) == 0 || errno == ENOENT;
+}
+#endif
+
+// Removes `path` (expected to be a directory) and everything under it,
+// using the no-follow descriptor-relative primitives above. Refuses
+// outright (a safe no-op) if `path` itself is a symlink, is not a
+// directory, or does not exist -- see safeRemoveEntryAt()'s comment for
+// the full rationale. On a hypothetical platform with no such
+// primitives available, this is a safe no-op rather than risking a
+// follow-through-symlink recursive delete.
+void safeRemoveTree(const QString &path) {
+#if defined(Q_OS_UNIX)
+  const QByteArray pathUtf8 = QFile::encodeName(path);
+  const int fd = ::open(pathUtf8.constData(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    return;
+  }
+  safeRemoveDirectoryContentsAt(fd); // closes fd
+  ::rmdir(pathUtf8.constData());
+#else
+  Q_UNUSED(path);
+#endif
+}
+
 } // namespace
 
 AssetCache::AssetCache(Config config)
@@ -114,7 +214,19 @@ AssetCache::AssetCache(Config config)
       m_memory(new QCache<QString, CachedEntry>()) {
   m_directory = m_config.directory.isEmpty() ? defaultCacheDirectory()
                                              : m_config.directory;
-  QDir().mkpath(m_directory);
+  // Review item 7: if the configured cache directory ALREADY exists as a
+  // symlink, refuse to use it at all -- never mkpath() through it (which
+  // would silently follow the symlink and start writing at whatever it
+  // points to), and never let any later store()/lookupDisk()/reap call
+  // touch it either. QFileInfo::isSymLink() (unlike QDir::exists(), which
+  // follows) reports the entry's own type without resolving it. The
+  // memory cache still works normally -- only disk persistence is
+  // disabled for this instance's entire lifetime.
+  if (QFileInfo(m_directory).isSymLink()) {
+    m_diskCacheDisabled = true;
+  } else {
+    QDir().mkpath(m_directory);
+  }
   m_memory->setMaxCost(m_config.memoryMaxCostBytes);
   reapAndEnforceQuota();
 }
@@ -228,6 +340,9 @@ AssetCache::readMetadata(const QString &key) const {
 }
 
 void AssetCache::deleteEntry(const QString &key) const {
+  if (m_diskCacheDisabled) {
+    return;
+  }
   QFile::remove(payloadPath(key));
   QFile::remove(metadataPath(key));
 }
@@ -238,6 +353,12 @@ AssetCache::lookupDisk(const QString &key) {
   // reason to touch the filesystem at all if the entry is already resident.
   if (auto memoryHit = lookupMemory(key)) {
     return memoryHit;
+  }
+
+  if (m_diskCacheDisabled) {
+    // Review item 7: the configured root was itself a symlink at
+    // construction time -- never read through it.
+    return std::nullopt;
   }
 
   if (!isValidKey(key)) {
@@ -364,7 +485,10 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
     // future caller invoking store() directly with an oversized entry.
     // The memory insert above is unaffected -- QCache's own cost-based
     // eviction already bounds memory usage independently of disk.
-    if (entry.encodedBytes.size() <= kMaxSinglePayloadBytesOnDisk) {
+    if (m_diskCacheDisabled) {
+      // Review item 7: root was a symlink at construction. Memory
+      // insert above still happened -- only the disk write is skipped.
+    } else if (entry.encodedBytes.size() <= kMaxSinglePayloadBytesOnDisk) {
       // Publication order matters for crash-consistency: write the
       // payload FIRST via QSaveFile (atomic for that one file), and only
       // once that commit succeeds, write the metadata that "vouches for"
@@ -414,7 +538,7 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
   // process start.
   const qint64 highWaterMark =
       static_cast<qint64>(m_config.diskMaxBytes * kHighWaterMarkFraction);
-  if (diskUsageBytes() > highWaterMark) {
+  if (!m_diskCacheDisabled && diskUsageBytes() > highWaterMark) {
     reapAndEnforceQuota();
   }
 }
@@ -422,6 +546,9 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
 void AssetCache::touchAfterNotModified(const QString &key,
                                        const QString &newEtag,
                                        const QString &newLastModified) {
+  if (m_diskCacheDisabled) {
+    return;
+  }
   if (!isValidKey(key)) {
     // Never let a malformed key reach payloadPath()/metadataPath() below
     // -- see isValidKey()'s comment.
@@ -510,6 +637,11 @@ void AssetCache::invalidate(const QString &key) {
 }
 
 void AssetCache::reapAndEnforceQuota() {
+  if (m_diskCacheDisabled) {
+    // Review item 7: root was a symlink at construction -- never
+    // enumerate, follow, or delete anything through it.
+    return;
+  }
   QMutexLocker locker(&m_mutex);
 
   QDir dir(m_directory);
@@ -526,15 +658,36 @@ void AssetCache::reapAndEnforceQuota() {
   // too: QDir's filters exclude hidden entries (dotfiles) by default,
   // so a stray hidden file/directory would otherwise be just as
   // invisible to this sweep as a stray directory was before this fix.
-  const QStringList allEntries = dir.entryList(
-      QDir::Files | QDir::Dirs | QDir::Hidden | QDir::NoDotAndDotDot,
-      QDir::Name);
+  // QDir::System is included so a DANGLING symlink (whose target no
+  // longer exists) is not silently invisible to this sweep either --
+  // without it, QDir::Files/QDir::Dirs alone only match entries whose
+  // resolved TARGET type is a regular file or directory, which excludes
+  // a broken symlink node entirely even though it still needs cleanup.
+  const QStringList allEntries =
+      dir.entryList(QDir::Files | QDir::Dirs | QDir::Hidden | QDir::System |
+                        QDir::NoDotAndDotDot,
+                    QDir::Name);
   QStringList allFiles;
   allFiles.reserve(allEntries.size());
   for (const QString &name : allEntries) {
     const QString fullPath = dir.filePath(name);
-    if (QFileInfo(fullPath).isDir()) {
-      QDir(fullPath).removeRecursively();
+    // Review item 7: classify with QFileInfo::isSymLink() FIRST, which
+    // (unlike isDir()) reports the entry's own type without resolving
+    // it. A symlink node found directly inside the cache root -- to a
+    // directory, a file, or a dangling target -- is unlinked itself via
+    // QFile::remove() (an unlink(), never a recursive follow); its
+    // target is never opened, stat'd through, or touched. Only a
+    // genuine (non-symlink) directory is recursed into, and even then
+    // via safeRemoveTree()'s descriptor-relative no-follow walk rather
+    // than QDir::removeRecursively() (which itself follows symlinks
+    // internally and would otherwise reintroduce exactly this escape).
+    const QFileInfo info(fullPath);
+    if (info.isSymLink()) {
+      QFile::remove(fullPath);
+      continue;
+    }
+    if (info.isDir()) {
+      safeRemoveTree(fullPath);
       continue;
     }
     allFiles.append(name);
@@ -657,6 +810,11 @@ qint64 AssetCache::memoryCostBytes() const {
 
 qint64 AssetCache::diskUsageBytes() const {
   QMutexLocker locker(&m_mutex);
+  if (m_diskCacheDisabled) {
+    // Review item 7: never enumerate through a symlinked root, even for
+    // a read-only usage total.
+    return 0;
+  }
   // Copilot review: recurse into subdirectories here (QDirIterator with
   // Subdirectories), not a flat QDir::Files listing -- this directory is
   // exclusively owned by AssetCache, so a stray directory (e.g. planted,
@@ -681,6 +839,9 @@ qint64 AssetCache::diskUsageBytes() const {
 
 int AssetCache::diskEntryCount() const {
   QMutexLocker locker(&m_mutex);
+  if (m_diskCacheDisabled) {
+    return 0;
+  }
   QDir dir(m_directory);
   int count = 0;
   for (const QString &name : dir.entryList(QDir::Files)) {

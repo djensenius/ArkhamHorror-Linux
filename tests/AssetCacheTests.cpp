@@ -587,3 +587,174 @@ void AssetCacheTests::promoteToMemoryRejectsMalformedKeyWithoutInserting() {
 
   QVERIFY(!cache.lookupMemory(malformedKey).has_value());
 }
+
+void AssetCacheTests::
+    symlinkedCacheRootDisablesDiskIoAndLeavesTargetUntouched() {
+  // Review item 7 (HIGH): a naive AssetCache pointed directly at a
+  // symlink would follow it transparently -- QDir::mkpath()/QSaveFile
+  // both resolve symlinks -- so a cache "directory" that is itself a
+  // symlink (e.g. an attacker-planted or misconfigured deployment) must
+  // be refused outright, not silently followed into whatever it points
+  // at. Build a genuine external sentinel directory with a real file in
+  // it, point AssetCache's configured directory at a symlink to that
+  // sentinel (never at the sentinel path directly), and prove: (a) the
+  // cache reports disk I/O as disabled, (b) store()/lookupDisk()/reap
+  // are all effective no-ops with respect to disk, and (c) the
+  // sentinel's own pre-existing file survives completely untouched.
+  const QString sentinelDir =
+      m_tempDirPath + QStringLiteral("/external-sentinel");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("external-sentinel")));
+  const QString sentinelFile = sentinelDir + QStringLiteral("/precious.txt");
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("do-not-touch"));
+  }
+
+  const QString symlinkRoot =
+      m_tempDirPath + QStringLiteral("/cache-root-symlink");
+  QVERIFY(QFile::link(sentinelDir, symlinkRoot));
+  QVERIFY(QFileInfo(symlinkRoot).isSymLink());
+
+  AssetCache cache(configFor(symlinkRoot));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  const QString key = QString::fromLatin1(
+      QCryptographicHash::hash(QByteArrayLiteral("symlink-root-key"),
+                               QCryptographicHash::Sha256)
+          .toHex());
+  cache.store(key, makeEntry(QByteArrayLiteral("payload-bytes")));
+  // The memory cache is unaffected by the disabled disk path -- only
+  // persistence to (through) the symlink is skipped.
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+  QCOMPARE(cache.diskEntryCount(), 0);
+
+  cache.reapAndEnforceQuota();
+
+  // The sentinel directory's real, pre-existing file must be completely
+  // untouched: no cache files written into it, and its own content
+  // unchanged.
+  QVERIFY(QFileInfo::exists(sentinelFile));
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("do-not-touch"));
+  }
+  QDir sentinelListing(sentinelDir);
+  QCOMPARE(sentinelListing.entryList(QDir::Files), QStringList{"precious.txt"});
+}
+
+void AssetCacheTests::directorySymlinkInsideCacheRootIsUnlinkedNotFollowed() {
+  // Review item 7 (HIGH): reapAndEnforceQuota()'s stray-entry sweep
+  // previously classified every entry with QFileInfo::isDir() (which
+  // FOLLOWS symlinks) and then called QDir::removeRecursively() (which
+  // also follows symlinks internally) on anything that looked like a
+  // directory -- so a directory SYMLINK planted inside a genuine cache
+  // root, pointing at an external sentinel directory OUTSIDE the cache
+  // root, would have its entire target recursively deleted. The
+  // sentinel here is a SIBLING of the cache root (not nested under it)
+  // so that a regression that actually follows the symlink is
+  // distinguishable from the pre-existing "a real directory placed
+  // directly inside the cache root is stray and removed" behavior.
+  // Prove the fixed sweep instead removes only the symlink node itself,
+  // and the sentinel's real directory (and the file inside it) survives
+  // untouched.
+  const QString cacheRoot = m_tempDirPath + QStringLiteral("/cache-root");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("cache-root")));
+  const QString sentinelDir =
+      m_tempDirPath + QStringLiteral("/external-sentinel-dir");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("external-sentinel-dir")));
+  const QString sentinelFile = sentinelDir + QStringLiteral("/keepme.bin");
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("external-directory-contents"));
+  }
+
+  AssetCache cache(configFor(cacheRoot));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString plantedSymlink =
+      cacheRoot + QStringLiteral("/planted-dir-symlink");
+  QVERIFY(QFile::link(sentinelDir, plantedSymlink));
+  QVERIFY(QFileInfo(plantedSymlink).isSymLink());
+
+  cache.reapAndEnforceQuota();
+
+  // The symlink node itself must be gone (it is a stray entry, exactly
+  // like any other unrecognized file), but the external sentinel
+  // directory and its contents must be completely untouched.
+  QVERIFY(!QFileInfo::exists(plantedSymlink));
+  QVERIFY(QFileInfo::exists(sentinelDir));
+  QVERIFY(QFileInfo::exists(sentinelFile));
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("external-directory-contents"));
+  }
+}
+
+void AssetCacheTests::fileSymlinkInsideCacheRootIsUnlinkedNotFollowed() {
+  // Review item 7 (HIGH), file-symlink variant: a symlink planted
+  // inside the cache root pointing at an external sentinel FILE (not a
+  // directory), OUTSIDE the cache root, must also be removed as a
+  // stray entry via a plain unlink of the symlink node -- never by
+  // opening/truncating/removing whatever it points at.
+  const QString cacheRoot = m_tempDirPath + QStringLiteral("/cache-root");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("cache-root")));
+  const QString sentinelFile =
+      m_tempDirPath + QStringLiteral("/external-sentinel-file.bin");
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("external-file-contents"));
+  }
+
+  AssetCache cache(configFor(cacheRoot));
+
+  const QString plantedSymlink =
+      cacheRoot + QStringLiteral("/planted-file-symlink");
+  QVERIFY(QFile::link(sentinelFile, plantedSymlink));
+  QVERIFY(QFileInfo(plantedSymlink).isSymLink());
+
+  cache.reapAndEnforceQuota();
+
+  QVERIFY(!QFileInfo::exists(plantedSymlink));
+  QVERIFY(QFileInfo::exists(sentinelFile));
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("external-file-contents"));
+  }
+}
+
+void AssetCacheTests::danglingSymlinkInsideCacheRootIsUnlinkedSafely() {
+  // A symlink whose target does not exist (or has since been removed)
+  // must still be classified as a symlink (via lstat-equivalent
+  // fstatat(..., AT_SYMLINK_NOFOLLOW)/QFileInfo::isSymLink(), which
+  // never requires the target to exist) and cleanly unlinked, not
+  // mishandled as "not found, skip" in a way that could leave it
+  // behind forever. This also exercises QDir::System in the entry
+  // enumeration: without it, a dangling symlink (matching neither
+  // QDir::Files nor QDir::Dirs, since its target cannot be stat'd)
+  // would be invisible to the sweep entirely.
+  const QString targetThatWillBeRemoved =
+      m_tempDirPath + QStringLiteral("/will-be-removed.bin");
+  {
+    QFile file(targetThatWillBeRemoved);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("temporary"));
+  }
+  const QString danglingSymlink =
+      m_tempDirPath + QStringLiteral("/dangling-symlink");
+  QVERIFY(QFile::link(targetThatWillBeRemoved, danglingSymlink));
+  QVERIFY(QFile::remove(targetThatWillBeRemoved));
+  QVERIFY(QFileInfo(danglingSymlink).isSymLink());
+  QVERIFY(!QFileInfo(danglingSymlink).exists()); // target gone: dangling
+
+  AssetCache cache(configFor(m_tempDirPath));
+  cache.reapAndEnforceQuota();
+
+  QVERIFY(!QFileInfo(danglingSymlink).isSymLink());
+}

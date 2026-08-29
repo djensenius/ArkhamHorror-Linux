@@ -36,6 +36,12 @@ private slots:
   void malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir();
   void promoteToMemoryRejectsMalformedKeyWithoutInserting();
 
+  // Review item 7: symlink cache-root/entry escape prevention.
+  void symlinkedCacheRootDisablesDiskIoAndLeavesTargetUntouched();
+  void directorySymlinkInsideCacheRootIsUnlinkedNotFollowed();
+  void fileSymlinkInsideCacheRootIsUnlinkedNotFollowed();
+  void danglingSymlinkInsideCacheRootIsUnlinkedSafely();
+
 private:
   QString m_tempDirPath;
   std::unique_ptr<QTemporaryDir> m_tempDir;
