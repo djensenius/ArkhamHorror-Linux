@@ -70,4 +70,22 @@ private slots:
   void cardBackRequiresBackKind();
   void nonBackSideRejectsBackFields();
   void cardBackNonexistentTrailingAbRejected();
+
+  // Round-6 item 9: homebrew ChaosToken route parity, tightened
+  // HomebrewCard card-code grammar (vs. the real client's
+  // `/^:(.+):(\d+[a-z]*)$/`), and the "identifier `c` strips to empty"
+  // degenerate-path bug.
+  void homebrewChaosTokenGoldenPath_data();
+  void homebrewChaosTokenGoldenPath();
+
+  void chaosTokenInvalidHomebrewNamespaceRejected_data();
+  void chaosTokenInvalidHomebrewNamespaceRejected();
+
+  void nonOptionalCategoryStillRejectsHomebrewNamespace();
+
+  void homebrewCardIdentifierGrammarEnforced_data();
+  void homebrewCardIdentifierGrammarEnforced();
+
+  void identifierStrippingToEmptyCardCodeRejected_data();
+  void identifierStrippingToEmptyCardCodeRejected();
 };

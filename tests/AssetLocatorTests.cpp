@@ -988,3 +988,171 @@ void AssetLocatorTests::cardBackNonexistentTrailingAbRejected() {
   QVERIFY2(!url.endsWith(QStringLiteral("01121ab.avif")), qPrintable(url));
   QVERIFY(url.endsWith(QStringLiteral("01121b.avif")));
 }
+
+// Round-6 item 9: ChaosToken.ts's chaosTokenImage() supports a custom/
+// homebrew token face formatted as ":campaign:key" (split on ':'),
+// building "homebrew/{campaign}/chaos-tokens/{key}.png" -- always PNG,
+// and critically WITHOUT the "ct-" prefix a standard fixed-catalog token
+// name gets. Both branches are exercised here from the same
+// resolveCandidates() entry point, keyed purely on whether
+// homebrewNamespace is empty.
+void AssetLocatorTests::homebrewChaosTokenGoldenPath_data() {
+  QTest::addColumn<QString>("homebrewNamespace");
+  QTest::addColumn<QString>("identifier");
+  QTest::addColumn<QString>("expectedUrl");
+
+  const QString base = kDefaultBase();
+
+  QTest::newRow("standard-token-ct-prefix-unaffected")
+      << QString() << QStringLiteral("skull")
+      << base + QStringLiteral("/img/arkham/chaos-tokens/ct-skull.png");
+
+  QTest::newRow("homebrew-token-no-ct-prefix")
+      << QStringLiteral("electric-nightmare") << QStringLiteral("my-token")
+      << base + QStringLiteral(
+                    "/img/arkham/homebrew/electric-nightmare/chaos-tokens/"
+                    "my-token.png");
+}
+
+void AssetLocatorTests::homebrewChaosTokenGoldenPath() {
+  QFETCH(QString, homebrewNamespace);
+  QFETCH(QString, identifier);
+  QFETCH(QString, expectedUrl);
+
+  const AssetKey key =
+      makeKey(kDefaultBase(), AssetCategory::ChaosToken, identifier,
+              AssetSide::Front, QString(), std::nullopt, homebrewNamespace);
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY2(bool(result),
+           qPrintable(result ? QString() : result.error().message));
+  QVERIFY(!result->isEmpty());
+  QCOMPARE(result->first().url.toString(QUrl::FullyEncoded), expectedUrl);
+  QCOMPARE(result->first().format, AssetFormat::Png);
+}
+
+// A non-empty homebrewNamespace on ChaosToken is optional, not
+// unvalidated: it must still pass the exact same isValidHomebrewNamespace()
+// grammar HomebrewCard/HomebrewSet use (no traversal, no uppercase, no
+// colon separators).
+void AssetLocatorTests::chaosTokenInvalidHomebrewNamespaceRejected_data() {
+  QTest::addColumn<QString>("homebrewNamespace");
+
+  QTest::newRow("path-traversal") << QStringLiteral("../etc");
+  QTest::newRow("uppercase") << QStringLiteral("MyCampaign");
+  QTest::newRow("colon-separator") << QStringLiteral("a:b");
+}
+
+void AssetLocatorTests::chaosTokenInvalidHomebrewNamespaceRejected() {
+  QFETCH(QString, homebrewNamespace);
+
+  const AssetKey key = makeKey(kDefaultBase(), AssetCategory::ChaosToken,
+                               QStringLiteral("skull"), AssetSide::Front,
+                               QString(), std::nullopt, homebrewNamespace);
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY(!result);
+  QCOMPARE(result.error().code, AssetErrorCode::InvalidHomebrewNamespace);
+}
+
+// Confirms making ChaosToken's homebrewNamespace optional did NOT loosen
+// the strict-forbidden rule for every other non-homebrew category (e.g.
+// plain Card): a stray homebrewNamespace there must still be rejected
+// outright, exactly as before this round's change.
+void AssetLocatorTests::nonOptionalCategoryStillRejectsHomebrewNamespace() {
+  const AssetKey key =
+      makeKey(kDefaultBase(), AssetCategory::Card, QStringLiteral("01001"),
+              AssetSide::Front, QString(), std::nullopt,
+              QStringLiteral("should-not-be-here"));
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY(!result);
+  QCOMPARE(result.error().code, AssetErrorCode::InvalidHomebrewNamespace);
+}
+
+// Round-6 item 9: the real client's homebrew card-art regex is
+// `/^:(.+):(\d+[a-z]*)$/` -- the card-code capture MUST be one-or-more
+// ASCII digits then zero-or-more ASCII lowercase letters. HomebrewCard's
+// identifier is tightened to this exact shape (with an optional leading
+// 'c' tag-prefix, stripped before use); a community-authored slug like
+// "my-homebrew-card" must never reach resolveCandidates() successfully,
+// unlike plain Card's deliberately broader identifier grammar.
+void AssetLocatorTests::homebrewCardIdentifierGrammarEnforced_data() {
+  QTest::addColumn<QString>("identifier");
+  QTest::addColumn<bool>("expectValid");
+
+  QTest::newRow("digits-only") << QStringLiteral("01121") << true;
+  QTest::newRow("digits-then-lowercase-letters")
+      << QStringLiteral("01121a") << true;
+  QTest::newRow("digits-then-two-lowercase-letters")
+      << QStringLiteral("03276ab") << true;
+  QTest::newRow("leading-c-tag-then-digits")
+      << QStringLiteral("c01121") << true;
+  QTest::newRow("arbitrary-slug-not-digit-shaped")
+      << QStringLiteral("my-homebrew-card") << false;
+  QTest::newRow("uppercase-letters-after-digits")
+      << QStringLiteral("01121A") << false;
+  QTest::newRow("letters-before-digits") << QStringLiteral("a01121") << false;
+  QTest::newRow("no-digits-at-all") << QStringLiteral("abc") << false;
+  QTest::newRow("digits-with-hyphen") << QStringLiteral("011-21") << false;
+}
+
+void AssetLocatorTests::homebrewCardIdentifierGrammarEnforced() {
+  QFETCH(QString, identifier);
+  QFETCH(bool, expectValid);
+
+  const AssetKey key = makeKey(kDefaultBase(), AssetCategory::HomebrewCard,
+                               identifier, AssetSide::Front, QString(),
+                               std::nullopt, QStringLiteral("mycampaign"));
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  if (expectValid) {
+    QVERIFY2(bool(result),
+             qPrintable(result ? QString() : result.error().message));
+  } else {
+    QVERIFY(!result);
+    QCOMPARE(result.error().code, AssetErrorCode::InvalidIdentifier);
+  }
+}
+
+// Round-6 item 9: a raw identifier of exactly "c" (or, for
+// ExplicitOtherSide, an otherSideIdentifier of exactly "c") passes the
+// generic isValidIdentifier() grammar Card/InvestigatorPortrait/SetIcon
+// use as a single valid alnum character, but stripLeadingCardCodePrefix()
+// reduces it to the empty string -- which must be rejected explicitly
+// rather than silently producing a degenerate "cards/.avif"-style path.
+void AssetLocatorTests::identifierStrippingToEmptyCardCodeRejected_data() {
+  QTest::addColumn<int>("category");
+  QTest::addColumn<bool>("isOtherSide");
+
+  using C = AssetCategory;
+  QTest::newRow("card-front") << int(C::Card) << false;
+  QTest::newRow("investigator-portrait-front")
+      << int(C::InvestigatorPortrait) << false;
+  QTest::newRow("set-icon-front") << int(C::SetIcon) << false;
+  QTest::newRow("card-back-explicit-other-side") << int(C::Card) << true;
+}
+
+void AssetLocatorTests::identifierStrippingToEmptyCardCodeRejected() {
+  QFETCH(int, category);
+  QFETCH(bool, isOtherSide);
+
+  if (isOtherSide) {
+    const AssetKey key =
+        makeBackKey(kDefaultBase(), AssetCategory(category),
+                    CardBackKind::ExplicitOtherSide, AssetFormat::Avif,
+                    QString(), QStringLiteral("c"));
+    const AssetOutcome<QVector<AssetCandidate>> result =
+        AssetLocator::resolveCandidates(key);
+    QVERIFY(!result);
+    QCOMPARE(result.error().code, AssetErrorCode::InvalidOtherSideIdentifier);
+    return;
+  }
+
+  const AssetKey key =
+      makeKey(kDefaultBase(), AssetCategory(category), QStringLiteral("c"));
+  const AssetOutcome<QVector<AssetCandidate>> result =
+      AssetLocator::resolveCandidates(key);
+  QVERIFY(!result);
+  QCOMPARE(result.error().code, AssetErrorCode::InvalidIdentifier);
+}

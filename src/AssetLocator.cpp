@@ -73,6 +73,49 @@ bool isValidIdentifier(const QString &identifier, qsizetype maxLength) {
   return true;
 }
 
+// Round-6 item 9: the real web client's HomebrewCard art path is built
+// from a compound `:campaign:code` slug matched with
+// `/^:(.+):(\d+[a-z]*)$/` in helpers.ts's cardImgPath() -- the `code`
+// capture is this exact "one or more ASCII digits, then zero or more
+// ASCII lowercase letters" shape (e.g. "01121", "01121a", "03276ab" for a
+// resolved-side override), never an arbitrary community-authored slug.
+// The generic isValidIdentifier() grammar above is deliberately too
+// broad for this specific field: every transform HomebrewCard's
+// identifier/otherSideIdentifier feeds after the optional leading-'c'
+// strip (resolveArtCodeForSide(), resolvedSideArtCode(), the back-kind
+// switch in resolveBackCandidates()) assumes this digit-then-letters
+// shape (e.g. "strip one trailing [aceg], append 'b'", "ends in digit"
+// for AlternateFront) and would otherwise silently build a nonsensical
+// on-CDN path for anything else. Matches the optional single leading 'c'
+// stripLeadingCardCodePrefix() removes -- exactly one, never more, so
+// this validates the SAME shape that function will actually strip.
+bool isValidCardCodeIdentifier(const QString &identifier, qsizetype maxLength) {
+  if (identifier.isEmpty() || identifier.size() > maxLength) {
+    return false;
+  }
+  qsizetype i = 0;
+  if (identifier.at(0) == u'c') {
+    ++i; // optional leading tag-prefix (see stripLeadingCardCodePrefix())
+  }
+  const qsizetype digitsStart = i;
+  for (; i < identifier.size(); ++i) {
+    const char16_t u = identifier.at(i).unicode();
+    if (u < u'0' || u > u'9') {
+      break;
+    }
+  }
+  if (i == digitsStart) {
+    return false; // no digits at all after the optional 'c'
+  }
+  for (; i < identifier.size(); ++i) {
+    const char16_t u = identifier.at(i).unicode();
+    if (u < u'a' || u > u'z') {
+      return false; // only ASCII lowercase letters may follow the digits
+    }
+  }
+  return true;
+}
+
 bool isAsciiLower(QChar c) {
   const char16_t u = c.unicode();
   return (u >= u'0' && u <= u'9') || (u >= u'a' && u <= u'z');
@@ -226,8 +269,17 @@ QString buildRelativePath(const AssetKey &key, const QString &artCode,
     // "investigators/".
     return "img/arkham/portraits/"_L1 + artCode + u'.' + ext;
   case AssetCategory::ChaosToken:
-    // ChaosToken.ts bakes a literal "ct-" prefix onto the token name.
-    return "img/arkham/chaos-tokens/ct-"_L1 + artCode + u'.' + ext;
+    // ChaosToken.ts's chaosTokenImage(): a standard named token bakes a
+    // literal "ct-" prefix onto the token name (chaos-tokens/ct-{name}
+    // .png); a homebrew/custom token face is instead formatted as
+    // ":{campaign}:{key}" and split on ':', building
+    // "homebrew/{campaign}/chaos-tokens/{key}.png" -- always PNG, and
+    // critically NEVER the "ct-" prefix, which only ever applies to the
+    // fixed catalog of standard token names.
+    return key.homebrewNamespace.isEmpty()
+               ? "img/arkham/chaos-tokens/ct-"_L1 + artCode + u'.' + ext
+               : "img/arkham/homebrew/"_L1 + key.homebrewNamespace +
+                     "/chaos-tokens/"_L1 + artCode + u'.' + ext;
   case AssetCategory::SetIcon:
     return "img/arkham/sets/"_L1 + artCode + u'.' + ext;
   case AssetCategory::CampaignBox:
@@ -285,6 +337,26 @@ qsizetype identifierMaxLengthFor(AssetCategory category) {
   default:
     return kOfficialIdentifierMaxLength;
   }
+}
+
+// Round-6 item 9: validates `identifier` (Front path) or
+// `otherSideIdentifier` (ExplicitOtherSide back path) using the correct
+// per-category grammar -- the strict card-code shape
+// (isValidCardCodeIdentifier()) for HomebrewCard, whose art code is
+// embedded verbatim in an on-CDN path per the real client's own
+// `\d+[a-z]*`-anchored regex (see that function's comment), and the
+// generic broader grammar (isValidIdentifier()) for every other
+// category, including plain Card -- whose identifier is NOT tightened
+// here to avoid over-constraining a field the real client itself never
+// regex-validates for the non-homebrew path (see cardImgPath()'s
+// unconditional `cards/${art}.avif` fallback).
+bool isValidCardIdentifierForCategory(AssetCategory category,
+                                      const QString &identifier,
+                                      qsizetype maxLength) {
+  if (category == AssetCategory::HomebrewCard) {
+    return isValidCardCodeIdentifier(identifier, maxLength);
+  }
+  return isValidIdentifier(identifier, maxLength);
 }
 
 // Maximum length for a homebrew-authored custom-back filename (stem plus
@@ -355,12 +427,13 @@ resolveBackCandidates(const AssetKey &key, const QUrl &normalizedBase) {
       !isFixedGenericPath && !isCustomBack && !isOtherSide;
 
   if (isSameCodeDriven) {
-    if (!isValidIdentifier(key.identifier,
-                           identifierMaxLengthFor(key.category))) {
+    if (!isValidCardIdentifierForCategory(
+            key.category, key.identifier,
+            identifierMaxLengthFor(key.category))) {
       return AssetError{
           AssetErrorCode::InvalidIdentifier,
-          QStringLiteral("asset identifier is empty, too long, or contains "
-                         "a character outside [A-Za-z0-9_-]"),
+          QStringLiteral("asset identifier is empty, too long, or has an "
+                         "invalid shape for this category"),
       };
     }
   } else if (!key.identifier.isEmpty()) {
@@ -371,12 +444,13 @@ resolveBackCandidates(const AssetKey &key, const QUrl &normalizedBase) {
   }
 
   if (isOtherSide) {
-    if (!isValidIdentifier(key.otherSideIdentifier,
-                           identifierMaxLengthFor(key.category))) {
+    if (!isValidCardIdentifierForCategory(
+            key.category, key.otherSideIdentifier,
+            identifierMaxLengthFor(key.category))) {
       return AssetError{
           AssetErrorCode::InvalidOtherSideIdentifier,
-          QStringLiteral("otherSideIdentifier is empty, too long, or "
-                         "contains a character outside [A-Za-z0-9_-]"),
+          QStringLiteral("otherSideIdentifier is empty, too long, or has an "
+                         "invalid shape for this category"),
       };
     }
   } else if (!key.otherSideIdentifier.isEmpty()) {
@@ -491,9 +565,30 @@ resolveBackCandidates(const AssetKey &key, const QUrl &normalizedBase) {
   QString artCode;
   if (isOtherSide) {
     artCode = stripLeadingCardCodePrefix(key.otherSideIdentifier);
+    // Round-6 item 9: a raw otherSideIdentifier of exactly "c" passes the
+    // generic (non-HomebrewCard) isValidIdentifier() grammar above as a
+    // single valid alnum char, but strips to the empty string here,
+    // which would otherwise silently build a degenerate "cards/.avif"
+    // path. HomebrewCard can never reach this since its tightened
+    // isValidCardCodeIdentifier() grammar already requires >=1 digit
+    // immediately after any leading 'c'.
+    if (artCode.isEmpty()) {
+      return AssetError{
+          AssetErrorCode::InvalidOtherSideIdentifier,
+          QStringLiteral("otherSideIdentifier reduces to an empty card "
+                         "code after stripping its leading tag prefix"),
+      };
+    }
   } else {
     const QString strippedIdentifier =
         stripLeadingCardCodePrefix(key.identifier);
+    if (strippedIdentifier.isEmpty()) {
+      return AssetError{
+          AssetErrorCode::InvalidIdentifier,
+          QStringLiteral("identifier reduces to an empty card code after "
+                         "stripping its leading tag prefix"),
+      };
+    }
     switch (kind) {
     case CardBackKind::SameCodeAppendB:
       artCode = strippedIdentifier + u'b';
@@ -598,12 +693,12 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
     };
   }
 
-  if (!isValidIdentifier(key.identifier,
-                         identifierMaxLengthFor(key.category))) {
+  if (!isValidCardIdentifierForCategory(key.category, key.identifier,
+                                        identifierMaxLengthFor(key.category))) {
     return AssetError{
         AssetErrorCode::InvalidIdentifier,
-        QStringLiteral("asset identifier is empty, too long, or contains a "
-                       "character outside [A-Za-z0-9_-]"),
+        QStringLiteral("asset identifier is empty, too long, or has an "
+                       "invalid shape for this category"),
     };
   }
 
@@ -616,16 +711,33 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
     };
   }
 
-  const bool wantsHomebrewNamespace =
+  const bool requiresHomebrewNamespace =
       key.category == AssetCategory::HomebrewCard ||
       key.category == AssetCategory::HomebrewSet;
-  if (wantsHomebrewNamespace) {
+  // Round-6 item 9: ChaosToken.ts's chaosTokenImage() supports BOTH a
+  // standard fixed-catalog token name (no homebrewNamespace) and a
+  // homebrew/custom ":campaign:key" token face (non-empty
+  // homebrewNamespace) -- unlike HomebrewCard/HomebrewSet, whose
+  // namespace is mandatory, ChaosToken's is genuinely optional.
+  const bool allowsOptionalHomebrewNamespace =
+      key.category == AssetCategory::ChaosToken;
+  if (requiresHomebrewNamespace) {
     if (!isValidHomebrewNamespace(key.homebrewNamespace,
                                   kHomebrewIdentifierMaxLength)) {
       return AssetError{
           AssetErrorCode::InvalidHomebrewNamespace,
           QStringLiteral("HomebrewCard/HomebrewSet requires a valid "
                          "homebrewNamespace"),
+      };
+    }
+  } else if (allowsOptionalHomebrewNamespace) {
+    if (!key.homebrewNamespace.isEmpty() &&
+        !isValidHomebrewNamespace(key.homebrewNamespace,
+                                  kHomebrewIdentifierMaxLength)) {
+      return AssetError{
+          AssetErrorCode::InvalidHomebrewNamespace,
+          QStringLiteral("ChaosToken's homebrewNamespace must be empty or "
+                         "a valid namespace"),
       };
     }
   } else if (!key.homebrewNamespace.isEmpty()) {
@@ -665,6 +777,18 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
       categoryStripsLeadingCardCodePrefix(key.category)
           ? stripLeadingCardCodePrefix(key.identifier)
           : key.identifier;
+  if (categoryStripsLeadingCardCodePrefix(key.category) &&
+      strippedIdentifier.isEmpty()) {
+    // Round-6 item 9: e.g. a raw identifier of exactly "c" for Card/
+    // InvestigatorPortrait/SetIcon (whose generic isValidIdentifier()
+    // grammar happily accepts a lone alnum char) strips to empty here,
+    // which would otherwise build a degenerate "cards/.avif"-style path.
+    return AssetError{
+        AssetErrorCode::InvalidIdentifier,
+        QStringLiteral("identifier reduces to an empty card code after "
+                       "stripping its leading tag prefix"),
+    };
+  }
 
   // A direct (non-auto-derived) request for a side that is structurally
   // inapplicable to this specific identifier's shape (currently only

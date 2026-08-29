@@ -17,7 +17,9 @@ namespace Arkham {
 enum class AssetCategory {
   Card, // Player/encounter card art (see AssetSide for face).
   InvestigatorPortrait,
-  ChaosToken,
+  ChaosToken, // Standard fixed-catalog token, OR a homebrew/custom token
+              // face when `homebrewNamespace` is non-empty -- see its
+              // doc comment near AssetKey::homebrewNamespace below.
   SetIcon,
   CampaignBox,
   SlotIcon,
@@ -121,8 +123,10 @@ enum class AssetErrorCode {
                             // AlternateFront request for an identifier not
                             // ending in a digit; see AssetLocator.cpp).
   InvalidHomebrewNamespace, // homebrewNamespace is missing/invalid for
-                            // HomebrewCard, or non-empty for any category
-                            // that must not carry one.
+                            // HomebrewCard/HomebrewSet, invalid (but
+                            // non-empty is optional) for ChaosToken, or
+                            // non-empty for any category that must not
+                            // carry one.
   InvalidMutationId, // mutationId is missing/invalid for MutatedFront, or
                      // non-empty for any other side.
   InvalidBackKind,   // side == Back with no backKind set, or (category,
@@ -306,17 +310,26 @@ private:
 // `locale` is a short BCP-47-ish language subtag (e.g. "it"); empty or
 // "en" both mean "no localisation, use the English/default asset".
 //
-// `homebrewNamespace` is the homebrew campaign namespace segment. Used by
-// AssetCategory::HomebrewCard (nests homebrew card art under a
-// per-campaign directory: "homebrew/{namespace}/cards/{code}...") and by
-// AssetCategory::HomebrewSet (nests a homebrew encounter-set icon under
+// `homebrewNamespace` is the homebrew campaign namespace segment.
+// REQUIRED (non-empty, validated) for AssetCategory::HomebrewCard (nests
+// homebrew card art under a per-campaign directory:
+// "homebrew/{namespace}/cards/{code}...") and for AssetCategory::
+// HomebrewSet (nests a homebrew encounter-set icon under
 // "homebrew/{namespace}/sets/{setId}...", where `identifier` supplies the
 // independently-validated set id -- the real client's campaign-namespace
 // and per-set-id slugs are two genuinely distinct captures of a compound
-// colon-delimited identifier, never the same field reused twice). Must be
-// empty for every other category, including HomebrewBox, whose real path
-// reuses `identifier` itself as both the directory and file name (a
-// single cover-art image per homebrew campaign, not one of several).
+// colon-delimited identifier, never the same field reused twice).
+// OPTIONAL (validated only when non-empty) for AssetCategory::ChaosToken:
+// the real client's chaosTokenImage() supports both a standard
+// fixed-catalog token name (empty `homebrewNamespace`, existing
+// "chaos-tokens/ct-{name}..." route, unchanged) and a homebrew/custom
+// token face formatted as ":campaign:key" (non-empty
+// `homebrewNamespace`, routed to "homebrew/{namespace}/chaos-tokens/
+// {key}..." -- notably WITHOUT the "ct-" prefix, which only ever applies
+// to the fixed catalog). Must be empty for every other category,
+// including HomebrewBox, whose real path reuses `identifier` itself as
+// both the directory and file name (a single cover-art image per
+// homebrew campaign, not one of several).
 //
 // `mutationId` is the arbitrary, backend-assigned per-instance sticker-
 // mutation identifier used ONLY when `side == AssetSide::MutatedFront`
