@@ -1,6 +1,7 @@
 #include <array>
 #include <utility>
 
+#include <QSet>
 #include <QtTest>
 
 #include "ControllerGlyphs.h"

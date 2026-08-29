@@ -150,9 +150,15 @@ private:
 
 void SemanticInputFixtureTests::init() {
   engine_.reset();
-  focus_.reset();
-  mapper_.reset();
+  // Reset router_ before mapper_: InputRouter borrows InputMapper by
+  // reference, so if a prior test's teardown were ever skipped (e.g. an
+  // early failure return), destroying mapper_ first while router_ still
+  // held a reference to it would be a use-after-free in InputRouter's own
+  // destructor/uninstall(). Mirrors the ordering already used below in
+  // cleanup().
   router_.reset();
+  mapper_.reset();
+  focus_.reset();
   window_ = nullptr;
 }
 
