@@ -476,6 +476,20 @@ private:
   // ITokenStore.
   void invalidateProfileCredential(const QString &profileId);
 
+  // Handles the SAME-profileId, DIFFERENT-endpoint case detected by
+  // mutateSelectedProfile(): performs invalidateProfileCredential()'s
+  // usual epoch bump plus in-flight-Save compensation, and ADDITIONALLY
+  // unconditionally reserves a Delete for whatever token may already be
+  // durably stored for this profileId() from a prior session at the old
+  // endpoint (invalidateProfileCredential() alone only reacts to a Save
+  // currently in flight; it never reaches into already-persisted storage).
+  // Reserving this Delete here -- before mutateSelectedProfile() returns,
+  // and therefore strictly before startCredentialRestore() can ever
+  // enqueue a Read for this profile -- guarantees via FIFO ordering alone
+  // that no credential from the old endpoint is ever read, sent, or saved
+  // against the new one.
+  void invalidateProfileCredentialForEndpointChange(const QString &profileId);
+
   // Assigns the coherent (state, cleared-user) snapshot via
   // mutateState()/mutateCurrentUser() (so every field that changes as
   // part of this transition is committed BEFORE either signal is

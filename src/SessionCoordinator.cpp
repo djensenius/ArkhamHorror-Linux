@@ -114,11 +114,40 @@ void SessionCoordinator::mutateCurrentUser(std::optional<CurrentUser> user) {
 
 void SessionCoordinator::mutateSelectedProfile(const QString &profileId,
                                                const ServerProfile &profile) {
+  if (profileId == m_selectedProfileId && m_currentProfile.has_value()) {
+    // The SAME profile ID may still have been reloaded with genuinely
+    // different content: start() unconditionally reloads every profile
+    // record from storage on every restart (see start()'s call to
+    // mutateSelectedProfile() with whatever the profile store currently
+    // returns for the persisted selection), and stable IDs are explicitly
+    // supported via ServerProfile::customWithId(), so the same UUID can
+    // legitimately come back with an updated displayName and/or baseUrl.
+    // switchProfile()'s own top-of-function early return already excludes
+    // the "user re-selects the still-identical current profile" case
+    // before ever reaching here, so a same-ID call that DOES reach this
+    // point with different content only ever comes from a reload, never
+    // from switchProfile() re-targeting itself.
+    const ServerProfile &previous = *m_currentProfile;
+    const bool sameEndpoint = previous.hasEquivalentEndpoint(profile);
+    const bool sameName = previous.displayName() == profile.displayName();
+    if (sameEndpoint && sameName) {
+      return; // Exact reload: nothing externally observable changed.
+    }
+    m_currentProfile = profile;
+    ++m_selectedProfileRevision.mutation;
+    if (!sameEndpoint) {
+      // A credential stored for this profileId() was scoped to the OLD
+      // endpoint and must never be read, sent, or saved against the new
+      // one -- a display-name-only change (sameEndpoint == true above)
+      // is safe to keep the existing token for and falls through without
+      // reaching this branch at all.
+      invalidateProfileCredentialForEndpointChange(profileId);
+    }
+    return;
+  }
   if (profileId == m_selectedProfileId) {
-    // Matches switchProfile()'s own pre-existing "already selected"
-    // convention: re-selecting the SAME profile ID is not a real
-    // transition (even if some other ServerProfile field were somehow
-    // different, which selection itself never re-derives from).
+    // No previous profile existed to compare against (e.g. the very first
+    // selection); matches switchProfile()'s pre-existing convention.
     return;
   }
   m_selectedProfileId = profileId;
@@ -639,14 +668,21 @@ void SessionCoordinator::deleteRestoredUnauthorizedToken(
                    if (!self) {
                      return;
                    }
-                   if (deleteResult.outcome == TokenStoreOutcome::Success) {
+                   // NotFound (the token was already absent) achieves the
+                   // exact same postcondition as Success here -- no token
+                   // remains under this profileId() -- so both are
+                   // treated identically; see the shared deleteFailed
+                   // check in startFrontTokenOp() for why NotFound must
+                   // never itself be mistaken for a failure.
+                   if (deleteResult.outcome == TokenStoreOutcome::Success ||
+                       deleteResult.outcome == TokenStoreOutcome::NotFound) {
                      self->clearCurrentUserAndSetStateIfCurrent(
                          generation, State::SignedOut);
                    }
-                   // On failure, nothing further to do here: the central
-                   // FIFO dispatch (see startFrontTokenOp()) has already
-                   // left the delete stalled and, if this profile is
-                   // still the coordinator's current one, has already
+                   // On any other failure, nothing further to do here: the
+                   // central FIFO dispatch (see startFrontTokenOp()) has
+                   // already left the delete stalled and, if this profile
+                   // is still the coordinator's current one, has already
                    // reinstalled an actionable retry() and surfaced
                    // SecureStorageUnavailable -- unconditionally,
                    // regardless of whether |generation| (the session that
@@ -820,10 +856,16 @@ void SessionCoordinator::signOut() {
 void SessionCoordinator::handleSignOutDeletionResult(
     quint64 generation, const QString &profileId,
     const TokenStoreResult &result) {
-  if (result.outcome == TokenStoreOutcome::Success) {
+  // NotFound (the token was already absent) achieves the exact same
+  // postcondition as Success here -- no token remains under this
+  // profileId() -- so both are treated identically; see the shared
+  // deleteFailed check in startFrontTokenOp() for why NotFound must never
+  // itself be mistaken for a genuine failure.
+  if (result.outcome == TokenStoreOutcome::Success ||
+      result.outcome == TokenStoreOutcome::NotFound) {
     clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut);
   }
-  // On failure, nothing further to do here: the central FIFO dispatch
+  // On any other failure, nothing further to do here: the central FIFO dispatch
   // (see startFrontTokenOp()) has already left the delete stalled at the
   // head of |profileId|'s queue and, if that profile is still the
   // coordinator's current one, has already reinstalled an actionable
@@ -958,8 +1000,18 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
     dispatchIt->inFlight = false;
 
     const TokenOpKind finishedKind = it->head().kind;
+    // NotFound is treated as an equally successful outcome for a Delete:
+    // deleting an already-absent entry achieves the exact same
+    // postcondition (no token remains under this profileId()) as deleting
+    // one that was present, so it must never be mistaken for a genuine
+    // failure requiring a durable stall/retry. This matters most for a
+    // required Delete reserved defensively (e.g.
+    // invalidateProfileCredentialForEndpointChange()'s unconditional
+    // cleanup) against a profile that may never have had a token saved at
+    // all.
     const bool deleteFailed = finishedKind == TokenOpKind::Delete &&
-                              result.outcome != TokenStoreOutcome::Success;
+                              result.outcome != TokenStoreOutcome::Success &&
+                              result.outcome != TokenStoreOutcome::NotFound;
     if (deleteFailed) {
       // A required Delete must never be silently abandoned: leave it at
       // the head of the FIFO (un-dequeued) so it durably blocks every
@@ -1119,6 +1171,43 @@ void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
                    // moment of failure, or otherwise the obligation is
                    // surfaced the next time this profile becomes current
                    // again (see startCredentialRestore()'s stalled check).
+                 });
+}
+
+void SessionCoordinator::invalidateProfileCredentialForEndpointChange(
+    const QString &profileId) {
+  // First perform the ordinary epoch bump plus in-flight-Save compensation
+  // shared with every other credential-invalidating transition (switching
+  // away from a profile entirely, signing out, restarting): an auth/token
+  // Save that already crossed the ITokenStore boundary under the OLD
+  // epoch must still be compensated for if it later persists a token,
+  // exactly as when abandoning a profile.
+  invalidateProfileCredential(profileId);
+
+  // Unlike invalidateProfileCredential()'s own conditional compensating
+  // Delete (which fires only when there is a stale in-flight Save at the
+  // head), an endpoint change must ALSO unconditionally reserve a Delete
+  // for whatever token may ALREADY be durably stored for this profile's
+  // UUID from a PRIOR session at the old endpoint, even when nothing is
+  // currently in flight. That token (if any) was authenticated against
+  // the OLD endpoint and must never be read, sent, or saved against the
+  // new one. Enqueueing it here appends it to the tail of this profile's
+  // FIFO, so it is guaranteed to run to completion -- or durably stall,
+  // blocking every later same-profile operation via the shared
+  // required-delete-failure retry path, see startFrontTokenOp() -- BEFORE
+  // any later-enqueued restore Read or auth Save for this profile,
+  // regardless of what (if anything) is already queued ahead of it.
+  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
+                 [](TokenStoreResult) {
+                   // No profile-specific reaction needed: this exists
+                   // purely to guarantee no token from the old endpoint
+                   // survives. A NotFound outcome (no prior token ever
+                   // existed for this profile) is treated as a successful,
+                   // idempotent delete by the shared FIFO completion logic
+                   // (see startFrontTokenOp()'s deleteFailed check); any
+                   // genuine failure still leaves the profile's FIFO
+                   // durably stalled and is surfaced/retried exactly like
+                   // any other required delete.
                  });
 }
 

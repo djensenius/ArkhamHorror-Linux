@@ -638,6 +638,15 @@ private slots:
   repeatedStartWhileSaveThenCompensatingDeleteChainInFlightDedupsRestoreRead();
   void staleReadAttemptCallbackCannotCompleteNewerReadAttempt();
 
+  // Profile reload / endpoint identity (same profileId, changed content)
+  void reloadedProfileNameOnlyChangeUpdatesNameKeepsEndpointAndToken();
+  void reloadedProfileEndpointChangeDeletesOldTokenBeforeRestoreRead();
+  void reloadedProfileEndpointChangeDuringInFlightSaveCompensatesExactlyOnce();
+  void reloadedProfileEndpointChangeDeleteFailureBlocksThenRetrySucceeds();
+  void
+  reloadedProfileCanonicallyEquivalentUrlIsNotEndpointChangeButPathCaseIs();
+  void reloadedProfileExactUnchangedContentEmitsNoSignals();
+
   // Destruction
   void destructionSuppressesProbeCompletion();
   void destructionSuppressesTokenStoreCompletion();
@@ -3722,6 +3731,460 @@ void SessionCoordinatorTests::
   QCOMPARE(selectedProfileSpy.count(), 0);
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedIn);
   QCOMPARE(h.coordinator->selectedProfileId(), profileId);
+}
+
+// ─── Profile reload / endpoint identity ──────────────────────────────────
+
+void SessionCoordinatorTests::
+    reloadedProfileNameOnlyChangeUpdatesNameKeepsEndpointAndToken() {
+  // start() unconditionally reloads every profile record from storage on
+  // every restart. A display-name-only change for the SAME stable
+  // profileId() (see ServerProfile::customWithId()) must update the
+  // observable name, fire selectedProfileChanged() EXACTLY ONCE, and keep
+  // using the SAME endpoint/token -- never treat this as a credential-
+  // invalidating endpoint change.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString url = QStringLiteral("https://old.example.test");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Old Name"), url);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+
+  const QString token = QStringLiteral("session-token");
+  bootToSignedIn(h, token);
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+  QCOMPARE(h.coordinator->selectedProfileDisplayName(),
+           QStringLiteral("Old Name"));
+
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("New Name"), url);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  QSignalSpy selectedProfileSpy(h.coordinator.get(),
+                                &SessionCoordinator::selectedProfileChanged);
+  QVERIFY(selectedProfileSpy.isValid());
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+
+  // No delete was ever issued for a name-only change: the op dispatched
+  // right after the reload is the credential-restore Read, not a Delete.
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("read"));
+
+  h.tokenStore.complete(profileId, successReadResult(token));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 3; }));
+  QCOMPARE(h.authClient.calls.at(2).kind, FakeAuthClient::CallKind::WhoAmI);
+  const QString sentToken = h.authClient.calls.at(2).token;
+  QVERIFY(sentToken == token);
+  h.authClient.completeUser(3, userSuccess(QStringLiteral("bob"),
+                                           QStringLiteral("bob@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+
+  QCOMPARE(selectedProfileSpy.count(), 1);
+  QCOMPARE(h.coordinator->selectedProfileDisplayName(),
+           QStringLiteral("New Name"));
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), url);
+  QCOMPARE(h.probeFactory.current()->lastProfile().baseUrl().toString(), url);
+  QCOMPARE(h.authClient.calls.at(2).profile.baseUrl().toString(), url);
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileEndpointChangeDeletesOldTokenBeforeRestoreRead() {
+  // The same stable profileId() reloaded with a DIFFERENT canonical
+  // endpoint must never let the OLD token be read, sent, or saved against
+  // the NEW endpoint: a required Delete must precede any restore Read.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString oldUrl = QStringLiteral("https://old.example.test");
+  const QString newUrl = QStringLiteral("https://new.example.test");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), oldUrl);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+
+  const QString oldToken = QStringLiteral("old-token");
+  bootToSignedIn(h, oldToken);
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+  QVERIFY(h.tokenStore.storedToken(profileId).has_value());
+  const int authCallsBeforeReload = h.authClient.calls.size();
+
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), newUrl);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  h.coordinator->start();
+
+  // The full new snapshot -- including the new endpoint -- is committed
+  // synchronously, before any asynchronous probe/token-store completion.
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), newUrl);
+
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+
+  // The required Delete for the OLD endpoint's token is dispatched ahead
+  // of any restore Read.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+
+  h.tokenStore.complete(profileId, successWriteResult());
+
+  // The restore Read now dispatches, strictly after the Delete.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("read"));
+
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  // The old token was truly deleted; the probe used the new endpoint; and
+  // -- restricting the check to calls made AFTER the reload, since the
+  // ORIGINAL bootToSignedIn() legitimately validated oldToken via its own
+  // whoami call before this reload ever happened -- no whoami call made
+  // as part of the reload/restore-after-reload flow ever carried the old
+  // token.
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+  QCOMPARE(h.probeFactory.current()->lastProfile().baseUrl().toString(),
+           newUrl);
+  for (int i = authCallsBeforeReload; i < h.authClient.calls.size(); ++i) {
+    if (h.authClient.calls.at(i).kind == FakeAuthClient::CallKind::WhoAmI) {
+      const QString sentToken = h.authClient.calls.at(i).token;
+      QVERIFY(sentToken != oldToken);
+    }
+  }
+
+  // A subsequent explicit sign-in uses the new URL only.
+  h.coordinator->signIn(QStringLiteral("carol@example.test"),
+                        QStringLiteral("hunter2"));
+  QCOMPARE(h.authClient.calls.size(), 3);
+  QCOMPARE(h.authClient.calls.last().kind,
+           FakeAuthClient::CallKind::Authenticate);
+  QCOMPARE(h.authClient.calls.last().profile.baseUrl().toString(), newUrl);
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileEndpointChangeDuringInFlightSaveCompensatesExactlyOnce() {
+  // An auth/token Save already dispatched (in flight, uncancellable) under
+  // the OLD endpoint's epoch must be compensated for by exactly one
+  // cleanup Delete, and the endpoint change's OWN unconditional required
+  // Delete must still separately run, leaving no orphan/cross-origin
+  // token behind.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString oldUrl = QStringLiteral("https://old.example.test");
+  const QString newUrl = QStringLiteral("https://new.example.test");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), oldUrl);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+  h.bootToSignedOut();
+
+  h.coordinator->signIn(QStringLiteral("dave@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  h.authClient.completeToken(1, tokenSuccess(QStringLiteral("stale-token")));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
+  h.authClient.completeUser(
+      2,
+      userSuccess(QStringLiteral("dave"), QStringLiteral("dave@example.test")));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  // The Save is now dispatched (in flight, uncancellable) under the OLD
+  // endpoint's credential epoch.
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+  QCOMPARE(h.tokenStore.calls.at(1).kind, QStringLiteral("save"));
+
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), newUrl);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+
+  // The stale Save is still the only in-flight op; nothing new is
+  // dispatched until it completes (only one op may be in flight per
+  // profile at a time -- FakeTokenStore would fatally assert otherwise).
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+
+  h.tokenStore.complete(profileId, successWriteResult()); // stale save lands
+
+  // Exactly one compensating Delete for the abandoned save.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, successWriteResult());
+
+  // The endpoint change's OWN unconditional required Delete follows.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, notFoundResult()); // already removed above
+
+  // Exactly two deletes total: never a duplicate compensation.
+  int deleteCount = 0;
+  for (const auto &call : h.tokenStore.calls) {
+    if (call.kind == QStringLiteral("delete")) {
+      ++deleteCount;
+    }
+  }
+  QCOMPARE(deleteCount, 2);
+
+  // The queued restore Read now dispatches, strictly after both deletes.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 5);
+  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+  QCOMPARE(h.probeFactory.current()->lastProfile().baseUrl().toString(),
+           newUrl);
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileEndpointChangeDeleteFailureBlocksThenRetrySucceeds() {
+  // A genuine failure of the endpoint-change's required Delete must
+  // durably block any later read/auth for this profile -- never silently
+  // proceed with (or leak) the old endpoint's token -- until retry()
+  // succeeds.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString oldUrl = QStringLiteral("https://old.example.test");
+  const QString newUrl = QStringLiteral("https://new.example.test");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), oldUrl);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+  bootToSignedIn(h, QStringLiteral("old-token"));
+
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), newUrl);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, backendErrorResult()); // genuine failure
+
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+
+  // The old token is still technically present in the fake store (the
+  // Delete failed) but must never be sent anywhere while blocked: no
+  // further tokenStore call, and no auth request, occurs while stalled.
+  QVERIFY(h.tokenStore.storedToken(profileId).has_value());
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  const int authCallsBeforeBlockedSignIn = h.authClient.calls.size();
+  h.coordinator->signIn(QStringLiteral("erin@example.test"),
+                        QStringLiteral("hunter2"));
+  QCOMPARE(h.authClient.calls.size(), authCallsBeforeBlockedSignIn);
+
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, successWriteResult()); // retry succeeds
+
+  // The queued restore Read now finally dispatches.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 5);
+  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileCanonicallyEquivalentUrlIsNotEndpointChangeButPathCaseIs() {
+  // Direct unit-level check of the canonical-endpoint-identity comparison
+  // itself: an explicit-vs-default port spelling is the SAME endpoint;
+  // an otherwise-identical path that differs only in case is NOT (URL
+  // paths are case-sensitive, unlike scheme/host, which QUrl already
+  // lowercases during parsing -- see UrlValidator::validateCustomUrl()).
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const auto portOmitted =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"),
+                                  QStringLiteral("https://example.test"));
+  const auto portExplicitDefault =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"),
+                                  QStringLiteral("https://example.test:443"));
+  QVERIFY(portOmitted.has_value());
+  QVERIFY(portExplicitDefault.has_value());
+  QVERIFY(portOmitted->hasEquivalentEndpoint(*portExplicitDefault));
+
+  const auto pathLower =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"),
+                                  QStringLiteral("https://example.test/app"));
+  const auto pathUpper =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"),
+                                  QStringLiteral("https://example.test/App"));
+  QVERIFY(pathLower.has_value());
+  QVERIFY(pathUpper.has_value());
+  QVERIFY(!pathLower->hasEquivalentEndpoint(*pathUpper));
+
+  // End-to-end behavioral proof, part 1: the port-spelling-only reload
+  // above must never trigger a delete at the SessionCoordinator level.
+  {
+    Harness h;
+    h.profileStore.profiles = {*portOmitted};
+    h.profileStore.selectedId = profileId;
+    const QString token = QStringLiteral("session-token");
+    bootToSignedIn(h, token);
+    QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+
+    h.profileStore.profiles[0] = *portExplicitDefault;
+    QSignalSpy selectedProfileSpy(h.coordinator.get(),
+                                  &SessionCoordinator::selectedProfileChanged);
+    QVERIFY(selectedProfileSpy.isValid());
+
+    h.coordinator->start();
+    QVERIFY(
+        pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+    h.probeFactory.current()->complete(compatibleProbeResult());
+    QVERIFY(pumpEventsUntil(
+        [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+
+    QCOMPARE(h.tokenStore.calls.size(), 3);
+    QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("read"));
+    QCOMPARE(selectedProfileSpy.count(), 0);
+    h.tokenStore.complete(profileId, successReadResult(token));
+    QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 3; }));
+    h.authClient.completeUser(
+        3,
+        userSuccess(QStringLiteral("fay"), QStringLiteral("fay@example.test")));
+    QVERIFY(pumpEventsUntil([&h] {
+      return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+    }));
+    QVERIFY(h.tokenStore.storedToken(profileId).has_value());
+  }
+
+  // End-to-end behavioral proof, part 2: the path-case-only reload above
+  // MUST trigger the required-delete-before-restore-Read sequence exactly
+  // like any other endpoint change.
+  {
+    Harness h;
+    h.profileStore.profiles = {*pathLower};
+    h.profileStore.selectedId = profileId;
+    bootToSignedIn(h, QStringLiteral("session-token"));
+    QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+
+    h.profileStore.profiles[0] = *pathUpper;
+    h.coordinator->start();
+    QVERIFY(
+        pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+    h.probeFactory.current()->complete(compatibleProbeResult());
+    QVERIFY(pumpEventsUntil(
+        [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+    QCOMPARE(h.tokenStore.calls.size(), 3);
+    QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+    h.tokenStore.complete(profileId, successWriteResult());
+    QVERIFY(pumpEventsUntil(
+        [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+    QCOMPARE(h.tokenStore.calls.size(), 4);
+    QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("read"));
+    h.tokenStore.complete(profileId, notFoundResult());
+    QVERIFY(pumpEventsUntil([&h] {
+      return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+    }));
+    QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+  }
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileExactUnchangedContentEmitsNoSignals() {
+  // start() unconditionally reloads every profile record from storage on
+  // every restart. When the freshly loaded record for the SAME profileId()
+  // is byte-for-byte unchanged (same displayName, same canonical URL),
+  // mutateSelectedProfile() must not create a new notification obligation
+  // -- selectedProfileChanged() must fire zero times, and no credential
+  // action of any kind (delete or otherwise) may be taken.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString url = QStringLiteral("https://example.test");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), url);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+  const QString token = QStringLiteral("session-token");
+  bootToSignedIn(h, token);
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+
+  // Reload with an INDEPENDENTLY constructed but byte-for-byte identical
+  // record for the same profileId().
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), url);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  QSignalSpy selectedProfileSpy(h.coordinator.get(),
+                                &SessionCoordinator::selectedProfileChanged);
+  QVERIFY(selectedProfileSpy.isValid());
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+
+  QCOMPARE(selectedProfileSpy.count(), 0);
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, restore-read only
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId, successReadResult(token));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 3; }));
+  h.authClient.completeUser(
+      3,
+      userSuccess(QStringLiteral("gina"), QStringLiteral("gina@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
 }
 
 // ─── Secret-free diagnostics ──────────────────────────────────────────────

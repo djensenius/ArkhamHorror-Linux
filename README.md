@@ -141,6 +141,19 @@ sign-out/cleanup for that profile. This is an accepted, explicitly
 documented residual risk (see `SessionCoordinator.h`'s "Durability scope"
 comment), not a claim of crash-proof durability.
 
+A stored token is keyed by a profile's stable UUID, so profile storage can
+legitimately reload the same UUID with different content (for example, an
+edited display name or a changed server URL) across a `start()`/reload
+cycle. `SessionCoordinator` treats a display-name-only change as safe to
+keep the existing token, but any change to the profile's canonical network
+endpoint (scheme, host, effective port, or path) invalidates that profile's
+credential epoch and enqueues a required token deletion ahead of any
+restore read or new save, so a token obtained for one server is never read,
+sent, or persisted against a different one. That required deletion follows
+the same durably-retryable, per-profile-serialized semantics as other
+required deletes (see the point above); until it succeeds, later reads/
+saves/sign-ins for that profile remain blocked and retryable.
+
 ## Prerequisites
 
 - [mise](https://mise.jdx.dev/)

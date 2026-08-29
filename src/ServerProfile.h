@@ -59,6 +59,29 @@ public:
   [[nodiscard]] const QString &displayName() const;
   [[nodiscard]] const QUrl &baseUrl() const;
 
+  // Returns true iff |other| designates the SAME network endpoint as this
+  // profile: identical scheme, identical host, identical EFFECTIVE port
+  // (an explicit port, or the scheme's implied default port -- 443 for
+  // https, 80 for http -- when none was given, so "https://host" and
+  // "https://host:443" compare equal despite QUrl::port() returning -1 for
+  // the former and 443 for the latter), and an identical stored path
+  // prefix compared CASE-SENSITIVELY (URL paths are case-sensitive, so
+  // "/foo" and "/Foo" genuinely select different routes on the server).
+  // Scheme and host are compared with plain QString equality because
+  // UrlValidator::validateCustomUrl() already normalises both via QUrl's
+  // own parsing (which lowercases them) before either is ever stored in
+  // m_baseUrl, so no further case-folding is needed -- or wanted, since
+  // that would risk silently masking a genuine host difference.
+  //
+  // Two profiles with the same profileId() but a false result here refer
+  // to different endpoints even though they share a stable ID (stable IDs
+  // are explicitly supported by customWithId(), e.g. across a persisted
+  // reload that changed the underlying URL); any credential previously
+  // stored for that profileId() was scoped to the OLD endpoint and must
+  // never be used against the new one -- see
+  // SessionCoordinator::mutateSelectedProfile().
+  [[nodiscard]] bool hasEquivalentEndpoint(const ServerProfile &other) const;
+
   // Returns the full URL for a REST endpoint at |path| relative to the API
   // root.  Any stored path prefix (set by custom()) is prepended before
   // the API base path from currentPin().

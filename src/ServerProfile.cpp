@@ -104,6 +104,34 @@ const QString &ServerProfile::displayName() const { return m_displayName; }
 
 const QUrl &ServerProfile::baseUrl() const { return m_baseUrl; }
 
+namespace {
+// The port a URL effectively targets: its explicit port if one was given,
+// otherwise the well-known default for its scheme. QUrl::port() itself
+// returns -1 whenever no port was given, so comparing raw port() values
+// would treat "https://host" and "https://host:443" as different
+// endpoints despite them being identical.
+int effectivePort(const QUrl &url) {
+  const int explicitPort = url.port();
+  if (explicitPort != -1) {
+    return explicitPort;
+  }
+  if (url.scheme() == "https"_L1) {
+    return 443;
+  }
+  if (url.scheme() == "http"_L1) {
+    return 80;
+  }
+  return -1;
+}
+} // namespace
+
+bool ServerProfile::hasEquivalentEndpoint(const ServerProfile &other) const {
+  return m_baseUrl.scheme() == other.m_baseUrl.scheme() &&
+         m_baseUrl.host() == other.m_baseUrl.host() &&
+         effectivePort(m_baseUrl) == effectivePort(other.m_baseUrl) &&
+         m_baseUrl.path() == other.m_baseUrl.path();
+}
+
 QUrl ServerProfile::apiUrl(const QStringView path) const {
   if (!isValid()) {
     return {};
