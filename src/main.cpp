@@ -1,15 +1,6 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QGuiApplication>
-// Not referenced directly in this file, but required: ProductionSession
-// (owned here via std::unique_ptr, and only ever destroyed in this file)
-// owns a QNetworkAccessManager via its own std::unique_ptr member, so the
-// complete type must be visible wherever std::unique_ptr<ProductionSession>'s
-// destructor is instantiated. AppSessionComposition.h also includes this
-// directly (for its own self-containment), but this file keeps its own
-// explicit include too, per this codebase's direct/self-contained-includes
-// convention.
-#include <QNetworkAccessManager>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickWindow>

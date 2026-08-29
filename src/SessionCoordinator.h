@@ -152,10 +152,14 @@ public:
   // Static, secret-free, human-readable label for state(). Never derived
   // from any server- or user-supplied text.
   [[nodiscard]] QString stateDescription() const;
-  // Static, secret-free diagnostic for the current state. Empty unless the
-  // current state represents a failure or an explanation is useful (e.g.
-  // "sign-in was rejected"). Never contains a response body, request body,
-  // password, token, or Authorization header.
+  // Secret-free, sanitized diagnostic for the current state. Empty unless
+  // the current state represents a failure or an explanation is useful.
+  // Not always static text: for transport/backend/malformed-payload
+  // failures it may forward non-secret network/parse context (e.g. a
+  // QNetworkReply/QJsonParseError errorString()) already sanitized by
+  // IAuthenticationClient/ITokenStore/ICapabilityProbe. Never contains a
+  // response body, request body, password, token, or Authorization
+  // header.
   [[nodiscard]] QString diagnostic() const { return m_diagnostic; }
 
   [[nodiscard]] QString selectedProfileId() const {
