@@ -7,6 +7,14 @@ BUILD_DIR = "build"
 
 [tasks."setup:macos"]
 description = "Install Qt development dependencies with Homebrew"
+# NOTE: neither this Homebrew qtbase install nor the official Qt binaries
+# CI uses (jurplel/install-qt-action) ship a real AVIF decode plugin --
+# Qt has no official AVIF plugin at all (upstream qtimageformats does not
+# include one). AssetNetworkFetcher's typed AssetErrorCode::UnsupportedCodec
+# path (see src/AssetNetworkFetcher.cpp) is therefore the expected,
+# permanent behavior for AVIF assets in local dev exactly as in CI, not a
+# local-only gap; tests branch on QImageReader::supportedImageFormats()
+# accordingly rather than assuming either outcome.
 run = "brew install clang-format qtbase qtdeclarative qtshadertools qtsvg qtwebsockets"
 
 [tasks.configure]

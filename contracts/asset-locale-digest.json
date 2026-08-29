@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "note": "Seed pin for the localized-card-image digest introduced by djensenius/ArkhamHorror-Linux#17. This lists every (locale, category, identifier, side) tuple for which the web client's asset host is known to publish a localized image; AssetLocator uses digest ABSENCE to skip a localized network request entirely rather than relying on a live probe. This seed set intentionally covers only a small, easily-audited representative sample of card identifiers per supported locale (enough to exercise every side/category the fallback chain must handle) rather than a full catalog import, because the authoritative upstream web-client asset manifest was not available to this change. Maintainers should replace this file with a full import from the authoritative web-client digest source when it becomes available; tools/generate_asset_locale_digest.py regenerates src/AssetLocaleDigestData.generated.h from whatever this file contains without any code changes, and tests/AssetLocaleDigestTests.cpp fails deterministically if the generated header ever drifts from this file's contents.",
+    "localeMapSource": "djensenius/ArkhamHorror-Linux#17 issue body: 'Preserve the web locale mapping it -> ita, fr -> fr, es -> es, ko -> ko, zh -> zh.'"
+  },
+  "localeMap": {
+    "it": "ita",
+    "fr": "fr",
+    "es": "es",
+    "ko": "ko",
+    "zh": "zh"
+  },
+  "entries": [
+    { "locale": "ita", "category": "card", "identifier": "01001", "side": "front" },
+    { "locale": "ita", "category": "card", "identifier": "01001", "side": "back" },
+    { "locale": "ita", "category": "card", "identifier": "01002", "side": "front" },
+    { "locale": "fr", "category": "card", "identifier": "01001", "side": "front" },
+    { "locale": "fr", "category": "card", "identifier": "01001", "side": "back" },
+    { "locale": "es", "category": "card", "identifier": "01001", "side": "front" },
+    { "locale": "ko", "category": "card", "identifier": "01001", "side": "front" },
+    { "locale": "zh", "category": "card", "identifier": "01001", "side": "front" },
+    { "locale": "ita", "category": "card", "identifier": "01002", "side": "resolved_front" },
+    { "locale": "ita", "category": "card", "identifier": "01003", "side": "mutated_front" }
+  ]
+}

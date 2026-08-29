@@ -76,6 +76,20 @@ endif()
 add_library(arkham_foundation STATIC
     src/AppCommand.cpp
     src/AppCommand.h
+    src/AssetCache.cpp
+    src/AssetCache.h
+    src/AssetImageRequest.cpp
+    src/AssetImageRequest.h
+    src/AssetLocaleDigest.cpp
+    src/AssetLocaleDigest.h
+    src/AssetLocator.cpp
+    src/AssetLocator.h
+    src/AssetNetworkFetcher.cpp
+    src/AssetNetworkFetcher.h
+    src/AssetRequestCoordinator.cpp
+    src/AssetRequestCoordinator.h
+    src/AssetTypes.cpp
+    src/AssetTypes.h
     src/AuthModels.cpp
     src/AuthModels.h
     src/AuthTransportSecurity.cpp
@@ -114,6 +128,7 @@ add_library(arkham_foundation STATIC
 target_include_directories(arkham_foundation PUBLIC src)
 target_link_libraries(arkham_foundation PUBLIC
     Qt6::Core
+    Qt6::Gui
     Qt6::Network
     Qt6Keychain::Qt6Keychain
 )
@@ -197,6 +212,33 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME auth_client COMMAND arkham-auth-client-tests)
+
+    qt_add_executable(arkham-asset-tests
+        tests/AssetCacheTests.cpp
+        tests/AssetCacheTests.h
+        tests/AssetImageRequestTests.cpp
+        tests/AssetImageRequestTests.h
+        tests/AssetLocaleDigestTests.cpp
+        tests/AssetLocaleDigestTests.h
+        tests/AssetLocatorTests.cpp
+        tests/AssetLocatorTests.h
+        tests/AssetNetworkFetcherTests.cpp
+        tests/AssetNetworkFetcherTests.h
+        tests/AssetRequestCoordinatorTests.cpp
+        tests/AssetRequestCoordinatorTests.h
+        tests/AssetTestsMain.cpp
+        tests/MockHttpServer.cpp
+        tests/MockHttpServer.h
+    )
+    target_compile_definitions(arkham-asset-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-asset-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME asset COMMAND arkham-asset-tests)
 
     # QtKeychain's kwallet5 backend (the two downstream hardening patches'
     # target) only exists in keychain_unix.cpp, compiled solely for

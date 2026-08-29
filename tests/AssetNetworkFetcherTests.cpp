@@ -1,0 +1,440 @@
+#include "AssetNetworkFetcherTests.h"
+
+#include "AssetNetworkFetcher.h"
+#include "MockHttpServer.h"
+
+#include <QBuffer>
+#include <QImage>
+#include <QImageReader>
+#include <QNetworkAccessManager>
+#include <QSignalSpy>
+#include <QTest>
+#include <optional>
+
+using namespace Arkham;
+
+namespace {
+
+QByteArray encodeImage(int width, int height, const char *format) {
+  QImage image(width, height, QImage::Format_Mono);
+  image.fill(0);
+  QByteArray bytes;
+  QBuffer buffer(&bytes);
+  buffer.open(QIODevice::WriteOnly);
+  const bool ok = image.save(&buffer, format);
+  Q_ASSERT(ok);
+  Q_UNUSED(ok);
+  return bytes;
+}
+
+using Outcome = AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult>;
+
+// Fetches synchronously (from the test's point of view) by pumping the
+// event loop until the callback fires or `timeoutMs` elapses. Returns
+// std::nullopt on a timeout (a test bug, never an expected outcome).
+std::optional<Outcome>
+fetchAndWait(AssetNetworkFetcher &fetcher, const QUrl &url, AssetFormat format,
+             AssetNetworkFetcher::ConditionalHeaders conditional = {},
+             int timeoutMs = 5000) {
+  std::optional<Outcome> result;
+  fetcher.fetch(url, format, conditional,
+                [&result](Outcome outcome) { result = std::move(outcome); });
+  (void)QTest::qWaitFor([&result]() { return result.has_value(); }, timeoutMs);
+  return result;
+}
+
+} // namespace
+
+void AssetNetworkFetcherTests::successfulFetchNeverSendsCookiesOrAuthHeader() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(64, 64, "png");
+  server.setResponse(QStringLiteral("/ok.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/ok.png")), AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QVERIFY(!(**result).notModified);
+  QCOMPARE((**result).asset->dimensions, QSize(64, 64));
+
+  const auto headers = server.lastRequestHeaders(QStringLiteral("/ok.png"));
+  QVERIFY(!headers.contains("cookie"));
+  QVERIFY(!headers.contains("authorization"));
+}
+
+void AssetNetworkFetcherTests::manualRedirectPolicyRejectsEvery3xx_data() {
+  QTest::addColumn<int>("status");
+  QTest::newRow("301") << 301;
+  QTest::newRow("302") << 302;
+  QTest::newRow("303") << 303;
+  QTest::newRow("307") << 307;
+  QTest::newRow("308") << 308;
+}
+
+void AssetNetworkFetcherTests::manualRedirectPolicyRejectsEvery3xx() {
+  QFETCH(int, status);
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.status = status;
+  response.reasonPhrase = "Redirect";
+  response.extraHeaders.append(qMakePair(
+      QByteArray("Location"), QByteArray("http://127.0.0.1/elsewhere")));
+  server.setResponse(QStringLiteral("/redirect"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/redirect")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::RedirectRejected);
+}
+
+void AssetNetworkFetcherTests::notFoundMapsToNotFoundError() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.status = 404;
+  response.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/missing.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/missing.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::NotFound);
+}
+
+void AssetNetworkFetcherTests::serverErrorMapsToUnexpectedStatus() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.status = 500;
+  response.reasonPhrase = "Internal Server Error";
+  server.setResponse(QStringLiteral("/broken.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/broken.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::UnexpectedStatus);
+}
+
+void AssetNetworkFetcherTests::incrementalByteCapAbortsBeforeFullBodyArrives() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  // The incremental byte cap is enforced purely on transferred byte count
+  // (readyRead), before any Content-Type/magic-byte/image parsing, so the
+  // body need not be a valid image at all here -- just larger than the
+  // tiny 4 KiB test cap below and incompressible-content-agnostic (raw
+  // pseudo-random bytes, so it can never accidentally compress away like
+  // a uniform PNG fixture would), streamed slowly so the abort can be
+  // observed to happen before the whole body was ever transmitted.
+  QByteArray body(64 * 1024, Qt::Uninitialized);
+  for (int i = 0; i < body.size(); ++i) {
+    body[i] = static_cast<char>((i * 2654435761u) & 0xFF);
+  }
+  response.body = body;
+  QVERIFY(response.body.size() > 4096);
+  response.slowDrip = true;
+  response.chunkSize = 256;
+  response.chunkDelayMs = 10;
+  server.setResponse(QStringLiteral("/big.png"), response);
+
+  AssetNetworkFetcher::Limits limits;
+  limits.maxEncodedBytes = 4096;
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam, limits);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/big.png")), AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::ResponseTooLarge);
+
+  // Give the server's timer-driven writer a moment to notice the
+  // disconnect and stop, then confirm it never got to flush the whole
+  // (much larger) body -- proving the cap was enforced incrementally,
+  // not merely re-checked once the full body had already arrived.
+  QTest::qWait(50);
+  const qint64 flushed =
+      server.lastBytesWrittenForSlowDrip(QStringLiteral("/big.png"));
+  QVERIFY(flushed >= 0);
+  QVERIFY2(flushed < response.body.size(),
+           qPrintable(QStringLiteral("flushed=%1 total=%2")
+                          .arg(flushed)
+                          .arg(response.body.size())));
+}
+
+void AssetNetworkFetcherTests::contentTypeMismatchIsRejected() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "text/plain"; // declared type does not match Jpeg
+  response.body = encodeImage(32, 32, "png");
+  server.setResponse(QStringLiteral("/wrong-type.jpg"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/wrong-type.jpg")),
+      AssetFormat::Jpeg);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::ContentTypeMismatch);
+}
+
+void AssetNetworkFetcherTests::magicBytesMismatchIsRejected() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  // Content-Type correctly claims PNG, but the body is actually a JPEG:
+  // this must be caught independently of the (possibly-lying) header.
+  response.contentType = "image/png";
+  response.body = encodeImage(32, 32, "jpg");
+  server.setResponse(QStringLiteral("/lying.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/lying.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MagicBytesMismatch);
+}
+
+void AssetNetworkFetcherTests::dimensionBombIsRejected() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  // A single dimension (8300) exceeds the default 8192 cap, while the
+  // other dimension is tiny -- this is a genuine, fully valid PNG (highly
+  // compressible, since it is a uniform mono image) so this exercises the
+  // real QImageReader::size() pre-decode path, not a hand-crafted header.
+  response.body = encodeImage(8300, 4, "png");
+  server.setResponse(QStringLiteral("/wide.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/wide.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::DimensionTooLarge);
+}
+
+void AssetNetworkFetcherTests::pixelBudgetBombIsRejected() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  // 6000 x 6000 = 36,000,000 pixels, over the 32,000,000 cap, while
+  // neither dimension alone exceeds the 8192 per-side cap.
+  response.body = encodeImage(6000, 6000, "png");
+  server.setResponse(QStringLiteral("/huge.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/huge.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::PixelBudgetExceeded);
+}
+
+void AssetNetworkFetcherTests::malformedImageBodyIsRejected() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  QByteArray body = encodeImage(64, 64, "png");
+  body.chop(body.size() / 2); // truncate: passes magic-byte sniff, fails decode
+  response.body = body;
+  server.setResponse(QStringLiteral("/truncated.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/truncated.png")),
+                   AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::avifCodecSupportIsEnvironmentAdaptive() {
+  const bool avifSupported =
+      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+
+  QByteArray body;
+  if (avifSupported) {
+    QImage image(32, 32, QImage::Format_Mono);
+    image.fill(0);
+    QBuffer buffer(&body);
+    buffer.open(QIODevice::WriteOnly);
+    if (!image.save(&buffer, "avif")) {
+      QSKIP("installed Qt build reports AVIF read support but cannot "
+            "encode a fixture image; skipping environment-specific case");
+    }
+  } else {
+    // A minimal ISOBMFF "ftyp" box whose major brand is "avif": enough to
+    // pass this class's independent magic-byte sniff, but with no actual
+    // decodable AV1 payload -- exactly modelling "bytes are structurally
+    // plausible but this Qt build has no plugin to decode them."
+    body = QByteArrayLiteral("\x00\x00\x00\x14"
+                             "ftyp"
+                             "avif"
+                             "\x00\x00\x00\x00"
+                             "avif");
+  }
+  response.body = body;
+  server.setResponse(QStringLiteral("/image.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/image.avif")),
+                   AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  if (avifSupported) {
+    QVERIFY2(bool(*result), qPrintable(result->error().message));
+  } else {
+    QVERIFY(!bool(*result));
+    QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  }
+}
+
+void AssetNetworkFetcherTests::conditionalRequestAcceptsMatchingNotModified() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(16, 16, "png");
+  response.etagForConditionalMatch = "\"abc123\"";
+  server.setResponse(QStringLiteral("/conditional.png"), response);
+
+  AssetNetworkFetcher::ConditionalHeaders conditional;
+  conditional.etag = QStringLiteral("\"abc123\"");
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/conditional.png")),
+      AssetFormat::Png, conditional);
+
+  QVERIFY(result.has_value());
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QVERIFY((**result).notModified);
+  QVERIFY(!(**result).asset.has_value());
+}
+
+void AssetNetworkFetcherTests::unconditional304IsRejectedAsTypedError() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(16, 16, "png");
+  // The server will 304 on ANY request once an etag/etc match is
+  // configured with an empty request-side header, simulating a
+  // buggy/hostile server that 304s even though this client never sent a
+  // conditional header at all (etagForConditionalMatch empty means we
+  // instead force it by matching an always-absent If-None-Match... so
+  // instead directly configure the server to unconditionally 304).
+  response.status = 304;
+  response.reasonPhrase = "Not Modified";
+  response.body.clear();
+  server.setResponse(QStringLiteral("/unexpected-304.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/unexpected-304.png")),
+      AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::ConditionalWithoutCachedBody);
+}
+
+void AssetNetworkFetcherTests::cancelInvokesCallbackExactlyOnceWithCancelled() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(2000, 2000, "png");
+  response.slowDrip = true;
+  response.chunkSize = 16;
+  response.chunkDelayMs = 200; // slow enough that the test can cancel first
+  server.setResponse(QStringLiteral("/slow.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+
+  int callCount = 0;
+  std::optional<Outcome> result;
+  const auto handle =
+      fetcher.fetch(server.baseUrlFor(QStringLiteral("/slow.png")),
+                    AssetFormat::Png, {}, [&](Outcome outcome) {
+                      ++callCount;
+                      result = std::move(outcome);
+                    });
+
+  fetcher.cancel(handle);
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QCOMPARE(callCount, 1);
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::Cancelled);
+
+  // Cancelling an already-completed handle (or a stale one) is a no-op:
+  // the callback must never fire a second time.
+  fetcher.cancel(handle);
+  QTest::qWait(50);
+  QCOMPARE(callCount, 1);
+}
+
+void AssetNetworkFetcherTests::destructionNeverInvokesStaleCallback() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(2000, 2000, "png");
+  response.slowDrip = true;
+  response.chunkSize = 16;
+  response.chunkDelayMs = 200;
+  server.setResponse(QStringLiteral("/slow2.png"), response);
+
+  bool callbackFired = false;
+  QNetworkAccessManager nam;
+  {
+    AssetNetworkFetcher fetcher(nam);
+    fetcher.fetch(server.baseUrlFor(QStringLiteral("/slow2.png")),
+                  AssetFormat::Png, {},
+                  [&callbackFired](Outcome) { callbackFired = true; });
+    // fetcher is destroyed here, mid-flight.
+  }
+
+  QTest::qWait(300); // long enough that the slow drip would otherwise finish
+  QVERIFY(!callbackFired);
+}

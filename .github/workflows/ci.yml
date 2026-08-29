@@ -68,7 +68,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. NOTE: Qt has no official AVIF plugin at all (upstream qtimageformats does not include one; a working plugin would require the separate third-party novomesk/qt-avif-image-plugin, out of scope here) -- the asset cache's AssetNetworkFetcher therefore returns a typed UnsupportedCodec error for AVIF assets on this runner, exactly as it does in local development, and the codec-support tests branch on QImageReader::supportedImageFormats().contains("avif") accordingly.
           cache: true
       - name: Install QtKeychain and D-Bus build dependencies
         run: |
@@ -111,7 +111,7 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; see the "Unit tests" job's Qt step above for why AVIF is not available here either.
           cache: true
       - name: Install QtKeychain build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
@@ -266,6 +266,45 @@ jobs:
             exit 1
           }
           echo "libsecret, libqt6keychain, and attribution files verified inside the AppImage."
+      - name: Verify the JPEG image-format plugin is bundled and loadable
+        # djensenius/ArkhamHorror-Linux#17's asset cache validates
+        # Content-Type plus real magic bytes for PNG/JPEG/AVIF and decodes
+        # via QImageReader. PNG decoding is compiled directly into QtGui
+        # (no separate plugin), but JPEG decoding is a separate Qt plugin
+        # (libqjpeg.so under .../plugins/imageformats/) that
+        # linuxdeploy-plugin-qt must actually bundle for JPEG assets to
+        # decode at all on a target host with no system Qt installed --
+        # unlike libsecret above, this is a Qt plugin loaded via Qt's own
+        # QFactoryLoader (scoped to the AppImage's own plugin path by
+        # AppRun), not a bare dlopen(), so a simple presence + ELF-validity
+        # check (mirroring the file-based half of the libsecret check) is
+        # the right-sized proof here; the "Launch the packaged AppImage
+        # headlessly" step below further proves the bundled Qt platform
+        # plugin loads with no host Qt leakage using the exact same
+        # plugin-path scoping mechanism.
+        #
+        # AVIF has no official Qt plugin at all as of this Qt release
+        # (upstream qtimageformats does not ship one; a working plugin
+        # would require the separate third-party
+        # novomesk/qt-avif-image-plugin, out of scope here), so
+        # AssetNetworkFetcher's typed UnsupportedCodec path -- not a
+        # bundled AVIF plugin -- is the actual, permanent behavior for
+        # AVIF assets on every target this AppImage runs on today; there
+        # is deliberately no AVIF plugin check here to assert against.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          jpeg_plugin="$(find "$extracted" -path '*/imageformats/libqjpeg.so' | head -n1)"
+          [[ -n "$jpeg_plugin" ]] || {
+            echo "libqjpeg.so was not bundled into the AppImage's imageformats plugin directory." >&2
+            exit 1
+          }
+          echo "Found bundled JPEG plugin: $jpeg_plugin"
+          file "$jpeg_plugin" | grep -q 'ELF' || {
+            echo "Bundled libqjpeg.so is not a valid ELF shared object:" >&2
+            file "$jpeg_plugin" >&2
+            exit 1
+          }
       - name: Recursive DT_NEEDED closure audit (with mutation regressions)
         # A static, purely file-based proof (packaging/audit_dependency_closure.py)
         # that every non-ABI transitive dependency of the bundled libsecret
