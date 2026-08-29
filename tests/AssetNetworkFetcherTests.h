@@ -33,6 +33,7 @@ private slots:
   void avifCodecSupportIsEnvironmentAdaptive();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void avifFtypMinorVersionIsNeverMisreadAsCompatibleBrand();
+  void avifFtypTruncatedBoxSizeNeverReadsPastDeclaredBoundary();
   void conditionalRequestAcceptsMatchingNotModified();
   void conditionalRequestWithLastModifiedAcceptsMatchingNotModified();
   void unconditional304IsRejectedAsTypedError();

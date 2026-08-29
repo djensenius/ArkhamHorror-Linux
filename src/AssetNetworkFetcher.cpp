@@ -53,21 +53,30 @@ std::optional<AssetFormat> sniffMagicBytes(const QByteArray &bytes) {
     // AVIF `ftyp` box as a magic-bytes mismatch.
     const qint64 boxEnd =
         boxSize == 0 ? available : qMin<qint64>(boxSize, available);
-    // Layout: [0..4) box size, [4..8) "ftyp", [8..12) major_brand,
-    // [12..16) minor_version (a version number, NOT a brand -- it must
-    // never be compared against "avif"/"avis"), [16..boxEnd) zero or
-    // more 4-byte compatible_brands. Checking major_brand and then
-    // skipping straight to compatible_brands (offset 16) avoids
-    // misclassifying a crafted minor_version as a brand match.
-    if (bytes.mid(8, 4) == QByteArrayLiteral("avif") ||
-        bytes.mid(8, 4) == QByteArrayLiteral("avis")) {
-      return AssetFormat::Avif;
-    }
-    for (qint64 offset = 16; offset + 4 <= boxEnd; offset += 4) {
-      const QByteArray brand = bytes.mid(offset, 4);
-      if (brand == QByteArrayLiteral("avif") ||
-          brand == QByteArrayLiteral("avis")) {
+    // A ftyp box must declare at least 12 bytes (4-byte size + "ftyp" +
+    // 4-byte major_brand) to even contain a major_brand field. A nonzero
+    // declared size smaller than that is a malformed/truncated box: it
+    // must never be treated as ftyp data, because reading major_brand at
+    // a fixed offset of 8 regardless of boxEnd would read past the
+    // declared (invalid) box boundary into whatever bytes happen to
+    // follow -- potentially misclassifying non-AVIF data as AVIF.
+    if (boxEnd >= 12) {
+      // Layout: [0..4) box size, [4..8) "ftyp", [8..12) major_brand,
+      // [12..16) minor_version (a version number, NOT a brand -- it must
+      // never be compared against "avif"/"avis"), [16..boxEnd) zero or
+      // more 4-byte compatible_brands. Checking major_brand and then
+      // skipping straight to compatible_brands (offset 16) avoids
+      // misclassifying a crafted minor_version as a brand match.
+      if (bytes.mid(8, 4) == QByteArrayLiteral("avif") ||
+          bytes.mid(8, 4) == QByteArrayLiteral("avis")) {
         return AssetFormat::Avif;
+      }
+      for (qint64 offset = 16; offset + 4 <= boxEnd; offset += 4) {
+        const QByteArray brand = bytes.mid(offset, 4);
+        if (brand == QByteArrayLiteral("avif") ||
+            brand == QByteArrayLiteral("avis")) {
+          return AssetFormat::Avif;
+        }
       }
     }
   }

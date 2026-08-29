@@ -482,6 +482,42 @@ void AssetNetworkFetcherTests::
   QCOMPARE(result->error().code, AssetErrorCode::MagicBytesMismatch);
 }
 
+void AssetNetworkFetcherTests::
+    avifFtypTruncatedBoxSizeNeverReadsPastDeclaredBoundary() {
+  // Per ISO/IEC 14496-12, a `ftyp` box must declare at least 12 bytes
+  // (4-byte size + "ftyp" + 4-byte major_brand) to legally contain a
+  // major_brand field at all. This body's leading size field declares
+  // only 8 bytes -- i.e. the box claims to end immediately after "ftyp",
+  // BEFORE any major_brand -- yet the buffer keeps going with 4 more
+  // bytes that spell "avif". Those trailing bytes are NOT part of the
+  // declared box (they belong to whatever comes after it, or are
+  // adversarially crafted padding); a correct sniff must never read them
+  // as major_brand and must reject this as MagicBytesMismatch. Without
+  // the fix, the code read bytes.mid(8, 4) unconditionally regardless of
+  // the (too-small) declared boxEnd, and would have misclassified this
+  // truncated/malformed box as a genuine AVIF signature.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  // 4-byte box size (8: box claims to end right after "ftyp", with no
+  // room for major_brand) + "ftyp" + 4 trailing bytes that spell "avif"
+  // but lie outside the declared box boundary.
+  response.body = QByteArrayLiteral("\x00\x00\x00\x08"
+                                    "ftyp"
+                                    "avif");
+  server.setResponse(QStringLiteral("/truncated-box.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/truncated-box.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MagicBytesMismatch);
+}
+
 void AssetNetworkFetcherTests::conditionalRequestAcceptsMatchingNotModified() {
   MockHttpServer server;
   MockHttpServer::Response response;
