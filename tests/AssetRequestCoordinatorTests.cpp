@@ -315,3 +315,190 @@ void AssetRequestCoordinatorTests::destructionNeverInvokesStaleCallback() {
   QTest::qWait(300);
   QVERIFY(!callbackFired);
 }
+
+void AssetRequestCoordinatorTests::
+    cancellingImmediateCacheHitCompletionSuppressesDelivery() {
+  // Even a cache hit (or a pre-network resolution error) must return a
+  // VALID handle, and that handle must be able to suppress the queued
+  // completion before it runs -- otherwise a QML seam that calls
+  // cancel() unconditionally in its destructor (as AssetImageRequest
+  // does) would have no way to prevent a completion callback from firing
+  // on an object it no longer owns.
+  MockHttpServer server; // no responses registered: any network hit fails.
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = QByteArrayLiteral("cache-hit-bytes");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  cache.store(cacheKey, preSeeded);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  int callbackCount = 0;
+  std::optional<Result> result;
+  const auto handle = coordinator.request(key, [&](Result r) {
+    ++callbackCount;
+    result = std::move(r);
+  });
+
+  // The whole point of this test: the handle for an immediate cache-hit
+  // completion must be valid, not the default-constructed sentinel.
+  QVERIFY(handle.isValid());
+
+  // Cancel before the event loop has had any chance to run the queued
+  // cache-hit delivery.
+  coordinator.cancel(handle);
+
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::Cancelled);
+
+  // Give any (incorrectly) still-queued cache-hit delivery a chance to
+  // fire before asserting it never did.
+  QTest::qWait(100);
+  QCOMPARE(callbackCount, 1);
+}
+
+void AssetRequestCoordinatorTests::
+    diskHitWithValidatorsRevalidatesAndServesStaleOn304() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(32, 32); // must never be served to the caller
+  response.etagForConditionalMatch = "\"stale-etag\"";
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = QByteArrayLiteral("stale-but-still-valid-bytes");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.etag = QStringLiteral("\"stale-etag\"");
+  cache.store(cacheKey, preSeeded);
+
+  // A fresh AssetCache instance (simulating a process restart with empty
+  // memory) forces this request through the disk-hit path rather than
+  // the memory-hit path, which never revalidates.
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).encodedBytes,
+           QByteArrayLiteral("stale-but-still-valid-bytes"));
+  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QCOMPARE(server.lastRequestHeaders(QStringLiteral("/cards/valid01.png"))
+               .value("if-none-match"),
+           QByteArrayLiteral("\"stale-etag\""));
+}
+
+void AssetRequestCoordinatorTests::
+    diskHitRevalidationReplacesEntryOnFresh200() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(32, 32);
+  // No etagForConditionalMatch configured: the origin's content genuinely
+  // changed, so it answers the conditional GET with a full fresh 200.
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = QByteArrayLiteral("old-bytes-now-outdated");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.etag = QStringLiteral("\"old-etag\"");
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QVERIFY((**result).encodedBytes !=
+          QByteArrayLiteral("old-bytes-now-outdated"));
+  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+
+  // The cache must actually be updated with the fresh content, not just
+  // the in-memory result returned to this one caller.
+  const auto updated = restartedCache.lookupMemory(cacheKey);
+  QVERIFY(updated.has_value());
+  QVERIFY(updated->encodedBytes != QByteArrayLiteral("old-bytes-now-outdated"));
+}
+
+void AssetRequestCoordinatorTests::
+    diskHitRevalidationServesStaleOnAnyFailure() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.status = 404;
+  response.reasonPhrase = "Not Found";
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = QByteArrayLiteral("still-served-despite-404");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.lastModified = QStringLiteral("Wed, 01 Jan 2020 00:00:00 GMT");
+  cache.store(cacheKey, preSeeded);
+
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  // "Stale-if-error": an origin that now 404s a previously-cached
+  // candidate must never make already-cached, already-displayed art
+  // disappear or error out.
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).encodedBytes,
+           QByteArrayLiteral("still-served-despite-404"));
+}

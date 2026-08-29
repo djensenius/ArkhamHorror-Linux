@@ -47,7 +47,12 @@ std::optional<AssetFormat> sniffMagicBytes(const QByteArray &bytes) {
                             (static_cast<unsigned char>(bytes[2]) << 8) |
                             static_cast<unsigned char>(bytes[3]);
     const qint64 available = bytes.size();
-    const qint64 boxEnd = qMin<qint64>(boxSize, available);
+    // Per ISO/IEC 14496-12, a box size of 0 means "this box extends to
+    // the end of the enclosing file/buffer" -- NOT a zero-length box.
+    // Treating it as zero-length would silently reject a spec-valid
+    // AVIF `ftyp` box as a magic-bytes mismatch.
+    const qint64 boxEnd =
+        boxSize == 0 ? available : qMin<qint64>(boxSize, available);
     for (qint64 offset = 8; offset + 4 <= boxEnd; offset += 4) {
       const QByteArray brand = bytes.mid(offset, 4);
       if (brand == QByteArrayLiteral("avif") ||

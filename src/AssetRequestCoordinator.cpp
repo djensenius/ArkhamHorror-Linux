@@ -61,17 +61,9 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   const AssetOutcome<QVector<AssetCandidate>> candidatesResult =
       AssetLocator::resolveCandidates(key);
   if (!candidatesResult) {
-    QPointer<AssetRequestCoordinator> self(this);
-    const AssetError error = candidatesResult.error();
-    QMetaObject::invokeMethod(
-        this,
-        [self, callback = std::move(callback), error]() mutable {
-          if (self) {
-            std::move(callback)(AssetOutcome<AssetCache::CachedEntry>(error));
-          }
-        },
-        Qt::QueuedConnection);
-    return RequestHandle{};
+    return registerImmediateCompletion(
+        key, std::move(callback),
+        AssetOutcome<AssetCache::CachedEntry>(candidatesResult.error()));
   }
 
   const QVector<AssetCandidate> &candidates = *candidatesResult;
@@ -82,33 +74,44 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   // fallback probing every time.
   for (const AssetCandidate &candidate : candidates) {
     const QString cacheKey = AssetCache::cacheKeyFor(candidate.url);
+
+    // A same-process memory hit was already validated during this
+    // process's own lifetime: serve it with no network round trip at all.
     if (auto hit = m_cache.lookupMemory(cacheKey)) {
-      QPointer<AssetRequestCoordinator> self(this);
-      AssetCache::CachedEntry entry = *hit;
-      QMetaObject::invokeMethod(
-          this,
-          [self, callback = std::move(callback),
-           entry = std::move(entry)]() mutable {
-            if (self) {
-              std::move(callback)(AssetOutcome<AssetCache::CachedEntry>(entry));
-            }
-          },
-          Qt::QueuedConnection);
-      return RequestHandle{};
+      return registerImmediateCompletion(
+          key, std::move(callback),
+          AssetOutcome<AssetCache::CachedEntry>(*hit));
     }
+
     if (auto hit = m_cache.lookupDisk(cacheKey)) {
-      QPointer<AssetRequestCoordinator> self(this);
       AssetCache::CachedEntry entry = *hit;
-      QMetaObject::invokeMethod(
-          this,
-          [self, callback = std::move(callback),
-           entry = std::move(entry)]() mutable {
-            if (self) {
-              std::move(callback)(AssetOutcome<AssetCache::CachedEntry>(entry));
-            }
-          },
-          Qt::QueuedConnection);
-      return RequestHandle{};
+      if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
+        // Nothing to conditionally revalidate against: serve as-is,
+        // exactly like a memory hit.
+        return registerImmediateCompletion(
+            key, std::move(callback),
+            AssetOutcome<AssetCache::CachedEntry>(std::move(entry)));
+      }
+
+      // A disk hit carrying validators is revalidated with a real
+      // conditional GET (see startRevalidation()) rather than trusted
+      // forever: this is the only production code path that actually
+      // exercises AssetNetworkFetcher::ConditionalHeaders end-to-end.
+      const quint64 handleId = m_nextHandle++;
+      const quint64 operationId = m_nextOperationId++;
+      Operation operation;
+      operation.key = key;
+      operation.candidates = QVector<AssetCandidate>{candidate};
+      operation.candidateIndex = 0;
+      operation.isRevalidation = true;
+      operation.revalidationCacheKey = cacheKey;
+      operation.staleEntry = std::move(entry);
+      operation.consumers.append(Consumer{handleId, std::move(callback)});
+      m_operations.insert(operationId, std::move(operation));
+      m_handleToOperation.insert(handleId, operationId);
+
+      startRevalidation(operationId);
+      return RequestHandle{handleId};
     }
   }
 
@@ -134,6 +137,37 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   m_handleToOperation.insert(handleId, operationId);
 
   startCandidate(operationId);
+
+  return RequestHandle{handleId};
+}
+
+AssetRequestCoordinator::RequestHandle
+AssetRequestCoordinator::registerImmediateCompletion(
+    const AssetKey &key, ResultCallback callback,
+    AssetOutcome<AssetCache::CachedEntry> result) {
+  // Even an immediate (cache-hit or pre-network-error) completion is
+  // routed through the normal operation/consumer bookkeeping and given a
+  // real, valid handle: this is what lets cancel(handle) suppress a queued
+  // completion that has not yet run, and is exactly what a QML seam's
+  // destructor relies on when it calls cancel() unconditionally.
+  const quint64 handleId = m_nextHandle++;
+  const quint64 operationId = m_nextOperationId++;
+
+  Operation operation;
+  operation.key = key;
+  operation.consumers.append(Consumer{handleId, std::move(callback)});
+  m_operations.insert(operationId, std::move(operation));
+  m_handleToOperation.insert(handleId, operationId);
+
+  QPointer<AssetRequestCoordinator> self(this);
+  QMetaObject::invokeMethod(
+      this,
+      [self, operationId, result = std::move(result)]() mutable {
+        if (self) {
+          self->completeOperation(operationId, std::move(result));
+        }
+      },
+      Qt::QueuedConnection);
 
   return RequestHandle{handleId};
 }
@@ -198,6 +232,75 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
         self->m_cache.store(cacheKey, entry);
         self->completeOperation(operationId,
                                 AssetOutcome<AssetCache::CachedEntry>(entry));
+      });
+}
+
+void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
+  auto it = m_operations.find(operationId);
+  if (it == m_operations.end()) {
+    return;
+  }
+  Operation &operation = it.value();
+  const AssetCandidate &candidate = operation.candidates.first();
+  const AssetCache::CachedEntry &staleEntry = *operation.staleEntry;
+
+  AssetNetworkFetcher::ConditionalHeaders conditional;
+  conditional.etag = staleEntry.etag;
+  conditional.lastModified = staleEntry.lastModified;
+
+  QPointer<AssetRequestCoordinator> self(this);
+  operation.fetchHandle = m_fetcher.fetch(
+      candidate.url, operation.key.format, conditional,
+      [self, operationId](
+          AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
+        if (!self) {
+          return;
+        }
+        auto opIt = self->m_operations.find(operationId);
+        if (opIt == self->m_operations.end()) {
+          return; // operation already fully cancelled/completed
+        }
+        Operation &operation = opIt.value();
+        const AssetCache::CachedEntry stale = *operation.staleEntry;
+
+        // "Stale-if-error": ANY revalidation failure (a 404 because the
+        // origin removed this exact candidate, a transport error, a
+        // timeout, an integrity/codec failure, cancellation racing a
+        // teardown, etc.) serves the still-valid stale cached entry
+        // as-is rather than surfacing an error or advancing candidates --
+        // a briefly-unreachable or since-changed origin can never make
+        // previously cached, already-displayed art disappear.
+        if (!result) {
+          self->completeOperation(operationId,
+                                  AssetOutcome<AssetCache::CachedEntry>(stale));
+          return;
+        }
+
+        if (result->notModified) {
+          // Confirmed unchanged: refresh only lastAccess (the payload
+          // bytes are never touched), then serve the same stale entry.
+          self->m_cache.touchAfterNotModified(operation.revalidationCacheKey,
+                                              QString(), QString());
+          self->completeOperation(operationId,
+                                  AssetOutcome<AssetCache::CachedEntry>(stale));
+          return;
+        }
+
+        if (!result->asset.has_value()) {
+          // Defensive only: AssetNetworkFetcher never returns
+          // notModified==false with an empty asset.
+          self->completeOperation(operationId,
+                                  AssetOutcome<AssetCache::CachedEntry>(stale));
+          return;
+        }
+
+        // The origin sent a fresh 200 body despite our conditional
+        // headers (its content genuinely changed): replace the cached
+        // entry and serve the new content.
+        AssetCache::CachedEntry fresh = toCachedEntry(*result->asset);
+        self->m_cache.store(operation.revalidationCacheKey, fresh);
+        self->completeOperation(operationId,
+                                AssetOutcome<AssetCache::CachedEntry>(fresh));
       });
 }
 

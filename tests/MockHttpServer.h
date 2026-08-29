@@ -5,6 +5,7 @@
 #include <QList>
 #include <QObject>
 #include <QPair>
+#include <QSet>
 #include <QString>
 #include <QUrl>
 
@@ -75,8 +76,10 @@ public:
   // "conditional headers arrived correctly" assertions these tests need).
   [[nodiscard]] QHash<QByteArray, QByteArray> lastRequestHeaders(const QString &path) const;
   // True iff ANY request to ANY path, ever, carried this (lower-cased)
-  // header name -- used to assert a header is NEVER sent, across an
-  // entire test, not just the most recent request.
+  // header name -- tracked via a running set of every header name seen
+  // across every request this server has ever handled (NOT merely the
+  // last request per path), so an assertion that a header is never sent
+  // cannot be defeated by a later request to the same path omitting it.
   [[nodiscard]] bool anyRequestEverHadHeader(const QByteArray &lowerHeaderName) const;
 
   // Number of bytes of a slowDrip response body actually flushed to the
@@ -113,6 +116,7 @@ private:
   QHash<QString, Response> m_responses;
   QHash<QString, int> m_requestCounts;
   QHash<QString, QHash<QByteArray, QByteArray>> m_lastRequestHeaders;
+  QSet<QByteArray> m_allHeaderNamesEverSeen;
   QHash<QString, qint64> m_lastSlowDripBytesWritten;
   QHash<QTcpSocket *, Connection> m_connections;
 };

@@ -29,6 +29,7 @@ private slots:
   void pixelBudgetBombIsRejected();
   void malformedImageBodyIsRejected();
   void avifCodecSupportIsEnvironmentAdaptive();
+  void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void conditionalRequestAcceptsMatchingNotModified();
   void unconditional304IsRejectedAsTypedError();
   void cancelInvokesCallbackExactlyOnceWithCancelled();

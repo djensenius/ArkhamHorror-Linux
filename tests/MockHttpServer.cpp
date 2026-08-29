@@ -6,7 +6,6 @@
 #include <QTimer>
 
 #include <algorithm>
-#include <memory>
 
 MockHttpServer::MockHttpServer(QObject *parent)
     : QObject(parent), m_server(new QTcpServer(this)) {
@@ -45,12 +44,7 @@ MockHttpServer::lastRequestHeaders(const QString &path) const {
 
 bool MockHttpServer::anyRequestEverHadHeader(
     const QByteArray &lowerHeaderName) const {
-  for (const auto &headers : m_lastRequestHeaders) {
-    if (headers.contains(lowerHeaderName)) {
-      return true;
-    }
-  }
-  return false;
+  return m_allHeaderNamesEverSeen.contains(lowerHeaderName);
 }
 
 qint64 MockHttpServer::lastBytesWrittenForSlowDrip(const QString &path) const {
@@ -124,6 +118,10 @@ void MockHttpServer::tryParseAndRespond(Connection &connection) {
 
   m_requestCounts[path] = m_requestCounts.value(path, 0) + 1;
   m_lastRequestHeaders[path] = connection.headers;
+  for (auto headerIt = connection.headers.keyBegin();
+       headerIt != connection.headers.keyEnd(); ++headerIt) {
+    m_allHeaderNamesEverSeen.insert(*headerIt);
+  }
   emit requestHandled(path);
 
   const Response response = m_responses.value(path, Response{});
@@ -189,35 +187,47 @@ void MockHttpServer::writeResponse(
 void MockHttpServer::writeSlowDrip(QTcpSocket *socket, const QString &path,
                                    QByteArray body, int chunkSize,
                                    int chunkDelayMs) {
-  auto offset = std::make_shared<qint64>(0);
-  auto timer = std::make_shared<QTimer>();
+  // The timer is a plain QObject child of `this` (NOT a shared_ptr
+  // captured inside its own timeout lambda): capturing a shared_ptr<QTimer>
+  // in a lambda connected to that same timer's own timeout signal creates
+  // a reference cycle (timer -> connection -> lambda -> shared_ptr ->
+  // timer) that keeps the timer alive forever, even after it stops
+  // firing. Parenting to `this` guarantees cleanup even if some early
+  // return path here were ever missed.
+  auto *timer = new QTimer(this);
   timer->setInterval(chunkDelayMs);
 
-  connect(timer.get(), &QTimer::timeout, this,
-          [this, socket, path, body, offset, chunkSize, timer]() mutable {
+  connect(timer, &QTimer::timeout, this,
+          [this, socket, path, body, chunkSize, timer,
+           offset = qint64{0}]() mutable {
             if (!m_connections.contains(socket)) {
               timer->stop();
+              timer->deleteLater();
               return;
             }
-            const qint64 remaining = body.size() - *offset;
+            const qint64 remaining = body.size() - offset;
             if (remaining <= 0) {
               timer->stop();
-              m_lastSlowDripBytesWritten[path] = *offset;
+              timer->deleteLater();
+              m_lastSlowDripBytesWritten[path] = offset;
               socket->disconnectFromHost();
               return;
             }
             const qint64 sliceSize = std::min<qint64>(chunkSize, remaining);
             const qint64 written =
-                socket->write(body.constData() + *offset, sliceSize);
+                socket->write(body.constData() + offset, sliceSize);
             if (written <= 0) {
               timer->stop();
-              m_lastSlowDripBytesWritten[path] = *offset;
+              timer->deleteLater();
+              m_lastSlowDripBytesWritten[path] = offset;
               return;
             }
-            *offset += written;
-            m_lastSlowDripBytesWritten[path] = *offset;
+            offset += written;
+            m_lastSlowDripBytesWritten[path] = offset;
           });
-  connect(socket, &QTcpSocket::disconnected, this,
-          [timer]() { timer->stop(); });
+  connect(socket, &QTcpSocket::disconnected, this, [timer]() {
+    timer->stop();
+    timer->deleteLater();
+  });
   timer->start();
 }

@@ -9,6 +9,7 @@
 #include <QVector>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace Arkham {
 
@@ -20,11 +21,29 @@ namespace Arkham {
 // ResponseTooLarge/ContentTypeMismatch/MagicBytesMismatch/DimensionTooLarge/
 // PixelBudgetExceeded/UnsupportedCodec/MalformedImage/Cancelled.
 //
+// A same-process (memory) cache hit short-circuits the network entirely,
+// since it was already validated during this process's own lifetime. A
+// disk cache hit whose stored metadata carries an ETag and/or
+// Last-Modified is instead conditionally revalidated with exactly those
+// headers (AssetNetworkFetcher::ConditionalHeaders) before being served:
+// a matching 304 refreshes only lastAccess (AssetCache::
+// touchAfterNotModified()) and serves the still-valid stale bytes; a 200
+// stores and serves the fresh body; any OTHER outcome (including a 404,
+// timeout, or transport failure) fails open and serves the stale cached
+// entry as-is ("stale-if-error"), so a flaky or briefly-unreachable origin
+// can never make previously-cached art disappear. A disk hit with no
+// stored validators at all (e.g. an origin that never sent either header)
+// is served immediately with no network round trip, exactly as before.
+//
 // Concurrent identical requests (same cache key, derived from the SAME
 // resolved candidate -- see AssetCache::cacheKeyFor()) are coalesced: a
 // second request() for a key already in flight attaches as an additional
 // consumer of the same underlying operation rather than issuing a second
-// network fetch. Each consumer receives its own opaque RequestHandle.
+// network fetch. Each consumer receives its own opaque RequestHandle --
+// including immediate cache-hit and error completions, which are queued
+// through the same operation/consumer bookkeeping specifically so that
+// handle remains valid for cancel() up until the queued delivery actually
+// runs.
 //
 // Cancellation/destruction semantics:
 //   - cancel(handle) detaches exactly that one consumer. Its own callback
@@ -86,9 +105,21 @@ private:
     int candidateIndex{0};
     AssetNetworkFetcher::FetchHandle fetchHandle;
     QVector<Consumer> consumers;
+
+    // Set only for a disk-cache-hit revalidation (see
+    // startRevalidation()): the previously-cached entry being revalidated,
+    // served as-is on any revalidation failure ("stale-if-error") and
+    // superseded only by an explicit fresh 200 response.
+    bool isRevalidation{false};
+    QString revalidationCacheKey;
+    std::optional<AssetCache::CachedEntry> staleEntry;
   };
 
+  RequestHandle
+  registerImmediateCompletion(const AssetKey &key, ResultCallback callback,
+                              AssetOutcome<AssetCache::CachedEntry> result);
   void startCandidate(quint64 operationId);
+  void startRevalidation(quint64 operationId);
   void completeOperation(quint64 operationId,
                          AssetOutcome<AssetCache::CachedEntry> result);
   void dispatchToConsumers(Operation &operation,

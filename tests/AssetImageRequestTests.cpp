@@ -187,3 +187,78 @@ void AssetImageRequestTests::destructionMidFlightNeverEmitsAfterDestruction() {
   QTest::qWait(400); // long enough for the slow drip to otherwise finish
   QVERIFY(true);     // reaching here without a crash is the assertion
 }
+
+void AssetImageRequestTests::
+    destructionImmediatelyAfterImmediateCompletionNeverCrashes() {
+  MockHttpServer server; // never actually contacted: this identifier is
+                         // rejected synchronously by AssetLocator.
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  {
+    AssetImageRequest request(coordinator);
+    // "UPPER01" fails AssetLocator's identifier grammar synchronously,
+    // so AssetRequestCoordinator::request() queues an immediate error
+    // completion (via QMetaObject::invokeMethod) rather than starting any
+    // network fetch. Destroying `request` right here -- before that
+    // queued completion has run -- is exactly the scenario that used to
+    // use-after-free: an invalid RequestHandle meant this object's
+    // destructor could never suppress the queued delivery.
+    request.load(
+        makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
+                QStringLiteral("UPPER01")));
+    // request destroyed here, before the event loop has run at all.
+  }
+
+  QTest::qWait(200);
+  QVERIFY(true); // reaching here without a crash is the assertion
+}
+
+void AssetImageRequestTests::
+    reloadingWithNewKeyClearsPreviousImageDuringLoading() {
+  MockHttpServer server;
+  MockHttpServer::Response firstResponse;
+  firstResponse.contentType = "image/png";
+  firstResponse.body = encodePng(16, 16);
+  server.setResponse(QStringLiteral("/cards/valid01.png"), firstResponse);
+
+  MockHttpServer::Response secondResponse;
+  secondResponse.contentType = "image/png";
+  secondResponse.body = encodePng(200, 200);
+  secondResponse.slowDrip = true;
+  secondResponse.chunkSize = 16;
+  secondResponse.chunkDelayMs = 60;
+  server.setResponse(QStringLiteral("/cards/valid02.png"), secondResponse);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  AssetImageRequest request(coordinator);
+
+  request.load(
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))));
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Ready; },
+      5000));
+  QVERIFY(!request.image().isNull());
+
+  // Switch to a second, slow-to-arrive image: the FIRST image must not
+  // still be visible while the second load is in its Loading phase.
+  request.load(
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
+              QStringLiteral("valid02")));
+  QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
+  QVERIFY(request.image().isNull());
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Ready; },
+      5000));
+  QVERIFY(!request.image().isNull());
+}

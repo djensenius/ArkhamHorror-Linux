@@ -1,6 +1,7 @@
 #include "AssetImageRequest.h"
 
 #include <QCoreApplication>
+#include <QPointer>
 
 namespace Arkham {
 
@@ -40,12 +41,11 @@ AssetImageRequest::AssetImageRequest(AssetRequestCoordinator &coordinator,
     : QObject(parent), m_coordinator(coordinator) {}
 
 AssetImageRequest::~AssetImageRequest() {
-  // Bump the generation before cancelling so that even if the coordinator
-  // were to (incorrectly) invoke a callback synchronously during
-  // destruction, it could never touch this half-destroyed object -- the
-  // callback captures `this` only via a QPointer-guarded lambda owned by
-  // the coordinator, and cancel() below detaches this consumer from the
-  // shared operation without this object being consulted again.
+  // Bump the generation before cancelling. This alone does NOT protect a
+  // queued coordinator callback that captures `this` -- that callback is
+  // guarded independently by the QPointer in load() below, since
+  // cancel()'s own queued delivery of the Cancelled result can run after
+  // this destructor has already finished.
   ++m_generation;
   if (m_handle.isValid()) {
     m_coordinator.cancel(m_handle);
@@ -63,45 +63,60 @@ void AssetImageRequest::load(const AssetKey &key) {
   emit progressChanged();
   m_errorString.clear();
   m_errorCode = 0;
+  // Clear any previously-loaded image immediately: otherwise a caller
+  // that reuses one AssetImageRequest across two different keys (e.g. a
+  // QML Image binding that switches source identifiers) would keep
+  // showing the OLD image throughout the new Loading phase.
+  if (!m_image.isNull()) {
+    m_image = QImage();
+    emit imageChanged();
+  }
   setAccessibleDescription(
       QStringLiteral("Loading %1 image \"%2\"...")
           .arg(categoryLabel(key.category), key.identifier));
 
+  // The coordinator retains this callback (via std::function, possibly
+  // queued past this object's own lifetime -- e.g. a cancel() during
+  // destruction still queues one final Cancelled delivery for exactly
+  // this consumer). A raw `this` capture would be a use-after-free once
+  // that queued delivery runs after this object is destroyed, so every
+  // member access below is guarded by a QPointer liveness check first.
+  QPointer<AssetImageRequest> self(this);
   m_handle = m_coordinator.request(
-      key, [this, generation](AssetOutcome<AssetCache::CachedEntry> result) {
-        // A stale callback from a superseded load()/cancel() (or this
-        // object having since been destroyed, in which case this lambda
-        // itself would never run because the coordinator only reaches
-        // consumers still registered under a live handle) is rejected by
-        // generation number: only the most recent load() may mutate
+      key, [self, generation](AssetOutcome<AssetCache::CachedEntry> result) {
+        if (!self) {
+          return; // this AssetImageRequest was destroyed
+        }
+        // A stale callback from a superseded load()/cancel() is rejected
+        // by generation number: only the most recent load() may mutate
         // state.
-        if (generation != m_generation) {
+        if (generation != self->m_generation) {
           return;
         }
-        m_handle = {};
+        self->m_handle = {};
         if (!result) {
           const AssetError &error = result.error();
-          m_status = Status::Error;
-          m_errorString = error.message;
-          m_errorCode = static_cast<int>(error.code);
-          m_image = QImage();
-          setAccessibleDescription(
+          self->m_status = Status::Error;
+          self->m_errorString = error.message;
+          self->m_errorCode = static_cast<int>(error.code);
+          self->m_image = QImage();
+          self->setAccessibleDescription(
               QStringLiteral("Failed to load image: %1").arg(error.message));
-          emit statusChanged();
-          emit errorChanged();
-          emit imageChanged();
-          m_progress = 1.0;
-          emit progressChanged();
+          emit self->statusChanged();
+          emit self->errorChanged();
+          emit self->imageChanged();
+          self->m_progress = 1.0;
+          emit self->progressChanged();
           return;
         }
 
-        m_image = result->decodedImage;
-        m_status = Status::Ready;
-        setAccessibleDescription(QStringLiteral("Image loaded"));
-        emit statusChanged();
-        emit imageChanged();
-        m_progress = 1.0;
-        emit progressChanged();
+        self->m_image = result->decodedImage;
+        self->m_status = Status::Ready;
+        self->setAccessibleDescription(QStringLiteral("Image loaded"));
+        emit self->statusChanged();
+        emit self->imageChanged();
+        self->m_progress = 1.0;
+        emit self->progressChanged();
       });
 }
 

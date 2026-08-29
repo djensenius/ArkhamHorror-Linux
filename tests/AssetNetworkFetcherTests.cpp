@@ -328,6 +328,48 @@ void AssetNetworkFetcherTests::avifCodecSupportIsEnvironmentAdaptive() {
   }
 }
 
+void AssetNetworkFetcherTests::
+    avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff() {
+  // Per ISO/IEC 14496-12, a leading box size of 0 means "this box extends
+  // to the end of the enclosing file", NOT a zero-length box. A body
+  // whose `ftyp` box declares size 0 is still a spec-valid AVIF signature
+  // and must be accepted by the independent magic-byte sniff (never
+  // rejected as AssetErrorCode::MagicBytesMismatch). This synthetic body
+  // is a bare `ftyp` box only (no meta/mdat), so it is never a real
+  // decodable image; whether an AVIF-capable Qt build can decode a real
+  // file is already covered by avifCodecSupportIsEnvironmentAdaptive()
+  // above, so a build that DOES have codec support is a real image
+  // decode attempt against garbage bytes here -- MalformedImage is an
+  // acceptable outcome in that (currently never exercised) case, but
+  // MagicBytesMismatch is never acceptable regardless of codec support.
+  const bool avifSupported =
+      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  // 4-byte box size (0 == "extends to end of buffer") + "ftyp" + "avif"
+  // major brand: exactly 12 bytes, the minimum sniffMagicBytes() inspects.
+  response.body = QByteArrayLiteral("\x00\x00\x00\x00"
+                                    "ftyp"
+                                    "avif");
+  server.setResponse(QStringLiteral("/zero-size.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/zero-size.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  if (!bool(*result)) {
+    QVERIFY(result->error().code != AssetErrorCode::MagicBytesMismatch);
+    if (!avifSupported) {
+      QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+    }
+  }
+}
+
 void AssetNetworkFetcherTests::conditionalRequestAcceptsMatchingNotModified() {
   MockHttpServer server;
   MockHttpServer::Response response;
