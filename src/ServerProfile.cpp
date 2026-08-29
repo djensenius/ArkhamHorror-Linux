@@ -3,6 +3,7 @@
 #include "ContractPin.h"
 #include "UrlValidator.h"
 
+#include <QHostAddress>
 #include <QUuid>
 #include <utility>
 
@@ -103,6 +104,51 @@ ServerProfileKind ServerProfile::kind() const { return m_kind; }
 const QString &ServerProfile::displayName() const { return m_displayName; }
 
 const QUrl &ServerProfile::baseUrl() const { return m_baseUrl; }
+
+namespace {
+// The port a URL effectively targets: its explicit port if one was given,
+// otherwise the well-known default for its scheme. QUrl::port() itself
+// returns -1 whenever no port was given, so comparing raw port() values
+// would treat "https://host" and "https://host:443" as different
+// endpoints despite them being identical.
+int effectivePort(const QUrl &url) {
+  const int explicitPort = url.port();
+  if (explicitPort != -1) {
+    return explicitPort;
+  }
+  if (url.scheme() == "https"_L1) {
+    return 443;
+  }
+  if (url.scheme() == "http"_L1) {
+    return 80;
+  }
+  return -1;
+}
+
+// Canonical host form used by credentialEndpointIdentity(): the
+// fully-encoded (ACE/punycode) host, lower-cased, then further
+// canonicalised through QHostAddress when it happens to be a literal IP
+// address. See ServerProfile::credentialEndpointIdentity()'s header
+// comment for why both steps matter.
+QString canonicalCredentialHost(const QUrl &url) {
+  const QString encoded = url.host(QUrl::FullyEncoded).toLower();
+  QHostAddress address;
+  if (address.setAddress(encoded)) {
+    return address.toString();
+  }
+  return encoded;
+}
+} // namespace
+
+QString ServerProfile::credentialEndpointIdentity() const {
+  return m_baseUrl.scheme().toLower() + u'|' +
+         canonicalCredentialHost(m_baseUrl) + u'|' +
+         QString::number(effectivePort(m_baseUrl)) + u'|' + m_baseUrl.path();
+}
+
+bool ServerProfile::hasEquivalentEndpoint(const ServerProfile &other) const {
+  return credentialEndpointIdentity() == other.credentialEndpointIdentity();
+}
 
 QUrl ServerProfile::apiUrl(const QStringView path) const {
   if (!isValid()) {

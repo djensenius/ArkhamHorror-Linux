@@ -74,8 +74,11 @@ if(NOT TARGET Qt6Keychain::Qt6Keychain)
 endif()
 
 add_library(arkham_foundation STATIC
+    src/AppBootstrap.h
     src/AppCommand.cpp
     src/AppCommand.h
+    src/AppSessionComposition.cpp
+    src/AppSessionComposition.h
     src/AuthModels.cpp
     src/AuthModels.h
     src/AuthTransportSecurity.cpp
@@ -106,6 +109,12 @@ add_library(arkham_foundation STATIC
     src/ServerCapabilities.h
     src/ServerProfile.cpp
     src/ServerProfile.h
+    src/SessionCoordinator.cpp
+    src/SessionCoordinator.h
+    src/TokenEnvelope.cpp
+    src/TokenEnvelope.h
+    src/TokenValidation.cpp
+    src/TokenValidation.h
     src/UrlValidator.cpp
     src/UrlValidator.h
     src/ValueOrError.h
@@ -197,6 +206,25 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME auth_client COMMAND arkham-auth-client-tests)
+
+    qt_add_executable(arkham-session-coordinator-tests
+        tests/SessionCoordinatorTests.cpp
+    )
+    target_link_libraries(arkham-session-coordinator-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME session_coordinator COMMAND arkham-session-coordinator-tests)
+
+    qt_add_executable(arkham-app-bootstrap-tests
+        tests/AppBootstrapTests.cpp
+    )
+    target_link_libraries(arkham-app-bootstrap-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME app_bootstrap COMMAND arkham-app-bootstrap-tests)
 
     # QtKeychain's kwallet5 backend (the two downstream hardening patches'
     # target) only exists in keychain_unix.cpp, compiled solely for
