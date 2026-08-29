@@ -238,8 +238,9 @@ public:
   // Value::parse()), so every key maps to at most one value. contains()/
   // value() are average-case O(1) via an index built once alongside
   // m_object (see m_objectIndex below), not a linear scan: ParseLimits
-  // permits an object up to maxObjectMembers (100k by default) entries,
-  // and a decode path performing its fixed handful of named-field lookups
+  // permits an object up to maxObjectMembers (1,024 by default; see
+  // ParseLimits::production() below) entries, and a decode path performing
+  // its fixed handful of named-field lookups
   // against a single adversarially-padded object must not degrade to
   // O(members) per lookup.
   [[nodiscard]] bool contains(QLatin1StringView key) const;
