@@ -23,6 +23,7 @@ private slots:
   void orphanMetadataWithoutPayloadIsRepaired();
   void mismatchedPayloadMetadataPairIsRepaired();
   void strayFileNotMatchingKeyShapeIsRemoved();
+  void strayDirectoryIsRemovedAndCountedTowardDiskUsage();
   void quotaEvictsOldestAccessFirstDownToLowWaterMark();
   void storeSkipsFullReapSweepWhenComfortablyUnderQuota();
   void touchAfterNotModifiedRefreshesLastAccessAndHeaders();

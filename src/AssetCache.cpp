@@ -3,6 +3,7 @@
 #include <QCache>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -479,7 +480,25 @@ void AssetCache::reapAndEnforceQuota() {
   if (!dir.exists()) {
     return;
   }
-  const QStringList allFiles = dir.entryList(QDir::Files, QDir::Name);
+  // Copilot review: enumerate BOTH files and directories here, not just
+  // QDir::Files -- this directory is exclusively owned by AssetCache
+  // (see the comment below), so a stray directory (planted, or left
+  // behind by some other means) is exactly as much of a leftover as a
+  // stray file, and must not be invisible to this repair sweep. Any
+  // directory found is removed recursively below, before the
+  // files-only key-shape pass that follows.
+  const QStringList allEntries = dir.entryList(
+      QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+  QStringList allFiles;
+  allFiles.reserve(allEntries.size());
+  for (const QString &name : allEntries) {
+    const QString fullPath = dir.filePath(name);
+    if (QFileInfo(fullPath).isDir()) {
+      QDir(fullPath).removeRecursively();
+      continue;
+    }
+    allFiles.append(name);
+  }
 
   // First pass: discover every key with either file present.
   QHash<QString, bool> hasPayload;
@@ -598,10 +617,20 @@ qint64 AssetCache::memoryCostBytes() const {
 
 qint64 AssetCache::diskUsageBytes() const {
   QMutexLocker locker(&m_mutex);
-  QDir dir(m_directory);
+  // Copilot review: recurse into subdirectories here (QDirIterator with
+  // Subdirectories), not a flat QDir::Files listing -- this directory is
+  // exclusively owned by AssetCache, so a stray directory (e.g. planted,
+  // or otherwise left behind) should never be invisible to this usage
+  // total. This cheap, stat-only check gates whether the much more
+  // expensive reapAndEnforceQuota() sweep (which does recursively remove
+  // stray directories) runs at all in store()'s hot path -- if a stray
+  // directory's contents weren't counted here, that gate could never
+  // trip, and the sweep that would actually clean it up might never run.
   qint64 total = 0;
-  for (const QFileInfo &info : dir.entryInfoList(QDir::Files)) {
-    total += info.size();
+  QDirIterator it(m_directory, QDir::Files, QDirIterator::Subdirectories);
+  while (it.hasNext()) {
+    it.next();
+    total += it.fileInfo().size();
   }
   return total;
 }

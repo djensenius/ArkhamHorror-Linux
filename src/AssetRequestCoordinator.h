@@ -67,9 +67,15 @@ namespace Arkham {
 // runs.
 //
 // Cancellation/destruction semantics:
-//   - cancel(handle) detaches exactly that one consumer. Its own callback
-//     is invoked exactly once, with AssetErrorCode::Cancelled, and never
-//     again afterwards.
+//   - cancel(handle) detaches exactly that one consumer. While this
+//     coordinator is alive, its own callback is invoked exactly once,
+//     with AssetErrorCode::Cancelled, and never again afterwards --
+//     but that delivery is itself queued via the event loop (like every
+//     other completion path here), not invoked synchronously from
+//     cancel() itself, and is suppressed entirely if this coordinator
+//     is destroyed before the queued delivery runs (the destructor
+//     cancels every in-flight operation without invoking any consumer
+//     callback at all).
 //   - This holds even after the underlying operation has already
 //     completed (successfully or not): the handle stays cancel()-able
 //     across the whole window until this consumer's own queued delivery

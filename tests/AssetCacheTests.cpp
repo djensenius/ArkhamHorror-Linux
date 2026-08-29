@@ -167,6 +167,39 @@ void AssetCacheTests::strayFileNotMatchingKeyShapeIsRemoved() {
   QVERIFY(!QFile::exists(strayPath));
 }
 
+void AssetCacheTests::strayDirectoryIsRemovedAndCountedTowardDiskUsage() {
+  // Copilot review (round 35): reapAndEnforceQuota() and
+  // diskUsageBytes() previously enumerated QDir::Files only, so a
+  // planted/stray DIRECTORY inside this cache's exclusively-owned
+  // directory was invisible to both cleanup and usage accounting -- a
+  // large stray directory could sit there forever, unreachable by the
+  // repair sweep and never counted toward the quota gate that decides
+  // whether to even run that sweep.
+  AssetCache cache(configFor(m_tempDirPath));
+
+  const QString strayDirPath =
+      m_tempDirPath + QStringLiteral("/stray-planted-directory");
+  QVERIFY(
+      QDir(m_tempDirPath).mkpath(QStringLiteral("stray-planted-directory")));
+  {
+    QFile nested(strayDirPath + QStringLiteral("/nested-file.bin"));
+    QVERIFY(nested.open(QIODevice::WriteOnly));
+    nested.write(QByteArray(4096, 'z'));
+  }
+  QVERIFY(QFileInfo(strayDirPath).isDir());
+
+  // diskUsageBytes() must count the nested file's bytes even though they
+  // sit inside a directory this cache never created.
+  QCOMPARE(cache.diskUsageBytes(), qint64(4096));
+
+  cache.reapAndEnforceQuota();
+
+  // The entire stray directory (and its contents) must be gone, and
+  // usage accounting must reflect that it is actually gone.
+  QVERIFY(!QFileInfo::exists(strayDirPath));
+  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+}
+
 void AssetCacheTests::quotaEvictsOldestAccessFirstDownToLowWaterMark() {
   // A tiny quota (5 entries of ~1 KiB fit comfortably below it, but 20
   // don't) forces eviction; the OLDEST-accessed entries must go first,
@@ -404,17 +437,31 @@ void AssetCacheTests::
   const QString metadataPath =
       m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
 
+  // Construct the cache BEFORE planting the blocking directory: the
+  // constructor runs an unconditional reapAndEnforceQuota() sweep at
+  // startup which (per Copilot review round 35) now recursively removes
+  // any stray directory it finds, since this cache directory is
+  // exclusively owned by AssetCache and a directory can never
+  // legitimately sit at a "<key>.meta.json"-shaped path. Planting the
+  // directory afterward, immediately before the single store() call
+  // under test, ensures that startup sweep cannot race with (and
+  // silently invalidate) this test's own deliberately-planted failure
+  // trigger.
+  AssetCache cache(configFor(m_tempDirPath));
+
   QVERIFY(QDir(m_tempDirPath).mkpath(key + QStringLiteral(".meta.json")));
   QVERIFY(QFileInfo(metadataPath).isDir());
 
-  AssetCache cache(configFor(m_tempDirPath));
   cache.store(key, makeEntry(QByteArrayLiteral("orphan-candidate-bytes")));
 
   // The payload must never be left behind once its sole validity witness
   // (metadata) failed to write.
   QVERIFY(!QFile::exists(payloadPath));
   // The directory planted at the metadata path is untouched: store()
-  // must never attempt to delete or otherwise overwrite it.
+  // itself must never attempt to delete or otherwise overwrite it (only
+  // the much rarer reapAndEnforceQuota() sweep -- not triggered by this
+  // single small store() call, since usage stays well under the
+  // configured high water mark -- ever removes stray directories).
   QVERIFY(QFileInfo(metadataPath).isDir());
 }
 
