@@ -79,12 +79,21 @@ public:
   [[nodiscard]] static ValueOrError<ExternalDeckId>
   fromRawObject(const Json::Value &obj, QStringView path);
 
-  // Lossy, display/log/debug-only conversion: Kind::Number rounds through
-  // a double exactly like the rest of this codebase's non-byte QJsonValue
-  // decoders. NEVER use this to build outbound request bytes -- see
-  // toRawJson() for the lossless equivalent DeckListInput::toJsonBytes()
-  // actually uses.
-  [[nodiscard]] QJsonValue toJson() const;
+  // QJsonValue convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toRawJson() for the lossless equivalent
+  // DeckListInput::toJsonBytes() actually uses. Kind::Number succeeds
+  // exactly (via QJsonValue(qint64), never a double) whenever the
+  // literal is mathematically integral and fits qint64's range (see
+  // RawNumber::toExactInt64()) -- exactly the same qint64 storage this
+  // codebase already relies on elsewhere for lossless QJsonValue
+  // round-tripping (see Json::Value::toQJson()'s doc comment). For every
+  // other Number literal (a genuine fraction, or an exponent pushing the
+  // magnitude outside qint64's range) there is no way to represent it in
+  // a QJsonValue without rounding through a double and silently losing
+  // precision, so this returns a typed failure instead: this type never
+  // has a "safe fallback" that substitutes a rounded value.
+  [[nodiscard]] ValueOrError<QJsonValue> toJson() const;
   // The lossless Json::Value AST fragment for this id, for splicing into
   // a request built via Json::Value's builder statics (see RawJson.h).
   // Precondition: kind() != Kind::Absent -- an absent id has no JSON
@@ -160,13 +169,25 @@ struct DeckListInput {
   // could not preserve a number nested anywhere else callers might add.
   [[nodiscard]] static ValueOrError<DeckListInput>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Fails (rather than silently rounding) whenever
+  // `id` is a Number literal that cannot be exactly represented as a
+  // QJsonValue -- see ExternalDeckId::toJson()'s doc comment.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // The lossless Json::Value AST fragment for this request body (see
   // RawJson.h); used by toJsonBytes() below and by any enclosing request
   // (e.g. CreateDeckRequest, ChooseDeckRequest) that needs to splice a
   // whole DeckListInput into a larger AST without a lossy
-  // encode-then-reparse round trip.
-  [[nodiscard]] Json::Value toRawJson() const;
+  // encode-then-reparse round trip. Fails (rather than emitting a
+  // schema-invalid request) if `cardSlots` -- a public
+  // QMap<QString, qint64> field, for ergonomic construction from a
+  // permissive external caller -- carries an empty key: unlike decode
+  // (which never produces one; see decodeCardQuantityMapInput), an
+  // encoder must still guard a hand-constructed instance against this,
+  // matching toJson() below.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   // Precision-preserving equivalent of toJson(): builds the complete
   // request as a lossless Json::Value AST (see RawJson.h) and serializes
   // it once, so `id`'s numeric variant and any number nested inside
@@ -197,6 +218,16 @@ struct DeckList {
 
   [[nodiscard]] static ValueOrError<DeckList> fromJson(const QJsonValue &v,
                                                        QStringView path);
+  // Canonical byte-level decode overload: identical logic (shared via a
+  // private template, see Decks.cpp), operating directly on the lossless
+  // AST (see RawJson.h) so a Deck::fromRawJson()/fromRawBytes() caller
+  // stays on Json::Value end-to-end for this nested field.
+  [[nodiscard]] static ValueOrError<DeckList> fromRawJson(const Json::Value &v,
+                                                          QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<DeckList> fromRawBytes(QByteArrayView bytes,
+                                                           QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const DeckList &, const DeckList &) = default;
@@ -213,6 +244,16 @@ struct Deck {
 
   [[nodiscard]] static ValueOrError<Deck> fromJson(const QJsonValue &v,
                                                    QStringView path);
+  // Canonical byte-level decode overload: identical logic (shared via a
+  // private template, see Decks.cpp), operating directly on the lossless
+  // AST (see RawJson.h) so this deck's list.cardSlots/sideSlots quantities
+  // (and any future unconstrained field) survive undamaged end-to-end.
+  [[nodiscard]] static ValueOrError<Deck> fromRawJson(const Json::Value &v,
+                                                      QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<Deck> fromRawBytes(QByteArrayView bytes,
+                                                       QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const Deck &, const Deck &) = default;
@@ -239,7 +280,10 @@ struct CreateDeckRequest {
   // above; see DeckListInput::fromRawBytes().
   [[nodiscard]] static ValueOrError<CreateDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // See DeckListInput::toJson()'s doc comment: fails (rather than
+  // silently rounding) whenever the nested deckList's `id` cannot be
+  // exactly represented as a QJsonValue.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Precision-preserving equivalent of toJson(); see
   // DeckListInput::toJsonBytes().
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;

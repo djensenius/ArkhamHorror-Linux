@@ -60,6 +60,11 @@ private slots:
   // Tagged variants (cardCost/gameValue/skillIcon) ──────────────────────────
   void allCardCostVariantsRoundTrip();
   void allGameValueVariantsRoundTrip();
+  // Round 7 item 8: byPlayerCount()'s four parameters are exact positional
+  // values for 1/2/3/4 players (per the pinned backend's `fromGameValue`
+  // case-match on `1|2|3|4`), not an "oneOrTwo/three/four/fiveOrMore"
+  // grouping.
+  void gameValueByPlayerCountFactoryUsesPositionalPlayerCountSemantics();
   void allSkillIconVariantsRoundTrip();
   void unrecognizedCardCostTagPreservedNotRejected();
   void unrecognizedGameValueTagPreservedNotRejected();
@@ -69,6 +74,14 @@ private slots:
   void nullaryCardCostTagWithContentsRejected();
   void nullaryGameValueTagWithContentsRejected();
   void nullarySkillIconTagWithContentsRejected();
+  // Round-8 item 7: additionalProperties:false on a known tagged-union
+  // branch's exact {"tag","contents"}/{"tag"} shape means an extra
+  // sibling key is malformed input, not a forward-compat additive field
+  // (unlike CardDef/GameListRow's success shape -- see
+  // gameListRowSuccessToleratesAdditiveTopLevelField below).
+  void extraKeyOnKnownCardCostBranchRejected();
+  void extraKeyOnKnownGameValueBranchRejected();
+  void extraKeyOnKnownSkillIconBranchRejected();
 
   // Forward compatibility ────────────────────────────────────────────────────
   void unknownAdditiveTopLevelFieldIgnored();
@@ -108,6 +121,13 @@ private slots:
   void rawBytesPreserveNumericPrecisionInUnconstrainedFields();
   void rawBytesRejectDuplicateKeyNestedInUnconstrainedField();
   void decodeCatalogFromRawBytesRoundTripsArray();
+  // Round 7 item 4: the ENCODE side must be equally lossless -- decoding a
+  // fixture with a huge/long-fraction number nested inside an
+  // unconstrained field, then re-encoding via toJsonBytes() (never
+  // through the QJsonObject-based toJson()), must reproduce the identical
+  // literal on reparse.
+  void toJsonBytesPreservesNumericPrecisionInUnconstrainedFieldsOnEncode();
+  void toJsonBytesPreservesUnknownTaggedUnionPrecisionOnEncode();
 };
 
 namespace {
@@ -527,6 +547,24 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   QVERIFY(!bad.has_value());
 }
 
+void CardCatalogTests::
+    gameValueByPlayerCountFactoryUsesPositionalPlayerCountSemantics() {
+  // Distinct values in each of the four positions prove contents()
+  // preserves onePlayer/twoPlayers/threePlayers/fourPlayers in that exact
+  // order -- matching the pinned backend's Arkham.GameValue
+  // `fromGameValue (ByPlayerCount n1 n2 n3 n4) pc = case pc of 1 -> n1;
+  // 2 -> n2; 3 -> n3; 4 -> n4`, not a grouped "1-or-2 / 3 / 4 / 5-or-more"
+  // scheme.
+  const GameValue value = GameValue::byPlayerCount(10, 20, 30, 40);
+  QCOMPARE(value.tag(), GameValueTag::ByPlayerCount);
+  QCOMPARE(value.contents(),
+           (QList<qint64>{qint64(10), qint64(20), qint64(30), qint64(40)}));
+  const QJsonObject expected{
+      {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
+      {QStringLiteral("contents"), QJsonArray{10, 20, 30, 40}}};
+  QCOMPARE(value.toJson(), expected);
+}
+
 void CardCatalogTests::allSkillIconVariantsRoundTrip() {
   for (const auto &[tag, skill] :
        {std::pair{"SkillWillpower"_L1, SkillType::SkillWillpower},
@@ -673,6 +711,88 @@ void CardCatalogTests::nullarySkillIconTagWithContentsRejected() {
                qPrintable(result.error()));
     }
   }
+}
+
+void CardCatalogTests::extraKeyOnKnownCardCostBranchRejected() {
+  // A sibling key beside "tag"/"contents" on a known, fixed-shape branch
+  // is malformed -- not a forward-compat additive field this client
+  // should silently ignore (that policy applies only to named-field
+  // response summary objects like CardDef, never a 1-2 key tagged
+  // union branch).
+  const QJsonObject staticCostExtra{
+      {QStringLiteral("tag"), QStringLiteral("StaticCost")},
+      {QStringLiteral("contents"), 3},
+      {QStringLiteral("unexpected"), true}};
+  const auto staticResult = CardCost::fromJson(staticCostExtra, u"cost");
+  QVERIFY(!staticResult.has_value());
+  QVERIFY2(staticResult.error().contains(QStringLiteral("unexpected")),
+           qPrintable(staticResult.error()));
+
+  const QJsonObject dynamicCostExtra{
+      {QStringLiteral("tag"), QStringLiteral("DynamicCost")},
+      {QStringLiteral("extra"), 1}};
+  const auto dynamicResult = CardCost::fromJson(dynamicCostExtra, u"cost");
+  QVERIFY(!dynamicResult.has_value());
+  QVERIFY2(dynamicResult.error().contains(QStringLiteral("extra")),
+           qPrintable(dynamicResult.error()));
+
+  const QJsonObject matchingEnemyFieldExtra{
+      {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
+      {QStringLiteral("contents"), QJsonArray{QStringLiteral("a"), 1}},
+      {QStringLiteral("extra"), QJsonValue(QJsonValue::Null)}};
+  const auto matchingResult =
+      CardCost::fromJson(matchingEnemyFieldExtra, u"cost");
+  QVERIFY(!matchingResult.has_value());
+  QVERIFY2(matchingResult.error().contains(QStringLiteral("extra")),
+           qPrintable(matchingResult.error()));
+}
+
+void CardCatalogTests::extraKeyOnKnownGameValueBranchRejected() {
+  const QJsonObject staticExtra{
+      {QStringLiteral("tag"), QStringLiteral("Static")},
+      {QStringLiteral("contents"), 2},
+      {QStringLiteral("unexpected"), true}};
+  const auto staticResult = GameValue::fromJson(staticExtra, u"gv");
+  QVERIFY(!staticResult.has_value());
+  QVERIFY2(staticResult.error().contains(QStringLiteral("unexpected")),
+           qPrintable(staticResult.error()));
+
+  const QJsonObject byPlayerCountExtra{
+      {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
+      {QStringLiteral("contents"), QJsonArray{1, 2, 3, 4}},
+      {QStringLiteral("extra"), 1}};
+  const auto byPlayerCountResult =
+      GameValue::fromJson(byPlayerCountExtra, u"gv");
+  QVERIFY(!byPlayerCountResult.has_value());
+  QVERIFY2(byPlayerCountResult.error().contains(QStringLiteral("extra")),
+           qPrintable(byPlayerCountResult.error()));
+
+  const QJsonObject valueXExtra{
+      {QStringLiteral("tag"), QStringLiteral("ValueX")},
+      {QStringLiteral("extra"), 1}};
+  const auto valueXResult = GameValue::fromJson(valueXExtra, u"gv");
+  QVERIFY(!valueXResult.has_value());
+  QVERIFY2(valueXResult.error().contains(QStringLiteral("extra")),
+           qPrintable(valueXResult.error()));
+}
+
+void CardCatalogTests::extraKeyOnKnownSkillIconBranchRejected() {
+  const QJsonObject skillIconExtra{
+      {QStringLiteral("tag"), QStringLiteral("SkillIcon")},
+      {QStringLiteral("contents"), QStringLiteral("Willpower")},
+      {QStringLiteral("unexpected"), true}};
+  const auto skillIconResult = SkillIcon::fromJson(skillIconExtra, u"skill");
+  QVERIFY(!skillIconResult.has_value());
+  QVERIFY2(skillIconResult.error().contains(QStringLiteral("unexpected")),
+           qPrintable(skillIconResult.error()));
+
+  const QJsonObject wildExtra{
+      {QStringLiteral("tag"), QStringLiteral("WildIcon")},
+      {QStringLiteral("extra"), 1}};
+  const auto wildResult = SkillIcon::fromJson(wildExtra, u"skill");
+  QVERIFY(!wildResult.has_value());
+  QVERIFY2(wildResult.error().contains(QStringLiteral("extra")),
+           qPrintable(wildResult.error()));
 }
 
 void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
@@ -1219,6 +1339,87 @@ void CardCatalogTests::decodeCatalogFromRawBytesRoundTripsArray() {
   const auto notArray =
       decodeCatalogFromRawBytes(QByteArrayLiteral("{}"), u"catalog");
   QVERIFY(!notArray.has_value());
+}
+
+void CardCatalogTests::
+    toJsonBytesPreservesNumericPrecisionInUnconstrainedFieldsOnEncode() {
+  const QByteArray bytes = R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "meta": {
+      "hugeInt": 99999999999999999999999999,
+      "longFraction": 1.234567890123456789012345678901234567890,
+      "hugeExponent": 1e400
+    },
+    "criteria": [{"nested": {"alsoHuge": 90071992547409931234567}}]
+  })";
+  const auto decoded = CardDef::fromRawBytes(bytes, u"card");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+
+  const auto encoded = decoded->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+
+  const auto reparsed = CardDef::fromRawBytes(*encoded, u"card");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+
+  QCOMPARE(reparsed->meta.value("hugeInt"_L1).toRawNumber().literal(),
+           QStringLiteral("99999999999999999999999999"));
+  QCOMPARE(reparsed->meta.value("longFraction"_L1).toRawNumber().literal(),
+           QStringLiteral("1.234567890123456789012345678901234567890"));
+  QCOMPARE(reparsed->meta.value("hugeExponent"_L1).toRawNumber().literal(),
+           QStringLiteral("1e400"));
+  QCOMPARE(reparsed->criteria.toArray()
+               .at(0)
+               .value("nested"_L1)
+               .value("alsoHuge"_L1)
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("90071992547409931234567"));
+}
+
+void CardCatalogTests::
+    toJsonBytesPreservesUnknownTaggedUnionPrecisionOnEncode() {
+  // An unknown SkillIcon/GameValue/CardCost tag's raw payload -- with a
+  // numeric literal beyond double precision -- must survive toJsonBytes(),
+  // not merely toRawJson() in isolation, since toJsonBytes() (a
+  // ValueOrError<QByteArray>-returning encoder, not the plain
+  // QJsonObject-returning toJson()) is the canonical byte-exact path.
+  const QByteArray costBytes = QByteArrayLiteral(
+      "{\"tag\":\"FutureCost\",\"contents\":{\"n\":9007199254740993}}");
+  const auto cost =
+      CardCost::fromRawJson(*Json::Value::parse(costBytes, u"cost"), u"cost");
+  if (!cost)
+    QFAIL(qPrintable(cost.error()));
+  const auto costEncoded = cost->toJsonBytes();
+  if (!costEncoded)
+    QFAIL(qPrintable(costEncoded.error()));
+  const auto costReparsed = Json::Value::parse(*costEncoded, u"cost");
+  if (!costReparsed)
+    QFAIL(qPrintable(costReparsed.error()));
+  QCOMPARE(
+      costReparsed->value("contents"_L1).value("n"_L1).toRawNumber().literal(),
+      QStringLiteral("9007199254740993"));
+
+  const QByteArray gvBytes = QByteArrayLiteral(
+      "{\"tag\":\"FutureValue\",\"contents\":[9007199254740993]}");
+  const auto gv =
+      GameValue::fromRawJson(*Json::Value::parse(gvBytes, u"gv"), u"gv");
+  if (!gv)
+    QFAIL(qPrintable(gv.error()));
+  const auto gvEncoded = gv->toJsonBytes();
+  if (!gvEncoded)
+    QFAIL(qPrintable(gvEncoded.error()));
+  const auto gvReparsed = Json::Value::parse(*gvEncoded, u"gv");
+  if (!gvReparsed)
+    QFAIL(qPrintable(gvReparsed.error()));
+  QCOMPARE(
+      gvReparsed->value("contents"_L1).toArray().at(0).toRawNumber().literal(),
+      QStringLiteral("9007199254740993"));
 }
 
 QTEST_APPLESS_MAIN(CardCatalogTests)

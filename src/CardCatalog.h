@@ -128,6 +128,14 @@ public:
   [[nodiscard]] static ValueOrError<SkillIcon> fromRawJson(const Json::Value &v,
                                                            QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level encode: composes the lossless AST directly (see
+  // RawJson.h) rather than through toJson()'s QJsonObject -- toJson()
+  // itself is now implemented in terms of this -- so an Unknown tag's
+  // unknownRaw() (or, once nested inside a CardDef/other aggregate, a
+  // numeric literal outside qint64 range anywhere within it) survives an
+  // encode-then-decode round trip byte-exact.
+  [[nodiscard]] Json::Value toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] SkillIconTag tag() const noexcept { return m_tag; }
   // Populated only when tag() == SkillIconTag::SkillIcon.
@@ -222,6 +230,11 @@ public:
   [[nodiscard]] static ValueOrError<CardCost> fromRawJson(const Json::Value &v,
                                                           QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level encode: see SkillIcon::toRawJson()'s doc
+  // comment -- identical rationale, since rawContents()/unknownRaw() may
+  // themselves hold a number outside qint64's exact range.
+  [[nodiscard]] Json::Value toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] CardCostTag tag() const noexcept { return m_tag; }
   // Populated only when tag() == CardCostTag::StaticCost.
@@ -282,8 +295,17 @@ public:
   [[nodiscard]] static GameValue perPlayer(qint64 amount);
   [[nodiscard]] static GameValue staticWithPerPlayer(qint64 staticAmount,
                                                      qint64 perPlayerAmount);
-  [[nodiscard]] static GameValue byPlayerCount(qint64 oneOrTwo, qint64 three,
-                                               qint64 four, qint64 fiveOrMore);
+  // The pinned backend's `ByPlayerCount Int Int Int Int` (Arkham.GameValue,
+  // backend commit 6a1befbd7b) is looked up by `fromGameValue` via an exact
+  // `case pc of 1 -> ...; 2 -> ...; 3 -> ...; 4 -> ...`, i.e. these are four
+  // distinct positional values for exactly 1/2/3/4 players -- not the
+  // "oneOrTwo/three/four/fiveOrMore" grouping an earlier revision of this
+  // client mistakenly named them after (there is no separate 5-or-more
+  // slot; the backend errors for any other player count).
+  [[nodiscard]] static GameValue byPlayerCount(qint64 onePlayer,
+                                               qint64 twoPlayers,
+                                               qint64 threePlayers,
+                                               qint64 fourPlayers);
   [[nodiscard]] static GameValue valueX();
   [[nodiscard]] static GameValue valueStar();
   [[nodiscard]] static GameValue valueUnknown();
@@ -295,13 +317,19 @@ public:
   [[nodiscard]] static ValueOrError<GameValue> fromRawJson(const Json::Value &v,
                                                            QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level encode: see SkillIcon::toRawJson()'s doc comment.
+  [[nodiscard]] Json::Value toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] GameValueTag tag() const noexcept { return m_tag; }
   // Populated only for tag() == Static/PerPlayer.
   [[nodiscard]] std::optional<qint64> singleAmount() const noexcept {
     return m_singleAmount;
   }
-  // Size 2 for StaticWithPerPlayer, 4 for ByPlayerCount, empty otherwise.
+  // Size 2 for StaticWithPerPlayer (staticAmount, perPlayerAmount); size 4
+  // for ByPlayerCount (onePlayer, twoPlayers, threePlayers, fourPlayers,
+  // in that exact positional order -- see byPlayerCount()'s doc comment);
+  // empty otherwise.
   [[nodiscard]] const QList<qint64> &contents() const noexcept {
     return m_contents;
   }
@@ -466,6 +494,18 @@ struct CardDef {
   [[nodiscard]] static ValueOrError<CardDef> fromRawBytes(QByteArrayView bytes,
                                                           QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level encode: composes the lossless AST directly (see
+  // RawJson.h), recursing into every nested CardCost/GameValue/SkillIcon's
+  // own toRawJson() and embedding every schema-unconstrained/outer-typed
+  // field's already-native Json::Value verbatim -- never converting
+  // through QJsonObject first -- so a decode(fromRawBytes)-then-encode
+  // round trip of e.g. a governed catalog.json entry is exact for every
+  // numeric literal nested at any depth inside criteria/meta/
+  // customizations/etc., not merely as exact as QJsonObject's
+  // double-backed storage allows. toJson() above is now implemented in
+  // terms of this.
+  [[nodiscard]] Json::Value toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const CardDef &, const CardDef &) = default;
 };

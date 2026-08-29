@@ -98,6 +98,14 @@ struct InvestigatorSummary {
 
   [[nodiscard]] static ValueOrError<InvestigatorSummary>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode overload: identical logic (shared via a
+  // private template, see Games.cpp), operating directly on the lossless
+  // AST (see RawJson.h). This type has no numeric-precision concern of
+  // its own, but a raw aggregate decoder (e.g. GameListRow::fromRawJson)
+  // needs this overload to stay on Json::Value end-to-end for its
+  // nested investigators/otherInvestigators arrays.
+  [[nodiscard]] static ValueOrError<InvestigatorSummary>
+  fromJson(const Json::Value &v, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const InvestigatorSummary &,
@@ -121,6 +129,10 @@ struct ScenarioSummary {
 
   [[nodiscard]] static ValueOrError<ScenarioSummary>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode overload: see InvestigatorSummary's
+  // Json::Value overload doc comment above.
+  [[nodiscard]] static ValueOrError<ScenarioSummary>
+  fromJson(const Json::Value &v, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const ScenarioSummary &,
@@ -141,6 +153,10 @@ struct CampaignSummary {
 
   [[nodiscard]] static ValueOrError<CampaignSummary>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode overload: see InvestigatorSummary's
+  // Json::Value overload doc comment above.
+  [[nodiscard]] static ValueOrError<CampaignSummary>
+  fromJson(const Json::Value &v, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const CampaignSummary &,
@@ -185,6 +201,14 @@ public:
   [[nodiscard]] static ValueOrError<GameState>
   fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level encode: composes the lossless AST directly (see
+  // RawJson.h) -- toJson() above is now implemented in terms of this --
+  // so unknownRaw()'s complete original object (including any numeric
+  // literal beyond double precision) survives an encode-then-decode round
+  // trip byte-exact via toJsonBytes(), not merely as closely as
+  // Json::Value::toQJson() allows.
+  [[nodiscard]] Json::Value toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   // Only meaningful for Pending/ChooseDecks: the seats still owed a deck.
@@ -279,6 +303,18 @@ public:
 
   [[nodiscard]] static ValueOrError<GameListRow> fromJson(const QJsonValue &v,
                                                           QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a private template, see Games.cpp), operating directly on
+  // the lossless AST (see RawJson.h) so a GameState::Unknown tag's complete
+  // raw object and any playerCount value outside IEEE-754 double's exact
+  // integer range survive undamaged end-to-end.
+  [[nodiscard]] static ValueOrError<GameListRow>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h),
+  // rejecting duplicate object keys before this (or any nested) decode
+  // runs, and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<GameListRow>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
@@ -319,6 +355,10 @@ public:
 private:
   GameListRow() = default;
 
+  template <typename V>
+  [[nodiscard]] static ValueOrError<GameListRow>
+  fromValueImpl(const V &v, QStringView path);
+
   Kind m_kind{Kind::Failure};
   std::optional<GameId> m_id;
   std::optional<ScenarioSummary> m_scenario;
@@ -334,6 +374,16 @@ private:
 
 [[nodiscard]] ValueOrError<QList<GameListRow>>
 decodeGameList(const QJsonValue &v, QStringView path);
+// Canonical byte-level decode: identical logic to decodeGameList() above
+// (shared via a template, see Games.cpp), operating directly on the
+// lossless AST (see RawJson.h).
+[[nodiscard]] ValueOrError<QList<GameListRow>>
+decodeGameListFromRawJson(const Json::Value &v, QStringView path);
+// Parses `bytes` through the canonical raw-byte parser (see RawJson.h),
+// rejecting duplicate object keys before any nested row decode runs, and
+// decodes via decodeGameListFromRawJson() above.
+[[nodiscard]] ValueOrError<QList<GameListRow>>
+decodeGameListFromRawBytes(QByteArrayView bytes, QStringView path);
 [[nodiscard]] QJsonArray encodeGameList(const QList<GameListRow> &rows);
 
 // createGameRequest's known `options` entries (Arkham.Campaign.Option's
@@ -409,6 +459,13 @@ public:
   [[nodiscard]] static ValueOrError<CampaignOption>
   fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level encode: composes the lossless AST directly (see
+  // RawJson.h) -- toJson() above is now implemented in terms of this --
+  // so unknownRaw()'s complete original object survives an
+  // encode-then-decode round trip byte-exact via toJsonBytes(), not
+  // merely as closely as Json::Value::toQJson() allows.
+  [[nodiscard]] Json::Value toRawJson() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   [[nodiscard]] std::optional<KnownCampaignOption> known() const noexcept {
@@ -493,6 +550,13 @@ public:
   // forward-compatible fallback for a request-bound value.
   [[nodiscard]] static ValueOrError<CampaignOptionRequest>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode overload: identical logic (shared via a
+  // private template, see Games.cpp), operating directly on the lossless
+  // AST (see RawJson.h) so a raw aggregate decoder (e.g.
+  // CreateGameRequest::fromRawJson) can decode its nested "options" array
+  // without dropping to QJsonValue for this element type.
+  [[nodiscard]] static ValueOrError<CampaignOptionRequest>
+  fromJson(const Json::Value &v, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
@@ -506,6 +570,10 @@ public:
 
 private:
   CampaignOptionRequest() = default;
+
+  template <typename V>
+  [[nodiscard]] static ValueOrError<CampaignOptionRequest>
+  fromValueImpl(const V &v, QStringView path);
 
   Kind m_kind{Kind::Known};
   std::optional<KnownCampaignOption> m_known;
@@ -536,6 +604,11 @@ public:
 
   [[nodiscard]] static ValueOrError<CampaignOrScenario>
   fromJson(const QJsonObject &requestObj, QStringView path);
+  // Canonical byte-level decode overload: identical logic (shared via a
+  // private template, see Games.cpp), operating directly on the lossless
+  // AST (see RawJson.h) for CreateGameRequest::fromRawJson.
+  [[nodiscard]] static ValueOrError<CampaignOrScenario>
+  fromJson(const Json::Value &requestObj, QStringView path);
   // Inserts this request's resolved "campaignId"/"scenarioId" keys (each
   // either the real id or explicit JSON null) into `obj`, matching the
   // fixture's own encoding (both keys always present).
@@ -556,6 +629,10 @@ public:
 
 private:
   CampaignOrScenario() = default;
+
+  template <typename Obj>
+  [[nodiscard]] static ValueOrError<CampaignOrScenario>
+  fromValueImpl(const Obj &requestObj, QStringView path);
 
   std::optional<CampaignId> m_campaignId;
   std::optional<ScenarioId> m_scenarioId;
@@ -586,7 +663,29 @@ struct CreateGameRequest {
 
   [[nodiscard]] static ValueOrError<CreateGameRequest>
   fromJson(const QJsonValue &v, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a template, see Games.cpp), operating directly on the
+  // lossless AST (see RawJson.h) so playerCount survives exactly outside
+  // IEEE-754 double's exact-integer range, an unrecognized CampaignOption
+  // tag's complete raw payload is visible for diagnostics before this
+  // request-bound decode rejects it, and nested numeric literals anywhere
+  // in the request body are never silently rounded.
+  [[nodiscard]] static ValueOrError<CreateGameRequest>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h),
+  // rejecting duplicate object keys before any nested decode runs, and
+  // decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<CreateGameRequest>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
+  // Fails (rather than silently emitting an invalid request) if any
+  // present entry in `deckIds` is the null (all-zero) uuid: this struct's
+  // fields are public for ergonomic aggregate construction, so unlike
+  // fromJson()/fromRawJson() (which route every uuid through
+  // Json::decodeUuid and can never produce a null one), a caller
+  // constructing/mutating a CreateGameRequest by hand could otherwise
+  // bypass that invariant and emit a wire value the backend -- and this
+  // client's own decoder -- would reject.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const CreateGameRequest &,
                          const CreateGameRequest &) = default;
@@ -617,7 +716,10 @@ struct ChooseDeckRequest {
   // patch deckList back in from the raw tree" implementation.
   [[nodiscard]] static ValueOrError<ChooseDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // See Decks.h's DeckListInput::toJson() doc comment: fails (rather
+  // than silently rounding) whenever a present deckList's `id` cannot be
+  // exactly represented as a QJsonValue.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Precision-preserving equivalent of toJson(); see
   // DeckListInput::toJsonBytes().
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;

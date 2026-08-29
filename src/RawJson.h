@@ -52,35 +52,59 @@ namespace Arkham::Json {
 // this client, but the parser is the canonical boundary every governed
 // fixture and future wire caller must go through, so it is bounded
 // unconditionally rather than trusting an outer layer that does not exist
-// yet. production() below is deliberately generous relative to every
-// fixture and real game-list/catalog response this client currently
-// decodes (megabytes of headroom on size, hundreds of headroom on element
-// counts) while still rejecting the pathological inputs each field guards
-// against (a single-token flood, a deeply nested bomb, an unbounded number
-// literal). Tests may construct a tighter ParseLimits to exercise each
-// boundary without needing to build gigabyte-scale fixtures.
+// yet.
+//
+// production()'s defaults below are sized against this client's actual
+// worst-case real-world payload, not an arbitrary round number: the full
+// pinned-backend card catalog (all ~5,929 cards, ~10.2MB of JSON) measures
+// ~228,000 total nodes, a maximum single-array size of ~5,929 elements
+// (the top-level card list), a maximum single-object size of 70 members,
+// a maximum nesting depth of 7, a maximum string length of ~1,400 UTF-16
+// units, and every numeric field well under 10 digits. Every limit below
+// keeps multiple-times headroom over those measurements (room for years
+// of new-card growth) while still bounding worst-case memory: `Value` is
+// 176 bytes on a 64-bit build (measured via sizeof(Value)), so an
+// unbounded/needlessly generous maxTotalNodes is a direct memory-
+// amplification vector -- a 1,000,000-node prior default meant a
+// ~2MB adversarial-but-otherwise-in-bounds payload (e.g. a handful of
+// 100,000-element arrays) could force ~176MB of `Value` storage alone,
+// before QString/QList/QHash container/allocator overhead, which is
+// disproportionate to any input size this client legitimately handles.
+// Tests may construct an even tighter ParseLimits to exercise each
+// boundary without needing to build megabyte-scale fixtures.
 struct ParseLimits {
   // Total input size, checked once before parsing begins. Parse-only:
-  // toJsonBytes() has no equivalent input byte stream to bound.
-  qsizetype maxInputBytes = 16 * 1024 * 1024;
+  // toJsonBytes() has no equivalent input byte stream to bound. ~3x
+  // headroom over the current full card catalog (~10.2MB).
+  qsizetype maxInputBytes = 32 * 1024 * 1024;
   // Maximum array/object nesting depth (mirrors the previous hardcoded
-  // kMaxNestingDepth, now a configurable field with the same default).
-  int maxDepth = 200;
+  // kMaxNestingDepth, now a configurable field). ~9x headroom over the
+  // catalog's measured maximum nesting depth of 7; also bounds this
+  // parser's/serializer's own recursion depth.
+  int maxDepth = 64;
   // Maximum decoded length (in QChar/UTF-16 code units) of any single
-  // string value or object key.
-  qsizetype maxStringLength = 1 * 1024 * 1024;
+  // string value or object key. ~46x headroom over the catalog's longest
+  // measured string (~1,400 units of card text).
+  qsizetype maxStringLength = 64 * 1024;
   // Maximum digit count of a number literal's integer, fraction, or
-  // exponent part (checked independently), bounding e.g. "1e<9000 more
-  // digits>" without rejecting any realistic finite JSON number.
-  qsizetype maxNumberDigits = 1024;
-  // Maximum element count of any single array.
-  qsizetype maxArrayElements = 100'000;
-  // Maximum member count of any single object.
-  qsizetype maxObjectMembers = 100'000;
+  // exponent part (checked independently), bounding e.g. "1e<huge>"
+  // without rejecting any realistic finite JSON number. This client's own
+  // precision-preservation tests exercise up to a 39-digit fraction and a
+  // 19-digit qint64-range exponent, so this stays comfortably above that
+  // (real catalog numbers never exceed a handful of digits).
+  qsizetype maxNumberDigits = 64;
+  // Maximum element count of any single array. ~3.4x headroom over the
+  // catalog's top-level card array (~5,929 elements).
+  qsizetype maxArrayElements = 20'000;
+  // Maximum member count of any single object. ~14x headroom over the
+  // catalog's largest single card object (70 members).
+  qsizetype maxObjectMembers = 1'024;
   // Maximum total value count (every scalar/array/object node) across the
   // whole document, bounding a flat "wide" document (many small siblings)
-  // that individually satisfies every other limit.
-  qsizetype maxTotalNodes = 1'000'000;
+  // that individually satisfies every other limit. ~1.75x headroom over
+  // the full catalog's measured ~228,000 nodes -- the dominant memory
+  // bound given sizeof(Value) == 176 bytes (see doc comment above).
+  qsizetype maxTotalNodes = 400'000;
 
   [[nodiscard]] static ParseLimits production() { return ParseLimits{}; }
 

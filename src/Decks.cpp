@@ -48,24 +48,92 @@ decodeCardQuantityMapInput(const Obj &obj, QLatin1StringView key,
 
 // Decodes a `cardQuantityMap`: an object whose property names must be valid
 // CardCodes, with integer values. Used for DeckList.slots/sideSlots.
+// Templatized over Obj like decodeCardQuantityMapInput above, via
+// Json::objectMembers() for uniform (key, value) iteration.
+template <typename Obj>
 ValueOrError<QMap<CardCode, qint64>>
-decodeCardQuantityMap(const QJsonObject &obj, QLatin1StringView key,
-                      QStringView path) {
+decodeCardQuantityMap(const Obj &obj, QLatin1StringView key, QStringView path) {
   auto objResult = Json::requireObjectField(obj, key, path);
   if (!objResult)
     return failure(objResult.error());
   QMap<CardCode, qint64> result;
-  for (auto it = objResult->constBegin(); it != objResult->constEnd(); ++it) {
-    const QString entryPath = Json::joinPath(path, it.key());
-    auto code = CardCode::parse(it.key());
+  for (const auto &[entryKey, value] : Json::objectMembers(*objResult)) {
+    const QString entryPath = Json::joinPath(path, entryKey);
+    auto code = CardCode::parse(entryKey);
     if (!code)
       return failure(QStringLiteral("%1: %2").arg(entryPath, code.error()));
-    auto amount = Json::requireIntValue(it.value(), entryPath);
+    auto amount = Json::requireIntValue(value, entryPath);
     if (!amount)
       return failure(amount.error());
     result.insert(*code, *amount);
   }
   return result;
+}
+
+// Shared decode body for DeckList::fromJson()/fromRawJson(): V is
+// QJsonValue or Json::Value. Every field decoder called below
+// (decodeCardQuantityMap, Json::requireField/requireString/
+// requireNullableString/requireNullableInt) is already generic over the
+// object-family it receives, and CardCode::fromJson is likewise
+// dual-overloaded (see Identifiers.h), so this one body serves both the
+// convenience fromJson() family and the canonical fromRawJson()/
+// fromRawBytes() family without duplication.
+template <typename V>
+ValueOrError<DeckList> decodeDeckList(const V &v, QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  auto cardSlots =
+      decodeCardQuantityMap(obj, "slots"_L1, Json::joinPath(path, u"slots"));
+  if (!cardSlots)
+    return failure(cardSlots.error());
+  auto sideSlots = decodeCardQuantityMap(obj, "sideSlots"_L1,
+                                         Json::joinPath(path, u"sideSlots"));
+  if (!sideSlots)
+    return failure(sideSlots.error());
+  auto investigatorCode = Json::requireField(
+      obj, "investigator_code"_L1, Json::joinPath(path, u"investigator_code"),
+      [](const auto &v, QStringView p) { return CardCode::fromJson(v, p); });
+  if (!investigatorCode)
+    return failure(investigatorCode.error());
+  auto investigatorName = Json::requireString(
+      obj, "investigator_name"_L1, Json::joinPath(path, u"investigator_name"));
+  if (!investigatorName)
+    return failure(investigatorName.error());
+  auto meta = Json::requireNullableString(obj, "meta"_L1,
+                                          Json::joinPath(path, u"meta"));
+  if (!meta)
+    return failure(meta.error());
+  auto tabooId = Json::requireNullableInt(obj, "taboo_id"_L1,
+                                          Json::joinPath(path, u"taboo_id"));
+  if (!tabooId)
+    return failure(tabooId.error());
+  auto url =
+      Json::requireNullableString(obj, "url"_L1, Json::joinPath(path, u"url"));
+  if (!url)
+    return failure(url.error());
+  auto id =
+      Json::requireNullableString(obj, "id"_L1, Json::joinPath(path, u"id"));
+  if (!id)
+    return failure(id.error());
+  auto name = Json::requireNullableString(obj, "name"_L1,
+                                          Json::joinPath(path, u"name"));
+  if (!name)
+    return failure(name.error());
+
+  return DeckList{
+      .cardSlots = *cardSlots,
+      .sideSlots = *sideSlots,
+      .investigatorCode = *investigatorCode,
+      .investigatorName = *investigatorName,
+      .meta = *meta,
+      .tabooId = *tabooId,
+      .url = *url,
+      .id = *id,
+      .name = *name,
+  };
 }
 
 QJsonObject encodeCardQuantityMapInput(const QMap<QString, qint64> &map) {
@@ -91,6 +159,22 @@ Json::Value rawEncodeCardQuantityMapInput(const QMap<QString, qint64> &map) {
     members.append({it.key(), Json::Value::makeNumber(
                                   Json::RawNumber::fromInt64(it.value()))});
   return Json::Value::makeObject(std::move(members));
+}
+
+// DeckListInput.cardSlots is a public QMap<QString, qint64> field (for
+// ergonomic construction from a permissive external caller), so unlike
+// decode (decodeCardQuantityMapInput above always rejects an empty key
+// before it ever reaches this type) an encoder must still guard a
+// hand-constructed instance against one slipping through: an empty key
+// would otherwise silently serialize into a schema-invalid
+// cardQuantityMapInput request. Returns an empty string when every key is
+// non-empty.
+QString firstEmptyCardSlotsKeyError(const QMap<QString, qint64> &map) {
+  for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
+    if (it.key().isEmpty())
+      return QStringLiteral("slots: quantity map key must not be empty");
+  }
+  return QString();
 }
 
 // Dispatch-shim overload pair (mirrors CardCatalog.cpp's identically-named
@@ -242,6 +326,69 @@ ValueOrError<CreateDeckRequest> decodeCreateDeckRequest(const Obj &v,
   };
 }
 
+// Dispatch-shim pair for DeckList (mirrors this file's
+// decodeInvestigatorRefValue/decodeExternalDeckId pattern): picks
+// DeckList::fromJson()'s QJsonValue-taking body, or the precision-
+// preserving fromRawJson() overload, to match decodeDeck<Obj>'s deduced
+// value-family parameter below.
+ValueOrError<DeckList> decodeDeckListValue(const QJsonValue &v,
+                                           QStringView path) {
+  return DeckList::fromJson(v, path);
+}
+ValueOrError<DeckList> decodeDeckListValue(const Json::Value &v,
+                                           QStringView path) {
+  return DeckList::fromRawJson(v, path);
+}
+
+// Shared decode body for Deck::fromJson()/fromRawJson(): V is QJsonValue
+// or Json::Value. `list` decodes through decodeDeckListValue's Json::Value
+// overload for the fromRawJson()/fromRawBytes() path, so a numeric card
+// quantity or other nested value survives exactly rather than only as
+// closely as QJsonValue's double-backed storage allows.
+template <typename V>
+ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  auto id = Json::requireField(
+      obj, "id"_L1, Json::joinPath(path, u"id"),
+      [](const auto &v, QStringView p) { return DeckId::fromJson(v, p); });
+  if (!id)
+    return failure(id.error());
+  auto userId =
+      Json::requireInt(obj, "userId"_L1, Json::joinPath(path, u"userId"));
+  if (!userId)
+    return failure(userId.error());
+  auto url =
+      Json::requireNullableString(obj, "url"_L1, Json::joinPath(path, u"url"));
+  if (!url)
+    return failure(url.error());
+  auto name =
+      Json::requireString(obj, "name"_L1, Json::joinPath(path, u"name"));
+  if (!name)
+    return failure(name.error());
+  auto investigatorName = Json::requireString(
+      obj, "investigatorName"_L1, Json::joinPath(path, u"investigatorName"));
+  if (!investigatorName)
+    return failure(investigatorName.error());
+  auto list = Json::requireField(
+      obj, "list"_L1, Json::joinPath(path, u"list"),
+      [](const auto &v, QStringView p) { return decodeDeckListValue(v, p); });
+  if (!list)
+    return failure(list.error());
+
+  return Deck{
+      .id = *id,
+      .userId = *userId,
+      .url = *url,
+      .name = *name,
+      .investigatorName = *investigatorName,
+      .list = *list,
+  };
+}
+
 } // namespace
 
 ExternalDeckId ExternalDeckId::absent() {
@@ -323,7 +470,7 @@ ExternalDeckId::fromRawObject(const Json::Value &obj, QStringView path) {
                      .arg(idPath, Json::typeName(v)));
 }
 
-QJsonValue ExternalDeckId::toJson() const {
+ValueOrError<QJsonValue> ExternalDeckId::toJson() const {
   switch (m_kind) {
   case Kind::Absent:
     return QJsonValue(QJsonValue::Undefined);
@@ -338,12 +485,27 @@ QJsonValue ExternalDeckId::toJson() const {
   case Kind::Text:
     return QJsonValue(m_text);
   case Kind::Number:
-    // Display/debug-only: see this method's header doc comment. Uses
-    // RawNumber::toDouble() (best-effort IEEE-754), never toRawJson()'s
-    // exact literal.
-    return QJsonValue(m_number.toDouble());
+    // Exact via QJsonValue(qint64) -- never a double -- whenever the
+    // literal is mathematically integral and fits qint64's range (see
+    // RawNumber::toExactInt64()): Qt's QJsonValue backing store
+    // preserves a qint64 exactly (see Value::toQJson()'s doc comment
+    // and toQJsonPreservesInt64ExactlyBeyondDoublePrecision in
+    // RawJsonTests.cpp), unlike constructing from a double. Any other
+    // Number literal -- a genuine fraction, or an exponent pushing the
+    // magnitude outside qint64's range -- cannot be represented in a
+    // QJsonValue without rounding, so this returns a typed failure
+    // rather than ever silently substituting a rounded value; use
+    // toRawJson() (always lossless) to encode such a value.
+    if (const auto exact = m_number.toExactInt64())
+      return QJsonValue(*exact);
+    return failure(
+        QStringLiteral("ExternalDeckId::toJson: numeric id \"%1\" cannot be "
+                       "represented exactly as a QJsonValue; use "
+                       "toRawJson()/toJsonBytes() instead")
+            .arg(m_number.literal()));
   }
-  Q_UNREACHABLE_RETURN(QJsonValue());
+  Q_UNREACHABLE_RETURN(
+      failure(QStringLiteral("ExternalDeckId::toJson: unreachable kind")));
 }
 
 Json::Value ExternalDeckId::toRawJson() const {
@@ -377,7 +539,10 @@ ValueOrError<DeckListInput> DeckListInput::fromRawBytes(QByteArrayView bytes,
   return fromRawJson(*raw, path);
 }
 
-QJsonObject DeckListInput::toJson() const {
+ValueOrError<QJsonObject> DeckListInput::toJson() const {
+  const QString slotsError = firstEmptyCardSlotsKeyError(cardSlots);
+  if (!slotsError.isEmpty())
+    return failure(slotsError);
   QJsonObject obj;
   obj.insert(QStringLiteral("slots"), encodeCardQuantityMapInput(cardSlots));
   if (!sideSlots.isUndefined())
@@ -391,15 +556,20 @@ QJsonObject DeckListInput::toJson() const {
     obj.insert(QStringLiteral("taboo_id"), *tabooId);
   if (url)
     obj.insert(QStringLiteral("url"), *url);
-  const QJsonValue idJson = id.toJson();
-  if (!idJson.isUndefined())
-    obj.insert(QStringLiteral("id"), idJson);
+  auto idJson = id.toJson();
+  if (!idJson)
+    return failure(idJson.error());
+  if (!idJson->isUndefined())
+    obj.insert(QStringLiteral("id"), *idJson);
   if (name)
     obj.insert(QStringLiteral("name"), *name);
   return obj;
 }
 
-Json::Value DeckListInput::toRawJson() const {
+ValueOrError<Json::Value> DeckListInput::toRawJson() const {
+  const QString slotsError = firstEmptyCardSlotsKeyError(cardSlots);
+  if (!slotsError.isEmpty())
+    return failure(slotsError);
   QList<std::pair<QString, Json::Value>> members;
   members.append(
       {QStringLiteral("slots"), rawEncodeCardQuantityMapInput(cardSlots)});
@@ -426,67 +596,28 @@ Json::Value DeckListInput::toRawJson() const {
 }
 
 ValueOrError<QByteArray> DeckListInput::toJsonBytes() const {
-  return toRawJson().toJsonBytes();
+  auto raw = toRawJson();
+  if (!raw)
+    return failure(raw.error());
+  return raw->toJsonBytes();
 }
 
 ValueOrError<DeckList> DeckList::fromJson(const QJsonValue &v,
                                           QStringView path) {
-  auto objResult = Json::requireObject(v, path);
-  if (!objResult)
-    return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  return decodeDeckList(v, path);
+}
 
-  auto cardSlots =
-      decodeCardQuantityMap(obj, "slots"_L1, Json::joinPath(path, u"slots"));
-  if (!cardSlots)
-    return failure(cardSlots.error());
-  auto sideSlots = decodeCardQuantityMap(obj, "sideSlots"_L1,
-                                         Json::joinPath(path, u"sideSlots"));
-  if (!sideSlots)
-    return failure(sideSlots.error());
-  auto investigatorCode = Json::requireField(
-      obj, "investigator_code"_L1, Json::joinPath(path, u"investigator_code"),
-      [](const QJsonValue &v, QStringView p) {
-        return CardCode::fromJson(v, p);
-      });
-  if (!investigatorCode)
-    return failure(investigatorCode.error());
-  auto investigatorName = Json::requireString(
-      obj, "investigator_name"_L1, Json::joinPath(path, u"investigator_name"));
-  if (!investigatorName)
-    return failure(investigatorName.error());
-  auto meta = Json::requireNullableString(obj, "meta"_L1,
-                                          Json::joinPath(path, u"meta"));
-  if (!meta)
-    return failure(meta.error());
-  auto tabooId = Json::requireNullableInt(obj, "taboo_id"_L1,
-                                          Json::joinPath(path, u"taboo_id"));
-  if (!tabooId)
-    return failure(tabooId.error());
-  auto url =
-      Json::requireNullableString(obj, "url"_L1, Json::joinPath(path, u"url"));
-  if (!url)
-    return failure(url.error());
-  auto id =
-      Json::requireNullableString(obj, "id"_L1, Json::joinPath(path, u"id"));
-  if (!id)
-    return failure(id.error());
-  auto name = Json::requireNullableString(obj, "name"_L1,
-                                          Json::joinPath(path, u"name"));
-  if (!name)
-    return failure(name.error());
+ValueOrError<DeckList> DeckList::fromRawJson(const Json::Value &v,
+                                             QStringView path) {
+  return decodeDeckList(v, path);
+}
 
-  return DeckList{
-      .cardSlots = *cardSlots,
-      .sideSlots = *sideSlots,
-      .investigatorCode = *investigatorCode,
-      .investigatorName = *investigatorName,
-      .meta = *meta,
-      .tabooId = *tabooId,
-      .url = *url,
-      .id = *id,
-      .name = *name,
-  };
+ValueOrError<DeckList> DeckList::fromRawBytes(QByteArrayView bytes,
+                                              QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
 }
 
 QJsonObject DeckList::toJson() const {
@@ -517,48 +648,18 @@ QJsonObject DeckList::toJson() const {
 }
 
 ValueOrError<Deck> Deck::fromJson(const QJsonValue &v, QStringView path) {
-  auto objResult = Json::requireObject(v, path);
-  if (!objResult)
-    return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  return decodeDeck(v, path);
+}
 
-  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
-                               [](const QJsonValue &v, QStringView p) {
-                                 return DeckId::fromJson(v, p);
-                               });
-  if (!id)
-    return failure(id.error());
-  auto userId =
-      Json::requireInt(obj, "userId"_L1, Json::joinPath(path, u"userId"));
-  if (!userId)
-    return failure(userId.error());
-  auto url =
-      Json::requireNullableString(obj, "url"_L1, Json::joinPath(path, u"url"));
-  if (!url)
-    return failure(url.error());
-  auto name =
-      Json::requireString(obj, "name"_L1, Json::joinPath(path, u"name"));
-  if (!name)
-    return failure(name.error());
-  auto investigatorName = Json::requireString(
-      obj, "investigatorName"_L1, Json::joinPath(path, u"investigatorName"));
-  if (!investigatorName)
-    return failure(investigatorName.error());
-  auto list = Json::requireField(obj, "list"_L1, Json::joinPath(path, u"list"),
-                                 [](const QJsonValue &v, QStringView p) {
-                                   return DeckList::fromJson(v, p);
-                                 });
-  if (!list)
-    return failure(list.error());
+ValueOrError<Deck> Deck::fromRawJson(const Json::Value &v, QStringView path) {
+  return decodeDeck(v, path);
+}
 
-  return Deck{
-      .id = *id,
-      .userId = *userId,
-      .url = *url,
-      .name = *name,
-      .investigatorName = *investigatorName,
-      .list = *list,
-  };
+ValueOrError<Deck> Deck::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
 }
 
 QJsonObject Deck::toJson() const {
@@ -595,11 +696,14 @@ CreateDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*raw, path);
 }
 
-QJsonObject CreateDeckRequest::toJson() const {
+ValueOrError<QJsonObject> CreateDeckRequest::toJson() const {
+  auto deckListJson = deckList.toJson();
+  if (!deckListJson)
+    return failure(deckListJson.error());
   QJsonObject obj{
       {QStringLiteral("deckId"), deckId},
       {QStringLiteral("deckName"), deckName},
-      {QStringLiteral("deckList"), deckList.toJson()},
+      {QStringLiteral("deckList"), *deckListJson},
   };
   if (deckUrl)
     obj.insert(QStringLiteral("deckUrl"), *deckUrl);
@@ -607,10 +711,13 @@ QJsonObject CreateDeckRequest::toJson() const {
 }
 
 ValueOrError<QByteArray> CreateDeckRequest::toJsonBytes() const {
+  auto deckListRaw = deckList.toRawJson();
+  if (!deckListRaw)
+    return failure(deckListRaw.error());
   QList<std::pair<QString, Json::Value>> members{
       {QStringLiteral("deckId"), Json::Value::makeString(deckId)},
       {QStringLiteral("deckName"), Json::Value::makeString(deckName)},
-      {QStringLiteral("deckList"), deckList.toRawJson()},
+      {QStringLiteral("deckList"), *deckListRaw},
   };
   if (deckUrl)
     members.append(

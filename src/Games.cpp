@@ -147,9 +147,13 @@ constexpr std::array<std::pair<QLatin1StringView, KnownCampaignOption>, 32>
 
 // Decodes a required-but-nullable closed-enum field (the key itself must be
 // present; its value may be JSON null): campaign.currentCampaignMode.
-template <typename Enum, std::size_t N>
+// Generic over Obj (QJsonObject or Json::Value, see RawJson.h): both
+// support fieldPresence()/value() identically, and decodeClosedEnum is
+// itself already generic, so one body serves both the fromJson() and
+// fromRawJson() decode families.
+template <typename Obj, typename Enum, std::size_t N>
 ValueOrError<std::optional<Enum>> requireNullableClosedEnum(
-    const QJsonObject &obj, QLatin1StringView key, QStringView path,
+    const Obj &obj, QLatin1StringView key, QStringView path,
     const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
   switch (Json::fieldPresence(obj, key)) {
   case Json::FieldPresence::Absent:
@@ -167,12 +171,13 @@ ValueOrError<std::optional<Enum>> requireNullableClosedEnum(
 }
 
 // Decodes an optional closed-enum field where an absent key and an explicit
-// JSON null both collapse to unset: createGameRequest.asIfRuling.
-template <typename Enum, std::size_t N>
+// JSON null both collapse to unset: createGameRequest.asIfRuling. Generic
+// over Obj for the same reason as requireNullableClosedEnum above.
+template <typename Obj, typename Enum, std::size_t N>
 ValueOrError<std::optional<Enum>> optionalClosedEnum(
-    const QJsonObject &obj, QLatin1StringView key, QStringView path,
+    const Obj &obj, QLatin1StringView key, QStringView path,
     const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
-  const QJsonValue v = obj.value(key);
+  const auto v = obj.value(key);
   if (v.isUndefined() || v.isNull())
     return std::optional<Enum>{};
   auto result = Json::decodeClosedEnum(v, path, table);
@@ -210,6 +215,19 @@ ValueOrError<QList<QUuid>> decodeUuidArray(const Arr &arr, QStringView path) {
   return result;
 }
 
+// Same-name overload pair so a generic template body (e.g.
+// GameListRow::fromValueImpl<V> below) can decode a nested "gameState"
+// field with one spelling despite GameState's differently-named fromJson()/
+// fromRawJson() public entry points.
+ValueOrError<GameState> decodeGameStateValue(const QJsonValue &v,
+                                             QStringView path) {
+  return GameState::fromJson(v, path);
+}
+ValueOrError<GameState> decodeGameStateValue(const Json::Value &v,
+                                             QStringView path) {
+  return GameState::fromRawJson(v, path);
+}
+
 QJsonArray encodeUuidArray(const QList<QUuid> &ids) {
   QJsonArray result;
   for (const QUuid &id : ids)
@@ -217,12 +235,25 @@ QJsonArray encodeUuidArray(const QList<QUuid> &ids) {
   return result;
 }
 
+// Raw-AST counterpart of encodeUuidArray() above, for GameState::toRawJson().
+Json::Value encodeUuidArrayRaw(const QList<QUuid> &ids) {
+  QList<Json::Value> result;
+  for (const QUuid &id : ids)
+    result.append(Json::Value::makeString(id.toString(QUuid::WithoutBraces)));
+  return Json::Value::makeArray(result);
+}
+
 // Decodes a required array of InvestigatorSummary (gameDetails.investigators/
 // otherInvestigators): unlike catalog.schema.json's optional arrays, the
 // list-schema.json key itself is always required, so an absent key fails
-// rather than defaulting to empty.
+// rather than defaulting to empty. Generic over Obj (QJsonObject or
+// Json::Value, see RawJson.h): Json::requireArrayField is itself already
+// generic, and InvestigatorSummary::fromJson is overloaded for both
+// element types below, so one body serves both the fromJson() and
+// fromRawJson() decode families.
+template <typename Obj>
 ValueOrError<QList<InvestigatorSummary>>
-decodeInvestigatorArray(const QJsonObject &obj, QLatin1StringView key,
+decodeInvestigatorArray(const Obj &obj, QLatin1StringView key,
                         QStringView path) {
   auto arrResult = Json::requireArrayField(obj, key, path);
   if (!arrResult)
@@ -241,17 +272,19 @@ decodeInvestigatorArray(const QJsonObject &obj, QLatin1StringView key,
 
 } // namespace
 
+namespace {
+
+template <typename V>
 ValueOrError<InvestigatorSummary>
-InvestigatorSummary::fromJson(const QJsonValue &v, QStringView path) {
+investigatorSummaryFromValueImpl(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
-  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
-                               [](const QJsonValue &v, QStringView p) {
-                                 return CardCode::fromJson(v, p);
-                               });
+  auto id = Json::requireField(
+      obj, "id"_L1, Json::joinPath(path, u"id"),
+      [](const auto &v, QStringView p) { return CardCode::fromJson(v, p); });
   if (!id)
     return failure(id.error());
 
@@ -266,25 +299,17 @@ InvestigatorSummary::fromJson(const QJsonValue &v, QStringView path) {
   return InvestigatorSummary{.id = *id, .classSymbol = *classSymbol};
 }
 
-QJsonObject InvestigatorSummary::toJson() const {
-  return QJsonObject{
-      {QStringLiteral("id"), id.toJson()},
-      {QStringLiteral("classSymbol"),
-       Json::encodeClosedEnum(classSymbol, kClassSymbolTable)},
-  };
-}
-
-ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const QJsonValue &v,
-                                                        QStringView path) {
+template <typename V>
+ValueOrError<ScenarioSummary> scenarioSummaryFromValueImpl(const V &v,
+                                                           QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
-  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
-                               [](const QJsonValue &v, QStringView p) {
-                                 return CardCode::fromJson(v, p);
-                               });
+  auto id = Json::requireField(
+      obj, "id"_L1, Json::joinPath(path, u"id"),
+      [](const auto &v, QStringView p) { return CardCode::fromJson(v, p); });
   if (!id)
     return failure(id.error());
 
@@ -296,10 +321,9 @@ ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const QJsonValue &v,
   if (!difficulty)
     return failure(difficulty.error());
 
-  auto name = Json::requireField(obj, "name"_L1, Json::joinPath(path, u"name"),
-                                 [](const QJsonValue &v, QStringView p) {
-                                   return CardName::fromJson(v, p);
-                                 });
+  auto name = Json::requireField(
+      obj, "name"_L1, Json::joinPath(path, u"name"),
+      [](const auto &v, QStringView p) { return CardName::fromJson(v, p); });
   if (!name)
     return failure(name.error());
 
@@ -312,28 +336,17 @@ ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const QJsonValue &v,
       .id = *id, .difficulty = *difficulty, .name = *name, .variant = *variant};
 }
 
-QJsonObject ScenarioSummary::toJson() const {
-  return QJsonObject{
-      {QStringLiteral("id"), id.toJson()},
-      {QStringLiteral("difficulty"),
-       Json::encodeClosedEnum(difficulty, kDifficultyTable)},
-      {QStringLiteral("name"), name.toJson()},
-      {QStringLiteral("variant"),
-       variant ? QJsonValue(*variant) : QJsonValue(QJsonValue::Null)},
-  };
-}
-
-ValueOrError<CampaignSummary> CampaignSummary::fromJson(const QJsonValue &v,
-                                                        QStringView path) {
+template <typename V>
+ValueOrError<CampaignSummary> campaignSummaryFromValueImpl(const V &v,
+                                                           QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
-  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
-                               [](const QJsonValue &v, QStringView p) {
-                                 return CampaignId::fromJson(v, p);
-                               });
+  auto id = Json::requireField(
+      obj, "id"_L1, Json::joinPath(path, u"id"),
+      [](const auto &v, QStringView p) { return CampaignId::fromJson(v, p); });
   if (!id)
     return failure(id.error());
 
@@ -354,6 +367,57 @@ ValueOrError<CampaignSummary> CampaignSummary::fromJson(const QJsonValue &v,
   return CampaignSummary{.id = *id,
                          .difficulty = *difficulty,
                          .currentCampaignMode = *currentCampaignMode};
+}
+
+} // namespace
+
+ValueOrError<InvestigatorSummary>
+InvestigatorSummary::fromJson(const QJsonValue &v, QStringView path) {
+  return investigatorSummaryFromValueImpl(v, path);
+}
+
+ValueOrError<InvestigatorSummary>
+InvestigatorSummary::fromJson(const Json::Value &v, QStringView path) {
+  return investigatorSummaryFromValueImpl(v, path);
+}
+
+QJsonObject InvestigatorSummary::toJson() const {
+  return QJsonObject{
+      {QStringLiteral("id"), id.toJson()},
+      {QStringLiteral("classSymbol"),
+       Json::encodeClosedEnum(classSymbol, kClassSymbolTable)},
+  };
+}
+
+ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const QJsonValue &v,
+                                                        QStringView path) {
+  return scenarioSummaryFromValueImpl(v, path);
+}
+
+ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const Json::Value &v,
+                                                        QStringView path) {
+  return scenarioSummaryFromValueImpl(v, path);
+}
+
+QJsonObject ScenarioSummary::toJson() const {
+  return QJsonObject{
+      {QStringLiteral("id"), id.toJson()},
+      {QStringLiteral("difficulty"),
+       Json::encodeClosedEnum(difficulty, kDifficultyTable)},
+      {QStringLiteral("name"), name.toJson()},
+      {QStringLiteral("variant"),
+       variant ? QJsonValue(*variant) : QJsonValue(QJsonValue::Null)},
+  };
+}
+
+ValueOrError<CampaignSummary> CampaignSummary::fromJson(const QJsonValue &v,
+                                                        QStringView path) {
+  return campaignSummaryFromValueImpl(v, path);
+}
+
+ValueOrError<CampaignSummary> CampaignSummary::fromJson(const Json::Value &v,
+                                                        QStringView path) {
+  return campaignSummaryFromValueImpl(v, path);
 }
 
 QJsonObject CampaignSummary::toJson() const {
@@ -434,6 +498,10 @@ ValueOrError<GameState> GameState::fromValueImpl(const V &v, QStringView path) {
   const QString &tag = *tagResult;
 
   if (tag == "IsPending"_L1 || tag == "IsChooseDecks"_L1) {
+    auto keysResult =
+        Json::requireExactKeys(obj, {"tag"_L1, "contents"_L1}, path);
+    if (!keysResult)
+      return failure(keysResult.error());
     const QString contentsPath = Json::joinPath(path, u"contents");
     auto arrResult = Json::requireArrayField(obj, "contents"_L1, contentsPath);
     if (!arrResult)
@@ -453,12 +521,12 @@ ValueOrError<GameState> GameState::fromValueImpl(const V &v, QStringView path) {
     return state;
   }
   if (tag == "IsActive"_L1 || tag == "IsOver"_L1) {
-    // Known nullary tags reject any "contents" presence -- even an
-    // explicit null -- rather than silently ignoring an unexpected
-    // payload.
-    if (Json::fieldPresence(obj, "contents"_L1) != Json::FieldPresence::Absent)
-      return failure(QStringLiteral("%1: \"%2\" must not have \"contents\"")
-                         .arg(path, tag));
+    // Known nullary tags reject any "contents" presence (or any other
+    // key) -- even an explicit null -- rather than silently ignoring an
+    // unexpected payload.
+    auto keysResult = Json::requireExactKeys(obj, {"tag"_L1}, path);
+    if (!keysResult)
+      return failure(keysResult.error());
     return tag == "IsActive"_L1 ? GameState::active() : GameState::over();
   }
 
@@ -479,23 +547,37 @@ ValueOrError<GameState> GameState::fromValueImpl(const V &v, QStringView path) {
 }
 
 QJsonObject GameState::toJson() const {
+  return toRawJson().toQJson().toObject();
+}
+
+Json::Value GameState::toRawJson() const {
   switch (m_kind) {
   case Kind::Pending:
-    return QJsonObject{
-        {QStringLiteral("tag"), QStringLiteral("IsPending")},
-        {QStringLiteral("contents"), encodeUuidArray(m_playerIds)}};
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"),
+          Json::Value::makeString(QStringLiteral("IsPending"))},
+         {QStringLiteral("contents"), encodeUuidArrayRaw(m_playerIds)}});
   case Kind::ChooseDecks:
-    return QJsonObject{
-        {QStringLiteral("tag"), QStringLiteral("IsChooseDecks")},
-        {QStringLiteral("contents"), encodeUuidArray(m_playerIds)}};
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"),
+          Json::Value::makeString(QStringLiteral("IsChooseDecks"))},
+         {QStringLiteral("contents"), encodeUuidArrayRaw(m_playerIds)}});
   case Kind::Active:
-    return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsActive")}};
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"),
+          Json::Value::makeString(QStringLiteral("IsActive"))}});
   case Kind::Over:
-    return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsOver")}};
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"),
+          Json::Value::makeString(QStringLiteral("IsOver"))}});
   case Kind::Unknown:
-    return m_unknownRaw.toQJson().toObject();
+    return m_unknownRaw;
   }
-  Q_UNREACHABLE_RETURN(QJsonObject{});
+  Q_UNREACHABLE_RETURN(Json::Value{});
+}
+
+ValueOrError<QByteArray> GameState::toJsonBytes() const {
+  return toRawJson().toJsonBytes();
 }
 
 GameListRow GameListRow::success(GameId id,
@@ -529,10 +611,29 @@ GameListRow GameListRow::failed(QString error) {
 
 ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
                                                 QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<GameListRow> GameListRow::fromRawJson(const Json::Value &v,
+                                                   QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<GameListRow> GameListRow::fromRawBytes(QByteArrayView bytes,
+                                                    QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+template <typename V>
+ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
+                                                     QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   // Disambiguated by shape, not an explicit tag: the backend's hand-written
   // GameDetailsEntry ToJSON encodes a failure as a bare `{"error": message}`
@@ -544,12 +645,12 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
   // data attached. Propagate that as a decode error instead of silently
   // discarding the other keys and declaring victory as Kind::Failure.
   if (obj.contains("error"_L1)) {
-    if (obj.size() != 1)
+    if (Json::objectMembers(obj).size() != 1)
       return failure(
           QStringLiteral("%1: a failure row's \"error\" must be its only "
                          "key (found %2 keys)")
               .arg(path)
-              .arg(obj.size()));
+              .arg(Json::objectMembers(obj).size()));
     auto error =
         Json::requireString(obj, "error"_L1, Json::joinPath(path, u"error"));
     if (!error)
@@ -557,10 +658,9 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
     return GameListRow::failed(*error);
   }
 
-  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
-                               [](const QJsonValue &v, QStringView p) {
-                                 return GameId::fromJson(v, p);
-                               });
+  auto id = Json::requireField(
+      obj, "id"_L1, Json::joinPath(path, u"id"),
+      [](const auto &v, QStringView p) { return GameId::fromJson(v, p); });
   if (!id)
     return failure(id.error());
 
@@ -570,7 +670,7 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
     if (!obj.contains("scenario"_L1))
       return failure(QStringLiteral("%1: missing required field \"scenario\"")
                          .arg(fieldPath));
-    const QJsonValue sv = obj.value("scenario"_L1);
+    const auto sv = obj.value("scenario"_L1);
     if (!sv.isNull()) {
       auto result = ScenarioSummary::fromJson(sv, fieldPath);
       if (!result)
@@ -585,7 +685,7 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
     if (!obj.contains("campaign"_L1))
       return failure(QStringLiteral("%1: missing required field \"campaign\"")
                          .arg(fieldPath));
-    const QJsonValue cv = obj.value("campaign"_L1);
+    const auto cv = obj.value("campaign"_L1);
     if (!cv.isNull()) {
       auto result = CampaignSummary::fromJson(cv, fieldPath);
       if (!result)
@@ -594,11 +694,9 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
     }
   }
 
-  auto gameState = Json::requireField(obj, "gameState"_L1,
-                                      Json::joinPath(path, u"gameState"),
-                                      [](const QJsonValue &v, QStringView p) {
-                                        return GameState::fromJson(v, p);
-                                      });
+  auto gameState = Json::requireField(
+      obj, "gameState"_L1, Json::joinPath(path, u"gameState"),
+      [](const auto &v, QStringView p) { return decodeGameStateValue(v, p); });
   if (!gameState)
     return failure(gameState.error());
 
@@ -672,21 +770,56 @@ QJsonObject GameListRow::toJson() const {
   return obj;
 }
 
-ValueOrError<QList<GameListRow>> decodeGameList(const QJsonValue &v,
-                                                QStringView path) {
+namespace {
+
+// Same-name overload pair so decodeGameListImpl<V> below can call one
+// spelling generically despite GameListRow's differently-named fromJson()/
+// fromRawJson() public entry points (see this codebase's established
+// idiom in Decks.cpp's decodeExternalDeckId/decodeInvestigatorRefValue).
+ValueOrError<GameListRow> decodeGameListRow(const QJsonValue &v,
+                                            QStringView path) {
+  return GameListRow::fromJson(v, path);
+}
+ValueOrError<GameListRow> decodeGameListRow(const Json::Value &v,
+                                            QStringView path) {
+  return GameListRow::fromRawJson(v, path);
+}
+
+template <typename V>
+ValueOrError<QList<GameListRow>> decodeGameListImpl(const V &v,
+                                                    QStringView path) {
   auto arrResult = Json::requireArray(v, path);
   if (!arrResult)
     return failure(arrResult.error());
   QList<GameListRow> result;
   result.reserve(arrResult->size());
   for (qsizetype i = 0; i < arrResult->size(); ++i) {
-    auto item =
-        GameListRow::fromJson((*arrResult)[i], Json::indexPath(path, i));
+    auto item = decodeGameListRow((*arrResult)[i], Json::indexPath(path, i));
     if (!item)
       return failure(item.error());
     result.append(*item);
   }
   return result;
+}
+
+} // namespace
+
+ValueOrError<QList<GameListRow>> decodeGameList(const QJsonValue &v,
+                                                QStringView path) {
+  return decodeGameListImpl(v, path);
+}
+
+ValueOrError<QList<GameListRow>> decodeGameListFromRawJson(const Json::Value &v,
+                                                           QStringView path) {
+  return decodeGameListImpl(v, path);
+}
+
+ValueOrError<QList<GameListRow>>
+decodeGameListFromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return decodeGameListFromRawJson(*parsed, path);
 }
 
 QJsonArray encodeGameList(const QList<GameListRow> &rows) {
@@ -778,19 +911,28 @@ ValueOrError<CampaignOption> CampaignOption::fromValueImpl(const V &v,
 }
 
 QJsonObject CampaignOption::toJson() const {
+  return toRawJson().toQJson().toObject();
+}
+
+Json::Value CampaignOption::toRawJson() const {
   switch (m_kind) {
   case Kind::Known:
-    return QJsonObject{
-        {QStringLiteral("tag"),
-         Json::encodeClosedEnum(*m_known, kKnownCampaignOptionTable)}};
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"), Json::Value::makeString(Json::encodeClosedEnum(
+                                     *m_known, kKnownCampaignOptionTable))}});
   case Kind::Variant:
-    return QJsonObject{
-        {QStringLiteral("tag"), QStringLiteral("CampaignVariant")},
-        {QStringLiteral("contents"), m_text}};
+    return Json::Value::makeObject(
+        {{QStringLiteral("tag"),
+          Json::Value::makeString(QStringLiteral("CampaignVariant"))},
+         {QStringLiteral("contents"), Json::Value::makeString(m_text)}});
   case Kind::Unknown:
-    return m_unknownRaw.toQJson().toObject();
+    return m_unknownRaw;
   }
-  Q_UNREACHABLE_RETURN(QJsonObject{});
+  Q_UNREACHABLE_RETURN(Json::Value{});
+}
+
+ValueOrError<QByteArray> CampaignOption::toJsonBytes() const {
+  return toRawJson().toJsonBytes();
 }
 
 ValueOrError<CampaignOptionRequest>
@@ -825,10 +967,21 @@ CampaignOptionRequest CampaignOptionRequest::variantOption(QString contents) {
 
 ValueOrError<CampaignOptionRequest>
 CampaignOptionRequest::fromJson(const QJsonValue &v, QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<CampaignOptionRequest>
+CampaignOptionRequest::fromJson(const Json::Value &v, QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+template <typename V>
+ValueOrError<CampaignOptionRequest>
+CampaignOptionRequest::fromValueImpl(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   auto tagResult =
       Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
@@ -891,10 +1044,21 @@ CampaignOrScenario CampaignOrScenario::scenario(ScenarioId id) {
 
 ValueOrError<CampaignOrScenario>
 CampaignOrScenario::fromJson(const QJsonObject &requestObj, QStringView path) {
+  return fromValueImpl(requestObj, path);
+}
+
+ValueOrError<CampaignOrScenario>
+CampaignOrScenario::fromJson(const Json::Value &requestObj, QStringView path) {
+  return fromValueImpl(requestObj, path);
+}
+
+template <typename Obj>
+ValueOrError<CampaignOrScenario>
+CampaignOrScenario::fromValueImpl(const Obj &requestObj, QStringView path) {
   // Both keys collapse absent-and-null identically, matching CreateGamePost's
   // hand-written `.:?` parse for each.
   std::optional<CampaignId> campaignId;
-  const QJsonValue campaignV = requestObj.value("campaignId"_L1);
+  const auto campaignV = requestObj.value("campaignId"_L1);
   if (!campaignV.isUndefined() && !campaignV.isNull()) {
     auto result =
         CampaignId::fromJson(campaignV, Json::joinPath(path, u"campaignId"));
@@ -904,7 +1068,7 @@ CampaignOrScenario::fromJson(const QJsonObject &requestObj, QStringView path) {
   }
 
   std::optional<ScenarioId> scenarioId;
-  const QJsonValue scenarioV = requestObj.value("scenarioId"_L1);
+  const auto scenarioV = requestObj.value("scenarioId"_L1);
   if (!scenarioV.isUndefined() && !scenarioV.isNull()) {
     auto result =
         ScenarioId::fromJson(scenarioV, Json::joinPath(path, u"scenarioId"));
@@ -937,12 +1101,13 @@ void CampaignOrScenario::insertInto(QJsonObject &obj) const {
                                                : QJsonValue(QJsonValue::Null));
 }
 
-ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
-                                                            QStringView path) {
+template <typename V>
+ValueOrError<CreateGameRequest>
+createGameRequestFromValueImpl(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   const QString deckIdsPath = Json::joinPath(path, u"deckIds");
   auto deckIdsArr = Json::requireArrayField(obj, "deckIds"_L1, deckIdsPath);
@@ -1025,7 +1190,7 @@ ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
   // nothing left here for this client to preserve; only a present non-null
   // value is actually decoded.
   QList<UltimatumOrBoon> ultimatumsAndBoons;
-  const QJsonValue ultimatumsV = obj.value("ultimatumsAndBoons"_L1);
+  const auto ultimatumsV = obj.value("ultimatumsAndBoons"_L1);
   if (!ultimatumsV.isUndefined() && !ultimatumsV.isNull()) {
     const QString ultimatumsPath = Json::joinPath(path, u"ultimatumsAndBoons");
     auto arrResult = Json::requireArray(ultimatumsV, ultimatumsPath);
@@ -1043,7 +1208,7 @@ ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
   }
 
   bool achievementsEnabled = true;
-  const QJsonValue achievementsV = obj.value("achievementsEnabled"_L1);
+  const auto achievementsV = obj.value("achievementsEnabled"_L1);
   if (!achievementsV.isUndefined() && !achievementsV.isNull()) {
     auto result = Json::requireBoolValue(
         achievementsV, Json::joinPath(path, u"achievementsEnabled"));
@@ -1068,12 +1233,35 @@ ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
   };
 }
 
-QJsonObject CreateGameRequest::toJson() const {
+ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
+                                                            QStringView path) {
+  return createGameRequestFromValueImpl(v, path);
+}
+
+ValueOrError<CreateGameRequest>
+CreateGameRequest::fromRawJson(const Json::Value &v, QStringView path) {
+  return createGameRequestFromValueImpl(v, path);
+}
+
+ValueOrError<CreateGameRequest>
+CreateGameRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+ValueOrError<QJsonObject> CreateGameRequest::toJson() const {
   QJsonObject obj;
   QJsonArray deckIdsArr;
-  for (const auto &id : deckIds)
+  for (qsizetype i = 0; i < deckIds.size(); ++i) {
+    const auto &id = deckIds.at(i);
+    if (id && id->isNull())
+      return failure(
+          QStringLiteral("deckIds[%1]: must not be the null uuid").arg(i));
     deckIdsArr.append(id ? QJsonValue(id->toString(QUuid::WithoutBraces))
                          : QJsonValue(QJsonValue::Null));
+  }
   obj.insert(QStringLiteral("deckIds"), deckIdsArr);
   obj.insert(QStringLiteral("playerCount"), playerCount);
   campaignOrScenario.insertInto(obj);
@@ -1175,13 +1363,17 @@ ValueOrError<ChooseDeckRequest> ChooseDeckRequest::fromJson(const QJsonValue &v,
   return decodeChooseDeckRequest(*objResult, path);
 }
 
-QJsonObject ChooseDeckRequest::toJson() const {
+ValueOrError<QJsonObject> ChooseDeckRequest::toJson() const {
   QJsonObject obj;
   obj.insert(QStringLiteral("investigatorId"), investigatorId.toJson());
   if (deckUrl)
     obj.insert(QStringLiteral("deckUrl"), *deckUrl);
-  if (deckList)
-    obj.insert(QStringLiteral("deckList"), deckList->toJson());
+  if (deckList) {
+    auto deckListJson = deckList->toJson();
+    if (!deckListJson)
+      return failure(deckListJson.error());
+    obj.insert(QStringLiteral("deckList"), *deckListJson);
+  }
   return obj;
 }
 
@@ -1215,8 +1407,12 @@ ValueOrError<QByteArray> ChooseDeckRequest::toJsonBytes() const {
   if (deckUrl)
     members.append(
         {QStringLiteral("deckUrl"), Json::Value::makeString(*deckUrl)});
-  if (deckList)
-    members.append({QStringLiteral("deckList"), deckList->toRawJson()});
+  if (deckList) {
+    auto deckListRaw = deckList->toRawJson();
+    if (!deckListRaw)
+      return failure(deckListRaw.error());
+    members.append({QStringLiteral("deckList"), *deckListRaw});
+  }
   return Json::Value::makeObject(std::move(members)).toJsonBytes();
 }
 

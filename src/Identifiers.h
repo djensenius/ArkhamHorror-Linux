@@ -36,6 +36,20 @@ public:
       return failure(uuid.error());
     return TypedId(uuid->toString(QUuid::WithoutBraces));
   }
+  // Canonical byte-level decode overload: identical logic, operating
+  // directly on the lossless AST (see RawJson.h) via Json::decodeUuid's
+  // own Json::Value overload. A UUID has no numeric-precision concern of
+  // its own, but routing a fromRawJson()-driven aggregate decode (e.g.
+  // GameListRow::fromRawJson) through this overload keeps the whole
+  // decode on Json::Value end-to-end rather than dropping to QJsonValue
+  // partway through for this one field.
+  [[nodiscard]] static ValueOrError<TypedId> fromJson(const Json::Value &v,
+                                                      QStringView path) {
+    auto uuid = Json::decodeUuid(v, path);
+    if (!uuid)
+      return failure(uuid.error());
+    return TypedId(uuid->toString(QUuid::WithoutBraces));
+  }
 
   [[nodiscard]] const QString &value() const noexcept { return m_value; }
   [[nodiscard]] QJsonValue toJson() const { return m_value; }
@@ -70,13 +84,14 @@ public:
 
   [[nodiscard]] static ValueOrError<NonEmptyString>
   fromJson(const QJsonValue &v, QStringView path) {
-    if (!v.isString())
-      return failure(QStringLiteral("%1: expected string, got %2")
-                         .arg(path, Json::typeName(v)));
-    auto result = parse(v.toString());
-    if (!result)
-      return failure(QStringLiteral("%1: %2").arg(path, result.error()));
-    return *result;
+    return fromJsonImpl(v, path);
+  }
+  // Canonical byte-level decode overload: see TypedId::fromJson's
+  // Json::Value overload doc comment -- identical rationale, since this
+  // type has no numeric-precision concern of its own either.
+  [[nodiscard]] static ValueOrError<NonEmptyString>
+  fromJson(const Json::Value &v, QStringView path) {
+    return fromJsonImpl(v, path);
   }
 
   [[nodiscard]] const QString &value() const noexcept { return m_value; }
@@ -87,6 +102,19 @@ public:
 
 private:
   explicit NonEmptyString(QString v) : m_value(std::move(v)) {}
+
+  template <typename V>
+  [[nodiscard]] static ValueOrError<NonEmptyString>
+  fromJsonImpl(const V &v, QStringView path) {
+    if (!v.isString())
+      return failure(QStringLiteral("%1: expected string, got %2")
+                         .arg(path, Json::typeName(v)));
+    auto result = parse(v.toString());
+    if (!result)
+      return failure(QStringLiteral("%1: %2").arg(path, result.error()));
+    return *result;
+  }
+
   QString m_value;
 };
 
@@ -111,6 +139,11 @@ class CardCode {
 public:
   [[nodiscard]] static ValueOrError<CardCode> parse(const QString &text);
   [[nodiscard]] static ValueOrError<CardCode> fromJson(const QJsonValue &v,
+                                                       QStringView path);
+  // Canonical byte-level decode overload: see TypedId::fromJson's
+  // Json::Value overload doc comment -- CardCode is a plain validated
+  // string with no numeric-precision concern of its own.
+  [[nodiscard]] static ValueOrError<CardCode> fromJson(const Json::Value &v,
                                                        QStringView path);
 
   [[nodiscard]] const QString &value() const noexcept { return m_value; }
@@ -141,7 +174,17 @@ struct CardName {
 
   [[nodiscard]] static ValueOrError<CardName> fromJson(const QJsonValue &v,
                                                        QStringView path);
+  // Canonical byte-level decode overload: see TypedId::fromJson's
+  // Json::Value overload doc comment -- title/subtitle are plain strings
+  // with no numeric-precision concern of their own.
+  [[nodiscard]] static ValueOrError<CardName> fromJson(const Json::Value &v,
+                                                       QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
+  // title/subtitle have no numeric-precision concern of their own, but
+  // exposing this alongside toJson() lets an enclosing aggregate (e.g.
+  // CardDef::toRawJson()) compose its own encode entirely in Json::Value
+  // without ever dropping to QJsonObject for this field specifically.
+  [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const CardName &, const CardName &) = default;
 };

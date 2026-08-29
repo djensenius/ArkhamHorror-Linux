@@ -6,6 +6,7 @@
 #include <QSet>
 #include <cmath>
 #include <limits>
+#include <new>
 
 using namespace Qt::StringLiterals;
 
@@ -473,8 +474,21 @@ private:
 
 ValueOrError<Value> Value::parse(QByteArrayView bytes, QStringView path,
                                  const ParseLimits &limits) {
-  Parser parser(bytes, path, limits);
-  return parser.parseDocument();
+  // ParseLimits bounds a document's *shape* (depth/counts/lengths) before
+  // any container grows, but a pathological-yet-in-bounds combination
+  // (e.g. many objects each holding many long-but-within-limit strings)
+  // can still exhaust available memory on a resource-constrained device.
+  // Rather than let that surface as Qt's fatal qBadAlloc()-driven abort,
+  // catch the standard allocation-failure exception at this canonical
+  // parse boundary and report it as a typed decode failure like any other
+  // malformed input, instead of terminating the process.
+  try {
+    Parser parser(bytes, path, limits);
+    return parser.parseDocument();
+  } catch (const std::bad_alloc &) {
+    return Failure{QStringLiteral("%1: parsing exhausted available memory")
+                       .arg(path.toString())};
+  }
 }
 
 bool Value::contains(QLatin1StringView key) const {
@@ -664,7 +678,19 @@ namespace {
 // characters, '"', '\\'); every other Unicode character is emitted as
 // literal (encoded) UTF-8 bytes, which is valid directly inside a JSON
 // string with no escape needed.
-void appendJsonEncodedString(QByteArray &out, const QString &s) {
+//
+// Returns false (leaving `out` in an unspecified, not-necessarily-valid
+// state the caller must discard) for a lone high surrogate not followed
+// by a matching low surrogate, or a lone low surrogate not preceded by a
+// consumed high surrogate: `s` is a QString, which -- unlike Value::parse()
+// 's own input -- can be constructed programmatically (e.g. via
+// QString::fromRawData() over ill-formed UTF-16, or by slicing a valid
+// string between a surrogate pair) to hold such an ill-formed code unit.
+// Encoding one directly as three UTF-8 bytes (as naive surrogate-oblivious
+// code does) produces a byte sequence RFC 8259/RFC 3629 both forbid, so
+// this function makes emitting it impossible rather than emitting invalid
+// JSON.
+[[nodiscard]] bool appendJsonEncodedString(QByteArray &out, const QString &s) {
   out += '"';
   for (qsizetype i = 0; i < s.size(); ++i) {
     const QChar ch = s[i];
@@ -672,6 +698,8 @@ void appendJsonEncodedString(QByteArray &out, const QString &s) {
     if (ch.isHighSurrogate() && i + 1 < s.size() && s[i + 1].isLowSurrogate()) {
       codepoint = QChar::surrogateToUcs4(ch, s[i + 1]);
       ++i;
+    } else if (ch.isHighSurrogate() || ch.isLowSurrogate()) {
+      return false;
     }
     switch (codepoint) {
     case '"':
@@ -723,12 +751,23 @@ void appendJsonEncodedString(QByteArray &out, const QString &s) {
     }
   }
   out += '"';
+  return true;
 }
 } // namespace
 
 ValueOrError<QByteArray> Value::toJsonBytes(const ParseLimits &limits) const {
-  qsizetype totalNodes = 0;
-  return toJsonBytesInner(limits, 0, totalNodes);
+  // See Value::parse()'s matching try/catch: a programmatically-built AST
+  // that satisfies every ParseLimits bound can still exhaust memory while
+  // serializing (e.g. concatenating many long-but-in-bounds strings into
+  // the output buffer); fail typed rather than let Qt's allocator abort.
+  try {
+    qsizetype totalNodes = 0;
+    return toJsonBytesInner(limits, 0, totalNodes);
+  } catch (const std::bad_alloc &) {
+    return Failure{QStringLiteral(
+        "Json::Value::toJsonBytes: serialization exhausted available "
+        "memory")};
+  }
 }
 
 ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
@@ -779,7 +818,10 @@ ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
           "Json::Value::toJsonBytes: string exceeds the maximum allowed "
           "length"));
     QByteArray out;
-    appendJsonEncodedString(out, m_string);
+    if (!appendJsonEncodedString(out, m_string))
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: string contains a lone UTF-16 "
+          "surrogate code unit, which cannot be encoded as valid UTF-8"));
     return out;
   }
   case Kind::Array: {
@@ -827,7 +869,10 @@ ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
       if (!first)
         out += ',';
       first = false;
-      appendJsonEncodedString(out, key);
+      if (!appendJsonEncodedString(out, key))
+        return failure(QStringLiteral(
+            "Json::Value::toJsonBytes: object key contains a lone UTF-16 "
+            "surrogate code unit, which cannot be encoded as valid UTF-8"));
       out += ':';
       auto encoded = value.toJsonBytesInner(limits, depth + 1, totalNodes);
       if (!encoded)
@@ -908,6 +953,37 @@ std::optional<qint64> RawNumber::toExactInt64() const {
   // that string, then is shifted further by the exponent (a positive
   // exponent moves it right/toward the end, negative moves it left).
   const QString digits = m_intDigits + m_fracDigits;
+
+  // A zero coefficient is exactly 0 regardless of how large a (validly
+  // parseable) exponent accompanies it -- 0 * 10^e == 0 for any finite e.
+  // Short-circuit here, before any exponent-magnitude arithmetic, so a
+  // literal like "0e9223372036854775807" is handled as the trivial exact
+  // zero it is: the decimal-point-position computation below adds the
+  // exponent to m_intDigits.size(), which would itself risk signed
+  // overflow for an exponent this large, even though the exponent's
+  // magnitude is completely irrelevant to a zero coefficient's value.
+  bool allZero = true;
+  for (const QChar c : digits) {
+    if (c != u'0') {
+      allZero = false;
+      break;
+    }
+  }
+  if (allZero) {
+    // Still require the exponent digit string (if any) to parse to *some*
+    // qint64 magnitude, so a genuinely malformed/unparseable exponent
+    // (defense in depth -- Value::parse() should already have rejected
+    // one exceeding maxNumberDigits at the syntax level) is not silently
+    // treated as if it were a valid, merely-irrelevant one.
+    if (m_hasExponent) {
+      bool ok = false;
+      m_expDigits.toLongLong(&ok);
+      if (!ok)
+        return std::nullopt;
+    }
+    return qint64(0);
+  }
+
   qint64 exponent = 0;
   if (m_hasExponent) {
     bool ok = false;
@@ -921,8 +997,18 @@ std::optional<qint64> RawNumber::toExactInt64() const {
       return std::nullopt;
     exponent = m_exponentNegative ? -magnitude : magnitude;
   }
-  const qint64 decimalPointPos =
-      static_cast<qint64>(m_intDigits.size()) + exponent;
+  // m_intDigits.size() + exponent, computed via checked addition: a
+  // nonzero coefficient with an exponent near qint64's own extremes (e.g.
+  // "1e9223372036854775807") would otherwise overflow this addition
+  // itself (signed integer overflow is undefined behavior), well before
+  // the result could be compared against any of the range checks below.
+  // Such a literal's magnitude is astronomically outside qint64's range
+  // regardless of the exact (unrepresentable) sum, so overflow here is
+  // unconditionally treated as "out of range" rather than computed.
+  qint64 decimalPointPos = 0;
+  if (__builtin_add_overflow(static_cast<qint64>(m_intDigits.size()), exponent,
+                             &decimalPointPos))
+    return std::nullopt;
 
   QString magnitudeDigits;
   if (decimalPointPos >= digits.size()) {

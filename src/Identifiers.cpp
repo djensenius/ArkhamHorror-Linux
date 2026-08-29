@@ -4,6 +4,41 @@ using namespace Qt::StringLiterals;
 
 namespace Arkham {
 
+namespace {
+
+template <typename V>
+ValueOrError<CardCode> cardCodeFromValueImpl(const V &v, QStringView path) {
+  if (!v.isString())
+    return failure(QStringLiteral("%1: expected string, got %2")
+                       .arg(path, Json::typeName(v)));
+  auto result = CardCode::parse(v.toString());
+  if (!result)
+    return failure(QStringLiteral("%1: %2").arg(path, result.error()));
+  return *result;
+}
+
+template <typename V>
+ValueOrError<CardName> cardNameFromValueImpl(const V &v, QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  auto titleResult =
+      Json::requireString(obj, "title"_L1, Json::joinPath(path, u"title"));
+  if (!titleResult)
+    return failure(titleResult.error());
+
+  auto subtitleResult = Json::requireNullableString(
+      obj, "subtitle"_L1, Json::joinPath(path, u"subtitle"));
+  if (!subtitleResult)
+    return failure(subtitleResult.error());
+
+  return CardName{.title = *titleResult, .subtitle = *subtitleResult};
+}
+
+} // namespace
+
 ValueOrError<CardCode> CardCode::parse(const QString &text) {
   // Matches contracts/schemas/catalog.schema.json's `cardCode` pattern
   // `^c.+$` under plain ECMA-262 regex semantics (no schema-level regex
@@ -33,33 +68,22 @@ ValueOrError<CardCode> CardCode::parse(const QString &text) {
 
 ValueOrError<CardCode> CardCode::fromJson(const QJsonValue &v,
                                           QStringView path) {
-  if (!v.isString())
-    return failure(QStringLiteral("%1: expected string, got %2")
-                       .arg(path, Json::typeName(v)));
-  auto result = parse(v.toString());
-  if (!result)
-    return failure(QStringLiteral("%1: %2").arg(path, result.error()));
-  return *result;
+  return cardCodeFromValueImpl(v, path);
+}
+
+ValueOrError<CardCode> CardCode::fromJson(const Json::Value &v,
+                                          QStringView path) {
+  return cardCodeFromValueImpl(v, path);
 }
 
 ValueOrError<CardName> CardName::fromJson(const QJsonValue &v,
                                           QStringView path) {
-  auto objResult = Json::requireObject(v, path);
-  if (!objResult)
-    return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  return cardNameFromValueImpl(v, path);
+}
 
-  auto titleResult =
-      Json::requireString(obj, "title"_L1, Json::joinPath(path, u"title"));
-  if (!titleResult)
-    return failure(titleResult.error());
-
-  auto subtitleResult = Json::requireNullableString(
-      obj, "subtitle"_L1, Json::joinPath(path, u"subtitle"));
-  if (!subtitleResult)
-    return failure(subtitleResult.error());
-
-  return CardName{.title = *titleResult, .subtitle = *subtitleResult};
+ValueOrError<CardName> CardName::fromJson(const Json::Value &v,
+                                          QStringView path) {
+  return cardNameFromValueImpl(v, path);
 }
 
 QJsonObject CardName::toJson() const {
@@ -75,6 +99,15 @@ QJsonObject CardName::toJson() const {
       {QStringLiteral("subtitle"),
        subtitle ? QJsonValue(*subtitle) : QJsonValue(QJsonValue::Null)},
   };
+}
+
+Json::Value CardName::toRawJson() const {
+  QList<std::pair<QString, Json::Value>> members;
+  members.append({QStringLiteral("title"), Json::Value::makeString(title)});
+  members.append(
+      {QStringLiteral("subtitle"), subtitle ? Json::Value::makeString(*subtitle)
+                                            : Json::Value::makeNull()});
+  return Json::Value::makeObject(std::move(members));
 }
 
 } // namespace Arkham

@@ -22,6 +22,14 @@ private slots:
   void decodesValidateDeckListInputFromFixture();
   void decodesNormalizedDeckListFromFixture();
   void decodesDeckFromFixture();
+  // Round decodeGameList/GameListRow/CreateGameRequest #3 (companion to
+  // GamesTests' identically-numbered items): DeckList/Deck previously had
+  // no raw-byte entry point at all -- any caller wanting exact quantity
+  // decoding had to collapse through QJsonDocument first. fromRawBytes()
+  // now decodes directly off the lossless AST end-to-end.
+  void deckListFromRawBytesMatchesFromJsonOnSameFixture();
+  void deckFromRawBytesMatchesFromJsonOnSameFixture();
+  void deckFromRawBytesRejectsDuplicateObjectKey();
   void decodesValidationErrorsFromFixture();
   void decodesValidationSuccessFromFixture();
   void decodesOperationErrorFromFixture();
@@ -33,6 +41,14 @@ private slots:
   void externalIdLargeIntegerPreservedWithoutPrecisionLoss();
   void externalIdDecimalPreserved();
   void externalIdWrongTypeRejected();
+  // Round-7 HIGH #2: ExternalDeckId::toJson()/DeckListInput::toJson()/
+  // CreateDeckRequest::toJson()/ChooseDeckRequest::toJson() must never
+  // silently round a Number id through a double -- exact ids succeed via
+  // QJsonValue(qint64), and anything else (fraction/huge exponent) is a
+  // typed failure, never a rounded/zero/string substitute.
+  void externalIdToJsonPreservesLargeIntegerExactlyAsQJsonInteger();
+  void externalIdToJsonRejectsHugeExponentWithoutRoundingOrFallback();
+  void externalIdToJsonRejectsFractionWithoutRoundingOrFallback();
 
   // ExternalDeckId via the raw-byte parser: genuine precision preservation
   // (HIGH #3) -- no double-rounding at all, unlike the QJsonValue-based
@@ -85,6 +101,12 @@ private slots:
   // Wrong types / malformed ──────────────────────────────────────────────────
   void wrongTypeForInvestigatorCodeRejected();
   void deckListInputMissingInvestigatorCodeRejected();
+  // Round 4 item 6: DeckListInput.cardSlots is a public
+  // QMap<QString, qint64> field, so a programmatically-constructed
+  // instance -- not merely a malformed decode -- with an empty key must
+  // still be rejected at encode time.
+  void deckListInputToJsonRejectsProgrammaticEmptyCardSlotsKey();
+  void deckListInputToJsonBytesRejectsProgrammaticEmptyCardSlotsKey();
 };
 
 namespace {
@@ -162,7 +184,10 @@ void DecksTests::decodesCreateDeckRequestFromFixture() {
   expectedDeckList = withoutKey(expectedDeckList, "externalField"_L1);
   expectedDeckList = withoutKey(expectedDeckList, "taboo_id"_L1);
   expected.insert(QStringLiteral("deckList"), expectedDeckList);
-  QCOMPARE(result->toJson(), expected);
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, expected);
 }
 
 void DecksTests::decodesFetchDeckRequestFromFixture() {
@@ -189,10 +214,13 @@ void DecksTests::decodesValidateDeckListInputFromFixture() {
   // explicit JSON null in the fixture; DeckListInput collapses absent/null
   // to unset and toJson() omits the key once unset, so it too must be
   // stripped from the expected shape.
-  QVERIFY(!result->toJson().contains(QStringLiteral("externalField")));
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->contains(QStringLiteral("externalField")));
   QJsonObject expected = withoutKey(v.toObject(), "externalField"_L1);
   expected = withoutKey(expected, "taboo_id"_L1);
-  QCOMPARE(result->toJson(), expected);
+  QCOMPARE(*reencoded, expected);
 }
 
 void DecksTests::decodesNormalizedDeckListFromFixture() {
@@ -228,6 +256,53 @@ void DecksTests::decodesDeckFromFixture() {
   QCOMPARE(result->list.investigatorCode.value(), QStringLiteral("c01001"));
 
   QCOMPARE(result->toJson(), v.toObject());
+}
+
+void DecksTests::deckListFromRawBytesMatchesFromJsonOnSameFixture() {
+  const QJsonObject fixture = decksFixture();
+  const QJsonValue v = fixture.value("normalizedDeckList"_L1);
+  const QByteArray bytes =
+      QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact);
+
+  const auto viaJson = DeckList::fromJson(v, u"normalizedDeckList");
+  const auto viaRawBytes = DeckList::fromRawBytes(bytes, u"normalizedDeckList");
+  if (!viaJson)
+    QFAIL(qPrintable(viaJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QVERIFY(*viaJson == *viaRawBytes);
+}
+
+void DecksTests::deckFromRawBytesMatchesFromJsonOnSameFixture() {
+  const QJsonObject fixture = decksFixture();
+  const QJsonValue v = fixture.value("deck"_L1);
+  const QByteArray bytes =
+      QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact);
+
+  const auto viaJson = Deck::fromJson(v, u"deck");
+  const auto viaRawBytes = Deck::fromRawBytes(bytes, u"deck");
+  if (!viaJson)
+    QFAIL(qPrintable(viaJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QVERIFY(*viaJson == *viaRawBytes);
+}
+
+void DecksTests::deckFromRawBytesRejectsDuplicateObjectKey() {
+  // The canonical raw-byte parser (see RawJson.h) rejects a duplicate
+  // object key before any nested aggregate decode runs -- proven here
+  // through Deck::fromRawBytes()'s actual production entry point, not
+  // only in isolation against the parser.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"id\":\"00000000-0000-0000-0000-000000000017\","
+      "\"userId\":7,\"userId\":8,\"url\":null,\"name\":\"X\","
+      "\"investigatorName\":\"Roland Banks\","
+      "\"list\":{\"slots\":{},\"sideSlots\":{},"
+      "\"investigator_code\":\"c01001\",\"investigator_name\":\"Roland "
+      "Banks\",\"meta\":null,\"taboo_id\":null,\"url\":null,\"id\":null,"
+      "\"name\":null}}");
+  const auto result = Deck::fromRawBytes(bytes, u"deck");
+  QVERIFY(!result);
 }
 
 void DecksTests::decodesValidationErrorsFromFixture() {
@@ -276,7 +351,10 @@ void DecksTests::externalIdAbsentPreserved() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Absent);
   // Omitted on re-encode -- never fabricates a null/zero id.
-  QVERIFY(!result->toJson().contains(QStringLiteral("id")));
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->contains(QStringLiteral("id")));
 }
 
 void DecksTests::externalIdExplicitNullPreserved() {
@@ -292,8 +370,11 @@ void DecksTests::externalIdExplicitNullPreserved() {
   // A missing key's .value() would be Undefined, whose isNull() is false
   // (confirmed empirically against Qt's actual behavior), so this pair
   // genuinely distinguishes "key present with null" from "key omitted".
-  QVERIFY(result->toJson().contains(QStringLiteral("id")));
-  QVERIFY(result->toJson().value(QStringLiteral("id")).isNull());
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(reencoded->contains(QStringLiteral("id")));
+  QVERIFY(reencoded->value(QStringLiteral("id")).isNull());
 }
 
 void DecksTests::externalIdStringPreserved() {
@@ -307,7 +388,10 @@ void DecksTests::externalIdStringPreserved() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Text);
   QCOMPARE(result->id.text(), QStringLiteral("external-9999"));
-  QCOMPARE(result->toJson().value(QStringLiteral("id")).toString(),
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(reencoded->value(QStringLiteral("id")).toString(),
            QStringLiteral("external-9999"));
 }
 
@@ -330,7 +414,15 @@ void DecksTests::externalIdLargeIntegerPreservedWithoutPrecisionLoss() {
   const auto exact = result->id.number().toExactInt64();
   QVERIFY(exact.has_value());
   QCOMPARE(*exact, qint64(9007199254740992LL));
-  QCOMPARE(result->toJson().value(QStringLiteral("id")).toDouble(), large);
+  // toJson() now succeeds exactly via QJsonValue(qint64) (never a lossy
+  // double) since this literal is mathematically integral and fits
+  // qint64's range -- see ExternalDeckId::toJson()'s doc comment.
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(reencoded->value(QStringLiteral("id")).toInteger(),
+           qint64(9007199254740992LL));
+  QCOMPARE(reencoded->value(QStringLiteral("id")).toDouble(), large);
 }
 
 void DecksTests::externalIdDecimalPreserved() {
@@ -345,7 +437,19 @@ void DecksTests::externalIdDecimalPreserved() {
   QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Number);
   QCOMPARE(result->id.number().literal(), QStringLiteral("42.5"));
   QVERIFY(!result->id.number().toExactInt64().has_value());
-  QCOMPARE(result->toJson().value(QStringLiteral("id")).toDouble(), 42.5);
+  // toJson() must FAIL for a genuine fraction rather than silently
+  // rounding through a double -- this is the exact scenario the
+  // "public outbound request QJson encoders silently round exact
+  // ExternalDeckId" review finding forbids: there is no safe fallback.
+  const auto reencoded = result->toJson();
+  QVERIFY(!reencoded.has_value());
+  QVERIFY2(reencoded.error().contains(QStringLiteral("42.5")),
+           qPrintable(reencoded.error()));
+  // The lossless byte path still encodes the exact literal unchanged.
+  const auto bytes = result->toJsonBytes();
+  if (!bytes)
+    QFAIL(qPrintable(bytes.error()));
+  QVERIFY(bytes->contains("42.5"));
 }
 
 void DecksTests::externalIdWrongTypeRejected() {
@@ -358,6 +462,55 @@ void DecksTests::externalIdWrongTypeRejected() {
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("id")),
            qPrintable(result.error()));
+}
+
+void DecksTests::externalIdToJsonPreservesLargeIntegerExactlyAsQJsonInteger() {
+  // Unit-level (not via DeckListInput): 9007199254740993 == 2^53 + 1 is the
+  // smallest positive integer a double cannot represent exactly, but it
+  // fits qint64 exactly. ExternalDeckId::toJson() must succeed and its
+  // QJsonValue must be backed by the exact qint64, not a rounded double.
+  const auto id =
+      ExternalDeckId::number(Json::RawNumber::fromInt64(9007199254740993LL));
+  const auto encoded = id.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->toInteger(), qint64(9007199254740993LL));
+  // The naive double round-trip for this literal is 9007199254740992 (2^53)
+  // -- assert the two are distinguishable so a regression back to
+  // QJsonValue(m_number.toDouble()) would fail this test.
+  QVERIFY(encoded->toInteger() != qint64(9007199254740992LL));
+}
+
+void DecksTests::
+    externalIdToJsonRejectsHugeExponentWithoutRoundingOrFallback() {
+  // "1e128" is syntactically a valid JSON number but its magnitude is far
+  // outside qint64's range and it parses to +Infinity as a double.
+  // ExternalDeckId::toJson() must return a typed failure -- never a
+  // rounded/Infinity/zero QJsonValue "fallback".
+  auto parsed = Json::Value::parse(QByteArrayLiteral("1e128"), u"id");
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  QVERIFY(parsed->isNumber());
+  const auto id = ExternalDeckId::number(parsed->toRawNumber());
+  const auto encoded = id.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("1e128")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::externalIdToJsonRejectsFractionWithoutRoundingOrFallback() {
+  // A genuine fraction (as opposed to a mathematically-integral literal
+  // like "1.0") can never be represented exactly as a qint64-backed
+  // QJsonValue; toJson() must fail rather than silently rounding through
+  // a double.
+  auto parsed = Json::Value::parse(QByteArrayLiteral("42.5"), u"id");
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  const auto id = ExternalDeckId::number(parsed->toRawNumber());
+  const auto encoded = id.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("42.5")),
+           qPrintable(encoded.error()));
 }
 
 void DecksTests::externalIdFromRawBytesPreservesLargeIntegerExactly() {
@@ -589,7 +742,10 @@ void DecksTests::sideSlotsAbsentStaysUndefinedNotEmptyMap() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->sideSlots.isUndefined());
-  QVERIFY(!result->toJson().contains(QStringLiteral("sideSlots")));
+  const auto reencodedJson = result->toJson();
+  if (!reencodedJson)
+    QFAIL(qPrintable(reencodedJson.error()));
+  QVERIFY(!reencodedJson->contains(QStringLiteral("sideSlots")));
   const auto reencoded = result->toJsonBytes();
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
@@ -946,6 +1102,60 @@ void DecksTests::deckListInputMissingInvestigatorCodeRejected() {
   QCOMPARE(result.error(),
            QStringLiteral("deckList.investigator_code: missing required field "
                           "\"investigator_code\""));
+}
+
+void DecksTests::deckListInputToJsonRejectsProgrammaticEmptyCardSlotsKey() {
+  // fromJson()/fromRawJson() can never produce an empty cardSlots key --
+  // decodeCardQuantityMapInput rejects it during decode -- but cardSlots
+  // is a public QMap<QString, qint64> field, so a caller
+  // building/mutating a DeckListInput by hand (not through decode) could
+  // otherwise slip one past every existing safeguard. toJson() must
+  // reject it rather than silently emitting a schema-invalid request.
+  DeckListInput input{
+      .cardSlots = {{QString(), 2}},
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+  };
+  const auto encoded = input.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("slots")),
+           qPrintable(encoded.error()));
+
+  // A non-empty key still encodes fine.
+  input.cardSlots = {{QStringLiteral("01001"), 2}};
+  const auto validEncoded = input.toJson();
+  if (!validEncoded)
+    QFAIL(qPrintable(validEncoded.error()));
+  QCOMPARE(validEncoded->value(QStringLiteral("slots"))
+               .toObject()
+               .value(QStringLiteral("01001"))
+               .toInt(),
+           2);
+}
+
+void DecksTests::
+    deckListInputToJsonBytesRejectsProgrammaticEmptyCardSlotsKey() {
+  // toJsonBytes() (and any enclosing request's toJsonBytes(), e.g.
+  // CreateDeckRequest/ChooseDeckRequest, which splice this type's
+  // toRawJson() into a larger AST) must refuse the same invalid state,
+  // not merely toJson().
+  DeckListInput input{
+      .cardSlots = {{QString(), 2}},
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+  };
+  const auto encoded = input.toJsonBytes();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("slots")),
+           qPrintable(encoded.error()));
+
+  const CreateDeckRequest request{
+      .deckId = QStringLiteral("external-1"),
+      .deckName = QStringLiteral("X"),
+      .deckList = input,
+  };
+  const auto requestEncoded = request.toJsonBytes();
+  QVERIFY(!requestEncoded.has_value());
+  QVERIFY2(requestEncoded.error().contains(QStringLiteral("slots")),
+           qPrintable(requestEncoded.error()));
 }
 
 QTEST_APPLESS_MAIN(DecksTests)

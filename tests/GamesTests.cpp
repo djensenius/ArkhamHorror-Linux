@@ -36,6 +36,13 @@ private slots:
   void decodesOverRowFromFixture();
   void decodesFailureRowFromFixture();
   void decodeGameListRoundTripsWholeFixtureByteExact();
+  // Round 3 (raw decoding not end-to-end): decodeGameList/GameListRow
+  // previously had no raw-byte entry point -- proven here through the
+  // real production entry points (decodeGameListFromRawBytes/
+  // GameListRow::fromRawBytes), not merely GameState in isolation.
+  void gameListRowFromRawBytesPreservesUnknownGameStateHugeNestedNumber();
+  void decodeGameListFromRawBytesMatchesQJsonPathOnSameFixture();
+  void decodeGameListFromRawBytesRejectsDuplicateObjectKey();
 
   // GameState forward compatibility ─────────────────────────────────────────
   void unknownGameStateTagPreservedAndRoundTrips();
@@ -45,19 +52,35 @@ private slots:
   void gameStateIsActiveWithContentsRejected();
   void gameStateIsOverWithContentsRejected();
   void gameStateIsActiveWithNullContentsRejected();
+  void gameStateKnownBranchesRejectExtraKey();
   void gameStateRawBytesPreserveAdditiveFieldBesideTagAndContents();
   void gameStateRawBytesPreserveHugeNestedNumericLiteralInUnknownContents();
+  void gameStateToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode();
+  void gameStateToJsonBytesPreservesAdditiveFieldBesideTagAndContentsOnEncode();
 
   // GameListRow success/error ambiguity ──────────────────────────────────────
   void rowWithBareErrorKeyIsFailure();
   void rowCombiningErrorWithAnyOtherKeyIsRejectedNotFailure();
   void rowWithoutErrorKeyAttemptsFullDecode();
+  void gameListRowSuccessToleratesAdditiveTopLevelField();
 
   // game-lifecycle.json fixture entries ──────────────────────────────────────
   void decodesCreateGameFromFixture();
   void decodesCreateGameDefaultsFromFixture();
   void createGameSupports64BitPlayerCount();
   void createGameDefaultsAndNullDefaultsDecodeIdentically();
+  // Round 4 item 6: CreateGameRequest's fields are public (for ergonomic
+  // aggregate construction), so a programmatically-constructed request --
+  // not merely a malformed decode -- with a null (all-zero) deckId must
+  // still be rejected at encode time rather than silently emitting an
+  // invalid wire value.
+  void createGameRequestToJsonRejectsProgrammaticNullDeckId();
+  // Round 3: CreateGameRequest::fromRawBytes() decodes playerCount directly
+  // off the lossless AST, so a mathematically-integral-but-decimal-spelled
+  // literal like "9007199254740993.0" (which Qt's own QJsonDocument parser
+  // stores as a double, silently losing a bit of precision before this
+  // client's code ever sees it) still recovers the exact qint64.
+  void createGameRequestFromRawBytesPreservesPlayerCountBeyondDoublePrecision();
   void decodesChooseDeckFromFixture();
   void decodesContinueWithoutUpgradeFromFixture();
   void decodesClaimSeatFromFixture();
@@ -77,6 +100,8 @@ private slots:
   void campaignOptionRawBytesPreserveAdditiveFieldBesideTagAndContents();
   void
   campaignOptionRawBytesPreserveHugeNestedNumericLiteralInUnknownContents();
+  void
+  campaignOptionToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode();
 
   // campaignId/scenarioId invariant ──────────────────────────────────────────
   void campaignWithStartingScenarioAccepted();
@@ -233,6 +258,59 @@ void GamesTests::decodeGameListRoundTripsWholeFixtureByteExact() {
   QCOMPARE(encodeGameList(*result), rows);
 }
 
+void GamesTests::
+    gameListRowFromRawBytesPreservesUnknownGameStateHugeNestedNumber() {
+  // A whole GameListRow, decoded end-to-end through the canonical
+  // production entry point (not GameState in isolation): an unrecognized
+  // gameState tag's complete raw object, including a numeric literal a
+  // double cannot represent exactly, must survive unchanged.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"id\":\"00000000-0000-0000-0000-000000000099\",\"scenario\":null,"
+      "\"campaign\":null,\"gameState\":{\"tag\":\"IsSuspended\",\"contents\":"
+      "{\"since\":9007199254740993}},\"name\":\"Row\",\"investigators\":[],"
+      "\"otherInvestigators\":[],\"multiplayerVariant\":\"Solo\","
+      "\"hasOpenSeats\":false}");
+  const auto result = GameListRow::fromRawBytes(bytes, u"row");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->kind(), GameListRow::Kind::Success);
+  QVERIFY(result->gameState().has_value());
+  QCOMPARE(result->gameState()->kind(), GameState::Kind::Unknown);
+  QCOMPARE(result->gameState()->unknownTag(), QStringLiteral("IsSuspended"));
+  QCOMPARE(result->gameState()
+               ->unknownContents()
+               .value(QLatin1StringView("since"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("9007199254740993"));
+}
+
+void GamesTests::decodeGameListFromRawBytesMatchesQJsonPathOnSameFixture() {
+  const QByteArray bytes = loadFixtureBytes(QStringLiteral("game-list.json"));
+  const QJsonArray rows = QJsonDocument::fromJson(bytes).array();
+
+  const auto viaQJson = decodeGameList(rows, u"rows");
+  const auto viaRawBytes = decodeGameListFromRawBytes(bytes, u"rows");
+  if (!viaQJson)
+    QFAIL(qPrintable(viaQJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QCOMPARE(viaRawBytes->size(), viaQJson->size());
+  for (qsizetype i = 0; i < viaQJson->size(); ++i)
+    QVERIFY(viaQJson->at(i) == viaRawBytes->at(i));
+}
+
+void GamesTests::decodeGameListFromRawBytesRejectsDuplicateObjectKey() {
+  const QByteArray bytes = QByteArrayLiteral(
+      "[{\"id\":\"00000000-0000-0000-0000-000000000099\","
+      "\"id\":\"00000000-0000-0000-0000-000000000098\",\"scenario\":null,"
+      "\"campaign\":null,\"gameState\":{\"tag\":\"IsPending\",\"contents\":"
+      "[]},\"name\":\"Row\",\"investigators\":[],\"otherInvestigators\":[],"
+      "\"multiplayerVariant\":\"Solo\",\"hasOpenSeats\":false}]");
+  const auto result = decodeGameListFromRawBytes(bytes, u"rows");
+  QVERIFY(!result);
+}
+
 void GamesTests::unknownGameStateTagPreservedAndRoundTrips() {
   const QJsonObject obj{{QStringLiteral("tag"), QStringLiteral("IsSuspended")}};
   const auto result = GameState::fromJson(obj, u"gameState");
@@ -311,6 +389,32 @@ void GamesTests::gameStateIsActiveWithNullContentsRejected() {
   QVERIFY(!result);
 }
 
+void GamesTests::gameStateKnownBranchesRejectExtraKey() {
+  // additionalProperties:false on a known GameState branch's exact
+  // {"tag","contents"}/{"tag"} shape: an extra sibling key is malformed,
+  // not a forward-compat additive field this client should silently
+  // ignore (unlike an *unrecognized tag*, whose additive siblings are
+  // preserved verbatim -- see
+  // gameStateRawBytesPreserveAdditiveFieldBesideTagAndContents above).
+  const QJsonObject pendingExtra{
+      {QStringLiteral("tag"), QStringLiteral("IsPending")},
+      {QStringLiteral("contents"),
+       QJsonArray{QUuid::createUuid().toString(QUuid::WithoutBraces)}},
+      {QStringLiteral("unexpected"), true}};
+  const auto pendingResult = GameState::fromJson(pendingExtra, u"gameState");
+  QVERIFY(!pendingResult.has_value());
+  QVERIFY2(pendingResult.error().contains(QStringLiteral("unexpected")),
+           qPrintable(pendingResult.error()));
+
+  const QJsonObject activeExtra{
+      {QStringLiteral("tag"), QStringLiteral("IsActive")},
+      {QStringLiteral("extra"), 1}};
+  const auto activeResult = GameState::fromJson(activeExtra, u"gameState");
+  QVERIFY(!activeResult.has_value());
+  QVERIFY2(activeResult.error().contains(QStringLiteral("extra")),
+           qPrintable(activeResult.error()));
+}
+
 void GamesTests::gameStateRawBytesPreserveAdditiveFieldBesideTagAndContents() {
   // A future backend release may add a sibling key alongside "tag"/
   // "contents" on an unrecognized GameState tag (e.g. a "since" timestamp
@@ -376,6 +480,61 @@ void GamesTests::
            QStringLiteral("9007199254740993"));
 }
 
+void GamesTests::
+    gameStateToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode() {
+  // Unlike the toJson()-mediated round trip above (which can only carry an
+  // exact-int64 literal like 9007199254740993 forward, not a huge-exponent
+  // literal like 1e300, since QJsonValue's storage is int64-or-double),
+  // toJsonBytes() is the canonical lossless encoder: both survive.
+  const QByteArray bytes =
+      QByteArrayLiteral("{\"tag\":\"IsSuspended\",\"contents\":{\"nested\":"
+                        "[9007199254740993,1e300]}}");
+  const auto decoded = GameState::fromRawBytes(bytes, u"gameState");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+
+  const auto encoded = decoded->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+
+  const auto reparsed = GameState::fromRawBytes(*encoded, u"gameState");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  const Json::Value nested =
+      reparsed->unknownContents().value(QLatin1StringView("nested"));
+  QVERIFY(nested.isArray());
+  QCOMPARE(nested.toArray().at(0).toRawNumber().literal(),
+           QStringLiteral("9007199254740993"));
+  QCOMPARE(nested.toArray().at(1).toRawNumber().literal(),
+           QStringLiteral("1e300"));
+}
+
+void GamesTests::
+    gameStateToJsonBytesPreservesAdditiveFieldBesideTagAndContentsOnEncode() {
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"tag\":\"IsSuspended\",\"contents\":{\"reason\":\"maintenance\"},"
+      "\"since\":123456}");
+  const auto decoded = GameState::fromRawBytes(bytes, u"gameState");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+
+  const auto encoded = decoded->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+
+  const auto reparsed = GameState::fromRawBytes(*encoded, u"gameState");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QCOMPARE(reparsed->unknownRaw()
+               .value(QLatin1StringView("since"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("123456"));
+  QCOMPARE(
+      reparsed->unknownContents().value(QLatin1StringView("reason")).toString(),
+      QStringLiteral("maintenance"));
+}
+
 void GamesTests::rowWithBareErrorKeyIsFailure() {
   const QJsonObject obj{{QStringLiteral("error"), QStringLiteral("boom")}};
   const auto result = GameListRow::fromJson(obj, u"row");
@@ -407,6 +566,25 @@ void GamesTests::rowWithoutErrorKeyAttemptsFullDecode() {
   // mistaken for a Failure row.
   QVERIFY2(result.error().contains(QStringLiteral("id")),
            qPrintable(result.error()));
+}
+
+void GamesTests::gameListRowSuccessToleratesAdditiveTopLevelField() {
+  // Round-8 item 7 clarifies: unlike a tagged union's fixed 1-2 key
+  // branch shape (see gameStateKnownBranchesRejectExtraKey /
+  // extraKeyOnKnown*BranchRejected in CardCatalogTests), a named-field
+  // response summary object like a successful GameListRow legitimately
+  // gains new fields over time and must keep ignoring them per this
+  // client's documented forward-compatibility read policy -- it must NOT
+  // be made to reject an extra key the way a tagged branch does.
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  QJsonObject withExtra = rows.at(0).toObject();
+  withExtra.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
+  const auto result = GameListRow::fromJson(withExtra, u"row");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->kind(), GameListRow::Kind::Success);
+  QCOMPARE(result->id()->value(),
+           QStringLiteral("00000000-0000-0000-0000-000000000003"));
 }
 
 void GamesTests::decodesCreateGameFromFixture() {
@@ -446,8 +624,10 @@ void GamesTests::decodesCreateGameFromFixture() {
 
   // Fixture carries an additive "unknownField" this client does not model;
   // re-encoding correctly drops it.
-  QCOMPARE(result->toJson(),
-           withoutKey(createGame.toObject(), "unknownField"_L1));
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, withoutKey(createGame.toObject(), "unknownField"_L1));
 }
 
 void GamesTests::decodesCreateGameDefaultsFromFixture() {
@@ -474,7 +654,10 @@ void GamesTests::decodesCreateGameDefaultsFromFixture() {
   // strictAsIfAt/asIfRuling are omitted (not merely null) on re-encode, but
   // ultimatumsAndBoons/achievementsEnabled are always emitted (already
   // resolved to their default) even though the fixture itself omits them.
-  const QJsonObject reencoded = result->toJson();
+  const auto reencodedResult = result->toJson();
+  if (!reencodedResult)
+    QFAIL(qPrintable(reencodedResult.error()));
+  const QJsonObject reencoded = *reencodedResult;
   QVERIFY(!reencoded.contains(QStringLiteral("strictAsIfAt")));
   QVERIFY(!reencoded.contains(QStringLiteral("asIfRuling")));
   QJsonObject expected = v.toObject();
@@ -502,8 +685,45 @@ void GamesTests::createGameSupports64BitPlayerCount() {
     QFAIL(qPrintable(result.error()));
 
   QCOMPARE(result->playerCount, largePlayerCount);
-  QCOMPARE(result->toJson().value(QStringLiteral("playerCount")).toInteger(),
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->value(QStringLiteral("playerCount")).toInteger(),
            largePlayerCount);
+}
+
+void GamesTests::
+    createGameRequestFromRawBytesPreservesPlayerCountBeyondDoublePrecision() {
+  // "9007199254740993.0" is mathematically integral (RawNumber::
+  // toExactInt64() accepts a trailing ".0" fraction), but its literal
+  // spelling includes a decimal point, so Qt's own QJsonDocument parser
+  // stores it as a double -- rounding to 9007199254740992 before this
+  // client's code ever sees a QJsonValue. The canonical raw-byte path
+  // parses the digits directly and is unaffected.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"deckIds\":[],\"playerCount\":9007199254740993.0,"
+      "\"campaignId\":null,\"scenarioId\":\"01104\",\"difficulty\":\"Easy\","
+      "\"campaignName\":\"X\",\"multiplayerVariant\":\"Solo\","
+      "\"includeTarotReadings\":false,\"options\":[]}");
+
+  const auto viaRawBytes = CreateGameRequest::fromRawBytes(bytes, u"request");
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QCOMPARE(viaRawBytes->playerCount, qint64{9007199254740993LL});
+
+  // Documents (rather than merely asserts) the legacy QJsonValue-mediated
+  // convenience path's inherent limitation: by the time Qt's own parser
+  // has produced a QJsonValue for this literal, the original digits are
+  // already gone, so this path is not suitable for wire-exact numeric
+  // decoding -- only fromRawBytes()/fromRawJson() (which never touch
+  // QJsonDocument) are canonical for that purpose.
+  const QJsonObject viaQJsonDocument = QJsonDocument::fromJson(bytes).object();
+  const auto viaLegacyPath =
+      CreateGameRequest::fromJson(viaQJsonDocument, u"request");
+  if (!viaLegacyPath)
+    QFAIL(qPrintable(viaLegacyPath.error()));
+  QVERIFY(viaLegacyPath->playerCount != viaRawBytes->playerCount);
+  QCOMPARE(viaLegacyPath->playerCount, qint64{9007199254740992LL});
 }
 
 void GamesTests::createGameDefaultsAndNullDefaultsDecodeIdentically() {
@@ -524,9 +744,49 @@ void GamesTests::createGameDefaultsAndNullDefaultsDecodeIdentically() {
 
   // Re-encoding the explicit-null fixture also omits the keys (there is
   // nothing left to distinguish once decoded).
-  const QJsonObject reencoded = nullDefaults->toJson();
+  const auto reencodedResult = nullDefaults->toJson();
+  if (!reencodedResult)
+    QFAIL(qPrintable(reencodedResult.error()));
+  const QJsonObject reencoded = *reencodedResult;
   QVERIFY(!reencoded.contains(QStringLiteral("strictAsIfAt")));
   QVERIFY(!reencoded.contains(QStringLiteral("asIfRuling")));
+}
+
+void GamesTests::createGameRequestToJsonRejectsProgrammaticNullDeckId() {
+  // fromJson()/fromRawJson() can never produce a null (all-zero) deckId --
+  // Json::decodeUuid rejects it during decode -- but deckIds is a public
+  // QList<std::optional<QUuid>> field, so a caller building/mutating a
+  // CreateGameRequest by hand (not through decode) could otherwise slip
+  // one past every existing safeguard. toJson() must reject it rather than
+  // silently emitting "00000000-0000-0000-0000-000000000000".
+  CreateGameRequest request{
+      .deckIds = {QUuid()},
+      .playerCount = 1,
+      .campaignOrScenario =
+          CampaignOrScenario::scenario(*ScenarioId::parse(u"01104"_s)),
+      .difficulty = Difficulty::Easy,
+      .campaignName = QStringLiteral("X"),
+      .multiplayerVariant = MultiplayerVariant::Solo,
+      .includeTarotReadings = false,
+  };
+  const auto encoded = request.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("deckIds")),
+           qPrintable(encoded.error()));
+
+  // A non-null deckId (and an absent/std::nullopt one) still encode fine.
+  request.deckIds = {
+      std::nullopt,
+      QUuid(QStringLiteral("00000000-0000-0000-0000-000000000017"))};
+  const auto validEncoded = request.toJson();
+  if (!validEncoded)
+    QFAIL(qPrintable(validEncoded.error()));
+  const QJsonArray deckIdsArr =
+      validEncoded->value(QStringLiteral("deckIds")).toArray();
+  QCOMPARE(deckIdsArr.size(), 2);
+  QVERIFY(deckIdsArr.at(0).isNull());
+  QCOMPARE(deckIdsArr.at(1).toString(),
+           QStringLiteral("00000000-0000-0000-0000-000000000017"));
 }
 
 void GamesTests::decodesChooseDeckFromFixture() {
@@ -550,7 +810,10 @@ void GamesTests::decodesChooseDeckFromFixture() {
   QJsonObject expectedDeckList =
       withoutKey(expected.value("deckList"_L1).toObject(), "taboo_id"_L1);
   expected.insert(QStringLiteral("deckList"), expectedDeckList);
-  QCOMPARE(result->toJson(), expected);
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, expected);
 }
 
 void GamesTests::decodesContinueWithoutUpgradeFromFixture() {
@@ -562,7 +825,10 @@ void GamesTests::decodesContinueWithoutUpgradeFromFixture() {
   QCOMPARE(result->investigatorId.value(), QStringLiteral("c01001"));
   QVERIFY(!result->deckUrl.has_value());
   QVERIFY(!result->deckList.has_value());
-  QCOMPARE(result->toJson(), v.toObject());
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, v.toObject());
 }
 
 void GamesTests::decodesClaimSeatFromFixture() {
@@ -759,6 +1025,37 @@ void GamesTests::
   QVERIFY(!asRequest);
 }
 
+void GamesTests::
+    campaignOptionToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode() {
+  // toJsonBytes() is the canonical lossless encoder (unlike the
+  // QJsonObject-typed toJson()), so a huge-exponent literal alongside an
+  // exact-int64 literal both survive an encode-then-decode round trip.
+  const QByteArray bytes =
+      QByteArrayLiteral("{\"tag\":\"FutureOption\",\"contents\":{\"limit\":"
+                        "9007199254740993,\"scale\":1e300}}");
+  const auto decoded = CampaignOption::fromRawBytes(bytes, u"option");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+
+  const auto encoded = decoded->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+
+  const auto reparsed = CampaignOption::fromRawBytes(*encoded, u"option");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QCOMPARE(reparsed->unknownContents()
+               .value(QLatin1StringView("limit"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("9007199254740993"));
+  QCOMPARE(reparsed->unknownContents()
+               .value(QLatin1StringView("scale"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("1e300"));
+}
+
 void GamesTests::campaignWithStartingScenarioAccepted() {
   // The backend dispatches on campaignId alone: `newCampaign cid
   // scenarioId ...` runs whether or not scenarioId is also set, so a
@@ -849,7 +1146,10 @@ void GamesTests::strictAsIfAtOmittedWhenUnset() {
       fixture.value("createGameDefaults"_L1), u"createGameDefaults");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QVERIFY(!result->toJson().contains(QStringLiteral("strictAsIfAt")));
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY(!encoded->contains(QStringLiteral("strictAsIfAt")));
 }
 
 void GamesTests::asIfRulingOmittedWhenUnset() {
@@ -858,7 +1158,10 @@ void GamesTests::asIfRulingOmittedWhenUnset() {
       fixture.value("createGameDefaults"_L1), u"createGameDefaults");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QVERIFY(!result->toJson().contains(QStringLiteral("asIfRuling")));
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY(!encoded->contains(QStringLiteral("asIfRuling")));
 }
 
 void GamesTests::asIfRulingLegacySpellingDecodesToCanonicalValue() {
@@ -895,15 +1198,20 @@ void GamesTests::asIfRulingLegacySpellingDecodesToCanonicalValue() {
   QVERIFY(*legacyResult == *shortResult);
   // Re-encode always uses the canonical short form, even when decoded from
   // the legacy spelling.
-  QCOMPARE(
-      legacyResult->toJson().value(QStringLiteral("asIfRuling")).toString(),
-      QStringLiteral("chapter1"));
+  const auto legacyEncoded = legacyResult->toJson();
+  if (!legacyEncoded)
+    QFAIL(qPrintable(legacyEncoded.error()));
+  QCOMPARE(legacyEncoded->value(QStringLiteral("asIfRuling")).toString(),
+           QStringLiteral("chapter1"));
 
   const auto legacy2 = CreateGameRequest::fromJson(
       buildRequest(QStringLiteral("Chapter2AsIfRuling")), u"request");
   if (!legacy2)
     QFAIL(qPrintable(legacy2.error()));
-  QCOMPARE(legacy2->toJson().value(QStringLiteral("asIfRuling")).toString(),
+  const auto legacy2Encoded = legacy2->toJson();
+  if (!legacy2Encoded)
+    QFAIL(qPrintable(legacy2Encoded.error()));
+  QCOMPARE(legacy2Encoded->value(QStringLiteral("asIfRuling")).toString(),
            QStringLiteral("chapter2"));
 }
 
@@ -993,7 +1301,10 @@ void GamesTests::chooseDeckUrlAbsentAndExplicitNullResolveIdentically() {
     QFAIL(qPrintable(nullResult.error()));
   QCOMPARE(absentResult->deckUrl, nullResult->deckUrl);
   QVERIFY(!absentResult->deckUrl.has_value());
-  QVERIFY(!absentResult->toJson().contains(QStringLiteral("deckUrl")));
+  const auto reencoded = absentResult->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->contains(QStringLiteral("deckUrl")));
 }
 
 void GamesTests::deckListInputTabooIdAbsentAndExplicitNullResolveIdentically() {
@@ -1016,7 +1327,10 @@ void GamesTests::deckListInputTabooIdAbsentAndExplicitNullResolveIdentically() {
     QFAIL(qPrintable(nullResult.error()));
   QCOMPARE(absentResult->tabooId, nullResult->tabooId);
   QVERIFY(!absentResult->tabooId.has_value());
-  QVERIFY(!absentResult->toJson().contains(QStringLiteral("taboo_id")));
+  const auto reencoded = absentResult->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->contains(QStringLiteral("taboo_id")));
 }
 
 void GamesTests::malformedUuidInDeckIdsRejected() {
@@ -1132,7 +1446,10 @@ void GamesTests::additiveUnknownFieldsIgnoredInChooseDeck() {
   const auto result = ChooseDeckRequest::fromJson(obj, u"chooseDeck");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QVERIFY(!result->toJson().contains(QStringLiteral("aFutureField")));
+  const auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->contains(QStringLiteral("aFutureField")));
 }
 
 void GamesTests::additiveUnknownFieldsIgnoredInClaimSeat() {
@@ -1152,7 +1469,10 @@ void GamesTests::chooseDeckWithDeckListRoundTrips() {
   const auto result = ChooseDeckRequest::fromJson(v, u"chooseDeck");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const QJsonObject reencoded = result->toJson();
+  const auto reencodedResult = result->toJson();
+  if (!reencodedResult)
+    QFAIL(qPrintable(reencodedResult.error()));
+  const QJsonObject reencoded = *reencodedResult;
   QVERIFY(reencoded.contains(QStringLiteral("deckList")));
   QVERIFY(reencoded.contains(QStringLiteral("deckUrl")));
 }

@@ -45,9 +45,10 @@ private slots:
   void acceptsEmptyArrayAndObject();
   void objectAccessorsFindPresentKeysAndMissAbsentOnes();
   // Review round 5 (RawJson.cpp:476 HIGH finding): contains()/value() must
-  // remain correct once backed by an index rather than a linear scan,
-  // including for a member count near ParseLimits::production()'s
-  // maxObjectMembers default and for the (invalid, but constructible via
+  // remain correct once backed by an index rather than a linear scan, at
+  // a large member count built via the unbounded makeObject() constructor
+  // (not Value::parse(), so ParseLimits::production()'s maxObjectMembers
+  // does not apply here), and for the (invalid, but constructible via
   // makeObject()) transient duplicate-key case toJsonBytes() rejects.
   void objectAccessorLookupIsCorrectAcrossManyMembers();
   void makeObjectDuplicateKeyResolvesToFirstOccurrence();
@@ -60,6 +61,14 @@ private slots:
   void toExactInt64AcceptsIntegralDecimalAndExponentForms();
   void toExactInt64RejectsGenuinelyFractionalValues();
   void toExactInt64HandlesQint64BoundariesExactly();
+  // Review round 7, item 1: a nonzero coefficient with an exponent near
+  // qint64's own extremes must not signed-overflow the internal
+  // decimal-point-position addition (undefined behavior otherwise); a
+  // zero coefficient must short-circuit to exact 0 before that addition
+  // even runs, since 0 * 10^e == 0 regardless of how huge (but validly
+  // parseable) e is.
+  void toExactInt64RejectsNonzeroCoefficientWithHugeExponentWithoutOverflow();
+  void toExactInt64ZeroCoefficientWithHugeExponentIsExactZero();
   void fromInt64RoundTripsFullRange();
   void toQJsonPreservesInt64ExactlyBeyondDoublePrecision();
   void fromQJsonConvertsQJsonTreeRecursively();
@@ -89,6 +98,14 @@ private slots:
   void parseLimitsRejectsObjectExceedingMaxObjectMembers();
   void parseLimitsRejectsTotalNodesExceedingMaxTotalNodes();
   void toJsonBytesRejectsDepthExceedingLimitOnProgrammaticAst();
+  // Round 5 item 9: production()'s own (now-lowered) defaults must be
+  // exercised directly -- not merely a tiny custom ParseLimits -- at
+  // realistic worst-case "dense scalars"/"wide object" scale, proving the
+  // new bounds are both large enough for this client's real catalog
+  // workload and actually enforced at that scale (not merely on paper).
+  void productionLimitsAcceptDenseArrayAtBoundaryAndRejectOneOver();
+  void productionLimitsAcceptWideObjectAtBoundaryAndRejectOneOver();
+  void productionLimitsAcceptTotalNodesAtBoundaryAndRejectOneOver();
 
   // toJsonBytes() must bound every ParseLimits field symmetrically with
   // parse() (except maxInputBytes, which has no meaning for an
@@ -103,6 +120,17 @@ private slots:
   void toJsonBytesRejectsObjectExceedingMaxObjectMembers();
   void toJsonBytesRejectsTotalNodesExceedingMaxTotalNodes();
   void toJsonBytesAcceptsValuesExactlyAtEveryLimitBoundary();
+  // Round 7 item 5: a lone (unpaired) UTF-16 surrogate in a
+  // programmatically-built string value or object key cannot be encoded
+  // as valid UTF-8, so serialization must fail with a typed error rather
+  // than emit an invalid byte sequence; a valid surrogate pair must still
+  // encode successfully, including when nested inside an aggregate.
+  void toJsonBytesRejectsLoneHighSurrogateInStringValue();
+  void toJsonBytesRejectsLoneLowSurrogateInStringValue();
+  void toJsonBytesRejectsLoneSurrogateInObjectKey();
+  void toJsonBytesRejectsLoneSurrogateNestedInsideArray();
+  void toJsonBytesAcceptsValidSurrogatePairInStringAndKey();
+  void parseAcceptsEverySerializerSuccess();
 };
 
 namespace {
@@ -321,13 +349,14 @@ void RawJsonTests::objectAccessorsFindPresentKeysAndMissAbsentOnes() {
 }
 
 void RawJsonTests::objectAccessorLookupIsCorrectAcrossManyMembers() {
-  // Exercises a member count close to ParseLimits::production()'s
-  // maxObjectMembers default (100k) so an index-backed contains()/value()
-  // is proven correct (not merely fast) at realistic worst-case size:
-  // every key must resolve to its own distinct value, the last-inserted
-  // key must be found exactly like the first, and an absent key must
-  // still correctly report "not found" rather than colliding with a
-  // present one.
+  // Exercises a member count well beyond ParseLimits::production()'s
+  // maxObjectMembers default (built via the unbounded makeObject()
+  // constructor, not Value::parse(), so that default does not apply) so
+  // an index-backed contains()/value() is proven correct (not merely
+  // fast) at a realistic worst-case size: every key must resolve to its
+  // own distinct value, the last-inserted key must be found exactly like
+  // the first, and an absent key must still correctly report "not found"
+  // rather than colliding with a present one.
   constexpr qsizetype kMemberCount = 50'000;
   QList<std::pair<QString, Value>> members;
   members.reserve(kMemberCount);
@@ -426,6 +455,55 @@ void RawJsonTests::toExactInt64HandlesQint64BoundariesExactly() {
                .toRawNumber()
                .toExactInt64()
                .has_value());
+}
+
+void RawJsonTests::
+    toExactInt64RejectsNonzeroCoefficientWithHugeExponentWithoutOverflow() {
+  // "1e9223372036854775807": exponent digit text itself parses to exactly
+  // qint64's max magnitude, so intDigits.size() (1) + exponent would
+  // overflow qint64 by exactly 1 if computed with plain (unchecked)
+  // addition -- undefined behavior that ASan/UBSan must not flag here,
+  // since the checked-addition fix must reject this as out-of-range
+  // instead of computing it.
+  QVERIFY(!mustParse("1e9223372036854775807")
+               .toRawNumber()
+               .toExactInt64()
+               .has_value());
+  QVERIFY(!mustParse("-1e9223372036854775807")
+               .toRawNumber()
+               .toExactInt64()
+               .has_value());
+  // A multi-digit coefficient pushes the addition even further past
+  // qint64::max, still must not overflow/crash, must reject cleanly.
+  QVERIFY(!mustParse("123456789e9223372036854775807")
+               .toRawNumber()
+               .toExactInt64()
+               .has_value());
+  // Huge *negative* exponent with a nonzero coefficient: every digit
+  // becomes fractional (magnitude < 1), a legitimate (non-overflow)
+  // rejection path, but must still not overflow computing the
+  // decimal-point position itself.
+  QVERIFY(!mustParse("1e-9223372036854775807")
+               .toRawNumber()
+               .toExactInt64()
+               .has_value());
+}
+
+void RawJsonTests::toExactInt64ZeroCoefficientWithHugeExponentIsExactZero() {
+  // 0 * 10^e == 0 for any (validly parseable) exponent, however huge --
+  // must short-circuit to exact 0 rather than attempting (and having to
+  // reject) the decimal-point-position arithmetic the nonzero-coefficient
+  // path above needs.
+  QCOMPARE(*mustParse("0e9223372036854775807").toRawNumber().toExactInt64(),
+           0LL);
+  QCOMPARE(*mustParse("-0e9223372036854775807").toRawNumber().toExactInt64(),
+           0LL);
+  QCOMPARE(*mustParse("0e-9223372036854775807").toRawNumber().toExactInt64(),
+           0LL);
+  // A zero coefficient spelled with a fractional part, still exactly
+  // zero.
+  QCOMPARE(*mustParse("0.000e9223372036854775807").toRawNumber().toExactInt64(),
+           0LL);
 }
 
 void RawJsonTests::fromInt64RoundTripsFullRange() {
@@ -679,6 +757,107 @@ void RawJsonTests::parseLimitsRejectsTotalNodesExceedingMaxTotalNodes() {
   QVERIFY(!Value::parse("[1,2,3]", u"test", limits).has_value());
 }
 
+void RawJsonTests::
+    productionLimitsAcceptDenseArrayAtBoundaryAndRejectOneOver() {
+  // "Dense scalars": a single flat array of small numbers at production's
+  // actual maxArrayElements boundary (20,000 -- see ParseLimits::
+  // production()'s doc comment: ~3.4x headroom over the full pinned card
+  // catalog's measured ~5,929-element top-level array).
+  const ParseLimits limits = ParseLimits::production();
+  auto buildFlatArray = [](qsizetype count) {
+    QByteArray bytes = "[";
+    for (qsizetype i = 0; i < count; ++i) {
+      if (i > 0)
+        bytes += ",";
+      bytes += "0";
+    }
+    bytes += "]";
+    return bytes;
+  };
+  const QByteArray atLimit = buildFlatArray(limits.maxArrayElements);
+  const auto atLimitResult = Value::parse(atLimit, u"test", limits);
+  if (!atLimitResult)
+    QFAIL(qPrintable(atLimitResult.error()));
+  QCOMPARE(atLimitResult->toArray().size(), limits.maxArrayElements);
+
+  const QByteArray overLimit = buildFlatArray(limits.maxArrayElements + 1);
+  QVERIFY(!Value::parse(overLimit, u"test", limits).has_value());
+}
+
+void RawJsonTests::
+    productionLimitsAcceptWideObjectAtBoundaryAndRejectOneOver() {
+  // "Wide objects": a single object at production's actual
+  // maxObjectMembers boundary (1,024 -- ~14x headroom over the full
+  // pinned card catalog's measured largest single object of 70 members).
+  const ParseLimits limits = ParseLimits::production();
+  auto buildWideObject = [](qsizetype count) {
+    QByteArray bytes = "{";
+    for (qsizetype i = 0; i < count; ++i) {
+      if (i > 0)
+        bytes += ",";
+      bytes += "\"k" + QByteArray::number(i) + "\":0";
+    }
+    bytes += "}";
+    return bytes;
+  };
+  const QByteArray atLimit = buildWideObject(limits.maxObjectMembers);
+  const auto atLimitResult = Value::parse(atLimit, u"test", limits);
+  if (!atLimitResult)
+    QFAIL(qPrintable(atLimitResult.error()));
+  QCOMPARE(atLimitResult->keys().size(), limits.maxObjectMembers);
+
+  const QByteArray overLimit = buildWideObject(limits.maxObjectMembers + 1);
+  QVERIFY(!Value::parse(overLimit, u"test", limits).has_value());
+}
+
+void RawJsonTests::
+    productionLimitsAcceptTotalNodesAtBoundaryAndRejectOneOver() {
+  // maxTotalNodes (400,000) is production()'s dominant memory bound (see
+  // its doc comment: sizeof(Value) == 176 bytes, so this caps worst-case
+  // `Value` storage at ~70MB, ~1.75x headroom over the full pinned card
+  // catalog's measured ~228,000 nodes). Every individual array here stays
+  // well under maxArrayElements (20,000) -- 453 outer elements, 882 inner
+  // elements each -- so only maxTotalNodes is exercised: 1 (outer array)
+  // + 453 (inner array nodes) + 453*882 (leaf number nodes) == 400,000
+  // exactly.
+  const ParseLimits limits = ParseLimits::production();
+  constexpr qsizetype kOuterCount = 453;
+  constexpr qsizetype kInnerCount = 882;
+  QVERIFY(1 + kOuterCount + kOuterCount * kInnerCount == limits.maxTotalNodes);
+
+  auto buildNested = [](qsizetype outerCount, qsizetype innerCount,
+                        qsizetype extraElementsOnLastInner) {
+    QByteArray bytes = "[";
+    for (qsizetype o = 0; o < outerCount; ++o) {
+      if (o > 0)
+        bytes += ",";
+      const qsizetype thisInnerCount =
+          (o == outerCount - 1) ? innerCount + extraElementsOnLastInner
+                                : innerCount;
+      bytes += "[";
+      for (qsizetype i = 0; i < thisInnerCount; ++i) {
+        if (i > 0)
+          bytes += ",";
+        bytes += "0";
+      }
+      bytes += "]";
+    }
+    bytes += "]";
+    return bytes;
+  };
+
+  const QByteArray atLimit = buildNested(kOuterCount, kInnerCount, 0);
+  const auto atLimitResult = Value::parse(atLimit, u"test", limits);
+  if (!atLimitResult)
+    QFAIL(qPrintable(atLimitResult.error()));
+
+  // Exactly one additional leaf node, appended only to the last inner
+  // array, pushes the total to precisely maxTotalNodes + 1 -- proving the
+  // off-by-one boundary exactly, not merely "some over-limit input fails".
+  const QByteArray overLimit = buildNested(kOuterCount, kInnerCount, 1);
+  QVERIFY(!Value::parse(overLimit, u"test", limits).has_value());
+}
+
 void RawJsonTests::toJsonBytesRejectsDepthExceedingLimitOnProgrammaticAst() {
   ParseLimits limits;
   limits.maxDepth = 1;
@@ -787,6 +966,90 @@ void RawJsonTests::toJsonBytesAcceptsValuesExactlyAtEveryLimitBoundary() {
   auto reparsed = Value::parse(*bytes, u"test");
   QVERIFY(reparsed.has_value());
   QCOMPARE(*reparsed, obj);
+}
+
+void RawJsonTests::toJsonBytesRejectsLoneHighSurrogateInStringValue() {
+  // U+D800 is a high surrogate with no following low surrogate: naively
+  // UTF-8-"encoding" it (as CESU-8-style code does) produces a byte
+  // sequence RFC 3629/RFC 8259 both forbid. toJsonBytes() must fail with
+  // a typed error rather than emit it.
+  QString lone;
+  lone += QChar(0xD800);
+  const Value value = Value::makeString(lone);
+  const auto result = value.toJsonBytes();
+  QVERIFY(!result.has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsLoneLowSurrogateInStringValue() {
+  QString lone;
+  lone += QChar(0xDC00);
+  const Value value = Value::makeString(lone);
+  const auto result = value.toJsonBytes();
+  QVERIFY(!result.has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsLoneSurrogateInObjectKey() {
+  QString lone;
+  lone += QChar(0xD800);
+  QList<std::pair<QString, Value>> members{{lone, Value::makeNull()}};
+  const Value obj = Value::makeObject(members);
+  const auto result = obj.toJsonBytes();
+  QVERIFY(!result.has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsLoneSurrogateNestedInsideArray() {
+  // The lone surrogate must be caught no matter how deeply it is nested,
+  // not only when it is the top-level value.
+  QString lone;
+  lone += QChar(0xDC00);
+  const Value nested = Value::makeArray(
+      {Value::makeObject({{QStringLiteral("deep"), Value::makeString(lone)}})});
+  const auto result = nested.toJsonBytes();
+  QVERIFY(!result.has_value());
+}
+
+void RawJsonTests::toJsonBytesAcceptsValidSurrogatePairInStringAndKey() {
+  // A genuine astral-plane character (U+1F600, a valid high+low surrogate
+  // pair) must still encode successfully and round-trip byte-exact,
+  // proving the lone-surrogate check above does not over-reject valid
+  // input.
+  QString astral;
+  astral += QChar::highSurrogate(0x1F600);
+  astral += QChar::lowSurrogate(0x1F600);
+  QList<std::pair<QString, Value>> members{{astral, Value::makeString(astral)}};
+  const Value obj = Value::makeObject(members);
+  auto bytes = obj.toJsonBytes();
+  QVERIFY(bytes.has_value());
+  auto reparsed = Value::parse(*bytes, u"test");
+  QVERIFY(reparsed.has_value());
+  QCOMPARE(*reparsed, obj);
+}
+
+void RawJsonTests::parseAcceptsEverySerializerSuccess() {
+  // Every value toJsonBytes() successfully serializes must be accepted by
+  // parse() and reproduce an identical tree -- proving the serializer and
+  // parser agree on what counts as valid JSON, not merely that each
+  // rejects its own known-bad inputs in isolation.
+  const QList<Value> values{
+      Value::makeNull(),
+      Value::makeBool(true),
+      Value::makeBool(false),
+      Value::makeNumber(RawNumber::fromInt64(-9223372036854775807LL - 1)),
+      Value::makeNumber(RawNumber::fromInt64(9223372036854775807LL)),
+      Value::makeString(QStringLiteral("plain")),
+      Value::makeString(QStringLiteral("a\"b\\c\n\t\x01")),
+      Value::makeArray({Value::makeNull(), Value::makeBool(false)}),
+      Value::makeObject(
+          {{QStringLiteral("k"), Value::makeString(QStringLiteral("v"))}}),
+  };
+  for (const auto &value : values) {
+    auto bytes = value.toJsonBytes();
+    QVERIFY(bytes.has_value());
+    auto reparsed = Value::parse(*bytes, u"test");
+    if (!reparsed)
+      QFAIL(qPrintable(reparsed.error()));
+    QCOMPARE(*reparsed, value);
+  }
 }
 
 QTEST_APPLESS_MAIN(RawJsonTests)

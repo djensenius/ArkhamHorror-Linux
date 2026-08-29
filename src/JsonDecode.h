@@ -340,6 +340,39 @@ objectMembers(const Json::Value &obj);
 [[nodiscard]] ValueOrError<Json::Value> toLosslessRaw(const QJsonValue &v);
 [[nodiscard]] ValueOrError<Json::Value> toLosslessRaw(const Json::Value &v);
 
+// Fails if `obj` carries any key other than those listed in `allowed`.
+// For a schema branch whose additionalProperties is false -- specifically
+// a known tagged union's exact "tag"/"contents" shape (SkillIcon/CardCost/
+// GameValue/GameState's known branches) -- this rejects an unexpected
+// extra key rather than silently accepting it and then re-emitting only
+// the keys this client models, dropping the rest. Deliberately NOT used
+// for this client's forward-compatible, additive-field-tolerant response
+// objects (e.g. CardDef, GameListRow's success shape): those intentionally
+// ignore unknown keys per this client's documented read policy -- adding
+// exact-key enforcement there would silently reject a wire response this
+// policy says must still decode. Generic over Obj (QJsonObject or
+// Json::Value, see RawJson.h) via objectMembers() above.
+template <typename Obj>
+[[nodiscard]] ValueOrError<bool>
+requireExactKeys(const Obj &obj,
+                 std::initializer_list<QLatin1StringView> allowed,
+                 QStringView path) {
+  for (const auto &member : objectMembers(obj)) {
+    const QString &key = member.first;
+    bool isKnown = false;
+    for (const auto &candidate : allowed) {
+      if (key == candidate) {
+        isKnown = true;
+        break;
+      }
+    }
+    if (!isKnown)
+      return failure(
+          QStringLiteral("%1: unexpected field \"%2\"").arg(path, key));
+  }
+  return true;
+}
+
 // Decodes a closed enum from a JSON string against an explicit
 // wire-name/value table. Unlike this codebase's open wire-string wrappers
 // (ContractRevision-adjacent "forward compatible" types), an unrecognized
