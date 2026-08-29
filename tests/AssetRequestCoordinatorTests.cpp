@@ -2875,6 +2875,99 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
+    soleConsumerCancellationPrunesIssuanceStateUnderHighCardinality() {
+  // Round-6 item 7 ("sole-consumer cancellation erases op/aborts but
+  // never prunes issuance state, causing unbounded
+  // m_cacheKeyIssuedGeneration for unique requests"). Previously
+  // pruneStaleCacheKeyState() was only ever called from
+  // completeOperation() -- the last-consumer branch of cancel() erased
+  // the Operation from m_operations directly and returned, never
+  // pruning. A network-bound candidate mints its
+  // m_cacheKeyIssuedGeneration entry as soon as it is ISSUED (see
+  // startCandidate()/issueCacheKeyGeneration()'s comment), strictly
+  // before any response arrives -- so a caller that starts a request
+  // and cancels it (as the sole consumer) before it ever completes,
+  // repeated across many DISTINCT cache keys (e.g. a user rapidly
+  // scrolling past many different card arts, each request cancelled the
+  // instant it scrolls off-screen), previously grew
+  // m_cacheKeyIssuedGeneration/m_cacheKeyGeneration without bound for
+  // the coordinator's entire process lifetime, since none of these
+  // cancelled candidates ever reaches completeOperation() at all.
+  //
+  // This drives many distinct, slow-drip candidates, cancelling each as
+  // the sole consumer immediately after confirming its fetch has
+  // actually started (so cancellation genuinely races a real in-flight
+  // operation, not one that never began), and asserts
+  // cacheKeyGenerationStateCountForTesting() never grows past a small
+  // bound -- proving the fix actually prunes on the cancellation path,
+  // not merely on completion.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  response.slowDrip = true;
+  response.chunkSize = 8;
+  response.chunkDelayMs = 200;
+
+  constexpr int kCandidateCount = 25;
+  for (int i = 0; i < kCandidateCount; ++i) {
+    server.setResponse(QStringLiteral("/img/arkham/sets/icon%1.png").arg(i),
+                       response);
+  }
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  for (int i = 0; i < kCandidateCount; ++i) {
+    const QString path = QStringLiteral("/img/arkham/sets/icon%1.png").arg(i);
+    const AssetKey key =
+        makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                QStringLiteral("icon%1").arg(i));
+    std::optional<Result> result;
+    const auto handle =
+        coordinator.request(key, [&](Result r) { result = std::move(r); });
+
+    // Confirm the underlying fetch has genuinely started streaming
+    // before cancelling -- this proves cancellation is racing a real
+    // in-flight operation (which really did mint an issuance-generation
+    // entry) rather than one that happened to be cancelled before the
+    // TCP connection was even established.
+    QVERIFY(QTest::qWaitFor(
+        [&]() { return server.lastBytesWrittenForSlowDrip(path) >= 0; }, 5000));
+
+    coordinator.cancel(handle);
+    QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+    QVERIFY(!bool(*result));
+    QCOMPARE(result->error().code, AssetErrorCode::Cancelled);
+    QCOMPARE(coordinator.inFlightOperationCountForTesting(), 0);
+
+    // The fix prunes opportunistically inside cancel() itself, so this
+    // must hold true after EVERY single cancellation, not only at the
+    // very end -- a coordinator that only pruned lazily on some later,
+    // unrelated event would still (harmlessly, but incorrectly for this
+    // test's purpose) pass a check made only after the loop.
+    QVERIFY2(coordinator.cacheKeyGenerationStateCountForTesting() <= 1,
+             qPrintable(
+                 QStringLiteral("issuance-generation state count %1 "
+                                "was not pruned after cancelling "
+                                "candidate %2")
+                     .arg(coordinator.cacheKeyGenerationStateCountForTesting())
+                     .arg(i)));
+  }
+
+  // Final state: nothing is in flight and no negative-404 record was
+  // ever recorded (every one of these was cancelled, never actually
+  // completed with a network result) -- so no cache key has any reason
+  // to still be pinned.
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 0);
+  QCOMPARE(coordinator.cacheKeyGenerationStateCountForTesting(), 0);
+}
+
+void AssetRequestCoordinatorTests::
     failedDurableInvalidationOnDefinitive404NeverRecordsNegativeAndFailsClosed() {
   // Round-6 item 6 ("definitive 404 invalidation ignores delete failure
   // and manifest unlink lacks directory fsync; old 200 can revive after

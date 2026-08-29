@@ -89,6 +89,7 @@ private slots:
   // Review round-4 items 5, 7.
   void newer404TombstonesOlderCachedEntryAcrossTtlExpiryAndRestart();
   void negative404AndGenerationStateStayBoundedUnderHighCardinality();
+  void soleConsumerCancellationPrunesIssuanceStateUnderHighCardinality();
   // Round-6 item 6: a 404 whose durable tombstone cannot be committed
   // must not record a negative-404 that could later let the entry it
   // failed to remove resurface.

@@ -1247,6 +1247,18 @@ void AssetRequestCoordinator::cancel(RequestHandle handle) {
     if (fetchHandle.isValid()) {
       m_fetcher.cancel(fetchHandle);
     }
+    // Round-6 item 7: this operation has just stopped being in-flight
+    // via cancellation, exactly as much as one that stopped via
+    // completeOperation() -- its cache key(s) must be equally eligible
+    // for pruning from m_negative404/m_cacheKeyGeneration/
+    // m_cacheKeyIssuedGeneration (see pruneStaleCacheKeyState()'s
+    // comment). Previously only completeOperation() called this, so a
+    // burst of uniquely-keyed requests that were each cancelled before
+    // ever completing (e.g. a scrolled-past card art) grew
+    // m_cacheKeyIssuedGeneration without bound -- activeInFlightCacheKeys()
+    // already correctly excludes an erased operation, so this is safe to
+    // call immediately after the erase above.
+    pruneStaleCacheKeyState();
   }
 }
 
