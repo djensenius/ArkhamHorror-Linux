@@ -74,6 +74,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev provides the mandatory AVIF decode dependency (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)).
+      - name: Test asset locale digest generator's --check fail-closed behavior
+        # tools/generate_asset_locale_digest.py's --check mode (review
+        # round-3 item 16) is a standalone local dev tool no CMake/ctest
+        # target invokes, so its own regression suite
+        # (tools/test_generate_asset_locale_digest.py, stdlib unittest
+        # only -- no extra dependency) needs to be run here explicitly,
+        # or a regression in --check's fail-closed behavior would go
+        # uncaught by every other CI step.
+        run: python3 tools/test_generate_asset_locale_digest.py
       - run: mise run test
 
   build:
