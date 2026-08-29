@@ -65,6 +65,35 @@ GENERATED_HEADER = REPO_ROOT / "src" / "AssetLocaleDigestData.generated.h"
 # silently regenerated into (or dropped from) the shipped digest.
 _EXPECTED_LOCALES = frozenset({"ita", "fr", "es", "ko", "zh"})
 
+# Round-4 review item 11: the exact, fixed ISO-locale -> web-locale map
+# this issue's provenance covers (djensenius/ArkhamHorror-Linux#17 issue
+# body: "Preserve the web locale mapping it -> ita, fr -> fr, es -> es,
+# ko -> ko, zh -> zh."). The manifest's localeMap must equal this dict
+# EXACTLY -- both keys and values, with no extra entry and no alias --
+# not merely have a matching VALUE set (the older check below only
+# compared `set(locale_map.values())`, which could not detect an extra
+# ISO-locale KEY mapping to an otherwise-legitimate value, e.g. a
+# malicious/accidental "it-IT": "ita" alias alongside the real "it": "ita"
+# entry, or a key containing a path-traversal-shaped string).
+_EXPECTED_LOCALE_MAP = {
+    "it": "ita",
+    "fr": "fr",
+    "es": "es",
+    "ko": "ko",
+    "zh": "zh",
+}
+
+# Round-4 review item 11: every pinned source file's manifest-declared
+# `path` must be EXACTLY this fixed, normalized, relative-to-contracts/
+# path for its own locale -- never merely "some path that happens to
+# exist" or "a path validated only by regex". This is checked with a
+# literal equality comparison (not just "no '..' components"), so no
+# path-normalization edge case (backslashes, a leading slash, a
+# doubled/trailing slash, a differently-cased directory segment, a
+# symlink component, etc.) can smuggle a source file's declared identity
+# outside contracts/asset-locale-digest-sources/ or rename which locale
+# it is read as.
+
 # Strict allow-list grammar for a validated path's art-code segment
 # (everything between the root and the extension): ASCII letters (either
 # case -- the real upstream data genuinely contains uppercase variant
@@ -128,12 +157,15 @@ def _load_manifest() -> dict:
     manifest = json.loads(MANIFEST_JSON.read_bytes())
 
     locale_map: dict[str, str] = manifest["localeMap"]
-    web_locales = set(locale_map.values())
-    if web_locales != _EXPECTED_LOCALES:
+    # Round-4 review item 11: exact dict equality (keys AND values), not
+    # merely a matching value set -- see _EXPECTED_LOCALE_MAP's comment.
+    if locale_map != _EXPECTED_LOCALE_MAP:
         raise ValueError(
-            "contracts/asset-locale-digest.json's localeMap web-locale set "
-            f"{sorted(web_locales)!r} does not match the exact expected "
-            f"set {sorted(_EXPECTED_LOCALES)!r}"
+            "contracts/asset-locale-digest.json's localeMap "
+            f"{locale_map!r} does not exactly match the fixed, pinned "
+            f"locale map {_EXPECTED_LOCALE_MAP!r} required by "
+            "djensenius/ArkhamHorror-Linux#17 -- no extra key/alias or "
+            "differing value is permitted"
         )
 
     source_files: dict[str, dict] = manifest["provenance"]["sourceFiles"]
@@ -143,6 +175,24 @@ def _load_manifest() -> dict:
             f"key set {sorted(source_files.keys())!r} does not match the "
             f"exact expected set {sorted(_EXPECTED_LOCALES)!r}"
         )
+
+    # Round-4 review item 11: each declared source path must be EXACTLY
+    # the fixed "asset-locale-digest-sources/<locale>.json" this locale is
+    # pinned to -- literal string equality, not merely "resolves inside
+    # the directory" or "matches a regex" -- so a manifest cannot smuggle
+    # a source file's declared identity to a different path (absolute,
+    # containing "..", using a different locale's filename, backslashes,
+    # a doubled/leading/trailing slash, etc.) while still passing a looser
+    # containment check.
+    for web_locale, entry in source_files.items():
+        expected_path = f"asset-locale-digest-sources/{web_locale}.json"
+        declared_path = entry.get("path")
+        if declared_path != expected_path:
+            raise ValueError(
+                f"contracts/asset-locale-digest.json's provenance."
+                f"sourceFiles[{web_locale!r}].path is {declared_path!r}, "
+                f"but must be exactly {expected_path!r}"
+            )
 
     on_disk = {p.stem for p in SOURCES_DIR.glob("*.json")}
     if on_disk != _EXPECTED_LOCALES:

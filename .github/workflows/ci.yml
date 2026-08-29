@@ -83,6 +83,32 @@ jobs:
         # or a regression in --check's fail-closed behavior would go
         # uncaught by every other CI step.
         run: python3 tools/test_generate_asset_locale_digest.py
+      - name: Test asset locale digest provenance verifier's fail-closed behavior
+        # tools/verify_asset_locale_digest_provenance.py (review round-4
+        # item 11) is itself only exercised offline against a mocked
+        # GitHub API response here (tools/test_verify_asset_locale_digest_provenance.py),
+        # so a regression in ITS OWN fail-closed logic (e.g. accepting a
+        # renamed sourceRepository, a wrong git blob mode, or a missing
+        # upstream blob) is caught before the real, network-dependent
+        # verification step below ever runs.
+        run: python3 tools/test_verify_asset_locale_digest_provenance.py
+      - name: Verify asset locale digest provenance against real upstream commit
+        # The actual live check (review round-4 item 11): fetches
+        # halogenandtoast/ArkhamHorror's real Git Data API tree listing at
+        # the exact commit contracts/asset-locale-digest.json pins, and
+        # requires every pinned contracts/asset-locale-digest-sources/*.json
+        # file to be a byte-for-byte identical git blob (by mode, path,
+        # and content-addressed sha) to what that commit's real tree
+        # actually contains -- rather than trusting the manifest's own
+        # self-reported sha256/sourceCommit fields. GITHUB_TOKEN is used
+        # only to raise this step's GitHub API rate limit; it is never
+        # sent to, and grants no access on, the upstream repository being
+        # verified (a public read-only Git Data API call). Any network
+        # failure, missing commit/blob, or mismatch fails this step --
+        # there is no fallback that lets a failed check pass silently.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/verify_asset_locale_digest_provenance.py
       - run: mise run test
 
   build:

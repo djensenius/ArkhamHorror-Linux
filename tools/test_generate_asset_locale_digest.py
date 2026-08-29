@@ -186,6 +186,76 @@ class GenerateAssetLocaleDigestCheckTests(unittest.TestCase):
         self.assertFalse(self.generated_header.exists())
         self.assertEqual(gen.main(["--check"]), 1)
 
+    def _rewrite_manifest_locale_map(self, locale_map: dict[str, str]) -> None:
+        manifest = json.loads(gen.MANIFEST_JSON.read_bytes())
+        manifest["localeMap"] = locale_map
+        gen.MANIFEST_JSON.write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
+    def test_load_manifest_rejects_extra_locale_map_alias_key(self) -> None:
+        # Round-4 review item 11: the older check only compared
+        # set(locale_map.values()) -- an extra ISO-locale KEY mapping to
+        # an otherwise-legitimate value (e.g. a redundant/aliased
+        # "it-IT": "ita" alongside the real "it": "ita") passed
+        # undetected. Exact dict equality must reject this outright.
+        locale_map = dict(gen._EXPECTED_LOCALE_MAP)
+        locale_map["it-IT"] = "ita"
+        self._rewrite_manifest_locale_map(locale_map)
+        with self.assertRaises(ValueError):
+            gen._load_manifest()
+
+    def test_load_manifest_rejects_locale_map_value_alias_mismatch(self) -> None:
+        # A same-size map that still matches on VALUES but has a
+        # different/extra KEY (e.g. "italian" instead of "it") must also
+        # be rejected by the new exact key+value dict comparison, even
+        # though the older values-only check would have accepted it.
+        locale_map = dict(gen._EXPECTED_LOCALE_MAP)
+        del locale_map["it"]
+        locale_map["italian"] = "ita"
+        self._rewrite_manifest_locale_map(locale_map)
+        with self.assertRaises(ValueError):
+            gen._load_manifest()
+
+    def _rewrite_manifest_source_path(self, locale: str, path: str) -> None:
+        manifest = json.loads(gen.MANIFEST_JSON.read_bytes())
+        manifest["provenance"]["sourceFiles"][locale]["path"] = path
+        gen.MANIFEST_JSON.write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
+    def test_load_manifest_rejects_absolute_source_path(self) -> None:
+        # Round-4 review item 11: a manifest-declared source path must be
+        # exactly "asset-locale-digest-sources/<locale>.json" -- an
+        # absolute path (even one that happens to point at the very same
+        # file on this machine) must be rejected outright rather than
+        # merely checked for "no traversal", since literal equality is
+        # the actual contract.
+        absolute_path = str((gen.SOURCES_DIR / "ita.json").resolve())
+        self._rewrite_manifest_source_path("ita", absolute_path)
+        with self.assertRaises(ValueError):
+            gen._load_manifest()
+
+    def test_load_manifest_rejects_dot_dot_traversal_source_path(self) -> None:
+        self._rewrite_manifest_source_path(
+            "ita", "asset-locale-digest-sources/../../../etc/passwd"
+        )
+        with self.assertRaises(ValueError):
+            gen._load_manifest()
+
+    def test_load_manifest_rejects_source_path_naming_a_different_locale(
+        self,
+    ) -> None:
+        # Even a path that stays strictly inside the sources directory
+        # must still be rejected if it does not name THIS locale's own
+        # file -- a manifest cannot alias one locale's provenance entry
+        # onto another locale's checked-in bytes.
+        self._rewrite_manifest_source_path(
+            "ita", "asset-locale-digest-sources/fr.json"
+        )
+        with self.assertRaises(ValueError):
+            gen._load_manifest()
+
 
 if __name__ == "__main__":
     unittest.main()
