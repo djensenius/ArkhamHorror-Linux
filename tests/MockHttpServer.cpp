@@ -145,12 +145,18 @@ void MockHttpServer::writeResponse(
 
   if (etagMatches || lastModifiedMatches) {
     QByteArray out = "HTTP/1.1 304 Not Modified\r\n";
-    if (!response.etagForConditionalMatch.isEmpty()) {
-      out += "ETag: " + response.etagForConditionalMatch + "\r\n";
+    const QByteArray etagToSend = !response.etagOn304Override.isEmpty()
+                                      ? response.etagOn304Override
+                                      : response.etagForConditionalMatch;
+    const QByteArray lastModifiedToSend =
+        !response.lastModifiedOn304Override.isEmpty()
+            ? response.lastModifiedOn304Override
+            : response.lastModifiedForConditionalMatch;
+    if (!etagToSend.isEmpty()) {
+      out += "ETag: " + etagToSend + "\r\n";
     }
-    if (!response.lastModifiedForConditionalMatch.isEmpty()) {
-      out +=
-          "Last-Modified: " + response.lastModifiedForConditionalMatch + "\r\n";
+    if (!lastModifiedToSend.isEmpty()) {
+      out += "Last-Modified: " + lastModifiedToSend + "\r\n";
     }
     out += "Content-Length: 0\r\n";
     out += "Connection: close\r\n\r\n";

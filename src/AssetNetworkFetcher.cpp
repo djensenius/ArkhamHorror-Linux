@@ -390,6 +390,13 @@ void AssetNetworkFetcher::handleFinished(quint64 handle) {
     }
     ConditionalFetchResult result;
     result.notModified = true;
+    // A 304 MAY carry refreshed validators (RFC 7232 S4.1) even with no
+    // body; capture them so the coordinator can extend the cache entry's
+    // validator instead of forever revalidating against a value the
+    // origin may eventually stop recognising.
+    result.refreshedEtag = QString::fromLatin1(reply->rawHeader("ETag"));
+    result.refreshedLastModified =
+        QString::fromLatin1(reply->rawHeader("Last-Modified"));
     emitResult(std::move(result));
     return;
   }

@@ -48,6 +48,16 @@ public:
     // of this full response.
     QByteArray etagForConditionalMatch;
     QByteArray lastModifiedForConditionalMatch;
+    // When non-empty, overrides the ETag/Last-Modified header VALUE sent
+    // on that bodyless 304 response, independent of what was matched
+    // against (etagForConditionalMatch/lastModifiedForConditionalMatch
+    // above). Models a server rotating/extending its validator at
+    // revalidation time (RFC 7232 S4.1 permits a 304 to carry a
+    // different validator than the one the client asked about). Only
+    // takes effect once a 304 is already being sent; a non-matching
+    // request is unaffected.
+    QByteArray etagOn304Override;
+    QByteArray lastModifiedOn304Override;
 
     // When true, `body` is written to the socket in small delayed slices
     // (see chunkSize/chunkDelayMs) instead of all at once, so a test can

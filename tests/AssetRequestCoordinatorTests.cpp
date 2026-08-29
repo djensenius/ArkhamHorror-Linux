@@ -579,6 +579,75 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
+    notModifiedResponseWithRefreshedValidatorUpdatesCacheEntry() {
+  // Regression test: RFC 7232 S4.1 permits a 304 response to carry a
+  // refreshed validator even though it has no body -- a server MAY
+  // rotate/extend its ETag at revalidation time without re-sending the
+  // representation. AssetNetworkFetcher must surface that refreshed
+  // validator and AssetRequestCoordinator/AssetCache must persist it, so
+  // a LATER revalidation (e.g. after a process restart) sends the NEW
+  // validator rather than replaying the original one forever.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(32, 32); // must never be served to the caller
+  response.etagForConditionalMatch = "\"stale-etag\"";
+  response.etagOn304Override = "\"refreshed-etag\"";
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache seedCache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(4, 4);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.etag = QStringLiteral("\"stale-etag\"");
+  seedCache.store(cacheKey, preSeeded);
+
+  // Restart #1 (fresh memory, forces the disk-hit revalidation path):
+  // revalidates against the pre-seeded "stale-etag" and receives a 304
+  // carrying the server's refreshed "refreshed-etag".
+  {
+    AssetCache restartedCache(cacheConfig);
+    AssetRequestCoordinator coordinator(restartedCache, fetcher);
+    std::optional<Result> result;
+    coordinator.request(key, [&](Result r) { result = std::move(r); });
+    QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+    QVERIFY2(bool(*result), qPrintable(result->error().message));
+    QCOMPARE(server.lastRequestHeaders(QStringLiteral("/cards/valid01.png"))
+                 .value("if-none-match"),
+             QByteArrayLiteral("\"stale-etag\""));
+  }
+
+  // Restart #2 (another fresh AssetCache reading only from disk, after
+  // the first coordinator/cache above has gone out of scope): if the
+  // refreshed validator from the first 304 was actually persisted, this
+  // revalidation attempt must send "refreshed-etag" as If-None-Match --
+  // NOT the original "stale-etag" -- proving the refresh survived a
+  // process restart rather than only updating an in-memory copy.
+  {
+    AssetCache restartedCache(cacheConfig);
+    AssetRequestCoordinator coordinator(restartedCache, fetcher);
+    std::optional<Result> result;
+    coordinator.request(key, [&](Result r) { result = std::move(r); });
+    QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+    QVERIFY2(bool(*result), qPrintable(result->error().message));
+    QCOMPARE(server.lastRequestHeaders(QStringLiteral("/cards/valid01.png"))
+                 .value("if-none-match"),
+             QByteArrayLiteral("\"refreshed-etag\""));
+  }
+}
+
+void AssetRequestCoordinatorTests::
     confirmedNotModifiedPromotesEntryToMemoryForSameProcessShortCircuit() {
   // Regression for a review finding: a successful 304 confirms the
   // disk-cached entry is still current, but touchAfterNotModified() only

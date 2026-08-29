@@ -345,10 +345,14 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         }
 
         if (result->notModified) {
-          // Confirmed unchanged: refresh only lastAccess (the payload
-          // bytes are never touched), then serve the same stale entry.
+          // Confirmed unchanged: refresh lastAccess, and adopt any
+          // validator the 304 itself refreshed (RFC 7232 S4.1 allows a
+          // 304 to rotate ETag/Last-Modified without a body); the payload
+          // bytes are never touched. Empty fields leave the existing
+          // validator untouched (see touchAfterNotModified()).
           self->m_cache.touchAfterNotModified(operation.revalidationCacheKey,
-                                              QString(), QString());
+                                              result->refreshedEtag,
+                                              result->refreshedLastModified);
           AssetOutcome<AssetCache::CachedEntry> outcome = self->ensureDecoded(
               stale, operation.key.format, operation.revalidationCacheKey);
           if (outcome) {

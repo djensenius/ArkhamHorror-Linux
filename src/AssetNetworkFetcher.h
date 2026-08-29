@@ -121,6 +121,14 @@ public:
   struct ConditionalFetchResult {
     bool notModified{false};
     std::optional<FetchedAsset> asset; // present iff !notModified
+    // A 304 response MAY carry refreshed validators even though it has
+    // no body (RFC 7232 S4.1): the server can extend/rotate an ETag or
+    // Last-Modified value at revalidation time without re-sending the
+    // representation. Populated only when notModified == true and the
+    // corresponding header was actually present; empty otherwise (never
+    // populated for a fresh 200, whose validators live on `asset`).
+    QString refreshedEtag;
+    QString refreshedLastModified;
   };
 
   using FetchCallback =

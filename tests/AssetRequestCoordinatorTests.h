@@ -34,6 +34,7 @@ private slots:
   void cancellingImmediateCacheHitCompletionSuppressesDelivery();
   void cancellingAfterCompletionButBeforeQueuedDeliverySuppressesResult();
   void diskHitWithValidatorsRevalidatesAndServesStaleOn304();
+  void notModifiedResponseWithRefreshedValidatorUpdatesCacheEntry();
   void confirmedNotModifiedPromotesEntryToMemoryForSameProcessShortCircuit();
   void diskHitRevalidationReplacesEntryOnFresh200();
   void diskHitRevalidationServesStaleOnAnyFailure();
