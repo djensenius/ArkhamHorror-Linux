@@ -50,15 +50,41 @@ _VALID_SIDES = {"front", "back", "alternate_front", "resolved_front", "mutated_f
 def _escape(value: str) -> str:
     # Escape backslashes and quotes first (order matters: backslash must
     # be escaped before the sequences that introduce a backslash for the
-    # other control characters below), then the common C++ string-literal
-    # control-character escapes. Without this, a pinned JSON value that
-    # ever contains a newline/tab/carriage-return -- even by accident --
-    # would silently produce an invalid (or line-broken) C++ string
-    # literal in the generated header.
+    # other control characters below), then every other control
+    # character (any codepoint below U+0020, plus DEL/U+007F) as a
+    # fixed-width 3-digit octal escape. Without this, a pinned JSON value
+    # that ever contains a stray control character -- even one this
+    # digest's data is not expected to contain, such as a form feed or a
+    # raw NUL -- would silently produce an invalid C++ string literal (or
+    # embed a literal control byte) in the generated header.
+    #
+    # Octal (not hex) is used deliberately: a C++ "\xHH" escape has NO
+    # fixed width and greedily consumes every following hex digit
+    # character (0-9a-fA-F) in the same string literal, so "\x01" next to
+    # an ordinary hex-looking character like "a" or "3" would silently
+    # become part of the escape and corrupt the following character. A
+    # "\ooo" octal escape is capped at exactly 3 digits by the C++ grammar,
+    # so emitting exactly 3 digits every time is always unambiguous
+    # regardless of what character follows.
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    escaped = escaped.replace("\n", "\\n").replace("\r", "\\r")
-    escaped = escaped.replace("\t", "\\t")
-    return escaped
+    named = {
+        "\n": "\\n",
+        "\r": "\\r",
+        "\t": "\\t",
+        "\b": "\\b",
+        "\f": "\\f",
+        "\v": "\\v",
+    }
+    result = []
+    for ch in escaped:
+        codepoint = ord(ch)
+        if ch in named:
+            result.append(named[ch])
+        elif codepoint < 0x20 or codepoint == 0x7F:
+            result.append(f"\\{codepoint:03o}")
+        else:
+            result.append(ch)
+    return "".join(result)
 
 
 def render_header(source_bytes: bytes, data: dict) -> str:

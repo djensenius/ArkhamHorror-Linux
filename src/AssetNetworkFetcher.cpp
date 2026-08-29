@@ -177,6 +177,16 @@ AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
   }
 
   QNetworkReply *reply = m_nam.get(request);
+  // Bound QNetworkReply's own internal socket-level read buffer to the
+  // same cap this class enforces on Pending::buffer (plus one byte, to
+  // match the "+1" over-read this class's readyRead handler already uses
+  // to detect an overflow without ever letting its own buffer exceed the
+  // cap -- see handleReadyRead()). Without this, a large/fast response
+  // could still let Qt buffer well past maxEncodedBytes internally, in
+  // its own reply object, in between this class's readyRead-driven reads
+  // -- this makes the "never exceeds maxEncodedBytes" bound apply to the
+  // whole pipeline, not just the copy this class keeps in Pending::buffer.
+  reply->setReadBufferSize(m_limits.maxEncodedBytes + 1);
   const quint64 handle = m_nextHandle++;
 
   Pending pending;
