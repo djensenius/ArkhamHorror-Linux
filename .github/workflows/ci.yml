@@ -386,13 +386,13 @@ jobs:
           doc_root="$extracted/usr/share/doc/ArkhamHorror/third_party"
 
           declare -A codec_globs=(
-            [libavif]='libavif.so*'
-            [dav1d]='libdav1d.so*'
-            [libaom]='libaom.so*'
-            [libgav1]='libgav1.so*'
-            [rav1e]='librav1e.so*'
-            [svt-av1]='libSvtAv1*.so*'
-            [libyuv]='libyuv.so*'
+            ["libavif"]='libavif.so*'
+            ["dav1d"]='libdav1d.so*'
+            ["libaom"]='libaom.so*'
+            ["libgav1"]='libgav1.so*'
+            ["rav1e"]='librav1e.so*'
+            ["svt-av1"]='libSvtAv1*.so*'
+            ["libyuv"]='libyuv.so*'
           )
 
           fail=0

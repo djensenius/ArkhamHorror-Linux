@@ -52,17 +52,22 @@ bundle_codec_notices() {
 
   # name -> SONAME glob, one pair per line. libavif is listed first and is
   # the only mandatory entry; the rest are optional AV1 codec backends
-  # libavif may or may not have been linked against.
+  # libavif may or may not have been linked against. Keys are explicitly
+  # quoted: although GNU Bash treats an associative-array subscript as a
+  # plain string (never arithmetic) regardless of quoting, a hyphenated
+  # key like "svt-av1" is quoted anyway so intent is unambiguous and this
+  # never depends on that subtler-than-it-looks distinction from ordinary
+  # indexed-array subscripts (which ARE arithmetically evaluated).
   local -a mandatory_names=(libavif)
   local -a optional_names=(dav1d libaom libgav1 rav1e svt-av1 libyuv)
   local -A globs=(
-    [libavif]='libavif.so*'
-    [dav1d]='libdav1d.so*'
-    [libaom]='libaom.so*'
-    [libgav1]='libgav1.so*'
-    [rav1e]='librav1e.so*'
-    [svt-av1]='libSvtAv1*.so*'
-    [libyuv]='libyuv.so*'
+    ["libavif"]='libavif.so*'
+    ["dav1d"]='libdav1d.so*'
+    ["libaom"]='libaom.so*'
+    ["libgav1"]='libgav1.so*'
+    ["rav1e"]='librav1e.so*'
+    ["svt-av1"]='libSvtAv1*.so*'
+    ["libyuv"]='libyuv.so*'
   )
 
   # Phase 1: work out which names actually need bundling, and VALIDATE

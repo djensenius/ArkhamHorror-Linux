@@ -61,7 +61,12 @@ run = '''
 CLANG_FORMAT="clang-format"
 if command -v brew >/dev/null 2>&1; then
   LLVM18_PREFIX="$(brew --prefix llvm@18 2>/dev/null || true)"
-  if [ -x "$LLVM18_PREFIX/bin/clang-format" ]; then
+  # A failed `brew --prefix` leaves LLVM18_PREFIX empty; without this
+  # non-empty guard, "$LLVM18_PREFIX/bin/clang-format" collapses to the
+  # unrelated absolute path "/bin/clang-format", which could silently
+  # exist and override the intended "clang-format" PATH fallback above
+  # with an untracked binary instead of leaving CLANG_FORMAT as-is.
+  if [ -n "$LLVM18_PREFIX" ] && [ -x "$LLVM18_PREFIX/bin/clang-format" ]; then
     CLANG_FORMAT="$LLVM18_PREFIX/bin/clang-format"
   fi
 fi
