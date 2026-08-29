@@ -1453,9 +1453,18 @@ void AssetNetworkFetcherTests::
       << validEncodedBytes << validDimension << validTotalPixels << qint64(0);
   QTest::newRow("negative-timeout")
       << validEncodedBytes << validDimension << validTotalPixels << qint64(-1);
+  // std::chrono::milliseconds::rep is platform-defined -- typically
+  // "long" (not Qt's "long long"-based qint64) under 64-bit Linux/glibc,
+  // but "long long" under macOS/libc++. QTest::addColumn<qint64>() above
+  // requires an EXACT type match on every pushed value, so an implicit
+  // "long" here silently registers as a different, unrelated metatype
+  // and QFETCH(qint64, ...) aborts with a fatal type-mismatch assert --
+  // this only ever showed up on Linux CI, never on macOS. An explicit
+  // qint64 cast keeps the column type identical on every platform.
   QTest::newRow("timeout-above-sane-cap")
       << validEncodedBytes << validDimension << validTotalPixels
-      << (AssetNetworkFetcher::kMaxAllowedTimeout.count() + 1);
+      << static_cast<qint64>(AssetNetworkFetcher::kMaxAllowedTimeout.count() +
+                             1);
 }
 
 void AssetNetworkFetcherTests::
