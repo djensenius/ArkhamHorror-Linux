@@ -44,12 +44,13 @@ namespace {
 // print a fixture secret, per this repository's established test
 // convention (see AuthClientTests.cpp).
 
-void pumpEventsUntil(const std::function<bool()> &predicate,
-                     int timeoutMs = 2000) {
+[[nodiscard]] bool pumpEventsUntil(const std::function<bool()> &predicate,
+                                   int timeoutMs = 2000) {
   const QDeadlineTimer deadline(timeoutMs);
   while (!predicate() && !deadline.hasExpired()) {
     QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
   }
+  return predicate();
 }
 
 // ─── Fake IProfileStore ──────────────────────────────────────────────────
@@ -174,22 +175,39 @@ public:
 
   void readToken(const QString &profileId, ResultCallback callback) override {
     calls.append({profileId, QStringLiteral("read"), QString()});
-    registerPending(profileId, std::move(callback));
+    registerPending(profileId, PendingKind::Read, QString(),
+                    std::move(callback));
   }
 
   void saveToken(const QString &profileId, const QString &token,
                  ResultCallback callback) override {
     calls.append({profileId, QStringLiteral("save"), token});
-    registerPending(profileId, std::move(callback));
+    registerPending(profileId, PendingKind::Save, token, std::move(callback));
   }
 
   void deleteToken(const QString &profileId, ResultCallback callback) override {
     calls.append({profileId, QStringLiteral("delete"), QString()});
-    registerPending(profileId, std::move(callback));
+    registerPending(profileId, PendingKind::Delete, QString(),
+                    std::move(callback));
   }
 
   [[nodiscard]] bool hasPending(const QString &profileId) const {
     return m_pending.contains(profileId);
+  }
+
+  // Real per-profile stored-token state, mutated automatically by
+  // complete() below whenever a Save/Delete completes with Success. This
+  // lets tests assert the genuine end state of the fake secure store --
+  // e.g. "the abandoned save's token was truly removed by the
+  // compensating cleanup delete" -- rather than only inspecting the
+  // |calls| ordering list.
+  [[nodiscard]] std::optional<QString>
+  storedToken(const QString &profileId) const {
+    const auto it = m_stored.find(profileId);
+    if (it == m_stored.end()) {
+      return std::nullopt;
+    }
+    return it.value();
   }
 
   // Releases the currently pending operation for |profileId| asynchronously
@@ -201,15 +219,31 @@ public:
     if (it == m_pending.end()) {
       qFatal("FakeTokenStore: no pending operation for this profile");
     }
-    ResultCallback callback = it.value();
+    PendingOp pending = it.value();
     m_pending.erase(it);
+    if (result.outcome == TokenStoreOutcome::Success) {
+      if (pending.kind == PendingKind::Save) {
+        m_stored.insert(profileId, pending.token);
+      } else if (pending.kind == PendingKind::Delete) {
+        m_stored.remove(profileId);
+      }
+    }
+    ResultCallback callback = pending.callback;
     QMetaObject::invokeMethod(
         this, [callback, result]() mutable { callback(std::move(result)); },
         Qt::QueuedConnection);
   }
 
 private:
-  void registerPending(const QString &profileId, ResultCallback callback) {
+  enum class PendingKind { Read, Save, Delete };
+  struct PendingOp {
+    PendingKind kind;
+    QString token; // only meaningful for Save
+    ResultCallback callback;
+  };
+
+  void registerPending(const QString &profileId, PendingKind kind,
+                       QString token, ResultCallback callback) {
     if (m_pending.contains(profileId)) {
       // SessionCoordinator's per-profile FIFO invariant requires exactly
       // one in-flight ITokenStore operation per profile ID at a time; a
@@ -218,10 +252,12 @@ private:
       qFatal("FakeTokenStore: overlapping token-store operation for the "
              "same profile ID");
     }
-    m_pending.insert(profileId, std::move(callback));
+    m_pending.insert(profileId,
+                     PendingOp{kind, std::move(token), std::move(callback)});
   }
 
-  QHash<QString, ResultCallback> m_pending;
+  QHash<QString, PendingOp> m_pending;
+  QHash<QString, QString> m_stored;
 };
 
 // ─── Fake IAuthenticationClient ──────────────────────────────────────────
@@ -452,15 +488,16 @@ struct Harness {
   // common starting point by tests that only care about later stages.
   void bootToSignedOut() {
     coordinator->start();
-    pumpEventsUntil([this] { return probeFactory.current() != nullptr; });
+    QVERIFY(
+        pumpEventsUntil([this] { return probeFactory.current() != nullptr; }));
     probeFactory.current()->complete(compatibleProbeResult());
     const QString profileId = coordinator->selectedProfileId();
-    pumpEventsUntil(
-        [this, profileId] { return tokenStore.hasPending(profileId); });
+    QVERIFY(pumpEventsUntil(
+        [this, profileId] { return tokenStore.hasPending(profileId); }));
     tokenStore.complete(profileId, notFoundResult());
-    pumpEventsUntil([this] {
+    QVERIFY(pumpEventsUntil([this] {
       return coordinator->state() == SessionCoordinator::State::SignedOut;
-    });
+    }));
   }
 };
 
@@ -514,12 +551,23 @@ private slots:
   void rapidSwitchAwayAndBackIgnoresStaleProbeCompletion();
   void rapidSwitchDuringWhoAmIIgnoresStaleCompletion();
   void perProfileFifoOrdersSaveBeforeLaterDelete();
+  void immediateNewAuthForSameProfileQueuesBehindReservedCleanupDelete();
+  void deleteFailureDurablyBlocksProfileUntilRetrySucceeds();
+  void deleteFailureRemainsAcrossSwitchAwayAndStartRestart();
+  void staleCompensatingCleanupCannotDeleteLaterSave();
   void concurrentProfilesHaveIndependentTokenQueues();
 
   // Destruction
   void destructionSuppressesProbeCompletion();
   void destructionSuppressesTokenStoreCompletion();
   void destructionCancelsPendingAuthRequest();
+
+  // Direct-connection reentrancy (Qt property signals are synchronous)
+  void directStateChangedReentrancyDuringSignInSendsNoStalePasswordRequest();
+  void
+  directStateChangedReentrancyDuringProbeDoesNotDereferenceDestroyedProbe();
+  void directCurrentUserChangedReentrancyCannotSignInOldProfileOrLeakSave();
+  void coordinatorDestructionDuringStateChangedEmissionIsSafe();
 
   // Secret-free diagnostics
   void diagnosticsAndStateNeverContainSecrets();
@@ -604,7 +652,8 @@ void SessionCoordinatorTests::
   // prior probe and begins an entirely fresh boot sequence instead.
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   // Track the first probe's liveness with a QPointer rather than comparing
   // its raw address later: once destroyed, that address may be reused by
   // an unrelated allocation (e.g. the very next FakeCapabilityProbe), which
@@ -615,9 +664,9 @@ void SessionCoordinatorTests::
   const int createdBefore = h.probeFactory.totalCreated();
 
   h.coordinator->start();
-  pumpEventsUntil([&h, createdBefore] {
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
     return h.probeFactory.totalCreated() > createdBefore;
-  });
+  }));
 
   // The first probe was genuinely destroyed (QPointer self-clears), and a
   // fresh probe instance was created for the restarted boot.
@@ -629,12 +678,12 @@ void SessionCoordinatorTests::
   // is a real restart rather than a stuck/broken state.
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, notFoundResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
 }
 
@@ -643,14 +692,15 @@ void SessionCoordinatorTests::
 void SessionCoordinatorTests::compatibleProbeProceedsToCredentialRestore() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   QCOMPARE(h.probeFactory.current()->probeCallCount(), 1);
   h.probeFactory.current()->complete(compatibleProbeResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
                SessionCoordinator::State::RestoringCredential ||
            !h.tokenStore.calls.isEmpty();
-  });
+  }));
   QCOMPARE(h.coordinator->state(),
            SessionCoordinator::State::RestoringCredential);
   QCOMPARE(h.tokenStore.calls.size(), 1);
@@ -660,9 +710,10 @@ void SessionCoordinatorTests::compatibleProbeProceedsToCredentialRestore() {
 void SessionCoordinatorTests::legacyFallbackProbeProceedsToCredentialRestore() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(legacyFallbackProbeResult());
-  pumpEventsUntil([&h] { return !h.tokenStore.calls.isEmpty(); });
+  QVERIFY(pumpEventsUntil([&h] { return !h.tokenStore.calls.isEmpty(); }));
   QCOMPARE(h.coordinator->state(),
            SessionCoordinator::State::RestoringCredential);
 }
@@ -671,19 +722,20 @@ void SessionCoordinatorTests::
     incompatibleProbeSetsIncompatibleStateAndIsRetryable() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(incompatibleProbeResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::Incompatible;
-  });
+  }));
   QVERIFY(!h.coordinator->diagnostic().isEmpty());
 
   // retry() re-probes: a new probe instance is created.
   const int createdBefore = h.probeFactory.totalCreated();
   h.coordinator->retry();
-  pumpEventsUntil([&h, createdBefore] {
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
     return h.probeFactory.totalCreated() > createdBefore;
-  });
+  }));
   QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
   QCOMPARE(h.coordinator->state(),
            SessionCoordinator::State::ProbingCapabilities);
@@ -693,18 +745,19 @@ void SessionCoordinatorTests::
     probeNetworkErrorSetsRecoverableFailureAndIsRetryable() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(networkErrorProbeResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::RecoverableFailure;
-  });
+  }));
 
   const int createdBefore = h.probeFactory.totalCreated();
   h.coordinator->retry();
-  pumpEventsUntil([&h, createdBefore] {
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
     return h.probeFactory.totalCreated() > createdBefore;
-  });
+  }));
   QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
 }
 
@@ -719,15 +772,16 @@ void SessionCoordinatorTests::missingTokenBecomesSignedOut() {
 void SessionCoordinatorTests::validTokenWhoAmISuccessBecomesSignedIn() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
 
   const QString expectedToken = QStringLiteral("stored-token-abc");
   h.tokenStore.complete(profileId, successReadResult(expectedToken));
-  pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); });
+  QVERIFY(pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); }));
   QCOMPARE(h.authClient.calls.size(), 1);
   QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::WhoAmI);
   const QString actualToken = h.authClient.calls.first().token;
@@ -736,9 +790,9 @@ void SessionCoordinatorTests::validTokenWhoAmISuccessBecomesSignedIn() {
   const QString expectedUsername = QStringLiteral("alice");
   const QString expectedEmail = QStringLiteral("alice@example.test");
   h.authClient.completeUser(1, userSuccess(expectedUsername, expectedEmail));
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedIn;
-  });
+  }));
   const QString actualUsername = h.coordinator->currentUsername();
   const QString actualEmail = h.coordinator->currentEmail();
   QVERIFY(actualUsername == expectedUsername);
@@ -750,25 +804,26 @@ void SessionCoordinatorTests::validTokenWhoAmISuccessBecomesSignedIn() {
 void SessionCoordinatorTests::unauthorizedRestoredTokenDeletesThenSignedOut() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId,
                         successReadResult(QStringLiteral("stale-token")));
-  pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); });
+  QVERIFY(pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); }));
 
   h.authClient.completeUser(1, userUnauthorized());
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   QCOMPARE(h.tokenStore.calls.size(), 2);
   QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
 
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
 }
 
@@ -776,23 +831,24 @@ void SessionCoordinatorTests::
     unauthorizedRestoredTokenDeletionFailureIsSecureStorageUnavailable() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId,
                         successReadResult(QStringLiteral("stale-token")));
-  pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); });
+  QVERIFY(pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); }));
   h.authClient.completeUser(1, userUnauthorized());
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
 
   h.tokenStore.complete(profileId, backendErrorResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
-  });
+  }));
   // Never claim signed out while the token might still remain.
   QVERIFY(h.coordinator->state() != SessionCoordinator::State::SignedOut);
   QCOMPARE(h.tokenStore.calls.size(), 2);
@@ -801,14 +857,14 @@ void SessionCoordinatorTests::
   // same durable deletion, and a successful retry completes the original
   // "become signed out only after deletion succeeds" contract.
   h.coordinator->retry();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   QCOMPARE(h.tokenStore.calls.size(), 3);
   QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
 }
 
@@ -816,26 +872,27 @@ void SessionCoordinatorTests::
     whoAmITransportFailureDuringRestoreIsRecoverableAndDoesNotDeleteToken() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId,
                         successReadResult(QStringLiteral("valid-token")));
-  pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); });
+  QVERIFY(pumpEventsUntil([&h] { return !h.authClient.calls.isEmpty(); }));
 
   h.authClient.completeUser(1, userTransport());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::RecoverableFailure;
-  });
+  }));
   // The potentially-valid token must not have been deleted.
   QCOMPARE(h.tokenStore.calls.size(), 1);
 
   // retry() re-issues whoami, not a fresh read.
   h.coordinator->retry();
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   QCOMPARE(h.authClient.calls.size(), 2);
   QCOMPARE(h.authClient.calls.last().kind, FakeAuthClient::CallKind::WhoAmI);
   QCOMPARE(h.tokenStore.calls.size(), 1);
@@ -845,16 +902,17 @@ void SessionCoordinatorTests::
     tokenStoreAccessDeniedDuringRestoreIsSecureStorageUnavailable() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, accessDeniedResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
-  });
+  }));
   QVERIFY(!h.coordinator->diagnostic().isEmpty());
 }
 
@@ -869,29 +927,29 @@ void SessionCoordinatorTests::signInSuccessValidatesThenSavesThenSignedIn() {
   const QString email = QStringLiteral("bob@example.test");
   h.coordinator->signIn(email, password);
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::Authenticating);
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   QCOMPARE(h.authClient.calls.first().kind,
            FakeAuthClient::CallKind::Authenticate);
 
   const QString expectedToken = QStringLiteral("fresh-token-xyz");
   h.authClient.completeToken(1, tokenSuccess(expectedToken));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   QCOMPARE(h.authClient.calls.last().kind, FakeAuthClient::CallKind::WhoAmI);
   const QString actualWhoAmIToken = h.authClient.calls.last().token;
   QVERIFY(actualWhoAmIToken == expectedToken);
 
   const QString expectedUsername = QStringLiteral("bob");
   h.authClient.completeUser(2, userSuccess(expectedUsername, email));
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("save"));
   const QString actualSavedToken = h.tokenStore.calls.last().token;
   QVERIFY(actualSavedToken == expectedToken);
 
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedIn;
-  });
+  }));
   const QString actualUsername = h.coordinator->currentUsername();
   QVERIFY(actualUsername == expectedUsername);
 }
@@ -901,12 +959,12 @@ void SessionCoordinatorTests::signInAuthFailureReturnsSignedOut() {
   h.bootToSignedOut();
   h.coordinator->signIn(QStringLiteral("bob@example.test"),
                         QStringLiteral("wrong-password"));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   h.authClient.completeToken(1, tokenUnauthorized());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut &&
            !h.coordinator->diagnostic().isEmpty();
-  });
+  }));
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
   QVERIFY(!h.coordinator->diagnostic().isEmpty());
 }
@@ -917,13 +975,13 @@ void SessionCoordinatorTests::
   h.bootToSignedOut();
   h.coordinator->signIn(QStringLiteral("bob@example.test"),
                         QStringLiteral("hunter2"));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   h.authClient.completeToken(1, tokenSuccess(QStringLiteral("rejected-token")));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   h.authClient.completeUser(2, userUnauthorized());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
   // No save was ever attempted for a token that failed validation.
   QCOMPARE(h.tokenStore.calls.size(), 1); // only the earlier restore read
 }
@@ -934,18 +992,18 @@ void SessionCoordinatorTests::signInSaveFailureIsSecureStorageUnavailable() {
   const QString profileId = h.coordinator->selectedProfileId();
   h.coordinator->signIn(QStringLiteral("bob@example.test"),
                         QStringLiteral("hunter2"));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   h.authClient.completeToken(1, tokenSuccess(QStringLiteral("fresh-token")));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   h.authClient.completeUser(2, userSuccess(QStringLiteral("bob"),
                                            QStringLiteral("bob@example.test")));
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, backendErrorResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
-  });
+  }));
   // bootToSignedOut() already performed one "read" call; the failed save
   // attempt above is the second call.
   QCOMPARE(h.tokenStore.calls.size(), 2);
@@ -954,14 +1012,14 @@ void SessionCoordinatorTests::signInSaveFailureIsSecureStorageUnavailable() {
   // still available and only the durable save needs to be retried, so a
   // successful retry completes sign-in without re-authenticating.
   h.coordinator->retry();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   QCOMPARE(h.tokenStore.calls.size(), 3);
   QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("save"));
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedIn;
-  });
+  }));
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedIn);
   // No re-authentication occurred; the retry reused the already-validated
   // token.
@@ -990,11 +1048,12 @@ void SessionCoordinatorTests::signInNoOpWhenProfileNotYetUsable() {
 void SessionCoordinatorTests::signInAndRegisterNoOpDuringCredentialRestore() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   QCOMPARE(h.coordinator->state(),
            SessionCoordinator::State::RestoringCredential);
 
@@ -1012,9 +1071,9 @@ void SessionCoordinatorTests::signInAndRegisterNoOpDuringCredentialRestore() {
   // The credential restore itself is unaffected by the rejected calls
   // above and can still proceed to completion normally.
   h.tokenStore.complete(profileId, notFoundResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
 }
 
 void SessionCoordinatorTests::registerAccountSuccessFlow() {
@@ -1025,18 +1084,18 @@ void SessionCoordinatorTests::registerAccountSuccessFlow() {
                                  QStringLiteral("newuser"),
                                  QStringLiteral("s3cret"));
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::Registering);
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::Register);
   h.authClient.completeToken(1, tokenSuccess(QStringLiteral("new-token")));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   h.authClient.completeUser(2, userSuccess(QStringLiteral("newuser"),
                                            QStringLiteral("new@example.test")));
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedIn;
-  });
+  }));
 }
 
 // ─── Sign out ─────────────────────────────────────────────────────────────
@@ -1049,17 +1108,17 @@ void bootToSignedIn(Harness &h, const QString &token) {
   const QString profileId = h.coordinator->selectedProfileId();
   h.coordinator->signIn(QStringLiteral("bob@example.test"),
                         QStringLiteral("hunter2"));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   h.authClient.completeToken(1, tokenSuccess(token));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   h.authClient.completeUser(2, userSuccess(QStringLiteral("bob"),
                                            QStringLiteral("bob@example.test")));
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedIn;
-  });
+  }));
 }
 } // namespace
 
@@ -1068,13 +1127,13 @@ void SessionCoordinatorTests::signOutDeletesTokenAndBecomesSignedOut() {
   bootToSignedIn(h, QStringLiteral("session-token"));
   const QString profileId = h.coordinator->selectedProfileId();
   h.coordinator->signOut();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
   QVERIFY(h.coordinator->currentUsername().isEmpty());
 }
 
@@ -1085,24 +1144,24 @@ void SessionCoordinatorTests::
   const QString profileId = h.coordinator->selectedProfileId();
   const QString expectedUsername = h.coordinator->currentUsername();
   h.coordinator->signOut();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, backendErrorResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
-  });
+  }));
   // Identity preserved; never silently claims signed out.
   const QString actualUsername = h.coordinator->currentUsername();
   QVERIFY(actualUsername == expectedUsername);
 
   h.coordinator->retry();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
 }
 
 void SessionCoordinatorTests::signOutNoOpWhenNotSignedIn() {
@@ -1127,23 +1186,25 @@ void SessionCoordinatorTests::switchProfilePersistsSelectionAndRestartsProbe() {
   h.profileStore.profiles = {hosted, *customProfile};
   h.profileStore.selectedId = hosted.profileId();
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString hostedId = h.coordinator->selectedProfileId();
-  pumpEventsUntil([&h, hostedId] { return h.tokenStore.hasPending(hostedId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, hostedId] { return h.tokenStore.hasPending(hostedId); }));
   h.tokenStore.complete(hostedId, notFoundResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
 
   const int createdBefore = h.probeFactory.totalCreated();
   h.coordinator->switchProfile(customProfile->profileId());
   const QString expectedId = customProfile->profileId();
   const QString actualId = h.profileStore.selectedId;
   QVERIFY(actualId == expectedId);
-  pumpEventsUntil([&h, createdBefore] {
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
     return h.probeFactory.totalCreated() > createdBefore;
-  });
+  }));
   QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
   QCOMPARE(h.coordinator->state(),
            SessionCoordinator::State::ProbingCapabilities);
@@ -1159,14 +1220,16 @@ void SessionCoordinatorTests::
   h.profileStore.profiles = {hosted, *customProfile};
   h.profileStore.selectedId = hosted.profileId();
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString hostedId = h.coordinator->selectedProfileId();
-  pumpEventsUntil([&h, hostedId] { return h.tokenStore.hasPending(hostedId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, hostedId] { return h.tokenStore.hasPending(hostedId); }));
   h.tokenStore.complete(hostedId, notFoundResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
   const QString originalId = h.coordinator->selectedProfileId();
   h.profileStore.failSaveSelectedId = QStringLiteral("disk full");
 
@@ -1186,21 +1249,23 @@ void SessionCoordinatorTests::switchProfileCancelsInFlightAuthRequest() {
   h.profileStore.profiles = {hosted, *customProfile};
   h.profileStore.selectedId = hosted.profileId();
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString hostedId = h.coordinator->selectedProfileId();
-  pumpEventsUntil([&h, hostedId] { return h.tokenStore.hasPending(hostedId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, hostedId] { return h.tokenStore.hasPending(hostedId); }));
   h.tokenStore.complete(hostedId, notFoundResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
 
   h.coordinator->signIn(QStringLiteral("a@example.test"), QStringLiteral("pw"));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   QVERIFY(h.authClient.hasPendingToken(1));
 
   h.coordinator->switchProfile(customProfile->profileId());
-  pumpEventsUntil([&h] { return !h.authClient.hasPendingToken(1); });
+  QVERIFY(pumpEventsUntil([&h] { return !h.authClient.hasPendingToken(1); }));
   QVERIFY(!h.authClient.hasPendingToken(1));
   // The stale cancellation must not clobber the new profile's fresh state.
   QCOMPARE(h.coordinator->state(),
@@ -1217,12 +1282,25 @@ void SessionCoordinatorTests::
   h.profileStore.profiles = {hosted, *customProfile};
   h.profileStore.selectedId = hosted.profileId();
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
-  FakeCapabilityProbe *firstProbe = h.probeFactory.current();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  QPointer<FakeCapabilityProbe> firstProbe(h.probeFactory.current());
+  const int createdBeforeSwitch = h.probeFactory.totalCreated();
+  QVERIFY(!firstProbe.isNull());
 
   h.coordinator->switchProfile(customProfile->profileId());
-  pumpEventsUntil(
-      [&h, firstProbe] { return h.probeFactory.current() != firstProbe; });
+  // Never compare a destroyed probe's raw address against a new instance:
+  // once switchProfile() destroys the old probe (m_probe.reset()), a
+  // subsequent heap allocation for the replacement probe may legitimately
+  // reuse the exact same address, making an address-equality check
+  // silently pass even when the coordinator is still (incorrectly)
+  // holding the OLD instance. A monotonically increasing creation count
+  // from the factory, plus the QPointer for liveness, cannot be fooled by
+  // allocator reuse.
+  QVERIFY(pumpEventsUntil([&h, createdBeforeSwitch] {
+    return h.probeFactory.totalCreated() > createdBeforeSwitch;
+  }));
+  QVERIFY(firstProbe.isNull());
   QCOMPARE(h.coordinator->state(),
            SessionCoordinator::State::ProbingCapabilities);
 
@@ -1230,22 +1308,22 @@ void SessionCoordinatorTests::
   // destroyed by switchProfile(). Complete the CURRENT probe with an
   // Incompatible result, then switch straight back to hosted.
   h.probeFactory.current()->complete(incompatibleProbeResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::Incompatible;
-  });
+  }));
 
   h.coordinator->switchProfile(hosted.profileId());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::ProbingCapabilities;
-  });
+  }));
   FakeCapabilityProbe *thirdProbe = h.probeFactory.current();
   QVERIFY(thirdProbe != nullptr);
   thirdProbe->complete(compatibleProbeResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::RestoringCredential;
-  });
+  }));
   const QString actualSelected = h.coordinator->selectedProfileId();
   const QString expectedSelected = hosted.profileId();
   QVERIFY(actualSelected == expectedSelected);
@@ -1260,17 +1338,19 @@ void SessionCoordinatorTests::rapidSwitchDuringWhoAmIIgnoresStaleCompletion() {
   h.profileStore.profiles = {hosted, *customProfile};
   h.profileStore.selectedId = hosted.profileId();
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString hostedId = hosted.profileId();
-  pumpEventsUntil([&h, hostedId] { return h.tokenStore.hasPending(hostedId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, hostedId] { return h.tokenStore.hasPending(hostedId); }));
   h.tokenStore.complete(hostedId,
                         successReadResult(QStringLiteral("old-token")));
-  pumpEventsUntil([&h] { return h.authClient.hasPendingUser(1); });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.hasPendingUser(1); }));
 
   // Switch away before whoami resolves.
   h.coordinator->switchProfile(customProfile->profileId());
-  pumpEventsUntil([&h] { return !h.authClient.hasPendingUser(1); });
+  QVERIFY(pumpEventsUntil([&h] { return !h.authClient.hasPendingUser(1); }));
 
   // The (stale, cancelled) whoami's completion must never flip state back
   // to SignedIn for the now-abandoned hosted profile: the coordinator must
@@ -1283,23 +1363,326 @@ void SessionCoordinatorTests::rapidSwitchDuringWhoAmIIgnoresStaleCompletion() {
 }
 
 void SessionCoordinatorTests::perProfileFifoOrdersSaveBeforeLaterDelete() {
+  // Genuine FIFO overlap: an ITokenStore Save is dispatched (in flight,
+  // uncancellable) for a profile, THEN that profile is switched away from
+  // before the Save completes. invalidateProfileCredential() must reserve
+  // a compensating Delete BEHIND the still-in-flight Save (never
+  // dispatching it early), and that Delete must only actually run once
+  // the Save finishes -- proving the abandoned token is truly cleaned up
+  // rather than left stored.
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  h.bootToSignedOut();
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  const QString sessionToken = QStringLiteral("session-token");
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  h.authClient.completeToken(1, tokenSuccess(sessionToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
+  h.authClient.completeUser(2, userSuccess(QStringLiteral("bob"),
+                                           QStringLiteral("bob@example.test")));
+
+  // The validated token's Save has now been enqueued AND dispatched (it is
+  // the sole/front op for this profile's FIFO) -- it is in flight and
+  // uncancellable.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+  QCOMPARE(h.tokenStore.calls.at(1).kind, QStringLiteral("save"));
+
+  // Switch away WHILE the Save is still outstanding. This must reserve a
+  // compensating Delete behind it -- not dispatch it now (only one
+  // ITokenStore op may be in flight per profile at a time; FakeTokenStore
+  // would fatally assert on an overlap) and not skip it either.
+  h.coordinator->switchProfile(customProfile->profileId());
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+  QVERIFY(h.tokenStore.hasPending(profileId)); // still the original Save
+  QCOMPARE(h.tokenStore.calls.size(), 2);      // no delete dispatched yet
+
+  // Release the Save. Its own continuation is generation-gated and must
+  // not resurrect SignedIn for the now-abandoned profile, but the FIFO
+  // must advance to dispatch the reserved cleanup Delete regardless.
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return !h.tokenStore.hasPending(profileId); }));
+
+  // The abandoned Save's token must have been truly removed by the
+  // compensating cleanup Delete -- not left stored.
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+  // Switching away must not have been derailed by any of this.
+  const QString actualSelected = h.coordinator->selectedProfileId();
+  const QString expectedSelected = customProfile->profileId();
+  QVERIFY(actualSelected == expectedSelected);
+}
+
+void SessionCoordinatorTests::
+    immediateNewAuthForSameProfileQueuesBehindReservedCleanupDelete() {
+  // After a Save crosses the ITokenStore boundary and is then invalidated
+  // (switch away), switching straight back to the SAME profile enqueues a
+  // fresh credential-restore Read for it. That Read must queue BEHIND the
+  // reserved compensating Delete -- it must never overtake cleanup and
+  // observe a token that is about to be deleted.
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  h.bootToSignedOut();
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  h.authClient.completeToken(1, tokenSuccess(QStringLiteral("session-token")));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
+  h.authClient.completeUser(2, userSuccess(QStringLiteral("bob"),
+                                           QStringLiteral("bob@example.test")));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save (in flight)
+
+  // Switch away (reserves a cleanup Delete behind the in-flight Save),
+  // then immediately switch straight back to the same profile.
+  h.coordinator->switchProfile(customProfile->profileId());
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.coordinator->switchProfile(profileId);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+
+  // startCredentialRestore() enqueues a new Read for profileId; it must
+  // sit behind [Save (in flight), Delete (reserved)] rather than being
+  // dispatched now.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(),
+           2); // still just read, save -- no new read yet
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::RestoringCredential);
+
+  // Release the stale Save: the reserved Delete must dispatch next, NOT
+  // the newly queued Read.
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+
+  // Release the Delete: only now may the queued Read finally dispatch.
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("read"));
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+}
+
+void SessionCoordinatorTests::
+    deleteFailureDurablyBlocksProfileUntilRetrySucceeds() {
+  // A failed REQUIRED deletion (here: a plain sign-out delete) must be
+  // left un-dequeued at the head of its profile's FIFO so it durably
+  // blocks every later same-profile operation -- including a credential
+  // restore triggered by switching back to it -- until
+  // retryStuckProfileTokenOp() actually succeeds. This is never abandoned
+  // just because the UI/session moved on in the meantime.
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  h.coordinator->signOut();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, backendErrorResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+
+  // Switch away and back to the SAME profile while the required deletion
+  // is still stuck: the switch itself must never silently proceed past
+  // it, and a fresh credential restore must immediately surface the
+  // still-unresolved block rather than trying (or worse, appearing) to
+  // read a token that is supposed to be deleted.
+  h.coordinator->switchProfile(customProfile->profileId());
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.coordinator->switchProfile(profileId);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+  // The stuck delete must not have been silently dequeued/abandoned: no
+  // new "read" call has been dispatched yet, and the fake store never
+  // received a second delete attempt either.
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete (all so far)
+
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, successWriteResult());
+
+  // Retry succeeded: the queued restore Read (enqueued behind the stuck
+  // delete while switching back) may now finally dispatch.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 5);
+  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+}
+
+void SessionCoordinatorTests::
+    deleteFailureRemainsAcrossSwitchAwayAndStartRestart() {
+  // The same required-deletion failure must remain recorded/actionable
+  // even across a full start() restart (not just switchProfile()): a
+  // stale UI/session generation must never be used as an excuse to
+  // silently drop a durable cleanup obligation.
   Harness h;
   bootToSignedIn(h, QStringLiteral("session-token"));
   const QString profileId = h.coordinator->selectedProfileId();
 
-  // Sign out while nothing else is in flight: a plain delete op is
-  // enqueued and must run to completion in order.
   h.coordinator->signOut();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
-  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete
-  QCOMPARE(h.tokenStore.calls.at(0).kind, QStringLiteral("read"));
-  QCOMPARE(h.tokenStore.calls.at(1).kind, QStringLiteral("save"));
-  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, accessDeniedResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+
+  // A full restart must not pretend the deletion succeeded, nor may it
+  // try to read a token that is still pending deletion.
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete -- no more yet
+
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("delete"));
   h.tokenStore.complete(profileId, successWriteResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
+}
+
+void SessionCoordinatorTests::staleCompensatingCleanupCannotDeleteLaterSave() {
+  // After an abandoned save has been fully compensated for by a cleanup
+  // delete (queue fully drained), a brand-new, independent sign-in cycle
+  // for the same profile must persist its own fresh token normally: the
+  // earlier (now long-completed) cleanup must have no lingering effect on
+  // a save that starts an entirely new lifecycle.
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  h.bootToSignedOut();
+  const QString profileId = h.coordinator->selectedProfileId();
+
+  // Abandon a save mid-flight (as in perProfileFifoOrdersSaveBeforeLaterDelete)
+  // and let its compensating cleanup delete run to completion.
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  h.authClient.completeToken(1,
+                             tokenSuccess(QStringLiteral("abandoned-token")));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
+  h.authClient.completeUser(2, userSuccess(QStringLiteral("bob"),
+                                           QStringLiteral("bob@example.test")));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.coordinator->switchProfile(customProfile->profileId());
+  h.tokenStore.complete(profileId, successWriteResult()); // abandoned save
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, successWriteResult()); // cleanup delete
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return !h.tokenStore.hasPending(profileId); }));
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+
+  // Switch back and start an entirely fresh, independent sign-in.
+  h.coordinator->switchProfile(profileId);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  const QString freshToken = QStringLiteral("fresh-token");
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 3; }));
+  h.authClient.completeToken(3, tokenSuccess(freshToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 4; }));
+  h.authClient.completeUser(4, userSuccess(QStringLiteral("bob"),
+                                           QStringLiteral("bob@example.test")));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+
+  const std::optional<QString> actualStored =
+      h.tokenStore.storedToken(profileId);
+  QVERIFY(actualStored.has_value());
+  QVERIFY(*actualStored == freshToken);
 }
 
 void SessionCoordinatorTests::concurrentProfilesHaveIndependentTokenQueues() {
@@ -1311,29 +1694,33 @@ void SessionCoordinatorTests::concurrentProfilesHaveIndependentTokenQueues() {
   h.profileStore.profiles = {hosted, *customProfile};
   h.profileStore.selectedId = hosted.profileId();
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString hostedId = hosted.profileId();
-  pumpEventsUntil([&h, hostedId] { return h.tokenStore.hasPending(hostedId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, hostedId] { return h.tokenStore.hasPending(hostedId); }));
 
   // Switch to the custom profile while the hosted profile's restore read is
   // still outstanding (uncancellable): both profiles now have independent,
   // non-overlapping pending operations, which FakeTokenStore would flag as
   // a fatal invariant violation if the coordinator ever mixed them up.
   h.coordinator->switchProfile(customProfile->profileId());
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
   const QString customId = customProfile->profileId();
-  pumpEventsUntil([&h, customId] { return h.tokenStore.hasPending(customId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, customId] { return h.tokenStore.hasPending(customId); }));
 
   QVERIFY(h.tokenStore.hasPending(hostedId));
   QVERIFY(h.tokenStore.hasPending(customId));
 
   h.tokenStore.complete(hostedId, notFoundResult());
   h.tokenStore.complete(customId, notFoundResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedOut;
-  });
+  }));
   const QString actualSelected = h.coordinator->selectedProfileId();
   const QString expectedSelected = customProfile->profileId();
   QVERIFY(actualSelected == expectedSelected);
@@ -1344,7 +1731,8 @@ void SessionCoordinatorTests::concurrentProfilesHaveIndependentTokenQueues() {
 void SessionCoordinatorTests::destructionSuppressesProbeCompletion() {
   Harness h;
   h.coordinator->start();
-  pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; });
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   QPointer<FakeCapabilityProbe> probe = h.probeFactory.current();
   h.coordinator.reset();
   QVERIFY(probe.isNull()); // destroyed together with the coordinator
@@ -1355,13 +1743,13 @@ void SessionCoordinatorTests::destructionSuppressesTokenStoreCompletion() {
   h.bootToSignedOut();
   const QString profileId = h.coordinator->selectedProfileId();
   h.coordinator->signIn(QStringLiteral("a@example.test"), QStringLiteral("pw"));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   h.authClient.completeToken(1, tokenSuccess(QStringLiteral("fresh-token")));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   h.authClient.completeUser(
       2, userSuccess(QStringLiteral("a"), QStringLiteral("a@example.test")));
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
 
   // Destroy the coordinator while the save is still outstanding
   // (uncancellable), then release it: FakeTokenStore invokes the stored
@@ -1377,10 +1765,210 @@ void SessionCoordinatorTests::destructionCancelsPendingAuthRequest() {
   Harness h;
   h.bootToSignedOut();
   h.coordinator->signIn(QStringLiteral("a@example.test"), QStringLiteral("pw"));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   QVERIFY(h.authClient.hasPendingToken(1));
   h.coordinator.reset();
   QVERIFY(!h.authClient.hasPendingToken(1));
+}
+
+// ─── Direct-connection reentrancy ─────────────────────────────────────────
+//
+// Qt property-changed signals are delivered SYNCHRONOUSLY. A directly
+// connected slot can therefore reenter the coordinator (switchProfile(),
+// start(), signOut(), or even destruction) from the middle of an emission
+// that the coordinator itself triggered, before the emitting method's own
+// continuation resumes. These tests connect with Qt::DirectConnection
+// (QObject::connect's default for same-thread objects) and verify the
+// coordinator never dispatches a request for an abandoned profile/session,
+// never dereferences a stale/destroyed object, and never emits a stale
+// result -- the existing sequential "reentrantStart" test above only
+// covers calling start() twice in a row, not reentrancy from inside an
+// emission, which is a fundamentally different hazard.
+
+void SessionCoordinatorTests::
+    directStateChangedReentrancyDuringSignInSendsNoStalePasswordRequest() {
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  h.bootToSignedOut();
+  const QString customId = customProfile->profileId();
+
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::stateChanged,
+      h.coordinator.get(),
+      [&h, &handled, customId] {
+        if (handled || h.coordinator->state() !=
+                           SessionCoordinator::State::Authenticating) {
+          return;
+        }
+        handled = true;
+        // Reentrantly abandon this profile from inside signIn()'s own
+        // setState(Authenticating) emission, before signIn() has had a
+        // chance to dispatch the network request.
+        h.coordinator->switchProfile(customId);
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+
+  QVERIFY(handled);
+  // The reentrant switch must have fully superseded signIn(): zero
+  // authenticate requests were ever dispatched for the abandoned profile.
+  QVERIFY(h.authClient.calls.isEmpty());
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+  const QString actualSelected = h.coordinator->selectedProfileId();
+  QVERIFY(actualSelected == customId);
+
+  // The new profile's own flow still proceeds normally afterward.
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, customId] { return h.tokenStore.hasPending(customId); }));
+  h.tokenStore.complete(customId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+}
+
+void SessionCoordinatorTests::
+    directStateChangedReentrancyDuringProbeDoesNotDereferenceDestroyedProbe() {
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+
+  bool handled = false;
+  const int createdBeforeStart = h.probeFactory.totalCreated();
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::stateChanged,
+      h.coordinator.get(),
+      [&h, &handled, &customProfile] {
+        if (handled || h.coordinator->state() !=
+                           SessionCoordinator::State::ProbingCapabilities) {
+          return;
+        }
+        handled = true;
+        // Reentrantly destroy/replace m_probe (via switchProfile()) from
+        // inside startProbe()'s own setState(ProbingCapabilities)
+        // emission, before startProbe() has dereferenced m_probe to call
+        // probe() on it. Without the QPointer+generation+non-null guard,
+        // this segfaults.
+        h.coordinator->switchProfile(customProfile->profileId());
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->start();
+
+  QVERIFY(handled);
+  // Exactly two probes were ever created: the original (superseded, never
+  // dereferenced again) and the one from the reentrant switch -- the
+  // superseded startProbe() call must not have gone on to create or
+  // dispatch a third, redundant probe for the abandoned profile.
+  QCOMPARE(h.probeFactory.totalCreated(), createdBeforeStart + 2);
+  const QString actualSelected = h.coordinator->selectedProfileId();
+  const QString expectedSelected = customProfile->profileId();
+  QVERIFY(actualSelected == expectedSelected);
+
+  // The surviving (current) probe still drives the flow normally.
+  QVERIFY(h.probeFactory.current() != nullptr);
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+}
+
+void SessionCoordinatorTests::
+    directCurrentUserChangedReentrancyCannotSignInOldProfileOrLeakSave() {
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  h.bootToSignedOut();
+  const QString hostedId = h.coordinator->selectedProfileId();
+  const QString customId = customProfile->profileId();
+
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  h.authClient.completeToken(1, tokenSuccess(QStringLiteral("fresh-token")));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
+
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::currentUserChanged,
+      h.coordinator.get(),
+      [&h, &handled, customId] {
+        if (handled || h.coordinator->currentUsername().isEmpty()) {
+          return;
+        }
+        handled = true;
+        // Reentrantly abandon this profile from inside
+        // handleWhoAmIResult()'s applyCurrentUser() emission, BEFORE the
+        // freshly validated token would otherwise be saved.
+        h.coordinator->switchProfile(customId);
+      },
+      Qt::DirectConnection);
+
+  h.authClient.completeUser(2, userSuccess(QStringLiteral("bob"),
+                                           QStringLiteral("bob@example.test")));
+  QVERIFY(pumpEventsUntil([&handled] { return handled; }));
+
+  QVERIFY(handled);
+  // The reentrant switch must have superseded the whoami success
+  // continuation entirely: the freshly obtained token is never saved for
+  // the abandoned profile (only the original restore "read" call exists),
+  // and the coordinator must not end up SignedIn for it.
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+  QCOMPARE(h.tokenStore.calls.first().kind, QStringLiteral("read"));
+  QVERIFY(!h.tokenStore.hasPending(hostedId));
+  const QString actualSelected = h.coordinator->selectedProfileId();
+  QVERIFY(actualSelected == customId);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+}
+
+void SessionCoordinatorTests::
+    coordinatorDestructionDuringStateChangedEmissionIsSafe() {
+  Harness h;
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::stateChanged,
+      h.coordinator.get(),
+      [&h, &handled] {
+        if (handled || h.coordinator->state() !=
+                           SessionCoordinator::State::ProbingCapabilities) {
+          return;
+        }
+        handled = true;
+        // Destroy the coordinator itself from inside its own
+        // stateChanged() emission. Every guard checkpoint uses a
+        // QPointer<SessionCoordinator>, so the continuation that
+        // triggered this emission must recognize destruction and return
+        // without ever touching `this` again -- this must not crash.
+        h.coordinator.reset();
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->start();
+
+  QVERIFY(handled);
+  QVERIFY(h.coordinator == nullptr);
+  // Reaching this line at all (no crash/UB) is the assertion.
 }
 
 // ─── Secret-free diagnostics ──────────────────────────────────────────────
@@ -1392,20 +1980,20 @@ void SessionCoordinatorTests::diagnosticsAndStateNeverContainSecrets() {
 
   h.bootToSignedOut();
   h.coordinator->signIn(QStringLiteral("carol@example.test"), secretPassword);
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
   h.authClient.completeToken(1, tokenSuccess(secretToken));
-  pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; });
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
   h.authClient.completeUser(2,
                             userSuccess(QStringLiteral("carol"),
                                         QStringLiteral("carol@example.test")));
   const QString profileId = h.coordinator->selectedProfileId();
-  pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); });
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   h.tokenStore.complete(profileId, backendErrorResult());
-  pumpEventsUntil([&h] {
+  QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
-  });
+  }));
 
   QVERIFY(!h.coordinator->diagnostic().contains(secretPassword));
   QVERIFY(!h.coordinator->diagnostic().contains(secretToken));

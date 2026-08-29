@@ -49,6 +49,18 @@ namespace Arkham {
 // any token-store operation already in flight is uncancellable and is left
 // to complete, but its completion is guarded by a QPointer so it can never
 // touch a destroyed coordinator.
+//
+// Durability scope: every guarantee above (uncancellable operations always
+// completing, abandoned fresh-token saves being compensated by a durable
+// cleanup delete, a failed required deletion permanently blocking later
+// same-profile operations until retried) holds for as long as this process
+// keeps running. None of it survives an OS-level process kill, crash, or
+// power loss between ITokenStore dispatching an operation and this
+// coordinator observing its completion: this class keeps no on-disk
+// journal of in-flight intent, so a process termination at exactly that
+// moment can leave the secure store in whatever state the backend itself
+// left it in, with no in-process record to resume or compensate from.
+// Nothing here claims otherwise.
 class SessionCoordinator final : public QObject {
   Q_OBJECT
   Q_PROPERTY(State state READ state NOTIFY stateChanged)
@@ -216,6 +228,14 @@ private:
     TokenOpKind kind{TokenOpKind::Read};
     QString token; // only meaningful for Save
     ITokenStore::ResultCallback onComplete;
+    // Captured from profileCredentialEpoch(profileId) at enqueue time.
+    // Only ever consulted for Save: a Save whose captured epoch no longer
+    // matches the profile's current epoch by the time it reaches the
+    // front of the FIFO was abandoned (profile switch, restart, or
+    // sign-out) before ever crossing the ITokenStore boundary, and is
+    // safely skipped without dispatching it. Read/Delete are never
+    // epoch-gated -- see invalidateProfileCredential()'s class comment.
+    quint64 admissionEpoch{0};
   };
 
   void setState(State state, QString diagnostic = {});
@@ -240,7 +260,7 @@ private:
   void handleFreshTokenResult(quint64 generation, const QString &profileId,
                               const AuthResult<AuthToken> &result);
 
-  void handleSignOutDeletionResult(quint64 generation,
+  void handleSignOutDeletionResult(quint64 generation, const QString &profileId,
                                    const TokenStoreResult &result);
 
   void cancelPendingAuthRequest();
@@ -253,9 +273,55 @@ private:
   // a later operation for the same profile (e.g. a sign-out deletion) is
   // even issued to the backing store, so a stale write can never clobber a
   // newer one and vice versa -- without needing to cancel anything.
+  //
+  // A Delete that fails is deliberately left un-dequeued at the head of
+  // the queue (see startFrontTokenOp()): a required durable deletion can
+  // never be silently abandoned merely because the coordinator's UI/
+  // session generation moved on. This durably blocks every later
+  // same-profile operation (read, save, or another delete) until the
+  // deletion is retried (see retryStuckProfileTokenOp()) and succeeds --
+  // generation only ever suppresses *state* mutation, never this
+  // durable-cleanup bookkeeping.
   void enqueueTokenOp(const QString &profileId, TokenOpKind kind, QString token,
                       ITokenStore::ResultCallback onComplete);
   void startFrontTokenOp(const QString &profileId);
+  void retryStuckProfileTokenOp(const QString &profileId);
+
+  [[nodiscard]] quint64 profileCredentialEpoch(const QString &profileId) const {
+    return m_profileCredentialEpoch.value(profileId, 0);
+  }
+
+  // Bumps |profileId|'s credential epoch. If a Save for the previous epoch
+  // has already been dispatched to ITokenStore (i.e. is the current
+  // in-flight head of that profile's FIFO queue), it cannot be un-sent:
+  // this reserves a cleanup Delete immediately behind it, so the now-
+  // abandoned token is durably removed the moment that save completes --
+  // before any later same-profile Save or Read is ever admitted. Called
+  // whenever start(), switchProfile(), or signOut() abandons whatever
+  // session activity was in progress for the profile being left. A Save
+  // that is only queued (not yet dispatched) for the previous epoch is
+  // left alone here; it is safely skipped by the epoch check in
+  // startFrontTokenOp() once it reaches the front, without ever touching
+  // ITokenStore.
+  void invalidateProfileCredential(const QString &profileId);
+
+  // Emits currentUserChanged() (if needed, via clearCurrentUser()) and
+  // then setState(state, diagnostic), but only if |generation| is still
+  // current both before and after the (possibly reentrancy-triggering)
+  // currentUserChanged() emission. clearCurrentUser()/setState() are
+  // synchronous Qt signal emissions; a directly-connected handler could
+  // reentrantly call switchProfile(), start(), signOut(), or destroy the
+  // coordinator while either is being delivered. Returns false (having
+  // made no further visible change) if superseded at either point.
+  bool clearCurrentUserAndSetStateIfCurrent(quint64 generation, State state,
+                                            QString diagnostic = {});
+
+  // Same reentrancy-safety contract as clearCurrentUserAndSetStateIfCurrent
+  // above, but for the "apply a freshly-known user, then transition to
+  // SignedIn" pattern (credential restore's whoami success path).
+  bool applyCurrentUserAndSetStateIfCurrent(quint64 generation,
+                                            const CurrentUser &user,
+                                            State state);
 
   void applyCurrentUser(const CurrentUser &user);
   void clearCurrentUser();
@@ -274,13 +340,29 @@ private:
 
   std::optional<CurrentUser> m_currentUser;
 
-  // Bumped on every profile switch and on signOut(); captured by value in
-  // every asynchronous completion lambda so a stale completion (from a
-  // profile that is no longer current, or from a session that has since
-  // been signed out) can never mutate visible state. Token-store
-  // operations still run to completion when stale (see enqueueTokenOp
-  // comment); only the *reaction* to their result is generation-gated.
+  // Bumped on every profile switch, start() restart, and signOut();
+  // captured by value in every asynchronous completion lambda so a stale
+  // completion (from a profile that is no longer current, or from a
+  // session that has since been signed out or restarted) can never mutate
+  // visible state. Token-store operations still run to completion when
+  // stale (see enqueueTokenOp comment); only the *reaction* to their
+  // result is generation-gated -- durable cleanup (see
+  // invalidateProfileCredential(), profileCredentialEpoch) is not.
   quint64 m_generation{0};
+
+  // Per-profile credential epoch: independent of m_generation (which is a
+  // single coordinator-wide UI/session counter). See
+  // invalidateProfileCredential() and TokenOp::admissionEpoch.
+  QHash<QString, quint64> m_profileCredentialEpoch;
+
+  // Profiles whose FIFO is durably blocked behind a Delete that has failed
+  // at least once and not yet been retried successfully (see
+  // startFrontTokenOp()'s non-dequeue-on-failure behavior and
+  // retryStuckProfileTokenOp()). Maps profileId to a static, secret-free
+  // diagnostic describing the block, so a later switch back to that
+  // profile (or a fresh credential restore for it) can immediately
+  // surface it rather than silently waiting behind it forever.
+  QHash<QString, QString> m_profileFifoStalled;
 
   std::function<void()> m_retryAction;
 

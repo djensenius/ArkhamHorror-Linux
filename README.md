@@ -32,11 +32,22 @@ The current walking skeleton establishes:
   seeding, capability probing before any secure-token read, credential
   restore (including durable cleanup of a rejected token), sign-in/register/
   sign-out, and profile switching with generation-based staleness
-  protection and per-profile FIFO token operations. Its properties/signals
-  never expose a password, token, or `Authorization` header. The production
-  composition (`AppSessionComposition`) and the hermetic `--smoke-test` gate
-  (`AppBootstrap`) ensure smoke-test runs never construct the coordinator or
-  touch QSettings/the network/the keychain.
+  protection and per-profile FIFO token operations. A separate per-profile
+  credential epoch tracks whether a fresh-token save has already crossed
+  the (uncancellable) secure-store boundary when a switch/restart/sign-out
+  invalidates the session: if so, a compensating delete is reserved behind
+  it in FIFO order so an abandoned token is never left stored, and a
+  required deletion that fails is left durably blocking that profile's
+  queue (never silently dropped) until a retry succeeds. Every emission
+  that can reenter the coordinator (`stateChanged`, `currentUserChanged`,
+  `selectedProfileChanged`) is guarded so a directly-connected reentrant
+  `switchProfile()`/`start()`/`signOut()`/destruction during that emission
+  can never dispatch a request for an abandoned profile, dereference a
+  stale/destroyed probe, or resurrect a superseded state. Its properties/
+  signals never expose a password, token, or `Authorization` header. The
+  production composition (`AppSessionComposition`) and the hermetic
+  `--smoke-test` gate (`AppBootstrap`) ensure smoke-test runs never
+  construct the coordinator or touch QSettings/the network/the keychain.
 - Separate lint, test, build, and AppImage CI jobs.
 - A `mise` entry point for local and CI tasks.
 
@@ -50,6 +61,15 @@ Secret Service/KWallet usability inside SteamOS Gaming Mode has not been
 verified on real hardware; do not assume it works there. When a backend is
 unavailable or unsupported, `QtKeychainTokenStore` reports an explicit
 typed failure rather than silently falling back to an insecure store.
+
+`SessionCoordinator`'s credential-epoch/cleanup durability guarantees hold
+only for the coordinator's in-process lifetime: there is no on-disk journal
+of in-flight save/delete intent, so an OS-level process kill or crash while
+a fresh-token save or a required compensating deletion is in flight can
+still leave a stale token in the OS secret store until the next successful
+sign-out/cleanup for that profile. This is an accepted, explicitly
+documented residual risk (see `SessionCoordinator.h`'s "Durability scope"
+comment), not a claim of crash-proof durability.
 
 ## Prerequisites
 

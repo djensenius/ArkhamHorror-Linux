@@ -108,14 +108,30 @@ void SessionCoordinator::start() {
   // start() doc comment in SessionCoordinator.h): cancelling any pending
   // auth request, discarding the current probe, and bumping the generation
   // makes every in-flight async completion from a prior start() stale, so
-  // it can never mutate state after this restart.
+  // it can never mutate state after this restart. If a fresh-token save
+  // for the profile being abandoned has already crossed the ITokenStore
+  // boundary, invalidateProfileCredential() reserves a compensating
+  // cleanup delete for it before any later same-profile auth/save can run.
   cancelPendingAuthRequest();
   m_probe.reset();
+  if (m_currentProfile.has_value()) {
+    invalidateProfileCredential(m_currentProfile->profileId());
+  }
   ++m_generation;
+  const quint64 generation = m_generation;
   m_retryAction = nullptr;
-  clearCurrentUser();
 
+  QPointer<SessionCoordinator> self(this);
+  clearCurrentUser();
   setState(State::Loading);
+  if (!self || generation != self->m_generation) {
+    // A directly-connected currentUserChanged()/stateChanged() handler
+    // reentrantly called start()/switchProfile()/signOut(), or destroyed
+    // the coordinator, while one of the above was being delivered: never
+    // let this now-superseded call continue with a stale local
+    // |generation| and possibly-destroyed |this|.
+    return;
+  }
 
   const auto profilesResult = m_profileStore.loadProfiles();
   if (!profilesResult) {
@@ -186,6 +202,9 @@ void SessionCoordinator::start() {
   m_selectedProfileId = selectedId;
   m_currentProfile = selectedProfile;
   emit selectedProfileChanged();
+  if (!self || generation != self->m_generation) {
+    return; // superseded while selectedProfileChanged() was being delivered
+  }
 
   startProbe();
 }
@@ -216,15 +235,30 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
 
   cancelPendingAuthRequest();
   // Destroying the probe suppresses any pending finished() signal from the
-  // profile being switched away from.
+  // profile being switched away from. If a fresh-token save for that
+  // profile has already crossed the ITokenStore boundary,
+  // invalidateProfileCredential() reserves a compensating cleanup delete
+  // for it before any later same-profile auth/save can run.
   m_probe.reset();
+  if (m_currentProfile.has_value()) {
+    invalidateProfileCredential(m_currentProfile->profileId());
+  }
   ++m_generation;
+  const quint64 generation = m_generation;
   m_retryAction = nullptr;
+
+  QPointer<SessionCoordinator> self(this);
   clearCurrentUser();
+  if (!self || generation != self->m_generation) {
+    return; // superseded while currentUserChanged() was being delivered
+  }
 
   m_selectedProfileId = profileId;
   m_currentProfile = *it;
   emit selectedProfileChanged();
+  if (!self || generation != self->m_generation) {
+    return; // superseded while selectedProfileChanged() was being delivered
+  }
 
   startProbe();
 }
@@ -249,7 +283,16 @@ void SessionCoordinator::startProbe() {
           [this, generation](ProbeResult result) {
             onProbeFinished(generation, std::move(result));
           });
+  QPointer<SessionCoordinator> self(this);
   setState(State::ProbingCapabilities);
+  if (!self || generation != self->m_generation || !self->m_probe) {
+    // A directly-connected stateChanged() handler reentrantly called
+    // switchProfile()/start()/signOut() (which reset m_probe and bumped
+    // the generation) or destroyed the coordinator while this emission
+    // was being delivered: m_probe may already be null or a different
+    // instance entirely, so it must never be dereferenced below.
+    return;
+  }
   m_probe->probe(*m_currentProfile);
 }
 
@@ -280,10 +323,32 @@ void SessionCoordinator::onProbeFinished(quint64 generation,
 // ─── Credential restore ─────────────────────────────────────────────────
 
 void SessionCoordinator::startCredentialRestore() {
-  setState(State::RestoringCredential);
+  // Capture generation/profileId BEFORE emitting: setState() below is a
+  // synchronous stateChanged() emission, and a directly-connected handler
+  // could reentrantly call switchProfile()/start()/signOut() (which would
+  // change m_currentProfile/m_generation) while it is being delivered.
+  // Re-deriving these from members only *after* the emission would enqueue
+  // a read for the wrong profile/generation -- a credential read must
+  // never be issued for a profile whose own capability probe has not
+  // itself just completed.
   const quint64 generation = m_generation;
   const QString profileId = m_currentProfile->profileId();
+  const bool stalled = m_profileFifoStalled.contains(profileId);
   QPointer<SessionCoordinator> self(this);
+  setState(stalled ? State::SecureStorageUnavailable
+                   : State::RestoringCredential,
+           stalled ? m_profileFifoStalled.value(profileId) : QString());
+  if (!self || generation != self->m_generation) {
+    return; // superseded while stateChanged() was being delivered
+  }
+  if (stalled) {
+    // A previously-failed required deletion for this profile is still
+    // durably blocking its FIFO (see startFrontTokenOp()); enqueuing a
+    // fresh read below is still correct (it will simply wait behind that
+    // still-queued deletion), but retry() must resolve the deletion, not
+    // silently wait forever with no actionable feedback.
+    m_retryAction = [this, profileId] { retryStuckProfileTokenOp(profileId); };
+  }
   enqueueTokenOp(profileId, TokenOpKind::Read, QString(),
                  [self, generation, profileId](TokenStoreResult result) {
                    if (!self) {
@@ -301,8 +366,7 @@ void SessionCoordinator::handleRestoreReadResult(
     const TokenStoreResult &result) {
   switch (result.outcome) {
   case TokenStoreOutcome::NotFound:
-    clearCurrentUser();
-    setState(State::SignedOut);
+    clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut);
     return;
   case TokenStoreOutcome::Success:
     issueWhoAmI(generation, profileId, result.token,
@@ -351,15 +415,21 @@ void SessionCoordinator::handleWhoAmIResult(
     quint64 generation, const QString &profileId, const QString &token,
     WhoAmIPurpose purpose, const AuthResult<CurrentUser> &result) {
   if (result.outcome == AuthOutcome::Success) {
-    applyCurrentUser(*result.value);
     if (purpose == WhoAmIPurpose::RestoreExisting) {
       // Already durably stored; nothing more to persist.
-      setState(State::SignedIn);
+      applyCurrentUserAndSetStateIfCurrent(generation, *result.value,
+                                           State::SignedIn);
       return;
     }
     // Freshly obtained token: persist it before declaring signed in. The
     // admission check happens immediately before enqueuing the write.
-    if (generation != m_generation) {
+    // applyCurrentUser()'s currentUserChanged() emission is synchronous
+    // and could reentrantly trigger switchProfile()/start()/signOut(), so
+    // |generation| is re-checked afterward before ever touching the
+    // secure store for a session that may no longer be current.
+    QPointer<SessionCoordinator> self(this);
+    applyCurrentUser(*result.value);
+    if (!self || generation != self->m_generation) {
       return;
     }
     saveFreshlyObtainedToken(generation, profileId, token);
@@ -375,9 +445,9 @@ void SessionCoordinator::handleWhoAmIResult(
       // Nothing was ever saved for a freshly rejected token; just report
       // signed out. This path is shared by signIn() and registerAccount(),
       // so the diagnostic must not claim it was specifically a sign-in.
-      clearCurrentUser();
-      setState(State::SignedOut,
-               QStringLiteral("The server rejected the freshly issued token."));
+      clearCurrentUserAndSetStateIfCurrent(
+          generation, State::SignedOut,
+          QStringLiteral("The server rejected the freshly issued token."));
     }
     return;
   }
@@ -395,8 +465,8 @@ void SessionCoordinator::handleWhoAmIResult(
     };
     setState(State::RecoverableFailure, result.diagnostic);
   } else {
-    clearCurrentUser();
-    setState(State::SignedOut, result.diagnostic);
+    clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut,
+                                         result.diagnostic);
   }
 }
 
@@ -455,23 +525,28 @@ void SessionCoordinator::deleteRestoredUnauthorizedToken(
                    if (!self) {
                      return;
                    }
+                   if (deleteResult.outcome == TokenStoreOutcome::Success) {
+                     self->clearCurrentUserAndSetStateIfCurrent(
+                         generation, State::SignedOut);
+                     return;
+                   }
+                   // A failed required deletion is left un-dequeued at the
+                   // head of this profile's FIFO (see startFrontTokenOp())
+                   // regardless of |generation|: durable cleanup is never
+                   // abandoned just because the UI/session moved on. Only
+                   // the visible state transition below is generation-
+                   // gated.
                    if (generation != self->m_generation) {
                      return;
                    }
-                   if (deleteResult.outcome == TokenStoreOutcome::Success) {
-                     self->clearCurrentUser();
-                     self->setState(State::SignedOut);
-                   } else {
-                     self->m_retryAction = [self, generation, profileId] {
-                       if (!self) {
-                         return;
-                       }
-                       self->deleteRestoredUnauthorizedToken(generation,
-                                                             profileId);
-                     };
-                     self->setState(State::SecureStorageUnavailable,
-                                    deleteResult.diagnostic);
-                   }
+                   self->m_retryAction = [self, profileId] {
+                     if (!self) {
+                       return;
+                     }
+                     self->retryStuckProfileTokenOp(profileId);
+                   };
+                   self->setState(State::SecureStorageUnavailable,
+                                  deleteResult.diagnostic);
                  });
 }
 
@@ -490,8 +565,17 @@ void SessionCoordinator::signIn(const QString &email, const QString &password) {
   const quint64 generation = m_generation;
   const QString profileId = m_currentProfile->profileId();
   const ServerProfile profile = *m_currentProfile;
-  setState(State::Authenticating);
   QPointer<SessionCoordinator> self(this);
+  setState(State::Authenticating);
+  if (!self || generation != self->m_generation) {
+    // A directly-connected stateChanged() handler reentrantly switched
+    // profile, restarted, or signed out while this emission was being
+    // delivered: the captured |profile|/|profileId| are for a session
+    // that is no longer current. Issuing the request below would send a
+    // password request for the wrong (abandoned) profile, so this must
+    // produce zero network calls instead.
+    return;
+  }
   m_pendingAuthHandle = m_authClient.authenticate(
       profile, AuthenticateRequest{email, password},
       [self, generation, profileId](AuthResult<AuthToken> result) {
@@ -523,8 +607,12 @@ void SessionCoordinator::registerAccount(const QString &email,
   const quint64 generation = m_generation;
   const QString profileId = m_currentProfile->profileId();
   const ServerProfile profile = *m_currentProfile;
-  setState(State::Registering);
   QPointer<SessionCoordinator> self(this);
+  setState(State::Registering);
+  if (!self || generation != self->m_generation) {
+    // See signIn()'s identical guard: never send a stale-profile request.
+    return;
+  }
   m_pendingAuthHandle = m_authClient.registerAccount(
       profile, RegisterRequest{email, username, password},
       [self, generation, profileId](AuthResult<AuthToken> result) {
@@ -546,8 +634,8 @@ void SessionCoordinator::handleFreshTokenResult(
     quint64 generation, const QString &profileId,
     const AuthResult<AuthToken> &result) {
   if (result.outcome != AuthOutcome::Success) {
-    clearCurrentUser();
-    setState(State::SignedOut, result.diagnostic);
+    clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut,
+                                         result.diagnostic);
     return;
   }
   issueWhoAmI(generation, profileId, result.value->token,
@@ -561,51 +649,47 @@ void SessionCoordinator::signOut() {
     return;
   }
   cancelPendingAuthRequest();
+  const QString profileId = m_currentProfile->profileId();
+  // Defensive: signOut() itself is about to enqueue a Delete for this
+  // profile, so there is no separate in-flight Save to compensate for at
+  // this exact instant, but bumping the credential epoch here keeps the
+  // invariant uniform ("every session-invalidating transition invalidates
+  // the outgoing profile's credential epoch") regardless of how signOut()
+  // is reached in the future.
+  invalidateProfileCredential(profileId);
   ++m_generation;
   const quint64 generation = m_generation;
-  const QString profileId = m_currentProfile->profileId();
   QPointer<SessionCoordinator> self(this);
   enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
-                 [self, generation](TokenStoreResult result) {
+                 [self, generation, profileId](TokenStoreResult result) {
                    if (!self) {
                      return;
                    }
-                   if (generation != self->m_generation) {
-                     return;
-                   }
-                   self->handleSignOutDeletionResult(generation, result);
+                   self->handleSignOutDeletionResult(generation, profileId,
+                                                     result);
                  });
 }
 
 void SessionCoordinator::handleSignOutDeletionResult(
-    quint64 generation, const TokenStoreResult &result) {
+    quint64 generation, const QString &profileId,
+    const TokenStoreResult &result) {
   if (result.outcome == TokenStoreOutcome::Success) {
-    clearCurrentUser();
-    setState(State::SignedOut);
+    clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut);
     return;
   }
   // Never claim signed out while the token might still remain in the
   // secure store: report an explicit, retryable failure instead. The
+  // failed Delete is left un-dequeued at the head of this profile's FIFO
+  // (see startFrontTokenOp()) regardless of |generation|, so it durably
+  // blocks any later same-profile operation until retryStuckProfileTokenOp()
+  // succeeds -- this is never abandoned just because the UI/session moved
+  // on. Only the visible state transition below is generation-gated; the
   // signed-in identity is preserved (not cleared) so the UI can still show
   // who is signed in while the user retries.
-  const QString profileId =
-      m_currentProfile.has_value() ? m_currentProfile->profileId() : QString();
-  m_retryAction = [this, generation, profileId] {
-    if (generation != m_generation) {
-      return;
-    }
-    QPointer<SessionCoordinator> self(this);
-    enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
-                   [self, generation](TokenStoreResult retryResult) {
-                     if (!self) {
-                       return;
-                     }
-                     if (generation != self->m_generation) {
-                       return;
-                     }
-                     self->handleSignOutDeletionResult(generation, retryResult);
-                   });
-  };
+  if (generation != m_generation) {
+    return;
+  }
+  m_retryAction = [this, profileId] { retryStuckProfileTokenOp(profileId); };
   setState(State::SecureStorageUnavailable, result.diagnostic);
 }
 
@@ -634,7 +718,9 @@ void SessionCoordinator::enqueueTokenOp(
     ITokenStore::ResultCallback onComplete) {
   auto &queue = m_tokenQueues[profileId];
   const bool wasEmpty = queue.isEmpty();
-  queue.enqueue(TokenOp{kind, std::move(token), std::move(onComplete)});
+  TokenOp op{kind, std::move(token), std::move(onComplete)};
+  op.admissionEpoch = profileCredentialEpoch(profileId);
+  queue.enqueue(std::move(op));
   if (wasEmpty) {
     startFrontTokenOp(profileId);
   }
@@ -646,6 +732,30 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
     return;
   }
   const TokenOp &op = queueIt->head();
+
+  if (op.kind == TokenOpKind::Save &&
+      op.admissionEpoch != profileCredentialEpoch(profileId)) {
+    // This Save was queued behind an operation that has since invalidated
+    // the profile's credential epoch (profile switch/restart/sign-out
+    // occurred before this Save ever crossed the ITokenStore boundary).
+    // It never needs to run -- and must not, since a subsequent
+    // compensating Delete may already be queued right behind it -- so it
+    // is skipped without ever touching the real secure store. Its
+    // onComplete is intentionally never invoked: nothing in the
+    // coordinator depends on it firing for an op that was never admitted
+    // (the caller's own generation guard already treats this the same as
+    // a stale/never-observed completion).
+    auto finishedOp = queueIt->dequeue();
+    const bool hasMore = !queueIt->isEmpty();
+    if (queueIt->isEmpty()) {
+      m_tokenQueues.erase(queueIt);
+    }
+    if (hasMore) {
+      startFrontTokenOp(profileId);
+    }
+    return;
+  }
+
   const TokenOpKind kind = op.kind;
   const QString token = op.token;
 
@@ -658,6 +768,30 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
     if (it == self->m_tokenQueues.end() || it->isEmpty()) {
       return; // should not happen; defensive
     }
+    const TokenOpKind finishedKind = it->head().kind;
+    const bool deleteFailed = finishedKind == TokenOpKind::Delete &&
+                              result.outcome != TokenStoreOutcome::Success;
+    if (deleteFailed) {
+      // A required Delete must never be silently abandoned: leave it at
+      // the head of the FIFO (un-dequeued) so it durably blocks every
+      // later same-profile operation until retryStuckProfileTokenOp()
+      // successfully re-dispatches this exact op. Its onComplete is still
+      // invoked (below) so the caller can surface the failure/retry
+      // action, but the FIFO does not advance.
+      self->m_profileFifoStalled.insert(
+          profileId,
+          result.diagnostic.isEmpty()
+              ? QStringLiteral("A required secure-store deletion failed "
+                               "and must be retried.")
+              : result.diagnostic);
+      const ITokenStore::ResultCallback &onComplete = it->head().onComplete;
+      if (onComplete) {
+        onComplete(result);
+      }
+      return;
+    }
+
+    self->m_profileFifoStalled.remove(profileId);
     TokenOp finishedOp = it->dequeue();
     const bool hasMore = !it->isEmpty();
     if (it->isEmpty()) {
@@ -692,6 +826,77 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
     m_tokenStore.deleteToken(profileId, std::move(onResult));
     break;
   }
+}
+
+void SessionCoordinator::retryStuckProfileTokenOp(const QString &profileId) {
+  // The stuck op's original onComplete closure is still installed at the
+  // head of the queue (it was never dequeued on failure); simply
+  // re-dispatching the front op re-runs the exact same operation with the
+  // exact same continuation -- no need to reconstruct or re-enqueue it.
+  startFrontTokenOp(profileId);
+}
+
+void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
+  const quint64 oldEpoch = m_profileCredentialEpoch.value(profileId, 0);
+  m_profileCredentialEpoch.insert(profileId, oldEpoch + 1);
+
+  const auto queueIt = m_tokenQueues.find(profileId);
+  if (queueIt == m_tokenQueues.end() || queueIt->isEmpty()) {
+    return;
+  }
+  const TokenOp &front = queueIt->head();
+  if (front.kind != TokenOpKind::Save || front.admissionEpoch != oldEpoch) {
+    // Either there is no in-flight Save for this profile, or the front op
+    // was already stamped with a newer epoch (already compensated for by
+    // an earlier invalidation) -- nothing further to reserve.
+    return;
+  }
+  // The front Save was admitted under the epoch we just invalidated. Since
+  // it is at the head of the FIFO, it has already been dispatched to the
+  // real ITokenStore (queued-but-undispatched Saves are never at the
+  // head -- only the op actually in flight occupies that position) and is
+  // therefore uncancellable: it may still succeed and durably persist a
+  // token for a profile/session that is no longer current. Reserve a
+  // compensating Delete behind it now, before any later same-profile
+  // auth/save can be enqueued, so that FIFO ordering alone guarantees the
+  // cleanup always runs after whatever the in-flight Save ends up doing.
+  enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
+                 [](TokenStoreResult) {
+                   // No coordinator-visible reaction: this compensating
+                   // cleanup exists purely to remove a possibly-leaked
+                   // token. A failure here still leaves the profile's FIFO
+                   // durably stalled (see startFrontTokenOp()) and will be
+                   // surfaced the next time that profile becomes current
+                   // again (see startCredentialRestore()'s stalled check).
+                 });
+}
+
+bool SessionCoordinator::clearCurrentUserAndSetStateIfCurrent(
+    quint64 generation, State state, QString diagnostic) {
+  if (generation != m_generation) {
+    return false;
+  }
+  QPointer<SessionCoordinator> self(this);
+  clearCurrentUser();
+  if (!self || generation != self->m_generation) {
+    return false; // superseded while currentUserChanged() was delivered
+  }
+  self->setState(state, std::move(diagnostic));
+  return !self.isNull() && generation == self->m_generation;
+}
+
+bool SessionCoordinator::applyCurrentUserAndSetStateIfCurrent(
+    quint64 generation, const CurrentUser &user, State state) {
+  if (generation != m_generation) {
+    return false;
+  }
+  QPointer<SessionCoordinator> self(this);
+  applyCurrentUser(user);
+  if (!self || generation != self->m_generation) {
+    return false; // superseded while currentUserChanged() was delivered
+  }
+  self->setState(state);
+  return !self.isNull() && generation == self->m_generation;
 }
 
 } // namespace Arkham
