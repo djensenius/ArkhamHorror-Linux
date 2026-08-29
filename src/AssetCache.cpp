@@ -25,14 +25,33 @@
 #include <unistd.h>
 #endif
 #if defined(__linux__)
-// statx()/struct statx/STATX_MNT_ID are declared by glibc's own
-// <sys/stat.h> when new enough (STATX_MNT_ID itself requires glibc
-// with kernel-5.8-era constants). Guarded entirely behind
-// `#if defined(STATX_MNT_ID)` below -- see MountIdentity's comment --
-// so this degrades to the pre-existing st_dev-only behaviour at compile
-// time on any older glibc/kernel header set, and at RUN time on any
-// older kernel that doesn't actually populate STATX_MNT_ID even if the
-// headers declare it.
+// statx()/struct statx are declared by glibc's own <sys/stat.h>, but
+// STATX_MNT_ID itself is NOT visible through that header alone under a
+// strict-ISO build: this project builds with
+// `set(CMAKE_CXX_EXTENSIONS OFF)` (see CMakeLists.txt), i.e.
+// `-std=c++23` rather than `-std=gnu++23`, so the compiler never
+// implicitly defines `_GNU_SOURCE` -- and glibc's own
+// bits/statx-generic.h (which is what actually declares STATX_MNT_ID)
+// is gated behind `_GNU_SOURCE`/`_DEFAULT_SOURCE`. An earlier version
+// of this file relied on plain `<sys/stat.h>` alone and was WRONG: the
+// `#if defined(STATX_MNT_ID)` guard below silently evaluated false in
+// this project's actual strict-ISO build configuration (even on a very
+// new glibc/kernel that fully supports the feature at runtime),
+// degrading every mount-id comparison to a bare st_dev check -- which
+// treats a same-device bind mount as ordinary same-mount content
+// instead of refusing to descend into it. Explicitly including
+// <linux/stat.h> (the kernel UAPI header, unconditionally exposing the
+// STATX_MNT_ID constant regardless of glibc feature-test macros, and
+// safely coexisting with glibc's own <sys/stat.h> on any glibc new
+// enough to define statx()/struct statx at all) closes that gap
+// without weakening CMAKE_CXX_EXTENSIONS project-wide just for this
+// one file. The `#if defined(STATX_MNT_ID)` guard below is kept
+// regardless, so this still degrades to the pre-existing st_dev-only
+// behaviour at compile time on any genuinely older/nonstandard header
+// set lacking the kernel UAPI header entirely, and at RUN time on any
+// older kernel that doesn't actually populate STATX_MNT_ID even though
+// the headers declare it (see mountIdViaStatx()'s stx_mask check).
+#include <linux/stat.h>
 #include <sys/syscall.h>
 #endif
 
@@ -2272,6 +2291,23 @@ bool AssetCache::directoryChainResolvesNoFollowForTesting(
 #else
   Q_UNUSED(trustedAnchorPath);
   Q_UNUSED(ownedSuffixComponents);
+  return false;
+#endif
+}
+
+bool AssetCache::mountIdentificationSupportedForTesting(const QString &path) {
+#if defined(__linux__) && defined(STATX_MNT_ID)
+  const QByteArray pathUtf8 = QFile::encodeName(path);
+  const int fd =
+      ::open(pathUtf8.constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  const MountIdentity identity = mountIdentityForFd(fd);
+  ::close(fd);
+  return identity.hasMountId;
+#else
+  Q_UNUSED(path);
   return false;
 #endif
 }

@@ -87,6 +87,7 @@ private slots:
   ownedSuffixComponentThatIsASymlinkIsRejectedEvenWhenTrustedAnchorIsPlain();
   void ownedSuffixOfPlainDirectoriesUnderTrustedAnchorResolvesSuccessfully();
   void crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted();
+  void mountIdentificationIsActuallySupportedOnThisLinuxBuildUnprivileged();
 
   // Round-6 item 6: invalidate() must report a typed failure -- rather
   // than silently succeeding -- when the manifest unlink it depends on

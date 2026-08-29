@@ -1679,8 +1679,29 @@ void AssetCacheTests::
   const QString decoyMountPoint =
       m_tempDirPath + QStringLiteral("/decoy-mount");
   QVERIFY(QDir().mkpath(decoyMountPoint));
-  const QString bindSource = m_tempDirPath + QStringLiteral("/bind-source");
-  QVERIFY(QDir().mkpath(bindSource));
+  // The bind mount's SOURCE directory is deliberately a completely
+  // separate QTemporaryDir, NOT a sibling reachable from inside
+  // `m_tempDirPath` itself. A real attacker's bind-mount source (the
+  // scenario this test exercises: something foreign planted onto a
+  // subdirectory of this cache's exclusively-owned root) always lives
+  // somewhere else entirely on the filesystem -- it is never itself a
+  // path this cache's own cleanup sweep would otherwise enumerate and
+  // legitimately reclaim as an ordinary, unrecognized same-mount stray
+  // directory (see strayDirectoryIsRemovedAndCountedTowardDiskUsage()'s
+  // test just above, which relies on exactly that cleanup behaviour
+  // being correct and unconditional for genuine same-mount strays).
+  // Putting the source INSIDE the cache root would make this test
+  // self-defeating: reapAndEnforceQuota()'s own (deliberately
+  // unconditional) top-level stray-directory removal would recurse
+  // into and delete the source's real content THROUGH ITS OWN PATH
+  // (never through the mount, and never violating the cross-mount
+  // guard this test exists to verify) the moment the constructor's
+  // automatic reap sweep runs, collapsing the mount point's own
+  // observed size to zero and starving the very assertion below for a
+  // reason that has nothing to do with the cross-mount guard itself.
+  QTemporaryDir bindSourceDir;
+  QVERIFY(bindSourceDir.isValid());
+  const QString bindSource = bindSourceDir.path();
   {
     QFile sentinel(bindSource + QStringLiteral("/sentinel.bin"));
     QVERIFY(sentinel.open(QIODevice::WriteOnly));
@@ -1725,6 +1746,32 @@ void AssetCacheTests::
   // ordinary stray directory the reap sweep would otherwise remove.
   QVERIFY(QFileInfo::exists(decoyMountPoint));
   QVERIFY(QFileInfo::exists(bindSource + QStringLiteral("/sentinel.bin")));
+#endif
+}
+
+void AssetCacheTests::
+    mountIdentificationIsActuallySupportedOnThisLinuxBuildUnprivileged() {
+  // Regression for the actual root cause behind the bind-mount test
+  // above ever failing at all on real CI: `STATX_MNT_ID` is declared by
+  // the Linux kernel UAPI header, but was previously only reachable
+  // through glibc's <sys/stat.h> feature-test-macro-gated extension --
+  // invisible under this project's own `CMAKE_CXX_EXTENSIONS OFF`
+  // strict `-std=c++23` build even on a brand-new glibc/kernel that
+  // fully supports the feature at runtime. That silent compile-time
+  // degradation made every same-device bind-mount comparison fall back
+  // to a bare st_dev check, which wrongly treats a bind mount as
+  // ordinary same-mount content -- exactly what the test above exists
+  // to catch, but only when passwordless sudo is actually available.
+  // This assertion needs no privilege at all (an ordinary, unmodified
+  // directory already has its own real mount id on any Linux kernel new
+  // enough to run this project at all), so it fails fast and
+  // unconditionally on Linux CI even in an environment where the
+  // bind-mount test above can only QSKIP.
+#if !defined(__linux__)
+  QSKIP("STATX_MNT_ID support is a Linux-specific concept; not "
+        "applicable on this platform");
+#else
+  QVERIFY(AssetCache::mountIdentificationSupportedForTesting(m_tempDirPath));
 #endif
 }
 

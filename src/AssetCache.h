@@ -315,6 +315,22 @@ public:
       const QString &trustedAnchorPath,
       const QStringList &ownedSuffixComponents);
 
+  // Test-only, UNPRIVILEGED witness for whether this build actually
+  // resolved the kernel's per-mount identifier (Linux 5.8+'s statx()
+  // STATX_MNT_ID) for an ordinary directory (`path`) at RUNTIME -- i.e.
+  // whether the strengthened same-device-bind-mount detection described
+  // by MountIdentity's comment in AssetCache.cpp is actually active,
+  // rather than having silently degraded to the weaker st_dev-only
+  // comparison. On any real Linux CI/desktop kernel this must be true;
+  // false here (without needing any privileged bind mount to observe
+  // it) is itself the regression -- see the fix for the header-
+  // visibility gap this exists to catch, so it never silently recurs
+  // undetected again if some future compiler/include-order change hides
+  // the STATX_MNT_ID constant. Returns false unconditionally on any
+  // non-Linux platform (the feature does not apply there).
+  [[nodiscard]] static bool
+  mountIdentificationSupportedForTesting(const QString &path);
+
 private:
   struct DiskMetadata {
     QString key;
