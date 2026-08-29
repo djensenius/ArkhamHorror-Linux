@@ -109,20 +109,20 @@ void GamesTests::decodesPendingRowFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
 
-  QCOMPARE(result->kind, GameListRow::Kind::Success);
-  QCOMPARE(result->id->value(),
+  QCOMPARE(result->kind(), GameListRow::Kind::Success);
+  QCOMPARE(result->id()->value(),
            QStringLiteral("00000000-0000-0000-0000-000000000003"));
-  QVERIFY(result->scenario.has_value());
-  QCOMPARE(result->scenario->id.value(), QStringLiteral("c01104"));
-  QCOMPARE(result->scenario->difficulty, Difficulty::Easy);
-  QVERIFY(!result->campaign.has_value());
-  QVERIFY(result->gameState.has_value());
-  QCOMPARE(result->gameState->kind, GameState::Kind::Pending);
-  QVERIFY(result->gameState->playerIds.isEmpty());
-  QCOMPARE(result->name, QStringLiteral("Contract fixture game"));
-  QVERIFY(result->investigators.isEmpty());
-  QCOMPARE(*result->multiplayerVariant, MultiplayerVariant::Solo);
-  QVERIFY(!result->hasOpenSeats);
+  QVERIFY(result->scenario().has_value());
+  QCOMPARE(result->scenario()->id.value(), QStringLiteral("c01104"));
+  QCOMPARE(result->scenario()->difficulty, Difficulty::Easy);
+  QVERIFY(!result->campaign().has_value());
+  QVERIFY(result->gameState().has_value());
+  QCOMPARE(result->gameState()->kind, GameState::Kind::Pending);
+  QVERIFY(result->gameState()->playerIds.isEmpty());
+  QCOMPARE(result->name(), QStringLiteral("Contract fixture game"));
+  QVERIFY(result->investigators().isEmpty());
+  QCOMPARE(*result->multiplayerVariant(), MultiplayerVariant::Solo);
+  QVERIFY(!result->hasOpenSeats());
 
   QCOMPARE(result->toJson(), rows.at(0).toObject());
 }
@@ -133,21 +133,22 @@ void GamesTests::decodesChooseDecksRowFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
 
-  QVERIFY(!result->scenario.has_value());
-  QVERIFY(result->campaign.has_value());
-  QCOMPARE(result->campaign->id.value(), QStringLiteral("06"));
-  QCOMPARE(result->campaign->difficulty, Difficulty::Easy);
-  QCOMPARE(*result->campaign->currentCampaignMode, CampaignPart::TheDreamQuest);
-  QCOMPARE(result->gameState->kind, GameState::Kind::ChooseDecks);
-  QCOMPARE(result->gameState->playerIds.size(), 1);
-  QCOMPARE(result->gameState->playerIds.at(0).toString(QUuid::WithoutBraces),
+  QVERIFY(!result->scenario().has_value());
+  QVERIFY(result->campaign().has_value());
+  QCOMPARE(result->campaign()->id.value(), QStringLiteral("06"));
+  QCOMPARE(result->campaign()->difficulty, Difficulty::Easy);
+  QCOMPARE(*result->campaign()->currentCampaignMode,
+           CampaignPart::TheDreamQuest);
+  QCOMPARE(result->gameState()->kind, GameState::Kind::ChooseDecks);
+  QCOMPARE(result->gameState()->playerIds.size(), 1);
+  QCOMPARE(result->gameState()->playerIds.at(0).toString(QUuid::WithoutBraces),
            QStringLiteral("00000000-0000-0000-0000-000000000001"));
-  QCOMPARE(result->investigators.size(), 2);
-  QCOMPARE(result->investigators.at(0).id.value(), QStringLiteral("c06001"));
-  QCOMPARE(result->investigators.at(0).classSymbol, ClassSymbol::Guardian);
-  QCOMPARE(result->otherInvestigators.size(), 1);
-  QCOMPARE(*result->multiplayerVariant, MultiplayerVariant::WithFriends);
-  QVERIFY(result->hasOpenSeats);
+  QCOMPARE(result->investigators().size(), 2);
+  QCOMPARE(result->investigators().at(0).id.value(), QStringLiteral("c06001"));
+  QCOMPARE(result->investigators().at(0).classSymbol, ClassSymbol::Guardian);
+  QCOMPARE(result->otherInvestigators().size(), 1);
+  QCOMPARE(*result->multiplayerVariant(), MultiplayerVariant::WithFriends);
+  QVERIFY(result->hasOpenSeats());
 
   QCOMPARE(result->toJson(), rows.at(1).toObject());
 }
@@ -157,7 +158,7 @@ void GamesTests::decodesActiveRowFromFixture() {
   const auto result = GameListRow::fromJson(rows.at(2), u"rows[2]");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->gameState->kind, GameState::Kind::Active);
+  QCOMPARE(result->gameState()->kind, GameState::Kind::Active);
   QCOMPARE(result->toJson(), rows.at(2).toObject());
 }
 
@@ -166,7 +167,7 @@ void GamesTests::decodesOverRowFromFixture() {
   const auto result = GameListRow::fromJson(rows.at(3), u"rows[3]");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->gameState->kind, GameState::Kind::Over);
+  QCOMPARE(result->gameState()->kind, GameState::Kind::Over);
   QCOMPARE(result->toJson(), rows.at(3).toObject());
 }
 
@@ -175,8 +176,8 @@ void GamesTests::decodesFailureRowFromFixture() {
   const auto result = GameListRow::fromJson(rows.at(4), u"rows[4]");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->kind, GameListRow::Kind::Failure);
-  QCOMPARE(result->error, QStringLiteral("Contract fixture failed to load."));
+  QCOMPARE(result->kind(), GameListRow::Kind::Failure);
+  QCOMPARE(result->error(), QStringLiteral("Contract fixture failed to load."));
   QCOMPARE(result->toJson(), rows.at(4).toObject());
 }
 
@@ -231,8 +232,8 @@ void GamesTests::rowWithErrorKeyIsAlwaysFailureRegardlessOfOtherKeys() {
   const auto result = GameListRow::fromJson(obj, u"row");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->kind, GameListRow::Kind::Failure);
-  QCOMPARE(result->error, QStringLiteral("boom"));
+  QCOMPARE(result->kind(), GameListRow::Kind::Failure);
+  QCOMPARE(result->error(), QStringLiteral("boom"));
 }
 
 void GamesTests::rowWithoutErrorKeyAttemptsFullDecode() {

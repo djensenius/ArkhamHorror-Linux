@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cmath>
 #include <limits>
+#include <string>
 #include <string_view>
 
 using namespace Qt::StringLiterals;

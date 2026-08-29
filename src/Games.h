@@ -165,28 +165,85 @@ struct GameState {
 // encodes as a bare `{"error": message}`, `SuccessGameDetails` as the raw
 // GameDetails object), so decode does the same: a top-level "error" key
 // means Failure, otherwise a full gameDetails decode is attempted.
-struct GameListRow {
+//
+// success()/failure() are the only ways to build one (mirroring
+// CampaignOrScenario above): the private constructor makes a Success row
+// with a missing id/gameState/multiplayerVariant unrepresentable, so
+// toJson() never needs to guard against -- or fail on -- an invalid
+// instance that was never possible to construct in the first place.
+class GameListRow {
+public:
   enum class Kind { Success, Failure };
 
-  Kind kind{Kind::Failure};
-  // Success fields (all populated together; unset when kind == Failure).
-  std::optional<GameId> id;
-  std::optional<ScenarioSummary> scenario;
-  std::optional<CampaignSummary> campaign;
-  std::optional<GameState> gameState;
-  QString name;
-  QList<InvestigatorSummary> investigators;
-  QList<InvestigatorSummary> otherInvestigators;
-  std::optional<MultiplayerVariant> multiplayerVariant;
-  bool hasOpenSeats{false};
-  // Failure field.
-  QString error;
+  [[nodiscard]] static GameListRow
+  success(GameId id, std::optional<ScenarioSummary> scenario,
+          std::optional<CampaignSummary> campaign, GameState gameState,
+          QString name, QList<InvestigatorSummary> investigators,
+          QList<InvestigatorSummary> otherInvestigators,
+          MultiplayerVariant multiplayerVariant, bool hasOpenSeats);
+  // Named `failed`, not `failure`, so that it cannot shadow the free
+  // function Arkham::failure() (declared in ValueOrError.h) used pervasively
+  // by this class's own fromJson() for its ValueOrError<GameListRow> error
+  // returns: an unqualified `failure(...)` call inside a GameListRow member
+  // function resolves to a same-named static member ahead of the enclosing
+  // namespace, which would otherwise silently turn every decode-error
+  // return into a "successful" GameListRow with Kind::Failure instead of an
+  // actual ValueOrError failure.
+  [[nodiscard]] static GameListRow failed(QString error);
 
   [[nodiscard]] static ValueOrError<GameListRow> fromJson(const QJsonValue &v,
                                                           QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  // Success-only accessors (Kind::Success only; unset/empty for Failure).
+  [[nodiscard]] const std::optional<GameId> &id() const noexcept {
+    return m_id;
+  }
+  [[nodiscard]] const std::optional<ScenarioSummary> &
+  scenario() const noexcept {
+    return m_scenario;
+  }
+  [[nodiscard]] const std::optional<CampaignSummary> &
+  campaign() const noexcept {
+    return m_campaign;
+  }
+  [[nodiscard]] const std::optional<GameState> &gameState() const noexcept {
+    return m_gameState;
+  }
+  [[nodiscard]] const QString &name() const noexcept { return m_name; }
+  [[nodiscard]] const QList<InvestigatorSummary> &
+  investigators() const noexcept {
+    return m_investigators;
+  }
+  [[nodiscard]] const QList<InvestigatorSummary> &
+  otherInvestigators() const noexcept {
+    return m_otherInvestigators;
+  }
+  [[nodiscard]] const std::optional<MultiplayerVariant> &
+  multiplayerVariant() const noexcept {
+    return m_multiplayerVariant;
+  }
+  [[nodiscard]] bool hasOpenSeats() const noexcept { return m_hasOpenSeats; }
+  // Failure-only accessor (Kind::Failure only; empty for Success).
+  [[nodiscard]] const QString &error() const noexcept { return m_error; }
+
   friend bool operator==(const GameListRow &, const GameListRow &) = default;
+
+private:
+  GameListRow() = default;
+
+  Kind m_kind{Kind::Failure};
+  std::optional<GameId> m_id;
+  std::optional<ScenarioSummary> m_scenario;
+  std::optional<CampaignSummary> m_campaign;
+  std::optional<GameState> m_gameState;
+  QString m_name;
+  QList<InvestigatorSummary> m_investigators;
+  QList<InvestigatorSummary> m_otherInvestigators;
+  std::optional<MultiplayerVariant> m_multiplayerVariant;
+  bool m_hasOpenSeats{false};
+  QString m_error;
 };
 
 [[nodiscard]] ValueOrError<QList<GameListRow>>

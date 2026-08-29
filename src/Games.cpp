@@ -395,6 +395,35 @@ QJsonObject GameState::toJson() const {
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
 
+GameListRow GameListRow::success(GameId id,
+                                 std::optional<ScenarioSummary> scenario,
+                                 std::optional<CampaignSummary> campaign,
+                                 GameState gameState, QString name,
+                                 QList<InvestigatorSummary> investigators,
+                                 QList<InvestigatorSummary> otherInvestigators,
+                                 MultiplayerVariant multiplayerVariant,
+                                 bool hasOpenSeats) {
+  GameListRow row;
+  row.m_kind = Kind::Success;
+  row.m_id = std::move(id);
+  row.m_scenario = std::move(scenario);
+  row.m_campaign = std::move(campaign);
+  row.m_gameState = std::move(gameState);
+  row.m_name = std::move(name);
+  row.m_investigators = std::move(investigators);
+  row.m_otherInvestigators = std::move(otherInvestigators);
+  row.m_multiplayerVariant = multiplayerVariant;
+  row.m_hasOpenSeats = hasOpenSeats;
+  return row;
+}
+
+GameListRow GameListRow::failed(QString error) {
+  GameListRow row;
+  row.m_kind = Kind::Failure;
+  row.m_error = std::move(error);
+  return row;
+}
+
 ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
                                                 QStringView path) {
   auto objResult = Json::requireObject(v, path);
@@ -411,7 +440,7 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
         Json::requireString(obj, "error"_L1, Json::joinPath(path, u"error"));
     if (!error)
       return failure(error.error());
-    return GameListRow{.kind = Kind::Failure, .error = *error};
+    return GameListRow::failed(*error);
   }
 
   auto id = GameId::fromJson(obj.value("id"_L1), Json::joinPath(path, u"id"));
@@ -480,61 +509,43 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
   if (!hasOpenSeats)
     return failure(hasOpenSeats.error());
 
-  return GameListRow{
-      .kind = Kind::Success,
-      .id = *id,
-      .scenario = std::move(scenario),
-      .campaign = std::move(campaign),
-      .gameState = *gameState,
-      .name = *name,
-      .investigators = std::move(*investigators),
-      .otherInvestigators = std::move(*otherInvestigators),
-      .multiplayerVariant = *multiplayerVariant,
-      .hasOpenSeats = *hasOpenSeats,
-  };
+  return GameListRow::success(*id, std::move(scenario), std::move(campaign),
+                              *gameState, *name, std::move(*investigators),
+                              std::move(*otherInvestigators),
+                              *multiplayerVariant, *hasOpenSeats);
 }
 
 QJsonObject GameListRow::toJson() const {
-  if (kind == Kind::Failure)
-    return QJsonObject{{QStringLiteral("error"), error}};
+  if (m_kind == Kind::Failure)
+    return QJsonObject{{QStringLiteral("error"), m_error}};
 
-  // id/gameState/multiplayerVariant are documented as always populated
-  // together with Kind::Success, but they are public std::optional fields
-  // with no constructor enforcing that invariant. Q_ASSERT alone is not
-  // enough (it compiles out entirely in release/NDEBUG builds, leaving a
-  // bare optional dereference below -- undefined behavior), and silently
-  // substituting JSON null for a missing field would be worse: it produces
-  // a row that violates the contract schema (id/gameState/
-  // multiplayerVariant are never null on the wire) while masking the
-  // construction bug that caused it. qFatal() is never compiled out and
-  // halts with a clear diagnostic instead of doing either.
-  if (!id || !gameState || !multiplayerVariant)
-    qFatal("GameListRow::toJson: Kind::Success row is missing a required "
-           "field (id/gameState/multiplayerVariant); this is a "
-           "construction bug, not a decode failure");
-
+  // Unlike the qFatal()-guarded toJson() implementations elsewhere in this
+  // file, no invariant check is needed here: success() is the only way to
+  // build a Kind::Success instance, and it always populates
+  // id/gameState/multiplayerVariant together, so they are guaranteed
+  // present by construction.
   QJsonObject obj;
-  obj.insert(QStringLiteral("id"), id->toJson());
-  obj.insert(QStringLiteral("scenario"), scenario
-                                             ? QJsonValue(scenario->toJson())
+  obj.insert(QStringLiteral("id"), m_id->toJson());
+  obj.insert(QStringLiteral("scenario"), m_scenario
+                                             ? QJsonValue(m_scenario->toJson())
                                              : QJsonValue(QJsonValue::Null));
-  obj.insert(QStringLiteral("campaign"), campaign
-                                             ? QJsonValue(campaign->toJson())
+  obj.insert(QStringLiteral("campaign"), m_campaign
+                                             ? QJsonValue(m_campaign->toJson())
                                              : QJsonValue(QJsonValue::Null));
-  obj.insert(QStringLiteral("gameState"), gameState->toJson());
-  obj.insert(QStringLiteral("name"), name);
+  obj.insert(QStringLiteral("gameState"), m_gameState->toJson());
+  obj.insert(QStringLiteral("name"), m_name);
   QJsonArray investigatorsArr;
-  for (const auto &investigator : investigators)
+  for (const auto &investigator : m_investigators)
     investigatorsArr.append(investigator.toJson());
   obj.insert(QStringLiteral("investigators"), investigatorsArr);
   QJsonArray otherArr;
-  for (const auto &investigator : otherInvestigators)
+  for (const auto &investigator : m_otherInvestigators)
     otherArr.append(investigator.toJson());
   obj.insert(QStringLiteral("otherInvestigators"), otherArr);
   obj.insert(
       QStringLiteral("multiplayerVariant"),
-      Json::encodeClosedEnum(*multiplayerVariant, kMultiplayerVariantTable));
-  obj.insert(QStringLiteral("hasOpenSeats"), hasOpenSeats);
+      Json::encodeClosedEnum(*m_multiplayerVariant, kMultiplayerVariantTable));
+  obj.insert(QStringLiteral("hasOpenSeats"), m_hasOpenSeats);
   return obj;
 }
 
