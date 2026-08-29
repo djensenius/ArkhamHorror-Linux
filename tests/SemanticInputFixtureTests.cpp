@@ -139,6 +139,8 @@ private slots:
   void switchingToTextEntryMidHoldClearsTheHoldSoItsReleaseIsNotDispatched();
   void explicitOverrideSuspendsSemanticDispatchEvenWithoutTextEntryFocus();
   void destroyingTheWindowWhileTextEntrySuspendedNeverCrashesOrDispatches();
+  void
+  automaticDetectionNeverConsultsAnUninstalledRoutersUnrelatedApplicationFocus();
 
 private:
   std::unique_ptr<QQmlApplicationEngine> engine_;
@@ -482,7 +484,7 @@ void SemanticInputFixtureTests::
   // documented text-entry policy, reserved keys are NOT exempted from
   // suspension: while a text control owns focus, Escape must pass
   // through unconsumed rather than being interpreted as
-  // SecondaryOwnAction, and must not delete the field's text or dismiss
+  // SecondaryAction, and must not delete the field's text or dismiss
   // anything on this router's behalf.
   QTest::keyClick(window_, Qt::Key_Escape);
   QCOMPARE(textField->property("text").toString(), QStringLiteral("wasd"));
@@ -642,6 +644,41 @@ void SemanticInputFixtureTests::
   QVERIFY(!router_->isInstalled());
   QCOMPARE(spy.count(), 0);
   window_ = nullptr;
+}
+
+void SemanticInputFixtureTests::
+    automaticDetectionNeverConsultsAnUninstalledRoutersUnrelatedApplicationFocus() {
+  // Regression/contract test: with nothing installed, isTextEntrySuspended()
+  // must be false, never based on whichever object the wider application
+  // happens to consider focused elsewhere (e.g. this same process's own
+  // fixture window/textEntryField, owned by the separate, already-
+  // installed router_). Note on mutation-testability: under the
+  // offscreen QPA platform this whole suite runs under,
+  // QGuiApplication::focusObject()/focusWindow() never become non-null
+  // even when a window's own Qt Quick scene genuinely has real active
+  // focus (real platform-level window activation, which the fallback
+  // path in focusedObjectAcceptsTextEntry() would need to observe, is
+  // simply never granted offscreen) -- so this specific guard's fallback
+  // branch cannot be driven non-null by any automated test in this
+  // environment regardless of installedTarget. This test still
+  // meaningfully guards the documented contract (uninstalled ==> never
+  // suspended) against any regression that makes isTextEntrySuspended()
+  // ignore installedTarget() entirely.
+  window_ = loadFixture();
+  QVERIFY(window_ != nullptr);
+  auto *textField =
+      window_->findChild<QQuickItem *>(QStringLiteral("textEntryField"));
+  QVERIFY(textField != nullptr);
+
+  textField->forceActiveFocus();
+  QTRY_VERIFY(textField->hasActiveFocus());
+  QVERIFY(router_->isTextEntrySuspended());
+
+  InputMapper uninstalledMapper;
+  InputRouter uninstalledRouter(uninstalledMapper);
+  QVERIFY(!uninstalledRouter.isInstalled());
+  QVERIFY(uninstalledRouter.isAutomaticTextEntryDetectionEnabled());
+  QVERIFY(!uninstalledRouter.isTextEntrySuspended());
 }
 
 QTEST_MAIN(SemanticInputFixtureTests)

@@ -89,8 +89,9 @@ namespace Arkham {
 // via Qt's own input-method query mechanism, on by default). Because
 // this codebase has no separate device-specific input path (see
 // InputMapper.h: generic-controller/Steam Input events arrive as
-// ordinary QKeyEvents, including Qt::Key_Gamepad*, through this exact
-// same filter), suspension applies uniformly to keyboard- and
+// ordinary QKeyEvents carrying standard Qt::Key values -- Qt has no
+// distinct "gamepad key" enum family -- through this exact same
+// filter), suspension applies uniformly to keyboard- and
 // controller-sourced events alike -- the simplest safe policy, so a
 // controller cannot "type" semantic commands into a focused text field
 // either. Reserved Escape/Back/Menu are also suspended: while a text
@@ -147,27 +148,32 @@ public:
   // requesting Qt::ImEnabled is sent synchronously to whichever focus
   // object Qt itself currently considers focused for input-method
   // purposes, each time eventFilter() considers a KeyPress/KeyRelease.
-  // That focus object is installedTarget()'s own QWindow::focusObject()
-  // when installedTarget() is a QWindow (for a QQuickWindow target this
-  // is the focused QQuickItem, which is not necessarily
-  // installedTarget() itself) -- this instance-level accessor reflects
-  // the window's own Qt Quick scene-graph focus regardless of real
-  // platform-level window activation, unlike the static
-  // QGuiApplication::focusObject(), which stays null under an
-  // unactivated/offscreen window (as in this project's own headless
-  // tests, and potentially some embedded/composited real deployments)
-  // even though the window's scene genuinely has an active focus item.
-  // QGuiApplication::focusObject() is used as a fallback for a
-  // non-QWindow installedTarget(), or when the target's own
-  // focusObject() is null. A focus object that never overrides input-
-  // method handling (an ordinary non-text QQuickItem, or no focus object
-  // at all, or no QGuiApplication instance at all -- e.g. under
-  // QTEST_GUILESS_MAIN) safely reports "not enabled" rather than
-  // suspending. Enabled by default; disable this if a host wants total
-  // manual control via setSemanticInputSuspended() alone. Deliberately
-  // does NOT depend on any on-screen/virtual-keyboard visibility signal:
-  // that is compositor/platform-specific, can lag arbitrarily far behind
-  // the actual focus change, and never appears at all on a desktop/
+  // Never reports enabled when nothing is installed (installedTarget()
+  // is null): with no target, this router is not filtering any events
+  // at all, so there is nothing for automatic detection to protect, and
+  // it must not consult some unrelated window's focus object elsewhere
+  // in the application. Otherwise, that focus object is
+  // installedTarget()'s own QWindow::focusObject() when installedTarget()
+  // is a QWindow (for a QQuickWindow target this is the focused
+  // QQuickItem, which is not necessarily installedTarget() itself) --
+  // this instance-level accessor reflects the window's own Qt Quick
+  // scene-graph focus regardless of real platform-level window
+  // activation, unlike the static QGuiApplication::focusObject(), which
+  // stays null under an unactivated/offscreen window (as in this
+  // project's own headless tests, and potentially some
+  // embedded/composited real deployments) even though the window's
+  // scene genuinely has an active focus item. QGuiApplication::
+  // focusObject() is used as a fallback for a non-QWindow
+  // installedTarget(), or when the target's own focusObject() is null.
+  // A focus object that never overrides input-method handling (an
+  // ordinary non-text QQuickItem, or no focus object at all, or no
+  // QGuiApplication instance at all -- e.g. under QTEST_GUILESS_MAIN)
+  // safely reports "not enabled" rather than suspending. Enabled by
+  // default; disable this if a host wants total manual control via
+  // setSemanticInputSuspended() alone. Deliberately does NOT depend on
+  // any on-screen/virtual-keyboard visibility signal: that is
+  // compositor/platform-specific, can lag arbitrarily far behind the
+  // actual focus change, and never appears at all on a desktop/
   // Steam-Deck-desktop-mode session with a physical keyboard attached --
   // an unreliable proxy for "the focused control currently wants raw key
   // events routed to it instead of semantic commands." Held/armed key
