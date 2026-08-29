@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arkhamhorror.app/contracts/game-state.schema.json",
+  "title": "GameState",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "contents"
+      ],
+      "properties": {
+        "tag": {
+          "enum": [
+            "IsPending",
+            "IsChooseDecks"
+          ]
+        },
+        "contents": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag"
+      ],
+      "properties": {
+        "tag": {
+          "enum": [
+            "IsActive",
+            "IsOver"
+          ]
+        }
+      }
+    }
+  ]
+}

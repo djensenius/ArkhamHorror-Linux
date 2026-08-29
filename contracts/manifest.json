@@ -1,0 +1,173 @@
+{
+  "schemaRevision": "0.1.12",
+  "status": "baseline-incomplete",
+  "apiBasePath": "/api/v1",
+  "documents": [
+    "contracts/openapi.yaml",
+    "contracts/asyncapi.yaml",
+    "contracts/route-inventory.json",
+    "contracts/schemas/account.schema.json",
+    "contracts/schemas/achievements.schema.json",
+    "contracts/schemas/capabilities.schema.json",
+    "contracts/schemas/catalog.schema.json",
+    "contracts/schemas/client-answer.schema.json",
+    "contracts/schemas/decks.schema.json",
+    "contracts/schemas/game-lifecycle.schema.json",
+    "contracts/schemas/game-list.schema.json",
+    "contracts/schemas/game-state.schema.json",
+    "contracts/schemas/game-step.schema.json",
+    "contracts/schemas/get-game.schema.json",
+    "contracts/schemas/public-game.schema.json",
+    "contracts/schemas/server-message.schema.json"
+  ],
+  "fixtures": [
+    {
+      "path": "contracts/fixtures/account.json",
+      "schema": "contracts/schemas/account.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/achievements.json",
+      "schema": "contracts/schemas/achievements.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/capabilities.json",
+      "schema": "contracts/schemas/capabilities.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/catalog.json",
+      "schema": "contracts/schemas/catalog.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/decks.json",
+      "schema": "contracts/schemas/decks.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-lifecycle.json",
+      "schema": "contracts/schemas/game-lifecycle.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-step.json",
+      "schema": "contracts/schemas/game-step.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-update.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-list.json",
+      "schema": "contracts/schemas/game-list.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/get-game.json",
+      "schema": "contracts/schemas/get-game.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-error.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-message.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-ui.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-audio.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-card.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-card-only.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-tarot.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-show-discard.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-show-under.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-achievement.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/game-playability-info.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/shared-state-update.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/event-changed.json",
+      "schema": "contracts/schemas/server-message.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-question.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-raw.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-payment-amounts.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-amounts.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-standalone-settings.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-campaign-settings.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-deck.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-deck-list.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-pick-destiny.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-campaign-specific.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-scenario-specific.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-exchange-amounts.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/answer-campaign-step.json",
+      "schema": "contracts/schemas/client-answer.schema.json"
+    }
+  ],
+  "compatibility": {
+    "webClient": "unchanged",
+    "nativeClientMinimumRevision": "0.1.0"
+  }
+}

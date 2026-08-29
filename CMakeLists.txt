@@ -80,13 +80,23 @@ add_library(arkham_foundation STATIC
     src/AuthModels.h
     src/AuthTransportSecurity.cpp
     src/AuthTransportSecurity.h
+    src/CardCatalog.cpp
+    src/CardCatalog.h
     src/CompatibilityEvaluator.cpp
     src/CompatibilityEvaluator.h
     src/ContractPin.cpp
     src/ContractPin.h
     src/ContractRevision.cpp
     src/ContractRevision.h
+    src/Decks.cpp
+    src/Decks.h
+    src/Games.cpp
+    src/Games.h
     src/IAuthenticationClient.h
+    src/Identifiers.cpp
+    src/Identifiers.h
+    src/JsonDecode.cpp
+    src/JsonDecode.h
     src/ICapabilityProbe.h
     src/IKeychainJobFactory.h
     src/IProfileStore.h
@@ -164,6 +174,54 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME contract COMMAND arkham-contract-tests)
+
+    qt_add_executable(arkham-contract-drift-tests
+        tests/ContractDriftTests.cpp
+    )
+    target_compile_definitions(arkham-contract-drift-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-contract-drift-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME contract_drift COMMAND arkham-contract-drift-tests)
+
+    qt_add_executable(arkham-card-catalog-tests
+        tests/CardCatalogTests.cpp
+    )
+    target_compile_definitions(arkham-card-catalog-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-card-catalog-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME card_catalog COMMAND arkham-card-catalog-tests)
+
+    qt_add_executable(arkham-decks-tests
+        tests/DecksTests.cpp
+    )
+    target_compile_definitions(arkham-decks-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-decks-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME decks COMMAND arkham-decks-tests)
+
+    qt_add_executable(arkham-games-tests
+        tests/GamesTests.cpp
+    )
+    target_compile_definitions(arkham-games-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-games-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME games COMMAND arkham-games-tests)
 
     qt_add_executable(arkham-network-tests
         tests/NetworkTests.cpp

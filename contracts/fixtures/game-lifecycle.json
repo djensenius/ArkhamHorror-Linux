@@ -1,0 +1,88 @@
+{
+  "createGame": {
+    "deckIds": [
+      "00000000-0000-0000-0000-000000000017",
+      null
+    ],
+    "playerCount": 2,
+    "campaignId": "01",
+    "scenarioId": null,
+    "difficulty": "Standard",
+    "campaignName": "Contract campaign",
+    "multiplayerVariant": "WithFriends",
+    "includeTarotReadings": true,
+    "options": [
+      {
+        "tag": "PerformIntro"
+      },
+      {
+        "tag": "CampaignVariant",
+        "contents": "return-to"
+      }
+    ],
+    "strictAsIfAt": false,
+    "asIfRuling": "chapter1",
+    "ultimatumsAndBoons": [
+      "BoonOfHades",
+      "UltimatumOfChaos"
+    ],
+    "achievementsEnabled": false,
+    "unknownField": "ignored by the decoder"
+  },
+  "createGameDefaults": {
+    "deckIds": [],
+    "playerCount": 1,
+    "campaignId": null,
+    "scenarioId": "01104",
+    "difficulty": "Easy",
+    "campaignName": "Contract standalone",
+    "multiplayerVariant": "Solo",
+    "includeTarotReadings": false,
+    "options": []
+  },
+  "createGameNullDefaults": {
+    "deckIds": [],
+    "playerCount": 1,
+    "campaignId": null,
+    "scenarioId": "01104",
+    "difficulty": "Easy",
+    "campaignName": "Contract standalone",
+    "multiplayerVariant": "Solo",
+    "includeTarotReadings": false,
+    "options": [],
+    "strictAsIfAt": null,
+    "asIfRuling": null,
+    "ultimatumsAndBoons": null,
+    "achievementsEnabled": null
+  },
+  "chooseDeck": {
+    "investigatorId": "01001",
+    "deckUrl": "https://arkhamdb.com/decklist/view/4242",
+    "deckList": {
+      "id": 4242,
+      "name": "Contract deck",
+      "investigator_code": "01001",
+      "investigator_name": "Roland Banks",
+      "slots": {
+        "01016": 2,
+        "c01018": 1
+      },
+      "sideSlots": [],
+      "meta": "{\"alternate_front\":\"c90001\"}",
+      "taboo_id": null,
+      "url": "https://arkhamdb.com/decklist/view/4242"
+    },
+    "unknownField": "ignored by the decoder"
+  },
+  "continueWithoutUpgrade": {
+    "investigatorId": "c01001"
+  },
+  "claimSeat": {
+    "investigatorId": "01001",
+    "unknownField": "ignored by the decoder"
+  },
+  "openSeats": [
+    "c01001",
+    "c01002"
+  ]
+}

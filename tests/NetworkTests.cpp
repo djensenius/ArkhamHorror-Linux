@@ -1401,11 +1401,16 @@ void NetworkTests::probeNonSuccessStatus() {
 
 void NetworkTests::probeIncompatible() {
   StubNetworkAccessManager nam;
+  // nativeClientMinimumRevision is deliberately one revision above this
+  // client's pinned ContractRevision (which the test suite bumps in lockstep
+  // with contracts/contract-pin.json) so this fixture always exercises a
+  // genuine client-too-old outcome rather than accidentally passing once the
+  // pin catches up to a hardcoded value.
   nam.enqueue(200, QByteArrayLiteral(R"({
-    "schemaRevision": "0.1.11",
+    "schemaRevision": "0.1.12",
     "status": "baseline-incomplete",
     "apiBasePath": "/api/v1",
-    "nativeClientMinimumRevision": "0.1.12",
+    "nativeClientMinimumRevision": "0.1.13",
     "capabilities": []
   })"));
 
