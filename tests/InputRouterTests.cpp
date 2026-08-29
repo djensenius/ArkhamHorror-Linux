@@ -44,6 +44,8 @@ private slots:
   void installAcrossThreadsIsRejected();
   void onlyKeyEventsOnTheInstalledTargetAreConsidered();
   void suppressedDedupTransitionsAreStillConsumedForABoundKey();
+  void
+  strayDuplicatePressWithDifferentModifiersForAnAlreadyHeldKeyIsStillConsumed();
   void keyEventsForAnUnboundKeyAreNeverConsumed();
   void focusOutClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress();
   void windowDeactivateClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress();
@@ -238,6 +240,58 @@ void InputRouterTests::keyEventsForAnUnboundKeyAreNeverConsumed() {
   QCOMPARE(spy.count(), 0);
   QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_F13));
   QCOMPARE(spy.count(), 0);
+}
+
+void InputRouterTests::
+    strayDuplicatePressWithDifferentModifiersForAnAlreadyHeldKeyIsStillConsumed() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+
+  // Ctrl+Z is bound to Undo by default (see
+  // InputMapper::resetToDefaults()). Pressing it arms the hold for
+  // physical key Z. Held-key identity is modifier-insensitive (see
+  // InputMapper.h's heldKeys_ comment): the key is now "owned" by this
+  // router for the rest of its hold, regardless of what modifiers later
+  // accompany any other event for it.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_Z, false,
+                  Qt::ControlModifier));
+  QCOMPARE(spy.count(), 1);
+  QCOMPARE(spy.constLast().at(0).value<SemanticCommand>(),
+           SemanticCommand::Undo);
+
+  // A stray duplicate press of the SAME physical key arrives with
+  // different (here, no) live modifiers -- e.g. because a platform
+  // delivered an extra press event without an intervening release, or
+  // a modifier key's own release was processed first even though this
+  // is still logically the same physical hold. commandFor({Z,
+  // NoModifier}) has no binding at all, so a router that decided
+  // consumption from commandFor() alone would incorrectly let this
+  // fall through to Qt's default key handling for a key it already
+  // owns. InputMapper's dedup still suppresses it (no second Pressed
+  // is dispatched), but it must still be consumed.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_Z));
+  QCOMPARE(spy.count(), 1);
+
+  // The eventual release -- however its modifiers happen to read --
+  // must also still be consumed and must dispatch the press-time
+  // command's Released phase.
+  QVERIFY(sendKey(&target, QEvent::KeyRelease, Qt::Key_Z));
+  QCOMPARE(spy.count(), 2);
+  QCOMPARE(spy.constLast().at(0).value<SemanticCommand>(),
+           SemanticCommand::Undo);
+  QCOMPARE(spy.constLast().at(1).value<CommandPhase>(), CommandPhase::Released);
+
+  // A genuinely stray release afterwards -- the hold has already ended,
+  // so this key is no longer "owned" by any measure (neither
+  // commandFor() nor isPhysicalKeyHeld()) -- must NOT be consumed,
+  // confirming the held-key-identity check only extends ownership for
+  // the duration of an actual hold, not forever.
+  QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_Z));
+  QCOMPARE(spy.count(), 2);
 }
 
 void InputRouterTests::assertLifecycleEventClearsHeldKeys(

@@ -188,6 +188,22 @@ public:
   // brand-new hold rather than being mistaken for a stray duplicate.
   void clearHeldKeys();
 
+  // True if |key| currently has an *armed* held hold -- i.e. it was
+  // bound to some command at press time (see the heldKeys_ comment
+  // below) and has not yet been released -- regardless of what
+  // modifiers currently accompany it. An unarmed hold (a key that was
+  // unbound for its whole press so far) does not count: such a key was
+  // never actually owned by any dispatched command, so its later
+  // events must still be free to propagate normally. InputRouter uses
+  // this -- together with commandFor() -- to decide whether an event
+  // for |key| must be consumed even when processKey() suppresses it as
+  // a dedup no-op: held-state is modifier-insensitive by design (see
+  // the heldKeys_ comment), so a duplicate/stray transition whose
+  // *current* modifiers no longer match any binding can still belong
+  // to a physical key this mapper already owns for the rest of its
+  // hold.
+  [[nodiscard]] bool isPhysicalKeyHeld(Qt::Key key) const;
+
 private:
   // Per-held-key state: a key present in |heldKeys_| is physically held
   // down regardless of whether it is currently bound to a command. A

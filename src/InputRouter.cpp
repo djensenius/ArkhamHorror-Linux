@@ -103,13 +103,22 @@ bool InputRouter::eventFilter(QObject *watched, QEvent *event) {
   // through to default Qt key handling could re-trigger a side effect
   // (e.g. Qt's own Tab-key focus-chain handling) for a key our own
   // dedup state machine has already accounted for via a different
-  // phase.
-  const bool isBoundKey = mapper_.commandFor(physicalKey).has_value();
+  // phase. commandFor() alone is not enough here: it is modifier-
+  // sensitive, but held-key identity is deliberately modifier-
+  // insensitive (see InputMapper::heldKeys_'s comment), so a stray
+  // duplicate transition whose *current* modifiers no longer match any
+  // binding (e.g. Ctrl+Z is held, then a duplicate Z arrives with Ctrl
+  // no longer down) must still be recognized as owned via
+  // isPhysicalKeyHeld() -- checked before processKey() runs, since a
+  // release can make the key no longer held by the time processKey()
+  // returns.
+  const bool isOwnedKey = mapper_.commandFor(physicalKey).has_value() ||
+                          mapper_.isPhysicalKeyHeld(physicalKey.key);
 
   const std::optional<DispatchedCommand> dispatched =
       mapper_.processKey(physicalKey, isPress, keyEvent->isAutoRepeat());
   if (!dispatched.has_value()) {
-    return isBoundKey;
+    return isOwnedKey;
   }
 
   emit commandDispatched(dispatched->command, dispatched->phase);
