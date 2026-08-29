@@ -13,6 +13,14 @@ namespace Arkham {
 
 namespace {
 
+// Brings Json::toLosslessRaw into unqualified lookup for both overloads:
+// ADL alone finds the Json::Value overload (its associated namespace is
+// Arkham::Json) but not the QJsonValue one (QJsonValue's associated
+// namespace is Qt's), so an unqualified call inside a template shared
+// between both value families needs this using-declaration -- see
+// CardCatalog.cpp/Decks.cpp for the identical rationale.
+using Json::toLosslessRaw;
+
 constexpr std::array<std::pair<QLatin1StringView, Difficulty>, 4>
     kDifficultyTable{{
         {"Easy"_L1, Difficulty::Easy},
@@ -183,8 +191,14 @@ QJsonArray encodeEnumArray(
   return result;
 }
 
-ValueOrError<QList<QUuid>> decodeUuidArray(const QJsonArray &arr,
-                                           QStringView path) {
+// Arr is QJsonArray (from Json::requireArrayField(QJsonObject...)) or
+// QList<Json::Value> (from Json::requireArrayField(Json::Value...)): both
+// support .size()/operator[] identically, and Json::decodeUuid is itself
+// overloaded for QJsonValue/Json::Value, so this one body serves both
+// GameState::fromJson (QJsonValue path) and GameState::fromRawJson
+// (Json::Value path, see Games.h) without duplication.
+template <typename Arr>
+ValueOrError<QList<QUuid>> decodeUuidArray(const Arr &arr, QStringView path) {
   QList<QUuid> result;
   result.reserve(arr.size());
   for (qsizetype i = 0; i < arr.size(); ++i) {
@@ -374,10 +388,28 @@ GameState GameState::over() {
 
 ValueOrError<GameState> GameState::fromJson(const QJsonValue &v,
                                             QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<GameState> GameState::fromRawJson(const Json::Value &v,
+                                               QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<GameState> GameState::fromRawBytes(QByteArrayView bytes,
+                                                QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+template <typename V>
+ValueOrError<GameState> GameState::fromValueImpl(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   auto tagResult =
       Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
@@ -408,18 +440,25 @@ ValueOrError<GameState> GameState::fromJson(const QJsonValue &v,
     // Known nullary tags reject any "contents" presence -- even an
     // explicit null -- rather than silently ignoring an unexpected
     // payload.
-    if (obj.contains("contents"_L1))
+    if (Json::fieldPresence(obj, "contents"_L1) != Json::FieldPresence::Absent)
       return failure(QStringLiteral("%1: \"%2\" must not have \"contents\"")
                          .arg(path, tag));
     return tag == "IsActive"_L1 ? GameState::active() : GameState::over();
   }
 
   // An unrecognized tag is preserved verbatim rather than rejected: this is
-  // a live state machine a future backend release can extend.
+  // a live state machine a future backend release can extend. The
+  // *complete* decoded object (not merely "contents") is captured -- any
+  // additive sibling key a future backend adds alongside "tag"/"contents"
+  // survives too, and toJson() below re-emits it byte-for-byte rather than
+  // reconstructing only the two keys this client currently knows about.
+  auto rawResult = toLosslessRaw(v);
+  if (!rawResult)
+    return failure(QStringLiteral("%1: %2").arg(path, rawResult.error()));
   GameState result;
   result.m_kind = Kind::Unknown;
   result.m_unknownTag = tag;
-  result.m_unknownContents = obj.value("contents"_L1);
+  result.m_unknownRaw = *rawResult;
   return result;
 }
 
@@ -437,12 +476,8 @@ QJsonObject GameState::toJson() const {
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsActive")}};
   case Kind::Over:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("IsOver")}};
-  case Kind::Unknown: {
-    QJsonObject obj{{QStringLiteral("tag"), m_unknownTag}};
-    if (!m_unknownContents.isUndefined())
-      obj.insert(QStringLiteral("contents"), m_unknownContents);
-    return obj;
-  }
+  case Kind::Unknown:
+    return m_unknownRaw.toQJson().toObject();
   }
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
@@ -653,10 +688,29 @@ CampaignOption CampaignOption::variantOption(QString contents) {
 
 ValueOrError<CampaignOption> CampaignOption::fromJson(const QJsonValue &v,
                                                       QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<CampaignOption> CampaignOption::fromRawJson(const Json::Value &v,
+                                                         QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<CampaignOption> CampaignOption::fromRawBytes(QByteArrayView bytes,
+                                                          QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+template <typename V>
+ValueOrError<CampaignOption> CampaignOption::fromValueImpl(const V &v,
+                                                           QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   auto tagResult =
       Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
@@ -684,10 +738,18 @@ ValueOrError<CampaignOption> CampaignOption::fromJson(const QJsonValue &v,
     }
   }
 
+  // An unrecognized tag is preserved verbatim rather than rejected. The
+  // *complete* decoded object (not merely "contents") is captured -- any
+  // additive sibling key a future backend adds alongside "tag"/"contents"
+  // survives too, and toJson() below re-emits it byte-for-byte rather than
+  // reconstructing only the two keys this client currently knows about.
+  auto rawResult = toLosslessRaw(v);
+  if (!rawResult)
+    return failure(QStringLiteral("%1: %2").arg(path, rawResult.error()));
   CampaignOption result;
   result.m_kind = Kind::Unknown;
   result.m_text = tag;
-  result.m_unknownContents = obj.value("contents"_L1);
+  result.m_unknownRaw = *rawResult;
   return result;
 }
 
@@ -701,12 +763,8 @@ QJsonObject CampaignOption::toJson() const {
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("CampaignVariant")},
         {QStringLiteral("contents"), m_text}};
-  case Kind::Unknown: {
-    QJsonObject obj{{QStringLiteral("tag"), m_text}};
-    if (!m_unknownContents.isUndefined())
-      obj.insert(QStringLiteral("contents"), m_unknownContents);
-    return obj;
-  }
+  case Kind::Unknown:
+    return m_unknownRaw.toQJson().toObject();
   }
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
@@ -1013,14 +1071,48 @@ QJsonObject CreateGameRequest::toJson() const {
   return obj;
 }
 
-ValueOrError<ChooseDeckRequest> ChooseDeckRequest::fromJson(const QJsonValue &v,
-                                                            QStringView path) {
-  auto objResult = Json::requireObject(v, path);
-  if (!objResult)
-    return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+// Dispatch-shim pair for InvestigatorRef (see CardCatalog.cpp/Decks.cpp for
+// the same pattern's rationale): picks InvestigatorRef::fromJson()'s
+// QJsonValue-taking body, or a hand-written Json::Value equivalent, based
+// on the deduced value-family template parameter in
+// decodeChooseDeckRequest<Obj> below.
+ValueOrError<InvestigatorRef> decodeInvestigatorRefValue(const QJsonValue &v,
+                                                         QStringView path) {
+  return InvestigatorRef::fromJson(v, path);
+}
+ValueOrError<InvestigatorRef> decodeInvestigatorRefValue(const Json::Value &v,
+                                                         QStringView path) {
+  auto str = Json::requireStringValue(v, path);
+  if (!str)
+    return failure(str.error());
+  auto parsed = InvestigatorRef::parse(*str);
+  if (!parsed)
+    return failure(QStringLiteral("%1: %2").arg(path, parsed.error()));
+  return *parsed;
+}
 
-  auto investigatorId = InvestigatorRef::fromJson(
+// Dispatch-shim pair for DeckListInput: picks fromJson()'s QJsonValue-
+// taking body, or the precision-preserving fromRawJson() overload.
+ValueOrError<DeckListInput> decodeDeckListInputValue(const QJsonValue &v,
+                                                     QStringView path) {
+  return DeckListInput::fromJson(v, path);
+}
+ValueOrError<DeckListInput> decodeDeckListInputValue(const Json::Value &v,
+                                                     QStringView path) {
+  return DeckListInput::fromRawJson(v, path);
+}
+
+// Shared decode body for ChooseDeckRequest::fromJson()/fromRawBytes(): Obj
+// is QJsonObject or Json::Value. `deckList` (when present) decodes through
+// decodeDeckListInputValue's Json::Value overload for the fromRawBytes()
+// path, so a numeric literal nested inside its sideSlots survives exactly
+// rather than only as closely as QJsonValue's double-backed storage
+// allows -- no toQJson()-then-reparse round trip is needed, unlike the
+// collapse-then-patch pattern this replaces.
+template <typename Obj>
+ValueOrError<ChooseDeckRequest> decodeChooseDeckRequest(const Obj &obj,
+                                                        QStringView path) {
+  auto investigatorId = decodeInvestigatorRefValue(
       obj.value("investigatorId"_L1), Json::joinPath(path, u"investigatorId"));
   if (!investigatorId)
     return failure(investigatorId.error());
@@ -1031,10 +1123,9 @@ ValueOrError<ChooseDeckRequest> ChooseDeckRequest::fromJson(const QJsonValue &v,
     return failure(deckUrl.error());
 
   std::optional<DeckListInput> deckList;
-  const QJsonValue deckListV = obj.value("deckList"_L1);
-  if (!deckListV.isUndefined() && !deckListV.isNull()) {
-    auto result =
-        DeckListInput::fromJson(deckListV, Json::joinPath(path, u"deckList"));
+  if (Json::fieldPresence(obj, "deckList"_L1) == Json::FieldPresence::Present) {
+    auto result = decodeDeckListInputValue(obj.value("deckList"_L1),
+                                           Json::joinPath(path, u"deckList"));
     if (!result)
       return failure(result.error());
     deckList = *result;
@@ -1043,6 +1134,14 @@ ValueOrError<ChooseDeckRequest> ChooseDeckRequest::fromJson(const QJsonValue &v,
   return ChooseDeckRequest{.investigatorId = *investigatorId,
                            .deckUrl = *deckUrl,
                            .deckList = std::move(deckList)};
+}
+
+ValueOrError<ChooseDeckRequest> ChooseDeckRequest::fromJson(const QJsonValue &v,
+                                                            QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  return decodeChooseDeckRequest(*objResult, path);
 }
 
 QJsonObject ChooseDeckRequest::toJson() const {
@@ -1056,27 +1155,19 @@ QJsonObject ChooseDeckRequest::toJson() const {
 }
 
 ValueOrError<ChooseDeckRequest>
+ChooseDeckRequest::fromRawJson(const Json::Value &v, QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  return decodeChooseDeckRequest(*objResult, path);
+}
+
+ValueOrError<ChooseDeckRequest>
 ChooseDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
   auto raw = Json::Value::parse(bytes, path);
   if (!raw)
     return failure(raw.error());
-  auto decoded = fromJson(raw->toQJson(), path);
-  if (!decoded)
-    return failure(decoded.error());
-  if (raw->isObject() && decoded->deckList) {
-    const Json::Value deckListRaw = raw->value("deckList"_L1);
-    if (deckListRaw.isObject()) {
-      auto deckListBytes = deckListRaw.toJsonBytes();
-      if (!deckListBytes)
-        return failure(deckListBytes.error());
-      auto preciseDeckList = DeckListInput::fromRawBytes(
-          *deckListBytes, Json::joinPath(path, u"deckList"));
-      if (!preciseDeckList)
-        return failure(preciseDeckList.error());
-      decoded->deckList = *preciseDeckList;
-    }
-  }
-  return *decoded;
+  return fromRawJson(*raw, path);
 }
 
 ValueOrError<QByteArray> ChooseDeckRequest::toJsonBytes() const {

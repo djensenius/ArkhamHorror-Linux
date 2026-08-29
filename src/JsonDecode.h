@@ -1,5 +1,6 @@
 #pragma once
 
+#include "RawJson.h"
 #include "ValueOrError.h"
 
 #include <QByteArray>
@@ -21,6 +22,17 @@ namespace Arkham::Json {
 // messages such as "cardCode: expected string, got number". Never includes
 // the value itself, so decode errors are safe to log verbatim.
 [[nodiscard]] QString typeName(const QJsonValue &v);
+// Same, for the canonical lossless AST (see RawJson.h). Every decode
+// helper below is overloaded for both QJsonValue/QJsonObject (the
+// existing, QJsonDocument-fed "convenience" path -- lossless only up to
+// whatever precision QJsonValue's own double-backed storage already
+// carries) and Json::Value (the byte-parsed, arbitrary-precision
+// canonical path): a caller decoding directly from Json::Value::parse()'s
+// result never touches a QJsonValue/double at all, so a number outside
+// int64 range, a long fraction, or a huge exponent nested at any depth
+// survives exactly rather than only "as closely as IEEE-754 double
+// allows".
+[[nodiscard]] QString typeName(const Json::Value &v);
 
 // Builds a qualified path for a nested field, e.g. joinPath("cards[3]",
 // "cost") -> "cards[3].cost". `parent` may be empty for a top-level field.
@@ -37,6 +49,8 @@ namespace Arkham::Json {
 enum class FieldPresence { Absent, Null, Present };
 [[nodiscard]] FieldPresence fieldPresence(const QJsonObject &obj,
                                           QLatin1StringView key);
+[[nodiscard]] FieldPresence fieldPresence(const Json::Value &obj,
+                                          QLatin1StringView key);
 
 // Bare-value required-type decoders: fail with a path-qualified, actionable
 // error if the value has the wrong JSON type. Useful directly for array
@@ -47,6 +61,21 @@ enum class FieldPresence { Absent, Null, Present };
 [[nodiscard]] ValueOrError<QJsonArray> requireArray(const QJsonValue &v,
                                                     QStringView path);
 [[nodiscard]] ValueOrError<QString> requireStringValue(const QJsonValue &v,
+                                                       QStringView path);
+// Json::Value overloads (see typeName(const Json::Value&) above): `v` is
+// returned by value (Json::Value is a small value type, same convention
+// RawJson.h itself uses throughout), letting a canonical fromRawJson()
+// decoder validate a subtree's outer kind without ever touching
+// QJsonValue/QJsonObject. requireArray's success value is the *decomposed*
+// element list (QList<Value>, via Value::toArray()) rather than the
+// wrapping Value itself, deliberately mirroring QJsonArray's shape so
+// templated decode logic shared between both value families (see
+// CardCatalog.cpp/Games.cpp) can index/iterate it identically either way.
+[[nodiscard]] ValueOrError<Json::Value> requireObject(const Json::Value &v,
+                                                      QStringView path);
+[[nodiscard]] ValueOrError<QList<Json::Value>>
+requireArray(const Json::Value &v, QStringView path);
+[[nodiscard]] ValueOrError<QString> requireStringValue(const Json::Value &v,
                                                        QStringView path);
 // Decodes a JSON number as an exact 64-bit integer: rejects any value that
 // is not a JSON number at all, is not mathematically integral (a
@@ -66,6 +95,14 @@ enum class FieldPresence { Absent, Null, Present };
                                                    QStringView path);
 [[nodiscard]] ValueOrError<bool> requireBoolValue(const QJsonValue &v,
                                                   QStringView path);
+// Json::Value overload: reads RawNumber::toExactInt64() directly (see
+// RawJson.h) -- exact across qint64's *entire* range with no double
+// involved at any point, so there is no boundary ambiguity to document
+// here at all (unlike the QJsonValue overload above).
+[[nodiscard]] ValueOrError<qint64> requireIntValue(const Json::Value &v,
+                                                   QStringView path);
+[[nodiscard]] ValueOrError<bool> requireBoolValue(const Json::Value &v,
+                                                  QStringView path);
 
 // Required-field decoders: fail with a path-qualified, actionable error if
 // the key is absent or the value has the wrong JSON type.
@@ -81,6 +118,21 @@ requireObjectField(const QJsonObject &obj, QLatin1StringView key,
 [[nodiscard]] ValueOrError<QJsonArray> requireArrayField(const QJsonObject &obj,
                                                          QLatin1StringView key,
                                                          QStringView path);
+// Json::Value overloads of the six required-field decoders above, for a
+// canonical fromRawJson() decoder operating on an already-parsed
+// Json::Value object (see RawJson.h) instead of QJsonObject.
+[[nodiscard]] ValueOrError<QString>
+requireString(const Json::Value &obj, QLatin1StringView key, QStringView path);
+[[nodiscard]] ValueOrError<qint64>
+requireInt(const Json::Value &obj, QLatin1StringView key, QStringView path);
+[[nodiscard]] ValueOrError<bool>
+requireBool(const Json::Value &obj, QLatin1StringView key, QStringView path);
+[[nodiscard]] ValueOrError<Json::Value>
+requireObjectField(const Json::Value &obj, QLatin1StringView key,
+                   QStringView path);
+[[nodiscard]] ValueOrError<QList<Json::Value>>
+requireArrayField(const Json::Value &obj, QLatin1StringView key,
+                  QStringView path);
 
 // Required-but-unconstrained-value decoder: fails only if the key itself is
 // absent. Unlike every other require* helper, a present value -- of any
@@ -92,6 +144,13 @@ requireObjectField(const QJsonObject &obj, QLatin1StringView key,
 [[nodiscard]] ValueOrError<QJsonValue> requireRawField(const QJsonObject &obj,
                                                        QLatin1StringView key,
                                                        QStringView path);
+// Json::Value overload: the canonical form for a schema-unconstrained
+// field, since the returned Json::Value preserves arbitrary nested
+// numeric precision/duplicate-key rejection that requireRawField()'s
+// QJsonValue result cannot.
+[[nodiscard]] ValueOrError<Json::Value> requireRawField(const Json::Value &obj,
+                                                        QLatin1StringView key,
+                                                        QStringView path);
 
 // Optional-field decoders: an absent key or an explicit JSON null both
 // decode to std::nullopt. A present value of the wrong type still fails.
@@ -106,6 +165,13 @@ optionalString(const QJsonObject &obj, QLatin1StringView key, QStringView path);
 optionalInt(const QJsonObject &obj, QLatin1StringView key, QStringView path);
 [[nodiscard]] ValueOrError<std::optional<bool>>
 optionalBool(const QJsonObject &obj, QLatin1StringView key, QStringView path);
+// Json::Value overloads of the three optional-field decoders above.
+[[nodiscard]] ValueOrError<std::optional<QString>>
+optionalString(const Json::Value &obj, QLatin1StringView key, QStringView path);
+[[nodiscard]] ValueOrError<std::optional<qint64>>
+optionalInt(const Json::Value &obj, QLatin1StringView key, QStringView path);
+[[nodiscard]] ValueOrError<std::optional<bool>>
+optionalBool(const Json::Value &obj, QLatin1StringView key, QStringView path);
 
 // Optional-but-non-nullable decoders: an absent key decodes to
 // std::nullopt, matching a schema field typed only "string"/"integer"/
@@ -125,6 +191,17 @@ optionalNonNullInt(const QJsonObject &obj, QLatin1StringView key,
 [[nodiscard]] ValueOrError<std::optional<bool>>
 optionalNonNullBool(const QJsonObject &obj, QLatin1StringView key,
                     QStringView path);
+// Json::Value overloads of the three optional-but-non-nullable decoders
+// above.
+[[nodiscard]] ValueOrError<std::optional<QString>>
+optionalNonNullString(const Json::Value &obj, QLatin1StringView key,
+                      QStringView path);
+[[nodiscard]] ValueOrError<std::optional<qint64>>
+optionalNonNullInt(const Json::Value &obj, QLatin1StringView key,
+                   QStringView path);
+[[nodiscard]] ValueOrError<std::optional<bool>>
+optionalNonNullBool(const Json::Value &obj, QLatin1StringView key,
+                    QStringView path);
 
 // Required-but-nullable decoders: the key itself must be present (schemas
 // such as decks.schema.json's `deckList` and catalog.schema.json's `name`
@@ -136,6 +213,13 @@ requireNullableString(const QJsonObject &obj, QLatin1StringView key,
                       QStringView path);
 [[nodiscard]] ValueOrError<std::optional<qint64>>
 requireNullableInt(const QJsonObject &obj, QLatin1StringView key,
+                   QStringView path);
+// Json::Value overloads of the two required-but-nullable decoders above.
+[[nodiscard]] ValueOrError<std::optional<QString>>
+requireNullableString(const Json::Value &obj, QLatin1StringView key,
+                      QStringView path);
+[[nodiscard]] ValueOrError<std::optional<qint64>>
+requireNullableInt(const Json::Value &obj, QLatin1StringView key,
                    QStringView path);
 
 // Optional-and-outer-typed raw decoders: match a schema field that is not
@@ -156,10 +240,24 @@ optionalRawArrayField(const QJsonObject &obj, QLatin1StringView key,
 [[nodiscard]] ValueOrError<QJsonValue>
 optionalRawObjectField(const QJsonObject &obj, QLatin1StringView key,
                        QStringView path);
+// Json::Value overloads of the two optional-and-outer-typed raw decoders
+// above: the canonical form for these fields (see requireRawField's
+// Json::Value overload doc comment) -- an absent key decodes to
+// Json::Value's default Kind::Undefined (Json::Value::isUndefined()),
+// preserving arbitrary nested numeric precision the QJsonValue overloads
+// above cannot.
+[[nodiscard]] ValueOrError<Json::Value>
+optionalRawArrayField(const Json::Value &obj, QLatin1StringView key,
+                      QStringView path);
+[[nodiscard]] ValueOrError<Json::Value>
+optionalRawObjectField(const Json::Value &obj, QLatin1StringView key,
+                       QStringView path);
 
 // Strict non-null UUID decode: fails on null, on a malformed string, and on
 // the all-zero UUID (never a valid backend-assigned identity).
 [[nodiscard]] ValueOrError<QUuid> decodeUuid(const QJsonValue &v,
+                                             QStringView path);
+[[nodiscard]] ValueOrError<QUuid> decodeUuid(const Json::Value &v,
                                              QStringView path);
 
 // Decodes a UUID array slot that may be JSON null (e.g. an unassigned deck
@@ -167,6 +265,8 @@ optionalRawObjectField(const QJsonObject &obj, QLatin1StringView key,
 // string -> the parsed value, anything else -> failure.
 [[nodiscard]] ValueOrError<std::optional<QUuid>>
 decodeNullableUuid(const QJsonValue &v, QStringView path);
+[[nodiscard]] ValueOrError<std::optional<QUuid>>
+decodeNullableUuid(const Json::Value &v, QStringView path);
 
 // Formats a JSON number exactly as the backend's Aeson `Scientific` Show
 // instance would (see Data.Scientific): fixed-point with a mandatory ".0"
@@ -186,6 +286,35 @@ decodeNullableUuid(const QJsonValue &v, QStringView path);
 [[nodiscard]] ValueOrError<QString> scientificShow(double value,
                                                    QStringView path);
 
+// Uniform (key, value) member iteration for a validated object, shared by
+// templated decode logic that walks a map-shaped field (alternateSkills,
+// alternateErrata, cardQuantityMap/Input) identically for both a
+// QJsonObject (returned by requireObject(QJsonValue)) and a Json::Value
+// object (returned by requireObject(Json::Value)/requireObjectField):
+// QJsonObject has no directly equivalent member-list accessor, so this
+// materializes one; Json::Value already stores its members exactly this
+// way (see RawJson.h's Value::members()) and this overload is a plain,
+// non-owning passthrough.
+[[nodiscard]] QList<std::pair<QString, QJsonValue>>
+objectMembers(const QJsonObject &obj);
+[[nodiscard]] const QList<std::pair<QString, Json::Value>> &
+objectMembers(const Json::Value &obj);
+
+// Converts an already-extracted field value to the lossless AST type every
+// scoped contract domain type (CardDef/DeckListInput/GameState/
+// CampaignOption/etc.) stores its schema-unconstrained/unknown-tag fields
+// as: a no-op passthrough when the surrounding decode is already running
+// on Json::Value (the canonical fromRawJson()/fromRawBytes() family), or
+// an explicit, individually-failable Json::Value::fromQJson() conversion
+// when running on QJsonValue (the fromJson() convenience family) -- never
+// a silent best-effort fallback. This is the ONLY place in this codebase a
+// QJsonValue-to-Json::Value conversion should happen, and callers should
+// invoke it per-field rather than for a whole subtree at once, so a single
+// malformed/unrepresentable numeric field fails with a precise path
+// rather than corrupting or discarding its siblings.
+[[nodiscard]] ValueOrError<Json::Value> toLosslessRaw(const QJsonValue &v);
+[[nodiscard]] ValueOrError<Json::Value> toLosslessRaw(const Json::Value &v);
+
 // Decodes a closed enum from a JSON string against an explicit
 // wire-name/value table. Unlike this codebase's open wire-string wrappers
 // (ContractRevision-adjacent "forward compatible" types), an unrecognized
@@ -193,9 +322,14 @@ decodeNullableUuid(const QJsonValue &v, QStringView path);
 // contract schemas use for e.g. cardType/classSymbol/slotType, which the
 // issue scopes as closed (only the game-list/lifecycle tag types need
 // explicit unknown-value forward compatibility).
-template <typename Enum, std::size_t N>
+// Generic over the input value's own type (QJsonValue or Json::Value, see
+// RawJson.h): both support isString()/toString() identically, and there is
+// no numeric/precision concern for a bare string comparison, so a single
+// template body serves both a QJsonValue-based fromJson() and a
+// Json::Value-based fromRawJson() decoder with no duplicated logic.
+template <typename Enum, typename V, std::size_t N>
 [[nodiscard]] ValueOrError<Enum> decodeClosedEnum(
-    const QJsonValue &v, QStringView path,
+    const V &v, QStringView path,
     const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
   if (!v.isString())
     return failure(

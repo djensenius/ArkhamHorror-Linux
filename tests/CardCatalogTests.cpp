@@ -3,9 +3,27 @@
 #include <QtTest>
 
 #include "CardCatalog.h"
+#include "RawJson.h"
 
 using namespace Arkham;
 using namespace Qt::StringLiterals;
+
+namespace {
+// Test-only convenience conversion standing in for a real byte-parsed
+// Json::Value (see RawJson.h): CardCost/SkillIcon/GameValue's raw payload
+// storage is the lossless AST, not QJsonValue, so tests comparing against
+// a literal QJsonValue/QJsonObject fixture must first convert it the same
+// way. Fails via qFatal only for a malformed *test fixture* (never
+// production code), per this project's convention that qFatal is
+// permitted solely for impossible-to-reach test setup.
+Json::Value toRawJson(const QJsonValue &v) {
+  auto result = Json::Value::fromQJson(v);
+  if (!result)
+    qFatal("test fixture construction must not fail: %s",
+           qPrintable(result.error()));
+  return *result;
+}
+} // namespace
 
 class CardCatalogTests final : public QObject {
   Q_OBJECT
@@ -78,6 +96,18 @@ private slots:
   void duplicateCardTraitsRejected();
   void duplicateRevealedCardTraitsRejected();
   void duplicateTagsAllowedNoUniquenessConstraint();
+
+  // Canonical byte-level decode (lossless Json::Value AST, see RawJson.h):
+  // fromRawJson()/fromRawBytes() must never round-trip through QJsonValue,
+  // so a number nested inside an unconstrained field survives byte-exact
+  // even outside qint64 range / with a long fraction / a huge exponent,
+  // and a duplicate key nested at any depth is rejected -- neither of
+  // which the QJsonValue-based fromJson() path (used only for values a
+  // caller already collapsed via QJsonDocument, e.g. legacy call sites)
+  // can guarantee.
+  void rawBytesPreserveNumericPrecisionInUnconstrainedFields();
+  void rawBytesRejectDuplicateKeyNestedInUnconstrainedField();
+  void decodeCatalogFromRawBytesRoundTripsArray();
 };
 
 namespace {
@@ -416,8 +446,8 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
       CardCost::fromJson(matchingEnemyFieldObj, u"cost");
   if (!matchingEnemyFieldResult)
     QFAIL(qPrintable(matchingEnemyFieldResult.error()));
-  QCOMPARE(matchingEnemyFieldResult->rawContents(),
-           QJsonValue(matchingEnemyFieldContents));
+  QVERIFY(matchingEnemyFieldResult->rawContents() ==
+          toRawJson(QJsonValue(matchingEnemyFieldContents)));
   QCOMPARE(matchingEnemyFieldResult->toJson(), matchingEnemyFieldObj);
 
   const QJsonObject staticObj{
@@ -532,7 +562,7 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tag(), CardCostTag::Unknown);
   QVERIFY(!result->staticAmount().has_value());
-  QCOMPARE(result->unknownRaw(), withContents);
+  QVERIFY(result->unknownRaw() == toRawJson(withContents));
   QCOMPARE(result->toJson(), withContents);
 
   const QJsonObject withoutContents{
@@ -541,7 +571,7 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
   if (!result2)
     QFAIL(qPrintable(result2.error()));
   QCOMPARE(result2->tag(), CardCostTag::Unknown);
-  QCOMPARE(result2->unknownRaw(), withoutContents);
+  QVERIFY(result2->unknownRaw() == toRawJson(withoutContents));
   QCOMPARE(result2->toJson(), withoutContents);
 
   // There is no public factory that lets calling code fabricate an
@@ -559,7 +589,7 @@ void CardCatalogTests::unrecognizedGameValueTagPreservedNotRejected() {
   // Must never be conflated with the *known* nullary tag literally named
   // "ValueUnknown".
   QVERIFY(result->tag() != GameValueTag::ValueUnknown);
-  QCOMPARE(result->unknownRaw(), obj);
+  QVERIFY(result->unknownRaw() == toRawJson(obj));
   QCOMPARE(result->toJson(), obj);
 }
 
@@ -570,7 +600,7 @@ void CardCatalogTests::unrecognizedSkillIconTagPreservedNotRejected() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tag(), SkillIconTag::Unknown);
-  QCOMPARE(result->unknownRaw(), obj);
+  QVERIFY(result->unknownRaw() == toRawJson(obj));
   QCOMPARE(result->toJson(), obj);
 }
 
@@ -683,28 +713,29 @@ void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
 }
 
 void CardCatalogTests::rawPayloadCardCostFactoriesValidateContents() {
-  const QJsonValue rawContents =
-      QJsonObject{{QStringLiteral("nested"), QJsonArray{1, 2, 3}}};
+  // CardCost's payload factories take the lossless Json::Value AST (see
+  // RawJson.h), not QJsonValue -- toRawJson() is this test's own
+  // convenience conversion, standing in for a real byte-parsed value.
+  const Json::Value rawContents =
+      toRawJson(QJsonObject{{QStringLiteral("nested"), QJsonArray{1, 2, 3}}});
 
   const auto maxDynamicCost = CardCost::maxDynamicCost(rawContents);
   if (!maxDynamicCost)
     QFAIL(qPrintable(maxDynamicCost.error()));
   QCOMPARE(maxDynamicCost->tag(), CardCostTag::MaxDynamicCost);
-  QCOMPARE(maxDynamicCost->rawContents(), rawContents);
+  QVERIFY(maxDynamicCost->rawContents() == rawContents);
 
   const auto anyMatchingCardCost = CardCost::anyMatchingCardCost(rawContents);
   if (!anyMatchingCardCost)
     QFAIL(qPrintable(anyMatchingCardCost.error()));
   QCOMPARE(anyMatchingCardCost->tag(), CardCostTag::AnyMatchingCardCost);
-  QCOMPARE(anyMatchingCardCost->rawContents(), rawContents);
+  QVERIFY(anyMatchingCardCost->rawContents() == rawContents);
 
   for (const auto &[label, result] : std::array{
-           std::pair{
-               QStringLiteral("maxDynamicCost"),
-               CardCost::maxDynamicCost(QJsonValue(QJsonValue::Undefined))},
+           std::pair{QStringLiteral("maxDynamicCost"),
+                     CardCost::maxDynamicCost(Json::Value())},
            std::pair{QStringLiteral("anyMatchingCardCost"),
-                     CardCost::anyMatchingCardCost(
-                         QJsonValue(QJsonValue::Undefined))},
+                     CardCost::anyMatchingCardCost(Json::Value())},
        }) {
     QVERIFY2(!result.has_value(),
              qPrintable(QStringLiteral("%1 unexpectedly accepted undefined "
@@ -714,29 +745,33 @@ void CardCatalogTests::rawPayloadCardCostFactoriesValidateContents() {
              qPrintable(result.error()));
   }
 
-  const QJsonArray validMatchingEnemyFieldContents{
+  const QJsonArray validMatchingEnemyFieldContentsQJson{
       QJsonObject{{QStringLiteral("enemy"), QStringLiteral("Ghoul")}},
       QJsonObject{{QStringLiteral("field"), QStringLiteral("Health")}}};
+  const Json::Value validMatchingEnemyFieldContents =
+      toRawJson(validMatchingEnemyFieldContentsQJson);
   const auto matchingEnemyFieldCost =
       CardCost::matchingEnemyFieldCost(validMatchingEnemyFieldContents);
   if (!matchingEnemyFieldCost)
     QFAIL(qPrintable(matchingEnemyFieldCost.error()));
   QCOMPARE(matchingEnemyFieldCost->tag(), CardCostTag::MatchingEnemyFieldCost);
-  QCOMPARE(matchingEnemyFieldCost->rawContents(),
-           QJsonValue(validMatchingEnemyFieldContents));
+  QVERIFY(matchingEnemyFieldCost->rawContents() ==
+          validMatchingEnemyFieldContents);
   QCOMPARE(
       matchingEnemyFieldCost->toJson(),
       (QJsonObject{
           {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
-          {QStringLiteral("contents"), validMatchingEnemyFieldContents},
+          {QStringLiteral("contents"), validMatchingEnemyFieldContentsQJson},
       }));
 
   for (const auto &[label, contents] : std::array{
-           std::pair{QStringLiteral("one element"), QJsonValue(QJsonArray{1})},
+           std::pair{QStringLiteral("one element"),
+                     toRawJson(QJsonValue(QJsonArray{1}))},
            std::pair{QStringLiteral("three elements"),
-                     QJsonValue(QJsonArray{1, 2, 3})},
-           std::pair{QStringLiteral("non-array"),
-                     QJsonValue(QJsonObject{{QStringLiteral("x"), 1}})},
+                     toRawJson(QJsonValue(QJsonArray{1, 2, 3}))},
+           std::pair{
+               QStringLiteral("non-array"),
+               toRawJson(QJsonValue(QJsonObject{{QStringLiteral("x"), 1}}))},
        }) {
     const auto result = CardCost::matchingEnemyFieldCost(contents);
     QVERIFY2(
@@ -781,7 +816,7 @@ void CardCatalogTests::unconstrainedFieldsPreservedVerbatim() {
   const auto result = CardDef::fromJson(obj, u"card");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->meta, QJsonValue(rawMeta));
+  QVERIFY(result->meta == toRawJson(QJsonValue(rawMeta)));
   QCOMPARE(result->toJson().value(QStringLiteral("meta")).toObject(), rawMeta);
 }
 
@@ -1007,9 +1042,10 @@ void CardCatalogTests::
   const auto result = CardDef::fromJson(obj, u"card");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->keywords, QJsonValue(rawKeywords));
-  QCOMPARE(result->commitRestrictions, QJsonValue(rawCommitRestrictions));
-  QCOMPARE(result->meta, QJsonValue(rawMeta));
+  QVERIFY(result->keywords == toRawJson(QJsonValue(rawKeywords)));
+  QVERIFY(result->commitRestrictions ==
+          toRawJson(QJsonValue(rawCommitRestrictions)));
+  QVERIFY(result->meta == toRawJson(QJsonValue(rawMeta)));
   QCOMPARE(result->toJson(), obj);
 }
 
@@ -1074,6 +1110,106 @@ void CardCatalogTests::duplicateTagsAllowedNoUniquenessConstraint() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tags.size(), 2);
   QCOMPARE(result->toJson(), obj);
+}
+
+void CardCatalogTests::rawBytesPreserveNumericPrecisionInUnconstrainedFields() {
+  // A number nested inside an unconstrained field (any depth) must survive
+  // CardDef::fromRawBytes() byte-exact: this is impossible for a decode
+  // path that collapses to QJsonValue first, since QJsonValue stores every
+  // number as a C++ double. None of these three literals is representable
+  // as an exact double / fits qint64, so this test fails outright if
+  // fromRawBytes() ever converts the tree to QJsonValue before extracting
+  // these fields.
+  const QByteArray bytes = R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "meta": {
+      "hugeInt": 99999999999999999999999999,
+      "longFraction": 1.234567890123456789012345678901234567890,
+      "hugeExponent": 1e400
+    },
+    "criteria": [{"nested": {"alsoHuge": 90071992547409931234567}}],
+    "keywords": ["surge", 99999999999999999999999999]
+  })";
+  const auto result = CardDef::fromRawBytes(bytes, u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->meta.kind(), Json::Value::Kind::Object);
+  const auto hugeInt = result->meta.value("hugeInt"_L1).toRawNumber();
+  QCOMPARE(hugeInt.literal(), QStringLiteral("99999999999999999999999999"));
+  QVERIFY(!hugeInt.toExactInt64().has_value());
+
+  const auto longFraction = result->meta.value("longFraction"_L1).toRawNumber();
+  QCOMPARE(longFraction.literal(),
+           QStringLiteral("1.234567890123456789012345678901234567890"));
+
+  const auto hugeExponent = result->meta.value("hugeExponent"_L1).toRawNumber();
+  QCOMPARE(hugeExponent.literal(), QStringLiteral("1e400"));
+
+  QCOMPARE(result->criteria.kind(), Json::Value::Kind::Array);
+  const auto nestedHuge = result->criteria.toArray()
+                              .at(0)
+                              .value("nested"_L1)
+                              .value("alsoHuge"_L1)
+                              .toRawNumber();
+  QCOMPARE(nestedHuge.literal(), QStringLiteral("90071992547409931234567"));
+
+  QCOMPARE(result->keywords.kind(), Json::Value::Kind::Array);
+  QCOMPARE(result->keywords.toArray().at(1).toRawNumber().literal(),
+           QStringLiteral("99999999999999999999999999"));
+}
+
+void CardCatalogTests::rawBytesRejectDuplicateKeyNestedInUnconstrainedField() {
+  // The duplicate-key rejection Value::parse() performs at every nesting
+  // depth must apply inside an unconstrained field too -- fromRawBytes()
+  // must never fall back to a lenient QJsonDocument-style "last one wins"
+  // parse for the parts of the tree this client does not itself model.
+  const QByteArray bytes = R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "meta": {"dup": 1, "dup": 2}
+  })";
+  const auto result = CardDef::fromRawBytes(bytes, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("duplicate")),
+           qPrintable(result.error()));
+}
+
+void CardCatalogTests::decodeCatalogFromRawBytesRoundTripsArray() {
+  const QByteArray bytes = R"([
+    {
+      "cardCode": "c00001",
+      "name": {"title": "First", "subtitle": null},
+      "cardType": "AssetType",
+      "art": "1",
+      "meta": {"bigId": 9007199254740993}
+    },
+    {
+      "cardCode": "c00002",
+      "name": {"title": "Second", "subtitle": null},
+      "cardType": "EventType",
+      "art": "2"
+    }
+  ])";
+  const auto result = decodeCatalogFromRawBytes(bytes, u"catalog");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->size(), 2);
+  QCOMPARE((*result)[0].cardCode.value(), QStringLiteral("c00001"));
+  QCOMPARE((*result)[0].meta.value("bigId"_L1).toRawNumber().literal(),
+           QStringLiteral("9007199254740993"));
+  QCOMPARE((*result)[1].cardCode.value(), QStringLiteral("c00002"));
+
+  // Not a JSON array at all: a top-level object is rejected, not silently
+  // treated as a single-element catalog.
+  const auto notArray =
+      decodeCatalogFromRawBytes(QByteArrayLiteral("{}"), u"catalog");
+  QVERIFY(!notArray.has_value());
 }
 
 QTEST_APPLESS_MAIN(CardCatalogTests)

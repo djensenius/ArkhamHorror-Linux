@@ -140,12 +140,22 @@ struct DeckListInput {
 
   [[nodiscard]] static ValueOrError<DeckListInput> fromJson(const QJsonValue &v,
                                                             QStringView path);
-  // Precision-preserving equivalent of fromJson(): every field decodes
-  // identically, except `id`'s numeric variant and `sideSlots` (including
-  // any number nested inside it) keep their exact source literal(s)
-  // instead of being rounded through a double by QJsonDocument before
-  // this type ever sees them. Callers with the original request/response
-  // bytes should prefer this over fromJson().
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a private template, see Decks.cpp), operating directly on
+  // the lossless AST (see RawJson.h) parsed by Json::Value::parse() --
+  // never converting the whole tree to QJsonValue first -- so `id`'s
+  // numeric variant and any number nested inside `sideSlots` (at any
+  // depth) survive a decode byte-exact, including a number outside
+  // qint64/double range, a long fraction, a huge exponent, or a duplicate
+  // key. The one production entry point governed fixtures and any future
+  // request/response body this client decodes must use.
+  [[nodiscard]] static ValueOrError<DeckListInput>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` per RFC 8259 exactly (see RawJson.h's Value::parse())
+  // and decodes via fromRawJson() above -- never collapsing to QJsonValue
+  // first, unlike this method's previous "decode via fromJson(), then
+  // patch id/sideSlots back in from the raw tree" implementation, which
+  // could not preserve a number nested anywhere else callers might add.
   [[nodiscard]] static ValueOrError<DeckListInput>
   fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
@@ -218,8 +228,13 @@ struct CreateDeckRequest {
 
   [[nodiscard]] static ValueOrError<CreateDeckRequest>
   fromJson(const QJsonValue &v, QStringView path);
-  // Precision-preserving equivalent of fromJson(); see
-  // DeckListInput::fromRawBytes().
+  // Canonical byte-level decode: see DeckListInput::fromRawJson()'s doc
+  // comment -- decodes deckList natively via the same lossless AST rather
+  // than reparsing it a second time from re-serialized bytes.
+  [[nodiscard]] static ValueOrError<CreateDeckRequest>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` per RFC 8259 exactly and decodes via fromRawJson()
+  // above; see DeckListInput::fromRawBytes().
   [[nodiscard]] static ValueOrError<CreateDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;

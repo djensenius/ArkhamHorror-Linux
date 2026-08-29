@@ -172,6 +172,18 @@ public:
 
   [[nodiscard]] static ValueOrError<GameState> fromJson(const QJsonValue &v,
                                                         QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a private template, see Games.cpp), operating directly on
+  // the lossless AST (see RawJson.h) so an Unknown tag's complete raw
+  // object -- including any numeric literal nested inside a future
+  // payload -- survives exactly rather than only as closely as
+  // QJsonValue's double-backed storage allows.
+  [[nodiscard]] static ValueOrError<GameState> fromRawJson(const Json::Value &v,
+                                                           QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<GameState>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
@@ -185,12 +197,23 @@ public:
   [[nodiscard]] const QString &unknownTag() const noexcept {
     return m_unknownTag;
   }
-  // Unknown only: the raw "contents" value the unrecognized tag object
-  // carried, if any (Undefined if it had none), preserved verbatim -- like
-  // CampaignOption's own unknown-tag handling -- so re-encoding an unknown
-  // state can never silently drop part of what the server sent.
-  [[nodiscard]] const QJsonValue &unknownContents() const noexcept {
-    return m_unknownContents;
+  // Unknown only: the complete raw decoded object (its "tag" and, if
+  // present, "contents", plus any additive sibling key a future backend
+  // release adds alongside them), preserved verbatim as a lossless
+  // Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue, so a huge
+  // numeric literal or duplicate-key-bearing payload this client cannot
+  // interpret still round-trips byte-exact and no additive key beside
+  // "contents" is silently dropped by toJson().
+  [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
+    return m_unknownRaw;
+  }
+  // Convenience view derived from unknownRaw(): the raw "contents" the
+  // unrecognized tag object carried, if any (Undefined if it had none).
+  // Never the source of truth for encoding -- toJson()/unknownRaw() are.
+  [[nodiscard]] Json::Value unknownContents() const {
+    return m_unknownRaw.isObject()
+               ? m_unknownRaw.value(QLatin1StringView("contents"))
+               : Json::Value{};
   }
 
   friend bool operator==(const GameState &, const GameState &) = default;
@@ -198,10 +221,18 @@ public:
 private:
   GameState() = default;
 
+  // Shared decode body for fromJson()/fromRawJson() above: V is QJsonValue
+  // or Json::Value. Defined in Games.cpp; a private member template
+  // (rather than a free function) so it may use the private constructor
+  // above directly.
+  template <typename V>
+  [[nodiscard]] static ValueOrError<GameState> fromValueImpl(const V &v,
+                                                             QStringView path);
+
   Kind m_kind{Kind::Unknown};
   QList<QUuid> m_playerIds;
   QString m_unknownTag;
-  QJsonValue m_unknownContents{QJsonValue::Undefined};
+  Json::Value m_unknownRaw;
 };
 
 // One row of the top-level game-list.json array: either a gameDetails
@@ -356,6 +387,18 @@ public:
 
   [[nodiscard]] static ValueOrError<CampaignOption>
   fromJson(const QJsonValue &v, QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a private template, see Games.cpp), operating directly on
+  // the lossless AST (see RawJson.h) so an Unknown tag's complete raw
+  // object -- including any numeric literal nested inside a future
+  // payload -- survives exactly rather than only as closely as
+  // QJsonValue's double-backed storage allows.
+  [[nodiscard]] static ValueOrError<CampaignOption>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<CampaignOption>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
@@ -365,12 +408,23 @@ public:
   // Variant's contents (Kind::Variant) or the unrecognized tag string
   // (Kind::Unknown); empty for Kind::Known.
   [[nodiscard]] const QString &text() const noexcept { return m_text; }
-  // Kind::Unknown only: the raw "contents" value the unrecognized tag
-  // object carried, if any (Undefined if it had none), preserved verbatim
-  // alongside the tag itself so re-encoding an unknown option never
-  // silently drops part of what the server sent.
-  [[nodiscard]] const QJsonValue &unknownContents() const noexcept {
-    return m_unknownContents;
+  // Kind::Unknown only: the complete raw decoded object (its "tag" and,
+  // if present, "contents", plus any additive sibling key a future
+  // backend release adds alongside them), preserved verbatim as a
+  // lossless Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue,
+  // so a huge numeric literal or duplicate-key-bearing payload this
+  // client cannot interpret still round-trips byte-exact and no additive
+  // key beside "contents" is silently dropped by toJson().
+  [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
+    return m_unknownRaw;
+  }
+  // Convenience view derived from unknownRaw(): the raw "contents" the
+  // unrecognized tag object carried, if any (Undefined if it had none).
+  // Never the source of truth for encoding -- toJson()/unknownRaw() are.
+  [[nodiscard]] Json::Value unknownContents() const {
+    return m_unknownRaw.isObject()
+               ? m_unknownRaw.value(QLatin1StringView("contents"))
+               : Json::Value{};
   }
 
   // Narrows this decoded (possibly Kind::Unknown) option down to the closed
@@ -386,10 +440,18 @@ public:
 private:
   CampaignOption() = default;
 
+  // Shared decode body for fromJson()/fromRawJson() above: V is QJsonValue
+  // or Json::Value. Defined in Games.cpp; a private member template
+  // (rather than a free function) so it may use the private constructor
+  // above directly.
+  template <typename V>
+  [[nodiscard]] static ValueOrError<CampaignOption>
+  fromValueImpl(const V &v, QStringView path);
+
   Kind m_kind{Kind::Unknown};
   std::optional<KnownCampaignOption> m_known;
   QString m_text;
-  QJsonValue m_unknownContents{QJsonValue::Undefined};
+  Json::Value m_unknownRaw;
 };
 
 // createGameRequest.options's actual element type. Unlike CampaignOption
@@ -524,8 +586,17 @@ struct ChooseDeckRequest {
 
   [[nodiscard]] static ValueOrError<ChooseDeckRequest>
   fromJson(const QJsonValue &v, QStringView path);
-  // Precision-preserving equivalent of fromJson(); see
-  // DeckListInput::fromRawBytes().
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via decodeChooseDeckRequest<Obj>, see Games.cpp), operating
+  // directly on the lossless AST (see RawJson.h) so a numeric literal
+  // nested inside deckList's sideSlots survives exactly rather than only
+  // as closely as QJsonValue's double-backed storage allows.
+  [[nodiscard]] static ValueOrError<ChooseDeckRequest>
+  fromRawJson(const Json::Value &v, QStringView path);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above -- never collapsing to QJsonValue
+  // first, unlike this method's previous "decode via fromJson(), then
+  // patch deckList back in from the raw tree" implementation.
   [[nodiscard]] static ValueOrError<ChooseDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;

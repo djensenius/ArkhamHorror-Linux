@@ -119,15 +119,95 @@ ValueOrError<bool> requireBoolValue(const QJsonValue &v, QStringView path) {
   return v.toBool();
 }
 
+QString typeName(const Json::Value &v) {
+  switch (v.kind()) {
+  case Json::Value::Kind::Null:
+    return QStringLiteral("null");
+  case Json::Value::Kind::Bool:
+    return QStringLiteral("bool");
+  case Json::Value::Kind::Number:
+    return QStringLiteral("number");
+  case Json::Value::Kind::String:
+    return QStringLiteral("string");
+  case Json::Value::Kind::Array:
+    return QStringLiteral("array");
+  case Json::Value::Kind::Object:
+    return QStringLiteral("object");
+  case Json::Value::Kind::Undefined:
+    return QStringLiteral("missing");
+  }
+  Q_UNREACHABLE_RETURN(QStringLiteral("unknown"));
+}
+
+FieldPresence fieldPresence(const Json::Value &obj, QLatin1StringView key) {
+  if (!obj.contains(key))
+    return FieldPresence::Absent;
+  return obj.value(key).isNull() ? FieldPresence::Null : FieldPresence::Present;
+}
+
+ValueOrError<Json::Value> requireObject(const Json::Value &v,
+                                        QStringView path) {
+  if (!v.isObject())
+    return failure(
+        QStringLiteral("%1: expected object, got %2").arg(path, typeName(v)));
+  return v;
+}
+
+ValueOrError<QList<Json::Value>> requireArray(const Json::Value &v,
+                                              QStringView path) {
+  if (!v.isArray())
+    return failure(
+        QStringLiteral("%1: expected array, got %2").arg(path, typeName(v)));
+  return v.toArray();
+}
+
+ValueOrError<QString> requireStringValue(const Json::Value &v,
+                                         QStringView path) {
+  if (!v.isString())
+    return failure(
+        QStringLiteral("%1: expected string, got %2").arg(path, typeName(v)));
+  return v.toString();
+}
+
+ValueOrError<qint64> requireIntValue(const Json::Value &v, QStringView path) {
+  if (!v.isNumber())
+    return failure(
+        QStringLiteral("%1: expected integer, got %2").arg(path, typeName(v)));
+  // RawNumber::toExactInt64() reads the literal's exact digits directly
+  // (no double involved anywhere), so -- unlike the QJsonValue overload
+  // above -- there is no boundary/precision case to reconcile: every
+  // qint64-range mathematically-integral literal (see that method's own
+  // doc comment for the exact set of Aeson-compatible spellings accepted)
+  // decodes exactly, and everything else is rejected outright.
+  auto exact = v.toRawNumber().toExactInt64();
+  if (!exact)
+    return failure(QStringLiteral("%1: expected integer, got a fractional "
+                                  "or out-of-range number")
+                       .arg(path));
+  return *exact;
+}
+
+ValueOrError<bool> requireBoolValue(const Json::Value &v, QStringView path) {
+  if (!v.isBool())
+    return failure(
+        QStringLiteral("%1: expected bool, got %2").arg(path, typeName(v)));
+  return v.toBool();
+}
+
 namespace {
 // Shared by every obj+key required-field wrapper below: reports a missing
 // key with the same "missing required field" phrasing requireRawField/
 // requireNullable* already use, rather than letting it fall through to the
 // bare value decoder and surface as a less specific "expected <type>, got
 // missing". A present value (of any type, including the wrong one) is
-// still forwarded to `valueDecoder` unchanged.
-template <typename T, typename ValueDecoder>
-ValueOrError<T> requireFieldOr(const QJsonObject &obj, QLatin1StringView key,
+// still forwarded to `valueDecoder` unchanged. Templated on the container
+// type too (QJsonObject or Json::Value, see RawJson.h) so the identical
+// "missing field" wrapping logic serves both value families; callers pass
+// an explicit lambda (rather than a bare, now-overloaded function name
+// like requireStringValue) so the compiler always has a single concrete
+// callable to deduce ValueDecoder from.
+template <typename T, typename Obj, typename ValueDecoder>
+ValueOrError<T> requireFieldOr(const Obj &obj, QLatin1StringView key,
                                QStringView path, ValueDecoder valueDecoder) {
   if (fieldPresence(obj, key) == FieldPresence::Absent)
     return failure(
@@ -138,34 +218,95 @@ ValueOrError<T> requireFieldOr(const QJsonObject &obj, QLatin1StringView key,
 
 ValueOrError<QString> requireString(const QJsonObject &obj,
                                     QLatin1StringView key, QStringView path) {
-  return requireFieldOr<QString>(obj, key, path, requireStringValue);
+  return requireFieldOr<QString>(obj, key, path,
+                                 [](const QJsonValue &v, QStringView p) {
+                                   return requireStringValue(v, p);
+                                 });
 }
 
 ValueOrError<qint64> requireInt(const QJsonObject &obj, QLatin1StringView key,
                                 QStringView path) {
-  return requireFieldOr<qint64>(obj, key, path, requireIntValue);
+  return requireFieldOr<qint64>(
+      obj, key, path,
+      [](const QJsonValue &v, QStringView p) { return requireIntValue(v, p); });
 }
 
 ValueOrError<bool> requireBool(const QJsonObject &obj, QLatin1StringView key,
                                QStringView path) {
-  return requireFieldOr<bool>(obj, key, path, requireBoolValue);
+  return requireFieldOr<bool>(obj, key, path,
+                              [](const QJsonValue &v, QStringView p) {
+                                return requireBoolValue(v, p);
+                              });
 }
 
 ValueOrError<QJsonObject> requireObjectField(const QJsonObject &obj,
                                              QLatin1StringView key,
                                              QStringView path) {
-  return requireFieldOr<QJsonObject>(obj, key, path, requireObject);
+  return requireFieldOr<QJsonObject>(
+      obj, key, path,
+      [](const QJsonValue &v, QStringView p) { return requireObject(v, p); });
 }
 
 ValueOrError<QJsonArray> requireArrayField(const QJsonObject &obj,
                                            QLatin1StringView key,
                                            QStringView path) {
-  return requireFieldOr<QJsonArray>(obj, key, path, requireArray);
+  return requireFieldOr<QJsonArray>(
+      obj, key, path,
+      [](const QJsonValue &v, QStringView p) { return requireArray(v, p); });
+}
+
+ValueOrError<QString> requireString(const Json::Value &obj,
+                                    QLatin1StringView key, QStringView path) {
+  return requireFieldOr<QString>(obj, key, path,
+                                 [](const Json::Value &v, QStringView p) {
+                                   return requireStringValue(v, p);
+                                 });
+}
+
+ValueOrError<qint64> requireInt(const Json::Value &obj, QLatin1StringView key,
+                                QStringView path) {
+  return requireFieldOr<qint64>(obj, key, path,
+                                [](const Json::Value &v, QStringView p) {
+                                  return requireIntValue(v, p);
+                                });
+}
+
+ValueOrError<bool> requireBool(const Json::Value &obj, QLatin1StringView key,
+                               QStringView path) {
+  return requireFieldOr<bool>(obj, key, path,
+                              [](const Json::Value &v, QStringView p) {
+                                return requireBoolValue(v, p);
+                              });
+}
+
+ValueOrError<Json::Value> requireObjectField(const Json::Value &obj,
+                                             QLatin1StringView key,
+                                             QStringView path) {
+  return requireFieldOr<Json::Value>(
+      obj, key, path,
+      [](const Json::Value &v, QStringView p) { return requireObject(v, p); });
+}
+
+ValueOrError<QList<Json::Value>> requireArrayField(const Json::Value &obj,
+                                                   QLatin1StringView key,
+                                                   QStringView path) {
+  return requireFieldOr<QList<Json::Value>>(
+      obj, key, path,
+      [](const Json::Value &v, QStringView p) { return requireArray(v, p); });
 }
 
 ValueOrError<QJsonValue> requireRawField(const QJsonObject &obj,
                                          QLatin1StringView key,
                                          QStringView path) {
+  if (fieldPresence(obj, key) == FieldPresence::Absent)
+    return failure(
+        QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
+  return obj.value(key);
+}
+
+ValueOrError<Json::Value> requireRawField(const Json::Value &obj,
+                                          QLatin1StringView key,
+                                          QStringView path) {
   if (fieldPresence(obj, key) == FieldPresence::Absent)
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
@@ -323,6 +464,176 @@ ValueOrError<std::optional<QUuid>> decodeNullableUuid(const QJsonValue &v,
     return failure(result.error());
   return std::optional<QUuid>{*result};
 }
+
+ValueOrError<std::optional<QString>> optionalString(const Json::Value &obj,
+                                                    QLatin1StringView key,
+                                                    QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined() || v.isNull())
+    return std::optional<QString>{};
+  if (!v.isString())
+    return failure(
+        QStringLiteral("%1: expected string, got %2").arg(path, typeName(v)));
+  return std::optional<QString>{v.toString()};
+}
+
+ValueOrError<std::optional<qint64>>
+optionalInt(const Json::Value &obj, QLatin1StringView key, QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined() || v.isNull())
+    return std::optional<qint64>{};
+  auto result = requireIntValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<qint64>{*result};
+}
+
+ValueOrError<std::optional<bool>>
+optionalBool(const Json::Value &obj, QLatin1StringView key, QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined() || v.isNull())
+    return std::optional<bool>{};
+  if (!v.isBool())
+    return failure(
+        QStringLiteral("%1: expected bool, got %2").arg(path, typeName(v)));
+  return std::optional<bool>{v.toBool()};
+}
+
+ValueOrError<std::optional<QString>>
+optionalNonNullString(const Json::Value &obj, QLatin1StringView key,
+                      QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined())
+    return std::optional<QString>{};
+  auto result = requireStringValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<QString>{*result};
+}
+
+ValueOrError<std::optional<qint64>> optionalNonNullInt(const Json::Value &obj,
+                                                       QLatin1StringView key,
+                                                       QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined())
+    return std::optional<qint64>{};
+  auto result = requireIntValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<qint64>{*result};
+}
+
+ValueOrError<std::optional<bool>> optionalNonNullBool(const Json::Value &obj,
+                                                      QLatin1StringView key,
+                                                      QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined())
+    return std::optional<bool>{};
+  auto result = requireBoolValue(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<bool>{*result};
+}
+
+ValueOrError<Json::Value> optionalRawArrayField(const Json::Value &obj,
+                                                QLatin1StringView key,
+                                                QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined())
+    return v;
+  if (!v.isArray())
+    return failure(
+        QStringLiteral("%1: expected array, got %2").arg(path, typeName(v)));
+  return v;
+}
+
+ValueOrError<Json::Value> optionalRawObjectField(const Json::Value &obj,
+                                                 QLatin1StringView key,
+                                                 QStringView path) {
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined())
+    return v;
+  if (!v.isObject())
+    return failure(
+        QStringLiteral("%1: expected object, got %2").arg(path, typeName(v)));
+  return v;
+}
+
+ValueOrError<std::optional<QString>>
+requireNullableString(const Json::Value &obj, QLatin1StringView key,
+                      QStringView path) {
+  switch (fieldPresence(obj, key)) {
+  case FieldPresence::Absent:
+    return failure(
+        QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
+  case FieldPresence::Null:
+    return std::optional<QString>{};
+  case FieldPresence::Present:
+    break;
+  }
+  const Json::Value v = obj.value(key);
+  if (!v.isString())
+    return failure(
+        QStringLiteral("%1: expected string, got %2").arg(path, typeName(v)));
+  return std::optional<QString>{v.toString()};
+}
+
+ValueOrError<std::optional<qint64>> requireNullableInt(const Json::Value &obj,
+                                                       QLatin1StringView key,
+                                                       QStringView path) {
+  switch (fieldPresence(obj, key)) {
+  case FieldPresence::Absent:
+    return failure(
+        QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
+  case FieldPresence::Null:
+    return std::optional<qint64>{};
+  case FieldPresence::Present:
+    break;
+  }
+  auto result = requireIntValue(obj.value(key), path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<qint64>{*result};
+}
+
+ValueOrError<QUuid> decodeUuid(const Json::Value &v, QStringView path) {
+  if (!v.isString())
+    return failure(QStringLiteral("%1: expected uuid string, got %2")
+                       .arg(path, typeName(v)));
+  const QString text = v.toString();
+  const QUuid parsed(text);
+  if (parsed.isNull())
+    return failure(QStringLiteral("%1: not a valid non-null uuid").arg(path));
+  return parsed;
+}
+
+ValueOrError<std::optional<QUuid>> decodeNullableUuid(const Json::Value &v,
+                                                      QStringView path) {
+  if (v.isNull())
+    return std::optional<QUuid>{};
+  auto result = decodeUuid(v, path);
+  if (!result)
+    return failure(result.error());
+  return std::optional<QUuid>{*result};
+}
+
+QList<std::pair<QString, QJsonValue>> objectMembers(const QJsonObject &obj) {
+  QList<std::pair<QString, QJsonValue>> result;
+  result.reserve(obj.size());
+  for (auto it = obj.constBegin(); it != obj.constEnd(); ++it)
+    result.append({it.key(), it.value()});
+  return result;
+}
+
+const QList<std::pair<QString, Json::Value>> &
+objectMembers(const Json::Value &obj) {
+  return obj.members();
+}
+
+ValueOrError<Json::Value> toLosslessRaw(const QJsonValue &v) {
+  return Json::Value::fromQJson(v);
+}
+ValueOrError<Json::Value> toLosslessRaw(const Json::Value &v) { return v; }
 
 ValueOrError<QString> scientificShow(double value, QStringView path) {
   // A syntactically valid JSON number can still parse to a non-finite

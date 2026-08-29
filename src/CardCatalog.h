@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Identifiers.h"
+#include "RawJson.h"
 #include "ValueOrError.h"
 
 #include <QJsonArray>
@@ -118,6 +119,14 @@ public:
 
   [[nodiscard]] static ValueOrError<SkillIcon> fromJson(const QJsonValue &v,
                                                         QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a private template, see CardCatalog.cpp), operating
+  // directly on the lossless AST (see RawJson.h) so an Unknown tag's
+  // complete raw object -- including any numeric literal nested inside a
+  // future payload -- survives exactly rather than only as closely as
+  // QJsonValue's double-backed storage allows.
+  [[nodiscard]] static ValueOrError<SkillIcon> fromRawJson(const Json::Value &v,
+                                                           QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   [[nodiscard]] SkillIconTag tag() const noexcept { return m_tag; }
@@ -126,8 +135,11 @@ public:
     return m_skill;
   }
   // Tag::Unknown only: the complete raw decoded object (its "tag" and, if
-  // present, "contents"), preserved verbatim.
-  [[nodiscard]] const QJsonObject &unknownRaw() const noexcept {
+  // present, "contents", plus any additive keys a future backend release
+  // adds), preserved verbatim as a lossless Json::Value (see RawJson.h) --
+  // never QJsonObject, so a huge/duplicate-key-bearing payload this
+  // client cannot interpret still round-trips byte-exact.
+  [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
 
@@ -136,9 +148,17 @@ public:
 private:
   SkillIcon() = default;
 
+  // Shared decode body for fromJson()/fromRawJson() above: V is QJsonValue
+  // or Json::Value. Defined in CardCatalog.cpp; a private member template
+  // (rather than a free function) so it may use the private constructor
+  // above directly.
+  template <typename V>
+  [[nodiscard]] static ValueOrError<SkillIcon> fromValueImpl(const V &v,
+                                                             QStringView path);
+
   SkillIconTag m_tag{SkillIconTag::WildIcon};
   std::optional<SkillType> m_skill;
-  QJsonObject m_unknownRaw;
+  Json::Value m_unknownRaw;
 };
 
 // `cardCost`: a static integer, one of three no-payload dynamic variants, or
@@ -165,14 +185,18 @@ public:
   [[nodiscard]] static CardCost dynamicCost();
   [[nodiscard]] static CardCost discardAmountCost();
   [[nodiscard]] static CardCost deferredCost();
-  // Rejects QJsonValue::Undefined contents (a caller must supply an
-  // explicit, present JSON value -- the schema leaves its shape
-  // unconstrained, but "unconstrained" is not the same as "may be
-  // omitted") -- see class comment.
+  // Rejects Kind::Undefined contents (a caller must supply an explicit,
+  // present JSON value -- the schema leaves its shape unconstrained, but
+  // "unconstrained" is not the same as "may be omitted") -- see class
+  // comment. `contents` is the lossless Json::Value AST (see RawJson.h),
+  // not QJsonValue: this schema-unconstrained payload may itself carry a
+  // number outside QJsonValue's exact range (e.g. nested arbitrarily deep
+  // inside a future backend's richer cost description), which only
+  // Json::Value can preserve through a decode-then-encode round trip.
   [[nodiscard]] static ValueOrError<CardCost>
-  maxDynamicCost(QJsonValue contents);
+  maxDynamicCost(Json::Value contents);
   [[nodiscard]] static ValueOrError<CardCost>
-  anyMatchingCardCost(QJsonValue contents);
+  anyMatchingCardCost(Json::Value contents);
   // Additionally requires `contents` to be a JSON array of exactly two
   // elements: the pinned backend's `MatchingEnemyFieldCost EnemyMatcher
   // EnemyCostField` (Arkham.Card.Cost, backend commit 6a1befbd7b) is a
@@ -184,10 +208,16 @@ public:
   // catalog.schema.json's conservative `contents: {}`. The two elements'
   // own internal structure remains genuinely unconstrained.
   [[nodiscard]] static ValueOrError<CardCost>
-  matchingEnemyFieldCost(QJsonValue contents);
+  matchingEnemyFieldCost(Json::Value contents);
 
   [[nodiscard]] static ValueOrError<CardCost> fromJson(const QJsonValue &v,
                                                        QStringView path);
+  // Canonical byte-level decode: see SkillIcon::fromRawJson()'s doc
+  // comment -- identical logic, operating directly on Json::Value so
+  // rawContents()/unknownRaw() below are exact even for a deeply nested
+  // number no QJsonValue could represent.
+  [[nodiscard]] static ValueOrError<CardCost> fromRawJson(const Json::Value &v,
+                                                          QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   [[nodiscard]] CardCostTag tag() const noexcept { return m_tag; }
@@ -196,12 +226,14 @@ public:
     return m_staticAmount;
   }
   // Populated only when tag() is MaxDynamicCost / AnyMatchingCardCost /
-  // MatchingEnemyFieldCost; schema-unconstrained, preserved verbatim.
-  [[nodiscard]] const QJsonValue &rawContents() const noexcept {
+  // MatchingEnemyFieldCost; schema-unconstrained, preserved verbatim as a
+  // lossless Json::Value (see RawJson.h).
+  [[nodiscard]] const Json::Value &rawContents() const noexcept {
     return m_rawContents;
   }
-  // Tag::Unknown only: the complete raw decoded object, preserved verbatim.
-  [[nodiscard]] const QJsonObject &unknownRaw() const noexcept {
+  // Tag::Unknown only: the complete raw decoded object, preserved verbatim
+  // as a lossless Json::Value.
+  [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
 
@@ -210,10 +242,14 @@ public:
 private:
   CardCost() = default;
 
+  template <typename V>
+  [[nodiscard]] static ValueOrError<CardCost> fromValueImpl(const V &v,
+                                                            QStringView path);
+
   CardCostTag m_tag{CardCostTag::DynamicCost};
   std::optional<qint64> m_staticAmount;
-  QJsonValue m_rawContents{QJsonValue::Undefined};
-  QJsonObject m_unknownRaw;
+  Json::Value m_rawContents;
+  Json::Value m_unknownRaw;
 };
 
 // `gameValue`: a single static amount, a (static, perPlayer) pair, four
@@ -251,6 +287,10 @@ public:
 
   [[nodiscard]] static ValueOrError<GameValue> fromJson(const QJsonValue &v,
                                                         QStringView path);
+  // Canonical byte-level decode: see SkillIcon::fromRawJson()'s doc
+  // comment.
+  [[nodiscard]] static ValueOrError<GameValue> fromRawJson(const Json::Value &v,
+                                                           QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   [[nodiscard]] GameValueTag tag() const noexcept { return m_tag; }
@@ -262,8 +302,9 @@ public:
   [[nodiscard]] const QList<qint64> &contents() const noexcept {
     return m_contents;
   }
-  // Tag::Unknown only: the complete raw decoded object, preserved verbatim.
-  [[nodiscard]] const QJsonObject &unknownRaw() const noexcept {
+  // Tag::Unknown only: the complete raw decoded object, preserved verbatim
+  // as a lossless Json::Value (see RawJson.h).
+  [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
 
@@ -272,45 +313,55 @@ public:
 private:
   GameValue() = default;
 
+  template <typename V>
+  [[nodiscard]] static ValueOrError<GameValue> fromValueImpl(const V &v,
+                                                             QStringView path);
+
   GameValueTag m_tag{GameValueTag::ValueX};
   std::optional<qint64> m_singleAmount;
   QList<qint64> m_contents;
-  QJsonObject m_unknownRaw;
+  Json::Value m_unknownRaw;
 };
 
 // A single card definition, covering every top-level property documented by
 // catalog.schema.json's `cardDef`. Fields the schema leaves fully
 // unconstrained (`{}`, or an array/object whose element/property shape is
-// unconstrained) are preserved verbatim as raw QJsonValue -- absent fields
-// decode to QJsonValue(QJsonValue::Undefined) and are omitted again by
-// toJson(), so a round trip of an untouched fixture entry is byte-faithful
-// modulo key order. Required fields are cardCode, name, cardType, and art;
-// every other field is optional, decoding to std::nullopt / an empty
-// container when absent.
+// unconstrained) are preserved verbatim as the lossless Json::Value AST
+// (see RawJson.h), never QJsonValue: catalog.json is a production
+// response this client decodes via the canonical byte-level fromRawBytes()
+// entry point below, and a number nested at any depth inside e.g.
+// `criteria`/`meta`/`customizations` -- or a duplicate key within one of
+// them -- must survive a decode-then-encode round trip exactly, which only
+// the byte-parsed AST (not QJsonValue's double-backed storage) can
+// guarantee. Absent fields decode to Json::Value's default Kind::Undefined
+// and are omitted again by toJson()/toRawJson(), so a round trip of an
+// untouched fixture entry is byte-faithful modulo key order. Required
+// fields are cardCode, name, cardType, and art; every other field is
+// optional, decoding to std::nullopt / an empty container when absent.
 //
 // Deliberate additive-field policy: any top-level object key this type
-// does not itself model is silently ignored by fromJson() (the schema's
-// implicit `additionalProperties: true`), not rejected. This is
-// intentional forward-compatible leniency for a read-only response type --
-// CardDef is decoded from the card catalog endpoint and is never itself
-// re-encoded as part of an outbound request, so tolerating a field this
-// client version does not yet recognize carries no outbound-safety risk
-// (contrast with e.g. CampaignOption/CampaignOptionRequest's split, where
-// only the closed *Request side must reject anything unrecognized because
-// it IS submitted). Every field this type does model is still validated
-// exactly: a known field's wrong JSON type, a required field's absence, or
-// a malformed value for a field with real constraints (duplicate
-// uniqueItems entries, wrong outer array/object shape, etc.) is a hard
-// decode failure, never silently dropped into "absent" -- only genuinely
-// *unrecognized* keys are ignored. The schema types level/victoryPoints/
-// vengeancePoints/overrideActionPlayableIfCriteriaMet/permanent/
-// encounterSet/encounterSetQuantity/unique/doubleSided/exceptional/
-// playableFromDiscard/stage/grantedXp/canReplace/skipPlayWindows/
-// beforeEffect/canCommitWhenNoIcons/commitTrigger/errata strictly as
-// integer/boolean/string (no "null" in the type union), so -- unlike a
-// backend field genuinely typed nullable -- an explicit JSON null for any
-// of these is malformed input and fromJson() rejects it rather than
-// collapsing it into "absent".
+// does not itself model is silently ignored by fromJson()/fromRawJson()
+// (the schema's implicit `additionalProperties: true`), not rejected. This
+// is intentional forward-compatible leniency for a read-only response
+// type -- CardDef is decoded from the card catalog endpoint and is never
+// itself re-encoded as part of an outbound request, so tolerating a field
+// this client version does not yet recognize carries no outbound-safety
+// risk (contrast with e.g. CampaignOption/CampaignOptionRequest's split,
+// where only the closed *Request side must reject anything unrecognized
+// because it IS submitted). Every field this type does model is still
+// validated exactly: a known field's wrong JSON type, a required field's
+// absence, or a malformed value for a field with real constraints
+// (duplicate uniqueItems entries, wrong outer array/object shape, etc.) is
+// a hard decode failure, never silently dropped into "absent" -- only
+// genuinely *unrecognized* keys are ignored. The schema types
+// level/victoryPoints/vengeancePoints/overrideActionPlayableIfCriteriaMet/
+// permanent/encounterSet/encounterSetQuantity/unique/doubleSided/
+// exceptional/playableFromDiscard/stage/grantedXp/canReplace/
+// skipPlayWindows/beforeEffect/canCommitWhenNoIcons/commitTrigger/errata
+// strictly as integer/boolean/string (no "null" in the type union), so --
+// unlike a backend field genuinely typed nullable -- an explicit JSON null
+// for any of these is malformed input and fromJson()/fromRawJson() rejects
+// it rather than collapsing it into "absent".
 struct CardDef {
   CardCode cardCode;
   CardName name;
@@ -360,37 +411,63 @@ struct CardDef {
   std::optional<QString> errata;
 
   // Schema-unconstrained fields ("{}" in catalog.schema.json), preserved
-  // verbatim including absent-vs-null (see class comment).
-  QJsonValue additionalCost{QJsonValue::Undefined};
-  QJsonValue fastWindow{QJsonValue::Undefined};
-  QJsonValue actions{QJsonValue::Undefined};
-  QJsonValue criteria{QJsonValue::Undefined};
-  QJsonValue uses{QJsonValue::Undefined};
-  QJsonValue locationSymbol{QJsonValue::Undefined};
-  QJsonValue locationRevealedSymbol{QJsonValue::Undefined};
-  QJsonValue purchaseTrauma{QJsonValue::Undefined};
-  QJsonValue customizations{QJsonValue::Undefined};
+  // verbatim (including absent-vs-null) as a lossless Json::Value -- see
+  // class comment.
+  Json::Value additionalCost;
+  Json::Value fastWindow;
+  Json::Value actions;
+  Json::Value criteria;
+  Json::Value uses;
+  Json::Value locationSymbol;
+  Json::Value locationRevealedSymbol;
+  Json::Value purchaseTrauma;
+  Json::Value customizations;
 
   // Outer-typed-but-inner-unconstrained fields: the schema constrains only
   // the outer JSON shape ("type":"array" or "type":"object", with no
-  // further validation of elements/properties). fromJson() validates and
-  // rejects a present value of the wrong outer shape (including an
-  // explicit null, which matches neither "array" nor "object"), then
-  // preserves the validated value's contents verbatim.
-  QJsonValue keywords{QJsonValue::Undefined};
-  QJsonValue commitRestrictions{QJsonValue::Undefined};
-  QJsonValue attackOfOpportunityModifiers{QJsonValue::Undefined};
-  QJsonValue limits{QJsonValue::Undefined};
-  QJsonValue locationConnections{QJsonValue::Undefined};
-  QJsonValue locationRevealedConnections{QJsonValue::Undefined};
-  QJsonValue deckRestrictions{QJsonValue::Undefined};
-  QJsonValue meta{QJsonValue::Undefined};
+  // further validation of elements/properties). fromJson()/fromRawJson()
+  // validate and reject a present value of the wrong outer shape
+  // (including an explicit null, which matches neither "array" nor
+  // "object"), then preserve the validated value's contents verbatim as a
+  // lossless Json::Value.
+  Json::Value keywords;
+  Json::Value commitRestrictions;
+  Json::Value attackOfOpportunityModifiers;
+  Json::Value limits;
+  Json::Value locationConnections;
+  Json::Value locationRevealedConnections;
+  Json::Value deckRestrictions;
+  Json::Value meta;
 
   [[nodiscard]] static ValueOrError<CardDef> fromJson(const QJsonValue &v,
                                                       QStringView path);
+  // Canonical byte-level decode: identical logic to fromJson() above
+  // (shared via a private template, see CardCatalog.cpp), operating
+  // directly on the lossless AST (see RawJson.h) parsed by
+  // Json::Value::parse() -- never converting the whole tree to QJsonValue
+  // first -- so every schema-unconstrained field above survives a
+  // decode-then-encode round trip byte-exact, including a number outside
+  // qint64 range, a long fraction, a huge exponent, or a duplicate key
+  // nested at any depth. The one production entry point governed fixtures
+  // (contracts/fixtures/catalog.json) and any future catalog-endpoint
+  // response must use.
+  [[nodiscard]] static ValueOrError<CardDef> fromRawJson(const Json::Value &v,
+                                                         QStringView path);
+  // Parses `bytes` per RFC 8259 exactly (see RawJson.h's Value::parse())
+  // and decodes via fromRawJson() above.
+  [[nodiscard]] static ValueOrError<CardDef> fromRawBytes(QByteArrayView bytes,
+                                                          QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
 
   friend bool operator==(const CardDef &, const CardDef &) = default;
 };
+
+// Decodes contracts/fixtures/catalog.json's/the card-catalog endpoint's
+// complete top-level array via the canonical byte-level parser (see
+// RawJson.h), never QJsonDocument -- see CardDef::fromRawJson()'s doc
+// comment for why this matters for this type specifically (every entry's
+// schema-unconstrained fields).
+[[nodiscard]] ValueOrError<QList<CardDef>>
+decodeCatalogFromRawBytes(QByteArrayView bytes, QStringView path);
 
 } // namespace Arkham

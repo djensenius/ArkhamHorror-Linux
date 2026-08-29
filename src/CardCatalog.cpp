@@ -90,6 +90,85 @@ constexpr std::array<std::pair<QLatin1StringView, SkillType>, 4>
         {"SkillAgility"_L1, SkillType::SkillAgility},
     }};
 
+// Dispatch shims: a templated decode body calls these by unqualified name
+// so ADL/overload resolution -- not an explicit if-constexpr branch --
+// picks the QJsonValue-taking convenience overload or the Json::Value-
+// taking canonical overload to match the surrounding template's deduced
+// value-family parameter, mirroring the dual-overload pattern JsonDecode.h
+// itself already uses throughout.
+ValueOrError<CardCode> decodeCardCodeValue(const QJsonValue &v,
+                                           QStringView path) {
+  return CardCode::fromJson(v, path);
+}
+ValueOrError<CardCode> decodeCardCodeValue(const Json::Value &v,
+                                           QStringView path) {
+  auto str = Json::requireStringValue(v, path);
+  if (!str)
+    return failure(str.error());
+  auto parsed = CardCode::parse(*str);
+  if (!parsed)
+    return failure(QStringLiteral("%1: %2").arg(path, parsed.error()));
+  return *parsed;
+}
+
+ValueOrError<CardName> decodeCardNameValue(const QJsonValue &v,
+                                           QStringView path) {
+  return CardName::fromJson(v, path);
+}
+ValueOrError<CardName> decodeCardNameValue(const Json::Value &v,
+                                           QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const Json::Value &obj = *objResult;
+  auto titleResult =
+      Json::requireString(obj, "title"_L1, Json::joinPath(path, u"title"));
+  if (!titleResult)
+    return failure(titleResult.error());
+  auto subtitleResult = Json::requireNullableString(
+      obj, "subtitle"_L1, Json::joinPath(path, u"subtitle"));
+  if (!subtitleResult)
+    return failure(subtitleResult.error());
+  return CardName{.title = *titleResult, .subtitle = *subtitleResult};
+}
+
+ValueOrError<SkillIcon> decodeSkillIconValue(const QJsonValue &v,
+                                             QStringView path) {
+  return SkillIcon::fromJson(v, path);
+}
+ValueOrError<SkillIcon> decodeSkillIconValue(const Json::Value &v,
+                                             QStringView path) {
+  return SkillIcon::fromRawJson(v, path);
+}
+
+ValueOrError<CardCost> decodeCardCostValue(const QJsonValue &v,
+                                           QStringView path) {
+  return CardCost::fromJson(v, path);
+}
+ValueOrError<CardCost> decodeCardCostValue(const Json::Value &v,
+                                           QStringView path) {
+  return CardCost::fromRawJson(v, path);
+}
+
+ValueOrError<GameValue> decodeGameValueValue(const QJsonValue &v,
+                                             QStringView path) {
+  return GameValue::fromJson(v, path);
+}
+ValueOrError<GameValue> decodeGameValueValue(const Json::Value &v,
+                                             QStringView path) {
+  return GameValue::fromRawJson(v, path);
+}
+
+// Converts an already-extracted field value to the lossless AST type every
+// scoped contract domain type now stores its schema-unconstrained fields
+// as (see CardDef's class comment in CardCatalog.h) -- see
+// Json::toLosslessRaw()'s own doc comment in JsonDecode.h for the full
+// contract; brought in unqualified here since it is used pervasively
+// below and its Json::Value overload is also reachable via ADL, but its
+// QJsonValue overload is not (QJsonValue's associated namespace is Qt's,
+// not Arkham::Json).
+using Json::toLosslessRaw;
+
 // Decodes an optional array-of-closed-enum field: an absent key decodes to
 // an empty list; a present non-array value, or an unrecognized element,
 // fails. When requireUnique is true (classSymbols' inline
@@ -97,12 +176,19 @@ constexpr std::array<std::pair<QLatin1StringView, SkillType>, 4>
 // collapsing -- duplicates are compared by decoded value, not raw JSON
 // text, so e.g. two differently-cased spellings of the same enum literal
 // would already have failed decodeClosedEnum for one of them.
-template <typename Enum, std::size_t N>
+//
+// Templated over Obj (QJsonObject or Json::Value) so the identical
+// validation logic backs both SkillIcon/CardCost/GameValue/CardDef's
+// QJsonValue-based fromJson() convenience entry points and their
+// Json::Value-based fromRawJson() canonical entry points -- see
+// CardDef::fromRawJson()'s doc comment in CardCatalog.h for why the
+// canonical path must never convert through QJsonValue first.
+template <typename Enum, std::size_t N, typename Obj>
 ValueOrError<QList<Enum>>
-decodeEnumArray(const QJsonObject &obj, QLatin1StringView key, QStringView path,
+decodeEnumArray(const Obj &obj, QLatin1StringView key, QStringView path,
                 const std::array<std::pair<QLatin1StringView, Enum>, N> &table,
                 bool requireUnique = false) {
-  const QJsonValue v = obj.value(key);
+  const auto v = obj.value(key);
   if (v.isUndefined())
     return QList<Enum>{};
   auto arrResult = Json::requireArray(v, path);
@@ -139,11 +225,11 @@ QJsonArray encodeEnumArray(
 // (via the shared `stringSet` $def); `tags` is a plain string array with
 // no uniqueness constraint, so requireUnique defaults to false and callers
 // opt in explicitly.
-ValueOrError<QStringList> decodeStringSet(const QJsonObject &obj,
-                                          QLatin1StringView key,
+template <typename Obj>
+ValueOrError<QStringList> decodeStringSet(const Obj &obj, QLatin1StringView key,
                                           QStringView path,
                                           bool requireUnique = false) {
-  const QJsonValue v = obj.value(key);
+  const auto v = obj.value(key);
   if (v.isUndefined())
     return QStringList{};
   auto arrResult = Json::requireArray(v, path);
@@ -164,10 +250,10 @@ ValueOrError<QStringList> decodeStringSet(const QJsonObject &obj,
   return result;
 }
 
-ValueOrError<QList<CardCode>> decodeCardCodeArray(const QJsonObject &obj,
-                                                  QLatin1StringView key,
-                                                  QStringView path) {
-  const QJsonValue v = obj.value(key);
+template <typename Obj>
+ValueOrError<QList<CardCode>>
+decodeCardCodeArray(const Obj &obj, QLatin1StringView key, QStringView path) {
+  const auto v = obj.value(key);
   if (v.isUndefined())
     return QList<CardCode>{};
   auto arrResult = Json::requireArray(v, path);
@@ -176,7 +262,7 @@ ValueOrError<QList<CardCode>> decodeCardCodeArray(const QJsonObject &obj,
   QList<CardCode> result;
   result.reserve(arrResult->size());
   for (qsizetype i = 0; i < arrResult->size(); ++i) {
-    auto item = CardCode::fromJson((*arrResult)[i], Json::indexPath(path, i));
+    auto item = decodeCardCodeValue((*arrResult)[i], Json::indexPath(path, i));
     if (!item)
       return failure(item.error());
     result.append(*item);
@@ -184,10 +270,10 @@ ValueOrError<QList<CardCode>> decodeCardCodeArray(const QJsonObject &obj,
   return result;
 }
 
-ValueOrError<QList<SkillIcon>> decodeSkillIconArray(const QJsonObject &obj,
-                                                    QLatin1StringView key,
-                                                    QStringView path) {
-  const QJsonValue v = obj.value(key);
+template <typename Obj>
+ValueOrError<QList<SkillIcon>>
+decodeSkillIconArray(const Obj &obj, QLatin1StringView key, QStringView path) {
+  const auto v = obj.value(key);
   if (v.isUndefined())
     return QList<SkillIcon>{};
   auto arrResult = Json::requireArray(v, path);
@@ -196,7 +282,7 @@ ValueOrError<QList<SkillIcon>> decodeSkillIconArray(const QJsonObject &obj,
   QList<SkillIcon> result;
   result.reserve(arrResult->size());
   for (qsizetype i = 0; i < arrResult->size(); ++i) {
-    auto item = SkillIcon::fromJson((*arrResult)[i], Json::indexPath(path, i));
+    auto item = decodeSkillIconValue((*arrResult)[i], Json::indexPath(path, i));
     if (!item)
       return failure(item.error());
     result.append(*item);
@@ -204,9 +290,10 @@ ValueOrError<QList<SkillIcon>> decodeSkillIconArray(const QJsonObject &obj,
   return result;
 }
 
+template <typename Obj>
 ValueOrError<QList<std::pair<qint64, CardCode>>>
-decodeBondedWith(const QJsonObject &obj, QStringView path) {
-  const QJsonValue v = obj.value("bondedWith"_L1);
+decodeBondedWith(const Obj &obj, QStringView path) {
+  const auto v = obj.value("bondedWith"_L1);
   if (v.isUndefined())
     return QList<std::pair<qint64, CardCode>>{};
   auto arrResult = Json::requireArray(v, path);
@@ -229,7 +316,7 @@ decodeBondedWith(const QJsonObject &obj, QStringView path) {
     if (!countResult)
       return failure(countResult.error());
     auto codeResult =
-        CardCode::fromJson((*pairResult)[1], Json::indexPath(itemPath, 1));
+        decodeCardCodeValue((*pairResult)[1], Json::indexPath(itemPath, 1));
     if (!codeResult)
       return failure(codeResult.error());
     result.append({*countResult, *codeResult});
@@ -237,49 +324,50 @@ decodeBondedWith(const QJsonObject &obj, QStringView path) {
   return result;
 }
 
+template <typename Obj>
 ValueOrError<QMap<QString, QList<SkillIcon>>>
-decodeAlternateSkills(const QJsonObject &obj, QStringView path) {
-  const QJsonValue v = obj.value("alternateSkills"_L1);
+decodeAlternateSkills(const Obj &obj, QStringView path) {
+  const auto v = obj.value("alternateSkills"_L1);
   if (v.isUndefined())
     return QMap<QString, QList<SkillIcon>>{};
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
   QMap<QString, QList<SkillIcon>> result;
-  for (auto it = objResult->constBegin(); it != objResult->constEnd(); ++it) {
-    const QString entryPath = Json::joinPath(path, it.key());
-    auto arrResult = Json::requireArray(it.value(), entryPath);
+  for (const auto &[key, value] : Json::objectMembers(*objResult)) {
+    const QString entryPath = Json::joinPath(path, key);
+    auto arrResult = Json::requireArray(value, entryPath);
     if (!arrResult)
       return failure(arrResult.error());
     QList<SkillIcon> icons;
     icons.reserve(arrResult->size());
     for (qsizetype i = 0; i < arrResult->size(); ++i) {
       auto icon =
-          SkillIcon::fromJson((*arrResult)[i], Json::indexPath(entryPath, i));
+          decodeSkillIconValue((*arrResult)[i], Json::indexPath(entryPath, i));
       if (!icon)
         return failure(icon.error());
       icons.append(*icon);
     }
-    result.insert(it.key(), icons);
+    result.insert(key, icons);
   }
   return result;
 }
 
-ValueOrError<QMap<QString, QString>>
-decodeAlternateErrata(const QJsonObject &obj, QStringView path) {
-  const QJsonValue v = obj.value("alternateErrata"_L1);
+template <typename Obj>
+ValueOrError<QMap<QString, QString>> decodeAlternateErrata(const Obj &obj,
+                                                           QStringView path) {
+  const auto v = obj.value("alternateErrata"_L1);
   if (v.isUndefined())
     return QMap<QString, QString>{};
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
   QMap<QString, QString> result;
-  for (auto it = objResult->constBegin(); it != objResult->constEnd(); ++it) {
-    auto strResult =
-        Json::requireStringValue(it.value(), Json::joinPath(path, it.key()));
+  for (const auto &[key, value] : Json::objectMembers(*objResult)) {
+    auto strResult = Json::requireStringValue(value, Json::joinPath(path, key));
     if (!strResult)
       return failure(strResult.error());
-    result.insert(it.key(), *strResult);
+    result.insert(key, *strResult);
   }
   return result;
 }
@@ -307,10 +395,20 @@ SkillIcon SkillIcon::wildMinus() {
 
 ValueOrError<SkillIcon> SkillIcon::fromJson(const QJsonValue &v,
                                             QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<SkillIcon> SkillIcon::fromRawJson(const Json::Value &v,
+                                               QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+template <typename V>
+ValueOrError<SkillIcon> SkillIcon::fromValueImpl(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   auto tagResult =
       Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
@@ -342,9 +440,12 @@ ValueOrError<SkillIcon> SkillIcon::fromJson(const QJsonValue &v,
   // this client cannot interpret the tag, but the backend fixture/response
   // it came from is otherwise well-formed, and forward-compat additive
   // tags must decode safely.
+  auto rawResult = toLosslessRaw(v);
+  if (!rawResult)
+    return failure(QStringLiteral("%1: %2").arg(path, rawResult.error()));
   SkillIcon result;
   result.m_tag = SkillIconTag::Unknown;
-  result.m_unknownRaw = obj;
+  result.m_unknownRaw = *rawResult;
   return result;
 }
 
@@ -366,7 +467,7 @@ QJsonObject SkillIcon::toJson() const {
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("WildMinusIcon")}};
   case SkillIconTag::Unknown:
-    return m_unknownRaw;
+    return m_unknownRaw.toQJson().toObject();
   }
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
@@ -396,7 +497,7 @@ CardCost CardCost::deferredCost() {
   return result;
 }
 
-ValueOrError<CardCost> CardCost::maxDynamicCost(QJsonValue contents) {
+ValueOrError<CardCost> CardCost::maxDynamicCost(Json::Value contents) {
   // The schema's payload is genuinely unconstrained ("{}"), but
   // "unconstrained" still means "some JSON value is present" -- an
   // Undefined contents is not a value at all, and a public factory that
@@ -412,7 +513,7 @@ ValueOrError<CardCost> CardCost::maxDynamicCost(QJsonValue contents) {
   return result;
 }
 
-ValueOrError<CardCost> CardCost::anyMatchingCardCost(QJsonValue contents) {
+ValueOrError<CardCost> CardCost::anyMatchingCardCost(Json::Value contents) {
   if (contents.isUndefined())
     return failure(QStringLiteral(
         "CardCost::anyMatchingCardCost: contents must not be undefined"));
@@ -422,7 +523,7 @@ ValueOrError<CardCost> CardCost::anyMatchingCardCost(QJsonValue contents) {
   return result;
 }
 
-ValueOrError<CardCost> CardCost::matchingEnemyFieldCost(QJsonValue contents) {
+ValueOrError<CardCost> CardCost::matchingEnemyFieldCost(Json::Value contents) {
   if (contents.isUndefined())
     return failure(QStringLiteral(
         "CardCost::matchingEnemyFieldCost: contents must not be undefined"));
@@ -442,10 +543,20 @@ ValueOrError<CardCost> CardCost::matchingEnemyFieldCost(QJsonValue contents) {
 
 ValueOrError<CardCost> CardCost::fromJson(const QJsonValue &v,
                                           QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<CardCost> CardCost::fromRawJson(const Json::Value &v,
+                                             QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+template <typename V>
+ValueOrError<CardCost> CardCost::fromValueImpl(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   auto tagResult =
       Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
@@ -475,41 +586,40 @@ ValueOrError<CardCost> CardCost::fromJson(const QJsonValue &v,
       return CardCost::discardAmountCost();
     return CardCost::deferredCost();
   }
-  if (tag == "MaxDynamicCost"_L1) {
+  if (tag == "MaxDynamicCost"_L1 || tag == "AnyMatchingCardCost"_L1 ||
+      tag == "MatchingEnemyFieldCost"_L1) {
     auto contents = Json::requireRawField(obj, "contents"_L1,
                                           Json::joinPath(path, u"contents"));
     if (!contents)
       return failure(contents.error());
-    auto result = CardCost::maxDynamicCost(*contents);
+    auto lossless = toLosslessRaw(*contents);
+    if (!lossless)
+      return failure(QStringLiteral("%1: %2").arg(path, lossless.error()));
+    if (tag == "MaxDynamicCost"_L1) {
+      auto result = CardCost::maxDynamicCost(*lossless);
+      if (!result)
+        return failure(QStringLiteral("%1: %2").arg(path, result.error()));
+      return *result;
+    }
+    if (tag == "AnyMatchingCardCost"_L1) {
+      auto result = CardCost::anyMatchingCardCost(*lossless);
+      if (!result)
+        return failure(QStringLiteral("%1: %2").arg(path, result.error()));
+      return *result;
+    }
+    auto result = CardCost::matchingEnemyFieldCost(*lossless);
     if (!result)
       return failure(QStringLiteral("%1: %2").arg(path, result.error()));
-    return result;
-  }
-  if (tag == "AnyMatchingCardCost"_L1) {
-    auto contents = Json::requireRawField(obj, "contents"_L1,
-                                          Json::joinPath(path, u"contents"));
-    if (!contents)
-      return failure(contents.error());
-    auto result = CardCost::anyMatchingCardCost(*contents);
-    if (!result)
-      return failure(QStringLiteral("%1: %2").arg(path, result.error()));
-    return result;
-  }
-  if (tag == "MatchingEnemyFieldCost"_L1) {
-    auto contents = Json::requireRawField(obj, "contents"_L1,
-                                          Json::joinPath(path, u"contents"));
-    if (!contents)
-      return failure(contents.error());
-    auto result = CardCost::matchingEnemyFieldCost(*contents);
-    if (!result)
-      return failure(QStringLiteral("%1: %2").arg(path, result.error()));
-    return result;
+    return *result;
   }
   // An unrecognized tag preserves the complete raw decoded object
   // verbatim; see SkillIcon::fromJson's Unknown branch for the rationale.
+  auto rawResult = toLosslessRaw(v);
+  if (!rawResult)
+    return failure(QStringLiteral("%1: %2").arg(path, rawResult.error()));
   CardCost result;
   result.m_tag = CardCostTag::Unknown;
-  result.m_unknownRaw = obj;
+  result.m_unknownRaw = *rawResult;
   return result;
 }
 
@@ -534,17 +644,17 @@ QJsonObject CardCost::toJson() const {
     // always set it, and fromJson requires "contents" to be present.
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("MaxDynamicCost")},
-        {QStringLiteral("contents"), m_rawContents}};
+        {QStringLiteral("contents"), m_rawContents.toQJson()}};
   case CardCostTag::AnyMatchingCardCost:
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("AnyMatchingCardCost")},
-        {QStringLiteral("contents"), m_rawContents}};
+        {QStringLiteral("contents"), m_rawContents.toQJson()}};
   case CardCostTag::MatchingEnemyFieldCost:
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
-        {QStringLiteral("contents"), m_rawContents}};
+        {QStringLiteral("contents"), m_rawContents.toQJson()}};
   case CardCostTag::Unknown:
-    return m_unknownRaw;
+    return m_unknownRaw.toQJson().toObject();
   }
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
@@ -599,10 +709,20 @@ GameValue GameValue::valueUnknown() {
 
 ValueOrError<GameValue> GameValue::fromJson(const QJsonValue &v,
                                             QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<GameValue> GameValue::fromRawJson(const Json::Value &v,
+                                               QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+template <typename V>
+ValueOrError<GameValue> GameValue::fromValueImpl(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
   auto tagResult =
       Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
@@ -659,9 +779,12 @@ ValueOrError<GameValue> GameValue::fromJson(const QJsonValue &v,
   }
   // An unrecognized tag preserves the complete raw decoded object
   // verbatim; see SkillIcon::fromJson's Unknown branch for the rationale.
+  auto rawResult = toLosslessRaw(v);
+  if (!rawResult)
+    return failure(QStringLiteral("%1: %2").arg(path, rawResult.error()));
   GameValue result;
   result.m_tag = GameValueTag::Unknown;
-  result.m_unknownRaw = obj;
+  result.m_unknownRaw = *rawResult;
   return result;
 }
 
@@ -702,23 +825,31 @@ QJsonObject GameValue::toJson() const {
   case GameValueTag::ValueUnknown:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("ValueUnknown")}};
   case GameValueTag::Unknown:
-    return m_unknownRaw;
+    return m_unknownRaw.toQJson().toObject();
   }
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
 
-ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
+namespace {
+
+// Shared decode body for CardDef::fromJson()/fromRawJson(): V is
+// QJsonValue or Json::Value. A free function (not a CardDef member
+// template) is sufficient here, unlike SkillIcon/CardCost/GameValue's
+// private fromValueImpl, since CardDef is a plain aggregate with no
+// private constructor to guard.
+template <typename V>
+ValueOrError<CardDef> decodeCardDef(const V &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
   if (!objResult)
     return failure(objResult.error());
-  const QJsonObject &obj = *objResult;
+  const auto &obj = *objResult;
 
-  auto cardCode = CardCode::fromJson(obj.value("cardCode"_L1),
-                                     Json::joinPath(path, u"cardCode"));
+  auto cardCode = decodeCardCodeValue(obj.value("cardCode"_L1),
+                                      Json::joinPath(path, u"cardCode"));
   if (!cardCode)
     return failure(cardCode.error());
   auto name =
-      CardName::fromJson(obj.value("name"_L1), Json::joinPath(path, u"name"));
+      decodeCardNameValue(obj.value("name"_L1), Json::joinPath(path, u"name"));
   if (!name)
     return failure(name.error());
   auto cardType = Json::decodeClosedEnum<CardType>(
@@ -736,8 +867,8 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
   std::optional<CardName> revealedName;
   if (Json::fieldPresence(obj, "revealedName"_L1) !=
       Json::FieldPresence::Absent) {
-    auto r = CardName::fromJson(obj.value("revealedName"_L1),
-                                Json::joinPath(path, u"revealedName"));
+    auto r = decodeCardNameValue(obj.value("revealedName"_L1),
+                                 Json::joinPath(path, u"revealedName"));
     if (!r)
       return failure(r.error());
     revealedName = *r;
@@ -745,8 +876,8 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
 
   std::optional<CardCost> cost;
   if (Json::fieldPresence(obj, "cost"_L1) != Json::FieldPresence::Absent) {
-    auto r =
-        CardCost::fromJson(obj.value("cost"_L1), Json::joinPath(path, u"cost"));
+    auto r = decodeCardCostValue(obj.value("cost"_L1),
+                                 Json::joinPath(path, u"cost"));
     if (!r)
       return failure(r.error());
     cost = *r;
@@ -885,8 +1016,8 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
 
   std::optional<CardCode> otherSide;
   if (Json::fieldPresence(obj, "otherSide"_L1) != Json::FieldPresence::Absent) {
-    auto r = CardCode::fromJson(obj.value("otherSide"_L1),
-                                Json::joinPath(path, u"otherSide"));
+    auto r = decodeCardCodeValue(obj.value("otherSide"_L1),
+                                 Json::joinPath(path, u"otherSide"));
     if (!r)
       return failure(r.error());
     otherSide = *r;
@@ -925,24 +1056,24 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
 
   std::optional<GameValue> health;
   if (Json::fieldPresence(obj, "health"_L1) != Json::FieldPresence::Absent) {
-    auto r = GameValue::fromJson(obj.value("health"_L1),
-                                 Json::joinPath(path, u"health"));
+    auto r = decodeGameValueValue(obj.value("health"_L1),
+                                  Json::joinPath(path, u"health"));
     if (!r)
       return failure(r.error());
     health = *r;
   }
   std::optional<GameValue> fight;
   if (Json::fieldPresence(obj, "fight"_L1) != Json::FieldPresence::Absent) {
-    auto r = GameValue::fromJson(obj.value("fight"_L1),
-                                 Json::joinPath(path, u"fight"));
+    auto r = decodeGameValueValue(obj.value("fight"_L1),
+                                  Json::joinPath(path, u"fight"));
     if (!r)
       return failure(r.error());
     fight = *r;
   }
   std::optional<GameValue> evade;
   if (Json::fieldPresence(obj, "evade"_L1) != Json::FieldPresence::Absent) {
-    auto r = GameValue::fromJson(obj.value("evade"_L1),
-                                 Json::joinPath(path, u"evade"));
+    auto r = decodeGameValueValue(obj.value("evade"_L1),
+                                  Json::joinPath(path, u"evade"));
     if (!r)
       return failure(r.error());
     evade = *r;
@@ -950,8 +1081,8 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
   std::optional<GameValue> healthDamage;
   if (Json::fieldPresence(obj, "healthDamage"_L1) !=
       Json::FieldPresence::Absent) {
-    auto r = GameValue::fromJson(obj.value("healthDamage"_L1),
-                                 Json::joinPath(path, u"healthDamage"));
+    auto r = decodeGameValueValue(obj.value("healthDamage"_L1),
+                                  Json::joinPath(path, u"healthDamage"));
     if (!r)
       return failure(r.error());
     healthDamage = *r;
@@ -959,8 +1090,8 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
   std::optional<GameValue> sanityDamage;
   if (Json::fieldPresence(obj, "sanityDamage"_L1) !=
       Json::FieldPresence::Absent) {
-    auto r = GameValue::fromJson(obj.value("sanityDamage"_L1),
-                                 Json::joinPath(path, u"sanityDamage"));
+    auto r = decodeGameValueValue(obj.value("sanityDamage"_L1),
+                                  Json::joinPath(path, u"sanityDamage"));
     if (!r)
       return failure(r.error());
     sanityDamage = *r;
@@ -979,49 +1110,133 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
   if (!errata)
     return failure(errata.error());
 
+  // Schema-unconstrained fields ("{}"): each is converted to the lossless
+  // Json::Value AST individually (see toLosslessRaw()'s doc comment
+  // above) rather than the whole `obj` being converted at once, so a
+  // malformed/unrepresentable numeric subtree in exactly one field fails
+  // with that field's own path rather than corrupting or discarding its
+  // siblings.
+  auto additionalCost = toLosslessRaw(obj.value("additionalCost"_L1));
+  if (!additionalCost)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"additionalCost"), additionalCost.error()));
+  auto fastWindow = toLosslessRaw(obj.value("fastWindow"_L1));
+  if (!fastWindow)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"fastWindow"), fastWindow.error()));
+  auto actions = toLosslessRaw(obj.value("actions"_L1));
+  if (!actions)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"actions"), actions.error()));
+  auto criteria = toLosslessRaw(obj.value("criteria"_L1));
+  if (!criteria)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"criteria"), criteria.error()));
+  auto uses = toLosslessRaw(obj.value("uses"_L1));
+  if (!uses)
+    return failure(QStringLiteral("%1: %2").arg(Json::joinPath(path, u"uses"),
+                                                uses.error()));
+  auto locationSymbol = toLosslessRaw(obj.value("locationSymbol"_L1));
+  if (!locationSymbol)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"locationSymbol"), locationSymbol.error()));
+  auto locationRevealedSymbol =
+      toLosslessRaw(obj.value("locationRevealedSymbol"_L1));
+  if (!locationRevealedSymbol)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"locationRevealedSymbol"),
+        locationRevealedSymbol.error()));
+  auto purchaseTrauma = toLosslessRaw(obj.value("purchaseTrauma"_L1));
+  if (!purchaseTrauma)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"purchaseTrauma"), purchaseTrauma.error()));
+  auto customizations = toLosslessRaw(obj.value("customizations"_L1));
+  if (!customizations)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"customizations"), customizations.error()));
+
   // These 7 fields are schema-typed "array" (not fully unconstrained
   // "{}"): their outer JSON shape is validated -- rejecting a present
   // non-array value, including an explicit null, which matches neither --
   // but their element contents are otherwise unconstrained and preserved
-  // verbatim.
+  // verbatim as a lossless Json::Value.
   auto keywords = Json::optionalRawArrayField(
       obj, "keywords"_L1, Json::joinPath(path, u"keywords"));
   if (!keywords)
     return failure(keywords.error());
+  auto keywordsRaw = toLosslessRaw(*keywords);
+  if (!keywordsRaw)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"keywords"), keywordsRaw.error()));
   auto commitRestrictions =
       Json::optionalRawArrayField(obj, "commitRestrictions"_L1,
                                   Json::joinPath(path, u"commitRestrictions"));
   if (!commitRestrictions)
     return failure(commitRestrictions.error());
+  auto commitRestrictionsRaw = toLosslessRaw(*commitRestrictions);
+  if (!commitRestrictionsRaw)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"commitRestrictions"),
+        commitRestrictionsRaw.error()));
   auto attackOfOpportunityModifiers = Json::optionalRawArrayField(
       obj, "attackOfOpportunityModifiers"_L1,
       Json::joinPath(path, u"attackOfOpportunityModifiers"));
   if (!attackOfOpportunityModifiers)
     return failure(attackOfOpportunityModifiers.error());
+  auto attackOfOpportunityModifiersRaw =
+      toLosslessRaw(*attackOfOpportunityModifiers);
+  if (!attackOfOpportunityModifiersRaw)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"attackOfOpportunityModifiers"),
+        attackOfOpportunityModifiersRaw.error()));
   auto limits = Json::optionalRawArrayField(obj, "limits"_L1,
                                             Json::joinPath(path, u"limits"));
   if (!limits)
     return failure(limits.error());
+  auto limitsRaw = toLosslessRaw(*limits);
+  if (!limitsRaw)
+    return failure(QStringLiteral("%1: %2").arg(Json::joinPath(path, u"limits"),
+                                                limitsRaw.error()));
   auto locationConnections =
       Json::optionalRawArrayField(obj, "locationConnections"_L1,
                                   Json::joinPath(path, u"locationConnections"));
   if (!locationConnections)
     return failure(locationConnections.error());
+  auto locationConnectionsRaw = toLosslessRaw(*locationConnections);
+  if (!locationConnectionsRaw)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"locationConnections"),
+        locationConnectionsRaw.error()));
   auto locationRevealedConnections = Json::optionalRawArrayField(
       obj, "locationRevealedConnections"_L1,
       Json::joinPath(path, u"locationRevealedConnections"));
   if (!locationRevealedConnections)
     return failure(locationRevealedConnections.error());
+  auto locationRevealedConnectionsRaw =
+      toLosslessRaw(*locationRevealedConnections);
+  if (!locationRevealedConnectionsRaw)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"locationRevealedConnections"),
+        locationRevealedConnectionsRaw.error()));
   auto deckRestrictions = Json::optionalRawArrayField(
       obj, "deckRestrictions"_L1, Json::joinPath(path, u"deckRestrictions"));
   if (!deckRestrictions)
     return failure(deckRestrictions.error());
+  auto deckRestrictionsRaw = toLosslessRaw(*deckRestrictions);
+  if (!deckRestrictionsRaw)
+    return failure(
+        QStringLiteral("%1: %2").arg(Json::joinPath(path, u"deckRestrictions"),
+                                     deckRestrictionsRaw.error()));
   // meta is schema-typed "object": same outer-shape validation, applied to
   // an object rather than an array.
   auto meta = Json::optionalRawObjectField(obj, "meta"_L1,
                                            Json::joinPath(path, u"meta"));
   if (!meta)
     return failure(meta.error());
+  auto metaRaw = toLosslessRaw(*meta);
+  if (!metaRaw)
+    return failure(QStringLiteral("%1: %2").arg(Json::joinPath(path, u"meta"),
+                                                metaRaw.error()));
 
   return CardDef{
       .cardCode = *cardCode,
@@ -1070,24 +1285,63 @@ ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
       .alternateSkills = *alternateSkills,
       .alternateErrata = *alternateErrata,
       .errata = *errata,
-      .additionalCost = obj.value("additionalCost"_L1),
-      .fastWindow = obj.value("fastWindow"_L1),
-      .actions = obj.value("actions"_L1),
-      .criteria = obj.value("criteria"_L1),
-      .uses = obj.value("uses"_L1),
-      .locationSymbol = obj.value("locationSymbol"_L1),
-      .locationRevealedSymbol = obj.value("locationRevealedSymbol"_L1),
-      .purchaseTrauma = obj.value("purchaseTrauma"_L1),
-      .customizations = obj.value("customizations"_L1),
-      .keywords = *keywords,
-      .commitRestrictions = *commitRestrictions,
-      .attackOfOpportunityModifiers = *attackOfOpportunityModifiers,
-      .limits = *limits,
-      .locationConnections = *locationConnections,
-      .locationRevealedConnections = *locationRevealedConnections,
-      .deckRestrictions = *deckRestrictions,
-      .meta = *meta,
+      .additionalCost = *additionalCost,
+      .fastWindow = *fastWindow,
+      .actions = *actions,
+      .criteria = *criteria,
+      .uses = *uses,
+      .locationSymbol = *locationSymbol,
+      .locationRevealedSymbol = *locationRevealedSymbol,
+      .purchaseTrauma = *purchaseTrauma,
+      .customizations = *customizations,
+      .keywords = *keywordsRaw,
+      .commitRestrictions = *commitRestrictionsRaw,
+      .attackOfOpportunityModifiers = *attackOfOpportunityModifiersRaw,
+      .limits = *limitsRaw,
+      .locationConnections = *locationConnectionsRaw,
+      .locationRevealedConnections = *locationRevealedConnectionsRaw,
+      .deckRestrictions = *deckRestrictionsRaw,
+      .meta = *metaRaw,
   };
+}
+
+} // namespace
+
+ValueOrError<CardDef> CardDef::fromJson(const QJsonValue &v, QStringView path) {
+  return decodeCardDef(v, path);
+}
+
+ValueOrError<CardDef> CardDef::fromRawJson(const Json::Value &v,
+                                           QStringView path) {
+  return decodeCardDef(v, path);
+}
+
+ValueOrError<CardDef> CardDef::fromRawBytes(QByteArrayView bytes,
+                                            QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return decodeCardDef(*parsed, path);
+}
+
+ValueOrError<QList<CardDef>> decodeCatalogFromRawBytes(QByteArrayView bytes,
+                                                       QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  if (!parsed->isArray())
+    return failure(QStringLiteral("%1: expected array, got %2")
+                       .arg(path, Json::typeName(*parsed)));
+  const QList<Json::Value> &elements = parsed->toArray();
+  QList<CardDef> result;
+  result.reserve(elements.size());
+  for (qsizetype i = 0; i < elements.size(); ++i) {
+    auto item = decodeCardDef(elements[i], Json::indexPath(path, i));
+    if (!item)
+      return failure(item.error());
+    result.append(*item);
+  }
+  return result;
 }
 
 QJsonObject CardDef::toJson() const {
@@ -1216,9 +1470,9 @@ QJsonObject CardDef::toJson() const {
   if (errata)
     obj.insert(QStringLiteral("errata"), *errata);
 
-  const auto insertRaw = [&obj](QLatin1StringView key, const QJsonValue &raw) {
+  const auto insertRaw = [&obj](QLatin1StringView key, const Json::Value &raw) {
     if (!raw.isUndefined())
-      obj.insert(key, raw);
+      obj.insert(key, raw.toQJson());
   };
   insertRaw("additionalCost"_L1, additionalCost);
   insertRaw("keywords"_L1, keywords);

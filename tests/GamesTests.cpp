@@ -3,9 +3,27 @@
 #include <QtTest>
 
 #include "Games.h"
+#include "RawJson.h"
 
 using namespace Arkham;
 using namespace Qt::StringLiterals;
+
+namespace {
+// Test-only convenience conversion standing in for a real byte-parsed
+// Json::Value (see RawJson.h): GameState/CampaignOption's unknown-tag raw
+// storage is the lossless AST, not QJsonValue, so tests comparing against
+// a literal QJsonValue/QJsonObject fixture must first convert it the same
+// way. Fails via qFatal only for a malformed *test fixture* (never
+// production code), per this project's convention that qFatal is
+// permitted solely for impossible-to-reach test setup.
+Json::Value toRawJson(const QJsonValue &v) {
+  auto result = Json::Value::fromQJson(v);
+  if (!result)
+    qFatal("test fixture construction must not fail: %s",
+           qPrintable(result.error()));
+  return *result;
+}
+} // namespace
 
 class GamesTests final : public QObject {
   Q_OBJECT
@@ -27,6 +45,8 @@ private slots:
   void gameStateIsActiveWithContentsRejected();
   void gameStateIsOverWithContentsRejected();
   void gameStateIsActiveWithNullContentsRejected();
+  void gameStateRawBytesPreserveAdditiveFieldBesideTagAndContents();
+  void gameStateRawBytesPreserveHugeNestedNumericLiteralInUnknownContents();
 
   // GameListRow success/error ambiguity ──────────────────────────────────────
   void rowWithBareErrorKeyIsFailure();
@@ -52,6 +72,9 @@ private slots:
   void unknownCampaignOptionCannotBeSubmittedAsRequestOption();
   void knownCampaignOptionNarrowsToRequestOption();
   void campaignOptionRequestRejectsUnrecognizedTag();
+  void campaignOptionRawBytesPreserveAdditiveFieldBesideTagAndContents();
+  void
+  campaignOptionRawBytesPreserveHugeNestedNumericLiteralInUnknownContents();
 
   // campaignId/scenarioId invariant ──────────────────────────────────────────
   void campaignWithStartingScenarioAccepted();
@@ -234,11 +257,9 @@ void GamesTests::unknownGameStateTagWithContentsPreservedAndRoundTrips() {
   QCOMPARE(result->kind(), GameState::Kind::Unknown);
   QCOMPARE(result->unknownTag(), QStringLiteral("IsSuspended"));
   QVERIFY(!result->unknownContents().isUndefined());
-  QCOMPARE(result->unknownContents()
-               .toObject()
-               .value(QStringLiteral("reason"))
-               .toString(),
-           QStringLiteral("maintenance"));
+  QCOMPARE(
+      result->unknownContents().value(QLatin1StringView("reason")).toString(),
+      QStringLiteral("maintenance"));
   QCOMPARE(result->toJson(), obj);
 }
 
@@ -286,6 +307,71 @@ void GamesTests::gameStateIsActiveWithNullContentsRejected() {
   };
   const auto result = GameState::fromJson(obj, u"gameState");
   QVERIFY(!result);
+}
+
+void GamesTests::gameStateRawBytesPreserveAdditiveFieldBesideTagAndContents() {
+  // A future backend release may add a sibling key alongside "tag"/
+  // "contents" on an unrecognized GameState tag (e.g. a "since" timestamp
+  // on a hypothetical IsSuspended variant); the *complete* decoded object
+  // must survive -- not merely the two keys this client currently knows to
+  // look for -- so toJson() below must re-emit "since" too, aggregately
+  // proven through the canonical byte parser rather than fromJson() alone.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"tag\":\"IsSuspended\",\"contents\":{\"reason\":\"maintenance\"},"
+      "\"since\":123456}");
+  const auto result = GameState::fromRawBytes(bytes, u"gameState");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->kind(), GameState::Kind::Unknown);
+  QCOMPARE(result->unknownTag(), QStringLiteral("IsSuspended"));
+  QVERIFY(result->unknownRaw().isObject());
+  QCOMPARE(result->unknownRaw()
+               .value(QLatin1StringView("since"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("123456"));
+  const auto encoded = result->toJson();
+  QCOMPARE(encoded.value(QStringLiteral("since")).toInt(), 123456);
+  QCOMPARE(QJsonDocument(encoded).toJson(QJsonDocument::Compact),
+           QJsonDocument::fromJson(bytes).toJson(QJsonDocument::Compact));
+}
+
+void GamesTests::
+    gameStateRawBytesPreserveHugeNestedNumericLiteralInUnknownContents() {
+  // 9007199254740993 == 2^53 + 1, the smallest positive integer a double
+  // cannot represent exactly; nested inside an unrecognized tag's
+  // "contents", it must survive the canonical byte parser boundary
+  // byte-exact rather than being rounded by any QJsonValue-mediated path.
+  const QByteArray bytes =
+      QByteArrayLiteral("{\"tag\":\"IsSuspended\",\"contents\":{\"nested\":"
+                        "[9007199254740993,1e300]}}");
+  const auto result = GameState::fromRawBytes(bytes, u"gameState");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->kind(), GameState::Kind::Unknown);
+  const Json::Value nested =
+      result->unknownContents().value(QLatin1StringView("nested"));
+  QVERIFY(nested.isArray());
+  QCOMPARE(nested.toArray().size(), 2);
+  QCOMPARE(nested.toArray().at(0).toRawNumber().literal(),
+           QStringLiteral("9007199254740993"));
+  QCOMPARE(nested.toArray().at(1).toRawNumber().literal(),
+           QStringLiteral("1e300"));
+
+  // toJson() re-emits the complete raw object; parsing it back through the
+  // canonical byte decoder must yield the identical numeric literals --
+  // proof the QJsonObject-typed toJson() convenience encoder still carries
+  // the exact digits forward for any caller that re-parses it byte-exact,
+  // even though QJsonObject's own in-memory storage is double-backed.
+  const QByteArray reencoded =
+      QJsonDocument(result->toJson()).toJson(QJsonDocument::Compact);
+  const auto reparsed = GameState::fromRawBytes(reencoded, u"gameState");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  const Json::Value reparsedNested =
+      reparsed->unknownContents().value(QLatin1StringView("nested"));
+  QCOMPARE(reparsedNested.toArray().at(0).toRawNumber().literal(),
+           QStringLiteral("9007199254740993"));
 }
 
 void GamesTests::rowWithBareErrorKeyIsFailure() {
@@ -507,7 +593,8 @@ void GamesTests::unknownCampaignOptionWithContentsPreservedAndRoundTrips() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind(), CampaignOption::Kind::Unknown);
   QCOMPARE(result->text(), QStringLiteral("SomeFutureOption"));
-  QCOMPARE(result->unknownContents(), QJsonValue(QStringLiteral("payload")));
+  QCOMPARE(result->unknownContents(),
+           toRawJson(QJsonValue(QStringLiteral("payload"))));
   QCOMPARE(result->toJson(), obj);
 }
 
@@ -598,6 +685,51 @@ void GamesTests::campaignOptionRequestRejectsUnrecognizedTag() {
       {QStringLiteral("tag"), QStringLiteral("NotARealOption")}};
   const auto result = CampaignOptionRequest::fromJson(obj, u"option");
   QVERIFY(!result);
+}
+
+void GamesTests::
+    campaignOptionRawBytesPreserveAdditiveFieldBesideTagAndContents() {
+  // A future backend release may add a sibling key alongside "tag"/
+  // "contents" on an unrecognized CampaignOption tag; the *complete*
+  // decoded object must survive -- not merely the two keys this client
+  // currently knows to look for -- proven through the canonical byte
+  // parser rather than fromJson() alone.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"tag\":\"SomeFutureOption\",\"contents\":\"payload\","
+      "\"isSuspended\":true}");
+  const auto result = CampaignOption::fromRawBytes(bytes, u"option");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->kind(), CampaignOption::Kind::Unknown);
+  QCOMPARE(result->text(), QStringLiteral("SomeFutureOption"));
+  QVERIFY(result->unknownRaw().isObject());
+  QVERIFY(
+      result->unknownRaw().value(QLatin1StringView("isSuspended")).toBool());
+  QCOMPARE(QJsonDocument(result->toJson()).toJson(QJsonDocument::Compact),
+           QJsonDocument::fromJson(bytes).toJson(QJsonDocument::Compact));
+}
+
+void GamesTests::
+    campaignOptionRawBytesPreserveHugeNestedNumericLiteralInUnknownContents() {
+  // 9007199254740993 == 2^53 + 1, the smallest positive integer a double
+  // cannot represent exactly; nested inside an unrecognized tag's
+  // "contents" metadata, it must survive the canonical byte parser
+  // boundary byte-exact.
+  const QByteArray bytes =
+      QByteArrayLiteral("{\"tag\":\"FutureOption\",\"contents\":{\"limit\":"
+                        "9007199254740993}}");
+  const auto result = CampaignOption::fromRawBytes(bytes, u"option");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->kind(), CampaignOption::Kind::Unknown);
+  const Json::Value limit =
+      result->unknownContents().value(QLatin1StringView("limit"));
+  QCOMPARE(limit.toRawNumber().literal(), QStringLiteral("9007199254740993"));
+
+  // An unknown option can never be submitted as a request, regardless of
+  // what metadata it carries.
+  const auto asRequest = result->toRequestOption(u"option");
+  QVERIFY(!asRequest);
 }
 
 void GamesTests::campaignWithStartingScenarioAccepted() {
