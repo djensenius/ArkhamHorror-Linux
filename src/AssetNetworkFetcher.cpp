@@ -93,6 +93,120 @@ std::optional<AssetFormat> sniffMagicBytes(const QByteArray &bytes) {
   return std::nullopt;
 }
 
+// Review item 10: Qt's bundled libjpeg-based decoder tolerates a
+// premature end-of-file within entropy-coded scan data by *synthesising*
+// a missing End-Of-Image (EOI, the two-byte marker 0xFF 0xD9) marker: it
+// logs a "premature end of data segment" warning but still returns a
+// non-null, seemingly-valid QImage. A response body truncated by a
+// flaky/adversarial network mid-transfer can therefore decode
+// "successfully" through QImageReader despite genuinely missing its
+// tail. This performs an independent, bounded, single-pass scan of the
+// JPEG marker structure to determine whether a *genuine* EOI marker is
+// actually present in the supplied bytes, distinct from (and run before
+// trusting) Qt's own decode.
+//
+// Trailing-data policy: once a genuine EOI marker is found, the scan
+// stops and reports success immediately -- any bytes that might follow
+// EOI (e.g. padding, or another concatenated stream) are deliberately
+// not inspected. Only bytes that never reach a genuine EOI at all (a
+// truncated response) are rejected here.
+//
+// This does not replace normal magic-byte or QImageReader
+// validation -- a body that fails this check is prevented from ever
+// reaching the decoder at all, and a body that passes still goes
+// through the existing dimension/limit/decode checks below.
+bool jpegCodestreamHasGenuineEoi(const QByteArray &bytes) {
+  const qint64 size = bytes.size();
+  const auto *const data =
+      reinterpret_cast<const unsigned char *>(bytes.constData());
+  // Magic-byte sniffing has already confirmed bytes[0..2] == FF D8 FF,
+  // so start scanning markers right after the two-byte SOI.
+  if (size < 2) {
+    return false;
+  }
+  qint64 pos = 2;
+  while (pos < size) {
+    if (data[pos] != 0xFF) {
+      // A marker was expected here but the byte isn't 0xFF: the
+      // structure itself is malformed. Leave that diagnosis to the
+      // normal QImageReader decode path (MalformedImage) rather than
+      // misreporting it as a codestream-completeness failure.
+      return false;
+    }
+    // Marker codes may be preceded by any number of 0xFF fill bytes.
+    while (pos < size && data[pos] == 0xFF) {
+      ++pos;
+    }
+    if (pos >= size) {
+      return false; // ran out of bytes while skipping fill bytes
+    }
+    const unsigned char marker = data[pos];
+    ++pos;
+    if (marker == 0xD9) {
+      return true; // genuine EOI actually present in the supplied bytes
+    }
+    if (marker == 0x00) {
+      return false; // a stuffed byte can only appear inside scan data
+    }
+    if ((marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) {
+      continue; // RSTn / TEM: standalone, no length field or payload
+    }
+    if (marker == 0xD8) {
+      return false; // unexpected second top-level SOI: malformed
+    }
+    // Every other marker (SOF*, DHT, DQT, DRI, APPn, COM, SOS, ...) is
+    // followed by a 2-byte big-endian length, INCLUDING those 2 bytes.
+    if (pos + 1 >= size) {
+      return false;
+    }
+    const int segmentLength =
+        (static_cast<int>(data[pos]) << 8) | static_cast<int>(data[pos + 1]);
+    if (segmentLength < 2) {
+      return false; // a length that can't even cover its own field
+    }
+    if (marker != 0xDA) {
+      // Non-scan segment: skip its declared payload wholesale.
+      pos += segmentLength;
+      if (pos > size) {
+        return false; // declared length runs past the available bytes
+      }
+      continue;
+    }
+    // SOS (Start Of Scan): skip its own header, then scan the
+    // entropy-coded data that follows byte-by-byte. Within scan data, a
+    // 0xFF byte only terminates the scan if the following byte is a
+    // "real" marker code -- 0xFF 0x00 is a stuffed literal 0xFF data
+    // byte, 0xFF 0xD0-0xD7 is a restart marker (both stay inside the
+    // scan), and a run of 0xFF fill bytes just keeps scanning.
+    pos += segmentLength;
+    if (pos > size) {
+      return false;
+    }
+    while (pos < size) {
+      if (data[pos] != 0xFF) {
+        ++pos;
+        continue;
+      }
+      if (pos + 1 >= size) {
+        return false; // truncated exactly on a trailing 0xFF byte
+      }
+      const unsigned char next = data[pos + 1];
+      if (next == 0x00 || (next >= 0xD0 && next <= 0xD7)) {
+        pos += 2; // stuffed byte or restart marker: still scan data
+        continue;
+      }
+      if (next == 0xFF) {
+        ++pos; // fill byte: keep looking at the byte after it
+        continue;
+      }
+      break; // a genuine marker follows: hand control back to the
+             // outer loop, which will interpret it (possibly another
+             // SOS for a progressive JPEG, or the final EOI).
+    }
+  }
+  return false; // exhausted the buffer without ever finding a genuine EOI
+}
+
 // Normalises a Content-Type header value to a bare, lowercase media type
 // (e.g. "image/png; charset=binary" -> "image/png"), so a parameter suffix
 // cannot defeat the comparison in either direction.
@@ -546,6 +660,14 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
         AssetErrorCode::MagicBytesMismatch,
         QStringLiteral("body's magic bytes do not match the expected "
                        "asset format")});
+  }
+
+  if (expectedFormat == AssetFormat::Jpeg &&
+      !jpegCodestreamHasGenuineEoi(encodedBytes)) {
+    return AssetOutcome<QImage>(AssetError{
+        AssetErrorCode::MalformedImage,
+        QStringLiteral("JPEG body has no genuine End-Of-Image marker "
+                       "(response was likely truncated in transit)")});
   }
 
   const QtCodecSupport codecSupport = resolveQtCodecSupport(expectedFormat);

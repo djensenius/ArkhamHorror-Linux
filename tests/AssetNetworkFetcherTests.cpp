@@ -428,6 +428,147 @@ void AssetNetworkFetcherTests::jpegDecodesRegardlessOfQtPluginKeySpelling() {
   QCOMPARE((**result).asset->dimensions, QSize(32, 32));
 }
 
+void AssetNetworkFetcherTests::
+    truncatedJpegMissingEoiIsRejectedDespiteQtDecodingIt() {
+  // Review item 10 regression: Qt's bundled libjpeg-based decoder
+  // tolerates a premature end-of-file within entropy-coded scan data by
+  // *synthesising* a missing End-Of-Image marker -- it logs a "premature
+  // end of data segment" warning but still returns a non-null image (this
+  // was independently confirmed against this exact codebase's QImage/
+  // QImageReader before writing this test). Chopping a substantial tail
+  // off a real encoded JPEG removes both its genuine EOI marker AND a
+  // chunk of entropy-coded scan data, which is exactly the shape a
+  // network response truncated mid-transfer would have. This must be
+  // rejected as MalformedImage, deliberately BEFORE ever reaching
+  // QImageReader, regardless of whether this Qt build even has a JPEG
+  // decode plugin installed -- so this test intentionally does not skip
+  // on missing codec support.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/jpeg";
+  QByteArray body = encodeImage(64, 64, "jpg");
+  body.chop(100); // removes the trailing EOI marker and scan data
+  response.body = body;
+  server.setResponse(QStringLiteral("/truncated.jpg"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/truncated.jpg")),
+                   AssetFormat::Jpeg);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::
+    truncatedJpegMissingEoiAtVaryingCutPointsAllRejected_data() {
+  QTest::addColumn<int>("chopPercent");
+  // Cut depths expressed as a percentage of the encoded body's total
+  // size (rather than a fixed byte count), so the codestream scanner is
+  // reliably exercised truncating just past the trailing EOI, shallowly
+  // into entropy-coded scan data, deep into scan data, and roughly at
+  // the midpoint of the whole body -- regardless of exactly how large
+  // the underlying JPEG fixture happens to encode to.
+  QTest::newRow("chop-tiny-trailing-eoi-only") << 1;
+  QTest::newRow("chop-shallow-into-scan-data") << 5;
+  QTest::newRow("chop-deep-into-scan-data") << 25;
+  QTest::newRow("chop-about-half-the-body") << 50;
+}
+
+void AssetNetworkFetcherTests::
+    truncatedJpegMissingEoiAtVaryingCutPointsAllRejected() {
+  QFETCH(int, chopPercent);
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/jpeg";
+  QByteArray body = encodeImage(64, 64, "jpg");
+  const int chopBytes =
+      qMax(1, static_cast<int>(body.size()) * chopPercent / 100);
+  QVERIFY(body.size() > chopBytes);
+  body.chop(chopBytes);
+  response.body = body;
+  server.setResponse(QStringLiteral("/truncated.jpg"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/truncated.jpg")),
+                   AssetFormat::Jpeg);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::
+    jpegWithStuffedFFBytesInScanDataStillDecodesWhenComplete() {
+  // The codestream-completeness scanner (review item 10) must not
+  // misinterpret byte-stuffed 0xFF bytes (0xFF 0x00, mandated by the
+  // JPEG spec for any literal 0xFF that occurs inside entropy-coded scan
+  // data) as a marker that terminates the scan early -- a genuinely
+  // COMPLETE JPEG containing such stuffing must still decode
+  // successfully. A high-frequency/high-contrast image (checkerboard of
+  // near-black/near-white pixels) reliably produces entropy-coded bytes
+  // containing literal 0xFF values, forcing the encoder to emit stuffed
+  // 0xFF 0x00 sequences.
+  const bool jpegSupported =
+      QImageReader::supportedImageFormats().contains(
+          QByteArrayLiteral("jpeg")) ||
+      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
+  if (!jpegSupported) {
+    QSKIP("this Qt build has no JPEG decode plugin under either key");
+  }
+
+  QImage image(48, 48, QImage::Format_RGB32);
+  for (int y = 0; y < image.height(); ++y) {
+    for (int x = 0; x < image.width(); ++x) {
+      const int v = ((x / 3) + (y / 3)) % 2 == 0 ? 255 : 0;
+      image.setPixel(x, y, qRgb(v, v, v));
+    }
+  }
+  QByteArray body;
+  QBuffer buffer(&body);
+  buffer.open(QIODevice::WriteOnly);
+  const bool encoded = image.save(&buffer, "JPG", /*quality=*/100);
+  if (!encoded) {
+    qFatal("failed to encode the checkerboard JPEG fixture");
+  }
+  // Sanity-check the fixture actually contains at least one stuffed
+  // 0xFF 0x00 pair -- otherwise this test would pass trivially without
+  // ever exercising the stuffing-handling branch of the scanner.
+  bool foundStuffedByte = false;
+  for (qsizetype i = 0; i + 1 < body.size(); ++i) {
+    if (static_cast<unsigned char>(body[i]) == 0xFF &&
+        static_cast<unsigned char>(body[i + 1]) == 0x00) {
+      foundStuffedByte = true;
+      break;
+    }
+  }
+  QVERIFY2(foundStuffedByte,
+           "fixture image did not produce a byte-stuffed 0xFF 0x00 "
+           "sequence; test needs a higher-contrast fixture to exercise "
+           "the stuffing branch");
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/jpeg";
+  response.body = body;
+  server.setResponse(QStringLiteral("/checkerboard.jpg"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/checkerboard.jpg")),
+      AssetFormat::Jpeg);
+
+  QVERIFY(result.has_value());
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).asset->dimensions, QSize(48, 48));
+}
+
 void AssetNetworkFetcherTests::avifCodecSupportIsEnvironmentAdaptive() {
   const bool avifSupported =
       QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));

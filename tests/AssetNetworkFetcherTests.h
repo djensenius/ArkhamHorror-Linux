@@ -12,7 +12,12 @@
 // + magic-byte validation; dimension/pixel-budget bombs; unsupported-codec
 // handling (environment-adaptive for AVIF); conditional (304) handling,
 // including the "304 without a matching conditional request" typed error;
-// and cancellation/destruction/stale-callback safety.
+// cancellation/destruction/stale-callback safety; and (review item 10) a
+// strict JPEG codestream completeness check -- a genuine End-Of-Image
+// marker must actually be present in the bytes, since Qt's bundled
+// decoder silently synthesises a missing one for a body truncated
+// mid-transfer, while a complete body containing byte-stuffed 0xFF
+// bytes in its entropy-coded scan data must still decode normally.
 class AssetNetworkFetcherTests final : public QObject {
   Q_OBJECT
 
@@ -31,6 +36,10 @@ private slots:
   void pixelBudgetBombIsRejected();
   void malformedImageBodyIsRejected();
   void jpegDecodesRegardlessOfQtPluginKeySpelling();
+  void truncatedJpegMissingEoiIsRejectedDespiteQtDecodingIt();
+  void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected_data();
+  void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected();
+  void jpegWithStuffedFFBytesInScanDataStillDecodesWhenComplete();
   void avifCodecSupportIsEnvironmentAdaptive();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void avifFtypMinorVersionIsNeverMisreadAsCompatibleBrand();
