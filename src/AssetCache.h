@@ -132,6 +132,19 @@ public:
   // lookupMemory() hit for the same key does not need to redecode.
   void updateMemoryDecodedImage(const QString &key, const QImage &image);
 
+  // Unconditionally inserts `entry` into memory (no disk I/O at all --
+  // the payload/metadata are assumed already correctly persisted).
+  // Unlike lookupDisk()'s conditional promotion (which withholds
+  // promoting a validator-carrying entry until it has actually been
+  // revalidated), this is for a caller that has ALREADY just performed a
+  // real revalidation and confirmed the entry is current: exactly the
+  // same trust model lookupDisk()'s doc comment describes for
+  // store()/touchAfterNotModified(). Used by AssetRequestCoordinator
+  // right after a successful 304 (confirmed-unchanged) revalidation, so
+  // a subsequent same-process request short-circuits via lookupMemory()
+  // instead of repeating the conditional GET.
+  void promoteToMemory(const QString &key, CachedEntry entry);
+
   // Repairs orphan payloads, corrupt entries, and stray temp files, then
   // evicts oldest-access entries if disk usage exceeds the 90% high-water
   // mark, down to the 75% low-water mark. Called once from the

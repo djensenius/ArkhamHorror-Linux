@@ -13,6 +13,7 @@
 #include <QSet>
 #include <QStandardPaths>
 #include <algorithm>
+#include <utility>
 #include <vector>
 
 using namespace Qt::StringLiterals;
@@ -332,6 +333,13 @@ void AssetCache::updateMemoryDecodedImage(const QString &key,
   auto *updated = new CachedEntry(*existing);
   updated->decodedImage = image;
   m_memory->insert(key, updated, static_cast<qsizetype>(updated->costBytes()));
+}
+
+void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
+  QMutexLocker locker(&m_mutex);
+  auto *heapEntry = new CachedEntry(std::move(entry));
+  m_memory->insert(key, heapEntry,
+                   static_cast<qsizetype>(heapEntry->costBytes()));
 }
 
 void AssetCache::reapAndEnforceQuota() {

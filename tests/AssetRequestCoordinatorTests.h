@@ -33,6 +33,7 @@ private slots:
   void destructionNeverInvokesStaleCallback();
   void cancellingImmediateCacheHitCompletionSuppressesDelivery();
   void diskHitWithValidatorsRevalidatesAndServesStaleOn304();
+  void confirmedNotModifiedPromotesEntryToMemoryForSameProcessShortCircuit();
   void diskHitRevalidationReplacesEntryOnFresh200();
   void diskHitRevalidationServesStaleOnAnyFailure();
   void diskHitRevalidationCoalescesConcurrentIdenticalRequests();

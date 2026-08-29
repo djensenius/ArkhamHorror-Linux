@@ -342,9 +342,20 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
           // bytes are never touched), then serve the same stale entry.
           self->m_cache.touchAfterNotModified(operation.revalidationCacheKey,
                                               QString(), QString());
-          self->completeOperation(
-              operationId, self->ensureDecoded(stale, operation.key.format,
-                                               operation.revalidationCacheKey));
+          AssetOutcome<AssetCache::CachedEntry> outcome = self->ensureDecoded(
+              stale, operation.key.format, operation.revalidationCacheKey);
+          if (outcome) {
+            // A validator-carrying disk hit is normally withheld from
+            // memory promotion (see lookupDisk()) until it has actually
+            // been revalidated -- this 304 IS that revalidation, so the
+            // (now-decoded) entry is unconditionally promoted, letting a
+            // subsequent same-process request for the same key
+            // short-circuit via lookupMemory() instead of repeating the
+            // conditional GET.
+            self->m_cache.promoteToMemory(operation.revalidationCacheKey,
+                                          *outcome);
+          }
+          self->completeOperation(operationId, std::move(outcome));
           return;
         }
 

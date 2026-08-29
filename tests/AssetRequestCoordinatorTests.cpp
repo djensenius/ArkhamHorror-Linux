@@ -504,6 +504,74 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
+    confirmedNotModifiedPromotesEntryToMemoryForSameProcessShortCircuit() {
+  // Regression for a review finding: a successful 304 confirms the
+  // disk-cached entry is still current, but touchAfterNotModified() only
+  // updates ALREADY memory-resident entries in place (a no-op here, since
+  // lookupDisk() intentionally withheld promoting a validator-carrying
+  // entry -- see its .cpp comment). Without promoting the now-confirmed
+  // entry into memory here, a second same-process request() for the
+  // identical key would hit disk again and start a second, entirely
+  // redundant conditional GET, defeating "a same-process memory hit
+  // short-circuits the network entirely" and repeating the on-demand
+  // decode every single time.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(32, 32); // must never be served to the caller
+  response.etagForConditionalMatch = "\"stale-etag\"";
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(4, 4);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.etag = QStringLiteral("\"stale-etag\"");
+  cache.store(cacheKey, preSeeded);
+
+  // A fresh AssetCache instance (simulating a process restart with empty
+  // memory) forces the FIRST request through the disk-hit-with-validators
+  // path.
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> firstResult;
+  coordinator.request(key, [&](Result r) { firstResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return firstResult.has_value(); }, 5000));
+  QVERIFY2(bool(*firstResult), qPrintable(firstResult->error().message));
+  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+
+  // The entry must now be memory-resident, with a decoded image, purely
+  // from the 304 confirmation above -- no second request() call needed to
+  // observe the promotion.
+  const auto memoryHit = restartedCache.lookupMemory(cacheKey);
+  QVERIFY2(memoryHit.has_value(),
+           "a confirmed-current entry must be promoted to memory after a "
+           "304, not left disk-only");
+  QVERIFY(!memoryHit->decodedImage.isNull());
+
+  // A second request for the identical key must now short-circuit via
+  // the memory hit: no additional network request at all.
+  std::optional<Result> secondResult;
+  coordinator.request(key, [&](Result r) { secondResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 5000));
+  QVERIFY2(bool(*secondResult), qPrintable(secondResult->error().message));
+  QVERIFY(!(**secondResult).decodedImage.isNull());
+  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+}
+
+void AssetRequestCoordinatorTests::
     diskHitRevalidationReplacesEntryOnFresh200() {
   MockHttpServer server;
   MockHttpServer::Response response;
