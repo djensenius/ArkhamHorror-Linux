@@ -405,14 +405,36 @@ QJsonObject CardCost::toJson() const {
   case CardCostTag::DeferredCost:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("DeferredCost")}};
   case CardCostTag::MaxDynamicCost:
+    // rawContents is documented as always populated (schema requires
+    // "contents" to be present, even though its value is unconstrained)
+    // for the three raw-payload tags below, but it is a public QJsonValue
+    // field with no constructor enforcing that invariant. An unset field
+    // defaults to QJsonValue::Undefined -- distinct from an explicit JSON
+    // null, which decodes/round-trips as QJsonValue::Null -- so checking
+    // isUndefined() here detects "never populated" without rejecting a
+    // legitimately-decoded null payload. Q_ASSERT alone would compile out
+    // in release/NDEBUG builds, and QJsonObject silently drops keys whose
+    // value isUndefined() when inserted, which would emit schema-invalid
+    // JSON missing the required "contents" key while masking the bug.
+    // qFatal() is never compiled out and halts with a clear diagnostic.
+    if (rawContents.isUndefined())
+      qFatal("CardCost::toJson: tag == MaxDynamicCost but rawContents is "
+             "unset; this is a construction bug, not a decode failure");
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("MaxDynamicCost")},
         {QStringLiteral("contents"), rawContents}};
   case CardCostTag::AnyMatchingCardCost:
+    if (rawContents.isUndefined())
+      qFatal("CardCost::toJson: tag == AnyMatchingCardCost but rawContents "
+             "is unset; this is a construction bug, not a decode failure");
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("AnyMatchingCardCost")},
         {QStringLiteral("contents"), rawContents}};
   case CardCostTag::MatchingEnemyFieldCost:
+    if (rawContents.isUndefined())
+      qFatal("CardCost::toJson: tag == MatchingEnemyFieldCost but "
+             "rawContents is unset; this is a construction bug, not a "
+             "decode failure");
     return QJsonObject{
         {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
         {QStringLiteral("contents"), rawContents}};
@@ -506,8 +528,26 @@ QJsonObject GameValue::toJson() const {
              "unset; this is a construction bug, not a decode failure");
     return withContents("PerPlayer"_L1, *singleAmount);
   case GameValueTag::StaticWithPerPlayer:
+    // contents is documented as always holding exactly 2 (for
+    // StaticWithPerPlayer) or 4 (for ByPlayerCount) integers, but it is a
+    // public QList<int> field with no constructor enforcing that
+    // invariant. Encoding any other size would emit schema-invalid JSON
+    // (the wire format is a fixed-arity tuple) while masking the
+    // construction bug. Q_ASSERT alone would compile out in
+    // release/NDEBUG builds, so qFatal() is used instead -- it is never
+    // compiled out and halts with a clear diagnostic.
+    if (contents.size() != 2)
+      qFatal("GameValue::toJson: tag == StaticWithPerPlayer but contents "
+             "has %lld elements, expected exactly 2; this is a "
+             "construction bug, not a decode failure",
+             static_cast<long long>(contents.size()));
     return withContents("StaticWithPerPlayer"_L1, arr);
   case GameValueTag::ByPlayerCount:
+    if (contents.size() != 4)
+      qFatal("GameValue::toJson: tag == ByPlayerCount but contents has "
+             "%lld elements, expected exactly 4; this is a construction "
+             "bug, not a decode failure",
+             static_cast<long long>(contents.size()));
     return withContents("ByPlayerCount"_L1, arr);
   case GameValueTag::ValueX:
     return QJsonObject{{QStringLiteral("tag"), QStringLiteral("ValueX")}};
