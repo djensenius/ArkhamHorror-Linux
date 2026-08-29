@@ -105,13 +105,14 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   // decoder-absence outcome that quarantining a specific cached entry
   // could never resolve by retrying.
   if (decoder->imageCount != 1) {
+    const int imageCount = decoder->imageCount;
     avifDecoderDestroy(decoder);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
         QStringLiteral("AVIF image sequences/animations (imageCount=%1) "
                        "are not supported; only a single still image is "
                        "accepted")
-            .arg(decoder->imageCount)});
+            .arg(imageCount)});
   }
 
   // avifDecoderParse() has populated decoder->image's container-declared

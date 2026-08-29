@@ -1,23 +1,25 @@
 #include "AssetNetworkFetcherTests.h"
 
+#include "AssetJpegDecoder.h"
 #include "AssetNetworkFetcher.h"
 #include "MockHttpServer.h"
 
 #include <QBuffer>
-#include <QCoreApplication>
 #include <QImage>
 #include <QImageReader>
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
-#include <QProcess>
 #include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QTest>
 #include <array>
+#include <atomic>
 #include <avif/avif.h>
 #include <cstring>
 #include <optional>
+#include <thread>
 #include <type_traits>
+#include <vector>
 
 using namespace Arkham;
 
@@ -713,25 +715,19 @@ void AssetNetworkFetcherTests::malformedImageBodyIsRejected() {
   QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
 }
 
-void AssetNetworkFetcherTests::jpegDecodesRegardlessOfQtPluginKeySpelling() {
-  // Regression for a review finding: the fetcher's internal codec-support
-  // check and QImageReader format hint must not hardcode a single spelling
-  // of the JPEG plugin key. Qt's stock qjpeg plugin advertises both "jpeg"
-  // and "jpg" (QImageReader::supportedImageFormats() includes both on this
-  // build -- see the aliasing handled by isQtImageFormatSupported() in
-  // AssetNetworkFetcher.cpp), but a fetcher that only recognised one
-  // spelling would spuriously report UnsupportedCodec on any Qt build/
-  // plugin set that only registers the other. A genuine, correctly
-  // Content-Typed and magic-byte-valid JPEG must decode successfully
-  // through the real production path end-to-end.
-  const bool jpegSupported =
-      QImageReader::supportedImageFormats().contains(
-          QByteArrayLiteral("jpeg")) ||
-      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
-  if (!jpegSupported) {
-    QSKIP("this Qt build has no JPEG decode plugin under either key");
-  }
-
+void AssetNetworkFetcherTests::
+    jpegDecodesDirectlyViaLibjpegIndependentOfQtImagePlugins() {
+  // Regression for review item 2 (PR #18 cumulative review at 14cf8de6):
+  // JPEG is decoded directly against libjpeg's own C API (see
+  // AssetJpegDecoder.h/.cpp), never through QImageReader/Qt's plugin
+  // registry -- exactly mirroring how AVIF is decoded (AssetAvifDecoder.h/
+  // .cpp). This is a required build dependency (see CMakeLists.txt), so a
+  // genuine, correctly Content-Typed and magic-byte-valid JPEG must decode
+  // successfully through the real production path unconditionally,
+  // regardless of whatever Qt image plugins this build happens to have
+  // registered (this test therefore, deliberately, does NOT guard/skip on
+  // QImageReader::supportedImageFormats() the way it did before this
+  // architecture change).
   MockHttpServer server;
   MockHttpServer::Response response;
   response.contentType = "image/jpeg";
@@ -835,14 +831,6 @@ void AssetNetworkFetcherTests::
   // near-black/near-white pixels) reliably produces entropy-coded bytes
   // containing literal 0xFF values, forcing the encoder to emit stuffed
   // 0xFF 0x00 sequences.
-  const bool jpegSupported =
-      QImageReader::supportedImageFormats().contains(
-          QByteArrayLiteral("jpeg")) ||
-      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
-  if (!jpegSupported) {
-    QSKIP("this Qt build has no JPEG decode plugin under either key");
-  }
-
   QImage image(48, 48, QImage::Format_RGB32);
   for (int y = 0; y < image.height(); ++y) {
     for (int x = 0; x < image.width(); ++x) {
@@ -896,14 +884,6 @@ void AssetNetworkFetcherTests::jpegTrailingDataAfterGenuineEoiIsRejected() {
   // (padding, or a second concatenated JPEG stream) is rejected, even
   // though the body up to and including that EOI is itself perfectly
   // complete and would decode fine on its own.
-  const bool jpegSupported =
-      QImageReader::supportedImageFormats().contains(
-          QByteArrayLiteral("jpeg")) ||
-      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
-  if (!jpegSupported) {
-    QSKIP("this Qt build has no JPEG decode plugin under either key");
-  }
-
   const QByteArray validJpeg = encodeImage(16, 16, "JPG");
   QVERIFY(validJpeg.size() > 2);
   QVERIFY(static_cast<unsigned char>(validJpeg[validJpeg.size() - 2]) == 0xFF &&
@@ -980,16 +960,8 @@ void AssetNetworkFetcherTests::
   // EOI" attack this review item requires rejecting -- proven here by
   // confirming the OLD scanner-only check alone would have accepted this
   // fixture, then confirming the full decode path (which additionally
-  // requires the ScopedJpegDecodeWarningDetector to observe no
-  // libjpeg-plugin message) rejects it.
-  const bool jpegSupported =
-      QImageReader::supportedImageFormats().contains(
-          QByteArrayLiteral("jpeg")) ||
-      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
-  if (!jpegSupported) {
-    QSKIP("this Qt build has no JPEG decode plugin under either key");
-  }
-
+  // requires the per-call libjpeg error/warning manager in
+  // AssetJpegDecoder.cpp to observe no corrupt-data warning) rejects it.
   const QByteArray validJpeg = encodeImage(64, 64, "JPG");
   QVERIFY(validJpeg.size() > 200);
   // Cut well into the entropy-coded scan data (past SOI/APPn/DQT/SOF/DHT/
@@ -1019,6 +991,86 @@ void AssetNetworkFetcherTests::
            "a truncated entropy stream with a forged trailing EOI must "
            "never be accepted as a successfully-decoded image");
   QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::
+    concurrentJpegDecodesOnDifferentThreadsNeverCrossContaminate() {
+  // Review item 2 (PR #18 cumulative review at 14cf8de6): the previous
+  // ScopedJpegDecodeWarningDetector kept its entire warning-detection
+  // state (previous handler, active flag, "saw warning" flag) in
+  // process-global `static inline` variables shared across EVERY decode.
+  // Two decodes overlapping on different threads would corrupt each
+  // other's state -- most dangerously, a second constructor call would
+  // capture the first instance's own forwardingHandler as "previous",
+  // making the eventual restore reinstall a self-referential handler
+  // (infinite recursion/stack overflow on the next logged message).
+  // AssetJpegDecoder.h/.cpp's decodeJpegImage() fixes this at the root:
+  // every piece of per-decode state (the jpeg_error_mgr, its setjmp
+  // buffer, its warning counter) lives in a plain local on THIS call's
+  // own stack, threaded through libjpeg only via this call's own cinfo --
+  // nothing is ever static or shared, so concurrent calls on different
+  // threads are independent by construction, with no lock required.
+  //
+  // This test proves that directly: many threads repeatedly decode a
+  // MIX of a genuinely valid JPEG and a genuinely corrupt/truncated one
+  // (forcing libjpeg's real error/warning path on some calls while other
+  // threads are mid-decode of the valid one), then asserts every single
+  // call -- across every thread, every iteration -- got exactly the
+  // outcome its own input warrants. Any cross-contamination (a valid
+  // decode spuriously failing, or a corrupt decode spuriously
+  // "succeeding" because some other thread's state leaked in) would fail
+  // this deterministically, not just probabilistically -- the old
+  // handler-corruption bug's failure mode was a crash/hang, and this
+  // test's structure (fully independent stack-local state, verified
+  // outcome-by-outcome) is what makes a clean pass actually meaningful
+  // rather than merely "didn't happen to crash this run."
+  const QByteArray validJpeg = encodeImage(48, 48, "JPG");
+  QVERIFY(validJpeg.size() > 200);
+
+  QByteArray corruptJpeg = validJpeg.left(validJpeg.size() * 4 / 10);
+  // No forged EOI appended here -- decodeJpegImage() is exercised
+  // directly (not through the marker-structure EOI prescan in
+  // AssetNetworkFetcher.cpp), so libjpeg's own entropy decoder is what
+  // must observe and recover from (and thus warn on) this truncation.
+
+  constexpr int kThreadCount = 8;
+  constexpr int kIterationsPerThread = 25;
+  std::atomic<int> unexpectedOutcomes{0};
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+  for (int t = 0; t < kThreadCount; ++t) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < kIterationsPerThread; ++i) {
+        // Alternate which input this thread/iteration decodes so valid
+        // and corrupt decodes are genuinely interleaved/overlapping in
+        // time across threads, not merely running the same input on
+        // every thread.
+        const bool decodeValid = ((t + i) % 2) == 0;
+        const AssetOutcome<QImage> outcome =
+            decodeValid
+                ? Arkham::decodeJpegImage(validJpeg, /*maxDimensionPixels=*/
+                                          8192,      /*maxTotalPixels=*/
+                                          32 * 1024 * 1024)
+                : Arkham::decodeJpegImage(corruptJpeg, 8192, 32 * 1024 * 1024);
+        if (decodeValid) {
+          if (!bool(outcome) || (*outcome).size() != QSize(48, 48)) {
+            unexpectedOutcomes.fetch_add(1);
+          }
+        } else {
+          if (bool(outcome) ||
+              outcome.error().code != AssetErrorCode::MalformedImage) {
+            unexpectedOutcomes.fetch_add(1);
+          }
+        }
+      }
+    });
+  }
+  for (std::thread &thread : threads) {
+    thread.join();
+  }
+
+  QCOMPARE(unexpectedOutcomes.load(), 0);
 }
 
 void AssetNetworkFetcherTests::pngWithCorruptChunkCrcIsRejected() {
@@ -1241,6 +1293,19 @@ void AssetNetworkFetcherTests::avifImageSequenceIsRejectedAsMalformedImage() {
   QVERIFY(result.has_value());
   QVERIFY(!bool(*result));
   QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+  // Regression for a use-after-free: AssetAvifDecoder.cpp used to call
+  // avifDecoderDestroy(decoder) and THEN read decoder->imageCount to
+  // format this message, reading already-freed memory. A plain (non-ASan)
+  // build can appear to "work" by accident depending on allocator reuse
+  // timing, so this asserts the exact expected count is present in the
+  // message (proving the read observed real, not clobbered/reused,
+  // memory) rather than merely checking the error code. Built and run
+  // once locally under `-fsanitize=address` against a deliberately
+  // reintroduced pre-fix version of this function to confirm ASan
+  // reports a heap-use-after-free at this exact call site, and reports
+  // none after the fix.
+  QVERIFY2(result->error().message.contains(QStringLiteral("imageCount=3")),
+           qPrintable(result->error().message));
 }
 
 void AssetNetworkFetcherTests::
@@ -1882,34 +1947,4 @@ void AssetNetworkFetcherTests::validConfigurationFactorySucceeds() {
   const auto result = AssetNetworkFetcher::create();
   QVERIFY2(result.has_value(), qPrintable(result.error().message));
   QVERIFY((*result)->isValid());
-}
-
-void AssetNetworkFetcherTests::
-    jpegDecodeWarningDetectorFatalFallbackTerminatesProcessLikeQtDefaultHandler() {
-  // Regression test for a review comment on ScopedJpegDecodeWarningDetector
-  // (src/AssetNetworkFetcher.cpp): its no-previous-handler fallback used to
-  // only fprintf() a fatal message to stderr and continue running, silently
-  // changing Qt's documented default-handler semantics (a real qFatal()
-  // call always terminates the process). Testing that in-process would
-  // crash this very test binary, so this spawns THIS SAME test executable
-  // as a subprocess with a dedicated sentinel argument that main() (see
-  // AssetTestsMain.cpp) recognises and, instead of running any QTest
-  // suite, calls the test-only hook directly -- proving the subprocess is
-  // actually terminated abnormally rather than exiting cleanly.
-  QProcess process;
-  process.setProgram(QCoreApplication::applicationFilePath());
-  process.setArguments(
-      {QStringLiteral("--test-only-trigger-jpeg-fatal-abort")});
-  process.start();
-  QVERIFY2(process.waitForStarted(5000), "subprocess failed to start");
-  QVERIFY2(process.waitForFinished(10000),
-           "subprocess did not terminate within the timeout");
-
-  // A real qFatal() with no installed message handler aborts (SIGABRT on
-  // POSIX platforms); the pre-fix fallback would instead have printed the
-  // message and returned normally out of the test-only hook, which is
-  // marked [[noreturn]] and would itself be undefined behaviour if it fell
-  // through -- either way, the correct, fixed behaviour is an abnormal
-  // (crashed) exit, never QProcess::NormalExit.
-  QCOMPARE(process.exitStatus(), QProcess::CrashExit);
 }

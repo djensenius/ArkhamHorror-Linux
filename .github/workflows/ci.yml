@@ -52,8 +52,8 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
-      - name: Install QtKeychain and libavif build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev # libavif-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...) needs this even for the configure-only lint job.
+      - name: Install QtKeychain, libavif and libjpeg build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev # libavif-dev/libjpeg-turbo8-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...) need these even for the configure-only lint job.
       - run: mise run lint
 
   test:
@@ -68,12 +68,12 @@ jobs:
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. AVIF card art is decoded directly against libavif's own C API (see src/AssetAvifDecoder.cpp), never through Qt's plugin registry -- Qt has no official AVIF plugin at all (upstream qtimageformats does not include one) -- so the codec-support tests exercise the real libavif-backed decode path unconditionally rather than branching on QImageReader::supportedImageFormats().
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. AVIF card art is decoded directly against libavif's own C API (see src/AssetAvifDecoder.cpp), and JPEG is decoded directly against libjpeg's own C API (see src/AssetJpegDecoder.cpp), neither through Qt's plugin registry -- Qt has no official AVIF plugin at all (upstream qtimageformats does not include one) -- so the codec-support tests exercise the real libavif/libjpeg-backed decode paths unconditionally rather than branching on QImageReader::supportedImageFormats().
           cache: true
-      - name: Install QtKeychain, D-Bus and libavif build dependencies
+      - name: Install QtKeychain, D-Bus, libavif and libjpeg build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev provides the mandatory AVIF decode dependency (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)).
+          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev libjpeg-turbo8-dev # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev/libjpeg-turbo8-dev provide the mandatory AVIF/JPEG decode dependencies (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)).
       - name: Test asset locale digest generator's --check fail-closed behavior
         # tools/generate_asset_locale_digest.py's --check mode (review
         # round-3 item 16) is a standalone local dev tool no CMake/ctest
@@ -126,7 +126,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain and libavif build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev
       - run: mise run build
 
   appimage-smoke:
@@ -149,7 +149,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; AVIF is decoded directly against a bundled libavif (see src/AssetAvifDecoder.cpp) rather than through any Qt image-format plugin, so no Qt AVIF module is needed here either.
           cache: true
       - name: Install QtKeychain and libavif build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev
       - name: Test libsecret discovery fallback logic
         # Exercises find_bundled_libsecret() (used by build-appimage.sh
         # below) against ldconfig-absent, ldconfig-failing,

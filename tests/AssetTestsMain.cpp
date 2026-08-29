@@ -18,27 +18,11 @@
 #include "AssetImageRequestTests.h"
 #include "AssetLocaleDigestTests.h"
 #include "AssetLocatorTests.h"
-#include "AssetNetworkFetcher.h"
 #include "AssetNetworkFetcherTests.h"
 #include "AssetRequestCoordinatorTests.h"
 
 int main(int argc, char **argv) {
   QCoreApplication app(argc, argv);
-
-  // Test-only subprocess entry point (see
-  // AssetNetworkFetcherTests::
-  // jpegDecodeWarningDetectorFatalFallbackTerminatesProcessLikeQtDefaultHandler()):
-  // when invoked with this exact sentinel argument, skip every normal
-  // QTest suite entirely and instead call the [[noreturn]] test-only hook
-  // directly, so a parent test process can observe this subprocess being
-  // terminated abnormally rather than exiting cleanly.
-  for (int i = 1; i < argc; ++i) {
-    if (QString::fromLocal8Bit(argv[i]) ==
-        QStringLiteral("--test-only-trigger-jpeg-fatal-abort")) {
-      Arkham::AssetNetworkFetcher::
-          triggerJpegDecodeWarningDetectorFatalMessageForTesting();
-    }
-  }
 
   int status = 0;
 

@@ -16,6 +16,13 @@ description = "Install Qt development dependencies with Homebrew"
 # dependency (see CMakeLists.txt's pkg_check_modules(LIBAVIF REQUIRED
 # ...)), installed here via Homebrew alongside the Qt packages.
 #
+# Review item 2 (PR #18 cumulative review at 14cf8de6): JPEG is likewise
+# decoded directly against libjpeg's own C API (see
+# src/AssetJpegDecoder.cpp), never through Qt's plugin registry -- see
+# CMakeLists.txt's pkg_check_modules(LIBJPEG REQUIRED ...). Homebrew's
+# "jpeg-turbo" formula (not the base system's own libjpeg, if any) is the
+# one that ships the pkg-config file CMake's REQUIRED lookup needs.
+#
 # llvm@18 (rather than the plain, ever-rolling-latest "clang-format"
 # formula) is installed specifically for its bundled clang-format: CI's
 # format job installs clang-format via `apt-get install clang-format` on
@@ -26,7 +33,7 @@ description = "Install Qt development dependencies with Homebrew"
 # keeps `mise run format:check` meaningful here instead of silently
 # drifting out of sync with the one clang-format invocation that actually
 # gates merges.
-run = "brew install llvm@18 qtbase qtdeclarative qtshadertools qtsvg qtwebsockets libavif pkg-config"
+run = "brew install llvm@18 qtbase qtdeclarative qtshadertools qtsvg qtwebsockets libavif jpeg-turbo pkg-config"
 
 [tasks.configure]
 description = "Configure the Qt build"

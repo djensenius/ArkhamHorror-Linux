@@ -28,6 +28,24 @@ qt_standard_project_setup(REQUIRES 6.8)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBAVIF REQUIRED IMPORTED_TARGET libavif)
 
+# --- libjpeg / libjpeg-turbo (IJG/BSD-style; https://libjpeg-turbo.org/) ---
+# Review item 2 (PR #18 cumulative review at 14cf8de6): the previous JPEG
+# decode path went through QImageReader (Qt's bundled qjpeg plugin), with
+# a separate ScopedJpegDecodeWarningDetector installing a PROCESS-GLOBAL
+# Qt message handler to observe whether libjpeg had to recover from
+# corrupt/incomplete entropy-coded scan data -- unsafe under any
+# concurrent/reentrant decode (two overlapping instances corrupt each
+# other's shared static state and can self-recursively reinstall their own
+# handler). AssetJpegDecoder.cpp fixes this at the root by decoding JPEG
+# directly against libjpeg's own C API instead, with a per-call (never
+# static/shared) custom jpeg_error_mgr, exactly mirroring how
+# AssetAvifDecoder.cpp already decodes AVIF directly against libavif. This
+# is therefore a REQUIRED build dependency (not optional), like libavif
+# above. See mise.toml's setup:macos task and .github/workflows/ci.yml for
+# how each environment installs it.
+pkg_check_modules(LIBJPEG REQUIRED IMPORTED_TARGET libjpeg)
+
+
 # include(CTest) establishes the real BUILD_TESTING cache value (default ON)
 # before the QtKeychain FetchContent block below temporarily forces it off,
 # so the save/restore around that block is well-defined regardless of
@@ -98,6 +116,8 @@ add_library(arkham_foundation STATIC
     src/AssetCache.h
     src/AssetImageRequest.cpp
     src/AssetImageRequest.h
+    src/AssetJpegDecoder.cpp
+    src/AssetJpegDecoder.h
     src/AssetLocaleDigest.cpp
     src/AssetLocaleDigest.h
     src/AssetLocator.cpp
@@ -166,6 +186,7 @@ target_link_libraries(arkham_foundation PUBLIC
     Qt6::Network
     Qt6Keychain::Qt6Keychain
     PkgConfig::LIBAVIF
+    PkgConfig::LIBJPEG
 )
 
 qt_add_executable(arkham-horror

@@ -1,6 +1,7 @@
 #include "AssetNetworkFetcher.h"
 
 #include "AssetAvifDecoder.h"
+#include "AssetJpegDecoder.h"
 #include "AuthTransportSecurity.h"
 
 #include <QAuthenticator>
@@ -8,8 +9,6 @@
 #include <QCryptographicHash>
 #include <QImageReader>
 #include <QMetaObject>
-#include <QMutex>
-#include <QMutexLocker>
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
 #include <QNetworkReply>
@@ -20,9 +19,6 @@
 #include <QVariant>
 #include <QtAssert>
 #include <array>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <utility>
 
 using namespace Qt::StringLiterals;
@@ -263,136 +259,7 @@ bool jpegCodestreamHasGenuineEoi(const QByteArray &bytes) {
   return false; // exhausted the buffer without ever finding a genuine EOI
 }
 
-// Round-4 review item 8 (PR #18 cumulative review): the structural EOI
-// scan above (jpegCodestreamHasGenuineEoi()) proves the marker STRUCTURE
-// of the supplied bytes is well-formed and ends in a genuine EOI -- but it
-// cannot detect a truncated/corrupt *entropy-coded scan* (the
-// Huffman-coded DCT data between SOS and EOI), because verifying THAT
-// requires actually running the entropy decoder, which only libjpeg
-// itself does. Qt's bundled qjpeg plugin already runs libjpeg's real
-// entropy decoder, and libjpeg has its own long-standing, well-defined
-// behaviour for exactly this case: when the entropy-coded data ends
-// prematurely, libjpeg's default source manager (qt_fill_input_buffer()
-// in qjpeghandler.cpp) synthesises a fake EOI marker "as per jpeglib
-// recommendation" and libjpeg emits a WARNING-class message ("Corrupt
-// JPEG data: premature end of data segment" from jdmarker.c's
-// WARNMS/JWRN_JPEG_EOF path) rather than a fatal error -- decode continues
-// to completion with the remainder of the image filled in from whatever
-// state the decoder was last in, and QImageReader::read() returns a
-// non-null QImage with no error at all. This is exactly the "silent
-// recovery" this review item requires this project to reject outright:
-// an attacker-truncated entropy stream with a forged EOI appended must
-// not decode "successfully".
-//
-// Rather than vendoring/linking libjpeg directly and reimplementing
-// QImageReader's decode call, this hooks Qt's own already-integrated
-// libjpeg pipeline at its existing, stable seam: every libjpeg
-// warning/error message the qjpeg plugin emits is routed through the
-// public, documented Qt logging category "qt.gui.imageio.jpeg"
-// (Q_LOGGING_CATEGORY(lcJpeg, "qt.gui.imageio.jpeg") in qjpeghandler.cpp;
-// both the fatal-error path or non-fatal WARNMS-class messages funnel
-// through the same qCWarning(lcJpeg, ...) call). A scoped message handler
-// installed only for the duration of a single JPEG reader.read() call
-// observes whether ANY message was logged under that exact category --
-// matched by category name, never by message text, so this does not
-// depend on libjpeg's exact wording being stable across Qt/libjpeg
-// versions -- and if so, the decode is treated as having required silent
-// recovery and is rejected regardless of whether QImageReader itself
-// returned a seemingly-valid, non-null QImage. This deliberately also
-// rejects the qjpeg plugin's one other, unrelated qCWarning(lcJpeg, ...)
-// call site (a malformed EXIF orientation tag): a well-formed CDN-served
-// JPEG has no reason to carry a malformed EXIF orientation tag either, and
-// this project's "do not bless partial recovery" policy is intentionally
-// strict rather than trying to enumerate which specific warning classes
-// are "safe" to ignore.
-//
-// Every other Qt message logged during the scoped window (from this
-// category or any other) is forwarded, unmodified, to whatever handler
-// was previously installed (or Qt's default handler if none was) --
-// nothing is ever swallowed. A QMutex guards the small amount of shared
-// state (previous handler pointer + "warning seen" flag) purely as a
-// defensive measure against a future regression that decodes JPEGs from
-// more than one thread; this project has no QThread usage today; see
-// AssetNetworkFetcher.h's class-level threading note in the header.
-class ScopedJpegDecodeWarningDetector {
-public:
-  ScopedJpegDecodeWarningDetector() {
-    QMutexLocker locker(&s_mutex);
-    s_previousHandler = qInstallMessageHandler(&forwardingHandler);
-    s_active = true;
-    s_sawJpegPluginMessage = false;
-  }
-
-  ~ScopedJpegDecodeWarningDetector() {
-    QMutexLocker locker(&s_mutex);
-    qInstallMessageHandler(s_previousHandler);
-    s_active = false;
-    s_previousHandler = nullptr;
-  }
-
-  ScopedJpegDecodeWarningDetector(const ScopedJpegDecodeWarningDetector &) =
-      delete;
-  ScopedJpegDecodeWarningDetector &
-  operator=(const ScopedJpegDecodeWarningDetector &) = delete;
-
-  [[nodiscard]] bool sawJpegPluginMessage() const {
-    QMutexLocker locker(&s_mutex);
-    return s_sawJpegPluginMessage;
-  }
-
-private:
-  static void forwardingHandler(QtMsgType type,
-                                const QMessageLogContext &context,
-                                const QString &msg) {
-    QtMessageHandler previous = nullptr;
-    {
-      QMutexLocker locker(&s_mutex);
-      if (s_active && context.category &&
-          std::strcmp(context.category, "qt.gui.imageio.jpeg") == 0) {
-        s_sawJpegPluginMessage = true;
-      }
-      previous = s_previousHandler;
-    }
-    if (previous) {
-      previous(type, context, msg);
-    } else {
-      // No prior custom handler was installed (Qt's own built-in default
-      // handler was in effect): there is no public API to invoke that
-      // default handler directly, so approximate its behaviour closely
-      // enough that messages are never silently dropped just because
-      // this scope happened to be the first handler ever installed by
-      // this process. Critically, Qt's real default handler does not
-      // merely print QtFatalMsg to stderr -- it terminates the process
-      // (see qlogging.cpp's qDefaultMessageHandler(), which calls
-      // std::abort() after printing a fatal message). Silently
-      // continuing execution past a qFatal() call inside this scope
-      // would be a genuine, dangerous change to Qt's documented logging
-      // semantics, so the fatal case is replicated exactly here.
-      fprintf(stderr, "%s: %s\n",
-              context.category ? context.category : "default", qPrintable(msg));
-      if (type == QtFatalMsg) {
-        fflush(stderr);
-        std::abort();
-      }
-    }
-  }
-
-  static inline QMutex s_mutex;
-  static inline QtMessageHandler s_previousHandler = nullptr;
-  static inline bool s_active = false;
-  static inline bool s_sawJpegPluginMessage = false;
-};
-
 } // namespace
-
-[[noreturn]] void
-AssetNetworkFetcher::triggerJpegDecodeWarningDetectorFatalMessageForTesting() {
-  ScopedJpegDecodeWarningDetector detector;
-  qFatal("AssetNetworkFetcher test-only fatal message: proving "
-         "ScopedJpegDecodeWarningDetector's no-previous-handler fallback "
-         "terminates the process exactly like Qt's real default handler "
-         "would");
-}
 
 namespace {
 
@@ -570,55 +437,22 @@ QString normalizeContentType(const QString &raw) {
   return mediaType.trimmed().toLower();
 }
 
-// Whether Qt's installed image plugins can decode `format`, and (if so)
-// which exact plugin-key spelling QImageReader should be constructed
-// with. These two questions are answered together, from the SAME
-// QImageReader::supportedImageFormats() snapshot, specifically so the
-// format-hint given to QImageReader can never diverge from the spelling
-// that was actually confirmed supported: a fixed hint independent of this
-// check (e.g. always "jpeg") could pass the support check on a Qt build
-// that only registers the OTHER JPEG key ("jpg") yet still fail to
-// decode, since QImageReader's format hint is matched by exact plugin key.
-// JPEG is checked/hinted under both of Qt's registered plugin keys
-// ("jpeg" and "jpg" -- both are advertised by the stock qjpeg plugin, but
-// a build could plausibly register only one). PNG has exactly one Qt key.
-//
-// AVIF is deliberately NEVER routed through this function (see
-// decodeAndValidate() and AssetAvifDecoder.h) -- it is decoded directly
-// against libavif's own C API, independent of whatever Qt image plugins
-// this build happens to have registered, so this function's answer for
-// AVIF would never actually be consulted.
-struct QtCodecSupport {
-  bool supported{false};
-  QByteArray formatHint;
-};
-
-QtCodecSupport resolveQtCodecSupport(AssetFormat format) {
-  Q_ASSERT(format != AssetFormat::Avif);
-  const QList<QByteArray> supported = QImageReader::supportedImageFormats();
-  switch (format) {
-  case AssetFormat::Avif:
-    // Unreachable per the Q_ASSERT above in a debug build; in a release
-    // build, fail closed rather than silently reporting support this
-    // function never actually checked for AVIF.
-    return {false, QByteArrayLiteral("avif")};
-  case AssetFormat::Jpeg:
-    if (supported.contains(QByteArrayLiteral("jpeg"))) {
-      return {true, QByteArrayLiteral("jpeg")};
-    }
-    if (supported.contains(QByteArrayLiteral("jpg"))) {
-      return {true, QByteArrayLiteral("jpg")};
-    }
-    // Neither key is registered: report unsupported. The hint value here
-    // is never actually used to construct a QImageReader in that case
-    // (the caller checks `supported` first), but is filled in for
-    // completeness.
-    return {false, QByteArrayLiteral("jpeg")};
-  case AssetFormat::Png:
-    return {supported.contains(QByteArrayLiteral("png")),
-            QByteArrayLiteral("png")};
-  }
-  Q_UNREACHABLE_RETURN((QtCodecSupport{}));
+// Whether Qt's installed image plugins can decode PNG. PNG is the only
+// format remaining that is decoded through QImageReader/Qt's plugin
+// registry at all: AVIF is decoded directly against libavif's own C API
+// (see decodeAndValidate() and AssetAvifDecoder.h/.cpp), and JPEG is
+// decoded directly against libjpeg's own C API (see decodeAndValidate()
+// and AssetJpegDecoder.h/.cpp -- review item 2 of the PR #18 cumulative
+// review at 14cf8de6 required replacing the previous
+// ScopedJpegDecodeWarningDetector, which relied on a process-global Qt
+// message handler, with a genuinely per-decode libjpeg error/warning
+// manager; the simplest way to guarantee that is to bypass
+// QImageReader/Qt's plugin registry for JPEG entirely, exactly like AVIF
+// already does). This function therefore never needs to consider
+// anything other than PNG's single, unambiguous Qt plugin key.
+bool isPngSupportedByQt() {
+  return QImageReader::supportedImageFormats().contains(
+      QByteArrayLiteral("png"));
 }
 
 void applyCommonRequestSettings(QNetworkRequest &request) {
@@ -1173,8 +1007,25 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
                            m_limits.maxTotalPixels);
   }
 
-  const QtCodecSupport codecSupport = resolveQtCodecSupport(expectedFormat);
-  if (!codecSupport.supported) {
+  // JPEG is decoded directly against libjpeg's own C API (see
+  // AssetJpegDecoder.h/.cpp) -- never through QImageReader/Qt's plugin
+  // registry. Review item 2 (PR #18 cumulative review at 14cf8de6)
+  // required this: the previous QImageReader-based path's only way to
+  // detect libjpeg silently recovering from corrupt/incomplete
+  // entropy-coded scan data was ScopedJpegDecodeWarningDetector, which
+  // relied on installing a PROCESS-GLOBAL Qt message handler for the
+  // duration of each decode -- unsafe under any concurrent/reentrant
+  // decode. Reading libjpeg's own per-call, non-shared jpeg_error_mgr
+  // directly (see AssetJpegDecoder.cpp) is both simpler and correct
+  // regardless of concurrency.
+  if (expectedFormat == AssetFormat::Jpeg) {
+    return decodeJpegImage(encodedBytes, m_limits.maxDimensionPixels,
+                           m_limits.maxTotalPixels);
+  }
+
+  // Only PNG reaches this point; Avif and Jpeg both returned above.
+  Q_ASSERT(expectedFormat == AssetFormat::Png);
+  if (!isPngSupportedByQt()) {
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::UnsupportedCodec,
         QStringLiteral("no installed Qt image plugin can decode this "
@@ -1184,7 +1035,7 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
   QBuffer buffer;
   buffer.setData(encodedBytes);
   buffer.open(QIODevice::ReadOnly);
-  QImageReader reader(&buffer, codecSupport.formatHint);
+  QImageReader reader(&buffer, QByteArrayLiteral("png"));
 
   const QSize declaredSize = reader.size();
   if (!declaredSize.isValid() || declaredSize.width() <= 0 ||
@@ -1218,28 +1069,7 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
             .arg(m_limits.maxTotalPixels)});
   }
 
-  // Round-4 review item 8: for JPEG specifically, the actual decode call
-  // is wrapped in a scoped detector (see ScopedJpegDecodeWarningDetector's
-  // doc comment above) that observes whether Qt's bundled libjpeg-based
-  // plugin needed to log ANY message under its "qt.gui.imageio.jpeg"
-  // category while decoding -- which happens precisely when libjpeg had
-  // to synthesise a fake EOI and/or otherwise recover from corrupt/
-  // incomplete data rather than genuinely completing every MCU of the
-  // entropy-coded scan. A "successful", non-null QImage obtained this way
-  // is exactly the silent-recovery case this review item requires
-  // rejecting outright, so it is treated as a decode failure regardless
-  // of what QImageReader itself reports.
-  std::optional<ScopedJpegDecodeWarningDetector> jpegDetector;
-  if (expectedFormat == AssetFormat::Jpeg) {
-    jpegDetector.emplace();
-  }
   QImage decoded = reader.read();
-  if (jpegDetector && jpegDetector->sawJpegPluginMessage()) {
-    return AssetOutcome<QImage>(AssetError{
-        AssetErrorCode::MalformedImage,
-        QStringLiteral("JPEG decode required libjpeg to recover from "
-                       "corrupt or incomplete entropy-coded data")});
-  }
   if (decoded.isNull()) {
     if (reader.error() == QImageReader::UnsupportedFormatError) {
       return AssetOutcome<QImage>(AssetError{

@@ -39,13 +39,14 @@ private slots:
   void dimensionBombIsRejected();
   void pixelBudgetBombIsRejected();
   void malformedImageBodyIsRejected();
-  void jpegDecodesRegardlessOfQtPluginKeySpelling();
+  void jpegDecodesDirectlyViaLibjpegIndependentOfQtImagePlugins();
   void truncatedJpegMissingEoiIsRejectedDespiteQtDecodingIt();
   void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected_data();
   void truncatedJpegMissingEoiAtVaryingCutPointsAllRejected();
   void jpegWithStuffedFFBytesInScanDataStillDecodesWhenComplete();
   void jpegTrailingDataAfterGenuineEoiIsRejected();
   void jpegTruncatedEntropyDataWithForgedGenuineEoiIsRejected();
+  void concurrentJpegDecodesOnDifferentThreadsNeverCrossContaminate();
   void pngWithCorruptChunkCrcIsRejected();
   void pngWithApngAnimationChunksIsRejected_data();
   void pngWithApngAnimationChunksIsRejected();
@@ -72,6 +73,4 @@ private slots:
   invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing_data();
   void invalidLimitsOrTimeoutIsRejectedAsInvalidConfigurationWithoutThrowing();
   void validConfigurationFactorySucceeds();
-  void
-  jpegDecodeWarningDetectorFatalFallbackTerminatesProcessLikeQtDefaultHandler();
 };
