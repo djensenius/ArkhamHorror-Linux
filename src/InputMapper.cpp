@@ -182,7 +182,11 @@ InputMapper::processKey(const PhysicalKey &physicalKey, const bool isPress,
     // Stray release (never pressed, or already released): suppressed.
     return std::nullopt;
   }
-  heldKeys_.insert(physicalKey, false);
+  // Remove rather than store false: a key that's not held has no
+  // useful state to remember, so this keeps heldKeys_ bounded to only
+  // the keys currently pressed instead of growing for every key ever
+  // seen over the process lifetime.
+  heldKeys_.remove(physicalKey);
 
   const auto command = commandFor(physicalKey);
   if (!command.has_value()) {

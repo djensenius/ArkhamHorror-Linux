@@ -22,8 +22,10 @@ enum class FocusDirection {
 };
 
 // Whether moving off the edge of a zone (no explicit neighbor registered
-// in the requested direction) wraps around to the opposite edge of the
-// same zone, or leaves focus unchanged.
+// in the requested direction) wraps around within the same zone -- to
+// the next/previous node in that zone's *registration order* (not
+// geometric position; there is no coordinate model here) -- or leaves
+// focus unchanged.
 enum class WrapPolicy {
   NoWrap,
   WrapWithinZone,

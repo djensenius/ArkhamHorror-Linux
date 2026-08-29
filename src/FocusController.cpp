@@ -105,7 +105,14 @@ bool FocusController::moveFocus(const FocusDirection direction) {
     return true;
   }
 
-  const QVector<QString> zoneNodes = nodesInZone(current.zoneId);
+  // Only pay for scanning/sorting the whole zone when a feature that
+  // actually needs the zone's node list is enabled; a plain neighborless
+  // move with no wrap and no geometry fallback is just a no-op.
+  const bool needsZoneNodes =
+      wrapPolicy_ == WrapPolicy::WrapWithinZone || geometryFallback_;
+  const QVector<QString> zoneNodes =
+      needsZoneNodes ? nodesInZone(current.zoneId) : QVector<QString>{};
+
   if (wrapPolicy_ == WrapPolicy::WrapWithinZone && zoneNodes.size() > 1) {
     const qsizetype idx = zoneNodes.indexOf(currentFocusId_);
     if (idx >= 0) {
