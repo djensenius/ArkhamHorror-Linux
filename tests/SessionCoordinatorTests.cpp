@@ -177,14 +177,16 @@ public:
   // When set, the NEXT deleteToken() call invokes its callback
   // synchronously (reentrantly, from within the very call that requested
   // the delete) instead of registering a pending op for complete() to
-  // release later. This simulates a pathological (but contractually
-  // possible, since ITokenStore's interface doc does not itself forbid
-  // it at the C++ type level) synchronously-completing secure-store
-  // backend, used specifically to prove SessionCoordinator's own
+  // release later. ITokenStore's documented contract (see ITokenStore.h)
+  // explicitly requires every callback to be invoked asynchronously and
+  // never reentrantly -- a real, contract-compliant backend must never do
+  // this. This fake deliberately VIOLATES that contract here, on purpose,
+  // to harden SessionCoordinator against a hypothetical buggy/non-
+  // compliant backend implementation: it proves the coordinator's own
   // internal ordering (reserve-before-notify, atomic state+identity
-  // assignment) is what makes this safe -- not an assumption that the
-  // real backend never behaves this way. Cleared automatically after
-  // firing once.
+  // assignment) stays safe even in that disallowed case, rather than
+  // relying on an unenforced assumption that no backend could ever
+  // misbehave this way. Cleared automatically after firing once.
   std::optional<TokenStoreResult> synchronousDeleteResult;
 
   void readToken(const QString &profileId, ResultCallback callback) override {
