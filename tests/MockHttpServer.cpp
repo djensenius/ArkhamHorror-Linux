@@ -144,7 +144,13 @@ void MockHttpServer::tryParseAndRespond(Connection &connection) {
   Response notFound;
   notFound.status = 404;
   notFound.reasonPhrase = "Not Found";
-  const Response response = m_responses.value(path, notFound);
+  // Select by reference rather than copying the registered Response out
+  // of the QHash: registered bodies can be multi-MiB fixtures (e.g. for
+  // proving incremental byte-cap aborts), and an unconditional value()
+  // copy would duplicate that QByteArray on every single request.
+  const auto responseIt = m_responses.constFind(path);
+  const Response &response =
+      responseIt != m_responses.constEnd() ? responseIt.value() : notFound;
   writeResponse(connection.socket, path, response, connection.headers);
 }
 

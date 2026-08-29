@@ -7,7 +7,9 @@ dependency of the ArkhamHorror-Linux client's AppImage packaging:
 - **Upstream:** https://www.pcre.org/
 - **License:** BSD-3-Clause (see `LICENSE`, reproduced verbatim from
   upstream)
-- **Copyright:** Copyright (c) 1997-2018 University of Cambridge
+- **Copyright:** Copyright (c) 1997-2021 University of Cambridge; portions
+  Copyright (c) 2007-2012 Google Inc.; portions Copyright (c) 2009-2021
+  Zoltan Herczeg (see `LICENSE`)
 
 ## Why this may be bundled
 

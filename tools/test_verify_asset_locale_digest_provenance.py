@@ -234,6 +234,39 @@ class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
         with self.assertRaises(verify_mod.ProvenanceVerificationError):
             self._verify(lambda url, token: tree)
 
+    def test_missing_manifest_file_fails_closed_not_uncaught(self) -> None:
+        # verify() must report a missing/unreadable manifest as a typed
+        # ProvenanceVerificationError, not crash with an uncaught OSError
+        # -- consistent with this module's documented "reports every
+        # provenance-verification failure in a single typed way" contract.
+        self.manifest_path.unlink()
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(lambda url, token: self._genuine_tree_response())
+
+    def test_malformed_manifest_json_fails_closed_not_uncaught(self) -> None:
+        self.manifest_path.write_text("{not valid json", encoding="utf-8")
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(lambda url, token: self._genuine_tree_response())
+
+    def test_manifest_missing_provenance_object_fails_closed_not_uncaught(
+        self,
+    ) -> None:
+        # A manifest that is valid JSON but lacks the expected
+        # "provenance" object shape (e.g. hand-edited or from an
+        # unrelated schema version) must not crash with an uncaught
+        # KeyError/TypeError when subscripted.
+        self.manifest_path.write_text(
+            json.dumps({"sourceCommit": _REAL_COMMIT}), encoding="utf-8"
+        )
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(lambda url, token: self._genuine_tree_response())
+
+        self.manifest_path.write_text(
+            json.dumps({"provenance": "not-an-object"}), encoding="utf-8"
+        )
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(lambda url, token: self._genuine_tree_response())
+
     def test_git_blob_sha1_matches_known_git_hash_object_value(self) -> None:
         # Pins the header-construction scheme itself against a
         # known-correct git blob sha1 (verifiable independently via

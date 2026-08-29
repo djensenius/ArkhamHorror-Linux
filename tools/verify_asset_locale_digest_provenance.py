@@ -140,8 +140,29 @@ def verify(
     returns normally only when every pinned locale's source file has been
     positively, independently confirmed against the real upstream commit.
     """
-    manifest = json.loads(manifest_path.read_bytes())
-    provenance = manifest["provenance"]
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError as exc:
+        raise ProvenanceVerificationError(
+            f"could not read manifest {manifest_path!r}: {exc}"
+        ) from exc
+    try:
+        manifest = json.loads(manifest_bytes)
+    except json.JSONDecodeError as exc:
+        raise ProvenanceVerificationError(
+            f"manifest {manifest_path!r} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ProvenanceVerificationError(
+            f"manifest {manifest_path!r} top-level JSON value must be an "
+            f"object, got {type(manifest).__name__}"
+        )
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ProvenanceVerificationError(
+            f"manifest {manifest_path!r} is missing a 'provenance' object "
+            f"(got {type(provenance).__name__ if provenance is not None else 'nothing'})"
+        )
 
     declared_repository = provenance.get("sourceRepository")
     if declared_repository != _EXPECTED_SOURCE_REPOSITORY:

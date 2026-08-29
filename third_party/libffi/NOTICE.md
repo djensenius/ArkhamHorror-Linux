@@ -6,7 +6,7 @@ dependency of the ArkhamHorror-Linux client's AppImage packaging:
 - **Name:** libffi
 - **Upstream:** https://github.com/libffi/libffi
 - **License:** MIT (see `LICENSE`, reproduced verbatim from upstream)
-- **Copyright:** Copyright (c) 1996-2025 Anthony Green, Red Hat, Inc and others
+- **Copyright:** Copyright (c) 1996-2026 Anthony Green, Red Hat, Inc and others
 
 ## Why this may be bundled
 
