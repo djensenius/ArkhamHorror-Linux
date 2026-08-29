@@ -568,30 +568,39 @@ Value Value::makeObject(QList<std::pair<QString, Value>> members) {
   return v;
 }
 
-Value Value::fromQJson(const QJsonValue &qv) {
+ValueOrError<Value> Value::fromQJson(const QJsonValue &qv) {
   switch (qv.type()) {
   case QJsonValue::Null:
     return makeNull();
   case QJsonValue::Bool:
     return makeBool(qv.toBool());
   case QJsonValue::Double: {
-    // Best-effort: a QJsonValue already only ever holds as much precision
-    // as the double (or, for a value built via the qint64 overload, the
-    // exact integer) it was constructed from -- see this function's
-    // header doc comment. Prefer the exact integer path whenever the
-    // stored value round-trips through toInteger(), falling back to the
-    // shortest round-trip decimal text otherwise.
     const double d = qv.toDouble();
-    if (std::trunc(d) == d && std::abs(d) < 9.2e18) {
+    if (!std::isfinite(d))
+      return failure(
+          QStringLiteral("cannot convert a non-finite number to JSON"));
+    if (std::trunc(d) == d) {
+      // Always attempt the exact-integer round-trip, regardless of `d`'s
+      // magnitude: toInteger() reads the QJsonValue's underlying storage
+      // directly rather than approximating through `d`, so it recovers
+      // the true stored qint64 even right at the qint64 boundary, where
+      // `d` itself is already only an approximation (e.g. qint64::max()
+      // rounds UP to 2^63 as a double). A prior version of this function
+      // additionally gated this path on `std::abs(d) < 9.2e18`, which
+      // excluded exactly that boundary region and silently fell through
+      // to the lossy decimal-text fallback below for large-but-valid
+      // integers.
       const qint64 asInt = qv.toInteger();
       if (static_cast<double>(asInt) == d)
         return makeNumber(RawNumber::fromInt64(asInt));
     }
     const QString text = QString::number(d, 'g', 17);
     auto parsed = Value::parse(text.toUtf8(), QStringView());
-    if (parsed && parsed->isNumber())
-      return *parsed;
-    return makeNumber(RawNumber::fromInt64(0));
+    if (!parsed || !parsed->isNumber())
+      return failure(
+          QStringLiteral("internal error converting number %1 to JSON")
+              .arg(text));
+    return *parsed;
   }
   case QJsonValue::String:
     return makeString(qv.toString());
@@ -599,16 +608,24 @@ Value Value::fromQJson(const QJsonValue &qv) {
     const QJsonArray arr = qv.toArray();
     QList<Value> elements;
     elements.reserve(arr.size());
-    for (const auto &e : arr)
-      elements.append(fromQJson(e));
+    for (const auto &e : arr) {
+      auto element = fromQJson(e);
+      if (!element)
+        return failure(element.error());
+      elements.append(std::move(*element));
+    }
     return makeArray(std::move(elements));
   }
   case QJsonValue::Object: {
     const QJsonObject obj = qv.toObject();
     QList<std::pair<QString, Value>> members;
     members.reserve(obj.size());
-    for (auto it = obj.constBegin(); it != obj.constEnd(); ++it)
-      members.append({it.key(), fromQJson(it.value())});
+    for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
+      auto member = fromQJson(it.value());
+      if (!member)
+        return failure(member.error());
+      members.append({it.key(), std::move(*member)});
+    }
     return makeObject(std::move(members));
   }
   case QJsonValue::Undefined:

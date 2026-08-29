@@ -56,6 +56,10 @@ private slots:
   void fromInt64RoundTripsFullRange();
   void toQJsonPreservesInt64ExactlyBeyondDoublePrecision();
   void fromQJsonConvertsQJsonTreeRecursively();
+  void fromQJsonPreservesInt64MaxExactlyAtBoundary();
+  void fromQJsonPreservesInt64MinExactlyAtBoundary();
+  void fromQJsonRejectsNonFiniteDouble();
+  void fromQJsonPreservesLargeIntegerNestedInsideArray();
 
   // Value::make*()/toJsonBytes() lossless AST builder+serializer (review
   // round 3, item 2: spliceRawJsonMember's replacement).
@@ -373,7 +377,10 @@ void RawJsonTests::fromQJsonConvertsQJsonTreeRecursively() {
   obj.insert(QStringLiteral("z"), QJsonValue());
   QJsonArray arr{1, 2, 3};
   obj.insert(QStringLiteral("a"), arr);
-  const Value converted = Value::fromQJson(obj);
+  auto convertedResult = Value::fromQJson(obj);
+  if (!convertedResult)
+    QFAIL(qPrintable(convertedResult.error()));
+  const Value &converted = *convertedResult;
   QVERIFY(converted.isObject());
   QCOMPARE(converted.value("n"_L1).toRawNumber().toExactInt64().value_or(-1),
            9007199254740993LL);
@@ -382,6 +389,64 @@ void RawJsonTests::fromQJsonConvertsQJsonTreeRecursively() {
   QVERIFY(converted.value("z"_L1).isNull());
   QVERIFY(converted.value("a"_L1).isArray());
   QCOMPARE(converted.value("a"_L1).toArray().size(), 3);
+}
+
+void RawJsonTests::fromQJsonPreservesInt64MaxExactlyAtBoundary() {
+  // qint64::max() (2^63-1) rounds UP to 2^63 as a double, so a version of
+  // fromQJson() that gated its exact-integer recovery on `std::abs(d) <
+  // 9.2e18` would incorrectly fall through to the lossy decimal-text
+  // fallback here and silently corrupt the value.
+  constexpr qint64 kMax = std::numeric_limits<qint64>::max();
+  const QJsonValue qv(kMax);
+  auto result = Value::fromQJson(qv);
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(result->isNumber());
+  QCOMPARE(result->toRawNumber().toExactInt64().value_or(0), kMax);
+}
+
+void RawJsonTests::fromQJsonPreservesInt64MinExactlyAtBoundary() {
+  constexpr qint64 kMin = std::numeric_limits<qint64>::min();
+  const QJsonValue qv(kMin);
+  auto result = Value::fromQJson(qv);
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(result->isNumber());
+  QCOMPARE(result->toRawNumber().toExactInt64().value_or(0), kMin);
+}
+
+void RawJsonTests::fromQJsonRejectsNonFiniteDouble() {
+  // A QJsonValue can only ever hold a non-finite double via direct C++
+  // construction (JSON text itself has no NaN/Infinity literal); previously
+  // this silently produced a valid-looking numeric literal "0" instead of
+  // failing.
+  const QJsonValue nanValue(std::numeric_limits<double>::quiet_NaN());
+  auto nanResult = Value::fromQJson(nanValue);
+  QVERIFY(!nanResult.has_value());
+
+  const QJsonValue infValue(std::numeric_limits<double>::infinity());
+  auto infResult = Value::fromQJson(infValue);
+  QVERIFY(!infResult.has_value());
+}
+
+void RawJsonTests::fromQJsonPreservesLargeIntegerNestedInsideArray() {
+  // The top-level scalar id path (ExternalDeckId::fromObject) has its own
+  // isfinite()/isNumber() guard, but fromQJson() itself must also recover
+  // full precision for numbers nested arbitrarily deep inside sideSlots
+  // (or any other open/unconstrained subtree), since no per-field caller
+  // wraps every nested value individually.
+  constexpr qint64 kMax = std::numeric_limits<qint64>::max();
+  QJsonArray arr;
+  arr.append(QJsonValue(kMax));
+  QJsonObject obj;
+  obj.insert(QStringLiteral("nested"), arr);
+  auto result = Value::fromQJson(obj);
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  const auto nested = result->value("nested"_L1);
+  QVERIFY(nested.isArray());
+  const auto element = nested.toArray().at(0);
+  QCOMPARE(element.toRawNumber().toExactInt64().value_or(0), kMax);
 }
 
 void RawJsonTests::toJsonBytesRoundTripsBuiltObject() {

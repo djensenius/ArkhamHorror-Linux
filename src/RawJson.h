@@ -252,11 +252,20 @@ public:
   [[nodiscard]] static Value makeArray(QList<Value> elements);
   [[nodiscard]] static Value
   makeObject(QList<std::pair<QString, Value>> members);
-  // Recursively converts a QJsonValue to a Value, for composing an AST out
-  // of fields that are not precision-sensitive (any QJsonValue::Double is
-  // necessarily already as lossy as that QJsonValue itself; see
-  // makeNumber()/RawNumber::fromInt64() for the lossless alternative).
-  [[nodiscard]] static Value fromQJson(const QJsonValue &v);
+  // Recursively converts a QJsonValue to a Value. A QJsonValue::Double can
+  // only ever carry as much precision as that QJsonValue itself already
+  // stores -- this recovers the exact qint64 whenever the underlying
+  // storage round-trips through QJsonValue::toInteger() (which, unlike
+  // toDouble(), reads the value's true stored representation and is
+  // therefore exact all the way to the qint64 boundary, not just up to
+  // double's 2^53 exact-integer range), and otherwise the shortest
+  // round-trip decimal text for a non-integral double. Explicitly fails
+  // (rather than silently substituting 0) for a non-finite double or an
+  // internal round-trip inconsistency, so a corrupted/unsupported value
+  // can never masquerade as a valid-looking numeric literal. See
+  // makeNumber()/RawNumber::fromInt64() for the fully lossless
+  // alternative when the source is not already a QJsonValue.
+  [[nodiscard]] static ValueOrError<Value> fromQJson(const QJsonValue &v);
 
   // Serializes this value back to bytes per RFC 8259, exactly (RawNumber
   // literals are emitted via RawNumber::literal(), never rounded through a

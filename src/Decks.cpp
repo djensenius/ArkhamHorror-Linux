@@ -131,11 +131,13 @@ ValueOrError<ExternalDeckId> ExternalDeckId::fromObject(const QJsonObject &obj,
     // (exact for any qint64-range integer -- see Json::Value::fromQJson()'s
     // doc comment -- best-effort IEEE-754 double otherwise) rather than
     // ever constructing a RawNumber from unchecked/re-parsed text.
-    const Json::Value converted = Json::Value::fromQJson(v);
-    if (!converted.isNumber())
+    auto converted = Json::Value::fromQJson(v);
+    if (!converted)
+      return failure(QStringLiteral("%1: %2").arg(idPath, converted.error()));
+    if (!converted->isNumber())
       return failure(
           QStringLiteral("%1: internal error converting number").arg(idPath));
-    return ExternalDeckId::number(converted.toRawNumber());
+    return ExternalDeckId::number(converted->toRawNumber());
   }
   return failure(QStringLiteral("%1: expected string, number, or null, got %2")
                      .arg(idPath, Json::typeName(v)));
@@ -230,10 +232,14 @@ ValueOrError<DeckListInput> DeckListInput::fromJson(const QJsonValue &v,
       Json::optionalString(obj, "name"_L1, Json::joinPath(path, u"name"));
   if (!name)
     return failure(name.error());
+  auto sideSlots = Json::Value::fromQJson(obj.value("sideSlots"_L1));
+  if (!sideSlots)
+    return failure(QStringLiteral("%1: %2").arg(
+        Json::joinPath(path, u"sideSlots"), sideSlots.error()));
 
   return DeckListInput{
       .cardSlots = *cardSlots,
-      .sideSlots = Json::Value::fromQJson(obj.value("sideSlots"_L1)),
+      .sideSlots = *sideSlots,
       .investigatorCode = *investigatorCode,
       .investigatorName = *investigatorName,
       .meta = *meta,

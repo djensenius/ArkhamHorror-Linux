@@ -1080,9 +1080,15 @@ ChooseDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QByteArray> ChooseDeckRequest::toJsonBytes() const {
+  // investigatorId is a NonEmptyString-backed id, so toJson() always
+  // yields a QJsonValue::String -- fromQJson() can only fail on a
+  // non-finite/unconvertible Double, which this branch never is -- but
+  // the error is still propagated rather than assumed away.
+  auto investigatorIdValue = Json::Value::fromQJson(investigatorId.toJson());
+  if (!investigatorIdValue)
+    return failure(investigatorIdValue.error());
   QList<std::pair<QString, Json::Value>> members{
-      {QStringLiteral("investigatorId"),
-       Json::Value::fromQJson(investigatorId.toJson())},
+      {QStringLiteral("investigatorId"), *investigatorIdValue},
   };
   if (deckUrl)
     members.append(
