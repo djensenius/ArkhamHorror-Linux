@@ -101,6 +101,71 @@ void AssetRequestCoordinatorTests::coalescesConcurrentIdenticalRequests() {
 }
 
 void AssetRequestCoordinatorTests::
+    keysDifferingOnlyByAssetBaseTrailingSlashStillCoalesce() {
+  // Regression test: AssetLocator::resolveCandidates() validates AND
+  // normalises assetBase via UrlValidator::validateCustomUrl() on every
+  // call, which strips a trailing slash -- so an assetBase with a
+  // trailing slash and one without resolve to IDENTICAL candidate URLs
+  // (and therefore identical cache keys). The operation-key identity used
+  // for coalescing must track that same normalised identity: two
+  // concurrent requests differing only by assetBase's trailing slash
+  // are, after normalisation, requests for the exact same resource, and
+  // must coalesce onto a single in-flight operation rather than issuing
+  // two redundant concurrent network fetches.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  response.slowDrip = true; // both requests must overlap in flight
+  response.chunkSize = 32;
+  response.chunkDelayMs = 20;
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  AssetKey keyA =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+
+  AssetKey keyB = keyA;
+  keyB.assetBase =
+      QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.port()));
+
+  // The two AssetKey values are NOT operator==-equal (assetBase differs
+  // as a raw QUrl), yet they must still coalesce onto one operation --
+  // confirming that coalescing tracks NORMALISED identity, not raw
+  // operator== equality.
+  QVERIFY(!(keyA == keyB));
+
+  int completions = 0;
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  coordinator.request(keyA, [&](Result r) {
+    ++completions;
+    resultA = std::move(r);
+  });
+  coordinator.request(keyB, [&](Result r) {
+    ++completions;
+    resultB = std::move(r);
+  });
+
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 1);
+
+  QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
+
+  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QVERIFY(resultA.has_value());
+  QVERIFY(resultB.has_value());
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QCOMPARE((**resultA).encodedBytes, (**resultB).encodedBytes);
+}
+
+void AssetRequestCoordinatorTests::
     keysDifferingOnlyByHostileLocaleContentNeverCoalesce() {
   // Regression test for a HIGH-severity coalescing-key robustness finding:
   // the operation key used to join fields (assetBase, category,

@@ -1,6 +1,7 @@
 #include "AssetRequestCoordinator.h"
 
 #include "AssetLocator.h"
+#include "UrlValidator.h"
 
 #include <QMetaObject>
 #include <QPointer>
@@ -28,8 +29,33 @@ QString lengthPrefixed(const QString &field) {
   return QString::number(field.size()) + u':' + field;
 }
 
+// AssetLocator::resolveCandidates() validates AND normalises key.assetBase
+// via UrlValidator::validateCustomUrl() on every call (stripping a
+// trailing slash, treating a bare "/" path as no path at all) before
+// building any candidate URL from it -- so two AssetKey values whose
+// assetBase differs ONLY by a trailing slash always resolve to identical
+// candidate URLs and cache keys. Applying that SAME normalisation here
+// (rather than key.assetBase.toString() verbatim) keeps the operation-key
+// identity used for coalescing aligned with the identity that actually
+// governs cache/network behaviour, so such a pair of requests coalesces
+// into one in-flight operation instead of two redundant concurrent
+// fetches for what is, after normalisation, the exact same resource. A
+// base that fails validation is passed through unnormalised: resolving
+// candidates for it will fail independently with a typed
+// AssetErrorCode::InvalidAssetBase, and every operation sharing that same
+// invalid raw string still coalesces onto the same (doomed) operation key
+// as before.
+QString canonicalizedAssetBase(const QUrl &assetBase) {
+  const QString raw = assetBase.toString(QUrl::FullyEncoded);
+  const UrlValidationResult validated = validateCustomUrl(raw);
+  if (!validated) {
+    return raw;
+  }
+  return validated->toString(QUrl::FullyEncoded);
+}
+
 QString canonicalOperationKey(const AssetKey &key) {
-  return lengthPrefixed(key.assetBase.toString(QUrl::FullyEncoded)) +
+  return lengthPrefixed(canonicalizedAssetBase(key.assetBase)) +
          lengthPrefixed(QString::number(static_cast<int>(key.category))) +
          lengthPrefixed(key.identifier) +
          lengthPrefixed(QString::number(static_cast<int>(key.side))) +
