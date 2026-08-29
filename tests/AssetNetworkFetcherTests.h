@@ -33,5 +33,6 @@ private slots:
   void conditionalRequestAcceptsMatchingNotModified();
   void unconditional304IsRejectedAsTypedError();
   void cancelInvokesCallbackExactlyOnceWithCancelled();
+  void timeoutFiresExactlyOnceAndCleansUpItsTimer();
   void destructionNeverInvokesStaleCallback();
 };

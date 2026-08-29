@@ -34,6 +34,23 @@ QString categoryLabel(AssetCategory category) {
   return QStringLiteral("asset");
 }
 
+// The base accessible description text this request is "carrying", per
+// djensenius/ArkhamHorror-Linux#17's requirement to carry a
+// caller-provided accessible description rather than an internally
+// invented one: `callerAccessibleDescription` is used verbatim when the
+// caller supplied one (e.g. a card's title, an investigator's name), and
+// only a generic category-derived label is synthesised as a fallback for
+// callers that have not (yet) been updated to supply their own.
+QString
+baseAccessibleDescriptionFor(const AssetKey &key,
+                             const QString &callerAccessibleDescription) {
+  if (!callerAccessibleDescription.isEmpty()) {
+    return callerAccessibleDescription;
+  }
+  return QStringLiteral("%1 \"%2\"")
+      .arg(categoryLabel(key.category), key.identifier);
+}
+
 } // namespace
 
 AssetImageRequest::AssetImageRequest(AssetRequestCoordinator &coordinator,
@@ -53,10 +70,13 @@ AssetImageRequest::~AssetImageRequest() {
   }
 }
 
-void AssetImageRequest::load(const AssetKey &key) {
+void AssetImageRequest::load(const AssetKey &key,
+                             const QString &callerAccessibleDescription) {
   cancel();
   ++m_generation;
   const quint64 generation = m_generation;
+  const QString base =
+      baseAccessibleDescriptionFor(key, callerAccessibleDescription);
 
   setStatus(Status::Loading);
   m_progress = 0.0;
@@ -71,9 +91,7 @@ void AssetImageRequest::load(const AssetKey &key) {
     m_image = QImage();
     emit imageChanged();
   }
-  setAccessibleDescription(
-      QStringLiteral("Loading %1 image \"%2\"...")
-          .arg(categoryLabel(key.category), key.identifier));
+  setAccessibleDescription(QStringLiteral("Loading %1...").arg(base));
 
   // The coordinator retains this callback (via std::function, possibly
   // queued past this object's own lifetime -- e.g. a cancel() during
@@ -83,7 +101,8 @@ void AssetImageRequest::load(const AssetKey &key) {
   // member access below is guarded by a QPointer liveness check first.
   QPointer<AssetImageRequest> self(this);
   m_handle = m_coordinator.request(
-      key, [self, generation](AssetOutcome<AssetCache::CachedEntry> result) {
+      key,
+      [self, generation, base](AssetOutcome<AssetCache::CachedEntry> result) {
         if (!self) {
           return; // this AssetImageRequest was destroyed
         }
@@ -101,7 +120,7 @@ void AssetImageRequest::load(const AssetKey &key) {
           self->m_errorCode = static_cast<int>(error.code);
           self->m_image = QImage();
           self->setAccessibleDescription(
-              QStringLiteral("Failed to load image: %1").arg(error.message));
+              QStringLiteral("Failed to load %1: %2").arg(base, error.message));
           emit self->statusChanged();
           emit self->errorChanged();
           emit self->imageChanged();
@@ -112,7 +131,7 @@ void AssetImageRequest::load(const AssetKey &key) {
 
         self->m_image = result->decodedImage;
         self->m_status = Status::Ready;
-        self->setAccessibleDescription(QStringLiteral("Image loaded"));
+        self->setAccessibleDescription(base);
         emit self->statusChanged();
         emit self->imageChanged();
         self->m_progress = 1.0;

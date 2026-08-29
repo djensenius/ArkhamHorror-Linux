@@ -176,9 +176,18 @@ AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
         return;
       }
       QNetworkReply *r = it.value().reply;
+      // The timer that just fired is this very request's own timer: it
+      // is single-shot (never fires again) but is NOT otherwise deleted
+      // anywhere else on this path, so it must be cleaned up here --
+      // otherwise every timed-out request leaks one QTimer for the
+      // remaining lifetime of this AssetNetworkFetcher.
+      QTimer *t = it.value().timer;
       QObject::disconnect(r, nullptr, this, nullptr);
       r->abort();
       r->deleteLater();
+      if (t) {
+        t->deleteLater();
+      }
       completeWithError(handle,
                         AssetError{AssetErrorCode::Transport,
                                    QStringLiteral("request timed out")});

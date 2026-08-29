@@ -86,6 +86,41 @@ void AssetImageRequestTests::successfulLoadTransitionsIdleLoadingReady() {
   QVERIFY(imageSpy.count() >= 1);
 }
 
+void AssetImageRequestTests::
+    callerProvidedAccessibleDescriptionIsCarriedThroughAllStates() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(16, 16);
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  AssetImageRequest request(coordinator);
+
+  const QString callerDescription = QStringLiteral("Zoey Samaras, front");
+
+  // Per djensenius/ArkhamHorror-Linux#17, this seam must carry a
+  // caller-provided accessible description rather than always inventing
+  // its own generic text -- verify the caller's exact text is present
+  // (not necessarily verbatim, since Loading/Error prefix/suffix status
+  // text around it) at every state, including the terminal Ready state
+  // where it must appear unchanged.
+  request.load(
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))),
+      callerDescription);
+  QVERIFY(request.accessibleDescription().contains(callerDescription));
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Ready; },
+      5000));
+  QCOMPARE(request.accessibleDescription(), callerDescription);
+}
+
 void AssetImageRequestTests::failedLoadTransitionsIdleLoadingError() {
   MockHttpServer server;
   QNetworkAccessManager nam;

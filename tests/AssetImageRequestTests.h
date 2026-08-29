@@ -24,6 +24,7 @@ private slots:
   void cleanup();
 
   void successfulLoadTransitionsIdleLoadingReady();
+  void callerProvidedAccessibleDescriptionIsCarriedThroughAllStates();
   void failedLoadTransitionsIdleLoadingError();
   void cancelMidFlightReturnsToIdleWithoutFurtherSignals();
   void destructionMidFlightNeverEmitsAfterDestruction();

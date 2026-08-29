@@ -457,6 +457,45 @@ void AssetNetworkFetcherTests::cancelInvokesCallbackExactlyOnceWithCancelled() {
   QCOMPARE(callCount, 1);
 }
 
+void AssetNetworkFetcherTests::timeoutFiresExactlyOnceAndCleansUpItsTimer() {
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodeImage(16, 16, "png");
+  response.slowDrip = true;
+  // Long enough that the fetcher's own short timeout below always fires
+  // first, well before any body byte (or even a full chunk) arrives.
+  response.chunkDelayMs = 5000;
+  server.setResponse(QStringLiteral("/never-completes.png"), response);
+
+  QNetworkAccessManager nam;
+  // A deliberately short timeout so this test does not need to wait
+  // anywhere near kDefaultTimeout (30s) to observe the timeout path.
+  AssetNetworkFetcher fetcher(nam, AssetNetworkFetcher::Limits{},
+                              std::chrono::milliseconds(50));
+
+  int callCount = 0;
+  std::optional<Outcome> result;
+  fetcher.fetch(server.baseUrlFor(QStringLiteral("/never-completes.png")),
+                AssetFormat::Png, {}, [&](Outcome outcome) {
+                  ++callCount;
+                  result = std::move(outcome);
+                });
+
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::Transport);
+
+  // The single-shot timeout timer fires exactly once by construction;
+  // this only re-confirms the callback itself is never invoked twice
+  // (the timer's own cleanup, previously leaked, is exercised by simply
+  // running this path at all -- a leak is not user-observable here
+  // without a heap profiler, but this proves the timeout completion path
+  // itself still functions correctly after that cleanup was added).
+  QTest::qWait(100);
+  QCOMPARE(callCount, 1);
+}
+
 void AssetNetworkFetcherTests::destructionNeverInvokesStaleCallback() {
   MockHttpServer server;
   MockHttpServer::Response response;

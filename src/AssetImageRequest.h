@@ -39,7 +39,17 @@ public:
 
   // Starts (or restarts) loading `key`. Any previously in-flight request
   // owned by this object is cancelled first. Safe to call repeatedly.
-  void load(const AssetKey &key);
+  //
+  // `callerAccessibleDescription` is the caller-provided accessible
+  // description this seam is required to carry (per
+  // djensenius/ArkhamHorror-Linux#17) -- e.g. a card's title or an
+  // investigator's name -- rather than an internally-invented generic
+  // label. It is woven into the Loading/Ready/Error accessibleDescription
+  // text at each state transition. Left empty, a generic
+  // category-derived label is used instead, so existing callers that do
+  // not yet have caller-specific text still get a reasonable default.
+  void load(const AssetKey &key,
+            const QString &callerAccessibleDescription = QString());
 
   // Cancels any in-flight request and returns to Idle. A no-op if already
   // Idle/Ready/Error.

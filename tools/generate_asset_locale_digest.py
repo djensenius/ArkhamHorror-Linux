@@ -138,7 +138,11 @@ def main(argv: list[str]) -> int:
     rendered = render_header(source_bytes, data)
 
     if args.check:
-        current = GENERATED_HEADER.read_text() if GENERATED_HEADER.exists() else ""
+        current = (
+            GENERATED_HEADER.read_text(encoding="utf-8")
+            if GENERATED_HEADER.exists()
+            else ""
+        )
         if current != rendered:
             print(
                 f"{GENERATED_HEADER} is stale; run "
@@ -149,7 +153,7 @@ def main(argv: list[str]) -> int:
         print("Generated asset locale digest header is up to date.")
         return 0
 
-    GENERATED_HEADER.write_text(rendered)
+    GENERATED_HEADER.write_text(rendered, encoding="utf-8", newline="\n")
     print(f"Wrote {GENERATED_HEADER}")
     return 0
 
