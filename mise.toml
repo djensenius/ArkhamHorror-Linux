@@ -59,3 +59,7 @@ run = "packaging/build-appimage.sh \"$BUILD_DIR\""
 [tasks."contracts:verify-provenance"]
 description = "Prove vendored contracts/ files are byte-identical to the pinned backend git commit (fetches from the real backend remote; not merely an offline digest re-check)"
 run = "python3 packaging/verify_contract_provenance.py"
+
+[tasks."contracts:test-provenance-script"]
+description = "Unit-test verify_contract_provenance.py's closure discovery/verify() logic against an in-memory fake backend tree (no network access)"
+run = "python3 packaging/verify_contract_provenance_test.py"

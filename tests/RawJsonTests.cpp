@@ -3,6 +3,7 @@
 #include "RawJson.h"
 
 using Arkham::Failure;
+using Arkham::Json::ParseLimits;
 using Arkham::Json::RawNumber;
 using Arkham::Json::Value;
 
@@ -43,6 +44,36 @@ private slots:
   void objectAccessorsFindPresentKeysAndMissAbsentOnes();
   void toQJsonConvertsEveryKind();
   void skipsLeadingAndTrailingWhitespace();
+
+  // toExactInt64()/fromInt64()/qint64-exactness (issue #19 review round 3,
+  // item 4: contract integers must be exact qint64, never rounded through
+  // a double).
+  void toExactInt64AcceptsIntegralDecimalAndExponentForms();
+  void toExactInt64RejectsGenuinelyFractionalValues();
+  void toExactInt64HandlesQint64BoundariesExactly();
+  void fromInt64RoundTripsFullRange();
+  void toQJsonPreservesInt64ExactlyBeyondDoublePrecision();
+  void fromQJsonConvertsQJsonTreeRecursively();
+
+  // Value::make*()/toJsonBytes() lossless AST builder+serializer (review
+  // round 3, item 2: spliceRawJsonMember's replacement).
+  void toJsonBytesRoundTripsBuiltObject();
+  void toJsonBytesRejectsDuplicateObjectKeys();
+  void toJsonBytesRejectsUndefinedValue();
+  void toJsonBytesEscapesInjectionAttemptsInStringsAndKeys();
+
+  // ParseLimits (review round 3, item 8: explicit configurable resource
+  // bounds). Each below constructs a deliberately tight limit and checks
+  // both the boundary (accepted) and boundary+1 (rejected) where
+  // meaningful.
+  void parseLimitsRejectsInputExceedingMaxInputBytes();
+  void parseLimitsRejectsDepthExceedingMaxDepth();
+  void parseLimitsRejectsStringExceedingMaxStringLength();
+  void parseLimitsRejectsNumberExceedingMaxNumberDigits();
+  void parseLimitsRejectsArrayExceedingMaxArrayElements();
+  void parseLimitsRejectsObjectExceedingMaxObjectMembers();
+  void parseLimitsRejectsTotalNodesExceedingMaxTotalNodes();
+  void toJsonBytesRejectsDepthExceedingLimitOnProgrammaticAst();
 };
 
 namespace {
@@ -277,6 +308,190 @@ void RawJsonTests::skipsLeadingAndTrailingWhitespace() {
   auto value = mustParse("  \n\t 42 \r\n ");
   QVERIFY(value.isNumber());
   QCOMPARE(value.toRawNumber().integerDigits(), u"42"_s);
+}
+
+void RawJsonTests::toExactInt64AcceptsIntegralDecimalAndExponentForms() {
+  QCOMPARE(*mustParse("1").toRawNumber().toExactInt64(), 1LL);
+  QCOMPARE(*mustParse("1.0").toRawNumber().toExactInt64(), 1LL);
+  QCOMPARE(*mustParse("1e2").toRawNumber().toExactInt64(), 100LL);
+  QCOMPARE(*mustParse("100e-2").toRawNumber().toExactInt64(), 1LL);
+  QCOMPARE(*mustParse("10e-1").toRawNumber().toExactInt64(), 1LL);
+  QCOMPARE(*mustParse("0").toRawNumber().toExactInt64(), 0LL);
+  QCOMPARE(*mustParse("-0").toRawNumber().toExactInt64(), 0LL);
+  // 2^53 + 1: exact via toExactInt64() even though it exceeds double's
+  // exact-integer range, unlike a value that had to round through one.
+  QCOMPARE(*mustParse("9007199254740993").toRawNumber().toExactInt64(),
+           9007199254740993LL);
+}
+
+void RawJsonTests::toExactInt64RejectsGenuinelyFractionalValues() {
+  QVERIFY(!mustParse("1.5").toRawNumber().toExactInt64().has_value());
+  QVERIFY(!mustParse("1e-1").toRawNumber().toExactInt64().has_value());
+  QVERIFY(!mustParse("1.23e1").toRawNumber().toExactInt64().has_value());
+}
+
+void RawJsonTests::toExactInt64HandlesQint64BoundariesExactly() {
+  QCOMPARE(*mustParse("9223372036854775807").toRawNumber().toExactInt64(),
+           std::numeric_limits<qint64>::max());
+  QVERIFY(!mustParse("9223372036854775808")
+               .toRawNumber()
+               .toExactInt64()
+               .has_value());
+  QCOMPARE(*mustParse("-9223372036854775808").toRawNumber().toExactInt64(),
+           std::numeric_limits<qint64>::min());
+  QVERIFY(!mustParse("-9223372036854775809")
+               .toRawNumber()
+               .toExactInt64()
+               .has_value());
+}
+
+void RawJsonTests::fromInt64RoundTripsFullRange() {
+  for (const qint64 v : {0LL, 1LL, -1LL, std::numeric_limits<qint64>::max(),
+                         std::numeric_limits<qint64>::min(), 100LL, -100LL}) {
+    const auto number = RawNumber::fromInt64(v);
+    QVERIFY(number.toExactInt64().has_value());
+    QCOMPARE(*number.toExactInt64(), v);
+  }
+}
+
+void RawJsonTests::toQJsonPreservesInt64ExactlyBeyondDoublePrecision() {
+  auto value = mustParse(R"({"id":9007199254740993})");
+  auto json = value.toQJson();
+  // toInteger() recovers the exact qint64 even though .isDouble()/
+  // .toDouble() report the rounded double -- see Value::toQJson()'s doc
+  // comment.
+  QCOMPARE(json.toObject().value("id"_L1).toInteger(), 9007199254740993LL);
+}
+
+void RawJsonTests::fromQJsonConvertsQJsonTreeRecursively() {
+  QJsonObject obj;
+  obj.insert(QStringLiteral("n"), QJsonValue(qint64(9007199254740993LL)));
+  obj.insert(QStringLiteral("s"), QStringLiteral("hi"));
+  obj.insert(QStringLiteral("b"), true);
+  obj.insert(QStringLiteral("z"), QJsonValue());
+  QJsonArray arr{1, 2, 3};
+  obj.insert(QStringLiteral("a"), arr);
+  const Value converted = Value::fromQJson(obj);
+  QVERIFY(converted.isObject());
+  QCOMPARE(converted.value("n"_L1).toRawNumber().toExactInt64().value_or(-1),
+           9007199254740993LL);
+  QCOMPARE(converted.value("s"_L1).toString(), u"hi"_s);
+  QCOMPARE(converted.value("b"_L1).toBool(), true);
+  QVERIFY(converted.value("z"_L1).isNull());
+  QVERIFY(converted.value("a"_L1).isArray());
+  QCOMPARE(converted.value("a"_L1).toArray().size(), 3);
+}
+
+void RawJsonTests::toJsonBytesRoundTripsBuiltObject() {
+  QList<std::pair<QString, Value>> members;
+  members.append({QStringLiteral("id"),
+                  Value::makeNumber(RawNumber::fromInt64(9007199254740993LL))});
+  members.append(
+      {QStringLiteral("name"), Value::makeString(QStringLiteral("a\"b\\c"))});
+  members.append(
+      {QStringLiteral("nested"),
+       Value::makeArray({Value::makeBool(true), Value::makeNull()})});
+  const Value obj = Value::makeObject(members);
+  auto bytes = obj.toJsonBytes();
+  QVERIFY(bytes.has_value());
+  auto reparsed = Value::parse(*bytes, u"test");
+  QVERIFY(reparsed.has_value());
+  QCOMPARE(*reparsed, obj);
+  QCOMPARE(reparsed->value("id"_L1).toRawNumber().toExactInt64().value_or(-1),
+           9007199254740993LL);
+}
+
+void RawJsonTests::toJsonBytesRejectsDuplicateObjectKeys() {
+  QList<std::pair<QString, Value>> members{
+      {QStringLiteral("a"), Value::makeNull()},
+      {QStringLiteral("a"), Value::makeBool(true)},
+  };
+  const Value obj = Value::makeObject(members);
+  auto bytes = obj.toJsonBytes();
+  QVERIFY(!bytes.has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsUndefinedValue() {
+  QVERIFY(!Value{}.toJsonBytes().has_value());
+  QList<std::pair<QString, Value>> members{{QStringLiteral("a"), Value{}}};
+  QVERIFY(!Value::makeObject(members).toJsonBytes().has_value());
+}
+
+void RawJsonTests::toJsonBytesEscapesInjectionAttemptsInStringsAndKeys() {
+  // A malicious value/key attempting to inject an extra key or break out
+  // of its string context must round-trip as a single string value/key,
+  // never as raw unescaped bytes.
+  QList<std::pair<QString, Value>> members{
+      {QStringLiteral("evil\"key"),
+       Value::makeString(QStringLiteral(R"(1,"evil":true)"))},
+  };
+  const Value obj = Value::makeObject(members);
+  auto bytes = obj.toJsonBytes();
+  QVERIFY(bytes.has_value());
+  auto reparsed = Value::parse(*bytes, u"test");
+  QVERIFY(reparsed.has_value());
+  QVERIFY(reparsed->isObject());
+  QCOMPARE(reparsed->keys().size(), 1);
+  QCOMPARE(reparsed->value("evil\"key"_L1).toString(),
+           QStringLiteral(R"(1,"evil":true)"));
+}
+
+void RawJsonTests::parseLimitsRejectsInputExceedingMaxInputBytes() {
+  ParseLimits limits;
+  limits.maxInputBytes = 4;
+  QVERIFY(Value::parse("1234", u"test", limits).has_value());
+  QVERIFY(!Value::parse("12345", u"test", limits).has_value());
+}
+
+void RawJsonTests::parseLimitsRejectsDepthExceedingMaxDepth() {
+  ParseLimits limits;
+  limits.maxDepth = 2;
+  QVERIFY(Value::parse("[[1]]", u"test", limits).has_value());
+  QVERIFY(!Value::parse("[[[1]]]", u"test", limits).has_value());
+}
+
+void RawJsonTests::parseLimitsRejectsStringExceedingMaxStringLength() {
+  ParseLimits limits;
+  limits.maxStringLength = 3;
+  QVERIFY(Value::parse(R"("abc")", u"test", limits).has_value());
+  QVERIFY(!Value::parse(R"("abcd")", u"test", limits).has_value());
+}
+
+void RawJsonTests::parseLimitsRejectsNumberExceedingMaxNumberDigits() {
+  ParseLimits limits;
+  limits.maxNumberDigits = 3;
+  QVERIFY(Value::parse("123", u"test", limits).has_value());
+  QVERIFY(!Value::parse("1234", u"test", limits).has_value());
+}
+
+void RawJsonTests::parseLimitsRejectsArrayExceedingMaxArrayElements() {
+  ParseLimits limits;
+  limits.maxArrayElements = 2;
+  QVERIFY(Value::parse("[1,2]", u"test", limits).has_value());
+  QVERIFY(!Value::parse("[1,2,3]", u"test", limits).has_value());
+}
+
+void RawJsonTests::parseLimitsRejectsObjectExceedingMaxObjectMembers() {
+  ParseLimits limits;
+  limits.maxObjectMembers = 1;
+  QVERIFY(Value::parse(R"({"a":1})", u"test", limits).has_value());
+  QVERIFY(!Value::parse(R"({"a":1,"b":2})", u"test", limits).has_value());
+}
+
+void RawJsonTests::parseLimitsRejectsTotalNodesExceedingMaxTotalNodes() {
+  ParseLimits limits;
+  limits.maxArrayElements = 100;
+  limits.maxTotalNodes = 3;
+  QVERIFY(Value::parse("[1,2]", u"test", limits).has_value());
+  QVERIFY(!Value::parse("[1,2,3]", u"test", limits).has_value());
+}
+
+void RawJsonTests::toJsonBytesRejectsDepthExceedingLimitOnProgrammaticAst() {
+  ParseLimits limits;
+  limits.maxDepth = 1;
+  const Value nested = Value::makeArray(
+      {Value::makeArray({Value::makeNumber(RawNumber::fromInt64(1))})});
+  QVERIFY(!nested.toJsonBytes(limits).has_value());
 }
 
 QTEST_APPLESS_MAIN(RawJsonTests)

@@ -48,8 +48,22 @@ enum class FieldPresence { Absent, Null, Present };
                                                     QStringView path);
 [[nodiscard]] ValueOrError<QString> requireStringValue(const QJsonValue &v,
                                                        QStringView path);
-[[nodiscard]] ValueOrError<int> requireIntValue(const QJsonValue &v,
-                                                QStringView path);
+// Decodes a JSON number as an exact 64-bit integer: rejects any value that
+// is not a JSON number at all, is not mathematically integral (a
+// fractional double, e.g. "1.5"), or does not fit qint64's range. Reads
+// the value via QJsonValue::toInteger() rather than
+// toDouble()+static_cast, so a value that reached this QJsonValue via
+// RawJson.h's Value::toQJson() int64-exact path (see that function's doc
+// comment) decodes to the identical qint64 -- including magnitudes no
+// double can represent exactly, e.g. 9223372036854775807. A QJsonValue
+// built directly from a double (as every contract-domain integer this
+// codebase's non-byte fromJson() entry points still decode, when not
+// reached via a fromRawBytes()-style raw-parse-first path) is exact only
+// within IEEE-754 double's integer-exact range (+-2^53); this is the most
+// fidelity obtainable from that representation, not a shortcut this
+// function takes for its own convenience.
+[[nodiscard]] ValueOrError<qint64> requireIntValue(const QJsonValue &v,
+                                                   QStringView path);
 [[nodiscard]] ValueOrError<bool> requireBoolValue(const QJsonValue &v,
                                                   QStringView path);
 
@@ -57,7 +71,7 @@ enum class FieldPresence { Absent, Null, Present };
 // the key is absent or the value has the wrong JSON type.
 [[nodiscard]] ValueOrError<QString>
 requireString(const QJsonObject &obj, QLatin1StringView key, QStringView path);
-[[nodiscard]] ValueOrError<int>
+[[nodiscard]] ValueOrError<qint64>
 requireInt(const QJsonObject &obj, QLatin1StringView key, QStringView path);
 [[nodiscard]] ValueOrError<bool>
 requireBool(const QJsonObject &obj, QLatin1StringView key, QStringView path);
@@ -88,7 +102,7 @@ requireObjectField(const QJsonObject &obj, QLatin1StringView key,
 // do not distinguish the two, not merely "this client doesn't care".
 [[nodiscard]] ValueOrError<std::optional<QString>>
 optionalString(const QJsonObject &obj, QLatin1StringView key, QStringView path);
-[[nodiscard]] ValueOrError<std::optional<int>>
+[[nodiscard]] ValueOrError<std::optional<qint64>>
 optionalInt(const QJsonObject &obj, QLatin1StringView key, QStringView path);
 [[nodiscard]] ValueOrError<std::optional<bool>>
 optionalBool(const QJsonObject &obj, QLatin1StringView key, QStringView path);
@@ -105,7 +119,7 @@ optionalBool(const QJsonObject &obj, QLatin1StringView key, QStringView path);
 [[nodiscard]] ValueOrError<std::optional<QString>>
 optionalNonNullString(const QJsonObject &obj, QLatin1StringView key,
                       QStringView path);
-[[nodiscard]] ValueOrError<std::optional<int>>
+[[nodiscard]] ValueOrError<std::optional<qint64>>
 optionalNonNullInt(const QJsonObject &obj, QLatin1StringView key,
                    QStringView path);
 [[nodiscard]] ValueOrError<std::optional<bool>>
@@ -120,7 +134,7 @@ optionalNonNullBool(const QJsonObject &obj, QLatin1StringView key,
 [[nodiscard]] ValueOrError<std::optional<QString>>
 requireNullableString(const QJsonObject &obj, QLatin1StringView key,
                       QStringView path);
-[[nodiscard]] ValueOrError<std::optional<int>>
+[[nodiscard]] ValueOrError<std::optional<qint64>>
 requireNullableInt(const QJsonObject &obj, QLatin1StringView key,
                    QStringView path);
 
@@ -208,22 +222,5 @@ template <typename Enum, std::size_t N>
   }
   Q_UNREACHABLE_RETURN(QString());
 }
-
-// Serializes `obj` to compact JSON bytes, then splices in `key: rawValue`
-// as an additional object member -- bypassing QJsonValue for that member's
-// value entirely, so a value QJsonValue cannot represent exactly (e.g. an
-// arbitrary-precision JSON number literal spliced in by a caller building
-// on RawJson.h) can still be encoded byte-exact. `key` itself is JSON
-// string-escaped before splicing (quotes/backslashes/control characters
-// are backslash-escaped; any byte outside printable ASCII is emitted as a
-// `\u00XX` escape, which is exact for QLatin1StringView since every
-// Latin-1 byte value is numerically identical to its Unicode code point)
-// -- callers are not required to pass a literal/pre-escaped key. `obj`
-// must not already contain `key`. `rawValueBytes` is trusted verbatim and
-// is the caller's responsibility to have already validated as syntactically
-// valid JSON (see e.g. RawJson.h's strict parser).
-[[nodiscard]] QByteArray spliceRawJsonMember(const QJsonObject &obj,
-                                             QLatin1StringView key,
-                                             QByteArrayView rawValueBytes);
 
 } // namespace Arkham::Json

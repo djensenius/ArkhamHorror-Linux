@@ -36,6 +36,7 @@ private slots:
   // game-lifecycle.json fixture entries ──────────────────────────────────────
   void decodesCreateGameFromFixture();
   void decodesCreateGameDefaultsFromFixture();
+  void createGameSupports64BitPlayerCount();
   void createGameDefaultsAndNullDefaultsDecodeIdentically();
   void decodesChooseDeckFromFixture();
   void decodesContinueWithoutUpgradeFromFixture();
@@ -85,6 +86,8 @@ private slots:
 
   // ClaimSeatRequest / ChooseDeckRequest ─────────────────────────────────────
   void chooseDeckWithDeckListRoundTrips();
+  void chooseDeckRawBytesPreserveExactNumericDeckIdAndSideSlots();
+  void chooseDeckRawBytesDistinguishAbsentAndNullDeckId();
   void claimSeatRoundTrips();
 };
 
@@ -390,6 +393,29 @@ void GamesTests::decodesCreateGameDefaultsFromFixture() {
   expected.insert(QStringLiteral("ultimatumsAndBoons"), QJsonArray{});
   expected.insert(QStringLiteral("achievementsEnabled"), true);
   QCOMPARE(reencoded, expected);
+}
+
+void GamesTests::createGameSupports64BitPlayerCount() {
+  const qint64 largePlayerCount = qint64{3000000000LL};
+  const QJsonObject obj{
+      {QStringLiteral("deckIds"), QJsonArray{}},
+      {QStringLiteral("playerCount"), QJsonValue(largePlayerCount)},
+      {QStringLiteral("campaignId"), QJsonValue()},
+      {QStringLiteral("scenarioId"), QStringLiteral("01104")},
+      {QStringLiteral("difficulty"), QStringLiteral("Easy")},
+      {QStringLiteral("campaignName"), QStringLiteral("X")},
+      {QStringLiteral("multiplayerVariant"), QStringLiteral("Solo")},
+      {QStringLiteral("includeTarotReadings"), false},
+      {QStringLiteral("options"), QJsonArray{}},
+  };
+
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->playerCount, largePlayerCount);
+  QCOMPARE(result->toJson().value(QStringLiteral("playerCount")).toInteger(),
+           largePlayerCount);
 }
 
 void GamesTests::createGameDefaultsAndNullDefaultsDecodeIdentically() {
@@ -970,6 +996,67 @@ void GamesTests::chooseDeckWithDeckListRoundTrips() {
   const QJsonObject reencoded = result->toJson();
   QVERIFY(reencoded.contains(QStringLiteral("deckList")));
   QVERIFY(reencoded.contains(QStringLiteral("deckUrl")));
+}
+
+void GamesTests::chooseDeckRawBytesPreserveExactNumericDeckIdAndSideSlots() {
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"investigatorId\":\"01001\",\"deckList\":{\"slots\":{\"01016\":2},"
+      "\"sideSlots\":[1e100],\"investigator_code\":\"01001\","
+      "\"id\":9007199254740993,\"name\":\"Huge deck\"}}");
+
+  const auto result = ChooseDeckRequest::fromRawBytes(bytes, u"chooseDeck");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(result->deckList.has_value());
+
+  const ExternalDeckId &id = result->deckList->id;
+  QCOMPARE(id.kind(), ExternalDeckId::Kind::Number);
+  QCOMPARE(id.number().literal(), QStringLiteral("9007199254740993"));
+  const auto exactId = id.number().toExactInt64();
+  QVERIFY(exactId.has_value());
+  QCOMPARE(*exactId, qint64{9007199254740993LL});
+
+  QVERIFY(result->deckList->sideSlots.isArray());
+  QCOMPARE(result->deckList->sideSlots.toArray().size(), 1);
+  QCOMPARE(result->deckList->sideSlots.toArray().at(0).toRawNumber().literal(),
+           QStringLiteral("1e100"));
+
+  const auto encoded = result->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, bytes);
+}
+
+void GamesTests::chooseDeckRawBytesDistinguishAbsentAndNullDeckId() {
+  const QByteArray nullIdBytes = QByteArrayLiteral(
+      "{\"investigatorId\":\"01001\",\"deckList\":{\"slots\":{},"
+      "\"investigator_code\":\"01001\",\"id\":null}}");
+  const QByteArray absentIdBytes = QByteArrayLiteral(
+      "{\"investigatorId\":\"01001\",\"deckList\":{\"slots\":{},"
+      "\"investigator_code\":\"01001\"}}");
+
+  const auto nullIdResult =
+      ChooseDeckRequest::fromRawBytes(nullIdBytes, u"chooseDeck");
+  const auto absentIdResult =
+      ChooseDeckRequest::fromRawBytes(absentIdBytes, u"chooseDeck");
+  if (!nullIdResult)
+    QFAIL(qPrintable(nullIdResult.error()));
+  if (!absentIdResult)
+    QFAIL(qPrintable(absentIdResult.error()));
+
+  QVERIFY(nullIdResult->deckList.has_value());
+  QVERIFY(absentIdResult->deckList.has_value());
+  QCOMPARE(nullIdResult->deckList->id.kind(), ExternalDeckId::Kind::Null);
+  QCOMPARE(absentIdResult->deckList->id.kind(), ExternalDeckId::Kind::Absent);
+
+  const auto encodedNullId = nullIdResult->toJsonBytes();
+  const auto encodedAbsentId = absentIdResult->toJsonBytes();
+  if (!encodedNullId)
+    QFAIL(qPrintable(encodedNullId.error()));
+  if (!encodedAbsentId)
+    QFAIL(qPrintable(encodedAbsentId.error()));
+  QCOMPARE(*encodedNullId, nullIdBytes);
+  QCOMPARE(*encodedAbsentId, absentIdBytes);
 }
 
 void GamesTests::claimSeatRoundTrips() {

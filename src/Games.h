@@ -492,7 +492,7 @@ private:
 // the key when unset).
 struct CreateGameRequest {
   QList<std::optional<QUuid>> deckIds;
-  int playerCount{};
+  qint64 playerCount{};
   CampaignOrScenario campaignOrScenario;
   Difficulty difficulty{};
   QString campaignName;
@@ -531,7 +531,7 @@ struct ChooseDeckRequest {
   [[nodiscard]] QJsonObject toJson() const;
   // Precision-preserving equivalent of toJson(); see
   // DeckListInput::toJsonBytes().
-  [[nodiscard]] QByteArray toJsonBytes() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const ChooseDeckRequest &,
                          const ChooseDeckRequest &) = default;

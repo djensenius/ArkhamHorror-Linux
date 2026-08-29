@@ -42,16 +42,17 @@ private slots:
   void externalIdFromRawBytesPreservesLongDecimalExactly();
   void externalIdFromRawBytesPreservesHugeExponentExactly();
   void externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly();
-  void toJsonBytesRejectsInvalidNumberLiteralInsteadOfSplicingItRaw();
-  void toJsonBytesRejectsInjectionAttemptInNumberLiteral();
-  void spliceRawJsonMemberEscapesQuotesAndBackslashesInKey();
-  void spliceRawJsonMemberEscapesControlAndNonAsciiBytesInKey();
+  void externalIdFromRawBytesRejectsMalformedNumberLiteral();
+  void toJsonBytesEscapesInjectionAttemptInStringValue();
+  void rawJsonObjectBuilderEscapesQuotesAndBackslashesInKey();
+  void rawJsonObjectBuilderEscapesControlCharactersAndUtf8InKey();
   void createDeckRequestFromRawBytesPreservesEveryIdVariantExactly();
 
   // sideSlots malformed/absent behavior ──────────────────────────────────────
   void sideSlotsAbsentStaysUndefinedNotEmptyMap();
   void sideSlotsMalformedArrayPreservedVerbatim();
   void sideSlotsAlreadyNormalizedMapDistinguishableFromMalformed();
+  void sideSlotsNormalizedLookingMalformedObjectPreservedVerbatim();
 
   // Quantity map keys ────────────────────────────────────────────────────────
   void inputQuantityMapAcceptsAnyNonEmptyKey();
@@ -101,6 +102,16 @@ QJsonObject withoutKey(QJsonObject obj, QLatin1StringView key) {
   return obj;
 }
 
+Json::Value objectMember(const Json::Value &obj, const QString &key) {
+  if (!obj.isObject())
+    return {};
+  for (const auto &[memberKey, memberValue] : obj.members()) {
+    if (memberKey == key)
+      return memberValue;
+  }
+  return {};
+}
+
 } // namespace
 
 void DecksTests::decodesCreateDeckRequestFromFixture() {
@@ -119,14 +130,14 @@ void DecksTests::decodesCreateDeckRequestFromFixture() {
   QCOMPARE(result->deckList.cardSlots.size(), 2);
   QCOMPARE(result->deckList.cardSlots.value(QStringLiteral("01016")), 2);
   QCOMPARE(result->deckList.investigatorCode.value(), QStringLiteral("01001"));
-  QCOMPARE(result->deckList.id.tag, ExternalDeckIdTag::Number);
-  // Decoded via fromJson(), so Qt's own QJsonDocument::fromJson() has
-  // already rounded the fixture's literal "id": 4242 through a double
-  // before this type ever saw it -- numberLiteral is the best-effort
-  // reconstruction of that (already-lossy) double; see
-  // createDeckRequestFromRawBytesPreservesEveryIdVariantExactly()
-  // below for the genuinely lossless entry point.
-  QCOMPARE(result->deckList.id.numberLiteral, QStringLiteral("4242.0"));
+  QCOMPARE(result->deckList.id.kind(), ExternalDeckId::Kind::Number);
+  // Decoded via fromJson(), so this is only as precise as Qt's parsed
+  // QJsonValue -- but for a plain integral value like 4242, the new
+  // ExternalDeckId path reconstructs the canonical bare-integer literal
+  // instead of the old lossy "4242.0" scientificShow text. See
+  // createDeckRequestFromRawBytesPreservesEveryIdVariantExactly() below
+  // for the genuinely byte-exact raw parser entry point.
+  QCOMPARE(result->deckList.id.number().literal(), QStringLiteral("4242"));
   // sideSlots is `[]` on the wire -- a malformed/legacy shape, preserved
   // verbatim rather than coerced into an already-normalized empty map.
   QVERIFY(result->deckList.sideSlots.isArray());
@@ -164,8 +175,8 @@ void DecksTests::decodesValidateDeckListInputFromFixture() {
   const auto result = DeckListInput::fromJson(v, u"validateDeckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.numberLiteral, QStringLiteral("4242.0"));
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Number);
+  QCOMPARE(result->id.number().literal(), QStringLiteral("4242"));
   // "externalField" is present in the fixture but not modeled -- must decode
   // safely and never reappear on re-encode. "taboo_id" is present as an
   // explicit JSON null in the fixture; DeckListInput collapses absent/null
@@ -204,7 +215,7 @@ void DecksTests::decodesDeckFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.value(),
            QStringLiteral("00000000-0000-0000-0000-000000000017"));
-  QCOMPARE(result->userId, 7);
+  QCOMPARE(result->userId, qint64(7));
   QCOMPARE(result->name, QStringLiteral("Contract deck"));
   QCOMPARE(result->investigatorName, QStringLiteral("Roland Banks"));
   QCOMPARE(result->list.investigatorCode.value(), QStringLiteral("c01001"));
@@ -256,7 +267,7 @@ void DecksTests::externalIdAbsentPreserved() {
   const auto result = DeckListInput::fromJson(obj, u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Absent);
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Absent);
   // Omitted on re-encode -- never fabricates a null/zero id.
   QVERIFY(!result->toJson().contains(QStringLiteral("id")));
 }
@@ -270,7 +281,7 @@ void DecksTests::externalIdExplicitNullPreserved() {
   const auto result = DeckListInput::fromJson(obj, u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Null);
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Null);
   QVERIFY(result->toJson().value(QStringLiteral("id")).isNull());
 }
 
@@ -283,21 +294,17 @@ void DecksTests::externalIdStringPreserved() {
   const auto result = DeckListInput::fromJson(obj, u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Text);
-  QCOMPARE(result->id.text, QStringLiteral("external-9999"));
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Text);
+  QCOMPARE(result->id.text(), QStringLiteral("external-9999"));
   QCOMPARE(result->toJson().value(QStringLiteral("id")).toString(),
            QStringLiteral("external-9999"));
 }
 
 void DecksTests::externalIdLargeIntegerPreservedWithoutPrecisionLoss() {
-  // 2^53 + 1 == 9007199254740993 cannot be exactly represented as a double
-  // (Qt's JSON storage) -- this proves the client preserves whatever value
-  // Qt's parser itself already gave it (no *additional* client-side
-  // precision loss on top of what Qt's JSON layer already does), rather
-  // than rounding again via e.g. an intermediate int64 conversion. This
-  // exercises fromJson() specifically -- see
-  // externalIdFromRawBytesPreservesLargeIntegerExactly() below for the
-  // entry point that avoids the double-rounding altogether.
+  // fromJson() can preserve only the already-parsed QJsonValue it is given.
+  // For an integral double like 2^53, the new path reconstructs the
+  // canonical integer literal from that QJsonValue rather than formatting a
+  // lossy "scientificShow" string with a forced trailing ".0".
   const double large = 9007199254740992.0; // 2^53, exactly representable.
   const QJsonObject obj{
       {QStringLiteral("slots"), QJsonObject{}},
@@ -307,8 +314,11 @@ void DecksTests::externalIdLargeIntegerPreservedWithoutPrecisionLoss() {
   const auto result = DeckListInput::fromJson(obj, u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.numberLiteral, *Json::scientificShow(large, u"test"));
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Number);
+  QCOMPARE(result->id.number().literal(), QStringLiteral("9007199254740992"));
+  const auto exact = result->id.number().toExactInt64();
+  QVERIFY(exact.has_value());
+  QCOMPARE(*exact, qint64(9007199254740992LL));
   QCOMPARE(result->toJson().value(QStringLiteral("id")).toDouble(), large);
 }
 
@@ -321,8 +331,9 @@ void DecksTests::externalIdDecimalPreserved() {
   const auto result = DeckListInput::fromJson(obj, u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.numberLiteral, *Json::scientificShow(42.5, u"test"));
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Number);
+  QCOMPARE(result->id.number().literal(), QStringLiteral("42.5"));
+  QVERIFY(!result->id.number().toExactInt64().has_value());
   QCOMPARE(result->toJson().value(QStringLiteral("id")).toDouble(), 42.5);
 }
 
@@ -353,8 +364,11 @@ void DecksTests::externalIdFromRawBytesPreservesLargeIntegerExactly() {
       u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.numberLiteral, QStringLiteral("9007199254740993"));
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Number);
+  QCOMPARE(result->id.number().literal(), QStringLiteral("9007199254740993"));
+  const auto exact = result->id.number().toExactInt64();
+  QVERIFY(exact.has_value());
+  QCOMPARE(*exact, qint64(9007199254740993LL));
 }
 
 void DecksTests::externalIdFromRawBytesPreservesLongDecimalExactly() {
@@ -364,9 +378,10 @@ void DecksTests::externalIdFromRawBytesPreservesLongDecimalExactly() {
                                   u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.numberLiteral,
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Number);
+  QCOMPARE(result->id.number().literal(),
            QStringLiteral("1.123456789012345678901234567890"));
+  QVERIFY(!result->id.number().toExactInt64().has_value());
 }
 
 void DecksTests::externalIdFromRawBytesPreservesHugeExponentExactly() {
@@ -374,8 +389,9 @@ void DecksTests::externalIdFromRawBytesPreservesHugeExponentExactly() {
       R"({"slots":{},"investigator_code":"01001","id":1e128})", u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->id.tag, ExternalDeckIdTag::Number);
-  QCOMPARE(result->id.numberLiteral, QStringLiteral("1e128"));
+  QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Number);
+  QCOMPARE(result->id.number().literal(), QStringLiteral("1e128"));
+  QVERIFY(!result->id.number().toExactInt64().has_value());
 }
 
 void DecksTests::externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly() {
@@ -384,11 +400,13 @@ void DecksTests::externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly() {
       u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const QByteArray reencoded = result->toJsonBytes();
+  const auto reencoded = result->toJsonBytes();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
   // Byte-level splice must have written the exact literal, not a
   // double-rounded approximation -- re-parsing it through the same
   // canonical parser must recover the identical literal.
-  auto reparsed = Json::Value::parse(reencoded, u"reencoded");
+  auto reparsed = Json::Value::parse(*reencoded, u"reencoded");
   if (!reparsed)
     QFAIL(qPrintable(reparsed.error()));
   QVERIFY(reparsed->isObject());
@@ -397,118 +415,124 @@ void DecksTests::externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly() {
            QStringLiteral("9007199254740993"));
 }
 
-void DecksTests::
-    toJsonBytesRejectsInvalidNumberLiteralInsteadOfSplicingItRaw() {
-  // ExternalDeckId::numberLiteral is a public field; nothing at the type
-  // level stops a caller from setting it to non-number text. toJsonBytes()
-  // must not splice that text into the output verbatim -- it must fall
-  // back to the ordinary (lossy but always valid) QJsonDocument-based
-  // encoding instead of producing malformed JSON.
-  DeckListInput input{
-      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
-      .id = ExternalDeckId{.tag = ExternalDeckIdTag::Number,
-                           .numberLiteral = QStringLiteral("not-a-number")},
+void DecksTests::externalIdFromRawBytesRejectsMalformedNumberLiteral() {
+  // A malformed number literal can never become a Number-kind ExternalDeckId:
+  // the raw parser rejects it before DeckListInput is constructed, with no
+  // fallback to 0, stringification, or any other substitute value.
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001","id":1.})", u"deckList");
+  QVERIFY(!result.has_value());
+  QVERIFY2(
+      result.error().contains(QStringLiteral("expected a digit after '.'")),
+      qPrintable(result.error()));
+}
+
+void DecksTests::toJsonBytesEscapesInjectionAttemptInStringValue() {
+  const QString maliciousDeckName =
+      QStringLiteral(R"(Contract deck","evil":true,"x)");
+  const QString maliciousListName =
+      QStringLiteral(R"(Nested deck","evil":true,"x)");
+
+  CreateDeckRequest input{
+      .deckId = QStringLiteral("external-4242"),
+      .deckName = maliciousDeckName,
+      .deckList =
+          DeckListInput{
+              .investigatorCode =
+                  *InvestigatorRef::parse(QStringLiteral("01001")),
+              .name = maliciousListName,
+          },
   };
-  const QByteArray reencoded = input.toJsonBytes();
-  auto reparsed = Json::Value::parse(reencoded, u"reencoded");
+  const auto reencoded = input.toJsonBytes();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  auto reparsed = Json::Value::parse(*reencoded, u"reencoded");
   if (!reparsed)
     QFAIL(qPrintable(QStringLiteral("toJsonBytes() produced invalid JSON: %1")
                          .arg(reparsed.error())));
   QVERIFY(reparsed->isObject());
-  // The fallback path never spliced the literal text in at all -- the
-  // invalid string must not appear anywhere in the output bytes.
-  QVERIFY(!reencoded.contains("not-a-number"));
+  QCOMPARE(reparsed->value("deckName"_L1).toString(), maliciousDeckName);
+  QVERIFY(!reparsed->contains("evil"_L1));
+
+  const Json::Value deckList = reparsed->value("deckList"_L1);
+  QVERIFY(deckList.isObject());
+  QCOMPARE(deckList.value("name"_L1).toString(), maliciousListName);
+  QVERIFY(!deckList.contains("evil"_L1));
 }
 
-void DecksTests::toJsonBytesRejectsInjectionAttemptInNumberLiteral() {
-  // A numberLiteral crafted to look like "a number followed by extra JSON
-  // tokens" must not be able to inject an additional key into the
-  // spliced output -- it must be rejected as invalid (it is not, in
-  // isolation, a single valid JSON number document) and fall back to the
-  // safe encoding instead.
-  DeckListInput input{
-      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
-      .id = ExternalDeckId{.tag = ExternalDeckIdTag::Number,
-                           .numberLiteral = QStringLiteral("1,\"evil\":true")},
-  };
-  const QByteArray reencoded = input.toJsonBytes();
-  auto reparsed = Json::Value::parse(reencoded, u"reencoded");
+void DecksTests::rawJsonObjectBuilderEscapesQuotesAndBackslashesInKey() {
+  const QString maliciousKey = QStringLiteral(R"("evil":true,"x\y)");
+  const Json::Value obj = Json::Value::makeObject(
+      {{QStringLiteral("existing"),
+        Json::Value::makeNumber(Json::RawNumber::fromInt64(1))},
+       {maliciousKey,
+        Json::Value::makeNumber(Json::RawNumber::fromInt64(42))}});
+  const auto bytes = obj.toJsonBytes();
+  if (!bytes)
+    QFAIL(qPrintable(bytes.error()));
+  auto reparsed = Json::Value::parse(*bytes, u"reencoded");
   if (!reparsed)
-    QFAIL(qPrintable(QStringLiteral("toJsonBytes() produced invalid JSON: %1")
+    QFAIL(qPrintable(QStringLiteral("Json::Value::toJsonBytes() produced "
+                                    "invalid JSON: %1")
                          .arg(reparsed.error())));
   QVERIFY(reparsed->isObject());
+  QCOMPARE(reparsed->keys().size(), 2);
   QVERIFY(!reparsed->contains("evil"_L1));
-  QVERIFY(!reencoded.contains("evil"));
-}
-
-void DecksTests::spliceRawJsonMemberEscapesQuotesAndBackslashesInKey() {
-  // spliceRawJsonMember() is a public, reusable helper -- it must not
-  // trust its `key` argument to already be a syntactically-safe JSON
-  // string. A key containing an embedded quote or backslash must be
-  // escaped rather than splicing those bytes in raw (which would either
-  // terminate the key string early, corrupting the object, or attach
-  // meaning to the following bytes as escape sequences).
-  const QJsonObject obj{{QStringLiteral("existing"), 1}};
-  const QByteArray bytes =
-      Json::spliceRawJsonMember(obj, R"("evil":true,"x)"_L1, "42");
-  auto reparsed = Json::Value::parse(bytes, u"reencoded");
-  if (!reparsed)
-    QFAIL(qPrintable(QStringLiteral("spliceRawJsonMember() produced invalid "
-                                    "JSON: %1")
-                         .arg(reparsed.error())));
-  QVERIFY(reparsed->isObject());
-  // The escaped key round-trips as a single member whose *value* is 42 --
-  // not as an injected top-level "evil" member.
-  QVERIFY(!reparsed->contains("evil"_L1));
-  QCOMPARE(reparsed->value(R"("evil":true,"x)"_L1).toRawNumber().literal(),
+  QCOMPARE(objectMember(*reparsed, maliciousKey).toRawNumber().literal(),
            QStringLiteral("42"));
 }
 
-void DecksTests::spliceRawJsonMemberEscapesControlAndNonAsciiBytesInKey() {
-  // A key containing a raw newline or a Latin-1 byte above ASCII must
-  // still produce valid, well-formed UTF-8 JSON bytes: both must be
-  // \u-escaped rather than emitted verbatim.
-  const QJsonObject obj;
-  const QByteArray bytes =
-      Json::spliceRawJsonMember(obj, QLatin1StringView("line\nbreak"), "1");
-  auto reparsed = Json::Value::parse(bytes, u"reencoded");
+void DecksTests::rawJsonObjectBuilderEscapesControlCharactersAndUtf8InKey() {
+  const QString key = QStringLiteral("line\nbreak☃");
+  const Json::Value obj = Json::Value::makeObject(
+      {{key, Json::Value::makeNumber(Json::RawNumber::fromInt64(1))}});
+  const auto bytes = obj.toJsonBytes();
+  if (!bytes)
+    QFAIL(qPrintable(bytes.error()));
+  auto reparsed = Json::Value::parse(*bytes, u"reencoded");
   if (!reparsed)
-    QFAIL(qPrintable(QStringLiteral("spliceRawJsonMember() produced invalid "
-                                    "JSON: %1")
+    QFAIL(qPrintable(QStringLiteral("Json::Value::toJsonBytes() produced "
+                                    "invalid JSON: %1")
                          .arg(reparsed.error())));
   QVERIFY(reparsed->isObject());
-  QCOMPARE(reparsed->value("line\nbreak"_L1).toRawNumber().literal(),
+  QCOMPARE(reparsed->keys(), QStringList{key});
+  QCOMPARE(objectMember(*reparsed, key).toRawNumber().literal(),
            QStringLiteral("1"));
   // The raw control byte must not appear unescaped in the output bytes.
-  QVERIFY(!bytes.contains('\n'));
+  QVERIFY(!bytes->contains('\n'));
 }
 
 void DecksTests::createDeckRequestFromRawBytesPreservesEveryIdVariantExactly() {
   struct Case {
     QByteArray bytes;
-    ExternalDeckIdTag tag;
+    ExternalDeckId::Kind kind;
     QString expectedNumberLiteral;
     QString expectedText;
   };
-  const std::array<Case, 4> cases{
+  const std::array<Case, 5> cases{
       Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
            R"("investigator_code":"01001","id":9007199254740993}})",
-           ExternalDeckIdTag::Number,
+           ExternalDeckId::Kind::Number,
            QStringLiteral("9007199254740993"),
            {}},
       Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
            R"("investigator_code":"01001","id":42.5}})",
-           ExternalDeckIdTag::Number,
+           ExternalDeckId::Kind::Number,
            QStringLiteral("42.5"),
            {}},
       Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
            R"("investigator_code":"01001","id":"external-9999"}})",
-           ExternalDeckIdTag::Text,
+           ExternalDeckId::Kind::Text,
            {},
            QStringLiteral("external-9999")},
       Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
            R"("investigator_code":"01001","id":null}})",
-           ExternalDeckIdTag::Null,
+           ExternalDeckId::Kind::Null,
+           {},
+           {}},
+      Case{R"({"deckId":"d","deckName":"n","deckList":{"slots":{},)"
+           R"("investigator_code":"01001"}})",
+           ExternalDeckId::Kind::Absent,
            {},
            {}},
   };
@@ -516,55 +540,110 @@ void DecksTests::createDeckRequestFromRawBytesPreservesEveryIdVariantExactly() {
     const auto result = CreateDeckRequest::fromRawBytes(c.bytes, u"createDeck");
     if (!result)
       QFAIL(qPrintable(result.error()));
-    QCOMPARE(result->deckList.id.tag, c.tag);
-    if (c.tag == ExternalDeckIdTag::Number)
-      QCOMPARE(result->deckList.id.numberLiteral, c.expectedNumberLiteral);
-    if (c.tag == ExternalDeckIdTag::Text)
-      QCOMPARE(result->deckList.id.text, c.expectedText);
+    QCOMPARE(result->deckList.id.kind(), c.kind);
+    if (c.kind == ExternalDeckId::Kind::Number) {
+      QCOMPARE(result->deckList.id.number().literal(), c.expectedNumberLiteral);
+      if (const auto exact = result->deckList.id.number().toExactInt64();
+          exact.has_value()) {
+        QCOMPARE(*exact, qint64(9007199254740993LL));
+      }
+    }
+    if (c.kind == ExternalDeckId::Kind::Text)
+      QCOMPARE(result->deckList.id.text(), c.expectedText);
+
+    const auto reencoded = result->toJsonBytes();
+    if (!reencoded)
+      QFAIL(qPrintable(reencoded.error()));
+    auto reparsed = Json::Value::parse(*reencoded, u"reencoded");
+    if (!reparsed)
+      QFAIL(qPrintable(reparsed.error()));
+    const Json::Value deckList = reparsed->value("deckList"_L1);
+    QVERIFY(deckList.isObject());
+    if (c.kind == ExternalDeckId::Kind::Absent) {
+      QVERIFY(!deckList.contains("id"_L1));
+    } else if (c.kind == ExternalDeckId::Kind::Null) {
+      QVERIFY(deckList.value("id"_L1).isNull());
+    } else if (c.kind == ExternalDeckId::Kind::Text) {
+      QCOMPARE(deckList.value("id"_L1).toString(), c.expectedText);
+    } else {
+      QCOMPARE(deckList.value("id"_L1).toRawNumber().literal(),
+               c.expectedNumberLiteral);
+    }
   }
 }
 
 void DecksTests::sideSlotsAbsentStaysUndefinedNotEmptyMap() {
-  const QJsonObject obj{
-      {QStringLiteral("slots"), QJsonObject{}},
-      {QStringLiteral("investigator_code"), QStringLiteral("01001")},
-  };
-  const auto result = DeckListInput::fromJson(obj, u"deckList");
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001"})", u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->sideSlots.isUndefined());
   QVERIFY(!result->toJson().contains(QStringLiteral("sideSlots")));
+  const auto reencoded = result->toJsonBytes();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  auto reparsed = Json::Value::parse(*reencoded, u"reencoded");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  QVERIFY(!reparsed->contains("sideSlots"_L1));
 }
 
 void DecksTests::sideSlotsMalformedArrayPreservedVerbatim() {
   // The fixture's own createDeck.deckList.sideSlots is `[]` -- a legacy
   // array shape, not an already-normalized map. Preserving it verbatim
   // (rather than coercing to {}) means a caller can tell the two apart.
-  const QJsonObject obj{
-      {QStringLiteral("slots"), QJsonObject{}},
-      {QStringLiteral("investigator_code"), QStringLiteral("01001")},
-      {QStringLiteral("sideSlots"), QJsonArray{}},
-  };
-  const auto result = DeckListInput::fromJson(obj, u"deckList");
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001","sideSlots":[]})",
+      u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->sideSlots.isArray());
   QVERIFY(!result->sideSlots.isObject());
+  QCOMPARE(result->sideSlots.toArray().size(), 0);
 }
 
 void DecksTests::sideSlotsAlreadyNormalizedMapDistinguishableFromMalformed() {
-  const QJsonObject obj{
-      {QStringLiteral("slots"), QJsonObject{}},
-      {QStringLiteral("investigator_code"), QStringLiteral("01001")},
-      {QStringLiteral("sideSlots"), QJsonObject{{QStringLiteral("c00001"), 2}}},
-  };
-  const auto result = DeckListInput::fromJson(obj, u"deckList");
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001","sideSlots":{"c00001":2}})",
+      u"deckList");
   if (!result)
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->sideSlots.isObject());
   QVERIFY(!result->sideSlots.isArray());
-  QCOMPARE(result->sideSlots.toObject().value(QStringLiteral("c00001")).toInt(),
-           2);
+  const Json::Value entry = result->sideSlots.value("c00001"_L1);
+  QVERIFY(entry.isNumber());
+  const auto quantity = entry.toRawNumber().toExactInt64();
+  QVERIFY(quantity.has_value());
+  QCOMPARE(*quantity, qint64(2));
+}
+
+void DecksTests::sideSlotsNormalizedLookingMalformedObjectPreservedVerbatim() {
+  // Keys that *look* normalized (valid CardCode text) still must not trigger
+  // silent coercion if the values are not the normalized quantity-map shape.
+  const auto result = DeckListInput::fromRawBytes(
+      R"({"slots":{},"investigator_code":"01001","sideSlots":{"c00001":[9007199254740993]}})",
+      u"deckList");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(result->sideSlots.isObject());
+  const Json::Value nested = result->sideSlots.value("c00001"_L1);
+  QVERIFY(nested.isArray());
+  QCOMPARE(nested.toArray().size(), 1);
+  QVERIFY(nested.toArray().at(0).isNumber());
+  QCOMPARE(nested.toArray().at(0).toRawNumber().literal(),
+           QStringLiteral("9007199254740993"));
+
+  const auto reencoded = result->toJsonBytes();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  auto reparsed = Json::Value::parse(*reencoded, u"reencoded");
+  if (!reparsed)
+    QFAIL(qPrintable(reparsed.error()));
+  const Json::Value sideSlots = reparsed->value("sideSlots"_L1);
+  QVERIFY(sideSlots.isObject());
+  QVERIFY(sideSlots.value("c00001"_L1).isArray());
+  QCOMPARE(sideSlots.value("c00001"_L1).toArray().at(0).toRawNumber().literal(),
+           QStringLiteral("9007199254740993"));
 }
 
 void DecksTests::inputQuantityMapAcceptsAnyNonEmptyKey() {

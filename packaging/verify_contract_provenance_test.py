@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Unit tests for packaging/verify_contract_provenance.py's closure
+discovery and verify() logic, using an in-memory FakeTree instead of a
+real network fetch (fast, deterministic, no external dependency) plus a
+scratch local "working tree" written under build/ (never /tmp) so file
+existence/symlink/mode checks are exercised against real filesystem
+objects rather than mocks.
+
+Run directly: `python3 packaging/verify_contract_provenance_test.py`
+"""
+
+from __future__ import annotations
+
+import shutil
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import verify_contract_provenance as vcp
+
+
+class FakeTree(vcp.GitTree):
+    """An in-memory GitTree: a fixed {path: bytes} table plus a mode/type
+    override table, standing in for a real pinned backend commit."""
+
+    def __init__(self, blobs: dict[str, bytes], modes: dict[str, tuple[str, str]] | None = None) -> None:
+        self._blobs = blobs
+        self._modes = modes or {}
+
+    def blob_bytes(self, path: str) -> bytes:
+        return self._blobs[path]
+
+    def ls_tree(self, path: str):
+        if path not in self._blobs:
+            return None
+        return self._modes.get(path, ("100644", "blob"))
+
+
+CATALOG_SCHEMA = b'{"$defs": {"cardCost": {"$ref": "#/$defs/nested"}}}'
+DECKS_SCHEMA = b'{"$defs": {"deckList": {}}}'
+MANIFEST = (
+    b'{"fixtures": ['
+    b'{"path": "contracts/fixtures/catalog.json", "schema": "contracts/schemas/catalog.schema.json"},'
+    b'{"path": "contracts/fixtures/decks.json", "schema": "contracts/schemas/decks.schema.json"},'
+    b'{"path": "contracts/fixtures/account.json", "schema": "contracts/schemas/account.schema.json"}'
+    b']}'
+)
+CAPABILITIES = b'{"schemaRevision": "0.1.12"}'
+CATALOG_FIXTURE = b'{"cards": []}'
+DECKS_FIXTURE = b'{"decks": []}'
+
+
+def _baseline_blobs() -> dict[str, bytes]:
+    return {
+        "contracts/schemas/catalog.schema.json": CATALOG_SCHEMA,
+        "contracts/schemas/decks.schema.json": DECKS_SCHEMA,
+        "contracts/schemas/game-lifecycle.schema.json": b"{}",
+        "contracts/schemas/game-list.schema.json": b"{}",
+        "contracts/schemas/game-state.schema.json": b"{}",
+        "contracts/manifest.json": MANIFEST,
+        "contracts/fixtures/capabilities.json": CAPABILITIES,
+        "contracts/fixtures/catalog.json": CATALOG_FIXTURE,
+        "contracts/fixtures/decks.json": DECKS_FIXTURE,
+    }
+
+
+class ClosureTests(unittest.TestCase):
+    def test_governed_paths_includes_roots_and_manifest_derived_fixtures(self):
+        tree = FakeTree(_baseline_blobs())
+        governed = vcp.compute_governed_paths(tree)
+        self.assertIn("contracts/schemas/catalog.schema.json", governed)
+        self.assertIn("contracts/manifest.json", governed)
+        self.assertIn("contracts/fixtures/capabilities.json", governed)
+        self.assertIn("contracts/fixtures/catalog.json", governed)
+        self.assertIn("contracts/fixtures/decks.json", governed)
+        # account.json's schema (account.schema.json) is not in the
+        # ROOT_SCHEMAS closure, so it must NOT be pulled in.
+        self.assertNotIn("contracts/fixtures/account.json", governed)
+
+    def test_omitted_referenced_schema_raises(self):
+        # catalog.schema.json's $ref points at a schema that is never
+        # actually present in the backend tree -- this must be a hard
+        # failure, not a silently-skipped dependency.
+        blobs = _baseline_blobs()
+        blobs["contracts/schemas/catalog.schema.json"] = (
+            b'{"$defs": {"x": {"$ref": "missing.schema.json#/$defs/y"}}}'
+        )
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_ref_path_traversal_escape_rejected(self):
+        blobs = _baseline_blobs()
+        blobs["contracts/schemas/catalog.schema.json"] = (
+            b'{"$defs": {"x": {"$ref": "../../etc/passwd#/$defs/y"}}}'
+        )
+        tree = FakeTree(blobs)
+        with self.assertRaises(vcp.RefEscapeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_ref_absolute_path_escape_rejected(self):
+        blobs = _baseline_blobs()
+        blobs["contracts/schemas/catalog.schema.json"] = (
+            b'{"$defs": {"x": {"$ref": "/etc/passwd#/$defs/y"}}}'
+        )
+        tree = FakeTree(blobs)
+        with self.assertRaises(vcp.RefEscapeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_same_document_fragment_ref_is_not_a_file_dependency(self):
+        tree = FakeTree(_baseline_blobs())
+        # CATALOG_SCHEMA's only $ref is "#/$defs/nested" (same document);
+        # closure must not try to fetch a file for it.
+        closure = vcp.compute_schema_closure(tree, ["contracts/schemas/catalog.schema.json"])
+        self.assertEqual(list(closure), ["contracts/schemas/catalog.schema.json"])
+
+
+class VerifyTests(unittest.TestCase):
+    def setUp(self):
+        self._scratch = Path(__file__).resolve().parent.parent / "build" / "provenance-test-scratch"
+        if self._scratch.exists():
+            shutil.rmtree(self._scratch)
+        self._scratch.mkdir(parents=True)
+        for rel, data in _baseline_blobs().items():
+            local = self._scratch / rel
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(data)
+
+    def tearDown(self):
+        shutil.rmtree(self._scratch, ignore_errors=True)
+
+    def test_matching_tree_has_no_failures(self):
+        tree = FakeTree(_baseline_blobs())
+        failures = vcp.verify(tree, self._scratch)
+        self.assertEqual(failures, [])
+
+    def test_altered_bytes_detected(self):
+        tree = FakeTree(_baseline_blobs())
+        (self._scratch / "contracts/fixtures/catalog.json").write_bytes(b'{"cards": ["tampered"]}')
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(any("do NOT match" in f for f in failures))
+
+    def test_missing_file_detected(self):
+        tree = FakeTree(_baseline_blobs())
+        (self._scratch / "contracts/fixtures/decks.json").unlink()
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(any("is missing" in f for f in failures))
+
+    def test_symlink_to_byte_identical_file_rejected(self):
+        # A symlink whose TARGET has byte-identical content must still be
+        # rejected: byte equality alone is not sufficient provenance.
+        tree = FakeTree(_baseline_blobs())
+        real = self._scratch / "contracts/fixtures/catalog-real.json"
+        real.write_bytes(CATALOG_FIXTURE)
+        link = self._scratch / "contracts/fixtures/catalog.json"
+        link.unlink()
+        link.symlink_to(real)
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(any("symlink" in f for f in failures))
+
+    def test_wrong_backend_mode_detected(self):
+        blobs = _baseline_blobs()
+        tree = FakeTree(
+            blobs,
+            modes={"contracts/fixtures/catalog.json": ("100755", "blob")},
+        )
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(any("expected a plain non-executable blob" in f for f in failures))
+
+    def test_added_unregistered_governed_file_detected(self):
+        tree = FakeTree(_baseline_blobs())
+        extra = self._scratch / "contracts/schemas/mystery.schema.json"
+        extra.write_bytes(b"{}")
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(any("mystery.schema.json" in f and "not reachable" in f for f in failures))
+
+    def test_stale_contract_pin_digest_flagged(self):
+        tree = FakeTree(_baseline_blobs())
+        stale_digests = {"contracts/fixtures/catalog.json": "0" * 64}
+        failures = vcp.verify(tree, self._scratch, governed_digests=stale_digests)
+        self.assertTrue(any("ContractPin.cpp is stale" in f for f in failures))
+
+
+if __name__ == "__main__":
+    unittest.main()

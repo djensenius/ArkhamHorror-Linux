@@ -71,28 +71,34 @@ ValueOrError<QString> requireStringValue(const QJsonValue &v,
   return v.toString();
 }
 
-ValueOrError<int> requireIntValue(const QJsonValue &v, QStringView path) {
+ValueOrError<qint64> requireIntValue(const QJsonValue &v, QStringView path) {
   // QJsonValue::isDouble() covers every JSON number; reject non-numbers
   // outright rather than silently truncating e.g. a string or bool.
   if (!v.isDouble())
     return failure(
         QStringLiteral("%1: expected integer, got %2").arg(path, typeName(v)));
   const double d = v.toDouble();
-  if (std::trunc(d) != d)
+  if (!std::isfinite(d) || std::trunc(d) != d)
     return failure(
         QStringLiteral("%1: expected integer, got non-integral number")
             .arg(path));
-  // A value that is integral in IEEE-754 double terms can still fall
-  // outside int's representable range (e.g. 1e300); casting such a value
-  // via static_cast<int> is undefined behavior, so reject it explicitly
-  // rather than truncating/wrapping.
-  if (d < static_cast<double>(std::numeric_limits<int>::min()) ||
-      d > static_cast<double>(std::numeric_limits<int>::max()))
+  // 2^63 is exactly representable as a double (unlike 2^63-1, qint64's
+  // actual max, which rounds up to 2^63) -- comparing against that exact
+  // boundary, rather than a cast of qint64::max()/min() through double,
+  // avoids the classic off-by-one this class of range check is prone to.
+  constexpr double kInt64MinExact = -9223372036854775808.0;     // -2^63, exact
+  constexpr double kInt64MaxBoundExact = 9223372036854775808.0; // 2^63, exact
+  if (d < kInt64MinExact || d >= kInt64MaxBoundExact)
     return failure(
-        QStringLiteral("%1: integer %2 is out of range for a 32-bit int")
+        QStringLiteral("%1: integer %2 is out of range for a 64-bit integer")
             .arg(path)
             .arg(d, 0, 'f', 0));
-  return static_cast<int>(d);
+  // v.toInteger() reads Qt's underlying QCborValue-backed storage exactly
+  // when this QJsonValue was constructed via the qint64 overload (see
+  // RawJson.h's Value::toQJson()); for a value built directly from a
+  // double it returns the nearest exact integer to that double, which is
+  // the most fidelity such a value could ever carry.
+  return v.toInteger();
 }
 
 ValueOrError<bool> requireBoolValue(const QJsonValue &v, QStringView path) {
@@ -124,9 +130,9 @@ ValueOrError<QString> requireString(const QJsonObject &obj,
   return requireFieldOr<QString>(obj, key, path, requireStringValue);
 }
 
-ValueOrError<int> requireInt(const QJsonObject &obj, QLatin1StringView key,
-                             QStringView path) {
-  return requireFieldOr<int>(obj, key, path, requireIntValue);
+ValueOrError<qint64> requireInt(const QJsonObject &obj, QLatin1StringView key,
+                                QStringView path) {
+  return requireFieldOr<qint64>(obj, key, path, requireIntValue);
 }
 
 ValueOrError<bool> requireBool(const QJsonObject &obj, QLatin1StringView key,
@@ -167,15 +173,15 @@ ValueOrError<std::optional<QString>> optionalString(const QJsonObject &obj,
   return std::optional<QString>{v.toString()};
 }
 
-ValueOrError<std::optional<int>>
+ValueOrError<std::optional<qint64>>
 optionalInt(const QJsonObject &obj, QLatin1StringView key, QStringView path) {
   const QJsonValue v = obj.value(key);
   if (v.isUndefined() || v.isNull())
-    return std::optional<int>{};
+    return std::optional<qint64>{};
   auto result = requireIntValue(v, path);
   if (!result)
     return failure(result.error());
-  return std::optional<int>{*result};
+  return std::optional<qint64>{*result};
 }
 
 ValueOrError<std::optional<bool>>
@@ -201,16 +207,16 @@ optionalNonNullString(const QJsonObject &obj, QLatin1StringView key,
   return std::optional<QString>{*result};
 }
 
-ValueOrError<std::optional<int>> optionalNonNullInt(const QJsonObject &obj,
-                                                    QLatin1StringView key,
-                                                    QStringView path) {
+ValueOrError<std::optional<qint64>> optionalNonNullInt(const QJsonObject &obj,
+                                                       QLatin1StringView key,
+                                                       QStringView path) {
   const QJsonValue v = obj.value(key);
   if (v.isUndefined())
-    return std::optional<int>{};
+    return std::optional<qint64>{};
   auto result = requireIntValue(v, path);
   if (!result)
     return failure(result.error());
-  return std::optional<int>{*result};
+  return std::optional<qint64>{*result};
 }
 
 ValueOrError<std::optional<bool>> optionalNonNullBool(const QJsonObject &obj,
@@ -268,22 +274,22 @@ requireNullableString(const QJsonObject &obj, QLatin1StringView key,
   return std::optional<QString>{v.toString()};
 }
 
-ValueOrError<std::optional<int>> requireNullableInt(const QJsonObject &obj,
-                                                    QLatin1StringView key,
-                                                    QStringView path) {
+ValueOrError<std::optional<qint64>> requireNullableInt(const QJsonObject &obj,
+                                                       QLatin1StringView key,
+                                                       QStringView path) {
   switch (fieldPresence(obj, key)) {
   case FieldPresence::Absent:
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
   case FieldPresence::Null:
-    return std::optional<int>{};
+    return std::optional<qint64>{};
   case FieldPresence::Present:
     break;
   }
   auto result = requireIntValue(obj.value(key), path);
   if (!result)
     return failure(result.error());
-  return std::optional<int>{*result};
+  return std::optional<qint64>{*result};
 }
 
 ValueOrError<QUuid> decodeUuid(const QJsonValue &v, QStringView path) {
@@ -377,72 +383,6 @@ ValueOrError<QString> scientificShow(double value, QStringView path) {
         digitsQ(static_cast<size_t>(e), digits.size() - static_cast<size_t>(e));
   }
   return negative ? u'-' + out : out;
-}
-
-namespace {
-// JSON string-escapes `key` for splicing as an object member name.
-// QLatin1StringView's bytes are Latin-1 code units, so every byte value is
-// numerically identical to its Unicode code point (U+0000-U+00FF); any
-// byte outside printable, non-quote/backslash ASCII is therefore safe (and
-// exact) to emit as a `\u00XX` escape rather than a raw byte, which keeps
-// the result valid UTF-8 JSON regardless of what the caller's key
-// contains.
-QByteArray escapeJsonKeyBytes(QLatin1StringView key) {
-  static constexpr char kHex[] = "0123456789abcdef";
-  QByteArray out;
-  out.reserve(key.size());
-  for (const char rawChar : key) {
-    const auto ch = static_cast<unsigned char>(rawChar);
-    switch (ch) {
-    case '"':
-      out += "\\\"";
-      break;
-    case '\\':
-      out += "\\\\";
-      break;
-    case '\b':
-      out += "\\b";
-      break;
-    case '\f':
-      out += "\\f";
-      break;
-    case '\n':
-      out += "\\n";
-      break;
-    case '\r':
-      out += "\\r";
-      break;
-    case '\t':
-      out += "\\t";
-      break;
-    default:
-      if (ch < 0x20 || ch >= 0x7F) {
-        out += "\\u00";
-        out += kHex[(ch >> 4) & 0xF];
-        out += kHex[ch & 0xF];
-      } else {
-        out += static_cast<char>(ch);
-      }
-    }
-  }
-  return out;
-}
-} // namespace
-
-QByteArray spliceRawJsonMember(const QJsonObject &obj, QLatin1StringView key,
-                               QByteArrayView rawValueBytes) {
-  QByteArray bytes = QJsonDocument(obj).toJson(QJsonDocument::Compact);
-  if (!bytes.endsWith('}'))
-    return bytes; // defensive-only: QJsonDocument::toJson always ends in '}'.
-  bytes.chop(1);
-  if (!obj.isEmpty())
-    bytes += ',';
-  bytes += '"';
-  bytes += escapeJsonKeyBytes(key);
-  bytes += "\":";
-  bytes += rawValueBytes;
-  bytes += '}';
-  return bytes;
 }
 
 } // namespace Arkham::Json

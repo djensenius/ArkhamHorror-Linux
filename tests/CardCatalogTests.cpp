@@ -47,6 +47,7 @@ private slots:
   void unrecognizedGameValueTagPreservedNotRejected();
   void unrecognizedSkillIconTagPreservedNotRejected();
   void missingContentsRejectedForRawPayloadCardCostTags();
+  void rawPayloadCardCostFactoriesValidateContents();
   void nullaryCardCostTagWithContentsRejected();
   void nullaryGameValueTagWithContentsRejected();
   void nullarySkillIconTagWithContentsRejected();
@@ -92,6 +93,17 @@ QJsonObject parseJson(QLatin1StringView text) {
   return QJsonDocument::fromJson(QByteArray(text.data(), text.size())).object();
 }
 
+QJsonObject minimalCardObject() {
+  return QJsonObject{
+      {QStringLiteral("cardCode"), QStringLiteral("c00001")},
+      {QStringLiteral("name"),
+       QJsonObject{{QStringLiteral("title"), QStringLiteral("X")},
+                   {QStringLiteral("subtitle"), QJsonValue(QJsonValue::Null)}}},
+      {QStringLiteral("cardType"), QStringLiteral("AssetType")},
+      {QStringLiteral("art"), QStringLiteral("1")},
+  };
+}
+
 } // namespace
 
 void CardCatalogTests::decodesFullCardFromFixture() {
@@ -109,8 +121,8 @@ void CardCatalogTests::decodesFullCardFromFixture() {
   QVERIFY(!result->name.subtitle.has_value());
   QVERIFY(result->cost.has_value());
   QCOMPARE(result->cost->tag(), CardCostTag::StaticCost);
-  QCOMPARE(*result->cost->staticAmount(), 3);
-  QCOMPARE(*result->level, 0);
+  QCOMPARE(*result->cost->staticAmount(), qint64(3));
+  QCOMPARE(*result->level, qint64(0));
   QCOMPARE(result->cardType, CardType::AssetType);
   QCOMPARE(result->classSymbols, (QList<ClassSymbol>{ClassSymbol::Guardian}));
   QCOMPARE(result->skills.size(), 1);
@@ -144,14 +156,14 @@ void CardCatalogTests::decodesHomebrewCardFromFixture() {
   QCOMPARE(result->cardType, CardType::EnemyType);
   QCOMPARE(*result->encounterSet,
            QStringLiteral(":dark-matter:in_the_shadow_of_earth"));
-  QCOMPARE(*result->encounterSetQuantity, 3);
+  QCOMPARE(*result->encounterSetQuantity, qint64(3));
   QVERIFY(result->health.has_value());
   QCOMPARE(result->health->tag(), GameValueTag::Static);
-  QCOMPARE(*result->health->singleAmount(), 1);
+  QCOMPARE(*result->health->singleAmount(), qint64(1));
   QCOMPARE(result->fight->tag(), GameValueTag::Static);
-  QCOMPARE(*result->fight->singleAmount(), 1);
-  QCOMPARE(*result->evade->singleAmount(), 3);
-  QCOMPARE(*result->healthDamage->singleAmount(), 1);
+  QCOMPARE(*result->fight->singleAmount(), qint64(1));
+  QCOMPARE(*result->evade->singleAmount(), qint64(3));
+  QCOMPARE(*result->healthDamage->singleAmount(), qint64(1));
   QVERIFY(!result->sanityDamage.has_value());
 
   QCOMPARE(result->toJson(), homebrew.at(0).toObject());
@@ -380,10 +392,9 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     QCOMPARE(result->toJson(), obj);
   }
 
-  // Unconstrained-contents variants: preserved verbatim, whatever shape.
+  // MaxDynamicCost/AnyMatchingCardCost preserve their raw payload verbatim.
   const QList<QLatin1StringView> rawPayload{"MaxDynamicCost"_L1,
-                                            "AnyMatchingCardCost"_L1,
-                                            "MatchingEnemyFieldCost"_L1};
+                                            "AnyMatchingCardCost"_L1};
   for (const auto &tag : rawPayload) {
     const QJsonObject obj{
         {QStringLiteral("tag"), QString(tag)},
@@ -395,13 +406,27 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     QCOMPARE(result->toJson(), obj);
   }
 
+  const QJsonArray matchingEnemyFieldContents{
+      QJsonObject{{QStringLiteral("enemy"), QStringLiteral("Ghoul")}},
+      QJsonArray{1, 2, 3}};
+  const QJsonObject matchingEnemyFieldObj{
+      {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
+      {QStringLiteral("contents"), matchingEnemyFieldContents}};
+  const auto matchingEnemyFieldResult =
+      CardCost::fromJson(matchingEnemyFieldObj, u"cost");
+  if (!matchingEnemyFieldResult)
+    QFAIL(qPrintable(matchingEnemyFieldResult.error()));
+  QCOMPARE(matchingEnemyFieldResult->rawContents(),
+           QJsonValue(matchingEnemyFieldContents));
+  QCOMPARE(matchingEnemyFieldResult->toJson(), matchingEnemyFieldObj);
+
   const QJsonObject staticObj{
       {QStringLiteral("tag"), QStringLiteral("StaticCost")},
       {QStringLiteral("contents"), 5}};
   const auto staticResult = CardCost::fromJson(staticObj, u"cost");
   if (!staticResult)
     QFAIL(qPrintable(staticResult.error()));
-  QCOMPARE(*staticResult->staticAmount(), 5);
+  QCOMPARE(*staticResult->staticAmount(), qint64(5));
   QCOMPARE(staticResult->toJson(), staticObj);
 }
 
@@ -427,7 +452,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r3 = GameValue::fromJson(staticWithPerPlayerObj, u"gv");
   if (!r3)
     QFAIL(qPrintable(r3.error()));
-  QCOMPARE(r3->contents(), (QList<int>{3, 1}));
+  QCOMPARE(r3->contents(), (QList<qint64>{qint64(3), qint64(1)}));
   QCOMPARE(r3->toJson(), staticWithPerPlayerObj);
 
   const QJsonObject byPlayerCountObj{
@@ -436,7 +461,8 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r4 = GameValue::fromJson(byPlayerCountObj, u"gv");
   if (!r4)
     QFAIL(qPrintable(r4.error()));
-  QCOMPARE(r4->contents(), (QList<int>{2, 3, 4, 5}));
+  QCOMPARE(r4->contents(),
+           (QList<qint64>{qint64(2), qint64(3), qint64(4), qint64(5)}));
   QCOMPARE(r4->toJson(), byPlayerCountObj);
 
   for (const auto &tag : {"ValueX"_L1, "ValueStar"_L1, "ValueUnknown"_L1}) {
@@ -446,6 +472,13 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
       QFAIL(qPrintable(r.error()));
     QCOMPARE(r->toJson(), obj);
   }
+
+  const QJsonObject badStaticWithPerPlayerCount{
+      {QStringLiteral("tag"), QStringLiteral("StaticWithPerPlayer")},
+      {QStringLiteral("contents"), QJsonArray{1}}};
+  auto badStaticWithPerPlayer =
+      GameValue::fromJson(badStaticWithPerPlayerCount, u"gv");
+  QVERIFY(!badStaticWithPerPlayer.has_value());
 
   // Wrong element count is rejected, not silently truncated/padded.
   const QJsonObject badCount{
@@ -478,6 +511,13 @@ void CardCatalogTests::allSkillIconVariantsRoundTrip() {
     QVERIFY(!r->skill().has_value());
     QCOMPARE(r->toJson(), obj);
   }
+
+  const QJsonObject badSkillPayload{
+      {QStringLiteral("tag"), QStringLiteral("SkillIcon")},
+      {QStringLiteral("contents"),
+       QJsonObject{{QStringLiteral("unexpected"), true}}}};
+  auto bad = SkillIcon::fromJson(badSkillPayload, u"skill");
+  QVERIFY(!bad.has_value());
 }
 
 void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
@@ -492,6 +532,7 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tag(), CardCostTag::Unknown);
   QVERIFY(!result->staticAmount().has_value());
+  QCOMPARE(result->unknownRaw(), withContents);
   QCOMPARE(result->toJson(), withContents);
 
   const QJsonObject withoutContents{
@@ -500,6 +541,7 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
   if (!result2)
     QFAIL(qPrintable(result2.error()));
   QCOMPARE(result2->tag(), CardCostTag::Unknown);
+  QCOMPARE(result2->unknownRaw(), withoutContents);
   QCOMPARE(result2->toJson(), withoutContents);
 
   // There is no public factory that lets calling code fabricate an
@@ -517,6 +559,7 @@ void CardCatalogTests::unrecognizedGameValueTagPreservedNotRejected() {
   // Must never be conflated with the *known* nullary tag literally named
   // "ValueUnknown".
   QVERIFY(result->tag() != GameValueTag::ValueUnknown);
+  QCOMPARE(result->unknownRaw(), obj);
   QCOMPARE(result->toJson(), obj);
 }
 
@@ -527,49 +570,69 @@ void CardCatalogTests::unrecognizedSkillIconTagPreservedNotRejected() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tag(), SkillIconTag::Unknown);
+  QCOMPARE(result->unknownRaw(), obj);
   QCOMPARE(result->toJson(), obj);
 }
 
 void CardCatalogTests::nullaryCardCostTagWithContentsRejected() {
+  const std::array unexpectedContentsCases{
+      std::pair{QStringLiteral("explicit null"), QJsonValue(QJsonValue::Null)},
+      std::pair{QStringLiteral("number"), QJsonValue(1)},
+  };
   for (const auto &tag :
        {"DynamicCost"_L1, "DiscardAmountCost"_L1, "DeferredCost"_L1}) {
-    const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
-                          {QStringLiteral("contents"), QJsonValue()}};
-    const auto result = CardCost::fromJson(obj, u"cost");
-    QVERIFY2(!result.has_value(),
-             qPrintable(QStringLiteral("%1 unexpectedly accepted an "
-                                       "explicit-null contents")
-                            .arg(tag)));
-    QVERIFY2(result.error().contains(QStringLiteral("contents")),
-             qPrintable(result.error()));
+    for (const auto &[label, contents] : unexpectedContentsCases) {
+      const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
+                            {QStringLiteral("contents"), contents}};
+      const auto result = CardCost::fromJson(obj, u"cost");
+      QVERIFY2(!result.has_value(),
+               qPrintable(QStringLiteral("%1 unexpectedly accepted %2 "
+                                         "contents")
+                              .arg(tag, label)));
+      QVERIFY2(result.error().contains(QStringLiteral("contents")),
+               qPrintable(result.error()));
+    }
   }
 }
 
 void CardCatalogTests::nullaryGameValueTagWithContentsRejected() {
+  const std::array unexpectedContentsCases{
+      std::pair{QStringLiteral("explicit null"), QJsonValue(QJsonValue::Null)},
+      std::pair{QStringLiteral("array"), QJsonValue(QJsonArray{1, 2})},
+  };
   for (const auto &tag : {"ValueX"_L1, "ValueStar"_L1, "ValueUnknown"_L1}) {
-    const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
-                          {QStringLiteral("contents"), QJsonValue()}};
-    const auto result = GameValue::fromJson(obj, u"gv");
-    QVERIFY2(!result.has_value(),
-             qPrintable(QStringLiteral("%1 unexpectedly accepted an "
-                                       "explicit-null contents")
-                            .arg(tag)));
-    QVERIFY2(result.error().contains(QStringLiteral("contents")),
-             qPrintable(result.error()));
+    for (const auto &[label, contents] : unexpectedContentsCases) {
+      const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
+                            {QStringLiteral("contents"), contents}};
+      const auto result = GameValue::fromJson(obj, u"gv");
+      QVERIFY2(!result.has_value(),
+               qPrintable(QStringLiteral("%1 unexpectedly accepted %2 "
+                                         "contents")
+                              .arg(tag, label)));
+      QVERIFY2(result.error().contains(QStringLiteral("contents")),
+               qPrintable(result.error()));
+    }
   }
 }
 
 void CardCatalogTests::nullarySkillIconTagWithContentsRejected() {
+  const std::array unexpectedContentsCases{
+      std::pair{QStringLiteral("explicit null"), QJsonValue(QJsonValue::Null)},
+      std::pair{QStringLiteral("object"),
+                QJsonValue(QJsonObject{{QStringLiteral("unexpected"), true}})},
+  };
   for (const auto &tag : {"WildIcon"_L1, "WildMinusIcon"_L1}) {
-    const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
-                          {QStringLiteral("contents"), QJsonValue()}};
-    const auto result = SkillIcon::fromJson(obj, u"skill");
-    QVERIFY2(!result.has_value(),
-             qPrintable(QStringLiteral("%1 unexpectedly accepted an "
-                                       "explicit-null contents")
-                            .arg(tag)));
-    QVERIFY2(result.error().contains(QStringLiteral("contents")),
-             qPrintable(result.error()));
+    for (const auto &[label, contents] : unexpectedContentsCases) {
+      const QJsonObject obj{{QStringLiteral("tag"), QString(tag)},
+                            {QStringLiteral("contents"), contents}};
+      const auto result = SkillIcon::fromJson(obj, u"skill");
+      QVERIFY2(!result.has_value(),
+               qPrintable(QStringLiteral("%1 unexpectedly accepted %2 "
+                                         "contents")
+                              .arg(tag, label)));
+      QVERIFY2(result.error().contains(QStringLiteral("contents")),
+               qPrintable(result.error()));
+    }
   }
 }
 
@@ -593,16 +656,96 @@ void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
              qPrintable(result.error()));
   }
 
-  // An explicit JSON null still counts as present -- only an entirely
-  // absent key is rejected.
-  const QJsonObject nullContents{
-      {QStringLiteral("tag"), QStringLiteral("MaxDynamicCost")},
+  // An explicit JSON null still counts as present for the genuinely
+  // unconstrained single-payload constructors.
+  for (const auto &tag : {"MaxDynamicCost"_L1, "AnyMatchingCardCost"_L1}) {
+    const QJsonObject nullContents{
+        {QStringLiteral("tag"), QString(tag)},
+        {QStringLiteral("contents"), QJsonValue(QJsonValue::Null)}};
+    const auto nullResult = CardCost::fromJson(nullContents, u"cost");
+    if (!nullResult)
+      QFAIL(qPrintable(nullResult.error()));
+    QVERIFY(nullResult->rawContents().isNull());
+    QCOMPARE(nullResult->toJson(), nullContents);
+  }
+
+  // MatchingEnemyFieldCost has a real fixed-arity wire shape, so null is
+  // not a valid stand-in for a missing/unknown payload.
+  const QJsonObject nullMatchingEnemyField{
+      {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
       {QStringLiteral("contents"), QJsonValue(QJsonValue::Null)}};
-  const auto nullResult = CardCost::fromJson(nullContents, u"cost");
-  if (!nullResult)
-    QFAIL(qPrintable(nullResult.error()));
-  QVERIFY(nullResult->rawContents().isNull());
-  QCOMPARE(nullResult->toJson(), nullContents);
+  const auto nullMatchingEnemyFieldResult =
+      CardCost::fromJson(nullMatchingEnemyField, u"cost");
+  QVERIFY(!nullMatchingEnemyFieldResult.has_value());
+  QVERIFY2(
+      nullMatchingEnemyFieldResult.error().contains(QStringLiteral("exactly")),
+      qPrintable(nullMatchingEnemyFieldResult.error()));
+}
+
+void CardCatalogTests::rawPayloadCardCostFactoriesValidateContents() {
+  const QJsonValue rawContents =
+      QJsonObject{{QStringLiteral("nested"), QJsonArray{1, 2, 3}}};
+
+  const auto maxDynamicCost = CardCost::maxDynamicCost(rawContents);
+  if (!maxDynamicCost)
+    QFAIL(qPrintable(maxDynamicCost.error()));
+  QCOMPARE(maxDynamicCost->tag(), CardCostTag::MaxDynamicCost);
+  QCOMPARE(maxDynamicCost->rawContents(), rawContents);
+
+  const auto anyMatchingCardCost = CardCost::anyMatchingCardCost(rawContents);
+  if (!anyMatchingCardCost)
+    QFAIL(qPrintable(anyMatchingCardCost.error()));
+  QCOMPARE(anyMatchingCardCost->tag(), CardCostTag::AnyMatchingCardCost);
+  QCOMPARE(anyMatchingCardCost->rawContents(), rawContents);
+
+  for (const auto &[label, result] : std::array{
+           std::pair{
+               QStringLiteral("maxDynamicCost"),
+               CardCost::maxDynamicCost(QJsonValue(QJsonValue::Undefined))},
+           std::pair{QStringLiteral("anyMatchingCardCost"),
+                     CardCost::anyMatchingCardCost(
+                         QJsonValue(QJsonValue::Undefined))},
+       }) {
+    QVERIFY2(!result.has_value(),
+             qPrintable(QStringLiteral("%1 unexpectedly accepted undefined "
+                                       "contents")
+                            .arg(label)));
+    QVERIFY2(result.error().contains(QStringLiteral("undefined")),
+             qPrintable(result.error()));
+  }
+
+  const QJsonArray validMatchingEnemyFieldContents{
+      QJsonObject{{QStringLiteral("enemy"), QStringLiteral("Ghoul")}},
+      QJsonObject{{QStringLiteral("field"), QStringLiteral("Health")}}};
+  const auto matchingEnemyFieldCost =
+      CardCost::matchingEnemyFieldCost(validMatchingEnemyFieldContents);
+  if (!matchingEnemyFieldCost)
+    QFAIL(qPrintable(matchingEnemyFieldCost.error()));
+  QCOMPARE(matchingEnemyFieldCost->tag(), CardCostTag::MatchingEnemyFieldCost);
+  QCOMPARE(matchingEnemyFieldCost->rawContents(),
+           QJsonValue(validMatchingEnemyFieldContents));
+  QCOMPARE(
+      matchingEnemyFieldCost->toJson(),
+      (QJsonObject{
+          {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
+          {QStringLiteral("contents"), validMatchingEnemyFieldContents},
+      }));
+
+  for (const auto &[label, contents] : std::array{
+           std::pair{QStringLiteral("one element"), QJsonValue(QJsonArray{1})},
+           std::pair{QStringLiteral("three elements"),
+                     QJsonValue(QJsonArray{1, 2, 3})},
+           std::pair{QStringLiteral("non-array"),
+                     QJsonValue(QJsonObject{{QStringLiteral("x"), 1}})},
+       }) {
+    const auto result = CardCost::matchingEnemyFieldCost(contents);
+    QVERIFY2(
+        !result.has_value(),
+        qPrintable(QStringLiteral("%1 unexpectedly accepted %2")
+                       .arg(QStringLiteral("matchingEnemyFieldCost"), label)));
+    QVERIFY2(result.error().contains(QStringLiteral("exactly two elements")),
+             qPrintable(result.error()));
+  }
 }
 
 void CardCatalogTests::unknownAdditiveTopLevelFieldIgnored() {
@@ -658,7 +801,7 @@ void CardCatalogTests::bondedWithRoundTrips() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->bondedWith.size(), 2);
-  QCOMPARE(result->bondedWith.at(0).first, 2);
+  QCOMPARE(result->bondedWith.at(0).first, qint64(2));
   QCOMPARE(result->bondedWith.at(0).second.value(), QStringLiteral("c00002"));
   QCOMPARE(result->toJson(), obj);
 }
@@ -695,42 +838,54 @@ void CardCatalogTests::explicitNullForNonNullableIntFieldRejected() {
   // to std::nullopt, but an explicit JSON null is exactly as malformed as
   // a present value of any other wrong type, and must fail rather than
   // silently collapsing into "absent".
-  const QJsonObject obj = parseJson(R"({
-    "cardCode": "c00001",
-    "name": {"title": "X", "subtitle": null},
-    "cardType": "AssetType",
-    "art": "1",
-    "level": null
-  })"_L1);
-  const auto result = CardDef::fromJson(obj, u"card");
-  QVERIFY(!result.has_value());
-  QVERIFY(result.error().contains(QStringLiteral("level")));
+  for (const QString &fieldName :
+       {QStringLiteral("level"), QStringLiteral("victoryPoints"),
+        QStringLiteral("vengeancePoints"),
+        QStringLiteral("encounterSetQuantity"), QStringLiteral("stage"),
+        QStringLiteral("grantedXp")}) {
+    QJsonObject obj = minimalCardObject();
+    obj.insert(fieldName, QJsonValue(QJsonValue::Null));
+    const auto result = CardDef::fromJson(obj, u"card");
+    QVERIFY2(
+        !result.has_value(),
+        qPrintable(
+            QStringLiteral("%1 unexpectedly accepted null").arg(fieldName)));
+    QVERIFY2(result.error().contains(fieldName), qPrintable(result.error()));
+  }
 }
 
 void CardCatalogTests::explicitNullForNonNullableBoolFieldRejected() {
-  const QJsonObject obj = parseJson(R"({
-    "cardCode": "c00001",
-    "name": {"title": "X", "subtitle": null},
-    "cardType": "AssetType",
-    "art": "1",
-    "unique": null
-  })"_L1);
-  const auto result = CardDef::fromJson(obj, u"card");
-  QVERIFY(!result.has_value());
-  QVERIFY(result.error().contains(QStringLiteral("unique")));
+  for (const QString &fieldName :
+       {QStringLiteral("overrideActionPlayableIfCriteriaMet"),
+        QStringLiteral("permanent"), QStringLiteral("unique"),
+        QStringLiteral("doubleSided"), QStringLiteral("exceptional"),
+        QStringLiteral("playableFromDiscard"), QStringLiteral("canReplace"),
+        QStringLiteral("skipPlayWindows"), QStringLiteral("beforeEffect"),
+        QStringLiteral("canCommitWhenNoIcons"),
+        QStringLiteral("commitTrigger")}) {
+    QJsonObject obj = minimalCardObject();
+    obj.insert(fieldName, QJsonValue(QJsonValue::Null));
+    const auto result = CardDef::fromJson(obj, u"card");
+    QVERIFY2(
+        !result.has_value(),
+        qPrintable(
+            QStringLiteral("%1 unexpectedly accepted null").arg(fieldName)));
+    QVERIFY2(result.error().contains(fieldName), qPrintable(result.error()));
+  }
 }
 
 void CardCatalogTests::explicitNullForNonNullableStringFieldRejected() {
-  const QJsonObject obj = parseJson(R"({
-    "cardCode": "c00001",
-    "name": {"title": "X", "subtitle": null},
-    "cardType": "AssetType",
-    "art": "1",
-    "errata": null
-  })"_L1);
-  const auto result = CardDef::fromJson(obj, u"card");
-  QVERIFY(!result.has_value());
-  QVERIFY(result.error().contains(QStringLiteral("errata")));
+  for (const QString &fieldName :
+       {QStringLiteral("encounterSet"), QStringLiteral("errata")}) {
+    QJsonObject obj = minimalCardObject();
+    obj.insert(fieldName, QJsonValue(QJsonValue::Null));
+    const auto result = CardDef::fromJson(obj, u"card");
+    QVERIFY2(
+        !result.has_value(),
+        qPrintable(
+            QStringLiteral("%1 unexpectedly accepted null").arg(fieldName)));
+    QVERIFY2(result.error().contains(fieldName), qPrintable(result.error()));
+  }
 }
 
 void CardCatalogTests::absentNonNullableScalarFieldsDecodeToNullopt() {
@@ -833,6 +988,10 @@ void CardCatalogTests::wrongOuterTypeForObjectFieldRejected() {
 void CardCatalogTests::
     arrayAndObjectFieldsPreservedVerbatimWhenOuterTypeValid() {
   const QJsonArray rawKeywords{QStringLiteral("surge"), 1, QJsonValue()};
+  const QJsonArray rawCommitRestrictions{
+      QJsonObject{
+          {QStringLiteral("matcher"), QStringLiteral("attacksOfOpportunity")}},
+      QJsonArray{true, QStringLiteral("freeform")}};
   const QJsonObject rawMeta{{QStringLiteral("adaptable"), true}};
   const QJsonObject obj{
       {QStringLiteral("cardCode"), QStringLiteral("c00001")},
@@ -842,12 +1001,14 @@ void CardCatalogTests::
       {QStringLiteral("cardType"), QStringLiteral("AssetType")},
       {QStringLiteral("art"), QStringLiteral("1")},
       {QStringLiteral("keywords"), rawKeywords},
+      {QStringLiteral("commitRestrictions"), rawCommitRestrictions},
       {QStringLiteral("meta"), rawMeta},
   };
   const auto result = CardDef::fromJson(obj, u"card");
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->keywords, QJsonValue(rawKeywords));
+  QCOMPARE(result->commitRestrictions, QJsonValue(rawCommitRestrictions));
   QCOMPARE(result->meta, QJsonValue(rawMeta));
   QCOMPARE(result->toJson(), obj);
 }

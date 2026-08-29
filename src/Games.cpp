@@ -1066,20 +1066,30 @@ ChooseDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
   if (raw->isObject() && decoded->deckList) {
     const Json::Value deckListRaw = raw->value("deckList"_L1);
     if (deckListRaw.isObject()) {
-      const Json::Value idValue = deckListRaw.value("id"_L1);
-      if (idValue.isNumber())
-        decoded->deckList->id.numberLiteral = idValue.toRawNumber().literal();
+      auto deckListBytes = deckListRaw.toJsonBytes();
+      if (!deckListBytes)
+        return failure(deckListBytes.error());
+      auto preciseDeckList = DeckListInput::fromRawBytes(
+          *deckListBytes, Json::joinPath(path, u"deckList"));
+      if (!preciseDeckList)
+        return failure(preciseDeckList.error());
+      decoded->deckList = *preciseDeckList;
     }
   }
   return *decoded;
 }
 
-QByteArray ChooseDeckRequest::toJsonBytes() const {
-  QJsonObject obj = toJson();
-  if (!deckList || deckList->id.tag != ExternalDeckIdTag::Number)
-    return QJsonDocument(obj).toJson(QJsonDocument::Compact);
-  obj.remove(QStringLiteral("deckList"));
-  return Json::spliceRawJsonMember(obj, "deckList"_L1, deckList->toJsonBytes());
+ValueOrError<QByteArray> ChooseDeckRequest::toJsonBytes() const {
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("investigatorId"),
+       Json::Value::fromQJson(investigatorId.toJson())},
+  };
+  if (deckUrl)
+    members.append(
+        {QStringLiteral("deckUrl"), Json::Value::makeString(*deckUrl)});
+  if (deckList)
+    members.append({QStringLiteral("deckList"), deckList->toRawJson()});
+  return Json::Value::makeObject(std::move(members)).toJsonBytes();
 }
 
 ValueOrError<ClaimSeatRequest> ClaimSeatRequest::fromJson(const QJsonValue &v,

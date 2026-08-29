@@ -204,15 +204,15 @@ ValueOrError<QList<SkillIcon>> decodeSkillIconArray(const QJsonObject &obj,
   return result;
 }
 
-ValueOrError<QList<std::pair<int, CardCode>>>
+ValueOrError<QList<std::pair<qint64, CardCode>>>
 decodeBondedWith(const QJsonObject &obj, QStringView path) {
   const QJsonValue v = obj.value("bondedWith"_L1);
   if (v.isUndefined())
-    return QList<std::pair<int, CardCode>>{};
+    return QList<std::pair<qint64, CardCode>>{};
   auto arrResult = Json::requireArray(v, path);
   if (!arrResult)
     return failure(arrResult.error());
-  QList<std::pair<int, CardCode>> result;
+  QList<std::pair<qint64, CardCode>> result;
   result.reserve(arrResult->size());
   for (qsizetype i = 0; i < arrResult->size(); ++i) {
     const QString itemPath = Json::indexPath(path, i);
@@ -371,7 +371,7 @@ QJsonObject SkillIcon::toJson() const {
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
 
-CardCost CardCost::staticCost(int amount) {
+CardCost CardCost::staticCost(qint64 amount) {
   CardCost result;
   result.m_tag = CardCostTag::StaticCost;
   result.m_staticAmount = amount;
@@ -396,21 +396,44 @@ CardCost CardCost::deferredCost() {
   return result;
 }
 
-CardCost CardCost::maxDynamicCost(QJsonValue contents) {
+ValueOrError<CardCost> CardCost::maxDynamicCost(QJsonValue contents) {
+  // The schema's payload is genuinely unconstrained ("{}"), but
+  // "unconstrained" still means "some JSON value is present" -- an
+  // Undefined contents is not a value at all, and a public factory that
+  // silently accepted one anyway would let calling code build a CardCost
+  // whose toJson() then has no "contents" to encode for a tag the schema
+  // requires one for.
+  if (contents.isUndefined())
+    return failure(QStringLiteral(
+        "CardCost::maxDynamicCost: contents must not be undefined"));
   CardCost result;
   result.m_tag = CardCostTag::MaxDynamicCost;
   result.m_rawContents = std::move(contents);
   return result;
 }
 
-CardCost CardCost::anyMatchingCardCost(QJsonValue contents) {
+ValueOrError<CardCost> CardCost::anyMatchingCardCost(QJsonValue contents) {
+  if (contents.isUndefined())
+    return failure(QStringLiteral(
+        "CardCost::anyMatchingCardCost: contents must not be undefined"));
   CardCost result;
   result.m_tag = CardCostTag::AnyMatchingCardCost;
   result.m_rawContents = std::move(contents);
   return result;
 }
 
-CardCost CardCost::matchingEnemyFieldCost(QJsonValue contents) {
+ValueOrError<CardCost> CardCost::matchingEnemyFieldCost(QJsonValue contents) {
+  if (contents.isUndefined())
+    return failure(QStringLiteral(
+        "CardCost::matchingEnemyFieldCost: contents must not be undefined"));
+  // See this factory's header doc comment: the pinned backend's
+  // MatchingEnemyFieldCost is a genuine two-argument constructor, so
+  // "contents" must be a JSON array of exactly two elements -- not
+  // arbitrary shape -- despite the schema's conservative "{}".
+  if (!contents.isArray() || contents.toArray().size() != 2)
+    return failure(QStringLiteral(
+        "CardCost::matchingEnemyFieldCost: contents must be a JSON array "
+        "of exactly two elements"));
   CardCost result;
   result.m_tag = CardCostTag::MatchingEnemyFieldCost;
   result.m_rawContents = std::move(contents);
@@ -457,21 +480,30 @@ ValueOrError<CardCost> CardCost::fromJson(const QJsonValue &v,
                                           Json::joinPath(path, u"contents"));
     if (!contents)
       return failure(contents.error());
-    return CardCost::maxDynamicCost(*contents);
+    auto result = CardCost::maxDynamicCost(*contents);
+    if (!result)
+      return failure(QStringLiteral("%1: %2").arg(path, result.error()));
+    return result;
   }
   if (tag == "AnyMatchingCardCost"_L1) {
     auto contents = Json::requireRawField(obj, "contents"_L1,
                                           Json::joinPath(path, u"contents"));
     if (!contents)
       return failure(contents.error());
-    return CardCost::anyMatchingCardCost(*contents);
+    auto result = CardCost::anyMatchingCardCost(*contents);
+    if (!result)
+      return failure(QStringLiteral("%1: %2").arg(path, result.error()));
+    return result;
   }
   if (tag == "MatchingEnemyFieldCost"_L1) {
     auto contents = Json::requireRawField(obj, "contents"_L1,
                                           Json::joinPath(path, u"contents"));
     if (!contents)
       return failure(contents.error());
-    return CardCost::matchingEnemyFieldCost(*contents);
+    auto result = CardCost::matchingEnemyFieldCost(*contents);
+    if (!result)
+      return failure(QStringLiteral("%1: %2").arg(path, result.error()));
+    return result;
   }
   // An unrecognized tag preserves the complete raw decoded object
   // verbatim; see SkillIcon::fromJson's Unknown branch for the rationale.
@@ -517,30 +549,30 @@ QJsonObject CardCost::toJson() const {
   Q_UNREACHABLE_RETURN(QJsonObject{});
 }
 
-GameValue GameValue::staticValue(int amount) {
+GameValue GameValue::staticValue(qint64 amount) {
   GameValue result;
   result.m_tag = GameValueTag::Static;
   result.m_singleAmount = amount;
   return result;
 }
 
-GameValue GameValue::perPlayer(int amount) {
+GameValue GameValue::perPlayer(qint64 amount) {
   GameValue result;
   result.m_tag = GameValueTag::PerPlayer;
   result.m_singleAmount = amount;
   return result;
 }
 
-GameValue GameValue::staticWithPerPlayer(int staticAmount,
-                                         int perPlayerAmount) {
+GameValue GameValue::staticWithPerPlayer(qint64 staticAmount,
+                                         qint64 perPlayerAmount) {
   GameValue result;
   result.m_tag = GameValueTag::StaticWithPerPlayer;
   result.m_contents = {staticAmount, perPlayerAmount};
   return result;
 }
 
-GameValue GameValue::byPlayerCount(int oneOrTwo, int three, int four,
-                                   int fiveOrMore) {
+GameValue GameValue::byPlayerCount(qint64 oneOrTwo, qint64 three, qint64 four,
+                                   qint64 fiveOrMore) {
   GameValue result;
   result.m_tag = GameValueTag::ByPlayerCount;
   result.m_contents = {oneOrTwo, three, four, fiveOrMore};
@@ -597,7 +629,7 @@ ValueOrError<GameValue> GameValue::fromJson(const QJsonValue &v,
                          .arg(contentsPath)
                          .arg(expected)
                          .arg(arrResult->size()));
-    QList<int> contents;
+    QList<qint64> contents;
     contents.reserve(expected);
     for (qsizetype i = 0; i < arrResult->size(); ++i) {
       auto item = Json::requireIntValue((*arrResult)[i],
@@ -650,16 +682,16 @@ QJsonObject GameValue::toJson() const {
   case GameValueTag::StaticWithPerPlayer: {
     // m_contents is guaranteed to hold exactly 2 elements here: the only
     // way to construct a StaticWithPerPlayer GameValue is
-    // staticWithPerPlayer(int, int), which always sets exactly 2.
+    // staticWithPerPlayer(qint64, qint64), which always sets exactly 2.
     QJsonArray arr;
-    for (const int n : m_contents)
+    for (const qint64 n : m_contents)
       arr.append(n);
     return withContents("StaticWithPerPlayer"_L1, arr);
   }
   case GameValueTag::ByPlayerCount: {
     // Likewise guaranteed to hold exactly 4 elements via byPlayerCount().
     QJsonArray arr;
-    for (const int n : m_contents)
+    for (const qint64 n : m_contents)
       arr.append(n);
     return withContents("ByPlayerCount"_L1, arr);
   }

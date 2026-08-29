@@ -23,32 +23,54 @@ namespace Arkham {
 // downstream (absent stays unset; explicit null normalizes to an empty
 // string), so this type keeps all four states distinguishable rather than
 // collapsing absent/null the way the optional* JsonDecode helpers do.
-enum class ExternalDeckIdTag { Absent, Null, Text, Number };
-struct ExternalDeckId {
-  ExternalDeckIdTag tag{ExternalDeckIdTag::Absent};
-  // Populated only when tag == Text.
-  QString text;
-  // Populated only when tag == Number: the number's JSON literal text
-  // (sign/digits/fraction/exponent), reconstructed via
-  // Json::RawNumber::literal()/Json::scientificShow() without ever
-  // rounding through a double, so arbitrary-precision integers past
-  // double's exact-integer range (2^53) -- which ArkhamDB is known to hand
-  // out as deck ids -- round-trip exactly. This is precision-preserving,
-  // not necessarily byte-for-byte: RawNumber::literal() always spells the
-  // exponent marker lowercase ('e') and omits a redundant leading '+' on a
-  // positive exponent, so a source literal spelled e.g. "1E+5" is
-  // canonicalized to "1e5" here (same numeric value, different spelling).
-  // fromObject()/toJson() below -- which must operate on an
-  // already-parsed QJsonValue/QJsonObject and therefore cannot recover
-  // precision QJsonDocument has already destroyed -- are only a
-  // best-effort fallback; fromRawBytes()/toJsonBytes() are this type's
-  // genuinely lossless (up to the canonicalization above) entry points
-  // and should be preferred by any caller that has the original bytes.
-  QString numberLiteral;
+//
+// Private-constructor sum type (mirrors CardCost/GameValue/SkillIcon's
+// convention elsewhere in this codebase): the Number variant can only be
+// produced from a Json::RawNumber, which -- unlike a plain QString/double
+// -- can only itself be constructed by Json::Value::parse() or
+// Json::RawNumber::fromInt64(), never by splicing arbitrary caller text.
+// This makes the historical defect this type previously had (a public,
+// independently-mutable `numberLiteral` QString field that toJson()
+// encoded by rounding through a double, and whose validation failure
+// silently fell back to that same lossy 0.0-on-failure path) structurally
+// unrepresentable rather than merely tested against: there is no public
+// mutator, and no code path -- valid or otherwise -- ever encodes a
+// Number variant by parsing/round-tripping arbitrary text through a
+// double.
+class ExternalDeckId {
+public:
+  enum class Kind { Absent, Null, Text, Number };
+
+  // Kind::Absent, matching an omitted "id" key.
+  ExternalDeckId() = default;
+
+  [[nodiscard]] static ExternalDeckId absent();
+  [[nodiscard]] static ExternalDeckId null();
+  [[nodiscard]] static ExternalDeckId text(QString value);
+  // `value` must have come from Json::Value::parse() or
+  // Json::RawNumber::fromInt64() (both guarantee a valid, non-empty digit
+  // string); a default-constructed Json::RawNumber is rejected by
+  // Json::Value::toJsonBytesInner() defensively but should never be
+  // passed here in the first place.
+  [[nodiscard]] static ExternalDeckId number(Json::RawNumber value);
+
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  // Populated only when kind() == Kind::Text.
+  [[nodiscard]] const QString &text() const noexcept { return m_text; }
+  // Populated only when kind() == Kind::Number.
+  [[nodiscard]] const Json::RawNumber &number() const noexcept {
+    return m_number;
+  }
 
   // Reads the "id" key directly from obj (needs the whole object, not just
-  // a value, to distinguish an absent key from an explicit null). Lossy
-  // for tag == Number: see numberLiteral's doc comment.
+  // a value, to distinguish an absent key from an explicit null). A
+  // Kind::Number result is only as precise as the source QJsonValue --
+  // exact for any qint64-range integer (QJsonValue's underlying
+  // QCborValue preserves int64 precision even though isDouble()/
+  // toDouble() report it as a rounded double; see toInteger()), best-
+  // effort (IEEE-754 double) otherwise. fromRawObject() below is
+  // preferred when the original bytes are available, since it can also
+  // preserve a genuinely fractional/huge-exponent literal exactly.
   [[nodiscard]] static ValueOrError<ExternalDeckId>
   fromObject(const QJsonObject &obj, QStringView path);
   // Precision-preserving equivalent of fromObject(), reading "id" from a
@@ -56,19 +78,30 @@ struct ExternalDeckId {
   // (see RawJson.h) instead of QJsonObject.
   [[nodiscard]] static ValueOrError<ExternalDeckId>
   fromRawObject(const Json::Value &obj, QStringView path);
-  // Undefined when tag == Absent, so callers can omit the key entirely; a
-  // real QJsonValue::Null/String/Double otherwise. Lossy for tag ==
-  // Number: see numberLiteral's doc comment; toJsonLiteral() below is
-  // the lossless equivalent for that case.
+
+  // Lossy, display/log/debug-only conversion: Kind::Number rounds through
+  // a double exactly like the rest of this codebase's non-byte QJsonValue
+  // decoders. NEVER use this to build outbound request bytes -- see
+  // toRawJson() for the lossless equivalent DeckListInput::toJsonBytes()
+  // actually uses.
   [[nodiscard]] QJsonValue toJson() const;
-  // The exact JSON literal to splice into a byte-level encode for this id
-  // (used by DeckListInput::toJsonBytes()); only meaningful for tag ==
-  // Number, where it returns numberLiteral (see that field's doc comment
-  // on the precision-vs-verbatim distinction).
-  [[nodiscard]] const QString &toJsonLiteral() const { return numberLiteral; }
+  // The lossless Json::Value AST fragment for this id, for splicing into
+  // a request built via Json::Value's builder statics (see RawJson.h).
+  // Precondition: kind() != Kind::Absent -- an absent id has no JSON
+  // representation at all (the caller must omit the "id" key from the
+  // enclosing object entirely, not insert some sentinel value); calling
+  // this for Kind::Absent returns Json::Value::makeNull() defensively
+  // (never crashes) but is a caller bug, since it would wrongly encode an
+  // omitted id as an explicit null.
+  [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const ExternalDeckId &,
                          const ExternalDeckId &) = default;
+
+private:
+  Kind m_kind{Kind::Absent};
+  QString m_text;
+  Json::RawNumber m_number;
 };
 
 // The permissive, externally-supplied deck-list shape accepted by
@@ -81,18 +114,26 @@ struct ExternalDeckId {
 struct DeckListInput {
   // Required. Keys need only be non-empty (schema: cardQuantityMapInput);
   // unlike the normalized DeckList, they are not required to look like card
-  // codes.
-  QMap<QString, int> cardSlots;
+  // codes. Values are exact qint64 (see JsonDecode.h::requireIntValue) --
+  // never rounded through a 32-bit int.
+  QMap<QString, qint64> cardSlots;
   // Schema-unconstrained and possibly malformed by design (the fixture
-  // itself supplies a legacy array here); kept as raw JSON exactly as
-  // received so a malformed or absent value can never be mistaken for an
-  // already-normalized empty map. Undefined when the key was absent.
-  QJsonValue sideSlots{QJsonValue::Undefined};
+  // itself supplies a legacy array here); kept as a lossless Json::Value
+  // tree exactly as received (see RawJson.h) rather than a QJsonValue, so
+  // a malformed or absent value can never be mistaken for an
+  // already-normalized empty map, AND any number nested inside it --
+  // however deep -- survives byte-exact through toJsonBytes() rather than
+  // being rounded through a double. Kind::Undefined when the key was
+  // absent. Populated via Json::Value::fromQJson() when decoded through
+  // fromJson() (best-effort: as precise as the source QJsonValue already
+  // is) or read directly from the raw parse tree when decoded through
+  // fromRawBytes() (exact).
+  Json::Value sideSlots;
   // Required. Permissive: may or may not carry the CardCode "c" prefix.
   InvestigatorRef investigatorCode;
   std::optional<QString> investigatorName;
   std::optional<QString> meta;
-  std::optional<int> tabooId;
+  std::optional<qint64> tabooId;
   std::optional<QString> url;
   ExternalDeckId id;
   std::optional<QString> name;
@@ -100,19 +141,28 @@ struct DeckListInput {
   [[nodiscard]] static ValueOrError<DeckListInput> fromJson(const QJsonValue &v,
                                                             QStringView path);
   // Precision-preserving equivalent of fromJson(): every field decodes
-  // identically, except `id`'s numeric variant keeps its exact source
-  // literal (see ExternalDeckId::numberLiteral) instead of being rounded
-  // through a double by QJsonDocument before this type ever sees it.
-  // Callers with the original request/response bytes should prefer this
-  // over fromJson().
+  // identically, except `id`'s numeric variant and `sideSlots` (including
+  // any number nested inside it) keep their exact source literal(s)
+  // instead of being rounded through a double by QJsonDocument before
+  // this type ever sees them. Callers with the original request/response
+  // bytes should prefer this over fromJson().
   [[nodiscard]] static ValueOrError<DeckListInput>
   fromRawBytes(QByteArrayView bytes, QStringView path);
   [[nodiscard]] QJsonObject toJson() const;
-  // Precision-preserving equivalent of toJson(): identical bytes except
-  // `id`'s numeric variant is spliced in from its canonicalized source
-  // literal (see ExternalDeckId::numberLiteral) rather than re-encoded
-  // through a double.
-  [[nodiscard]] QByteArray toJsonBytes() const;
+  // The lossless Json::Value AST fragment for this request body (see
+  // RawJson.h); used by toJsonBytes() below and by any enclosing request
+  // (e.g. CreateDeckRequest, ChooseDeckRequest) that needs to splice a
+  // whole DeckListInput into a larger AST without a lossy
+  // encode-then-reparse round trip.
+  [[nodiscard]] Json::Value toRawJson() const;
+  // Precision-preserving equivalent of toJson(): builds the complete
+  // request as a lossless Json::Value AST (see RawJson.h) and serializes
+  // it once, so `id`'s numeric variant and any number nested inside
+  // `sideSlots` are encoded byte-exact rather than re-encoded through a
+  // double. Returns a typed failure rather than ever falling back to a
+  // lossy encoding (e.g. if `id`/`sideSlots` somehow could not be
+  // serialized -- see Json::Value::toJsonBytes()'s own failure cases).
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const DeckListInput &,
                          const DeckListInput &) = default;
@@ -123,12 +173,12 @@ struct DeckListInput {
 // merely permits) each key while still allowing several to carry an
 // explicit JSON null value.
 struct DeckList {
-  QMap<CardCode, int> cardSlots;
-  QMap<CardCode, int> sideSlots;
+  QMap<CardCode, qint64> cardSlots;
+  QMap<CardCode, qint64> sideSlots;
   CardCode investigatorCode;
   QString investigatorName;
   std::optional<QString> meta;
-  std::optional<int> tabooId;
+  std::optional<qint64> tabooId;
   std::optional<QString> url;
   std::optional<QString> id;
   std::optional<QString> name;
@@ -143,7 +193,7 @@ struct DeckList {
 // A saved deck, as returned by the deck list/detail endpoints.
 struct Deck {
   DeckId id;
-  int userId{0};
+  qint64 userId{0};
   std::optional<QString> url;
   QString name;
   QString investigatorName;
@@ -175,7 +225,7 @@ struct CreateDeckRequest {
   [[nodiscard]] QJsonObject toJson() const;
   // Precision-preserving equivalent of toJson(); see
   // DeckListInput::toJsonBytes().
-  [[nodiscard]] QByteArray toJsonBytes() const;
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const CreateDeckRequest &,
                          const CreateDeckRequest &) = default;

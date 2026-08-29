@@ -161,13 +161,30 @@ enum class CardCostTag {
 };
 class CardCost {
 public:
-  [[nodiscard]] static CardCost staticCost(int amount);
+  [[nodiscard]] static CardCost staticCost(qint64 amount);
   [[nodiscard]] static CardCost dynamicCost();
   [[nodiscard]] static CardCost discardAmountCost();
   [[nodiscard]] static CardCost deferredCost();
-  [[nodiscard]] static CardCost maxDynamicCost(QJsonValue contents);
-  [[nodiscard]] static CardCost anyMatchingCardCost(QJsonValue contents);
-  [[nodiscard]] static CardCost matchingEnemyFieldCost(QJsonValue contents);
+  // Rejects QJsonValue::Undefined contents (a caller must supply an
+  // explicit, present JSON value -- the schema leaves its shape
+  // unconstrained, but "unconstrained" is not the same as "may be
+  // omitted") -- see class comment.
+  [[nodiscard]] static ValueOrError<CardCost>
+  maxDynamicCost(QJsonValue contents);
+  [[nodiscard]] static ValueOrError<CardCost>
+  anyMatchingCardCost(QJsonValue contents);
+  // Additionally requires `contents` to be a JSON array of exactly two
+  // elements: the pinned backend's `MatchingEnemyFieldCost EnemyMatcher
+  // EnemyCostField` (Arkham.Card.Cost, backend commit 6a1befbd7b) is a
+  // genuine two-argument constructor, and Aeson's default TaggedObject
+  // derivation for a multi-argument constructor encodes `contents` as a
+  // JSON array of exactly that many elements -- so, unlike
+  // MaxDynamicCost/AnyMatchingCardCost's single-argument constructors,
+  // this tag's wire shape is NOT actually schema-unconstrained despite
+  // catalog.schema.json's conservative `contents: {}`. The two elements'
+  // own internal structure remains genuinely unconstrained.
+  [[nodiscard]] static ValueOrError<CardCost>
+  matchingEnemyFieldCost(QJsonValue contents);
 
   [[nodiscard]] static ValueOrError<CardCost> fromJson(const QJsonValue &v,
                                                        QStringView path);
@@ -175,7 +192,7 @@ public:
 
   [[nodiscard]] CardCostTag tag() const noexcept { return m_tag; }
   // Populated only when tag() == CardCostTag::StaticCost.
-  [[nodiscard]] std::optional<int> staticAmount() const noexcept {
+  [[nodiscard]] std::optional<qint64> staticAmount() const noexcept {
     return m_staticAmount;
   }
   // Populated only when tag() is MaxDynamicCost / AnyMatchingCardCost /
@@ -194,7 +211,7 @@ private:
   CardCost() = default;
 
   CardCostTag m_tag{CardCostTag::DynamicCost};
-  std::optional<int> m_staticAmount;
+  std::optional<qint64> m_staticAmount;
   QJsonValue m_rawContents{QJsonValue::Undefined};
   QJsonObject m_unknownRaw;
 };
@@ -204,7 +221,7 @@ private:
 // SkillIcon/CardCost above, the private constructor/validated factories
 // make every inconsistent state unrepresentable (in particular, the
 // StaticWithPerPlayer/ByPlayerCount factories take their fixed-arity
-// payload as separate int parameters rather than a QList<int>, so a
+// payload as separate qint64 parameters rather than a QList<qint64>, so a
 // wrong-size list can never be constructed in the first place). An
 // unrecognized tag decodes to Tag::Unknown, preserving the complete raw
 // object; note this is distinct from the *known* backend tag literally
@@ -222,12 +239,12 @@ enum class GameValueTag {
 };
 class GameValue {
 public:
-  [[nodiscard]] static GameValue staticValue(int amount);
-  [[nodiscard]] static GameValue perPlayer(int amount);
-  [[nodiscard]] static GameValue staticWithPerPlayer(int staticAmount,
-                                                     int perPlayerAmount);
-  [[nodiscard]] static GameValue byPlayerCount(int oneOrTwo, int three,
-                                               int four, int fiveOrMore);
+  [[nodiscard]] static GameValue staticValue(qint64 amount);
+  [[nodiscard]] static GameValue perPlayer(qint64 amount);
+  [[nodiscard]] static GameValue staticWithPerPlayer(qint64 staticAmount,
+                                                     qint64 perPlayerAmount);
+  [[nodiscard]] static GameValue byPlayerCount(qint64 oneOrTwo, qint64 three,
+                                               qint64 four, qint64 fiveOrMore);
   [[nodiscard]] static GameValue valueX();
   [[nodiscard]] static GameValue valueStar();
   [[nodiscard]] static GameValue valueUnknown();
@@ -238,11 +255,11 @@ public:
 
   [[nodiscard]] GameValueTag tag() const noexcept { return m_tag; }
   // Populated only for tag() == Static/PerPlayer.
-  [[nodiscard]] std::optional<int> singleAmount() const noexcept {
+  [[nodiscard]] std::optional<qint64> singleAmount() const noexcept {
     return m_singleAmount;
   }
   // Size 2 for StaticWithPerPlayer, 4 for ByPlayerCount, empty otherwise.
-  [[nodiscard]] const QList<int> &contents() const noexcept {
+  [[nodiscard]] const QList<qint64> &contents() const noexcept {
     return m_contents;
   }
   // Tag::Unknown only: the complete raw decoded object, preserved verbatim.
@@ -256,8 +273,8 @@ private:
   GameValue() = default;
 
   GameValueTag m_tag{GameValueTag::ValueX};
-  std::optional<int> m_singleAmount;
-  QList<int> m_contents;
+  std::optional<qint64> m_singleAmount;
+  QList<qint64> m_contents;
   QJsonObject m_unknownRaw;
 };
 
@@ -269,7 +286,23 @@ private:
 // toJson(), so a round trip of an untouched fixture entry is byte-faithful
 // modulo key order. Required fields are cardCode, name, cardType, and art;
 // every other field is optional, decoding to std::nullopt / an empty
-// container when absent. The schema types level/victoryPoints/
+// container when absent.
+//
+// Deliberate additive-field policy: any top-level object key this type
+// does not itself model is silently ignored by fromJson() (the schema's
+// implicit `additionalProperties: true`), not rejected. This is
+// intentional forward-compatible leniency for a read-only response type --
+// CardDef is decoded from the card catalog endpoint and is never itself
+// re-encoded as part of an outbound request, so tolerating a field this
+// client version does not yet recognize carries no outbound-safety risk
+// (contrast with e.g. CampaignOption/CampaignOptionRequest's split, where
+// only the closed *Request side must reject anything unrecognized because
+// it IS submitted). Every field this type does model is still validated
+// exactly: a known field's wrong JSON type, a required field's absence, or
+// a malformed value for a field with real constraints (duplicate
+// uniqueItems entries, wrong outer array/object shape, etc.) is a hard
+// decode failure, never silently dropped into "absent" -- only genuinely
+// *unrecognized* keys are ignored. The schema types level/victoryPoints/
 // vengeancePoints/overrideActionPlayableIfCriteriaMet/permanent/
 // encounterSet/encounterSetQuantity/unique/doubleSided/exceptional/
 // playableFromDiscard/stage/grantedXp/canReplace/skipPlayWindows/
@@ -286,29 +319,29 @@ struct CardDef {
 
   std::optional<CardName> revealedName;
   std::optional<CardCost> cost;
-  std::optional<int> level;
+  std::optional<qint64> level;
   std::optional<CardSubType> cardSubType;
   QList<ClassSymbol> classSymbols;
   QList<SkillIcon> skills;
   QStringList cardTraits;
   QStringList revealedCardTraits;
   std::optional<Revelation> revelation;
-  std::optional<int> victoryPoints;
-  std::optional<int> vengeancePoints;
+  std::optional<qint64> victoryPoints;
+  std::optional<qint64> vengeancePoints;
   std::optional<bool> overrideActionPlayableIfCriteriaMet;
   std::optional<bool> permanent;
   std::optional<QString> encounterSet;
-  std::optional<int> encounterSetQuantity;
+  std::optional<qint64> encounterSetQuantity;
   std::optional<bool> unique;
   std::optional<bool> doubleSided;
   std::optional<bool> exceptional;
   std::optional<bool> playableFromDiscard;
-  std::optional<int> stage;
+  std::optional<qint64> stage;
   QList<SlotType> cardSlots;
   QList<CardCode> alternateCardCodes;
-  std::optional<int> grantedXp;
+  std::optional<qint64> grantedXp;
   std::optional<bool> canReplace;
-  QList<std::pair<int, CardCode>> bondedWith;
+  QList<std::pair<qint64, CardCode>> bondedWith;
   std::optional<bool> skipPlayWindows;
   std::optional<bool> beforeEffect;
   std::optional<CardCode> otherSide;
