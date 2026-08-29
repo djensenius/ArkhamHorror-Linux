@@ -262,6 +262,23 @@ void SessionCoordinator::switchProfile(const QString &profileId) {
     return; // superseded while currentUserChanged() was being delivered
   }
 
+  // Publish a coherent non-SignedIn transitional snapshot (cleared
+  // identity, Loading state) BEFORE the selected profile itself changes
+  // below. Without this, a reentrant observer of the selectedProfileChanged()
+  // emission further down could see the NEW profile while state() still
+  // reported the OLD session's SignedIn (setState() was previously only
+  // reached later, inside startProbe()) -- letting e.g. a directly
+  // connected selectedProfileChanged()/currentUserChanged() handler that
+  // calls signOut() delete the NEW profile's token while believing it was
+  // still authenticated as the profile being left. Every subsequent
+  // notification below re-checks self/generation, so a reentrant handler
+  // observes either the complete old snapshot or this complete transition
+  // snapshot -- never a hybrid of the two.
+  setState(State::Loading);
+  if (!self || generation != self->m_generation) {
+    return; // superseded while stateChanged() was being delivered
+  }
+
   m_selectedProfileId = profileId;
   m_currentProfile = *it;
   emit selectedProfileChanged();
@@ -537,25 +554,15 @@ void SessionCoordinator::deleteRestoredUnauthorizedToken(
                    if (deleteResult.outcome == TokenStoreOutcome::Success) {
                      self->clearCurrentUserAndSetStateIfCurrent(
                          generation, State::SignedOut);
-                     return;
                    }
-                   // A failed required deletion is left un-dequeued at the
-                   // head of this profile's FIFO (see startFrontTokenOp())
-                   // regardless of |generation|: durable cleanup is never
-                   // abandoned just because the UI/session moved on. Only
-                   // the visible state transition below is generation-
-                   // gated.
-                   if (generation != self->m_generation) {
-                     return;
-                   }
-                   self->m_retryAction = [self, profileId] {
-                     if (!self) {
-                       return;
-                     }
-                     self->retryStuckProfileTokenOp(profileId);
-                   };
-                   self->setState(State::SecureStorageUnavailable,
-                                  deleteResult.diagnostic);
+                   // On failure, nothing further to do here: the central
+                   // FIFO dispatch (see startFrontTokenOp()) has already
+                   // left the delete stalled and, if this profile is
+                   // still the coordinator's current one, has already
+                   // reinstalled an actionable retry() and surfaced
+                   // SecureStorageUnavailable -- unconditionally,
+                   // regardless of whether |generation| (the session that
+                   // originally triggered this cleanup) is still current.
                  });
 }
 
@@ -656,11 +663,12 @@ void SessionCoordinator::handleFreshTokenResult(
 void SessionCoordinator::signOut() {
   if (m_state != State::SignedIn || !m_currentProfile.has_value()) {
     // Also covers a signOut() already in progress: the very first call to
-    // reach this point transitions to SigningOut below before enqueuing
-    // anything, so a reentrant call (from within that transition's
-    // stateChanged() emission) or a merely duplicate call sees m_state !=
-    // SignedIn here and is rejected as a safe, idempotent no-op -- it can
-    // never bump the generation again or enqueue a second deletion.
+    // reach this point transitions to SigningOut below (after the delete
+    // is already reserved) so a reentrant call (from within that
+    // transition's stateChanged() emission) or a merely duplicate call
+    // sees m_state != SignedIn here and is rejected as a safe, idempotent
+    // no-op -- it can never bump the generation again or enqueue a second
+    // deletion.
     return;
   }
   cancelPendingAuthRequest();
@@ -675,17 +683,19 @@ void SessionCoordinator::signOut() {
   ++m_generation;
   const quint64 generation = m_generation;
   QPointer<SessionCoordinator> self(this);
-  setState(State::SigningOut);
-  if (!self || generation != self->m_generation) {
-    // A directly-connected stateChanged() handler reentrantly called
-    // start()/switchProfile()/signOut() again, or destroyed the
-    // coordinator, while this emission was being delivered: never enqueue
-    // a deletion for a session that is no longer current (or `this` that
-    // may no longer exist). Note the reentrant signOut() case above is
-    // itself already rejected by the guard at the top of this function,
-    // since m_state was set to SigningOut before the emission.
-    return;
-  }
+
+  // Reserve the durable deletion BEFORE any notification is emitted.
+  // enqueueTokenOp() is a plain, non-signal-emitting FIFO mutation (and
+  // ITokenStore's own dispatch is itself asynchronous per its contract),
+  // so recording the obligation here -- rather than after the SigningOut
+  // transition below, as a previous version of this function did --
+  // guarantees it survives even if a directly-connected observer of that
+  // transition reentrantly calls start()/switchProfile()/signOut() again
+  // and bumps the generation further. Durable cleanup must never depend
+  // on the generation surviving a notification it would otherwise be
+  // emitted alongside; the required-delete failure path itself is also no
+  // longer generation-gated (see startFrontTokenOp()'s central retry
+  // reinstatement), so this obligation remains actionable regardless.
   enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
                  [self, generation, profileId](TokenStoreResult result) {
                    if (!self) {
@@ -694,6 +704,20 @@ void SessionCoordinator::signOut() {
                    self->handleSignOutDeletionResult(generation, profileId,
                                                      result);
                  });
+
+  // A pathological (test-only) synchronously-completing ITokenStore may
+  // already have invoked the callback above and moved m_state past
+  // SignedIn (e.g. straight to SignedOut on immediate success, or to
+  // SecureStorageUnavailable via the central FIFO dispatcher on immediate
+  // failure) before this line ever runs. Only publish the SigningOut
+  // transition if that has not happened, so this call can never clobber
+  // an already-correct, more-current state with a stale "still signing
+  // out" label.
+  if (!self || generation != self->m_generation ||
+      self->m_state != State::SignedIn) {
+    return;
+  }
+  setState(State::SigningOut);
 }
 
 void SessionCoordinator::handleSignOutDeletionResult(
@@ -701,22 +725,16 @@ void SessionCoordinator::handleSignOutDeletionResult(
     const TokenStoreResult &result) {
   if (result.outcome == TokenStoreOutcome::Success) {
     clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut);
-    return;
   }
-  // Never claim signed out while the token might still remain in the
-  // secure store: report an explicit, retryable failure instead. The
-  // failed Delete is left un-dequeued at the head of this profile's FIFO
-  // (see startFrontTokenOp()) regardless of |generation|, so it durably
-  // blocks any later same-profile operation until retryStuckProfileTokenOp()
-  // succeeds -- this is never abandoned just because the UI/session moved
-  // on. Only the visible state transition below is generation-gated; the
-  // signed-in identity is preserved (not cleared) so the UI can still show
-  // who is signed in while the user retries.
-  if (generation != m_generation) {
-    return;
-  }
-  m_retryAction = [this, profileId] { retryStuckProfileTokenOp(profileId); };
-  setState(State::SecureStorageUnavailable, result.diagnostic);
+  // On failure, nothing further to do here: the central FIFO dispatch
+  // (see startFrontTokenOp()) has already left the delete stalled at the
+  // head of |profileId|'s queue and, if that profile is still the
+  // coordinator's current one, has already reinstalled an actionable
+  // retry() action and surfaced SecureStorageUnavailable -- unconditionally,
+  // regardless of whether |generation| (the session that originally
+  // called signOut()) is still current. Retryability for a required
+  // delete must never depend on that original generation surviving (see
+  // the class-level FIFO/durability comments in SessionCoordinator.h).
 }
 
 // ─── Retry ───────────────────────────────────────────────────────────────
@@ -843,15 +861,45 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
       // the head of the FIFO (un-dequeued) so it durably blocks every
       // later same-profile operation until retryStuckProfileTokenOp()
       // successfully re-dispatches this exact op (same opId, new
-      // attemptId). Its onComplete is still invoked (below) so the caller
-      // can surface the failure/retry action, but the FIFO does not
-      // advance.
-      self->m_profileFifoStalled.insert(
-          profileId,
+      // attemptId).
+      const QString stallDiagnostic =
           result.diagnostic.isEmpty()
               ? QStringLiteral("A required secure-store deletion failed "
                                "and must be retried.")
-              : result.diagnostic);
+              : result.diagnostic;
+      self->m_profileFifoStalled.insert(profileId, stallDiagnostic);
+
+      // Retryability for a required delete must derive from this durable
+      // per-profile FIFO/stalled state, not from whatever UI generation
+      // originally enqueued the op: an op's onComplete continuation below
+      // is a fixed closure captured once at enqueue time, so if the
+      // coordinator's generation has since moved on (e.g. the profile was
+      // switched away from and back, or start() restarted while this
+      // retry was in flight), that continuation's own generation check
+      // would otherwise silently drop the retry action forever even
+      // though this profile may still be the one currently selected. Make
+      // this profile's retry() action authoritative here instead,
+      // unconditionally, whenever it is still the current profile --
+      // regardless of |generation|. If the UI has moved to a different
+      // profile, no state is published here; the obligation itself (via
+      // m_profileFifoStalled) remains and is enforced/surfaced again by
+      // startCredentialRestore() the next time this profile becomes
+      // current.
+      if (self->m_currentProfile.has_value() &&
+          self->m_currentProfile->profileId() == profileId) {
+        self->m_retryAction = [self, profileId] {
+          if (!self) {
+            return;
+          }
+          self->retryStuckProfileTokenOp(profileId);
+        };
+        self->setState(State::SecureStorageUnavailable, stallDiagnostic);
+      }
+
+      // The original per-call onComplete may still react to this failure
+      // for its own generation-gated purposes (e.g. identity handling);
+      // it must never be relied upon as the sole source of truth for
+      // whether a retry action exists (see above).
       const ITokenStore::ResultCallback &onComplete = it->head().onComplete;
       if (onComplete) {
         onComplete(result);
@@ -940,11 +988,16 @@ void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
   // cleanup always runs after whatever the in-flight Save ends up doing.
   enqueueTokenOp(profileId, TokenOpKind::Delete, QString(),
                  [](TokenStoreResult) {
-                   // No coordinator-visible reaction: this compensating
-                   // cleanup exists purely to remove a possibly-leaked
-                   // token. A failure here still leaves the profile's FIFO
-                   // durably stalled (see startFrontTokenOp()) and will be
-                   // surfaced the next time that profile becomes current
+                   // No profile-specific reaction needed here: this
+                   // compensating cleanup exists purely to remove a
+                   // possibly-leaked token. A failure here still leaves
+                   // the profile's FIFO durably stalled (see
+                   // startFrontTokenOp()) -- startFrontTokenOp()'s own
+                   // central dispatch immediately surfaces
+                   // SecureStorageUnavailable and reinstalls retry() if
+                   // this profile already is the current one at the
+                   // moment of failure, or otherwise the obligation is
+                   // surfaced the next time this profile becomes current
                    // again (see startCredentialRestore()'s stalled check).
                  });
 }

@@ -107,12 +107,19 @@ public:
     SignedIn,                 ///< A validated session is active.
     SigningOut,               ///< signOut() has enqueued a durable token
                               ///< deletion that has not yet succeeded.
-                              ///< Installed synchronously before the
-                              ///< deletion is enqueued so a reentrant or
-                              ///< duplicate signOut() call (m_state is no
-                              ///< longer SignedIn) is a safe no-op rather
-                              ///< than bumping the generation or enqueuing
-                              ///< a second deletion.
+                              ///< The deletion is reserved (enqueued)
+                              ///< BEFORE this state is published, so a
+                              ///< reentrant observer of this transition
+                              ///< can never cause the deletion itself to
+                              ///< be dropped; the state is then installed
+                              ///< only if still SignedIn (a synchronously-
+                              ///< completing store may already have moved
+                              ///< state further). Once installed, a
+                              ///< reentrant or duplicate signOut() call
+                              ///< (m_state is no longer SignedIn) is a
+                              ///< safe no-op rather than bumping the
+                              ///< generation or enqueuing a second
+                              ///< deletion.
     Incompatible,             ///< The server failed compatibility evaluation.
     SecureStorageUnavailable, ///< The secure token store is locked,
                               ///< unavailable, denied access, rejected
@@ -192,7 +199,12 @@ public slots:
   // capability probe instance, advances the operation generation (so any
   // still-in-flight, uncancellable token-store completion for the previous
   // profile can never mutate state for the new one), and restarts the
-  // capability probe for the new profile.
+  // capability probe for the new profile. The observable transition itself
+  // is published as a coherent snapshot: identity is cleared and state is
+  // set to a non-SignedIn transitional value BEFORE the selected profile
+  // is reassigned and selectedProfileChanged() is emitted, so a reentrant
+  // observer of any of these signals can never see a hybrid of the OLD
+  // session's SignedIn state paired with the NEW profile's identity.
   void switchProfile(const QString &profileId);
 
   // Issues POST /authenticate for the current profile. Only usable while
@@ -214,22 +226,25 @@ public slots:
   void registerAccount(const QString &email, const QString &username,
                        const QString &password);
 
-  // Only usable while SignedIn. Synchronously transitions to SigningOut
-  // (before enqueuing anything), cancels any in-flight session network
-  // work, enqueues a durable token deletion for the current profile, and
-  // becomes SignedOut only once that deletion succeeds. Because the
-  // SigningOut transition happens first and m_state is no longer SignedIn
-  // once it is delivered, a reentrant (from within the stateChanged()
-  // emission) or merely duplicate signOut() call is a safe, idempotent
-  // no-op: it can never bump the generation or enqueue a second deletion.
-  // On deletion failure, the signed-in identity is preserved and the
-  // coordinator reports SecureStorageUnavailable with an actionable
-  // retry(); it never claims SignedOut while a token might still remain in
-  // the secure store. If the profile is switched away from while a
-  // deletion is pending or has failed, the obligation to delete is
-  // retained for that profile (see the FIFO/credential-epoch machinery
-  // below) and is enforced again before any future restore/auth/save for
-  // it, independent of the coordinator's current generation/selection.
+  // Only usable while SignedIn. Reserves (enqueues) the durable token
+  // deletion for the current profile FIRST, then transitions to
+  // SigningOut only if still SignedIn (a synchronously-completing store
+  // may already have moved state further) -- never the reverse -- so a
+  // reentrant observer of the SigningOut transition can never cause the
+  // deletion itself to be dropped. Cancels any in-flight session network
+  // work and becomes SignedOut only once that deletion succeeds. Because
+  // m_state is no longer SignedIn once the transition is delivered, a
+  // reentrant (from within the stateChanged() emission) or merely
+  // duplicate signOut() call is a safe, idempotent no-op: it can never
+  // bump the generation or enqueue a second deletion. On deletion failure,
+  // the signed-in identity is preserved and the coordinator reports
+  // SecureStorageUnavailable with an actionable retry(); it never claims
+  // SignedOut while a token might still remain in the secure store. If
+  // the profile is switched away from while a deletion is pending or has
+  // failed, the obligation to delete is retained for that profile (see
+  // the FIFO/credential-epoch machinery below) and is enforced again
+  // before any future restore/auth/save for it, independent of the
+  // coordinator's current generation/selection.
   void signOut();
 
   // Re-runs whatever stage most recently failed (profile load/save,
@@ -333,6 +348,15 @@ private:
   // generation only ever suppresses *state* mutation, never this
   // durable-cleanup bookkeeping. See ProfileTokenDispatch above for how
   // concurrent/duplicate dispatch of that same stalled head is prevented.
+  // The actionable retry() action and the visible SecureStorageUnavailable
+  // state on such a failure are themselves installed centrally, inside
+  // startFrontTokenOp()'s own completion handling, gated only on whether
+  // |profileId| is still the coordinator's *current* profile -- never on
+  // whatever UI generation happened to be current when the failed op was
+  // originally enqueued. A per-call onComplete continuation's own
+  // generation guard would otherwise permanently lose the retry action if
+  // the same op fails again after the profile was switched away from and
+  // back (or start() restarted) in between.
   void enqueueTokenOp(const QString &profileId, TokenOpKind kind, QString token,
                       ITokenStore::ResultCallback onComplete);
   void startFrontTokenOp(const QString &profileId);

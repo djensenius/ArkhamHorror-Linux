@@ -45,10 +45,23 @@ The current walking skeleton establishes:
   completion is only ever applied to the queue if it matches both IDs --
   so a duplicate retry, an overlapping `retry()` call, or a replayed/stale
   store callback can never redispatch concurrently or corrupt a later,
-  unrelated operation's result. An explicit `SigningOut` state is set
-  synchronously before `signOut()`'s durable delete is enqueued, so a
-  reentrant or ordinary duplicate `signOut()` call while one is already in
-  flight is a safe no-op rather than a second enqueued deletion. Every emission
+  unrelated operation's result. A required deletion's actionable `retry()`
+  action and its visible `SecureStorageUnavailable` state are installed
+  centrally (inside the FIFO dispatcher itself, gated only on whether the
+  profile is still the one currently selected), not by the original
+  per-call continuation, so a retry does not silently become
+  un-actionable merely because the UI switched away and back (or
+  restarted) while it was outstanding. `signOut()` reserves (enqueues) its
+  durable delete FIRST and only then publishes the explicit `SigningOut`
+  state -- and only if still `SignedIn` -- so a directly-connected
+  reentrant observer of that transition can never cause the deletion
+  itself to be dropped; once published, a reentrant or ordinary duplicate
+  `signOut()` call while one is already in flight is a safe no-op rather
+  than a second enqueued deletion. `switchProfile()` similarly publishes a
+  coherent non-`SignedIn` transitional snapshot (cleared identity, before
+  the profile itself changes) so a reentrant observer of
+  `selectedProfileChanged()` can never see the new profile's identity
+  paired with the old session's stale `SignedIn` state. Every emission
   that can reenter the coordinator (`stateChanged`, `currentUserChanged`,
   `selectedProfileChanged`) is guarded so a directly-connected reentrant
   `switchProfile()`/`start()`/`signOut()`/destruction during that emission

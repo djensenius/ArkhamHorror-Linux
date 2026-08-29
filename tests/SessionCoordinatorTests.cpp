@@ -619,6 +619,13 @@ private slots:
   void coordinatorDestructionDuringStateChangedEmissionIsSafe();
   void
   directCurrentUserChangedReentrancyDuringStartFromSignedInDestroysSafely();
+  void
+  directStateChangedReentrancyDuringSigningOutSwitchProfileCannotAbandonDelete();
+  void directStateChangedReentrancyDuringSigningOutStartCannotAbandonDelete();
+  void
+  directSelectedProfileChangedReentrancySignOutCannotDeleteWrongProfileDuringSwitch();
+  void
+  directCurrentUserChangedReentrancyDuringSwitchSignsOutOldProfileNotNewProfile();
 
   // Secret-free diagnostics
   void diagnosticsAndStateNeverContainSecrets();
@@ -1800,19 +1807,27 @@ void SessionCoordinatorTests::
 void SessionCoordinatorTests::
     retryCannotConcurrentlyRedispatchStalledDeleteAndDuplicateCallbackCannotDequeueNextOp() {
   // Exact regression from review: a required Delete fails and stalls; a
-  // retry is dispatched but held (not yet resolved); a SECOND retry call
-  // while the first attempt is still outstanding must be a complete no-op
-  // (no second store dispatch, no overlap recorded). Only after the held
-  // attempt completes may the queued restore Read dispatch -- and a
-  // replayed/duplicate delivery of the (now stale) delete-success
-  // callback must not be able to dequeue/corrupt that Read.
+  // retry is dispatched but held (not yet resolved). While that attempt is
+  // STILL outstanding, a genuine production path (start() -> probe
+  // completion -> startCredentialRestore()'s stalled check) re-installs
+  // the profile's retry() action -- this is deliberate: the previous
+  // version of this test merely called retry() a second/third time
+  // immediately, which found m_retryAction already null (retry() always
+  // consumes it via std::exchange) and therefore never even reached
+  // retryStuckProfileTokenOp()/startFrontTokenOp()'s real inFlight guard.
+  // That made the "no second dispatch" assertions vacuously true. Here,
+  // the second retry() call is only possible because a real code path put
+  // a fresh action in place, so reaching the inFlight guard -- and being
+  // rejected by it -- is what this test actually exercises: removing the
+  // guard, or breaking its opId/attemptId matching, must make this test
+  // fail. A duplicate/stale delete-attempt callback is then replayed to
+  // prove it cannot dequeue/corrupt the still-queued restore Read, the
+  // held attempt is finally failed again to prove the centralized
+  // (generation-independent) retry-reinstatement from finding #3, and
+  // that reinstated retry is used to actually resolve the deletion so the
+  // queued Read can finally dispatch and the coordinator reaches its
+  // correct final state.
   Harness h;
-  const ServerProfile hosted = ServerProfile::hostedDefault();
-  const auto customProfile = ServerProfile::custom(
-      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
-  QVERIFY(customProfile.has_value());
-  h.profileStore.profiles = {hosted, *customProfile};
-  h.profileStore.selectedId = hosted.profileId();
   bootToSignedIn(h, QStringLiteral("session-token"));
   const QString profileId = h.coordinator->selectedProfileId();
 
@@ -1824,16 +1839,26 @@ void SessionCoordinatorTests::
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
   }));
-  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete (attempt #1)
 
-  // Switch away and back while the deletion is still stuck: this enqueues
-  // a fresh restore Read behind the stalled delete, giving us a genuine
-  // "next op" that must not be corrupted by a later duplicate/stale
-  // delete callback.
-  h.coordinator->switchProfile(customProfile->profileId());
-  QVERIFY(
-      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
-  h.coordinator->switchProfile(profileId);
+  // First retry: dispatches attempt #2 of the same logical delete op
+  // (same opId, new attemptId), but it is held unresolved for the rest of
+  // this test until explicitly completed below.
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("delete"));
+
+  // A genuine production path re-installs the retry action while attempt
+  // #2 is still outstanding: start() restarts the whole session (a fresh
+  // probe, re-selecting the SAME still-current profile), and once that
+  // new probe reports Compatible, startCredentialRestore() observes this
+  // profile is still stalled (the delete attempt is unresolved) and
+  // re-installs m_retryAction -- without touching the real ITokenStore at
+  // all, since the enqueued restore Read simply queues behind the
+  // still-in-flight delete.
+  h.coordinator->start();
   QVERIFY(
       pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
   h.probeFactory.current()->complete(compatibleProbeResult());
@@ -1841,46 +1866,65 @@ void SessionCoordinatorTests::
     return h.coordinator->state() ==
            SessionCoordinator::State::SecureStorageUnavailable;
   }));
-  QCOMPARE(h.tokenStore.calls.size(), 3); // still no new dispatch: still stuck
+  QCOMPARE(h.tokenStore.calls.size(), 4); // no new store dispatch yet
 
-  // First retry: dispatches attempt #2 of the same logical delete op, but
-  // holds it unresolved.
-  h.coordinator->retry();
-  QVERIFY(pumpEventsUntil(
-      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
-  QCOMPARE(h.tokenStore.calls.size(), 4);
-  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("delete"));
-
-  // A second (and third) retry call while the first attempt is still
-  // outstanding must be entirely refused by the central dispatch guard:
-  // no additional store call, and the fake never observes an overlapping
-  // dispatch for this profile.
-  h.coordinator->retry();
+  // The second retry() call now genuinely reaches
+  // retryStuckProfileTokenOp()/startFrontTokenOp(): it must be rejected by
+  // the real dispatch.inFlight guard (attempt #2 is still outstanding), so
+  // no additional store call is issued and no overlapping dispatch is ever
+  // observed by the fake. If the guard (or its opId/attemptId matching)
+  // were removed, this would instead dispatch a concurrent second delete.
   h.coordinator->retry();
   QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
   QCOMPARE(h.tokenStore.calls.size(), 4);
   QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
 
-  // Complete the held retry attempt successfully: the FIFO may now finally
+  // A stale/duplicate replay of attempt #1's ALREADY-PROCESSED failure
+  // callback (captured before attempt #2 was ever dispatched) must be
+  // rejected by attemptId matching: it must not touch the queue, corrupt
+  // the still-outstanding attempt #2, or feed a result to the queued
+  // restore Read.
+  h.tokenStore.replayLastCompletion(profileId);
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  QCOMPARE(h.tokenStore.calls.size(), 4); // unchanged: no new dispatch
+  QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable); // untouched
+
+  // Fail the held attempt #2 again. Its onComplete continuation was
+  // captured at the ORIGINAL signOut() call's generation, which is now
+  // stale (start() above bumped the generation) -- proving finding #3:
+  // the centralized dispatcher in startFrontTokenOp(), not the stale
+  // per-call continuation, is what reinstates the retry action here,
+  // since this profile is still the coordinator's current one. The state
+  // was already SecureStorageUnavailable before this call and remains so
+  // afterward, so a state-based pumpEventsUntil() predicate here would be
+  // trivially (and vacuously) satisfied without ever pumping the fake's
+  // queued completion through; drain the event loop unconditionally
+  // instead, then prove the completion was actually delivered via the
+  // retry() dispatch immediately below.
+  h.tokenStore.complete(profileId, backendErrorResult());
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::SecureStorageUnavailable);
+
+  // The reinstated retry is genuinely actionable: it dispatches a THIRD
+  // delete attempt.
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 5);
+  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("delete"));
+
+  // Complete the third attempt successfully: the FIFO may now finally
   // advance and dispatch the restore Read that had been queued behind the
   // stuck delete this whole time.
   h.tokenStore.complete(profileId, successWriteResult());
   QVERIFY(pumpEventsUntil(
       [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
-  QCOMPARE(h.tokenStore.calls.size(), 5);
-  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("read"));
+  QCOMPARE(h.tokenStore.calls.size(), 6);
+  QCOMPARE(h.tokenStore.calls.at(5).kind, QStringLiteral("read"));
   QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
-
-  // A duplicate/replayed delivery of the (already-processed) delete
-  // completion must not be able to touch the queue at all now that
-  // dispatch has moved on to the Read: it must not dequeue the Read, feed
-  // it a stale result, or register as an overlapping dispatch.
-  h.tokenStore.replayLastCompletion(profileId);
-  QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-  QCOMPARE(h.tokenStore.calls.size(), 5); // unchanged: no new dispatch
-  QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
-  QCOMPARE(h.coordinator->state(),
-           SessionCoordinator::State::SecureStorageUnavailable); // untouched
 
   // The genuine, still-outstanding Read completes normally and the
   // coordinator reaches its correct final state.
@@ -2282,6 +2326,270 @@ void SessionCoordinatorTests::
   QVERIFY(handled);
   QVERIFY(h.coordinator == nullptr);
   // Reaching this line at all (no crash/UB) is the assertion.
+}
+
+void SessionCoordinatorTests::
+    directStateChangedReentrancyDuringSigningOutSwitchProfileCannotAbandonDelete() {
+  // Exact regression from review: signOut() previously emitted
+  // setState(SigningOut) BEFORE enqueuing the required delete, so a
+  // directly-connected stateChanged() handler observing SigningOut could
+  // call switchProfile() (bumping the generation) and cause the
+  // post-emission guard to return before enqueueTokenOp(Delete) ever ran
+  // -- silently dropping the deletion forever. The fix reserves the
+  // delete BEFORE the SigningOut notification, so it must survive
+  // regardless of what a reentrant observer does afterward.
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  const QString customId = customProfile->profileId();
+
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::stateChanged,
+      h.coordinator.get(),
+      [&h, &handled, customId] {
+        if (handled ||
+            h.coordinator->state() != SessionCoordinator::State::SigningOut) {
+          return;
+        }
+        handled = true;
+        // Reentrantly abandon this profile from inside signOut()'s own
+        // setState(SigningOut) emission.
+        h.coordinator->switchProfile(customId);
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->signOut();
+
+  QVERIFY(handled);
+  // Exactly one delete was ever dispatched for the abandoned profile,
+  // despite the reentrant switch -- the obligation was reserved before
+  // the notification that triggered the switch.
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  const QString actualDeletedProfile = h.tokenStore.calls.at(2).profileId;
+  QVERIFY(actualDeletedProfile == profileId);
+
+  // The reentrant switch fully superseded signOut(): the new profile is
+  // selected.
+  const QString actualSelected = h.coordinator->selectedProfileId();
+  QVERIFY(actualSelected == customId);
+
+  // Completing the reserved delete removes the old profile's token --
+  // returning to it later cannot find a restored credential.
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return !h.tokenStore.hasPending(profileId); }));
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+
+  // The new profile's own flow still proceeds normally afterward.
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, customId] { return h.tokenStore.hasPending(customId); }));
+  h.tokenStore.complete(customId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+
+  // Returning to the abandoned profile confirms the deletion was durable:
+  // there is no token left to restore.
+  h.coordinator->switchProfile(profileId);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+}
+
+void SessionCoordinatorTests::
+    directStateChangedReentrancyDuringSigningOutStartCannotAbandonDelete() {
+  // Same hazard as the switchProfile() variant above, but the reentrant
+  // observer calls start() (a full restart) instead: the required delete
+  // must still survive.
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  const int probesBefore = h.probeFactory.totalCreated();
+
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::stateChanged,
+      h.coordinator.get(),
+      [&h, &handled] {
+        if (handled ||
+            h.coordinator->state() != SessionCoordinator::State::SigningOut) {
+          return;
+        }
+        handled = true;
+        // Reentrantly restart the whole session from inside signOut()'s
+        // own setState(SigningOut) emission.
+        h.coordinator->start();
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->signOut();
+
+  QVERIFY(handled);
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  const QString actualDeletedProfile = h.tokenStore.calls.at(2).profileId;
+  QVERIFY(actualDeletedProfile == profileId);
+  // start() discarded the old probe and created its own fresh one.
+  QCOMPARE(h.probeFactory.totalCreated(), probesBefore + 1);
+
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return !h.tokenStore.hasPending(profileId); }));
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
+
+  // The restarted session's own probe/restore flow completes cleanly,
+  // finding no token (since it was just durably deleted above).
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+}
+
+void SessionCoordinatorTests::
+    directSelectedProfileChangedReentrancySignOutCannotDeleteWrongProfileDuringSwitch() {
+  // Exact regression from review: switchProfile() previously mutated
+  // m_selectedProfileId/m_currentProfile and emitted selectedProfileChanged()
+  // for the NEW profile while state() still reported the OLD profile's
+  // SignedIn (setState() to a non-SignedIn value only happened later,
+  // inside startProbe()). A directly-connected selectedProfileChanged()
+  // handler that called signOut() could therefore observe the NEW
+  // profile's ID alongside the stale SignedIn state and delete the NEW
+  // profile's token -- even though it had never authenticated. The fix
+  // publishes a coherent non-SignedIn transitional snapshot (Loading,
+  // nil user) BEFORE the profile itself changes, so this reentrant
+  // signOut() must now see state() != SignedIn and be rejected as a
+  // no-op, regardless of which profile selectedProfileId() reports.
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  const QString token = QStringLiteral("session-token");
+  bootToSignedIn(h, token);
+  const QString profileId = h.coordinator->selectedProfileId();
+  const QString customId = customProfile->profileId();
+
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::selectedProfileChanged,
+      h.coordinator.get(),
+      [&h, &handled] {
+        if (handled) {
+          return;
+        }
+        handled = true;
+        h.coordinator->signOut();
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->switchProfile(customId);
+
+  QVERIFY(handled);
+  // No delete was ever dispatched: signOut() observed a coherent
+  // non-SignedIn transitional state (never a hybrid of the old SignedIn
+  // state with the new profile's identity) and rejected the call as a
+  // no-op.
+  QCOMPARE(h.tokenStore.calls.size(), 2); // just the original read + save
+  const std::optional<QString> actualStored =
+      h.tokenStore.storedToken(profileId);
+  QVERIFY(actualStored.has_value());
+  QVERIFY(*actualStored == token);
+
+  // The switch itself still proceeds normally.
+  const QString actualSelected = h.coordinator->selectedProfileId();
+  QVERIFY(actualSelected == customId);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, customId] { return h.tokenStore.hasPending(customId); }));
+  h.tokenStore.complete(customId, notFoundResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+}
+
+void SessionCoordinatorTests::
+    directCurrentUserChangedReentrancyDuringSwitchSignsOutOldProfileNotNewProfile() {
+  // A directly-connected currentUserChanged() handler fires earlier in
+  // switchProfile(), while m_currentProfile/m_selectedProfileId still
+  // refer to the OLD profile (they are only reassigned afterward). A
+  // reentrant signOut() from here observes a fully coherent OLD snapshot
+  // (state still SignedIn, current profile still the OLD one, user just
+  // cleared) and so is accepted -- but it must delete the OLD profile's
+  // token, never the new one being switched to, and the generation bump
+  // it causes must cleanly supersede (not corrupt) the outer switch.
+  Harness h;
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  QVERIFY(customProfile.has_value());
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  const QString customId = customProfile->profileId();
+
+  bool handled = false;
+  QObject::connect(
+      h.coordinator.get(), &SessionCoordinator::currentUserChanged,
+      h.coordinator.get(),
+      [&h, &handled] {
+        if (handled) {
+          return;
+        }
+        handled = true;
+        h.coordinator->signOut();
+      },
+      Qt::DirectConnection);
+
+  h.coordinator->switchProfile(customId);
+
+  QVERIFY(handled);
+  // The reentrant signOut() deleted the OLD profile's token specifically
+  // -- never the new one being switched to (which has no token at all).
+  QCOMPARE(h.tokenStore.calls.size(), 3); // read, save, delete
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  const QString actualDeletedProfile = h.tokenStore.calls.at(2).profileId;
+  QVERIFY(actualDeletedProfile == profileId);
+
+  // The reentrant signOut() bumped the generation, superseding the outer
+  // switchProfile() call entirely: the coordinator's own observable
+  // snapshot remains fully coherent on the OLD profile throughout (never
+  // a hybrid), even though the new selection was already persisted to
+  // storage by the time signOut() ran.
+  const QString actualSelected = h.coordinator->selectedProfileId();
+  QVERIFY(actualSelected == profileId);
+
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QVERIFY(!h.tokenStore.storedToken(profileId).has_value());
 }
 
 // ─── Secret-free diagnostics ──────────────────────────────────────────────
