@@ -1,5 +1,7 @@
 #include "TokenEnvelope.h"
 
+#include "TokenValidation.h"
+
 using namespace Qt::StringLiterals;
 
 namespace Arkham {
@@ -16,38 +18,6 @@ TokenEnvelopeParseResult malformed() {
   TokenEnvelopeParseResult result;
   result.outcome = TokenEnvelopeParseOutcome::Malformed;
   return result;
-}
-
-// The backend's actual token grammar (signed JWT compact serialization:
-// base64url segments -- [A-Za-z0-9-_] -- joined by '.') never contains
-// whitespace or control characters, so any parsed token exhibiting these
-// traits is definitively corrupt/tampered data, never a legitimate value
-// that merely needs different handling downstream. Classifying it as
-// Malformed here (a terminal parse failure) rather than letting it through
-// as Parsed is what lets the coordinator's required-delete-then-fresh-flow
-// path actually resolve such an entry, instead of a caller retrying the
-// exact same corrupt read forever under some retryable-looking outcome.
-// This also closes a defense-in-depth gap: a token containing embedded
-// control characters (e.g. CR/LF) must never reach `Authorization: Token
-// <token>` verbatim.
-bool isDefinitivelyInvalidTokenContent(const QString &token) {
-  if (token.isEmpty()) {
-    return true;
-  }
-  if (token != token.trimmed()) {
-    return true; // leading and/or trailing whitespace
-  }
-  for (const QChar &ch : token) {
-    if (ch.isSpace() || ch.category() == QChar::Other_Control) {
-      // ch.isSpace() also catches an entirely whitespace-only token (which
-      // trims to empty and is already excluded above via token.trimmed()
-      // != token unless the token is a single whitespace char -- covered
-      // here regardless); Other_Control catches any embedded control
-      // character that is not whitespace.
-      return true;
-    }
-  }
-  return false;
 }
 } // namespace
 
@@ -123,13 +93,16 @@ TokenEnvelopeParseResult parseTokenEnvelope(const QString &raw) {
       raw.mid(identityStart, static_cast<qsizetype>(identityLength));
   const QString token =
       raw.mid(identityStart + static_cast<qsizetype>(identityLength));
-  if (isDefinitivelyInvalidTokenContent(token)) {
-    // A genuine save always writes a token matching the backend's actual
-    // grammar (see isDefinitivelyInvalidTokenContent()'s own comment): an
-    // empty remainder means the payload was truncated right after the
-    // identity; a whitespace-only, leading/trailing-whitespace, or
-    // control-character-containing remainder means the entry is
-    // corrupt/tampered. None of these are ever a real entry.
+  if (!isValidTokenContent(token)) {
+    // QtKeychainTokenStore::saveToken() rejects any token failing this
+    // exact shared check (see TokenValidation.h) before ever calling
+    // serializeTokenEnvelope(), so a genuine save always writes a token
+    // that would still pass here. A remainder failing it now -- whether
+    // empty (the payload was truncated right after the identity),
+    // whitespace-only, leading/trailing-whitespace, containing an
+    // embedded control character, or containing any other character this
+    // shared validator rejects -- means the entry is corrupt/tampered.
+    // None of these are ever a real entry.
     return malformed();
   }
 

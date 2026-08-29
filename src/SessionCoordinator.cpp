@@ -1,5 +1,7 @@
 #include "SessionCoordinator.h"
 
+#include "TokenValidation.h"
+
 #include <QPointer>
 #include <QSet>
 
@@ -884,6 +886,30 @@ void SessionCoordinator::handleFreshTokenResult(
   if (result.outcome != AuthOutcome::Success) {
     clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut,
                                          result.diagnostic);
+    return;
+  }
+  // Defense-in-depth, independent of which IAuthenticationClient
+  // implementation produced |result|: a production
+  // NetworkAuthenticationClient's AuthToken::fromJson() already rejects
+  // any token failing isValidTokenContent() (see TokenValidation.h)
+  // before ever reporting Success here, but an alternate/fake client (as
+  // used throughout this coordinator's own test suite, and any future
+  // alternate implementation) could still hand back a Success result
+  // carrying a token that never went through that decoder at all. Every
+  // other trust boundary this same token could next cross --
+  // NetworkAuthenticationClient::whoAmI()'s own admission check and
+  // QtKeychainTokenStore::saveToken() -- enforces this exact identical
+  // shared check, so re-validating it here, BEFORE ever calling
+  // issueWhoAmI() or saveFreshlyObtainedToken(), guarantees the same
+  // invariant holds no matter which client implementation is wired in: no
+  // request is ever sent, and nothing is ever saved, for a token this
+  // coordinator's own secure-store layer would immediately classify as
+  // Malformed (and durably delete) on the very next restore.
+  if (!isValidTokenContent(result.value->token)) {
+    clearCurrentUserAndSetStateIfCurrent(
+        generation, State::SignedOut,
+        QStringLiteral(
+            "authentication response did not contain a usable token"));
     return;
   }
   issueWhoAmI(generation, profileId, result.value->token,

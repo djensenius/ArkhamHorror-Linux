@@ -113,6 +113,8 @@ add_library(arkham_foundation STATIC
     src/SessionCoordinator.h
     src/TokenEnvelope.cpp
     src/TokenEnvelope.h
+    src/TokenValidation.cpp
+    src/TokenValidation.h
     src/UrlValidator.cpp
     src/UrlValidator.h
     src/ValueOrError.h

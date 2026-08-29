@@ -21,8 +21,10 @@ enum class TokenStoreOutcome {
   BackendError,    ///< The secure-store backend reported another failure.
   InvalidInput,    ///< The supplied profile ID is not a valid non-nil UUID, the
                    ///< endpoint identity is empty, or (for saveToken()) the
-                   ///< token is empty or whitespace-only. Rejected before any
-                   ///< secure-store operation is attempted.
+                   ///< token fails isValidTokenContent() (see
+                   ///< TokenValidation.h) -- e.g. empty or whitespace-only.
+                   ///< Rejected before any secure-store operation is
+                   ///< attempted.
   BindingMismatch, ///< readToken() found a structurally valid, versioned
                    ///< entry, but it is durably bound (see saveToken()) to a
                    ///< DIFFERENT endpoint than the one the caller currently
@@ -43,11 +45,9 @@ enum class TokenStoreOutcome {
   Malformed,       ///< readToken() found an entry that either declares this
                    ///< store's envelope format but fails strict structural
                    ///< parsing (unsupported version, corrupt framing,
-                   ///< truncated content, or a token portion that is empty,
-                   ///< whitespace-only, has leading/trailing whitespace, or
-                   ///< contains a control character -- see
-                   ///< TokenEnvelope.h's own doc comment on why this
-                   ///< grammar check is included here), or is an entirely
+                   ///< truncated content, or a token portion failing
+                   ///< isValidTokenContent() -- see TokenValidation.h for
+                   ///< that shared grammar), or is an entirely
                    ///< blank/whitespace-only raw payload that predates any
                    ///< envelope framing at all. Both are definitively
                    ///< corrupt/tampered data, never a transient backend
@@ -100,7 +100,9 @@ struct TokenStoreResult {
 //     AccessDenied; it is never treated as "no token" (NotFound) and never
 //     silently degrades to an insecure store.
 //   - profileId is validated as a non-nil UUID, endpointIdentity as
-//     non-empty, and token (on save) as non-empty after trimming; invalid
+//     non-empty, and token (on save) against isValidTokenContent() (see
+//     TokenValidation.h) -- non-empty, no ASCII space, no control
+//     character, no other non-visible-ASCII character; invalid
 //     input yields TokenStoreOutcome::InvalidInput without touching the
 //     backing store.
 //   - A mismatched, legacy (pre-envelope), or malformed entry NEVER yields a

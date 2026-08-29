@@ -34,6 +34,7 @@
 #include "QtKeychainTokenStore.h"
 #include "ServerProfile.h"
 #include "SessionCoordinator.h"
+#include "TokenContentTestData.h"
 #include "TokenEnvelope.h"
 #include "ValueOrError.h"
 
@@ -812,6 +813,9 @@ private slots:
   void signInAuthFailureReturnsSignedOut();
   void signInWhoAmIUnauthorizedDoesNotSaveAndReturnsSignedOut();
   void signInSaveFailureIsSecureStorageUnavailable();
+  void
+  signInFakeClientReturningInvalidTokenContentNeverCallsWhoAmIOrSaves_data();
+  void signInFakeClientReturningInvalidTokenContentNeverCallsWhoAmIOrSaves();
   void signInNoOpWhenProfileNotYetUsable();
   void signInAndRegisterNoOpDuringCredentialRestore();
   void registerAccountSuccessFlow();
@@ -1365,6 +1369,66 @@ void SessionCoordinatorTests::
   }));
   // No save was ever attempted for a token that failed validation.
   QCOMPARE(h.tokenStore.calls.size(), 1); // only the earlier restore read
+}
+
+void SessionCoordinatorTests::
+    signInFakeClientReturningInvalidTokenContentNeverCallsWhoAmIOrSaves_data() {
+  QTest::addColumn<QString>("token");
+  for (const auto &row : Arkham::Test::tokenContentRows()) {
+    if (!row.expectValid) {
+      QTest::newRow(row.name) << row.token;
+    }
+  }
+}
+
+void SessionCoordinatorTests::
+    signInFakeClientReturningInvalidTokenContentNeverCallsWhoAmIOrSaves() {
+  // Defense-in-depth, independent of which IAuthenticationClient
+  // implementation produced the result: tokenSuccess() below builds an
+  // AuthResult<AuthToken> directly (bypassing AuthToken::fromJson()
+  // entirely, exactly like FakeAuthClient does throughout this whole test
+  // suite), so a production NetworkAuthenticationClient's own decode-time
+  // rejection can never be what is under test here. The coordinator's own
+  // handleFreshTokenResult() must still reject every one of this shared
+  // table's invalid samples itself, before ever calling whoAmI() (no
+  // second authClient call) or enqueuing a secure-store save (no new
+  // tokenStore call beyond the earlier restore read), settling to
+  // SignedOut with a secret-free, actionable diagnostic instead.
+  QFETCH(QString, token);
+  Harness h;
+  h.bootToSignedOut();
+  const int tokenStoreCallsBeforeSignIn = h.tokenStore.calls.size();
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  h.authClient.completeToken(1, tokenSuccess(token));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QVERIFY(!h.coordinator->diagnostic().isEmpty());
+  // The diagnostic is always the fixed, static, secret-free message
+  // handleFreshTokenResult() sets for this exact rejection -- never a
+  // value derived from (and so never accidentally containing, whether by
+  // design or by unlucky substring coincidence) the offending token
+  // itself.
+  QCOMPARE(
+      h.coordinator->diagnostic(),
+      QStringLiteral("authentication response did not contain a usable token"));
+  // No currentUser was ever published for this rejected attempt.
+  QVERIFY(h.coordinator->currentUsername().isEmpty());
+  // Exactly the one Authenticate call was ever made -- no whoAmI followed.
+  QCOMPARE(h.authClient.calls.size(), 1);
+  QCOMPARE(h.authClient.calls.first().kind,
+           FakeAuthClient::CallKind::Authenticate);
+  // No new secure-store operation (i.e. no save) was ever attempted.
+  QCOMPARE(h.tokenStore.calls.size(), tokenStoreCallsBeforeSignIn);
+
+  // Give the event loop one more uneventful pump: proves the rejection is
+  // durable/terminal (no delayed whoAmI/save sneaks in later), not merely
+  // "not yet observed".
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  QCOMPARE(h.authClient.calls.size(), 1);
+  QCOMPARE(h.tokenStore.calls.size(), tokenStoreCallsBeforeSignIn);
 }
 
 void SessionCoordinatorTests::signInSaveFailureIsSecureStorageUnavailable() {

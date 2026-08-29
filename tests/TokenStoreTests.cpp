@@ -23,7 +23,9 @@
 #include "ITokenStore.h"
 #include "QtKeychainJobFactory.h"
 #include "QtKeychainTokenStore.h"
+#include "TokenContentTestData.h"
 #include "TokenEnvelope.h"
+#include "TokenValidation.h"
 
 using namespace Arkham;
 
@@ -184,6 +186,7 @@ public:
   createWriteJob(const QString &service, const QString &key) override {
     lastService = service;
     lastWriteKey = key;
+    ++writeJobsCreated;
     if (auto err = takeError()) {
       return std::make_unique<FakeWriteJob>(*err, nullptr);
     }
@@ -212,6 +215,13 @@ public:
   QString lastReadKey;
   QString lastWriteKey;
   QString lastDeleteKey;
+  // Incremented on every createWriteJob() call, regardless of outcome.
+  // Lets a test prove a rejected saveToken() call (e.g. InvalidInput for a
+  // token failing isValidTokenContent()) never even reaches the real
+  // keychain job boundary, rather than merely inferring it indirectly from
+  // lastWriteKey/lastService (which a same-named prior call could leave
+  // looking identical).
+  int writeJobsCreated{0};
 
 private:
   std::optional<QKeychain::Error> takeError() {
@@ -319,6 +329,21 @@ private slots:
   void envelopeParseRejectsPrefixWithNoVersionDigits();
   void envelopeParseRejectsInvalidTokenGrammar_data();
   void envelopeParseRejectsInvalidTokenGrammar();
+
+  // ─── Shared token-content validator (src/TokenValidation.h) ─────────
+  //
+  // See tests/TokenContentTestData.h for the single canonical
+  // accept/reject table these four tests all share with
+  // tests/AuthClientTests.cpp and tests/SessionCoordinatorTests.cpp.
+
+  void tokenValidatorMatchesSharedTable_data();
+  void tokenValidatorMatchesSharedTable();
+  void envelopeRoundTripSucceedsIffValidatorAccepts_data();
+  void envelopeRoundTripSucceedsIffValidatorAccepts();
+  void saveReadRoundTripForEveryValidSample_data();
+  void saveReadRoundTripForEveryValidSample();
+  void rejectedSaveCreatesNoKeychainJob_data();
+  void rejectedSaveCreatesNoKeychainJob();
 };
 
 void TokenStoreTests::saveThenReadRoundTrip() {
@@ -806,9 +831,8 @@ void TokenStoreTests::readMalformedEnvelopeIsRejectedWithNoToken_data() {
   QTest::newRow("empty-token-remainder") << QStringLiteral("AHKV1:5:hosta");
 
   // A structurally valid envelope (correct magic prefix/version/identity
-  // framing) whose token portion is definitively invalid per the
-  // backend's actual token grammar (see isDefinitivelyInvalidTokenContent()
-  // in TokenEnvelope.cpp): these must ALSO be classified Malformed, never
+  // framing) whose token portion fails isValidTokenContent() (see
+  // TokenValidation.h): these must ALSO be classified Malformed, never
   // silently parsed as a usable token.
   const QString identity = endpointIdentityA();
   const auto envelopeWithToken = [&identity](const QString &token) {
@@ -849,7 +873,7 @@ void TokenStoreTests::
   // never produce this themselves -- saveToken() rejects a whitespace-only
   // token outright -- so this simulates a tampered/corrupted secure-store
   // entry. parseTokenEnvelope() itself now classifies this as Malformed
-  // (see isDefinitivelyInvalidTokenContent()), never Parsed.
+  // (see isValidTokenContent() in TokenValidation.h), never Parsed.
   const QString identity = endpointIdentityA();
   const QString whitespaceToken = QStringLiteral("   \t  ");
   const QString tampered = QStringLiteral("AHKV1:") +
@@ -1054,6 +1078,122 @@ void TokenStoreTests::envelopeParseRejectsInvalidTokenGrammar() {
   QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
   QVERIFY(parsed.token.isEmpty());
   QVERIFY(parsed.endpointIdentity.isEmpty());
+}
+
+// ─── Shared token-content validator (src/TokenValidation.h) ────────────
+
+void TokenStoreTests::tokenValidatorMatchesSharedTable_data() {
+  QTest::addColumn<QString>("token");
+  QTest::addColumn<bool>("expectValid");
+  for (const auto &row : Arkham::Test::tokenContentRows()) {
+    QTest::newRow(row.name) << row.token << row.expectValid;
+  }
+}
+
+void TokenStoreTests::tokenValidatorMatchesSharedTable() {
+  // Direct unit test of the single shared validator every other test below
+  // (and every other trust boundary in production code -- auth-response
+  // decoding, whoAmI() admission, this store's own save/read, and the
+  // envelope's own serialize/parse) is built on top of.
+  QFETCH(QString, token);
+  QFETCH(bool, expectValid);
+  QCOMPARE(isValidTokenContent(token), expectValid);
+}
+
+void TokenStoreTests::envelopeRoundTripSucceedsIffValidatorAccepts_data() {
+  QTest::addColumn<QString>("token");
+  QTest::addColumn<bool>("expectValid");
+  for (const auto &row : Arkham::Test::tokenContentRows()) {
+    QTest::newRow(row.name) << row.token << row.expectValid;
+  }
+}
+
+void TokenStoreTests::envelopeRoundTripSucceedsIffValidatorAccepts() {
+  // parseTokenEnvelope(serializeTokenEnvelope(identity, t)) must succeed
+  // (outcome == Parsed, with the exact original token recovered) if and
+  // only if isValidTokenContent(t) is true -- proving the writer
+  // (serializeTokenEnvelope(), gated in production by
+  // QtKeychainTokenStore::saveToken()'s own isValidTokenContent() check)
+  // and the reader (parseTokenEnvelope()) enforce byte-for-byte the same
+  // grammar, so the writer can never persist a token the reader would go
+  // on to reject.
+  QFETCH(QString, token);
+  QFETCH(bool, expectValid);
+  const QString identity = QStringLiteral("https|example.com|443|");
+  const QString serialized = serializeTokenEnvelope(identity, token);
+  const TokenEnvelopeParseResult parsed = parseTokenEnvelope(serialized);
+  if (expectValid) {
+    QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Parsed);
+    QVERIFY(parsed.token == token);
+    QVERIFY(parsed.endpointIdentity == identity);
+  } else {
+    QCOMPARE(parsed.outcome, TokenEnvelopeParseOutcome::Malformed);
+    QVERIFY(parsed.token.isEmpty());
+    QVERIFY(parsed.endpointIdentity.isEmpty());
+  }
+}
+
+void TokenStoreTests::saveReadRoundTripForEveryValidSample_data() {
+  QTest::addColumn<QString>("token");
+  for (const auto &row : Arkham::Test::tokenContentRows()) {
+    if (row.expectValid) {
+      QTest::newRow(row.name) << row.token;
+    }
+  }
+}
+
+void TokenStoreTests::saveReadRoundTripForEveryValidSample() {
+  // Every sample this shared table calls valid must actually save and
+  // read back successfully through the real QtKeychainTokenStore (fake
+  // keychain jobs, no real backend) -- proving the validator's accept set
+  // is not merely permissive in the abstract, but genuinely usable
+  // end-to-end.
+  QFETCH(QString, token);
+  auto factory = std::make_unique<FakeKeychainJobFactory>();
+  QtKeychainTokenStore store(std::move(factory));
+  const QString profileId = newProfileId();
+
+  const auto saveResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(profileId, token, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(saveResult.has_value());
+  QCOMPARE(saveResult->outcome, TokenStoreOutcome::Success);
+
+  const auto readResult = runOp([&](ITokenStore::ResultCallback cb) {
+    store.readToken(profileId, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(readResult.has_value());
+  QCOMPARE(readResult->outcome, TokenStoreOutcome::Success);
+  // QVERIFY (not QCOMPARE): a failure must never print the actual token
+  // value into test/CI logs.
+  QVERIFY(readResult->token == token);
+}
+
+void TokenStoreTests::rejectedSaveCreatesNoKeychainJob_data() {
+  QTest::addColumn<QString>("token");
+  for (const auto &row : Arkham::Test::tokenContentRows()) {
+    if (!row.expectValid) {
+      QTest::newRow(row.name) << row.token;
+    }
+  }
+}
+
+void TokenStoreTests::rejectedSaveCreatesNoKeychainJob() {
+  // A save rejected as InvalidInput must never even reach the real
+  // keychain job boundary: the writer must never persist a token its own
+  // reader would go on to reject, and the strongest form of that
+  // guarantee is that the backend is never touched at all.
+  QFETCH(QString, token);
+  auto ownedFactory = std::make_unique<FakeKeychainJobFactory>();
+  FakeKeychainJobFactory *factory = ownedFactory.get();
+  QtKeychainTokenStore store(std::move(ownedFactory));
+
+  const auto result = runOp([&](ITokenStore::ResultCallback cb) {
+    store.saveToken(newProfileId(), token, endpointIdentityA(), std::move(cb));
+  });
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, TokenStoreOutcome::InvalidInput);
+  QCOMPARE(factory->writeJobsCreated, 0);
 }
 
 QTEST_GUILESS_MAIN(TokenStoreTests)

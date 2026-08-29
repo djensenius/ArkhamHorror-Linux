@@ -1,6 +1,7 @@
 #include "NetworkAuthenticationClient.h"
 
 #include "AuthTransportSecurity.h"
+#include "TokenValidation.h"
 
 #include <QJsonDocument>
 #include <QJsonParseError>
@@ -117,21 +118,6 @@ void applyCommonRequestSettings(QNetworkRequest &request) {
   request.setAttribute(QNetworkRequest::CacheLoadControlAttribute,
                        QNetworkRequest::AlwaysNetwork);
   request.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);
-}
-
-// A bearer token is placed verbatim into a raw "Authorization: Token <...>"
-// header value. HTTP header field-values must not contain CR/LF (doing so
-// would allow header/request splitting or injection of extra headers) or
-// other control characters, so any such token must be rejected before a
-// request is ever constructed -- never sanitized/stripped, since that would
-// silently send a different token than the caller supplied.
-bool containsHeaderUnsafeCharacter(const QString &token) {
-  for (const QChar ch : token) {
-    if (ch.category() == QChar::Other_Control) {
-      return true;
-    }
-  }
-  return false;
 }
 
 } // namespace
@@ -320,16 +306,20 @@ NetworkAuthenticationClient::whoAmI(const ServerProfile &profile,
         std::move(callback),
         QStringLiteral("server profile is invalid; cannot issue request"));
   }
-  if (token.trimmed().isEmpty()) {
+  if (!isValidTokenContent(token)) {
+    // See TokenValidation.h: this is the exact same shared check every
+    // other token trust boundary enforces (auth-response decoding,
+    // secure-store save/read). Beyond simply refusing an unusable token,
+    // this specifically prevents an embedded CR/LF or other control
+    // character from being placed verbatim into a raw
+    // "Authorization: Token <...>" header value, which would otherwise
+    // allow HTTP header/request splitting or injection of extra headers.
+    // Rejected outright -- never sanitized/stripped, since that would
+    // silently send a different token than the caller supplied.
     return rejectInvalidInput<CurrentUser>(
         std::move(callback),
-        QStringLiteral("token must not be empty or whitespace-only"));
-  }
-  if (containsHeaderUnsafeCharacter(token)) {
-    return rejectInvalidInput<CurrentUser>(
-        std::move(callback),
-        QStringLiteral("token contains control characters and cannot be "
-                       "used in an HTTP header"));
+        QStringLiteral("token is not a usable token and cannot be used in "
+                       "an HTTP header"));
   }
 
   const QUrl url = profile.apiUrl(u"whoami");
@@ -342,6 +332,19 @@ NetworkAuthenticationClient::whoAmI(const ServerProfile &profile,
 
   QNetworkRequest request(url);
   applyCommonRequestSettings(request);
+  // Header-injection/normalization audit: isValidTokenContent(token) was
+  // already required to hold above, which restricts every code unit of
+  // |token| to the single contiguous range U+0021-U+007E (visible,
+  // non-space ASCII). That range excludes CR/LF and every other C0/C1
+  // control character (so no header/request splitting or extra-header
+  // injection is possible), excludes ASCII space and all Unicode
+  // whitespace/zero-width/format characters, and is a strict subset of
+  // ASCII, so the QString -> QByteArray UTF-8 conversion below is always
+  // a lossless, single-byte-per-character identity mapping -- it can
+  // never silently reinterpret or mangle the token's bytes. The literal
+  // "Token " prefix is a fixed ASCII constant with no user-controlled
+  // content, so the composed header value is provably exactly one
+  // well-formed "Authorization" field with no smuggled characters.
   request.setRawHeader("Authorization", ("Token " + token).toUtf8());
 
   QNetworkReply *reply = m_nam.get(request);

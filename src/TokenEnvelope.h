@@ -24,11 +24,11 @@ enum class TokenEnvelopeParseOutcome {
   Malformed,     ///< The payload begins with this format's magic prefix but
                  ///< fails strict structural validation (bad/unsupported
                  ///< version, corrupt length field, truncated content, or a
-                 ///< token portion that is empty, whitespace-only, has
-                 ///< leading/trailing whitespace, or contains any control
-                 ///< character -- see parseTokenEnvelope()'s own comment on
-                 ///< why this grammar check lives here rather than being
-                 ///< left to a caller). Never trusted or exposed.
+                 ///< token portion failing isValidTokenContent() -- see
+                 ///< TokenValidation.h for that shared grammar and
+                 ///< parseTokenEnvelope()'s own comment on why this check
+                 ///< lives here rather than being left to a caller). Never
+                 ///< trusted or exposed.
 };
 
 struct TokenEnvelopeParseResult {
@@ -43,9 +43,14 @@ struct TokenEnvelopeParseResult {
 // Serializes |token| bound to |endpointIdentity| (see
 // ServerProfile::credentialEndpointIdentity()) into the exact opaque
 // string that is persisted as a single secure-store entry's payload.
-// |endpointIdentity| and |token| are both assumed non-empty -- callers
-// are expected to have already rejected blank input (see
-// QtKeychainTokenStore's own validation) before reaching this function.
+// |endpointIdentity| and |token| are both assumed non-empty, and |token|
+// is assumed to already satisfy isValidTokenContent() (see
+// TokenValidation.h) -- callers are expected to have already rejected
+// blank/invalid input (see QtKeychainTokenStore::saveToken(), which
+// enforces this exact same shared check) before reaching this function.
+// This is what guarantees the writer can never persist a token
+// parseTokenEnvelope() would go on to reject as Malformed on the very
+// next read.
 //
 // Wire format (version 1):
 //   "AHKV1:" <decimal endpointIdentity length> ":" <endpointIdentity,

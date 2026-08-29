@@ -2,6 +2,7 @@
 
 #include "QtKeychainJobFactory.h"
 #include "TokenEnvelope.h"
+#include "TokenValidation.h"
 
 #include <QMetaObject>
 #include <QPointer>
@@ -224,12 +225,10 @@ void QtKeychainTokenStore::readToken(const QString &profileId,
                 const TokenEnvelopeParseResult parsed = parseTokenEnvelope(raw);
                 switch (parsed.outcome) {
                 case TokenEnvelopeParseOutcome::Parsed:
-                  // parseTokenEnvelope() itself now rejects every definitively
-                  // invalid token content (empty, whitespace-only,
-                  // leading/trailing whitespace, or embedded control
-                  // characters) as Malformed -- see
-                  // isDefinitivelyInvalidTokenContent() in TokenEnvelope.cpp --
-                  // so a Parsed outcome here always carries a usable token.
+                  // parseTokenEnvelope() itself now rejects any token
+                  // failing isValidTokenContent() (see TokenValidation.h)
+                  // as Malformed, so a Parsed outcome here always carries
+                  // a usable token.
                   if (parsed.endpointIdentity == expectedEndpointIdentity) {
                     token = parsed.token;
                   } else {
@@ -268,10 +267,15 @@ void QtKeychainTokenStore::saveToken(const QString &profileId,
                        QStringLiteral("profile ID must be a non-nil UUID"));
     return;
   }
-  if (token.trimmed().isEmpty()) {
+  if (!isValidTokenContent(token)) {
+    // See TokenValidation.h: this is the exact same shared check
+    // parseTokenEnvelope() enforces on read, so a token rejected here can
+    // never be the "writer persists something the reader later rejects"
+    // gap -- it is simply never persisted in the first place.
     rejectInvalidInput(
         std::move(callback),
-        QStringLiteral("token must not be empty or whitespace-only"));
+        QStringLiteral("token must be non-empty visible ASCII with no "
+                       "spaces or control characters"));
     return;
   }
   if (endpointIdentity.isEmpty()) {
