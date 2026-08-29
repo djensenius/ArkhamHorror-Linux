@@ -384,13 +384,15 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
   // 1. Localized candidate, but ONLY if the digest confirms it exists.
   // Skipping here (rather than issuing a network request and relying on a
   // 404) keeps resolution pure/deterministic and avoids a request this
-  // client already knows will fail. The digest is keyed by the same
-  // leading-c-stripped identifier the real path uses.
+  // client already knows will fail. The digest is keyed by the EXACT
+  // fully-resolved art code (the same string used to build the URL
+  // itself), not a separately decomposed identifier/side pair -- see
+  // AssetLocaleDigest::hasLocalizedVariant()'s header comment for why a
+  // reverse-decomposition would be ambiguous.
   if (localizable && !key.locale.isEmpty() && key.locale != "en"_L1) {
     const QString webLocale = AssetLocaleDigest::webLocaleFor(key.locale);
-    if (!webLocale.isEmpty() &&
-        AssetLocaleDigest::hasLocalizedVariant(webLocale, key.category,
-                                               strippedIdentifier, key.side)) {
+    if (!webLocale.isEmpty() && AssetLocaleDigest::hasLocalizedVariant(
+                                    webLocale, key.category, *directArtCode)) {
       tryAppend(webLocale, key.locale, *directArtCode, false);
     }
   }

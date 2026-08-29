@@ -1,24 +1,45 @@
 #!/usr/bin/env python3
 """Deterministically regenerate src/AssetLocaleDigestData.generated.h from
-contracts/asset-locale-digest.json.
+contracts/asset-locale-digest.json (a manifest: locale map, category-root
+mapping, and pinned provenance for the five per-locale source files in
+contracts/asset-locale-digest-sources/) plus those source files themselves.
 
-This script is the single source of truth for turning the pinned,
-human-reviewed JSON digest (see that file's own "provenance" note for what
-it currently covers and why) into the compact C++ lookup table
-AssetLocaleDigest.cpp consults at runtime. It is intentionally *generated*
-data, kept in its own file separate from handwritten sources, per
-djensenius/ArkhamHorror-Linux#17's requirement to keep generated lookup
-output identifiable and separate from the handwritten diff.
+Each contracts/asset-locale-digest-sources/<locale>.json file is an exact,
+byte-for-byte copy of the real web client's own digest
+(frontend/src/digests/<locale>.json at the pinned sourceCommit in the
+manifest -- see that manifest's "provenance" note) -- a plain JSON array
+of asset-relative path strings such as "cards/01001b.avif". This script:
+
+  1. Verifies every source file's SHA-256 against the manifest's pinned
+     hash (catching an accidental or malicious edit to a "pinned" file
+     immediately, rather than silently regenerating stale/tampered data).
+  2. Verifies the manifest's locale set is EXACTLY the five locales this
+     issue's provenance covers (it/fr/es/ko/zh) -- no fewer, no more --
+     and that the sourceFiles/localeMap/on-disk source-file set all agree
+     with each other and with the source directory's actual contents (no
+     unregistered extra source file, no missing declared one).
+  3. Independently parses and normalises every path in every source file:
+     splits "<root>/<artCode>.<ext>", maps <root> to a modeled
+     AssetCategory via acceptedCategoryRoots (or verifies it is an
+     explicitly-documented, deliberately-ignored root such Tarot card
+     backs, which are not a modeled category at all), validates <ext>
+     against that category's one fixed canonical extension, validates
+     <artCode> against a strict allow-list grammar, and rejects
+     duplicates. This never trusts the upstream data's shape blindly: an
+     unmapped root that is not on the ignore-list, or any path that fails
+     validation, is a hard generator error (data corruption or an
+     unannounced upstream schema change), not a silent skip.
 
 Usage:
     tools/generate_asset_locale_digest.py            # regenerate in place
     tools/generate_asset_locale_digest.py --check     # exit 1 if stale
 
 tests/AssetLocaleDigestTests.cpp performs an independent, C++-only drift
-check at test time (it recomputes the SHA-256 of the checked-in JSON and
-compares it against the hash embedded in the generated header by this
-script), so CI catches drift even without invoking Python -- this script's
---check mode is a convenience for local development, not what CI relies on.
+check at test time (it recomputes the SHA-256 of every checked-in source
+file and of the manifest itself, and compares them against the hashes
+embedded in the generated header by this script), so CI catches drift even
+without invoking Python -- this script's --check mode is a convenience for
+local development, not what CI relies on.
 """
 
 from __future__ import annotations
@@ -33,21 +54,35 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SOURCE_JSON = REPO_ROOT / "contracts" / "asset-locale-digest.json"
+CONTRACTS_DIR = REPO_ROOT / "contracts"
+MANIFEST_JSON = CONTRACTS_DIR / "asset-locale-digest.json"
+SOURCES_DIR = CONTRACTS_DIR / "asset-locale-digest-sources"
 GENERATED_HEADER = REPO_ROOT / "src" / "AssetLocaleDigestData.generated.h"
 
-_VALID_CATEGORIES = {
-    "card",
-    "investigator_portrait",
-    "chaos_token",
-    "set_icon",
-    "campaign_box",
-    "slot_icon",
-    "homebrew_card",
-    "homebrew_set",
-    "homebrew_box",
+# The exact, closed set of locales this issue's provenance covers. Neither
+# more nor fewer: a manifest/source-directory mismatch against this set is
+# a hard error, so an accidental extra or missing locale can never be
+# silently regenerated into (or dropped from) the shipped digest.
+_EXPECTED_LOCALES = frozenset({"ita", "fr", "es", "ko", "zh"})
+
+# Strict allow-list grammar for a validated path's art-code segment
+# (everything between the root and the extension): ASCII letters (either
+# case -- the real upstream data genuinely contains uppercase variant
+# suffixes, e.g. "cards/04242B.avif"), digits, '-', and '_'. This
+# deliberately rejects '.', '/', and any other punctuation or control
+# character outright.
+_ART_CODE_RE = re.compile(r"^[0-9A-Za-z_-]+$")
+_PATH_RE = re.compile(r"^([a-z]+)/([^/]+)\.([A-Za-z0-9]+)$")
+
+# Canonical extension per modeled category token, mirroring
+# AssetLocator::canonicalFormatFor()'s per-category fixed format -- a
+# digest entry whose extension does not match its category's real
+# extension indicates either a parsing bug in this script or a genuine
+# upstream schema change, either of which must fail loudly rather than
+# silently accepting the wrong extension for that category.
+_CATEGORY_EXTENSION = {
+    "card": "avif",
 }
-_VALID_SIDES = {"front", "back", "alternate_front", "resolved_front", "mutated_front"}
 
 
 def _escape(value: str) -> str:
@@ -55,11 +90,10 @@ def _escape(value: str) -> str:
     # be escaped before the sequences that introduce a backslash for the
     # other control characters below), then every other control
     # character (any codepoint below U+0020, plus DEL/U+007F) as a
-    # fixed-width 3-digit octal escape. Without this, a pinned JSON value
-    # that ever contains a stray control character -- even one this
-    # digest's data is not expected to contain, such as a form feed or a
-    # raw NUL -- would silently produce an invalid C++ string literal (or
-    # embed a literal control byte) in the generated header.
+    # fixed-width 3-digit octal escape. Without this, a pinned source
+    # value that ever contains a stray control character would silently
+    # produce an invalid C++ string literal (or embed a literal control
+    # byte) in the generated header.
     #
     # Octal (not hex) is used deliberately: a C++ "\xHH" escape has NO
     # fixed width and greedily consumes every following hex digit
@@ -90,43 +124,156 @@ def _escape(value: str) -> str:
     return "".join(result)
 
 
-def render_header(source_bytes: bytes, data: dict) -> str:
-    digest_hex = hashlib.sha256(source_bytes).hexdigest()
+def _load_manifest() -> dict:
+    manifest = json.loads(MANIFEST_JSON.read_bytes())
 
-    locale_map = data["localeMap"]
-    entries = data["entries"]
+    locale_map: dict[str, str] = manifest["localeMap"]
+    web_locales = set(locale_map.values())
+    if web_locales != _EXPECTED_LOCALES:
+        raise ValueError(
+            "contracts/asset-locale-digest.json's localeMap web-locale set "
+            f"{sorted(web_locales)!r} does not match the exact expected "
+            f"set {sorted(_EXPECTED_LOCALES)!r}"
+        )
 
-    for locale, mapped in locale_map.items():
-        if not locale or not mapped:
-            raise ValueError(f"empty locale mapping entry: {locale!r} -> {mapped!r}")
+    source_files: dict[str, dict] = manifest["provenance"]["sourceFiles"]
+    if set(source_files.keys()) != _EXPECTED_LOCALES:
+        raise ValueError(
+            "contracts/asset-locale-digest.json's provenance.sourceFiles "
+            f"key set {sorted(source_files.keys())!r} does not match the "
+            f"exact expected set {sorted(_EXPECTED_LOCALES)!r}"
+        )
 
-    for entry in entries:
-        if entry["category"] not in _VALID_CATEGORIES:
-            raise ValueError(f"unknown category in digest entry: {entry!r}")
-        if entry["side"] not in _VALID_SIDES:
-            raise ValueError(f"unknown side in digest entry: {entry!r}")
-        if not entry["locale"] or not entry["identifier"]:
-            raise ValueError(f"empty locale/identifier in digest entry: {entry!r}")
+    on_disk = {p.stem for p in SOURCES_DIR.glob("*.json")}
+    if on_disk != _EXPECTED_LOCALES:
+        raise ValueError(
+            f"{SOURCES_DIR} contains {sorted(on_disk)!r}, which does not "
+            f"match the exact expected locale set "
+            f"{sorted(_EXPECTED_LOCALES)!r} -- an unregistered source "
+            "file was added or a declared one is missing"
+        )
+
+    return manifest
+
+
+def _load_and_validate_source(
+    web_locale: str,
+    accepted_roots: dict[str, str],
+    ignored_roots: set[str],
+    source_files: dict[str, dict],
+) -> list[tuple[str, str]]:
+    """Returns a validated, deduplicated list of (category, artCode) pairs
+    for `web_locale`, having verified the source file's pinned SHA-256 and
+    every path's shape/grammar/extension first.
+    """
+    entry = source_files[web_locale]
+    path = REPO_ROOT / "contracts" / entry["path"]
+    raw_bytes = path.read_bytes()
+    actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if actual_sha256 != entry["sha256"]:
+        raise ValueError(
+            f"{path} has SHA-256 {actual_sha256}, but the manifest pins "
+            f"{entry['sha256']!r} -- this pinned source file must not be "
+            "edited without updating its recorded hash (and re-verifying "
+            "provenance against the real upstream commit)"
+        )
+
+    raw_paths = json.loads(raw_bytes)
+    if not isinstance(raw_paths, list):
+        raise ValueError(f"{path} must contain a JSON array of path strings")
+
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"{path}: non-string or empty path entry: {raw_path!r}")
+        if raw_path in seen:
+            raise ValueError(f"{path}: duplicate path entry: {raw_path!r}")
+        seen.add(raw_path)
+
+        match = _PATH_RE.match(raw_path)
+        if not match:
+            raise ValueError(f"{path}: path does not match expected shape: {raw_path!r}")
+        root, art_code, ext = match.groups()
+
+        if root in ignored_roots:
+            continue
+        category = accepted_roots.get(root)
+        if category is None:
+            raise ValueError(
+                f"{path}: unmapped, non-ignored category root {root!r} in "
+                f"path {raw_path!r} -- add it to acceptedCategoryRoots or "
+                "ignoredCategoryRoots in contracts/asset-locale-digest.json "
+                "as a conscious decision, do not silently drop it"
+            )
+
+        expected_ext = _CATEGORY_EXTENSION[category]
+        if ext.lower() != expected_ext:
+            raise ValueError(
+                f"{path}: category {category!r} must use extension "
+                f"{expected_ext!r}, got {ext!r} in path {raw_path!r}"
+            )
+
+        if not _ART_CODE_RE.match(art_code):
+            raise ValueError(
+                f"{path}: art code {art_code!r} in path {raw_path!r} fails "
+                "the strict [0-9A-Za-z_-]+ grammar"
+            )
+
+        result.append((category, art_code))
+
+    return result
+
+
+def render_header(manifest: dict) -> str:
+    locale_map: dict[str, str] = manifest["localeMap"]
+    accepted_roots: dict[str, str] = manifest["acceptedCategoryRoots"]
+    ignored_roots = set(manifest.get("ignoredCategoryRoots", {}).keys())
+    source_files: dict[str, dict] = manifest["provenance"]["sourceFiles"]
+
+    manifest_sha256 = hashlib.sha256(MANIFEST_JSON.read_bytes()).hexdigest()
+
+    per_locale_entries: dict[str, list[tuple[str, str]]] = {}
+    source_sha256: dict[str, str] = {}
+    for web_locale in sorted(_EXPECTED_LOCALES):
+        per_locale_entries[web_locale] = _load_and_validate_source(
+            web_locale, accepted_roots, ignored_roots, source_files
+        )
+        source_sha256[web_locale] = source_files[web_locale]["sha256"]
 
     lines = []
     lines.append("// GENERATED FILE -- DO NOT EDIT BY HAND.")
     lines.append("//")
     lines.append(
         "// Produced by tools/generate_asset_locale_digest.py from "
-        "contracts/asset-locale-digest.json."
+        "contracts/asset-locale-digest.json and the pinned per-locale "
+        "source files in contracts/asset-locale-digest-sources/."
     )
     lines.append(
-        "// Re-run that script after editing the JSON source; "
-        "tests/AssetLocaleDigestTests.cpp fails the build if this file "
-        "drifts from the JSON source's SHA-256."
+        "// Re-run that script after editing either the manifest or a "
+        "pinned source file; tests/AssetLocaleDigestTests.cpp fails the "
+        "build if this file drifts from those sources' SHA-256 hashes."
     )
     lines.append("#pragma once")
     lines.append("")
     lines.append("namespace Arkham::AssetLocaleDigestData {")
     lines.append("")
     lines.append(
-        f'inline constexpr char kSourceJsonSha256[] = "{digest_hex}";'
+        f'inline constexpr char kManifestJsonSha256[] = "{manifest_sha256}";'
     )
+    lines.append("")
+    lines.append("struct SourceFileHash {")
+    lines.append("  const char *webLocale;")
+    lines.append("  const char *sha256;")
+    lines.append("};")
+    lines.append("")
+    lines.append("inline constexpr SourceFileHash kSourceFileHashes[] = {")
+    for web_locale in sorted(_EXPECTED_LOCALES):
+        lines.append(
+            f'    {{"{_escape(web_locale)}", '
+            f'"{_escape(source_sha256[web_locale])}"}},'
+        )
+    lines.append("};")
     lines.append("")
     lines.append("struct LocaleMapEntry {")
     lines.append("  const char *isoLocale;")
@@ -138,23 +285,33 @@ def render_header(source_bytes: bytes, data: dict) -> str:
         lines.append(f'    {{"{_escape(locale)}", "{_escape(mapped)}"}},')
     lines.append("};")
     lines.append("")
+    # DigestEntry is keyed by the exact, fully-resolved art code (the
+    # SAME string AssetLocator::resolveArtCodeForSide() computes for a
+    # given identifier+side) rather than a separately decomposed
+    # (identifier, side) pair. The raw upstream data is a flat list of
+    # already-resolved final path segments (e.g. "01001b.avif",
+    # "01514_Mutated19.avif") with no side annotation of its own, and a
+    # generic reverse-parse from art code back to (identifier, side)
+    # would be genuinely ambiguous (e.g. a trailing "b" could mean
+    # AssetSide::Back OR the generic ResolvedFront rule's output) --
+    # keying by the resolved art code string sidesteps that ambiguity
+    # entirely, matching upstream's own model exactly.
     lines.append("struct DigestEntry {")
     lines.append("  const char *webLocale;")
     lines.append("  const char *category;")
-    lines.append("  const char *identifier;")
-    lines.append("  const char *side;")
+    lines.append("  const char *artCode;")
     lines.append("};")
     lines.append("")
     lines.append("inline constexpr DigestEntry kEntries[] = {")
-    for entry in entries:
-        lines.append(
-            "    {"
-            f'"{_escape(entry["locale"])}", '
-            f'"{_escape(entry["category"])}", '
-            f'"{_escape(entry["identifier"])}", '
-            f'"{_escape(entry["side"])}"'
-            "},"
-        )
+    for web_locale in sorted(_EXPECTED_LOCALES):
+        for category, art_code in per_locale_entries[web_locale]:
+            lines.append(
+                "    {"
+                f'"{_escape(web_locale)}", '
+                f'"{_escape(category)}", '
+                f'"{_escape(art_code)}"'
+                "},"
+            )
     lines.append("};")
     lines.append("")
     lines.append("} // namespace Arkham::AssetLocaleDigestData")
@@ -172,8 +329,8 @@ def _clang_format(rendered: str) -> tuple[str, bool]:
     Falls back to the unformatted text (rather than failing outright) if
     clang-format isn't on PATH -- or is on PATH but fails to run to
     completion (a broken install, missing shared libs, a crash, etc.) --
-    since --check's real drift signal is the embedded SHA-256, and CI's
-    separate format:check job independently enforces formatting
+    since --check's real drift signal is the embedded SHA-256 hashes, and
+    CI's separate format:check job independently enforces formatting
     regardless.
 
     Returns (text, formatted_ok): `formatted_ok` is True only when
@@ -204,19 +361,25 @@ def _clang_format(rendered: str) -> tuple[str, bool]:
     return result.stdout, True
 
 
-def _extract_embedded_sha256(header_text: str) -> str | None:
-    """Extracts the kSourceJsonSha256 hex string embedded in an already
-    generated header, or None if the header is missing/malformed. Used by
-    --check to validate drift by hash alone when clang-format isn't
-    available to make a full-text comparison meaningful (see
-    _clang_format's docstring): a checked-in header need only be
-    formatting-different, not data-different, to make a raw text compare
-    report a false positive.
+def _extract_embedded_hashes(header_text: str) -> tuple[str | None, dict[str, str]]:
+    """Extracts the kManifestJsonSha256 and per-locale kSourceFileHashes
+    embedded in an already-generated header, or (None, {}) if missing/
+    malformed. Used by --check to validate drift by hash alone when
+    clang-format isn't available to make a full-text comparison
+    meaningful (see _clang_format's docstring): a checked-in header need
+    only be formatting-different, not data-different, to make a raw text
+    compare report a false positive.
     """
-    match = re.search(
-        r'kSourceJsonSha256\[\]\s*=\s*"([0-9a-f]{64})"', header_text
+    manifest_match = re.search(
+        r'kManifestJsonSha256\[\]\s*=\s*"([0-9a-f]{64})"', header_text
     )
-    return match.group(1) if match else None
+    manifest_hash = manifest_match.group(1) if manifest_match else None
+    source_hashes: dict[str, str] = {}
+    for locale_match in re.finditer(
+        r'\{"([a-z]+)",\s*"([0-9a-f]{64})"\}', header_text
+    ):
+        source_hashes[locale_match.group(1)] = locale_match.group(2)
+    return manifest_hash, source_hashes
 
 
 def main(argv: list[str]) -> int:
@@ -229,10 +392,13 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    source_bytes = SOURCE_JSON.read_bytes()
-    data = json.loads(source_bytes)
-    expected_sha256 = hashlib.sha256(source_bytes).hexdigest()
-    rendered, formatted_ok = _clang_format(render_header(source_bytes, data))
+    manifest = _load_manifest()
+    expected_manifest_sha256 = hashlib.sha256(MANIFEST_JSON.read_bytes()).hexdigest()
+    expected_source_sha256 = {
+        locale: entry["sha256"]
+        for locale, entry in manifest["provenance"]["sourceFiles"].items()
+    }
+    rendered, formatted_ok = _clang_format(render_header(manifest))
 
     if args.check:
         current = (
@@ -249,27 +415,17 @@ def main(argv: list[str]) -> int:
         # run the full-text comparison below against unformatted output,
         # reporting a checked-in (already clang-formatted) header as
         # falsely stale even though the actual data (the embedded
-        # SHA-256) has not drifted at all.
+        # hashes) has not drifted at all.
         if formatted_ok:
-            # The full-text comparison is meaningful here: `rendered` was
-            # itself successfully clang-formatted above, so any
-            # difference from `current` (which is expected to already be
-            # clang-formatted, being checked in) reflects real drift --
-            # either data drift or a stale formatting pass.
             is_stale = current != rendered
         else:
-            # `rendered`'s formatting cannot be trusted to match the
-            # checked-in header's -- comparing full text here would
-            # report the header as stale purely because this particular
-            # run couldn't successfully format it, even when the data
-            # itself (the actual drift signal) is unchanged. Fall back to
-            # comparing only the embedded SHA-256 of the JSON source
-            # against a fresh hash of it: that is the same drift check
-            # tests/AssetLocaleDigestTests.cpp performs independently in
-            # C++, and is unaffected by formatting-tool availability or
-            # success.
-            embedded = _extract_embedded_sha256(current)
-            is_stale = embedded != expected_sha256
+            embedded_manifest_hash, embedded_source_hashes = _extract_embedded_hashes(
+                current
+            )
+            is_stale = (
+                embedded_manifest_hash != expected_manifest_sha256
+                or embedded_source_hashes != expected_source_sha256
+            )
         if is_stale:
             print(
                 f"{GENERATED_HEADER} is stale; run "

@@ -39,26 +39,10 @@ QLatin1StringView categoryToken(AssetCategory category) {
   Q_UNREACHABLE_RETURN(QLatin1StringView());
 }
 
-QLatin1StringView sideToken(AssetSide side) {
-  switch (side) {
-  case AssetSide::Front:
-    return "front"_L1;
-  case AssetSide::Back:
-    return "back"_L1;
-  case AssetSide::AlternateFront:
-    return "alternate_front"_L1;
-  case AssetSide::ResolvedFront:
-    return "resolved_front"_L1;
-  case AssetSide::MutatedFront:
-    return "mutated_front"_L1;
-  }
-  Q_UNREACHABLE_RETURN(QLatin1StringView());
-}
-
 // Encodes a variable-length field as its UTF-16 code-unit COUNT (not byte
 // count) followed by a NUL separator, then the field itself. Composite
 // keys built purely by concatenating variable-length fields (webLocale,
-// identifier) back-to-back could otherwise collide across two distinct
+// artCode) back-to-back could otherwise collide across two distinct
 // logical tuples if one field's suffix happens to look like the next
 // field's prefix (the same class of bug fixed in
 // AssetRequestCoordinator::canonicalOperationKey() for AssetKey
@@ -70,15 +54,13 @@ QString lengthPrefixed(const QString &field) {
 
 // Builds (once, lazily, on first call -- C++11 guarantees this
 // initialization is both thread-safe and happens at most once) an O(1)
-// hash-set index over every (webLocale, category, identifier, side)
-// tuple in AssetLocaleDigestData::kEntries, keyed by the same
-// length-prefixed composite encoding hasLocalizedVariant() below queries
-// with. contracts/asset-locale-digest.json's own provenance note
-// documents this seed list as expected to be replaced with a full
-// import later; building an index once up front (rather than
-// linear-scanning kEntries on every call, which is only cheap while the
-// seed list stays small) keeps hasLocalizedVariant() from becoming an
-// O(N)-per-call hot-path bottleneck once that happens.
+// hash-set index over every (webLocale, category, artCode) tuple in
+// AssetLocaleDigestData::kEntries, keyed by the same length-prefixed
+// composite encoding hasLocalizedVariant() below queries with. Building
+// an index once up front (rather than linear-scanning kEntries on every
+// call, which the full ~18k-entry import makes a real cost) keeps
+// hasLocalizedVariant() an O(1)-per-call lookup regardless of digest
+// size.
 const QSet<QString> &localizedVariantIndex() {
   static const QSet<QString> index = [] {
     QSet<QString> built;
@@ -87,8 +69,7 @@ const QSet<QString> &localizedVariantIndex() {
     for (const auto &entry : AssetLocaleDigestData::kEntries) {
       built.insert(lengthPrefixed(QString::fromLatin1(entry.webLocale)) +
                    lengthPrefixed(QString::fromLatin1(entry.category)) +
-                   lengthPrefixed(QString::fromLatin1(entry.identifier)) +
-                   lengthPrefixed(QString::fromLatin1(entry.side)));
+                   lengthPrefixed(QString::fromLatin1(entry.artCode)));
     }
     return built;
   }();
@@ -109,18 +90,29 @@ QString webLocaleFor(const QString &isoLocale) {
 }
 
 bool hasLocalizedVariant(const QString &webLocale, AssetCategory category,
-                         const QString &identifier, AssetSide side) {
+                         const QString &artCode) {
   if (webLocale.isEmpty()) {
     return false;
   }
-  const QString key =
-      lengthPrefixed(webLocale) + lengthPrefixed(categoryToken(category)) +
-      lengthPrefixed(identifier) + lengthPrefixed(sideToken(side));
+  const QString key = lengthPrefixed(webLocale) +
+                      lengthPrefixed(categoryToken(category)) +
+                      lengthPrefixed(artCode);
   return localizedVariantIndex().contains(key);
 }
 
-QString pinnedSourceJsonSha256() {
-  return QString::fromLatin1(AssetLocaleDigestData::kSourceJsonSha256);
+QString pinnedManifestJsonSha256() {
+  return QString::fromLatin1(AssetLocaleDigestData::kManifestJsonSha256);
+}
+
+QHash<QString, QString> pinnedSourceFileSha256() {
+  QHash<QString, QString> result;
+  result.reserve(static_cast<qsizetype>(
+      std::size(AssetLocaleDigestData::kSourceFileHashes)));
+  for (const auto &entry : AssetLocaleDigestData::kSourceFileHashes) {
+    result.insert(QString::fromLatin1(entry.webLocale),
+                  QString::fromLatin1(entry.sha256));
+  }
+  return result;
 }
 
 } // namespace AssetLocaleDigest
