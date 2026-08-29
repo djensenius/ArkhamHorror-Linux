@@ -12,6 +12,7 @@
 using Arkham::CommandPhase;
 using Arkham::InputMapper;
 using Arkham::InputRouter;
+using Arkham::PhysicalKey;
 using Arkham::SemanticCommand;
 
 namespace {
@@ -46,6 +47,7 @@ private slots:
   void suppressedDedupTransitionsAreStillConsumedForABoundKey();
   void
   strayDuplicatePressWithDifferentModifiersForAnAlreadyHeldKeyIsStillConsumed();
+  void remappingAnInitiallyUnboundKeyMidHoldDoesNotConsumeItsRepeatOrRelease();
   void keyEventsForAnUnboundKeyAreNeverConsumed();
   void focusOutClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress();
   void windowDeactivateClearsHeldKeysWithoutDispatchingAndAllowsAFreshPress();
@@ -292,6 +294,48 @@ void InputRouterTests::
   // the duration of an actual hold, not forever.
   QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_Z));
   QCOMPARE(spy.count(), 2);
+}
+
+void InputRouterTests::
+    remappingAnInitiallyUnboundKeyMidHoldDoesNotConsumeItsRepeatOrRelease() {
+  InputMapper mapper;
+  InputRouter router(mapper);
+  QObject target;
+  QVERIFY(router.install(&target));
+
+  QSignalSpy spy(&router, &InputRouter::commandDispatched);
+
+  // Qt::Key_F13 has no default binding, so pressing it starts an
+  // *unarmed* hold: correctly not consumed and not dispatched, exactly
+  // like any other unbound key's press.
+  QVERIFY(!sendKey(&target, QEvent::KeyPress, Qt::Key_F13));
+  QCOMPARE(spy.count(), 0);
+
+  // Bind F13 to a command WHILE it is still physically held down --
+  // e.g. a settings/remap UI applied mid-press. commandFor(F13) now
+  // reports CameraZoomIn, but the F13 hold itself was frozen as
+  // unarmed at press time and must keep behaving exactly as it did
+  // when it started: neither its auto-repeat nor its eventual release
+  // may suddenly become consumed, or downstream code would observe an
+  // (unconsumed) press with no matching (also-unconsumed) release --
+  // an asymmetric break of ordinary Qt key-event propagation for a key
+  // this router never actually took ownership of.
+  QVERIFY(!mapper.remap(PhysicalKey{Qt::Key_F13}, SemanticCommand::CameraZoomIn)
+               .has_value());
+
+  QVERIFY(!sendKey(&target, QEvent::KeyPress, Qt::Key_F13, true));
+  QCOMPARE(spy.count(), 0);
+  QVERIFY(!sendKey(&target, QEvent::KeyRelease, Qt::Key_F13));
+  QCOMPARE(spy.count(), 0);
+
+  // A brand-new press afterwards -- no longer mid-hold, so this is a
+  // completely fresh key-down -- must now correctly dispatch the newly
+  // bound command and be consumed, proving the mid-hold remap did take
+  // effect for the *next* independent hold.
+  QVERIFY(sendKey(&target, QEvent::KeyPress, Qt::Key_F13));
+  QCOMPARE(spy.count(), 1);
+  QCOMPARE(spy.constLast().at(0).value<SemanticCommand>(),
+           SemanticCommand::CameraZoomIn);
 }
 
 void InputRouterTests::assertLifecycleEventClearsHeldKeys(

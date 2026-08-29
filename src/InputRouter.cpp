@@ -112,8 +112,21 @@ bool InputRouter::eventFilter(QObject *watched, QEvent *event) {
   // isArmedKeyHeld() -- checked before processKey() runs, since a
   // release can make the key no longer held by the time processKey()
   // returns.
-  const bool isOwnedKey = mapper_.commandFor(physicalKey).has_value() ||
-                          mapper_.isArmedKeyHeld(physicalKey.key);
+  //
+  // Conversely, commandFor() must NOT be trusted on its own for a key
+  // that is currently held *unarmed* (pressed while unbound): a
+  // remap()/bind() that runs while such a hold is still down would make
+  // commandFor() start reporting a binding mid-hold, but processKey()
+  // deliberately keeps replaying "unarmed" (dedup no-op) for the rest
+  // of that same physical hold -- its initial press was correctly left
+  // unconsumed, so its later repeat/release must stay unconsumed too,
+  // or downstream code would observe a press with no matching release.
+  // isKeyHeld() lets us tell "not held at all yet" (where commandFor()
+  // alone is the right, and only, signal for a fresh press) apart from
+  // "held unarmed" (where commandFor() must be ignored).
+  const bool isOwnedKey = mapper_.isArmedKeyHeld(physicalKey.key) ||
+                          (!mapper_.isKeyHeld(physicalKey.key) &&
+                           mapper_.commandFor(physicalKey).has_value());
 
   const std::optional<DispatchedCommand> dispatched =
       mapper_.processKey(physicalKey, isPress, keyEvent->isAutoRepeat());

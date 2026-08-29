@@ -195,14 +195,25 @@ public:
   // unbound for its whole press so far) does not count: such a key was
   // never actually owned by any dispatched command, so its later
   // events must still be free to propagate normally. InputRouter uses
-  // this -- together with commandFor() -- to decide whether an event
-  // for |key| must be consumed even when processKey() suppresses it as
-  // a dedup no-op: held-state is modifier-insensitive by design (see
-  // the heldKeys_ comment), so a duplicate/stray transition whose
-  // *current* modifiers no longer match any binding can still belong
-  // to a physical key this mapper already owns for the rest of its
-  // hold.
+  // this -- together with commandFor() and isKeyHeld() -- to decide
+  // whether an event for |key| must be consumed even when processKey()
+  // suppresses it as a dedup no-op: held-state is modifier-insensitive
+  // by design (see the heldKeys_ comment), so a duplicate/stray
+  // transition whose *current* modifiers no longer match any binding
+  // can still belong to a physical key this mapper already owns for
+  // the rest of its hold.
   [[nodiscard]] bool isArmedKeyHeld(Qt::Key key) const;
+
+  // True if |key| is currently held at all, armed or not. InputRouter
+  // needs this in addition to isArmedKeyHeld(): commandFor(key) alone
+  // can report a binding that only came into existence *after* |key|
+  // was pressed (e.g. a remap() that runs while the key is still held
+  // down and unarmed), and such a hold must keep propagating its
+  // repeat/release events normally -- exactly like it did for its
+  // initial (also-unconsumed) press -- rather than suddenly being
+  // treated as owned partway through, which would leave downstream code
+  // observing a press with no matching release.
+  [[nodiscard]] bool isKeyHeld(Qt::Key key) const;
 
 private:
   // Per-held-key state: a key present in |heldKeys_| is physically held

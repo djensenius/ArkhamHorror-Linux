@@ -213,4 +213,8 @@ bool InputMapper::isArmedKeyHeld(const Qt::Key key) const {
   return it != heldKeys_.constEnd() && it.value().has_value();
 }
 
+bool InputMapper::isKeyHeld(const Qt::Key key) const {
+  return heldKeys_.contains(key);
+}
+
 } // namespace Arkham
