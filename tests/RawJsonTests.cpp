@@ -82,6 +82,8 @@ private slots:
   void parseLimitsRejectsInputExceedingMaxInputBytes();
   void parseLimitsRejectsDepthExceedingMaxDepth();
   void parseLimitsRejectsStringExceedingMaxStringLength();
+  void parseLimitsBoundsSurrogatePairAppendAgainstMaxStringLength();
+  void parseLimitsBoundsRawUtf8AstralAppendAgainstMaxStringLength();
   void parseLimitsRejectsNumberExceedingMaxNumberDigits();
   void parseLimitsRejectsArrayExceedingMaxArrayElements();
   void parseLimitsRejectsObjectExceedingMaxObjectMembers();
@@ -597,6 +599,55 @@ void RawJsonTests::parseLimitsRejectsStringExceedingMaxStringLength() {
   limits.maxStringLength = 3;
   QVERIFY(Value::parse(R"("abc")", u"test", limits).has_value());
   QVERIFY(!Value::parse(R"("abcd")", u"test", limits).has_value());
+}
+
+void RawJsonTests::
+    parseLimitsBoundsSurrogatePairAppendAgainstMaxStringLength() {
+  // U+1F600 GRINNING FACE via a \ud83d\ude00 surrogate-pair escape decodes
+  // to exactly 2 UTF-16 code units in one appending step. The bound must
+  // be enforced as a genuine hard maximum -- never transiently exceeded --
+  // rather than only being noticed one iteration after the pair has
+  // already been appended (review round 5 finding: RawJson.cpp's
+  // parseStringText() checked `out.size() > maxStringLength` once per
+  // loop iteration, which let a single iteration that appends two code
+  // units at once push `out` two units past the limit before the next
+  // iteration's check caught it).
+  ParseLimits exactLimit;
+  exactLimit.maxStringLength = 2;
+  QVERIFY(Value::parse(R"("\ud83d\ude00")", u"test", exactLimit).has_value());
+
+  ParseLimits oneUnderLimit;
+  oneUnderLimit.maxStringLength = 1;
+  QVERIFY(
+      !Value::parse(R"("\ud83d\ude00")", u"test", oneUnderLimit).has_value());
+
+  // The same two-unit append preceded by one ordinary character must
+  // still be bounded correctly: exactly at the limit succeeds, one over
+  // fails.
+  ParseLimits exactLimitWithPrefix;
+  exactLimitWithPrefix.maxStringLength = 3;
+  QVERIFY(Value::parse(R"("a\ud83d\ude00")", u"test", exactLimitWithPrefix)
+              .has_value());
+
+  ParseLimits oneOverLimitWithPrefix;
+  oneOverLimitWithPrefix.maxStringLength = 2;
+  QVERIFY(!Value::parse(R"("a\ud83d\ude00")", u"test", oneOverLimitWithPrefix)
+               .has_value());
+}
+
+void RawJsonTests::
+    parseLimitsBoundsRawUtf8AstralAppendAgainstMaxStringLength() {
+  // Same U+1F600 codepoint, but as a raw UTF-8 byte sequence (decoded via
+  // parseUtf8Sequence() and re-encoded as a surrogate pair), exercising
+  // the second two-unit append site independently of the \u-escape path.
+  const QByteArray exactLimitBytes = QByteArrayLiteral("\"\xF0\x9F\x98\x80\"");
+  ParseLimits exactLimit;
+  exactLimit.maxStringLength = 2;
+  QVERIFY(Value::parse(exactLimitBytes, u"test", exactLimit).has_value());
+
+  ParseLimits oneUnderLimit;
+  oneUnderLimit.maxStringLength = 1;
+  QVERIFY(!Value::parse(exactLimitBytes, u"test", oneUnderLimit).has_value());
 }
 
 void RawJsonTests::parseLimitsRejectsNumberExceedingMaxNumberDigits() {

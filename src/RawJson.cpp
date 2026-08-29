@@ -218,13 +218,23 @@ private:
     for (;;) {
       if (atEnd())
         return failAt("unterminated string literal");
-      if (out.size() > m_limits.maxStringLength)
-        return failAt("string literal exceeds the maximum allowed length");
       unsigned char c = static_cast<unsigned char>(m_bytes[m_pos]);
+      // The closing quote is checked before the length bound below so an
+      // already-at-the-limit string that is about to terminate is never
+      // wrongly rejected.
       if (c == '"') {
         ++m_pos;
         return out;
       }
+      // A hard bound checked before consuming/appending anything else
+      // this iteration, guaranteeing `out` never grows past
+      // maxStringLength via a single-code-unit append. Branches that
+      // append two UTF-16 code units at once (a \u surrogate pair, or a
+      // decoded UTF-8 codepoint above the BMP) additionally re-check
+      // below, since this alone only guarantees one code unit of
+      // headroom.
+      if (out.size() >= m_limits.maxStringLength)
+        return failAt("string literal exceeds the maximum allowed length");
       if (c == '\\') {
         ++m_pos;
         if (atEnd())
@@ -283,6 +293,11 @@ private:
             if (*low < 0xDC00 || *low > 0xDFFF)
               return failAt("high surrogate not followed by a valid low "
                             "surrogate");
+            // This appends two code units at once, so the one-unit
+            // headroom already checked above is not enough on its own.
+            if (out.size() + 2 > m_limits.maxStringLength)
+              return failAt(
+                  "string literal exceeds the maximum allowed length");
             out += QChar(code);
             out += QChar(*low);
           } else if (code >= 0xDC00 && code <= 0xDFFF) {
@@ -312,6 +327,10 @@ private:
         out += QChar(static_cast<char16_t>(cp));
       } else {
         cp -= 0x10000;
+        // A codepoint above the BMP appends two code units at once (a
+        // surrogate pair), so re-verify room for both before appending.
+        if (out.size() + 2 > m_limits.maxStringLength)
+          return failAt("string literal exceeds the maximum allowed length");
         out += QChar(static_cast<char16_t>(0xD800 + (cp >> 10)));
         out += QChar(static_cast<char16_t>(0xDC00 + (cp & 0x3FF)));
       }
