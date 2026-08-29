@@ -134,7 +134,17 @@ void MockHttpServer::tryParseAndRespond(Connection &connection) {
   }
   emit requestHandled(path);
 
-  const Response response = m_responses.value(path, Response{});
+  // A request for a path this test never registered a response for is a
+  // realistic "no such resource" condition, not a successful empty 200 --
+  // defaulting to 200 here would let genuinely wrong/misspelled request
+  // paths silently "succeed" with an empty body (e.g. failing later with
+  // a confusing Content-Type mismatch) instead of surfacing as the exact
+  // NotFound/fallback-advancement condition most of this suite's tests
+  // are specifically trying to exercise.
+  Response notFound;
+  notFound.status = 404;
+  notFound.reasonPhrase = "Not Found";
+  const Response response = m_responses.value(path, notFound);
   writeResponse(connection.socket, path, response, connection.headers);
 }
 
