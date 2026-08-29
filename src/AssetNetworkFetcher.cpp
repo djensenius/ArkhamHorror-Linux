@@ -218,14 +218,24 @@ void AssetNetworkFetcher::handleReadyRead(quint64 handle) {
   if (pending.overflowed) {
     return; // already aborting; ignore further readyRead delivery
   }
-  pending.buffer.append(pending.reply->readAll());
-  if (pending.buffer.size() > m_limits.maxEncodedBytes) {
+  // Never read (and therefore never buffer) more than the remaining
+  // budget, plus exactly one extra byte solely to detect that the server
+  // tried to send more than the cap allows: appending readAll() first and
+  // checking the size afterwards would let pending.buffer briefly grow
+  // past m_limits.maxEncodedBytes before this function aborts, weakening
+  // the hard bound the class comment promises.
+  const qint64 remaining = m_limits.maxEncodedBytes - pending.buffer.size();
+  const QByteArray chunk = pending.reply->read(remaining + 1);
+  if (chunk.size() > remaining) {
     // Abort immediately: never buffer past the configured cap, regardless
     // of how large a hostile or misconfigured server claims (or omits)
     // Content-Length to be.
+    pending.buffer.append(chunk.left(remaining));
     pending.overflowed = true;
     pending.reply->abort();
+    return;
   }
+  pending.buffer.append(chunk);
 }
 
 void AssetNetworkFetcher::completeWithError(quint64 handle, AssetError error) {

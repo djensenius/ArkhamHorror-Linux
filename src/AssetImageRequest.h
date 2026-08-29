@@ -51,8 +51,10 @@ public:
   void load(const AssetKey &key,
             const QString &callerAccessibleDescription = QString());
 
-  // Cancels any in-flight request and returns to Idle. A no-op if already
-  // Idle/Ready/Error.
+  // Cancels any in-flight request. If currently Loading, transitions back
+  // to Idle (clearing progress/accessibleDescription); otherwise (Idle,
+  // Ready, or Error) this is a no-op and the current status is left
+  // unchanged.
   void cancel();
 
   [[nodiscard]] Status status() const { return m_status; }
