@@ -584,3 +584,82 @@ void AssetRequestCoordinatorTests::
   QCOMPARE((**result).encodedBytes,
            QByteArrayLiteral("still-served-despite-404"));
 }
+
+void AssetRequestCoordinatorTests::
+    diskHitRevalidationCoalescesConcurrentIdenticalRequests() {
+  // Regression for a review finding: request() started a brand-new
+  // revalidation operation unconditionally on every disk-hit-with-
+  // validators call, without first checking whether an identical AssetKey
+  // was already being revalidated -- bypassing the coordinator's
+  // coalescing guarantee and issuing a redundant conditional GET under
+  // contention. Two concurrent request() calls for the same key, both
+  // landing on the disk-hit-with-validators path, must coalesce onto the
+  // SAME underlying revalidation operation, exactly like
+  // coalescesConcurrentIdenticalRequests() above proves for the ordinary
+  // (no-cache-entry) path.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(32, 32);
+  // No etagForConditionalMatch configured: the origin answers the
+  // conditional GET with a full fresh 200 (which -- unlike this mock
+  // server's synchronous bodyless 304 path -- supports slowDrip), giving
+  // a deterministic window in which both request() calls are reliably
+  // in flight at once.
+  response.slowDrip = true;
+  response.chunkSize = 32;
+  response.chunkDelayMs = 20;
+  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = QByteArrayLiteral("old-bytes-now-outdated");
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(4, 4);
+  preSeeded.etag = QStringLiteral("\"old-etag\"");
+  cache.store(cacheKey, preSeeded);
+
+  // A fresh AssetCache instance forces both requests through the
+  // disk-hit path rather than the memory-hit path, which never
+  // revalidates.
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  int completions = 0;
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  coordinator.request(key, [&](Result r) {
+    ++completions;
+    resultA = std::move(r);
+  });
+  // Issued immediately after, while the first revalidation is still in
+  // flight: must coalesce onto the SAME underlying operation rather than
+  // issuing a second conditional GET.
+  coordinator.request(key, [&](Result r) {
+    ++completions;
+    resultB = std::move(r);
+  });
+
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 1);
+
+  QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
+
+  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QVERIFY(resultA.has_value());
+  QVERIFY(resultB.has_value());
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QVERIFY((**resultA).encodedBytes !=
+          QByteArrayLiteral("old-bytes-now-outdated"));
+  QCOMPARE((**resultA).encodedBytes, (**resultB).encodedBytes);
+}

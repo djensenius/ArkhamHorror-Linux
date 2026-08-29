@@ -202,8 +202,23 @@ AssetCache::lookupDisk(const QString &key) {
   refreshed.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
   (void)writeMetadata(key, refreshed);
 
-  auto *heapEntry = new CachedEntry(entry);
-  m_memory->insert(key, heapEntry, static_cast<qsizetype>(entry.costBytes()));
+  // Promote into memory ONLY when this entry needs no further
+  // revalidation. AssetRequestCoordinator's memory-hit path (see
+  // AssetRequestCoordinator.cpp) trusts a memory hit unconditionally, with
+  // no conditional GET or etag/lastModified check at all -- so promoting
+  // an entry that still carries a validator here would let it become a
+  // trusted memory hit for every later lookupMemory() call BEFORE this
+  // process has ever actually revalidated it against the origin (e.g. two
+  // request() calls issued back-to-back, the second landing here while
+  // the first's real conditional GET for the very same bytes is still in
+  // flight). AssetRequestCoordinator only ever calls
+  // AssetCache::store()/touchAfterNotModified() -- which manage the
+  // memory entry directly -- once a real revalidation has actually
+  // completed, so this is the only path that must withhold promotion.
+  if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
+    auto *heapEntry = new CachedEntry(entry);
+    m_memory->insert(key, heapEntry, static_cast<qsizetype>(entry.costBytes()));
+  }
 
   return entry;
 }

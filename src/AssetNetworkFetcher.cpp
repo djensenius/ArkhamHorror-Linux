@@ -78,11 +78,30 @@ const char *qtImageFormatName(AssetFormat format) {
   case AssetFormat::Avif:
     return "avif";
   case AssetFormat::Jpeg:
-    return "jpg";
+    return "jpeg";
   case AssetFormat::Png:
     return "png";
   }
   Q_UNREACHABLE_RETURN("");
+}
+
+// Whether Qt's installed image plugins can decode `format`. JPEG support is
+// checked under both of Qt's registered plugin keys ("jpeg" and "jpg" --
+// both are advertised by the stock qjpeg plugin, but relying on a single
+// exact spelling risks a false UnsupportedCodec on any Qt build/plugin set
+// that only registers the other one). AVIF/PNG have exactly one Qt key.
+bool isQtImageFormatSupported(AssetFormat format) {
+  const QList<QByteArray> supported = QImageReader::supportedImageFormats();
+  switch (format) {
+  case AssetFormat::Avif:
+    return supported.contains(QByteArrayLiteral("avif"));
+  case AssetFormat::Jpeg:
+    return supported.contains(QByteArrayLiteral("jpeg")) ||
+           supported.contains(QByteArrayLiteral("jpg"));
+  case AssetFormat::Png:
+    return supported.contains(QByteArrayLiteral("png"));
+  }
+  Q_UNREACHABLE_RETURN(false);
 }
 
 void applyCommonRequestSettings(QNetworkRequest &request) {
@@ -391,8 +410,7 @@ void AssetNetworkFetcher::handleFinished(quint64 handle) {
   buffer.open(QIODevice::ReadOnly);
   QImageReader reader(&buffer, qtImageFormatName(pendingCopy.expectedFormat));
 
-  if (!QImageReader::supportedImageFormats().contains(
-          QByteArray(qtImageFormatName(pendingCopy.expectedFormat)))) {
+  if (!isQtImageFormatSupported(pendingCopy.expectedFormat)) {
     emitResult(AssetError{
         AssetErrorCode::UnsupportedCodec,
         QStringLiteral("no installed Qt image plugin can decode this "

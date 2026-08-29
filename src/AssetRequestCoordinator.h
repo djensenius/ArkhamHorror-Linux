@@ -85,9 +85,11 @@ public:
 
   // Resolves `key`'s candidates, serves from cache when possible, and
   // otherwise fetches -- coalescing with any identical in-flight request
-  // for the SAME first candidate's cache key. `callback` is always invoked
-  // exactly once (synchronously-deferred via the event loop), even when
-  // the request is rejected before any network I/O (e.g. InvalidIdentifier).
+  // for the SAME canonicalized AssetKey (see canonicalOperationKey() in
+  // the .cpp; this includes both ordinary fetches and disk-hit
+  // revalidations). `callback` is always invoked exactly once
+  // (synchronously-deferred via the event loop), even when the request is
+  // rejected before any network I/O (e.g. InvalidIdentifier).
   RequestHandle request(const AssetKey &key, ResultCallback callback);
 
   // Detaches this one consumer; see the class comment for the exact
@@ -123,6 +125,12 @@ private:
   RequestHandle
   registerImmediateCompletion(const AssetKey &key, ResultCallback callback,
                               AssetOutcome<AssetCache::CachedEntry> result);
+  // Finds an already in-flight operation (revalidation or ordinary
+  // candidate fetch) whose AssetKey canonicalizes to the same opKey, so a
+  // new request() call can attach as an additional consumer instead of
+  // starting a redundant network operation. Returns nullopt if none.
+  [[nodiscard]] std::optional<quint64>
+  findInFlightOperation(const QString &opKey) const;
   void startCandidate(quint64 operationId);
   void startRevalidation(quint64 operationId);
   void completeOperation(quint64 operationId,

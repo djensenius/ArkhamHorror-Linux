@@ -103,7 +103,8 @@ public:
   lookupMemory(const QString &key) const;
 
   // Disk lookup: validates the payload/metadata pair (deleting either or
-  // both if corrupt/orphaned), promotes a valid hit into memory, and
+  // both if corrupt/orphaned), promotes a valid hit into memory (UNLESS it
+  // carries a validator -- see lookupDisk()'s .cpp comment for why), and
   // refreshes its on-disk lastAccess. Returns std::nullopt on any miss,
   // including a validation failure -- CacheCorrupt is not surfaced as a
   // distinct return here because a cache miss and a corrupt-then-deleted

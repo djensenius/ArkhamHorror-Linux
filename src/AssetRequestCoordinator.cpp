@@ -111,6 +111,23 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
       // conditional GET (see startRevalidation()) rather than trusted
       // forever: this is the only production code path that actually
       // exercises AssetNetworkFetcher::ConditionalHeaders end-to-end.
+      //
+      // Coalesce with an already in-flight identical request (revalidation
+      // or otherwise) before starting a new one: without this check, two
+      // concurrent request() calls for the same AssetKey that both land on
+      // this disk-hit-with-validators path would each issue their own
+      // conditional GET, silently bypassing the coordinator's coalescing
+      // guarantee.
+      const QString opKey = canonicalOperationKey(key);
+      if (const std::optional<quint64> existingOperationId =
+              findInFlightOperation(opKey)) {
+        const quint64 handleId = m_nextHandle++;
+        Operation &existing = m_operations[*existingOperationId];
+        existing.consumers.append(Consumer{handleId, std::move(callback)});
+        m_handleToOperation.insert(handleId, *existingOperationId);
+        return RequestHandle{handleId};
+      }
+
       const quint64 handleId = m_nextHandle++;
       const quint64 operationId = m_nextOperationId++;
       Operation operation;
@@ -133,12 +150,12 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   const quint64 handleId = m_nextHandle++;
 
   // Coalesce with an already-in-flight identical request, if one exists.
-  for (auto it = m_operations.begin(); it != m_operations.end(); ++it) {
-    if (canonicalOperationKey(it.value().key) == opKey) {
-      it.value().consumers.append(Consumer{handleId, std::move(callback)});
-      m_handleToOperation.insert(handleId, it.key());
-      return RequestHandle{handleId};
-    }
+  if (const std::optional<quint64> existingOperationId =
+          findInFlightOperation(opKey)) {
+    Operation &existing = m_operations[*existingOperationId];
+    existing.consumers.append(Consumer{handleId, std::move(callback)});
+    m_handleToOperation.insert(handleId, *existingOperationId);
+    return RequestHandle{handleId};
   }
 
   const quint64 operationId = m_nextOperationId++;
@@ -153,6 +170,16 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   startCandidate(operationId);
 
   return RequestHandle{handleId};
+}
+
+std::optional<quint64>
+AssetRequestCoordinator::findInFlightOperation(const QString &opKey) const {
+  for (auto it = m_operations.begin(); it != m_operations.end(); ++it) {
+    if (canonicalOperationKey(it.value().key) == opKey) {
+      return it.key();
+    }
+  }
+  return std::nullopt;
 }
 
 AssetRequestCoordinator::RequestHandle

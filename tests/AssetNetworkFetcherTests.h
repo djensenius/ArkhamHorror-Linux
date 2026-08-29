@@ -28,6 +28,7 @@ private slots:
   void dimensionBombIsRejected();
   void pixelBudgetBombIsRejected();
   void malformedImageBodyIsRejected();
+  void jpegDecodesRegardlessOfQtPluginKeySpelling();
   void avifCodecSupportIsEnvironmentAdaptive();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void conditionalRequestAcceptsMatchingNotModified();

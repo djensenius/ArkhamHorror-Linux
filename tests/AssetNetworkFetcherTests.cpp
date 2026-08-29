@@ -281,6 +281,42 @@ void AssetNetworkFetcherTests::malformedImageBodyIsRejected() {
   QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
 }
 
+void AssetNetworkFetcherTests::jpegDecodesRegardlessOfQtPluginKeySpelling() {
+  // Regression for a review finding: the fetcher's internal codec-support
+  // check and QImageReader format hint must not hardcode a single spelling
+  // of the JPEG plugin key. Qt's stock qjpeg plugin advertises both "jpeg"
+  // and "jpg" (QImageReader::supportedImageFormats() includes both on this
+  // build -- see the aliasing handled by isQtImageFormatSupported() in
+  // AssetNetworkFetcher.cpp), but a fetcher that only recognised one
+  // spelling would spuriously report UnsupportedCodec on any Qt build/
+  // plugin set that only registers the other. A genuine, correctly
+  // Content-Typed and magic-byte-valid JPEG must decode successfully
+  // through the real production path end-to-end.
+  const bool jpegSupported =
+      QImageReader::supportedImageFormats().contains(
+          QByteArrayLiteral("jpeg")) ||
+      QImageReader::supportedImageFormats().contains(QByteArrayLiteral("jpg"));
+  if (!jpegSupported) {
+    QSKIP("this Qt build has no JPEG decode plugin under either key");
+  }
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/jpeg";
+  response.body = encodeImage(32, 32, "jpg");
+  server.setResponse(QStringLiteral("/image.jpg"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result =
+      fetchAndWait(fetcher, server.baseUrlFor(QStringLiteral("/image.jpg")),
+                   AssetFormat::Jpeg);
+
+  QVERIFY(result.has_value());
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).asset->dimensions, QSize(32, 32));
+}
+
 void AssetNetworkFetcherTests::avifCodecSupportIsEnvironmentAdaptive() {
   const bool avifSupported =
       QImageReader::supportedImageFormats().contains(QByteArrayLiteral("avif"));
