@@ -61,6 +61,8 @@ private slots:
   void decodesChooseDeckFromFixture();
   void decodesContinueWithoutUpgradeFromFixture();
   void decodesClaimSeatFromFixture();
+  void chooseDeckMissingInvestigatorIdRejected();
+  void claimSeatMissingInvestigatorIdRejected();
   void decodesOpenSeatsFromFixture();
 
   // CampaignOption forward compatibility ────────────────────────────────────
@@ -571,6 +573,31 @@ void GamesTests::decodesClaimSeatFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->investigatorId.value(), QStringLiteral("01001"));
   QCOMPARE(result->toJson(), withoutKey(v.toObject(), "unknownField"_L1));
+}
+
+void GamesTests::chooseDeckMissingInvestigatorIdRejected() {
+  const QJsonObject obj{
+      {QStringLiteral("deckUrl"),
+       QStringLiteral("https://arkhamdb.com/decklist/view/4242")},
+  };
+  const auto result = ChooseDeckRequest::fromJson(obj, u"chooseDeck");
+  QVERIFY(!result.has_value());
+  // Asserts the exact, clearer "missing required field" phrasing rather
+  // than the less specific "expected string, got missing" a bare
+  // value-decoder call would produce for an absent key -- see
+  // Json::requireField (JsonDecode.h).
+  QCOMPARE(result.error(),
+           QStringLiteral("chooseDeck.investigatorId: missing required field "
+                          "\"investigatorId\""));
+}
+
+void GamesTests::claimSeatMissingInvestigatorIdRejected() {
+  const QJsonObject obj{};
+  const auto result = ClaimSeatRequest::fromJson(obj, u"claimSeat");
+  QVERIFY(!result.has_value());
+  QCOMPARE(result.error(),
+           QStringLiteral("claimSeat.investigatorId: missing required field "
+                          "\"investigatorId\""));
 }
 
 void GamesTests::decodesOpenSeatsFromFixture() {

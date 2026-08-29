@@ -134,6 +134,31 @@ requireObjectField(const Json::Value &obj, QLatin1StringView key,
 requireArrayField(const Json::Value &obj, QLatin1StringView key,
                   QStringView path);
 
+// Generic required-field wrapper for callers decoding a field through a
+// strongly-typed factory (e.g. SomeId::fromJson, CardCode::fromJson) not
+// covered by one of the concrete requireString/requireInt/... wrappers
+// above: reports a missing key with the exact same "missing required
+// field" phrasing those wrappers use, rather than letting the raw
+// QJsonValue::Undefined/absent-key value fall through to the factory's
+// own type-check and surface as a less specific "expected <type>, got
+// missing". A present value (of any type, including the wrong one) is
+// still forwarded to `valueDecoder` unchanged, so type errors from
+// `valueDecoder` itself are untouched. Every requireString/requireInt/...
+// wrapper above is itself implemented in terms of this one helper (see
+// JsonDecode.cpp); it is exposed here as a template so it can also be
+// called directly wherever a call site's value decoder is some other
+// type's fromJson()-shaped factory instead of one of requireStringValue/
+// requireIntValue/requireBoolValue/requireObject/requireArray.
+template <typename Obj, typename ValueDecoder>
+[[nodiscard]] auto requireField(const Obj &obj, QLatin1StringView key,
+                                QStringView path, ValueDecoder valueDecoder)
+    -> decltype(valueDecoder(obj.value(key), path)) {
+  if (fieldPresence(obj, key) == FieldPresence::Absent)
+    return failure(
+        QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
+  return valueDecoder(obj.value(key), path);
+}
+
 // Required-but-unconstrained-value decoder: fails only if the key itself is
 // absent. Unlike every other require* helper, a present value -- of any
 // type, including explicit null -- decodes verbatim with no type check.

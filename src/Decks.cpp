@@ -153,9 +153,11 @@ ValueOrError<DeckListInput> decodeDeckListInput(const Obj &v,
   if (!cardSlots)
     return failure(cardSlots.error());
 
-  auto investigatorCode =
-      decodeInvestigatorRefValue(obj.value("investigator_code"_L1),
-                                 Json::joinPath(path, u"investigator_code"));
+  auto investigatorCode = Json::requireField(
+      obj, "investigator_code"_L1, Json::joinPath(path, u"investigator_code"),
+      [](const auto &v, QStringView p) {
+        return decodeInvestigatorRefValue(v, p);
+      });
   if (!investigatorCode)
     return failure(investigatorCode.error());
 
@@ -436,9 +438,11 @@ ValueOrError<DeckList> DeckList::fromJson(const QJsonValue &v,
                                          Json::joinPath(path, u"sideSlots"));
   if (!sideSlots)
     return failure(sideSlots.error());
-  auto investigatorCode =
-      CardCode::fromJson(obj.value("investigator_code"_L1),
-                         Json::joinPath(path, u"investigator_code"));
+  auto investigatorCode = Json::requireField(
+      obj, "investigator_code"_L1, Json::joinPath(path, u"investigator_code"),
+      [](const QJsonValue &v, QStringView p) {
+        return CardCode::fromJson(v, p);
+      });
   if (!investigatorCode)
     return failure(investigatorCode.error());
   auto investigatorName = Json::requireString(
@@ -500,7 +504,10 @@ ValueOrError<Deck> Deck::fromJson(const QJsonValue &v, QStringView path) {
     return failure(objResult.error());
   const QJsonObject &obj = *objResult;
 
-  auto id = DeckId::fromJson(obj.value("id"_L1), Json::joinPath(path, u"id"));
+  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
+                               [](const QJsonValue &v, QStringView p) {
+                                 return DeckId::fromJson(v, p);
+                               });
   if (!id)
     return failure(id.error());
   auto userId =
@@ -519,8 +526,10 @@ ValueOrError<Deck> Deck::fromJson(const QJsonValue &v, QStringView path) {
       obj, "investigatorName"_L1, Json::joinPath(path, u"investigatorName"));
   if (!investigatorName)
     return failure(investigatorName.error());
-  auto list =
-      DeckList::fromJson(obj.value("list"_L1), Json::joinPath(path, u"list"));
+  auto list = Json::requireField(obj, "list"_L1, Json::joinPath(path, u"list"),
+                                 [](const QJsonValue &v, QStringView p) {
+                                   return DeckList::fromJson(v, p);
+                                 });
   if (!list)
     return failure(list.error());
 
@@ -615,8 +624,11 @@ DeckValidationError::fromJson(const QJsonValue &v, QStringView path) {
   if (*tag != "UnimplementedCard"_L1)
     return failure(
         QStringLiteral("%1.tag: unrecognized value \"%2\"").arg(path, *tag));
-  auto cardCode = CardCode::fromJson(obj.value("contents"_L1),
-                                     Json::joinPath(path, u"contents"));
+  auto cardCode =
+      Json::requireField(obj, "contents"_L1, Json::joinPath(path, u"contents"),
+                         [](const QJsonValue &v, QStringView p) {
+                           return CardCode::fromJson(v, p);
+                         });
   if (!cardCode)
     return failure(cardCode.error());
   return DeckValidationError{.cardCode = *cardCode};

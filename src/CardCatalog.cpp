@@ -416,9 +416,11 @@ ValueOrError<SkillIcon> SkillIcon::fromValueImpl(const V &v, QStringView path) {
     return failure(tagResult.error());
 
   if (*tagResult == "SkillIcon"_L1) {
-    auto skillResult = Json::decodeClosedEnum<SkillType>(
-        obj.value("contents"_L1), Json::joinPath(path, u"contents"),
-        kSkillTypeTable);
+    auto skillResult = Json::requireField(
+        obj, "contents"_L1, Json::joinPath(path, u"contents"),
+        [](const auto &cv, QStringView cp) {
+          return Json::decodeClosedEnum<SkillType>(cv, cp, kSkillTypeTable);
+        });
     if (!skillResult)
       return failure(skillResult.error());
     return SkillIcon::skillType(*skillResult);
@@ -844,17 +846,21 @@ ValueOrError<CardDef> decodeCardDef(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  auto cardCode = decodeCardCodeValue(obj.value("cardCode"_L1),
-                                      Json::joinPath(path, u"cardCode"));
+  auto cardCode = Json::requireField(
+      obj, "cardCode"_L1, Json::joinPath(path, u"cardCode"),
+      [](const auto &v, QStringView p) { return decodeCardCodeValue(v, p); });
   if (!cardCode)
     return failure(cardCode.error());
-  auto name =
-      decodeCardNameValue(obj.value("name"_L1), Json::joinPath(path, u"name"));
+  auto name = Json::requireField(
+      obj, "name"_L1, Json::joinPath(path, u"name"),
+      [](const auto &v, QStringView p) { return decodeCardNameValue(v, p); });
   if (!name)
     return failure(name.error());
-  auto cardType = Json::decodeClosedEnum<CardType>(
-      obj.value("cardType"_L1), Json::joinPath(path, u"cardType"),
-      kCardTypeTable);
+  auto cardType = Json::requireField(
+      obj, "cardType"_L1, Json::joinPath(path, u"cardType"),
+      [](const auto &v, QStringView p) {
+        return Json::decodeClosedEnum<CardType>(v, p, kCardTypeTable);
+      });
   if (!cardType)
     return failure(cardType.error());
   auto art = Json::requireString(obj, "art"_L1, Json::joinPath(path, u"art"));

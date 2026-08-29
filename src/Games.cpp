@@ -248,13 +248,18 @@ InvestigatorSummary::fromJson(const QJsonValue &v, QStringView path) {
     return failure(objResult.error());
   const QJsonObject &obj = *objResult;
 
-  auto id = CardCode::fromJson(obj.value("id"_L1), Json::joinPath(path, u"id"));
+  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
+                               [](const QJsonValue &v, QStringView p) {
+                                 return CardCode::fromJson(v, p);
+                               });
   if (!id)
     return failure(id.error());
 
-  auto classSymbol = Json::decodeClosedEnum(
-      obj.value("classSymbol"_L1), Json::joinPath(path, u"classSymbol"),
-      kClassSymbolTable);
+  auto classSymbol = Json::requireField(
+      obj, "classSymbol"_L1, Json::joinPath(path, u"classSymbol"),
+      [](const auto &v, QStringView p) {
+        return Json::decodeClosedEnum(v, p, kClassSymbolTable);
+      });
   if (!classSymbol)
     return failure(classSymbol.error());
 
@@ -276,18 +281,25 @@ ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const QJsonValue &v,
     return failure(objResult.error());
   const QJsonObject &obj = *objResult;
 
-  auto id = CardCode::fromJson(obj.value("id"_L1), Json::joinPath(path, u"id"));
+  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
+                               [](const QJsonValue &v, QStringView p) {
+                                 return CardCode::fromJson(v, p);
+                               });
   if (!id)
     return failure(id.error());
 
-  auto difficulty = Json::decodeClosedEnum(obj.value("difficulty"_L1),
-                                           Json::joinPath(path, u"difficulty"),
-                                           kDifficultyTable);
+  auto difficulty = Json::requireField(
+      obj, "difficulty"_L1, Json::joinPath(path, u"difficulty"),
+      [](const auto &v, QStringView p) {
+        return Json::decodeClosedEnum(v, p, kDifficultyTable);
+      });
   if (!difficulty)
     return failure(difficulty.error());
 
-  auto name =
-      CardName::fromJson(obj.value("name"_L1), Json::joinPath(path, u"name"));
+  auto name = Json::requireField(obj, "name"_L1, Json::joinPath(path, u"name"),
+                                 [](const QJsonValue &v, QStringView p) {
+                                   return CardName::fromJson(v, p);
+                                 });
   if (!name)
     return failure(name.error());
 
@@ -318,14 +330,18 @@ ValueOrError<CampaignSummary> CampaignSummary::fromJson(const QJsonValue &v,
     return failure(objResult.error());
   const QJsonObject &obj = *objResult;
 
-  auto id =
-      CampaignId::fromJson(obj.value("id"_L1), Json::joinPath(path, u"id"));
+  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
+                               [](const QJsonValue &v, QStringView p) {
+                                 return CampaignId::fromJson(v, p);
+                               });
   if (!id)
     return failure(id.error());
 
-  auto difficulty = Json::decodeClosedEnum(obj.value("difficulty"_L1),
-                                           Json::joinPath(path, u"difficulty"),
-                                           kDifficultyTable);
+  auto difficulty = Json::requireField(
+      obj, "difficulty"_L1, Json::joinPath(path, u"difficulty"),
+      [](const auto &v, QStringView p) {
+        return Json::decodeClosedEnum(v, p, kDifficultyTable);
+      });
   if (!difficulty)
     return failure(difficulty.error());
 
@@ -541,7 +557,10 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
     return GameListRow::failed(*error);
   }
 
-  auto id = GameId::fromJson(obj.value("id"_L1), Json::joinPath(path, u"id"));
+  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
+                               [](const QJsonValue &v, QStringView p) {
+                                 return GameId::fromJson(v, p);
+                               });
   if (!id)
     return failure(id.error());
 
@@ -575,8 +594,11 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
     }
   }
 
-  auto gameState = GameState::fromJson(obj.value("gameState"_L1),
-                                       Json::joinPath(path, u"gameState"));
+  auto gameState = Json::requireField(obj, "gameState"_L1,
+                                      Json::joinPath(path, u"gameState"),
+                                      [](const QJsonValue &v, QStringView p) {
+                                        return GameState::fromJson(v, p);
+                                      });
   if (!gameState)
     return failure(gameState.error());
 
@@ -596,9 +618,11 @@ ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
   if (!otherInvestigators)
     return failure(otherInvestigators.error());
 
-  auto multiplayerVariant = Json::decodeClosedEnum(
-      obj.value("multiplayerVariant"_L1),
-      Json::joinPath(path, u"multiplayerVariant"), kMultiplayerVariantTable);
+  auto multiplayerVariant = Json::requireField(
+      obj, "multiplayerVariant"_L1, Json::joinPath(path, u"multiplayerVariant"),
+      [](const auto &v, QStringView p) {
+        return Json::decodeClosedEnum(v, p, kMultiplayerVariantTable);
+      });
   if (!multiplayerVariant)
     return failure(multiplayerVariant.error());
 
@@ -943,9 +967,11 @@ ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
   if (!campaignOrScenario)
     return failure(campaignOrScenario.error());
 
-  auto difficulty = Json::decodeClosedEnum(obj.value("difficulty"_L1),
-                                           Json::joinPath(path, u"difficulty"),
-                                           kDifficultyTable);
+  auto difficulty = Json::requireField(
+      obj, "difficulty"_L1, Json::joinPath(path, u"difficulty"),
+      [](const auto &v, QStringView p) {
+        return Json::decodeClosedEnum(v, p, kDifficultyTable);
+      });
   if (!difficulty)
     return failure(difficulty.error());
 
@@ -954,9 +980,11 @@ ValueOrError<CreateGameRequest> CreateGameRequest::fromJson(const QJsonValue &v,
   if (!campaignName)
     return failure(campaignName.error());
 
-  auto multiplayerVariant = Json::decodeClosedEnum(
-      obj.value("multiplayerVariant"_L1),
-      Json::joinPath(path, u"multiplayerVariant"), kMultiplayerVariantTable);
+  auto multiplayerVariant = Json::requireField(
+      obj, "multiplayerVariant"_L1, Json::joinPath(path, u"multiplayerVariant"),
+      [](const auto &v, QStringView p) {
+        return Json::decodeClosedEnum(v, p, kMultiplayerVariantTable);
+      });
   if (!multiplayerVariant)
     return failure(multiplayerVariant.error());
 
@@ -1112,8 +1140,11 @@ ValueOrError<DeckListInput> decodeDeckListInputValue(const Json::Value &v,
 template <typename Obj>
 ValueOrError<ChooseDeckRequest> decodeChooseDeckRequest(const Obj &obj,
                                                         QStringView path) {
-  auto investigatorId = decodeInvestigatorRefValue(
-      obj.value("investigatorId"_L1), Json::joinPath(path, u"investigatorId"));
+  auto investigatorId = Json::requireField(
+      obj, "investigatorId"_L1, Json::joinPath(path, u"investigatorId"),
+      [](const auto &v, QStringView p) {
+        return decodeInvestigatorRefValue(v, p);
+      });
   if (!investigatorId)
     return failure(investigatorId.error());
 
@@ -1195,9 +1226,11 @@ ValueOrError<ClaimSeatRequest> ClaimSeatRequest::fromJson(const QJsonValue &v,
   if (!objResult)
     return failure(objResult.error());
 
-  auto investigatorId =
-      InvestigatorRef::fromJson(objResult->value("investigatorId"_L1),
-                                Json::joinPath(path, u"investigatorId"));
+  auto investigatorId = Json::requireField(
+      *objResult, "investigatorId"_L1, Json::joinPath(path, u"investigatorId"),
+      [](const QJsonValue &fv, QStringView p) {
+        return InvestigatorRef::fromJson(fv, p);
+      });
   if (!investigatorId)
     return failure(investigatorId.error());
 

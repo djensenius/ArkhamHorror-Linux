@@ -231,7 +231,13 @@ void CardCatalogTests::missingCardCodeRejected() {
   })"_L1);
   const auto result = CardDef::fromJson(obj, u"card");
   QVERIFY(!result.has_value());
-  QVERIFY(result.error().contains(QStringLiteral("cardCode")));
+  // Asserts the exact, clearer "missing required field" phrasing (see
+  // Json::requireField, JsonDecode.h) rather than the less specific
+  // "expected string, got missing" a bare value-decoder call would
+  // produce for an absent key.
+  QCOMPARE(
+      result.error(),
+      QStringLiteral("card.cardCode: missing required field \"cardCode\""));
 }
 
 void CardCatalogTests::missingNameRejected() {
@@ -242,7 +248,8 @@ void CardCatalogTests::missingNameRejected() {
   })"_L1);
   const auto result = CardDef::fromJson(obj, u"card");
   QVERIFY(!result.has_value());
-  QVERIFY(result.error().contains(QStringLiteral("name")));
+  QCOMPARE(result.error(),
+           QStringLiteral("card.name: missing required field \"name\""));
 }
 
 void CardCatalogTests::missingCardTypeRejected() {
@@ -253,7 +260,9 @@ void CardCatalogTests::missingCardTypeRejected() {
   })"_L1);
   const auto result = CardDef::fromJson(obj, u"card");
   QVERIFY(!result.has_value());
-  QVERIFY(result.error().contains(QStringLiteral("cardType")));
+  QCOMPARE(
+      result.error(),
+      QStringLiteral("card.cardType: missing required field \"cardType\""));
 }
 
 void CardCatalogTests::missingArtRejected() {

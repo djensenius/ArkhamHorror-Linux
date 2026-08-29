@@ -891,6 +891,13 @@ void DecksTests::deckListInputMissingInvestigatorCodeRejected() {
   const QJsonObject obj{{QStringLiteral("slots"), QJsonObject{}}};
   const auto result = DeckListInput::fromJson(obj, u"deckList");
   QVERIFY(!result.has_value());
+  // Asserts the exact, clearer "missing required field" phrasing rather
+  // than the less specific "expected string, got missing" a bare
+  // value-decoder call would produce for an absent key -- see
+  // Json::requireField (JsonDecode.h).
+  QCOMPARE(result.error(),
+           QStringLiteral("deckList.investigator_code: missing required field "
+                          "\"investigator_code\""));
 }
 
 QTEST_APPLESS_MAIN(DecksTests)

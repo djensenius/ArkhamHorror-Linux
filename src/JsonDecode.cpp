@@ -194,105 +194,78 @@ ValueOrError<bool> requireBoolValue(const Json::Value &v, QStringView path) {
   return v.toBool();
 }
 
-namespace {
-// Shared by every obj+key required-field wrapper below: reports a missing
-// key with the same "missing required field" phrasing requireRawField/
-// requireNullable* already use, rather than letting it fall through to the
-// bare value decoder and surface as a less specific "expected <type>, got
-// missing". A present value (of any type, including the wrong one) is
-// still forwarded to `valueDecoder` unchanged. Templated on the container
-// type too (QJsonObject or Json::Value, see RawJson.h) so the identical
-// "missing field" wrapping logic serves both value families; callers pass
-// an explicit lambda (rather than a bare, now-overloaded function name
-// like requireStringValue) so the compiler always has a single concrete
-// callable to deduce ValueDecoder from.
-template <typename T, typename Obj, typename ValueDecoder>
-ValueOrError<T> requireFieldOr(const Obj &obj, QLatin1StringView key,
-                               QStringView path, ValueDecoder valueDecoder) {
-  if (fieldPresence(obj, key) == FieldPresence::Absent)
-    return failure(
-        QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  return valueDecoder(obj.value(key), path);
-}
-} // namespace
-
 ValueOrError<QString> requireString(const QJsonObject &obj,
                                     QLatin1StringView key, QStringView path) {
-  return requireFieldOr<QString>(obj, key, path,
-                                 [](const QJsonValue &v, QStringView p) {
-                                   return requireStringValue(v, p);
-                                 });
+  return requireField(obj, key, path, [](const QJsonValue &v, QStringView p) {
+    return requireStringValue(v, p);
+  });
 }
 
 ValueOrError<qint64> requireInt(const QJsonObject &obj, QLatin1StringView key,
                                 QStringView path) {
-  return requireFieldOr<qint64>(
-      obj, key, path,
-      [](const QJsonValue &v, QStringView p) { return requireIntValue(v, p); });
+  return requireField(obj, key, path, [](const QJsonValue &v, QStringView p) {
+    return requireIntValue(v, p);
+  });
 }
 
 ValueOrError<bool> requireBool(const QJsonObject &obj, QLatin1StringView key,
                                QStringView path) {
-  return requireFieldOr<bool>(obj, key, path,
-                              [](const QJsonValue &v, QStringView p) {
-                                return requireBoolValue(v, p);
-                              });
+  return requireField(obj, key, path, [](const QJsonValue &v, QStringView p) {
+    return requireBoolValue(v, p);
+  });
 }
 
 ValueOrError<QJsonObject> requireObjectField(const QJsonObject &obj,
                                              QLatin1StringView key,
                                              QStringView path) {
-  return requireFieldOr<QJsonObject>(
-      obj, key, path,
-      [](const QJsonValue &v, QStringView p) { return requireObject(v, p); });
+  return requireField(obj, key, path, [](const QJsonValue &v, QStringView p) {
+    return requireObject(v, p);
+  });
 }
 
 ValueOrError<QJsonArray> requireArrayField(const QJsonObject &obj,
                                            QLatin1StringView key,
                                            QStringView path) {
-  return requireFieldOr<QJsonArray>(
-      obj, key, path,
-      [](const QJsonValue &v, QStringView p) { return requireArray(v, p); });
+  return requireField(obj, key, path, [](const QJsonValue &v, QStringView p) {
+    return requireArray(v, p);
+  });
 }
 
 ValueOrError<QString> requireString(const Json::Value &obj,
                                     QLatin1StringView key, QStringView path) {
-  return requireFieldOr<QString>(obj, key, path,
-                                 [](const Json::Value &v, QStringView p) {
-                                   return requireStringValue(v, p);
-                                 });
+  return requireField(obj, key, path, [](const Json::Value &v, QStringView p) {
+    return requireStringValue(v, p);
+  });
 }
 
 ValueOrError<qint64> requireInt(const Json::Value &obj, QLatin1StringView key,
                                 QStringView path) {
-  return requireFieldOr<qint64>(obj, key, path,
-                                [](const Json::Value &v, QStringView p) {
-                                  return requireIntValue(v, p);
-                                });
+  return requireField(obj, key, path, [](const Json::Value &v, QStringView p) {
+    return requireIntValue(v, p);
+  });
 }
 
 ValueOrError<bool> requireBool(const Json::Value &obj, QLatin1StringView key,
                                QStringView path) {
-  return requireFieldOr<bool>(obj, key, path,
-                              [](const Json::Value &v, QStringView p) {
-                                return requireBoolValue(v, p);
-                              });
+  return requireField(obj, key, path, [](const Json::Value &v, QStringView p) {
+    return requireBoolValue(v, p);
+  });
 }
 
 ValueOrError<Json::Value> requireObjectField(const Json::Value &obj,
                                              QLatin1StringView key,
                                              QStringView path) {
-  return requireFieldOr<Json::Value>(
-      obj, key, path,
-      [](const Json::Value &v, QStringView p) { return requireObject(v, p); });
+  return requireField(obj, key, path, [](const Json::Value &v, QStringView p) {
+    return requireObject(v, p);
+  });
 }
 
 ValueOrError<QList<Json::Value>> requireArrayField(const Json::Value &obj,
                                                    QLatin1StringView key,
                                                    QStringView path) {
-  return requireFieldOr<QList<Json::Value>>(
-      obj, key, path,
-      [](const Json::Value &v, QStringView p) { return requireArray(v, p); });
+  return requireField(obj, key, path, [](const Json::Value &v, QStringView p) {
+    return requireArray(v, p);
+  });
 }
 
 ValueOrError<QJsonValue> requireRawField(const QJsonObject &obj,
