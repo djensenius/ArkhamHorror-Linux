@@ -128,6 +128,29 @@ class ClosureTests(unittest.TestCase):
         closure = vcp.compute_schema_closure(tree, ["contracts/schemas/catalog.schema.json"])
         self.assertEqual(list(closure), ["contracts/schemas/catalog.schema.json"])
 
+    def test_dot_slash_prefixed_cross_file_ref_resolves(self):
+        # The real backend's contracts/schemas/game-list.schema.json
+        # contains a genuine cross-file ref written as
+        # "$ref": "./game-state.schema.json" (a leading "./" segment, not
+        # just a bare filename). The closure walk must resolve this to
+        # "contracts/schemas/game-state.schema.json" and actually fetch
+        # it, not silently drop the dependency or look up a literal
+        # "contracts/schemas/./game-state.schema.json" path that does not
+        # exist in the backend tree.
+        blobs = _baseline_blobs()
+        blobs["contracts/schemas/game-list.schema.json"] = (
+            b'{"$defs": {"row": {"$ref": "./game-state.schema.json"}}}'
+        )
+        tree = FakeTree(blobs)
+        closure = vcp.compute_schema_closure(
+            tree, ["contracts/schemas/game-list.schema.json"]
+        )
+        self.assertIn("contracts/schemas/game-state.schema.json", closure)
+        self.assertEqual(
+            closure["contracts/schemas/game-state.schema.json"],
+            blobs["contracts/schemas/game-state.schema.json"],
+        )
+
     def test_ref_substring_in_prose_is_not_a_dependency(self):
         # A schema author writing prose that happens to contain the four
         # characters "$ref" (e.g. documenting $ref syntax itself in a

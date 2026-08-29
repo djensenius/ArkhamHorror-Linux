@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import posixpath
 import re
 import stat
 import subprocess
@@ -196,11 +197,16 @@ def _resolve_schema_ref(schema_path: str, ref: str) -> str | None:
             f"{schema_path}: $ref {ref!r} is an absolute path, not permitted"
         )
     resolved = (Path(schema_path).parent / file_part).as_posix()
-    # Normalize away any "./"/".." *after* rejecting absolute paths above,
-    # then require the normalized result still starts with
-    # contracts/schemas/ -- catches "../../../etc/passwd"-shaped escapes
-    # and anything that would otherwise land outside the schemas tree.
-    normalized = Path(resolved).as_posix()
+    # Collapse any "./" segments explicitly via posixpath.normpath rather
+    # than relying on Path's "/" join operator to have already done so:
+    # this makes the "./nested.schema.json"-style refs actually present in
+    # the real backend schemas (e.g. game-list.schema.json's
+    # "$ref": "./game-state.schema.json") resolve deterministically
+    # without depending on pathlib join internals. ".." is rejected above
+    # from the *raw* file_part before this call, so normpath here can only
+    # ever collapse a redundant "./", never silently normalize away an
+    # attempted directory-traversal escape.
+    normalized = posixpath.normpath(resolved)
     parts = Path(file_part).parts
     if ".." in parts:
         raise RefEscapeError(
