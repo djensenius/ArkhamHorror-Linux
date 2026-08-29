@@ -19,6 +19,22 @@ provenance.sourceRepository field to name one. If the manifest's
 sourceRepository does not match this fixed constant, verification fails
 immediately without ever making a network request.
 
+Round-6/7 review item 10: `sourceCommit` must be an exact, immutable
+40-character lowercase hex SHA-1 object id -- never a mutable ref (a
+branch/tag name, or an abbreviated/short SHA), which the GitHub API would
+otherwise happily resolve to whatever commit currently sits there at
+fetch time, silently verifying against a moving target rather than the
+specific immutable commit this provenance record claims to attest to.
+This is checked locally, before any network request, exactly like the
+sourceRepository check above. As a second, belt-and-braces guard, this
+also fetches the single-commit-object endpoint
+(/repos/.../git/commits/<sha>) and requires its own `sha` field to equal
+the requested identifier verbatim -- that endpoint can only ever resolve
+an EXACT object id to itself or 404 (unlike the ref-resolving contents/
+refs APIs), so this additionally protects against any future API
+behavior change that might otherwise let a non-exact identifier slip
+past the local regex check with a "helpful" fuzzy resolution.
+
 For each of the five pinned locales, this:
   1. Locates the exact tree entry for frontend/src/digests/<web-locale>.json
      within the recursive tree listing at the pinned commit.
@@ -56,6 +72,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -82,6 +99,16 @@ _EXPECTED_REPO = "ArkhamHorror"
 _UPSTREAM_DIGEST_PATH_TEMPLATE = "frontend/src/digests/{web_locale}.json"
 
 _EXPECTED_REGULAR_FILE_MODE = "100644"
+
+# Round-6/7 review item 10: sourceCommit must be an exact, immutable
+# 40-character lowercase hex SHA-1 object id -- NEVER a mutable ref such
+# as a branch name ("main"), tag, or abbreviated/short SHA. A mutable ref
+# resolves to whatever commit currently sits at that ref at fetch time
+# (a moving target an attacker who can push to the upstream repository,
+# or simply time itself via an ordinary future upstream commit, could
+# shift out from under this "pin"), which defeats the entire point of
+# pinning a specific, immutable commit for provenance verification.
+_FULL_LOWERCASE_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class ProvenanceVerificationError(RuntimeError):
@@ -181,6 +208,47 @@ def verify(
     if not isinstance(source_commit, str) or not source_commit:
         raise ProvenanceVerificationError(
             "manifest provenance.sourceCommit is missing or not a string"
+        )
+    if not _FULL_LOWERCASE_SHA1_RE.fullmatch(source_commit):
+        # Deliberately fails BEFORE any network request, same as the
+        # sourceRepository check above: a mutable ref name (a branch,
+        # tag, or abbreviated SHA) is never an acceptable "pin", since
+        # the GitHub API would happily resolve it to whatever commit
+        # currently sits there -- silently verifying against a moving
+        # target rather than the specific immutable commit this
+        # provenance record claims to attest to.
+        raise ProvenanceVerificationError(
+            f"manifest provenance.sourceCommit is {source_commit!r}, but "
+            "must be an exact, immutable 40-character lowercase hex "
+            "SHA-1 commit id -- a mutable ref (branch/tag name) or "
+            "abbreviated SHA is never an acceptable pin"
+        )
+
+    commit_url = (
+        f"https://api.github.com/repos/{_EXPECTED_OWNER}/{_EXPECTED_REPO}"
+        f"/git/commits/{source_commit}"
+    )
+    commit_response = fetch_json(commit_url, token)
+    resolved_commit_sha = commit_response.get("sha")
+    if resolved_commit_sha != source_commit:
+        # Belt-and-braces: the Git Data API's single-commit-object
+        # endpoint (unlike the ref-resolving contents/refs APIs) can only
+        # ever resolve an EXACT object id to itself or 404 -- so this
+        # additionally guards against any future API behavior change that
+        # might otherwise let a non-exact identifier slip through the
+        # regex check above with a "helpful" fuzzy resolution.
+        raise ProvenanceVerificationError(
+            f"commit lookup for {source_commit!r} returned a different "
+            f"sha {resolved_commit_sha!r} -- refusing to trust a "
+            "non-exact commit resolution"
+        )
+    commit_tree = commit_response.get("tree")
+    if not isinstance(commit_tree, dict) or not isinstance(
+        commit_tree.get("sha"), str
+    ):
+        raise ProvenanceVerificationError(
+            f"commit {source_commit!r} response had no usable tree sha -- "
+            f"got keys {sorted(commit_response.keys())!r}"
         )
 
     tree_url = (

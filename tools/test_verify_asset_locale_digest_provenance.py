@@ -39,6 +39,28 @@ _REAL_COMMIT = "330b7dda81e6fc3be17e50aefd5d0a6fced35a39"
 _UPSTREAM_PATH = "frontend/src/digests/{locale}.json"
 
 
+def _fetch_json_router(commit_sha: str, tree_response: dict):
+    """Builds a fetch_json double that behaves like the real GitHub Git
+    Data API: the commit-object endpoint
+    (/repos/.../git/commits/<sha>) resolves EXACTLY `commit_sha` back to
+    itself with a `tree.sha` pointer, and the recursive tree-listing
+    endpoint (/repos/.../git/trees/<sha>?recursive=1) returns
+    `tree_response`. Most tests below only care about the tree-listing
+    response's shape/content, so this lets them keep expressing that
+    directly while still exercising the (round-6/7 item 10) commit-
+    identity resolution step verify() now performs first."""
+
+    def fetch_json(url: str, token: str | None) -> dict:
+        del token
+        if "/git/commits/" in url:
+            return {"sha": commit_sha, "tree": {"sha": "0" * 40}}
+        if "/git/trees/" in url:
+            return tree_response
+        raise AssertionError(f"unexpected fetch_json url: {url!r}")
+
+    return fetch_json
+
+
 class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -101,7 +123,7 @@ class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
 
     def test_genuinely_matching_provenance_passes(self) -> None:
         tree = self._genuine_tree_response()
-        self._verify(lambda url, token: tree)
+        self._verify(_fetch_json_router(_REAL_COMMIT, tree))
 
     def test_wrong_source_repository_fails_without_any_network_call(self) -> None:
         self.manifest["provenance"]["sourceRepository"] = (
@@ -114,6 +136,71 @@ class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
                 "must not make any network request once sourceRepository "
                 "fails the fixed-identity check"
             )
+
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(fetch_json)
+
+    def test_mutable_branch_ref_as_source_commit_is_rejected_without_network(
+        self,
+    ) -> None:
+        # Round-6/7 review item 10: a branch name (or any other mutable
+        # ref) resolves to whatever commit currently sits there -- a
+        # moving target, not a genuine pin. This must fail the local
+        # grammar check before ever making a network request that could
+        # otherwise "successfully" resolve it.
+        self.manifest["provenance"]["sourceCommit"] = "main"
+        self._write_manifest()
+
+        def fetch_json(url, token):
+            self.fail(
+                "must not make any network request once sourceCommit "
+                "fails the exact-40-hex-SHA grammar check"
+            )
+
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(fetch_json)
+
+    def test_abbreviated_short_sha_source_commit_is_rejected_without_network(
+        self,
+    ) -> None:
+        self.manifest["provenance"]["sourceCommit"] = _REAL_COMMIT[:7]
+        self._write_manifest()
+
+        def fetch_json(url, token):
+            self.fail(
+                "must not make any network request for an abbreviated "
+                "(non-40-character) commit id"
+            )
+
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(fetch_json)
+
+    def test_uppercase_hex_source_commit_is_rejected_without_network(self) -> None:
+        self.manifest["provenance"]["sourceCommit"] = _REAL_COMMIT.upper()
+        self._write_manifest()
+
+        def fetch_json(url, token):
+            self.fail(
+                "must not make any network request for an uppercase-hex "
+                "commit id, even though the same bytes lowercased are "
+                "genuinely valid"
+            )
+
+        with self.assertRaises(verify_mod.ProvenanceVerificationError):
+            self._verify(fetch_json)
+
+    def test_commit_lookup_resolving_to_a_different_sha_is_rejected(self) -> None:
+        # Guards the belt-and-braces resolved-sha comparison itself: even
+        # if some future API behavior change made the commit-object
+        # endpoint "helpfully" resolve a non-exact identifier, a response
+        # whose own `sha` field disagrees with the requested commit must
+        # still be rejected rather than trusted.
+        tree = self._genuine_tree_response()
+
+        def fetch_json(url, token):
+            if "/git/commits/" in url:
+                return {"sha": "e" * 40, "tree": {"sha": "0" * 40}}
+            return tree
 
         with self.assertRaises(verify_mod.ProvenanceVerificationError):
             self._verify(fetch_json)
@@ -134,6 +221,8 @@ class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
 
         def fetch_json(url, token):
             self.assertIn("f" * 40, url)
+            if "/git/commits/" in url:
+                return {"sha": "f" * 40, "tree": {"sha": "0" * 40}}
             different_upstream_content = b"[\"cards/DIFFERENT.avif\"]"
             return {
                 "tree": [
@@ -166,7 +255,7 @@ class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
         (self.sources_dir / "ita.json").write_bytes(tampered_bytes)
 
         with self.assertRaises(verify_mod.ProvenanceVerificationError):
-            self._verify(lambda url, token: genuine_tree)
+            self._verify(_fetch_json_router(_REAL_COMMIT, genuine_tree))
 
     def test_extra_locale_map_alias_key_is_out_of_scope_for_this_script(self) -> None:
         # Extra key/alias and absolute/".." path rejection are covered by
@@ -195,18 +284,18 @@ class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
             "truncated": False,
         }
         with self.assertRaises(verify_mod.ProvenanceVerificationError):
-            self._verify(lambda url, token: tree)
+            self._verify(_fetch_json_router(_REAL_COMMIT, tree))
 
     def test_missing_blob_in_tree_is_rejected(self) -> None:
         tree = {"tree": [], "truncated": False}
         with self.assertRaises(verify_mod.ProvenanceVerificationError):
-            self._verify(lambda url, token: tree)
+            self._verify(_fetch_json_router(_REAL_COMMIT, tree))
 
     def test_truncated_tree_listing_is_rejected(self) -> None:
         tree = self._genuine_tree_response()
         tree["truncated"] = True
         with self.assertRaises(verify_mod.ProvenanceVerificationError):
-            self._verify(lambda url, token: tree)
+            self._verify(_fetch_json_router(_REAL_COMMIT, tree))
 
     def test_network_failure_never_falls_back_to_success(self) -> None:
         def fetch_json(url, token):
@@ -232,7 +321,7 @@ class VerifyAssetLocaleDigestProvenanceTests(unittest.TestCase):
         (self.sources_dir / "ita.json").unlink()
         tree = self._genuine_tree_response()
         with self.assertRaises(verify_mod.ProvenanceVerificationError):
-            self._verify(lambda url, token: tree)
+            self._verify(_fetch_json_router(_REAL_COMMIT, tree))
 
     def test_missing_manifest_file_fails_closed_not_uncaught(self) -> None:
         # verify() must report a missing/unreadable manifest as a typed

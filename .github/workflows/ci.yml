@@ -70,10 +70,10 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. AVIF card art is decoded directly against libavif's own C API (see src/AssetAvifDecoder.cpp), and JPEG is decoded directly against libjpeg's own C API (see src/AssetJpegDecoder.cpp), neither through Qt's plugin registry -- Qt has no official AVIF plugin at all (upstream qtimageformats does not include one) -- so the codec-support tests exercise the real libavif/libjpeg-backed decode paths unconditionally rather than branching on QImageReader::supportedImageFormats().
           cache: true
-      - name: Install QtKeychain, D-Bus, libavif and libjpeg build dependencies
+      - name: Install QtKeychain, D-Bus, libavif, libjpeg and clang-format build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev libjpeg-turbo8-dev # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev/libjpeg-turbo8-dev provide the mandatory AVIF/JPEG decode dependencies (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)).
+          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev libjpeg-turbo8-dev clang-format # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev/libjpeg-turbo8-dev provide the mandatory AVIF/JPEG decode dependencies (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)); clang-format is required by generate_asset_locale_digest.py --check below (review round-6/7 item 10 -- --check fails closed without it, see that script's _clang_format()).
       - name: Test asset locale digest generator's --check fail-closed behavior
         # tools/generate_asset_locale_digest.py's --check mode (review
         # round-3 item 16) is a standalone local dev tool no CMake/ctest
@@ -109,6 +109,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/verify_asset_locale_digest_provenance.py
+      - name: Verify generated asset locale digest header is not stale
+        # Review round-6/7 item 10: previously CI only ran this script's
+        # OWN unit tests (above) plus tests/AssetLocaleDigestTests.cpp's
+        # independent C++ hash-drift check -- never the real
+        # generate_asset_locale_digest.py --check itself against the
+        # actual checked-in src/AssetLocaleDigestData.generated.h. That
+        # left a gap: --check's own stronger drift detection (full
+        # rendered-output comparison, not just embedded input hashes --
+        # see review round-3 item 16's _clang_format()/fail-closed logic)
+        # was never actually exercised in CI. clang-format is installed
+        # above so --check's fail-closed-without-a-formatter path is
+        # never spuriously triggered here.
+        run: python3 tools/generate_asset_locale_digest.py --check
       - run: mise run test
 
   build:
