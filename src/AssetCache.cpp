@@ -83,15 +83,74 @@ std::optional<QByteArray> readVerifiedPayload(QFile &payloadFile,
   return bytes;
 }
 
-// Every valid entry filename matches exactly this shape: a 64-character
-// lowercase hex SHA-256 key, followed by ".bin" or ".meta.json". Anything
-// else found in the cache directory during a sweep (a QSaveFile crash
-// artifact, a file from an old format version, etc.) is treated as a
-// stray leftover and removed -- this directory is exclusively owned and
-// fully managed by AssetCache, so that is always safe.
+// A 64-character lowercase hex SHA-256 string -- the shape of both a
+// cache key (cacheKeyFor()) and a generation identifier (a payload's own
+// content hash): both are validated against this exact same pattern
+// before ever becoming part of a filesystem path.
 const QRegularExpression &validKeyPattern() {
   static const QRegularExpression re(QStringLiteral("^[0-9a-f]{64}$"));
   return re;
+}
+
+// Review item 8: on-disk filename shapes for the generation/manifest
+// layout described in AssetCache.h. Anything found in the cache
+// directory during a sweep that matches none of these three shapes (a
+// QSaveFile crash artifact, debris from an old format version, etc.) is
+// a stray leftover and removed outright -- this directory is exclusively
+// owned and fully managed by AssetCache, so that is always safe.
+const QRegularExpression &manifestNamePattern() {
+  static const QRegularExpression re(
+      QStringLiteral("^([0-9a-f]{64})\\.manifest\\.json$"));
+  return re;
+}
+const QRegularExpression &generationPayloadNamePattern() {
+  static const QRegularExpression re(
+      QStringLiteral("^([0-9a-f]{64})\\.([0-9a-f]{64})\\.bin$"));
+  return re;
+}
+const QRegularExpression &generationMetadataNamePattern() {
+  static const QRegularExpression re(
+      QStringLiteral("^([0-9a-f]{64})\\.([0-9a-f]{64})\\.meta\\.json$"));
+  return re;
+}
+
+// Flushes `file`'s buffered writes and, on POSIX, fsyncs its underlying
+// descriptor BEFORE commit() performs the atomic rename that publishes
+// it -- so the rename that makes a new generation's (or the manifest's)
+// file visible can never be reordered, by the OS or a real power loss,
+// ahead of that file's own content actually reaching stable storage. On
+// a hypothetical non-POSIX build, this degrades to a plain flush (no
+// durability guarantee beyond whatever the OS itself provides for a
+// rename), which mirrors this codebase's existing safeRemoveTree()
+// POSIX-or-no-op precedent above.
+bool fsyncSaveFileBeforeCommit(QSaveFile &file) {
+  file.flush();
+#if defined(Q_OS_UNIX)
+  return ::fsync(static_cast<int>(file.handle())) == 0;
+#else
+  return true;
+#endif
+}
+
+// fsyncs the directory entry `dirPath` itself: on POSIX, a file rename
+// (as QSaveFile::commit() performs) is only durable across a crash once
+// the directory's own metadata update is flushed, independent of the
+// renamed file's own content already being synced (see
+// fsyncSaveFileBeforeCommit() above). Called once after the manifest
+// swap -- the single atomic pointer flip that actually publishes a new
+// generation -- commits, so that publication itself survives a crash
+// immediately following it.
+void fsyncDirectory(const QString &dirPath) {
+#if defined(Q_OS_UNIX)
+  const QByteArray dirUtf8 = QFile::encodeName(dirPath);
+  const int fd = ::open(dirUtf8.constData(), O_RDONLY | O_DIRECTORY);
+  if (fd >= 0) {
+    ::fsync(fd);
+    ::close(fd);
+  }
+#else
+  Q_UNUSED(dirPath);
+#endif
 }
 
 // All disk-touching public entry points (lookupDisk(), store(),
@@ -241,12 +300,35 @@ QString AssetCache::cacheKeyFor(const QUrl &resolvedCandidateUrl) {
       QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex());
 }
 
-QString AssetCache::payloadPath(const QString &key) const {
-  return m_directory + u'/' + key + ".bin"_L1;
+QString AssetCache::manifestPath(const QString &key) const {
+  return m_directory + u'/' + key + ".manifest.json"_L1;
 }
 
-QString AssetCache::metadataPath(const QString &key) const {
-  return m_directory + u'/' + key + ".meta.json"_L1;
+QString AssetCache::generationPayloadPath(const QString &key,
+                                          const QString &generation) const {
+  return m_directory + u'/' + key + u'.' + generation + ".bin"_L1;
+}
+
+QString AssetCache::generationMetadataPath(const QString &key,
+                                           const QString &generation) const {
+  return m_directory + u'/' + key + u'.' + generation + ".meta.json"_L1;
+}
+
+QString AssetCache::manifestPathForTesting(const QString &directory,
+                                           const QString &key) {
+  return directory + u'/' + key + ".manifest.json"_L1;
+}
+
+QString AssetCache::payloadPathForTesting(const QString &directory,
+                                          const QString &key,
+                                          const QString &generation) {
+  return directory + u'/' + key + u'.' + generation + ".bin"_L1;
+}
+
+QString AssetCache::metadataPathForTesting(const QString &directory,
+                                           const QString &key,
+                                           const QString &generation) {
+  return directory + u'/' + key + u'.' + generation + ".meta.json"_L1;
 }
 
 std::optional<AssetCache::CachedEntry>
@@ -258,7 +340,7 @@ AssetCache::lookupMemory(const QString &key) const {
   return std::nullopt;
 }
 
-bool AssetCache::writeMetadata(const QString &key,
+bool AssetCache::writeMetadata(const QString &metadataFilePath,
                                const DiskMetadata &metadata) const {
   QJsonObject obj;
   obj[QStringLiteral("formatVersion")] = kMetadataFormatVersion;
@@ -273,17 +355,69 @@ bool AssetCache::writeMetadata(const QString &key,
   obj[QStringLiteral("insertedAtMs")] = metadata.insertedAtMsecsSinceEpoch;
   obj[QStringLiteral("lastAccessMs")] = metadata.lastAccessMsecsSinceEpoch;
 
-  QSaveFile file(metadataPath(key));
+  QSaveFile file(metadataFilePath);
   if (!file.open(QIODevice::WriteOnly)) {
     return false;
   }
   file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
-  return file.commit();
+  // Review item 8: fsync the metadata content itself before the commit()
+  // rename publishes it -- see fsyncSaveFileBeforeCommit()'s comment.
+  return fsyncSaveFileBeforeCommit(file) && file.commit();
+}
+
+bool AssetCache::writeManifest(const QString &key,
+                               const QString &generation) const {
+  QJsonObject obj;
+  obj[QStringLiteral("formatVersion")] = kMetadataFormatVersion;
+  obj[QStringLiteral("key")] = key;
+  obj[QStringLiteral("generation")] = generation;
+
+  QSaveFile file(manifestPath(key));
+  if (!file.open(QIODevice::WriteOnly)) {
+    return false;
+  }
+  file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+  return fsyncSaveFileBeforeCommit(file) && file.commit();
+}
+
+std::optional<QString>
+AssetCache::readManifestGeneration(const QString &key) const {
+  QFile file(manifestPath(key));
+  if (!file.open(QIODevice::ReadOnly)) {
+    return std::nullopt;
+  }
+  if (file.size() < 0 || file.size() > kMaxMetadataBytesOnDisk) {
+    return std::nullopt;
+  }
+  const QByteArray raw = file.read(kMaxMetadataBytesOnDisk + 1);
+  if (raw.size() > kMaxMetadataBytesOnDisk) {
+    return std::nullopt;
+  }
+  const QJsonDocument doc = QJsonDocument::fromJson(raw);
+  if (!doc.isObject()) {
+    return std::nullopt;
+  }
+  const QJsonObject obj = doc.object();
+  if (obj[QStringLiteral("formatVersion")].toInt(-1) !=
+          kMetadataFormatVersion ||
+      obj[QStringLiteral("key")].toString() != key) {
+    return std::nullopt;
+  }
+  const QString generation = obj[QStringLiteral("generation")].toString();
+  // A generation identifier is always a payload's own SHA-256 hex
+  // digest -- exactly the same shape as a cache key -- and this string
+  // becomes part of a filesystem path below (generationPayloadPath()/
+  // generationMetadataPath()): never trust it otherwise.
+  if (!validKeyPattern().match(generation).hasMatch()) {
+    return std::nullopt;
+  }
+  return generation;
 }
 
 std::optional<AssetCache::DiskMetadata>
-AssetCache::readMetadata(const QString &key) const {
-  QFile file(metadataPath(key));
+AssetCache::readMetadata(const QString &metadataFilePath,
+                         const QString &expectedKey) const {
+  QFile file(metadataFilePath);
   if (!file.open(QIODevice::ReadOnly)) {
     return std::nullopt;
   }
@@ -332,7 +466,7 @@ AssetCache::readMetadata(const QString &key) const {
       static_cast<qint64>(obj[QStringLiteral("insertedAtMs")].toDouble(0));
   metadata.lastAccessMsecsSinceEpoch =
       static_cast<qint64>(obj[QStringLiteral("lastAccessMs")].toDouble(0));
-  if (metadata.key != key || metadata.sha256Hex.isEmpty() ||
+  if (metadata.key != expectedKey || metadata.sha256Hex.isEmpty() ||
       metadata.encodedSize < 0) {
     return std::nullopt;
   }
@@ -343,8 +477,20 @@ void AssetCache::deleteEntry(const QString &key) const {
   if (m_diskCacheDisabled) {
     return;
   }
-  QFile::remove(payloadPath(key));
-  QFile::remove(metadataPath(key));
+  // Review item 8: `key` no longer maps to a fixed pair of filenames --
+  // reclaim EVERY file this cache could ever have written for it (the
+  // manifest, plus every generation-scoped payload/metadata file,
+  // whether it's the live generation or an orphan left by an
+  // interrupted replacement) via a name-prefix sweep, rather than
+  // guessing at a single generation. `key` is always validated
+  // (isValidKey()) by every public entry point before reaching here, so
+  // it can never itself contain a wildcard-special character.
+  QDir dir(m_directory);
+  const QStringList matches =
+      dir.entryList(QStringList{key + QStringLiteral(".*")}, QDir::Files);
+  for (const QString &name : matches) {
+    QFile::remove(dir.filePath(name));
+  }
 }
 
 std::optional<AssetCache::CachedEntry>
@@ -363,25 +509,37 @@ AssetCache::lookupDisk(const QString &key) {
 
   if (!isValidKey(key)) {
     // Never let a malformed key (path separators, "..", etc.) reach
-    // payloadPath()/metadataPath() below -- see isValidKey()'s comment.
+    // manifestPath()/generationPayloadPath()/generationMetadataPath()
+    // below -- see isValidKey()'s comment.
     return std::nullopt;
   }
 
   QMutexLocker locker(&m_mutex);
 
-  const std::optional<DiskMetadata> metadata = readMetadata(key);
-  if (!metadata) {
-    // Metadata missing or corrupt. A payload might still be sitting there
-    // as an orphan (e.g. a crash between the payload commit and the
-    // metadata commit) -- clean it up defensively rather than leaving a
-    // file this cache can never otherwise reclaim.
+  const std::optional<QString> generation = readManifestGeneration(key);
+  if (!generation) {
+    // Manifest missing or corrupt: nothing for this key can be trusted
+    // (see the class comment -- the manifest is the sole pointer to
+    // which generation, if any, is live). Reclaim anything left behind
+    // for this key -- including any orphaned generation files -- rather
+    // than leaking it until the next sweep.
     deleteEntry(key);
     return std::nullopt;
   }
 
-  QFile payloadFile(payloadPath(key));
+  const std::optional<DiskMetadata> metadata =
+      readMetadata(generationMetadataPath(key, *generation), key);
+  if (!metadata || metadata->sha256Hex != *generation) {
+    // Metadata missing/corrupt, or (defense in depth) it does not even
+    // claim to be the generation its own filename says it is.
+    deleteEntry(key);
+    return std::nullopt;
+  }
+
+  QFile payloadFile(generationPayloadPath(key, *generation));
   if (!payloadFile.open(QIODevice::ReadOnly)) {
-    // Metadata present but payload missing: corrupt/incomplete entry.
+    // Manifest+metadata present but this generation's payload missing:
+    // corrupt/incomplete entry.
     deleteEntry(key);
     return std::nullopt;
   }
@@ -399,10 +557,11 @@ AssetCache::lookupDisk(const QString &key) {
 
   const QString actualSha256 = QString::fromLatin1(
       QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
-  if (actualSha256 != metadata->sha256Hex ||
+  if (actualSha256 != metadata->sha256Hex || actualSha256 != *generation ||
       bytes.size() != metadata->encodedSize) {
-    // Payload does not match the metadata that vouches for it: never trust
-    // a mismatched pair, no matter which file is "actually" wrong.
+    // Payload does not match the metadata that vouches for it (or the
+    // generation identifier its own filename claims): never trust a
+    // mismatched pair, no matter which file is "actually" wrong.
     deleteEntry(key);
     return std::nullopt;
   }
@@ -419,10 +578,15 @@ AssetCache::lookupDisk(const QString &key) {
 
   // Refresh on-disk lastAccess so LRU eviction reflects this real read,
   // per the class comment's metadata-driven-LRU policy (never filesystem
-  // atime).
+  // atime). This rewrites the SAME generation's metadata file in place
+  // (the generation, and therefore the manifest, is unchanged) -- a
+  // failure here only loses this one LRU-freshness update, never the
+  // entry's validity: writeMetadata() is itself atomic (QSaveFile), so a
+  // crash mid-write leaves the prior, still-fully-valid metadata
+  // untouched.
   DiskMetadata refreshed = *metadata;
   refreshed.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
-  (void)writeMetadata(key, refreshed);
+  (void)writeMetadata(generationMetadataPath(key, *generation), refreshed);
 
   // Promote into memory ONLY when this entry needs no further
   // revalidation. AssetRequestCoordinator's memory-hit path (see
@@ -463,11 +627,17 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
   if (entry.lastAccessMsecsSinceEpoch == 0) {
     entry.lastAccessMsecsSinceEpoch = now;
   }
-  if (entry.sha256Hex.isEmpty()) {
-    entry.sha256Hex = QString::fromLatin1(
-        QCryptographicHash::hash(entry.encodedBytes, QCryptographicHash::Sha256)
-            .toHex());
-  }
+  // Review item 8: ALWAYS (re)compute this from the actual bytes being
+  // stored, never trusting a caller-supplied value verbatim -- this
+  // string becomes the generation's filename segment below
+  // (generationPayloadPath()/generationMetadataPath()), so a malformed
+  // or attacker-influenced caller-supplied sha256Hex must never reach a
+  // filesystem path. Every legitimate caller already derives this value
+  // from a hash of these exact bytes anyway, so recomputing changes
+  // nothing for them.
+  entry.sha256Hex = QString::fromLatin1(
+      QCryptographicHash::hash(entry.encodedBytes, QCryptographicHash::Sha256)
+          .toHex());
 
   {
     QMutexLocker locker(&m_mutex);
@@ -489,16 +659,24 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
       // Review item 7: root was a symlink at construction. Memory
       // insert above still happened -- only the disk write is skipped.
     } else if (entry.encodedBytes.size() <= kMaxSinglePayloadBytesOnDisk) {
-      // Publication order matters for crash-consistency: write the
-      // payload FIRST via QSaveFile (atomic for that one file), and only
-      // once that commit succeeds, write the metadata that "vouches for"
-      // it. A crash between the two leaves an orphan payload with no
-      // metadata, which lookupDisk()/reapAndEnforceQuota() both already
-      // treat as invalid and remove -- never as a half-valid hit.
-      QSaveFile payloadFile(payloadPath(key));
+      // Review item 8: content-addressed generation publication. The
+      // generation's filename is derived from its own content hash, so
+      // writing generation N+1's files can NEVER touch generation N's
+      // files (unless the content is byte-identical, in which case
+      // there is nothing to actually replace) -- an existing, currently
+      // -live generation is therefore fully intact at every point up
+      // until the manifest swap below actually commits. See the class
+      // comment for the full crash-consistency argument.
+      const QString generation = entry.sha256Hex;
+      const std::optional<QString> previousGeneration =
+          readManifestGeneration(key);
+      const QString genPayloadPath = generationPayloadPath(key, generation);
+      const QString genMetadataPath = generationMetadataPath(key, generation);
+
+      QSaveFile payloadFile(genPayloadPath);
       if (payloadFile.open(QIODevice::WriteOnly)) {
         payloadFile.write(entry.encodedBytes);
-        if (payloadFile.commit()) {
+        if (fsyncSaveFileBeforeCommit(payloadFile) && payloadFile.commit()) {
           DiskMetadata metadata;
           metadata.key = key;
           metadata.contentType = entry.contentType;
@@ -510,13 +688,38 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
           metadata.lastModified = entry.lastModified;
           metadata.insertedAtMsecsSinceEpoch = entry.insertedAtMsecsSinceEpoch;
           metadata.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
-          if (!writeMetadata(key, metadata)) {
-            // Metadata is the SOLE validity witness for a payload (see
-            // above): without it, the payload just committed can never
-            // be read back as valid and would otherwise leak disk usage
-            // until the next reap/lookup sweep happens to remove it.
-            // Delete it immediately instead of leaving that window open.
-            QFile::remove(payloadPath(key));
+          if (writeMetadata(genMetadataPath, metadata)) {
+            // Both of this generation's own files are now fully
+            // written, fsync'd, and committed -- ATOMICALLY publish it
+            // as the live one via the single mutable manifest pointer,
+            // then fsync the directory so that publish survives a crash
+            // immediately after it (see fsyncDirectory()'s comment).
+            if (writeManifest(key, generation)) {
+              fsyncDirectory(m_directory);
+              // Only now -- strictly after the new generation is
+              // durably live -- reclaim the OLD generation's files, if
+              // there was a different one. A crash at any point before
+              // this line leaves the OLD generation still fully intact
+              // and still the one the manifest names.
+              if (previousGeneration && *previousGeneration != generation) {
+                QFile::remove(generationPayloadPath(key, *previousGeneration));
+                QFile::remove(generationMetadataPath(key, *previousGeneration));
+              }
+            } else {
+              // Manifest publish failed: this generation's files become
+              // orphans, safely reclaimed by the next reap sweep (or
+              // immediately here, defensively) -- the OLD generation
+              // (if any) remains untouched and still live.
+              QFile::remove(genPayloadPath);
+              QFile::remove(genMetadataPath);
+            }
+          } else {
+            // Metadata is the sole validity witness for a payload (see
+            // lookupDisk()): without it, the payload just committed can
+            // never be read back as valid. Delete it immediately rather
+            // than leaving that window open; the OLD generation (if
+            // any) is completely untouched by any of this.
+            QFile::remove(genPayloadPath);
           }
         }
       }
@@ -550,24 +753,24 @@ void AssetCache::touchAfterNotModified(const QString &key,
     return;
   }
   if (!isValidKey(key)) {
-    // Never let a malformed key reach payloadPath()/metadataPath() below
-    // -- see isValidKey()'s comment.
+    // Never let a malformed key reach manifestPath()/
+    // generationMetadataPath() below -- see isValidKey()'s comment.
     return;
   }
   QMutexLocker locker(&m_mutex);
-  const std::optional<DiskMetadata> metadata = readMetadata(key);
-  if (!metadata) {
-    // Metadata missing or corrupt, exactly as lookupDisk() and
-    // reapAndEnforceQuota() both handle: a payload might still be
-    // sitting there as an orphan (e.g. a crash between the payload
-    // commit and the metadata commit, or external corruption), and
-    // this cache would otherwise never reclaim it -- a caller only
-    // reaches touchAfterNotModified() after a 304 response to a
+  const std::optional<QString> generation = readManifestGeneration(key);
+  const std::optional<DiskMetadata> metadata =
+      generation ? readMetadata(generationMetadataPath(key, *generation), key)
+                 : std::nullopt;
+  if (!generation || !metadata || metadata->sha256Hex != *generation) {
+    // Manifest/metadata missing, corrupt, or self-inconsistent, exactly
+    // as lookupDisk() and reapAndEnforceQuota() both handle: a caller
+    // only reaches touchAfterNotModified() after a 304 response to a
     // conditional request it issued for what it believed was a valid
-    // disk entry, so missing/corrupt metadata here is itself a repair
-    // signal, not merely "already evicted." Clean it up defensively
-    // for the same reason lookupDisk() does; a subsequent lookup will
-    // simply miss and refetch from scratch.
+    // disk entry, so this is itself a repair signal, not merely
+    // "already evicted." Clean up defensively for the same reason
+    // lookupDisk() does; a subsequent lookup will simply miss and
+    // refetch from scratch.
     deleteEntry(key);
     return;
   }
@@ -579,7 +782,11 @@ void AssetCache::touchAfterNotModified(const QString &key,
   if (!newLastModified.isEmpty()) {
     refreshed.lastModified = newLastModified;
   }
-  (void)writeMetadata(key, refreshed);
+  // The generation itself (content hash) never changes on a 304 --
+  // only its metadata (etag/lastModified/lastAccess) is rewritten in
+  // place, atomically, via the same generation-scoped file; the
+  // manifest is untouched since the live generation hasn't changed.
+  (void)writeMetadata(generationMetadataPath(key, *generation), refreshed);
 
   if (CachedEntry *entry = m_memory->object(key)) {
     entry->lastAccessMsecsSinceEpoch = refreshed.lastAccessMsecsSinceEpoch;
@@ -693,36 +900,57 @@ void AssetCache::reapAndEnforceQuota() {
     allFiles.append(name);
   }
 
-  // First pass: discover every key with either file present.
-  QHash<QString, bool> hasPayload;
-  QHash<QString, bool> hasMetadata;
+  // First pass: discover every manifest (key -> the generation it
+  // names) and every generation-scoped payload/metadata file present
+  // (key -> the set of generations found for each shape), removing
+  // anything that doesn't match one of the three known filename shapes
+  // (review item 8) outright.
+  QHash<QString, QString> manifestGeneration;
+  QHash<QString, QSet<QString>> payloadGenerations;
+  QHash<QString, QSet<QString>> metadataGenerations;
   for (const QString &name : allFiles) {
-    if (name.endsWith(".bin"_L1)) {
-      const QString key = name.chopped(4);
-      if (validKeyPattern().match(key).hasMatch()) {
-        hasPayload[key] = true;
-        continue;
+    if (const auto m = manifestNamePattern().match(name); m.hasMatch()) {
+      const QString key = m.captured(1);
+      if (const std::optional<QString> generation =
+              readManifestGeneration(key)) {
+        manifestGeneration[key] = *generation;
+      } else {
+        // Manifest itself unreadable/malformed/self-inconsistent: a
+        // stray leftover -- remove outright. Any generation files it
+        // might have named are reclaimed below as orphans, since no
+        // valid manifest ends up naming this key.
+        QFile::remove(dir.filePath(name));
       }
-    } else if (name.endsWith(".meta.json"_L1)) {
-      const QString key = name.chopped(10);
-      if (validKeyPattern().match(key).hasMatch()) {
-        hasMetadata[key] = true;
-        continue;
-      }
+      continue;
     }
-    // Anything not matching the exact "<64-hex-key>.bin" or
-    // "<64-hex-key>.meta.json" shape is a stray leftover (a QSaveFile temp
-    // artifact from an interrupted write, or debris from an old format) --
-    // this directory is exclusively owned by AssetCache, so removing it
-    // unconditionally is safe.
+    if (const auto m = generationPayloadNamePattern().match(name);
+        m.hasMatch()) {
+      payloadGenerations[m.captured(1)].insert(m.captured(2));
+      continue;
+    }
+    if (const auto m = generationMetadataNamePattern().match(name);
+        m.hasMatch()) {
+      metadataGenerations[m.captured(1)].insert(m.captured(2));
+      continue;
+    }
+    // Anything not matching one of the three known shapes is a stray
+    // leftover (a QSaveFile temp artifact from an interrupted write, or
+    // debris from an old format) -- this directory is exclusively owned
+    // by AssetCache, so removing it unconditionally is safe.
     QFile::remove(dir.filePath(name));
   }
 
   QSet<QString> allKeys;
-  for (auto it = hasPayload.constBegin(); it != hasPayload.constEnd(); ++it) {
+  for (auto it = manifestGeneration.constBegin();
+       it != manifestGeneration.constEnd(); ++it) {
     allKeys.insert(it.key());
   }
-  for (auto it = hasMetadata.constBegin(); it != hasMetadata.constEnd(); ++it) {
+  for (auto it = payloadGenerations.constBegin();
+       it != payloadGenerations.constEnd(); ++it) {
+    allKeys.insert(it.key());
+  }
+  for (auto it = metadataGenerations.constBegin();
+       it != metadataGenerations.constEnd(); ++it) {
     allKeys.insert(it.key());
   }
 
@@ -734,19 +962,30 @@ void AssetCache::reapAndEnforceQuota() {
   std::vector<ValidEntry> valid;
 
   for (const QString &key : allKeys) {
-    const bool payloadPresent = hasPayload.value(key, false);
-    const bool metadataPresent = hasMetadata.value(key, false);
-    if (payloadPresent && !metadataPresent) {
-      deleteEntry(key); // orphan payload
+    const auto manifestIt = manifestGeneration.constFind(key);
+    if (manifestIt == manifestGeneration.constEnd()) {
+      // No valid manifest names this key at all: nothing for it can be
+      // trusted (see the class comment) -- reclaim every generation
+      // file left behind for it.
+      deleteEntry(key);
       continue;
     }
-    if (!payloadPresent && metadataPresent) {
-      deleteEntry(key); // metadata with no payload
+    const QString &generation = manifestIt.value();
+    const bool payloadPresent =
+        payloadGenerations.value(key).contains(generation);
+    const bool metadataPresent =
+        metadataGenerations.value(key).contains(generation);
+    if (!payloadPresent || !metadataPresent) {
+      // The manifest names a generation whose files are (partially or
+      // wholly) missing -- corrupt/incomplete, never a half-valid hit.
+      deleteEntry(key);
       continue;
     }
-    // Both present: validate the pair.
-    const std::optional<DiskMetadata> metadata = readMetadata(key);
-    QFile payloadFile(payloadPath(key));
+    const QString genPayloadPath = generationPayloadPath(key, generation);
+    const QString genMetadataPath = generationMetadataPath(key, generation);
+    const std::optional<DiskMetadata> metadata =
+        readMetadata(genMetadataPath, key);
+    QFile payloadFile(genPayloadPath);
     const bool payloadReadable = payloadFile.open(QIODevice::ReadOnly);
     const std::optional<QByteArray> verifiedBytes =
         (payloadReadable && metadata)
@@ -755,21 +994,40 @@ void AssetCache::reapAndEnforceQuota() {
     if (payloadReadable) {
       payloadFile.close();
     }
-    if (!metadata || !payloadReadable || !verifiedBytes) {
+    if (!metadata || metadata->sha256Hex != generation || !payloadReadable ||
+        !verifiedBytes) {
       deleteEntry(key); // corrupt pair, or rejected on size alone
       continue;
     }
     const QByteArray &bytes = *verifiedBytes;
     const QString actualSha256 = QString::fromLatin1(
         QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
-    if (actualSha256 != metadata->sha256Hex ||
-        bytes.size() != metadata->encodedSize) {
+    if (actualSha256 != generation || bytes.size() != metadata->encodedSize) {
       deleteEntry(key); // corrupt pair
       continue;
     }
-    const qint64 payloadBytes = QFileInfo(payloadPath(key)).size();
-    const qint64 metadataBytes = QFileInfo(metadataPath(key)).size();
-    valid.push_back(ValidEntry{key, payloadBytes + metadataBytes,
+
+    // The live generation validated cleanly: reclaim any OTHER
+    // generation's files still sitting around for this key -- orphans
+    // left by a crash between writing a new generation and cleaning up
+    // its predecessor, or between writing a new generation's own files
+    // and ever reaching the manifest swap (see store()).
+    for (const QString &other : payloadGenerations.value(key)) {
+      if (other != generation) {
+        QFile::remove(generationPayloadPath(key, other));
+      }
+    }
+    for (const QString &other : metadataGenerations.value(key)) {
+      if (other != generation) {
+        QFile::remove(generationMetadataPath(key, other));
+      }
+    }
+
+    const qint64 manifestBytes = QFileInfo(manifestPath(key)).size();
+    const qint64 payloadBytes = QFileInfo(genPayloadPath).size();
+    const qint64 metadataBytes = QFileInfo(genMetadataPath).size();
+    valid.push_back(ValidEntry{key,
+                               manifestBytes + payloadBytes + metadataBytes,
                                metadata->lastAccessMsecsSinceEpoch});
   }
 
@@ -845,7 +1103,12 @@ int AssetCache::diskEntryCount() const {
   QDir dir(m_directory);
   int count = 0;
   for (const QString &name : dir.entryList(QDir::Files)) {
-    if (name.endsWith(".meta.json"_L1)) {
+    // One manifest file exists per live entry (review item 8) -- this is
+    // a more accurate "how many entries does this cache have" count than
+    // counting generation-scoped metadata files, which can transiently
+    // include an orphan left by an interrupted replacement until the
+    // next reap sweep reclaims it.
+    if (manifestNamePattern().match(name).hasMatch()) {
       ++count;
     }
   }

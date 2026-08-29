@@ -5,11 +5,13 @@
 #include <memory>
 
 // Tests for AssetCache: memory/disk hit ordering, SHA-256 cache-key
-// namespace isolation, atomic payload+metadata publication and
-// crash/corruption repair (orphan payload, orphan metadata, mismatched
-// pair, stray temp file), metadata-driven LRU quota/watermark eviction,
-// touch-after-304 lastAccess refresh, and restart persistence (a fresh
-// AssetCache instance pointed at the same directory sees prior entries).
+// namespace isolation, crash-consistent content-addressed
+// generation+manifest publication and crash/corruption repair (orphan
+// generation payload/metadata, mismatched pair, stray temp file,
+// interrupted-replacement orphan before/after the manifest swap),
+// metadata-driven LRU quota/watermark eviction, touch-after-304
+// lastAccess refresh, and restart persistence (a fresh AssetCache
+// instance pointed at the same directory sees prior entries).
 class AssetCacheTests final : public QObject {
   Q_OBJECT
 
@@ -35,6 +37,13 @@ private slots:
   void oversizedMetadataFileIsRejectedWithoutUnboundedReadAll();
   void malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir();
   void promoteToMemoryRejectsMalformedKeyWithoutInserting();
+
+  // Review item 8: crash-consistent generation/manifest publication.
+  void initialInsertCrashBeforeManifestPublishLeavesNoValidEntry();
+  void replacementCrashBeforeManifestSwapPreservesOldGenerationIntact();
+  void
+  replacementCrashAfterManifestSwapPromotesNewGenerationAndReclaimsOld();
+  void storeReplacementLeavesExactlyOneLiveGenerationOnDisk();
 
   // Review item 7: symlink cache-root/entry escape prevention.
   void symlinkedCacheRootDisablesDiskIoAndLeavesTargetUntouched();

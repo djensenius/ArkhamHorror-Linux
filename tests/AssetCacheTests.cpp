@@ -54,6 +54,30 @@ struct ScopedFileRemoval {
   ~ScopedFileRemoval() { QFile::remove(path); }
 };
 
+// Hand-writes a generation-scoped metadata JSON file at `metadataPath` in
+// exactly the shape AssetCache's own (private) writeMetadata() produces,
+// so fault-injection tests can construct crash-boundary on-disk states
+// (a generation's files present, with or without a manifest naming it)
+// without needing access to AssetCache's private write path itself.
+void writeRawMetadataForTesting(const QString &metadataPath, const QString &key,
+                                const QString &generation, qint64 encodedSize) {
+  QJsonObject obj;
+  obj[QStringLiteral("formatVersion")] = 1;
+  obj[QStringLiteral("key")] = key;
+  obj[QStringLiteral("contentType")] = QStringLiteral("image/png");
+  obj[QStringLiteral("encodedSize")] = encodedSize;
+  obj[QStringLiteral("width")] = 1;
+  obj[QStringLiteral("height")] = 1;
+  obj[QStringLiteral("sha256")] = generation;
+  obj[QStringLiteral("etag")] = QString();
+  obj[QStringLiteral("lastModified")] = QString();
+  obj[QStringLiteral("insertedAtMs")] = QDateTime::currentMSecsSinceEpoch();
+  obj[QStringLiteral("lastAccessMs")] = QDateTime::currentMSecsSinceEpoch();
+  QFile file(metadataPath);
+  QVERIFY(file.open(QIODevice::WriteOnly));
+  file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+}
+
 } // namespace
 
 void AssetCacheTests::storeThenLookupMemoryAndDiskRoundTrips() {
@@ -102,11 +126,20 @@ void AssetCacheTests::cacheKeyIsNamespacedByFullResolvedUrl() {
 }
 
 void AssetCacheTests::orphanPayloadWithoutMetadataIsRepaired() {
+  // Review item 8: this models a crash between a generation's payload
+  // commit and its metadata commit (or, equivalently for a fresh
+  // insert, a crash before the manifest that would ever have made it
+  // "live" was written at all) -- a fully-formed, content-addressed
+  // generation payload file sits on disk with nothing referencing it.
   AssetCache cache(configFor(m_tempDirPath));
   const QString key = QStringLiteral("a").repeated(64);
-  QFile payload(m_tempDirPath + u'/' + key + QStringLiteral(".bin"));
+  const QByteArray bytes = QByteArrayLiteral("orphan");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+  QFile payload(
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation));
   QVERIFY(payload.open(QIODevice::WriteOnly));
-  payload.write("orphan");
+  payload.write(bytes);
   payload.close();
 
   QVERIFY(!cache.lookupDisk(key).has_value());
@@ -116,10 +149,13 @@ void AssetCacheTests::orphanPayloadWithoutMetadataIsRepaired() {
 void AssetCacheTests::orphanMetadataWithoutPayloadIsRepaired() {
   AssetCache cache(configFor(m_tempDirPath));
   const QString key = QStringLiteral("b").repeated(64);
-  QFile metadata(m_tempDirPath + u'/' + key + QStringLiteral(".meta.json"));
+  const QString generation = QStringLiteral("d").repeated(64);
+  QFile metadata(
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation));
   QVERIFY(metadata.open(QIODevice::WriteOnly));
   metadata.write(R"({"formatVersion":1,"key":")" + key.toUtf8() +
-                 R"(","sha256":"deadbeef","encodedSize":6})");
+                 R"(","sha256":")" + generation.toUtf8() +
+                 R"(","encodedSize":6})");
   metadata.close();
 
   QVERIFY(!cache.lookupDisk(key).has_value());
@@ -129,15 +165,21 @@ void AssetCacheTests::orphanMetadataWithoutPayloadIsRepaired() {
 void AssetCacheTests::mismatchedPayloadMetadataPairIsRepaired() {
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/mismatch.png")));
+  const QByteArray originalBytes = QByteArrayLiteral("original-bytes");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(originalBytes, QCryptographicHash::Sha256)
+          .toHex());
   {
     AssetCache cache(configFor(m_tempDirPath));
-    cache.store(key, makeEntry(QByteArrayLiteral("original-bytes")));
+    cache.store(key, makeEntry(originalBytes));
   }
 
-  // Tamper with the payload on disk directly, invalidating the metadata's
-  // recorded SHA-256/size without touching the metadata file at all --
-  // this must never be served as a "half-valid success."
-  QFile payload(m_tempDirPath + u'/' + key + QStringLiteral(".bin"));
+  // Tamper with the LIVE generation's payload on disk directly,
+  // invalidating its own metadata's recorded SHA-256/size without
+  // touching the metadata file at all -- this must never be served as a
+  // "half-valid success."
+  QFile payload(
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation));
   QVERIFY(payload.open(QIODevice::WriteOnly | QIODevice::Truncate));
   payload.write("tampered-bytes-of-different-content");
   payload.close();
@@ -151,6 +193,180 @@ void AssetCacheTests::mismatchedPayloadMetadataPairIsRepaired() {
   AssetCache freshCache(configFor(m_tempDirPath));
   QVERIFY(!freshCache.lookupDisk(key).has_value());
   QVERIFY(!QFile::exists(payload.fileName()));
+}
+
+void AssetCacheTests::
+    initialInsertCrashBeforeManifestPublishLeavesNoValidEntry() {
+  // Review item 8: simulates a crash strictly AFTER a brand-new
+  // generation's payload+metadata files both committed successfully but
+  // BEFORE the manifest that would have made them "live" was ever
+  // written -- for a key that had NO prior entry at all. Nothing was
+  // ever a valid success here (the manifest is the sole "this exists"
+  // witness), so a lookup must miss, and the orphaned pair must be
+  // reclaimed rather than leaking disk usage forever.
+  const QString key = QStringLiteral("e").repeated(64);
+  const QByteArray bytes = QByteArrayLiteral("never-published-bytes");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+  const QString payloadPath =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation);
+  const QString metadataPath =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation);
+  {
+    QFile payload(payloadPath);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(bytes);
+  }
+  writeRawMetadataForTesting(metadataPath, key, generation, bytes.size());
+  QVERIFY(QFile::exists(payloadPath));
+  QVERIFY(QFile::exists(metadataPath));
+  // Deliberately no manifest written: this generation was never
+  // published.
+
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.lookupDisk(key).has_value());
+  QVERIFY(!QFile::exists(payloadPath));
+  QVERIFY(!QFile::exists(metadataPath));
+}
+
+void AssetCacheTests::
+    replacementCrashBeforeManifestSwapPreservesOldGenerationIntact() {
+  // Review item 8: after a REAL store() has published generation A
+  // (manifest -> A), simulate a crash immediately after a REPLACEMENT
+  // generation B's payload+metadata both committed but strictly BEFORE
+  // the manifest swap that would have published B ever ran. The
+  // manifest still names A, and A's own files were never touched by any
+  // of this (content-addressed generations never share a filename) --
+  // so a restart must still serve exactly A's original bytes, and B's
+  // now-orphaned files must be reclaimed by the repair sweep without
+  // touching A at all.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/replace-before-swap.png")));
+  const QByteArray bytesA = QByteArrayLiteral("generation-a-bytes");
+  const QByteArray bytesB = QByteArrayLiteral("generation-b-bytes-different");
+  const QString generationA = QString::fromLatin1(
+      QCryptographicHash::hash(bytesA, QCryptographicHash::Sha256).toHex());
+  const QString generationB = QString::fromLatin1(
+      QCryptographicHash::hash(bytesB, QCryptographicHash::Sha256).toHex());
+  {
+    AssetCache cache(configFor(m_tempDirPath));
+    cache.store(key, makeEntry(bytesA));
+  }
+
+  const QString payloadPathB =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generationB);
+  const QString metadataPathB =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generationB);
+  {
+    QFile payload(payloadPathB);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(bytesB);
+  }
+  writeRawMetadataForTesting(metadataPathB, key, generationB, bytesB.size());
+  QVERIFY(QFile::exists(payloadPathB));
+  QVERIFY(QFile::exists(metadataPathB));
+  // The manifest is deliberately left untouched -- still naming A.
+
+  AssetCache freshCache(configFor(m_tempDirPath));
+  const auto hit = freshCache.lookupDisk(key);
+  QVERIFY(hit.has_value());
+  QCOMPARE(hit->encodedBytes, bytesA);
+  // B's orphaned files, never published, must be reclaimed; A's own
+  // files (a different filename entirely) are untouched by that
+  // reclamation.
+  QVERIFY(!QFile::exists(payloadPathB));
+  QVERIFY(!QFile::exists(metadataPathB));
+  QVERIFY(QFile::exists(
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generationA)));
+}
+
+void AssetCacheTests::
+    replacementCrashAfterManifestSwapPromotesNewGenerationAndReclaimsOld() {
+  // Review item 8: the opposite boundary -- generation B's files
+  // committed AND the manifest swap to B itself committed, but the
+  // crash happens strictly BEFORE the old generation A's cleanup ran.
+  // A restart must serve B (the new, now-live generation) and reclaim
+  // A's now-superseded files.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/replace-after-swap.png")));
+  const QByteArray bytesA = QByteArrayLiteral("generation-a-bytes");
+  const QByteArray bytesB = QByteArrayLiteral("generation-b-bytes-different");
+  const QString generationA = QString::fromLatin1(
+      QCryptographicHash::hash(bytesA, QCryptographicHash::Sha256).toHex());
+  const QString generationB = QString::fromLatin1(
+      QCryptographicHash::hash(bytesB, QCryptographicHash::Sha256).toHex());
+  {
+    AssetCache cache(configFor(m_tempDirPath));
+    cache.store(key, makeEntry(bytesA));
+  }
+
+  const QString payloadPathB =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generationB);
+  const QString metadataPathB =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generationB);
+  {
+    QFile payload(payloadPathB);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(bytesB);
+  }
+  writeRawMetadataForTesting(metadataPathB, key, generationB, bytesB.size());
+
+  // Simulate the manifest swap itself having already committed (the
+  // manifest's own JSON shape is documented in AssetCache.h/.cpp; this
+  // is the exact shape writeManifest() itself produces).
+  {
+    QFile manifest(AssetCache::manifestPathForTesting(m_tempDirPath, key));
+    QVERIFY(manifest.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    manifest.write(R"({"formatVersion":1,"key":")" + key.toUtf8() +
+                   R"(","generation":")" + generationB.toUtf8() + R"("})");
+  }
+
+  const QString payloadPathA =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generationA);
+  const QString metadataPathA =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generationA);
+  QVERIFY(QFile::exists(payloadPathA)); // A's files still present
+
+  AssetCache freshCache(configFor(m_tempDirPath));
+  const auto hit = freshCache.lookupDisk(key);
+  QVERIFY(hit.has_value());
+  QCOMPARE(hit->encodedBytes, bytesB);
+  QVERIFY(!QFile::exists(payloadPathA));
+  QVERIFY(!QFile::exists(metadataPathA));
+  QVERIFY(QFile::exists(payloadPathB));
+  QVERIFY(QFile::exists(metadataPathB));
+}
+
+void AssetCacheTests::storeReplacementLeavesExactlyOneLiveGenerationOnDisk() {
+  // Complements the fault-injection tests above with the ordinary,
+  // uninterrupted case: two REAL store() calls for the same key (a
+  // normal cache refresh) must leave exactly one generation's files on
+  // disk afterward -- proving store()'s own post-publish old-generation
+  // cleanup actually runs, not just that a crash mid-way would be safe.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/normal-replace.png")));
+  AssetCache cache(configFor(m_tempDirPath));
+  cache.store(key, makeEntry(QByteArrayLiteral("first-version-bytes")));
+  cache.store(key, makeEntry(QByteArrayLiteral("second-version-bytes")));
+
+  const auto hit = cache.lookupDisk(key);
+  QVERIFY(hit.has_value());
+  QCOMPARE(hit->encodedBytes, QByteArrayLiteral("second-version-bytes"));
+
+  QDir dir(m_tempDirPath);
+  int payloadCount = 0;
+  int metadataCount = 0;
+  for (const QString &name : dir.entryList(QDir::Files)) {
+    if (name.startsWith(key) && name.endsWith(QStringLiteral(".bin"))) {
+      ++payloadCount;
+    } else if (name.startsWith(key) &&
+               name.endsWith(QStringLiteral(".meta.json")) &&
+               !name.endsWith(QStringLiteral(".manifest.json"))) {
+      ++metadataCount;
+    }
+  }
+  QCOMPARE(payloadCount, 1);
+  QCOMPARE(metadataCount, 1);
 }
 
 void AssetCacheTests::strayFileNotMatchingKeyShapeIsRemoved() {
@@ -292,9 +508,13 @@ void AssetCacheTests::
   // rather than silently leaving unreclaimable disk usage behind.
   AssetCache cache(configFor(m_tempDirPath));
   const QString key = QStringLiteral("c").repeated(64);
-  QFile payload(m_tempDirPath + u'/' + key + QStringLiteral(".bin"));
+  const QByteArray bytes = QByteArrayLiteral("orphan-touch");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+  QFile payload(
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation));
   QVERIFY(payload.open(QIODevice::WriteOnly));
-  payload.write("orphan-touch");
+  payload.write(bytes);
   payload.close();
   QVERIFY(QFile::exists(payload.fileName()));
 
@@ -341,19 +561,20 @@ void AssetCacheTests::
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/oversized.png")));
   const QByteArray oversized(20 * 1024 * 1024 + 4096, 'x');
+  const QString sha256Hex = QString::fromLatin1(
+      QCryptographicHash::hash(oversized, QCryptographicHash::Sha256).toHex());
   const QString payloadPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, sha256Hex);
   const QString metadataPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, sha256Hex);
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
   {
     QFile payload(payloadPath);
     QVERIFY(payload.open(QIODevice::WriteOnly));
     payload.write(oversized);
     payload.close();
 
-    const QString sha256Hex = QString::fromLatin1(
-        QCryptographicHash::hash(oversized, QCryptographicHash::Sha256)
-            .toHex());
     QJsonObject obj;
     obj[QStringLiteral("formatVersion")] = 1;
     obj[QStringLiteral("key")] = key;
@@ -371,9 +592,19 @@ void AssetCacheTests::
     QVERIFY(metadata.open(QIODevice::WriteOnly));
     metadata.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
     metadata.close();
+
+    QJsonObject manifestObj;
+    manifestObj[QStringLiteral("formatVersion")] = 1;
+    manifestObj[QStringLiteral("key")] = key;
+    manifestObj[QStringLiteral("generation")] = sha256Hex;
+    QFile manifest(manifestPath);
+    QVERIFY(manifest.open(QIODevice::WriteOnly));
+    manifest.write(QJsonDocument(manifestObj).toJson(QJsonDocument::Compact));
+    manifest.close();
   }
   QVERIFY(QFile::exists(payloadPath));
   QVERIFY(QFile::exists(metadataPath));
+  QVERIFY(QFile::exists(manifestPath));
 
   // A fresh instance (simulating a restart) runs reapAndEnforceQuota() in
   // its own constructor, which must reject and remove this pair on its
@@ -382,6 +613,7 @@ void AssetCacheTests::
   AssetCache freshCache(configFor(m_tempDirPath, 64LL * 1024 * 1024));
   QVERIFY(!QFile::exists(payloadPath));
   QVERIFY(!QFile::exists(metadataPath));
+  QVERIFY(!QFile::exists(manifestPath));
   QVERIFY(!freshCache.lookupDisk(key).has_value());
 }
 
@@ -397,10 +629,14 @@ void AssetCacheTests::
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/oversized-store.png")));
   const QByteArray oversized(20 * 1024 * 1024 + 1, 'y');
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(oversized, QCryptographicHash::Sha256).toHex());
   const QString payloadPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation);
   const QString metadataPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation);
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
 
   AssetCache cache(
       configFor(m_tempDirPath, 64LL * 1024 * 1024, 64LL * 1024 * 1024));
@@ -408,6 +644,7 @@ void AssetCacheTests::
 
   QVERIFY(!QFile::exists(payloadPath));
   QVERIFY(!QFile::exists(metadataPath));
+  QVERIFY(!QFile::exists(manifestPath));
   // The memory cache is unaffected by this disk-side guard: it still
   // serves the entry via its own independent, cost-based eviction.
   QVERIFY(cache.lookupMemory(key).has_value());
@@ -415,44 +652,49 @@ void AssetCacheTests::
 
 void AssetCacheTests::
     metadataWriteFailureAfterPayloadCommitCleansUpOrphanPayload() {
-  // Regression test: store() writes the payload first (atomically via
-  // QSaveFile) and only then writes metadata, which is the SOLE validity
-  // witness for that payload (see the comment in store()). If metadata
-  // fails to write AFTER the payload commit already succeeded, the
-  // just-committed payload must be deleted immediately -- not left
-  // behind as an orphan that only a later reap/lookup sweep happens to
-  // notice, silently leaking disk usage in the meantime.
+  // Regression test: store() writes a generation's payload first
+  // (atomically via QSaveFile) and only then writes that generation's
+  // metadata, which is the SOLE validity witness for it (see the
+  // comment in store()). If metadata fails to write AFTER the payload
+  // commit already succeeded, the just-committed payload must be
+  // deleted immediately -- not left behind as an orphan that only a
+  // later reap/lookup sweep happens to notice, silently leaking disk
+  // usage in the meantime.
   //
   // Forces writeMetadata() to fail deterministically (rather than
   // relying on filesystem permission bits, which are unreliable across
-  // platforms/sandboxes) by pre-creating a DIRECTORY at the exact path
-  // metadataPath() would use: QSaveFile::open() cannot open a directory
-  // for writing, so writeMetadata() fails exactly like a real disk-full
-  // or permission-denied failure would, without depending on any
+  // platforms/sandboxes) by pre-creating a DIRECTORY at the exact
+  // generation-scoped path store() will compute for these exact bytes:
+  // QSaveFile::open() cannot open a directory for writing, so
+  // writeMetadata() fails exactly like a real disk-full or
+  // permission-denied failure would, without depending on any
   // OS-specific permission enforcement.
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/metadata-fail.png")));
+  const QByteArray bytes = QByteArrayLiteral("orphan-candidate-bytes");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
   const QString payloadPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation);
   const QString metadataPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation);
 
   // Construct the cache BEFORE planting the blocking directory: the
   // constructor runs an unconditional reapAndEnforceQuota() sweep at
   // startup which (per Copilot review round 35) now recursively removes
   // any stray directory it finds, since this cache directory is
   // exclusively owned by AssetCache and a directory can never
-  // legitimately sit at a "<key>.meta.json"-shaped path. Planting the
+  // legitimately sit at a generation-metadata-shaped path. Planting the
   // directory afterward, immediately before the single store() call
   // under test, ensures that startup sweep cannot race with (and
   // silently invalidate) this test's own deliberately-planted failure
   // trigger.
   AssetCache cache(configFor(m_tempDirPath));
 
-  QVERIFY(QDir(m_tempDirPath).mkpath(key + QStringLiteral(".meta.json")));
+  QVERIFY(QDir().mkpath(metadataPath));
   QVERIFY(QFileInfo(metadataPath).isDir());
 
-  cache.store(key, makeEntry(QByteArrayLiteral("orphan-candidate-bytes")));
+  cache.store(key, makeEntry(bytes));
 
   // The payload must never be left behind once its sole validity witness
   // (metadata) failed to write.
@@ -479,20 +721,22 @@ void AssetCacheTests::oversizedMetadataFileIsRejectedWithoutUnboundedReadAll() {
   // than ever being served.
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/oversized-metadata.png")));
-  const QString payloadPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
-  const QString metadataPath =
-      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
   const QByteArray payloadBytes = QByteArrayLiteral("small-payload-bytes");
+  const QString sha256Hex = QString::fromLatin1(
+      QCryptographicHash::hash(payloadBytes, QCryptographicHash::Sha256)
+          .toHex());
+  const QString payloadPath =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, sha256Hex);
+  const QString metadataPath =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, sha256Hex);
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
   {
     QFile payload(payloadPath);
     QVERIFY(payload.open(QIODevice::WriteOnly));
     payload.write(payloadBytes);
     payload.close();
 
-    const QString sha256Hex = QString::fromLatin1(
-        QCryptographicHash::hash(payloadBytes, QCryptographicHash::Sha256)
-            .toHex());
     QJsonObject obj;
     obj[QStringLiteral("formatVersion")] = 1;
     obj[QStringLiteral("key")] = key;
@@ -512,6 +756,15 @@ void AssetCacheTests::oversizedMetadataFileIsRejectedWithoutUnboundedReadAll() {
     QVERIFY(metadata.open(QIODevice::WriteOnly));
     metadata.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
     metadata.close();
+
+    QJsonObject manifestObj;
+    manifestObj[QStringLiteral("formatVersion")] = 1;
+    manifestObj[QStringLiteral("key")] = key;
+    manifestObj[QStringLiteral("generation")] = sha256Hex;
+    QFile manifest(manifestPath);
+    QVERIFY(manifest.open(QIODevice::WriteOnly));
+    manifest.write(QJsonDocument(manifestObj).toJson(QJsonDocument::Compact));
+    manifest.close();
   }
   QVERIFY(QFile::exists(payloadPath));
   QVERIFY(QFileInfo(metadataPath).size() > 64 * 1024);
@@ -528,11 +781,11 @@ void AssetCacheTests::
   // caller from forwarding an arbitrary string as `key`, and every
   // disk-touching entry point (lookupDisk(), store(),
   // touchAfterNotModified()) turns `key` directly into a filesystem path
-  // via payloadPath()/metadataPath() ("<dir>/<key>.bin",
-  // "<dir>/<key>.meta.json"). This test uses a key crafted with "../"
-  // segments to escape the cache directory entirely and confirms none of
-  // the three entry points ever creates, reads, or deletes anything
-  // outside the cache directory -- nor anything unexpected inside it.
+  // via manifestPath()/generationPayloadPath()/generationMetadataPath().
+  // This test uses a key crafted with "../" segments to escape the
+  // cache directory entirely and confirms none of the three entry
+  // points ever creates, reads, or deletes anything outside the cache
+  // directory -- nor anything unexpected inside it.
   const QString maliciousKey =
       QStringLiteral("../asset-cache-traversal-canary");
 

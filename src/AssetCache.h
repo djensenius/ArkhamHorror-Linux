@@ -25,20 +25,40 @@ namespace Arkham {
 // candidates for the same logical AssetKey) can never collide, and no
 // remote-controlled string ever becomes a local path component.
 //
-// On disk, each entry is two separate files under `directory()`:
-//   {key}.bin        -- the raw encoded bytes, written via QSaveFile.
-//   {key}.meta.json  -- versioned metadata, also written via QSaveFile,
-//                       AFTER the payload commit succeeds.
-// QSaveFile only makes a single file's write atomic; it does not make the
-// pair transactional. Crash-consistency across the pair is achieved by
-// treating metadata as the sole "this entry is valid" witness: a read (or
-// the startup/periodic reapAndEnforceQuota() sweep) always re-hashes the
-// payload and compares it against metadata's recorded SHA-256 before
-// trusting an entry, deletes a payload-without-metadata as an orphan, and
-// deletes a metadata-without-payload (or metadata whose payload hash
-// mismatches) as corrupt. A crash between the two writes therefore always
-// resolves deterministically to "entry absent" on the next read/sweep,
-// never to a half-valid success.
+// On disk (review item 8), each entry is published as an immutable,
+// content-addressed GENERATION plus one small mutable pointer:
+//   {key}.{generation}.bin        -- raw encoded bytes (generation is the
+//                                    SHA-256 hex of those exact bytes).
+//   {key}.{generation}.meta.json  -- versioned metadata for that exact
+//                                    generation (its own "sha256" field
+//                                    always equals `generation`).
+//   {key}.manifest.json           -- the ONE mutable file: which
+//                                    generation is currently "live" for
+//                                    this key.
+// Both generation-scoped files are written via QSaveFile (temp file in
+// the same directory, fsync'd before the atomic rename that commits it),
+// and only once BOTH commit does the manifest itself get rewritten (also
+// QSaveFile + fsync) to point at the new generation; the containing
+// directory is then fsync'd too, so the rename that publishes the new
+// manifest is itself durable. Because a generation's filename is
+// content-addressed, publishing generation N+1 for a key that already has
+// generation N NEVER touches generation N's files at all until AFTER the
+// manifest swap has fully committed -- at every crash boundary before
+// that swap commits, the manifest (if it exists) still names the old,
+// completely intact generation; at every boundary at or after it, the
+// manifest names the new, completely intact generation. A read (or the
+// startup/periodic reapAndEnforceQuota() sweep) always re-hashes the
+// generation's payload and compares it against that generation's own
+// metadata before trusting it, so even a manifest that somehow survives
+// pointing at an incomplete/corrupt generation is never served -- and any
+// generation whose files exist but are NOT the one the manifest currently
+// names (an orphan left by a crash between publishing a new generation
+// and cleaning up the old one, or between writing a new generation's
+// files and ever reaching the manifest swap) is reclaimed by the reap
+// sweep. A crash therefore always resolves deterministically to either
+// the complete old generation or the complete new one -- never a
+// half-valid mix of the two -- and metadata/manifest commit failure
+// always preserves whatever generation was already live.
 //
 // Metadata (not filesystem atime, which many container/build
 // environments mount with atime updates disabled or coarsened) drives
@@ -189,6 +209,22 @@ public:
     return m_diskCacheDisabled;
   }
 
+  // Test-only exposure of this cache's on-disk generation/manifest
+  // layout (review item 8 -- see the class comment above), so
+  // fault-injection tests can construct exact crash-boundary scenarios
+  // (a generation's files present but the manifest not yet -- or still
+  // -- pointing at them) by hand without duplicating this cache's own
+  // path-naming logic, and without any of these three calls counting as
+  // production API surface a normal caller would ever need.
+  [[nodiscard]] static QString manifestPathForTesting(const QString &directory,
+                                                      const QString &key);
+  [[nodiscard]] static QString payloadPathForTesting(const QString &directory,
+                                                     const QString &key,
+                                                     const QString &generation);
+  [[nodiscard]] static QString
+  metadataPathForTesting(const QString &directory, const QString &key,
+                         const QString &generation);
+
 private:
   struct DiskMetadata {
     QString key;
@@ -203,12 +239,36 @@ private:
     qint64 lastAccessMsecsSinceEpoch{0};
   };
 
-  [[nodiscard]] QString payloadPath(const QString &key) const;
-  [[nodiscard]] QString metadataPath(const QString &key) const;
-  [[nodiscard]] bool writeMetadata(const QString &key,
+  [[nodiscard]] QString manifestPath(const QString &key) const;
+  [[nodiscard]] QString generationPayloadPath(const QString &key,
+                                              const QString &generation) const;
+  [[nodiscard]] QString generationMetadataPath(const QString &key,
+                                               const QString &generation) const;
+  [[nodiscard]] bool writeMetadata(const QString &metadataFilePath,
                                    const DiskMetadata &metadata) const;
   [[nodiscard]] std::optional<DiskMetadata>
-  readMetadata(const QString &key) const;
+  readMetadata(const QString &metadataFilePath,
+               const QString &expectedKey) const;
+  // Publishes `generation` as the current one for `key`: the single
+  // atomic pointer swap that makes a freshly-written generation "live"
+  // (or, on first insert, live at all). See the class comment.
+  [[nodiscard]] bool writeManifest(const QString &key,
+                                   const QString &generation) const;
+  // Reads and validates `key`'s manifest, returning the generation it
+  // names iff the manifest itself is well-formed, matches `key`, and its
+  // generation field is a syntactically valid (64-hex) identifier --
+  // NOT whether that generation's files actually exist or are valid
+  // (callers still verify that separately).
+  [[nodiscard]] std::optional<QString>
+  readManifestGeneration(const QString &key) const;
+  // Unconditionally reclaims EVERY file associated with `key` --
+  // its manifest and every generation-scoped payload/metadata file that
+  // exists for it, live or orphaned -- via a name-prefix sweep of this
+  // cache's exclusively-owned directory. Used whenever `key` is
+  // confirmed to have no valid entry at all (repair, invalidate(),
+  // quota eviction); NEVER used mid-replacement in store(), which must
+  // keep an old-but-still-live generation's files intact until its
+  // successor's manifest swap has actually committed.
   void deleteEntry(const QString &key) const;
 
   bool m_diskCacheDisabled{false};
