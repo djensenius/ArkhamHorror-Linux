@@ -245,7 +245,17 @@ void MockHttpServer::writeSlowDrip(QTcpSocket *socket, const QString &path,
             offset += written;
             m_lastSlowDripBytesWritten[path] = offset;
           });
-  connect(socket, &QTcpSocket::disconnected, this, [timer]() {
+  // Copilot review (round 31, high severity): the timeout lambda above
+  // can already have called timer->deleteLater() on several early-return
+  // paths (e.g. written <= 0) before the socket's disconnected signal
+  // fires. Using `timer` itself as the receiver/context object (rather
+  // than `this`) means Qt automatically severs this connection once
+  // `timer`'s destructor actually runs, so this lambda can never be
+  // invoked with a dangling `timer` pointer -- unlike a `this`-scoped
+  // connection, which stays alive for MockHttpServer's whole lifetime
+  // and would happily invoke the capture-by-raw-pointer lambda even
+  // after the timer it points to had already been destroyed.
+  connect(socket, &QTcpSocket::disconnected, timer, [timer]() {
     timer->stop();
     timer->deleteLater();
   });

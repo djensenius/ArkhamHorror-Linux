@@ -443,6 +443,17 @@ void AssetCache::updateMemoryDecodedImage(const QString &key,
 }
 
 void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
+  if (!isValidKey(key)) {
+    // Unlike lookupDisk()/store()/touchAfterNotModified(), this method
+    // never turns `key` into a filesystem path, so a malformed key can't
+    // cause a path-traversal here -- but it's a public API, and every
+    // other entry point enforces the invariant that entries only ever
+    // exist in the cache under a cacheKeyFor()-shaped (64-hex) key.
+    // Silently accepting anything else here would let this one method
+    // create an inconsistency future callers/entry points can't rely on
+    // -- see isValidKey()'s comment.
+    return;
+  }
   QMutexLocker locker(&m_mutex);
   auto *heapEntry = new CachedEntry(std::move(entry));
   m_memory->insert(key, heapEntry,

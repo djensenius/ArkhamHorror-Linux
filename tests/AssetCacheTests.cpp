@@ -498,3 +498,21 @@ void AssetCacheTests::
   QDir cacheDir(m_tempDirPath);
   QVERIFY(cacheDir.entryList(QDir::Files).isEmpty());
 }
+
+void AssetCacheTests::promoteToMemoryRejectsMalformedKeyWithoutInserting() {
+  // Copilot review (round 31, suppressed comment): unlike
+  // lookupDisk()/store()/touchAfterNotModified(), promoteToMemory()
+  // never turns `key` into a filesystem path -- a malformed key can't
+  // cause path traversal here -- but it's a public API, and every other
+  // entry point enforces the invariant that entries only ever exist in
+  // the cache under a cacheKeyFor()-shaped (64-hex) key. This proves
+  // promoteToMemory() rejects a malformed key rather than silently
+  // breaking that invariant.
+  const QString malformedKey = QStringLiteral("../not-a-real-cache-key");
+
+  AssetCache cache(configFor(m_tempDirPath));
+  cache.promoteToMemory(malformedKey,
+                        makeEntry(QByteArrayLiteral("should-never-be-stored")));
+
+  QVERIFY(!cache.lookupMemory(malformedKey).has_value());
+}

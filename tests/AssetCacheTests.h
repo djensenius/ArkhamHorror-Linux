@@ -32,6 +32,7 @@ private slots:
   void metadataWriteFailureAfterPayloadCommitCleansUpOrphanPayload();
   void oversizedMetadataFileIsRejectedWithoutUnboundedReadAll();
   void malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir();
+  void promoteToMemoryRejectsMalformedKeyWithoutInserting();
 
 private:
   QString m_tempDirPath;
