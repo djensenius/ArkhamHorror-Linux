@@ -112,15 +112,18 @@ struct InvestigatorSummary {
                          const InvestigatorSummary &) = default;
 };
 
-// gameDetails.scenario (null for a campaign game between scenarios, or
-// absent entirely for a from-scratch campaign that has not started its
-// first scenario). `id` is game-list.schema.json's plain, unconstrained
-// `scenario.id` string -- but the backend's actual ScenarioDetails.id field
-// is typed Arkham.Id.ScenarioId, a newtype directly wrapping (and
-// `deriving newtype` its ToJSON/FromJSON from) Arkham.Card.CardCode, same
-// as InvestigatorSummary.id above -- so CardCode here is likewise the real
-// backend guarantee, not over-validation relative to the pinned contract
-// commit.
+// gameDetails.scenario is a required key whose value may be `null` (for a
+// campaign game between scenarios, or a from-scratch campaign that has
+// not started its first scenario yet) -- the pinned game-list.schema.json
+// requires the "scenario" key, and the decoder in Games.cpp enforces its
+// presence via obj.contains("scenario"); it is never an absent/omitted
+// key, only ever present-with-null. `id` is game-list.schema.json's
+// plain, unconstrained `scenario.id` string -- but the backend's actual
+// ScenarioDetails.id field is typed Arkham.Id.ScenarioId, a newtype
+// directly wrapping (and `deriving newtype` its ToJSON/FromJSON from)
+// Arkham.Card.CardCode, same as InvestigatorSummary.id above -- so
+// CardCode here is likewise the real backend guarantee, not
+// over-validation relative to the pinned contract commit.
 struct ScenarioSummary {
   CardCode id;
   Difficulty difficulty{};
