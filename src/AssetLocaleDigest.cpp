@@ -7,6 +7,8 @@
 #include <QString>
 #include <QtAssert>
 
+#include <iterator>
+
 using namespace Qt::StringLiterals;
 
 namespace Arkham {

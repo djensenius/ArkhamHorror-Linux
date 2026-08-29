@@ -1,6 +1,5 @@
 #include "AssetImageRequest.h"
 
-#include <QCoreApplication>
 #include <QPointer>
 
 namespace Arkham {
