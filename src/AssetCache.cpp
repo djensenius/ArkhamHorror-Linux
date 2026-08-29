@@ -35,6 +35,16 @@ constexpr double kLowWaterMarkFraction = 0.75;
 // read-back allocation -- see readVerifiedPayload() below.
 constexpr qint64 kMaxSinglePayloadBytesOnDisk = 20LL * 1024 * 1024;
 
+// A legitimate metadata JSON file (see writeMetadata()) holds only a
+// handful of short strings/numbers and is always well under 1 KiB in
+// practice. This cache directory is locally writable and can contain a
+// corrupted or maliciously-planted *.meta.json file; without an
+// independent ceiling here, reading one via readAll() would be an
+// unbounded allocation triggered purely by a file's on-disk size, before
+// any of its content is even parsed. 64 KiB leaves generous headroom
+// over any legitimate metadata payload while still bounding the read.
+constexpr qint64 kMaxMetadataBytesOnDisk = 64 * 1024;
+
 // Verifies `payloadFile`'s on-disk size against `expectedSize` (from
 // metadata) and an absolute hard ceiling BEFORE ever calling readAll().
 // A corrupted, truncated, or locally-planted payload file can be
@@ -149,6 +159,13 @@ std::optional<AssetCache::DiskMetadata>
 AssetCache::readMetadata(const QString &key) const {
   QFile file(metadataPath(key));
   if (!file.open(QIODevice::ReadOnly)) {
+    return std::nullopt;
+  }
+  // Reject on the cheap stat alone, before ever calling readAll(): see
+  // kMaxMetadataBytesOnDisk's comment above. A corrupted or
+  // locally-planted metadata file can claim an arbitrary size regardless
+  // of what its (if any) JSON content actually is.
+  if (file.size() < 0 || file.size() > kMaxMetadataBytesOnDisk) {
     return std::nullopt;
   }
   const QByteArray raw = file.readAll();

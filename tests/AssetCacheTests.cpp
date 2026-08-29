@@ -394,6 +394,63 @@ void AssetCacheTests::
   QVERIFY(QFileInfo(metadataPath).isDir());
 }
 
+void AssetCacheTests::oversizedMetadataFileIsRejectedWithoutUnboundedReadAll() {
+  // Copilot review (round 27): readMetadata() called QFile::readAll() on
+  // the metadata JSON with no size bound at all. This cache directory is
+  // locally writable and can contain a corrupted or maliciously-planted
+  // *.meta.json file; a legitimate metadata file is always tiny (a
+  // handful of short strings/numbers), so an oversized one -- valid JSON
+  // or not -- must be rejected on the cheap stat alone, never read in
+  // full. This test plants a metadata file exceeding the absolute cap
+  // (kMaxMetadataBytesOnDisk, 64 KiB) directly on disk -- valid JSON,
+  // padded via an oversized "etag" field so it would otherwise parse
+  // successfully -- and asserts it is rejected and cleaned up rather
+  // than ever being served.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/oversized-metadata.png")));
+  const QString payloadPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
+  const QString metadataPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
+  const QByteArray payloadBytes = QByteArrayLiteral("small-payload-bytes");
+  {
+    QFile payload(payloadPath);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(payloadBytes);
+    payload.close();
+
+    const QString sha256Hex = QString::fromLatin1(
+        QCryptographicHash::hash(payloadBytes, QCryptographicHash::Sha256)
+            .toHex());
+    QJsonObject obj;
+    obj[QStringLiteral("formatVersion")] = 1;
+    obj[QStringLiteral("key")] = key;
+    obj[QStringLiteral("contentType")] = QStringLiteral("image/png");
+    obj[QStringLiteral("encodedSize")] = payloadBytes.size();
+    obj[QStringLiteral("width")] = 1;
+    obj[QStringLiteral("height")] = 1;
+    obj[QStringLiteral("sha256")] = sha256Hex;
+    // Padding field: still perfectly valid JSON, but pushes the whole
+    // file past the 64 KiB metadata cap (128 KiB of filler text).
+    obj[QStringLiteral("etag")] = QString(128 * 1024, QLatin1Char('e'));
+    obj[QStringLiteral("lastModified")] = QString();
+    obj[QStringLiteral("insertedAtMs")] = QDateTime::currentMSecsSinceEpoch();
+    obj[QStringLiteral("lastAccessMs")] = QDateTime::currentMSecsSinceEpoch();
+
+    QFile metadata(metadataPath);
+    QVERIFY(metadata.open(QIODevice::WriteOnly));
+    metadata.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    metadata.close();
+  }
+  QVERIFY(QFile::exists(payloadPath));
+  QVERIFY(QFileInfo(metadataPath).size() > 64 * 1024);
+
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.lookupDisk(key).has_value());
+  QVERIFY(!QFile::exists(payloadPath));
+  QVERIFY(!QFile::exists(metadataPath));
+}
+
 void AssetCacheTests::
     malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir() {
   // AssetCache is a public API: nothing in the type system stops a

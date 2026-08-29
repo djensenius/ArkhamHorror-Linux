@@ -30,6 +30,7 @@ private slots:
   void oversizedSelfConsistentPayloadBeyondAbsoluteCapIsRejected();
   void storeRejectsPayloadBeyondAbsoluteCapWithoutTouchingDisk();
   void metadataWriteFailureAfterPayloadCommitCleansUpOrphanPayload();
+  void oversizedMetadataFileIsRejectedWithoutUnboundedReadAll();
   void malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir();
 
 private:
