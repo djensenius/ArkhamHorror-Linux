@@ -25,7 +25,7 @@ decodeCardQuantityMapInput(const QJsonObject &obj, QLatin1StringView key,
     const QString entryPath = Json::joinPath(path, it.key());
     if (it.key().isEmpty())
       return failure(
-          QStringLiteral("%1: card code key must not be empty").arg(path));
+          QStringLiteral("%1: quantity map key must not be empty").arg(path));
     auto amount = Json::requireIntValue(it.value(), entryPath);
     if (!amount)
       return failure(amount.error());
