@@ -511,6 +511,15 @@ ValueOrError<QJsonValue> ExternalDeckId::toJson() const {
 Json::Value ExternalDeckId::toRawJson() const {
   switch (m_kind) {
   case Kind::Absent:
+    // Mirrors toJson()'s QJsonValue::Undefined above: Undefined (not
+    // Null) so a caller composing this directly into an enclosing object
+    // omits the "id" key entirely, rather than silently emitting an
+    // explicit JSON null for what is semantically an omitted id. Any
+    // attempt to serialize this Undefined value on its own fails loudly
+    // (Value::toJsonBytes() rejects Kind::Undefined) instead of
+    // producing a request payload with a different meaning than
+    // intended.
+    return Json::Value{};
   case Kind::Null:
     return Json::Value::makeNull();
   case Kind::Text:

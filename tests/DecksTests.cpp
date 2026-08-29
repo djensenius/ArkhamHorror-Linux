@@ -59,6 +59,12 @@ private slots:
   void externalIdFromRawBytesPreservesHugeExponentExactly();
   void externalIdFromRawBytesRoundTripsThroughToJsonBytesExactly();
   void externalIdFromRawBytesRejectsMalformedNumberLiteral();
+  // Fixes a suppressed reviewer comment on b7e7901: toRawJson() must
+  // distinguish Absent (Json::Value Undefined -- an omitted key) from an
+  // explicit Null (Json::Value::makeNull()), exactly mirroring toJson()'s
+  // existing QJsonValue::Undefined-vs-Null distinction, so no caller can
+  // silently turn an omitted id into an explicit JSON null on the wire.
+  void externalIdToRawJsonDistinguishesAbsentFromExplicitNull();
   void toJsonBytesEscapesInjectionAttemptInStringValue();
   void rawJsonObjectBuilderEscapesQuotesAndBackslashesInKey();
   void rawJsonObjectBuilderEscapesControlCharactersAndUtf8InKey();
@@ -589,6 +595,32 @@ void DecksTests::externalIdFromRawBytesRejectsMalformedNumberLiteral() {
   QVERIFY2(
       result.error().contains(QStringLiteral("expected a digit after '.'")),
       qPrintable(result.error()));
+}
+
+void DecksTests::externalIdToRawJsonDistinguishesAbsentFromExplicitNull() {
+  // Absent must encode as Json::Value's Undefined -- an omitted id key,
+  // not a JSON null -- exactly mirroring toJson()'s existing
+  // QJsonValue::Undefined-vs-Null distinction. Prior to this fix,
+  // toRawJson() collapsed Absent and Null to the same makeNull() result,
+  // so a caller invoking toRawJson() directly (bypassing the
+  // kind()-guarded composition in DeckListInput::toRawJson()) could
+  // silently turn an omitted id into a semantically different explicit
+  // null on the wire.
+  const auto absentRaw = ExternalDeckId::absent().toRawJson();
+  QVERIFY(absentRaw.isUndefined());
+  // Serializing an Undefined value on its own is a typed failure, not a
+  // silently-emitted "null" -- confirming Absent cannot masquerade as a
+  // valid standalone JSON value.
+  const auto absentBytes = absentRaw.toJsonBytes();
+  QVERIFY(!absentBytes.has_value());
+
+  const auto nullRaw = ExternalDeckId::null().toRawJson();
+  QVERIFY(nullRaw.isNull());
+  QVERIFY(!nullRaw.isUndefined());
+  const auto nullBytes = nullRaw.toJsonBytes();
+  if (!nullBytes)
+    QFAIL(qPrintable(nullBytes.error()));
+  QCOMPARE(*nullBytes, QByteArrayLiteral("null"));
 }
 
 void DecksTests::toJsonBytesEscapesInjectionAttemptInStringValue() {
