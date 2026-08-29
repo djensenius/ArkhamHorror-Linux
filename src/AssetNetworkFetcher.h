@@ -152,13 +152,27 @@ public:
 
   // Issues a GET for `url`, validating the response against `expectedFormat`
   // as described in the class comment. `conditional` may be empty for a
-  // plain unconditional fetch.
+  // plain unconditional fetch. `callback` is always invoked exactly once,
+  // asynchronously (never synchronously from within this call), with
+  // either the fetched result or a typed error.
+  //
+  // The returned handle is invalid (FetchHandle::isValid() == false) when
+  // `url`'s scheme is anything other than http/https: that request is
+  // rejected before any network operation begins, so there is nothing
+  // for cancel() to intercept, and `callback` will still fire with
+  // AssetErrorCode::UnsupportedScheme regardless of whether cancel() is
+  // ever called on the returned handle. For every other request, the
+  // returned handle is valid and eligible for cancel().
   FetchHandle fetch(const QUrl &url, AssetFormat expectedFormat,
                     ConditionalHeaders conditional, FetchCallback callback);
 
-  // Cancels a specific in-flight fetch. A stale/unknown handle is a no-op.
-  // The callback is invoked exactly once with AssetErrorCode::Cancelled;
-  // it is never invoked again afterwards for this handle.
+  // Cancels a specific in-flight fetch. An invalid, stale, or unknown
+  // handle is a safe no-op that never invokes `callback` on cancel()'s
+  // behalf (the request's real outcome, if any is still pending
+  // delivery, is unaffected). For a handle that IS actually pending,
+  // cancellation is synchronous and guaranteed: the callback is invoked
+  // exactly once with AssetErrorCode::Cancelled, and it is never invoked
+  // again afterwards for this handle.
   void cancel(FetchHandle handle);
 
   // Validates and decodes already-downloaded, already-trusted encoded

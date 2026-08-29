@@ -103,12 +103,18 @@ void AssetNetworkFetcherTests::
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> outcome) {
         result = std::move(outcome);
       });
-  QVERIFY(handle.isValid());
-  // cancel() on THIS specific handle (returned for a rejected scheme,
-  // never registered as pending) must remain a safe no-op, exactly like
-  // cancelling an already-completed request -- it must not crash and
-  // must not prevent the queued UnsupportedScheme callback from still
-  // firing exactly once below.
+  // Copilot review (round 29, medium severity): a scheme rejection is
+  // dispatched before any network operation exists for cancel() to
+  // intercept, so the returned handle must be invalid -- this documents
+  // (and lets callers detect, via isValid() alone) that cancel() could
+  // never actually have cancelled this queued UnsupportedScheme
+  // delivery, rather than silently returning a "valid" handle whose
+  // cancel() contract (invoke Cancelled exactly once) can never actually
+  // be honoured.
+  QVERIFY(!handle.isValid());
+  // cancel() on an invalid handle must remain a safe no-op: it must not
+  // crash and must not prevent the queued UnsupportedScheme callback
+  // from still firing exactly once below.
   fetcher.cancel(handle);
   QVERIFY(QTest::qWaitFor([&result]() { return result.has_value(); }, 5000));
 

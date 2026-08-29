@@ -219,7 +219,6 @@ AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
   // scheme never reaches QNetworkAccessManager at all.
   const QString scheme = url.scheme();
   if (scheme != QStringLiteral("http") && scheme != QStringLiteral("https")) {
-    const quint64 handle = m_nextHandle++;
     QPointer<AssetNetworkFetcher> self(this);
     QMetaObject::invokeMethod(
         this,
@@ -231,9 +230,22 @@ AssetNetworkFetcher::fetch(const QUrl &url, AssetFormat expectedFormat,
           }
         },
         Qt::QueuedConnection);
-    // Never inserted into m_pending: cancel() on this handle is already
-    // a safe no-op for any handle it does not recognise.
-    return FetchHandle{handle};
+    // Copilot review (round 29, medium severity): this rejection is
+    // dispatched asynchronously (to preserve fetch()'s always-async
+    // callback contract) but nothing is ever inserted into m_pending for
+    // it, so there is genuinely no in-flight operation cancel() could
+    // intercept -- calling cancel() on a handle for this path could
+    // therefore never actually cancel the still-queued UnsupportedScheme
+    // delivery, which would contradict cancel()'s documented contract
+    // that a successful cancellation always yields
+    // AssetErrorCode::Cancelled instead of the operation's real outcome.
+    // Returning an invalid handle (rather than consuming a real
+    // m_nextHandle value) makes that contract unambiguous: callers can
+    // tell from isValid() alone that this handle was never eligible for
+    // cancel() to begin with, instead of having to learn via a stale/
+    // unknown-handle no-op that happens to look identical to cancelling
+    // an already-completed request.
+    return FetchHandle{};
   }
 
   QNetworkRequest request(url);
