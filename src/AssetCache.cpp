@@ -308,28 +308,48 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
     auto *heapEntry = new CachedEntry(entry);
     m_memory->insert(key, heapEntry, static_cast<qsizetype>(entry.costBytes()));
 
-    // Publication order matters for crash-consistency: write the payload
-    // FIRST via QSaveFile (atomic for that one file), and only once that
-    // commit succeeds, write the metadata that "vouches for" it. A crash
-    // between the two leaves an orphan payload with no metadata, which
-    // lookupDisk()/reapAndEnforceQuota() both already treat as invalid and
-    // remove -- never as a half-valid hit.
-    QSaveFile payloadFile(payloadPath(key));
-    if (payloadFile.open(QIODevice::WriteOnly)) {
-      payloadFile.write(entry.encodedBytes);
-      if (payloadFile.commit()) {
-        DiskMetadata metadata;
-        metadata.key = key;
-        metadata.contentType = entry.contentType;
-        metadata.encodedSize = entry.encodedBytes.size();
-        metadata.width = entry.dimensions.width();
-        metadata.height = entry.dimensions.height();
-        metadata.sha256Hex = entry.sha256Hex;
-        metadata.etag = entry.etag;
-        metadata.lastModified = entry.lastModified;
-        metadata.insertedAtMsecsSinceEpoch = entry.insertedAtMsecsSinceEpoch;
-        metadata.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
-        (void)writeMetadata(key, metadata);
+    // Never write a payload to disk that this cache could never itself
+    // read back: readVerifiedPayload() hard-caps any disk read at
+    // kMaxSinglePayloadBytesOnDisk, so a larger on-disk file would sit as
+    // unreclaimable disk usage (never a valid lookupDisk() hit) until a
+    // later reap sweep happens to notice it. Production callers already
+    // cap fetched bytes well below this via
+    // AssetNetworkFetcher::Limits::maxEncodedBytes before a fetch even
+    // completes; this guard is defense-in-depth against a bug or a
+    // future caller invoking store() directly with an oversized entry.
+    // The memory insert above is unaffected -- QCache's own cost-based
+    // eviction already bounds memory usage independently of disk.
+    if (entry.encodedBytes.size() <= kMaxSinglePayloadBytesOnDisk) {
+      // Publication order matters for crash-consistency: write the
+      // payload FIRST via QSaveFile (atomic for that one file), and only
+      // once that commit succeeds, write the metadata that "vouches for"
+      // it. A crash between the two leaves an orphan payload with no
+      // metadata, which lookupDisk()/reapAndEnforceQuota() both already
+      // treat as invalid and remove -- never as a half-valid hit.
+      QSaveFile payloadFile(payloadPath(key));
+      if (payloadFile.open(QIODevice::WriteOnly)) {
+        payloadFile.write(entry.encodedBytes);
+        if (payloadFile.commit()) {
+          DiskMetadata metadata;
+          metadata.key = key;
+          metadata.contentType = entry.contentType;
+          metadata.encodedSize = entry.encodedBytes.size();
+          metadata.width = entry.dimensions.width();
+          metadata.height = entry.dimensions.height();
+          metadata.sha256Hex = entry.sha256Hex;
+          metadata.etag = entry.etag;
+          metadata.lastModified = entry.lastModified;
+          metadata.insertedAtMsecsSinceEpoch = entry.insertedAtMsecsSinceEpoch;
+          metadata.lastAccessMsecsSinceEpoch = entry.lastAccessMsecsSinceEpoch;
+          if (!writeMetadata(key, metadata)) {
+            // Metadata is the SOLE validity witness for a payload (see
+            // above): without it, the payload just committed can never
+            // be read back as valid and would otherwise leak disk usage
+            // until the next reap/lookup sweep happens to remove it.
+            // Delete it immediately instead of leaving that window open.
+            QFile::remove(payloadPath(key));
+          }
+        }
       }
     }
   }

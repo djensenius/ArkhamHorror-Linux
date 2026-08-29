@@ -28,6 +28,8 @@ private slots:
   void touchAfterNotModifiedRefreshesLastAccessAndHeaders();
   void restartingWithSameDirectorySeesPriorEntries();
   void oversizedSelfConsistentPayloadBeyondAbsoluteCapIsRejected();
+  void storeRejectsPayloadBeyondAbsoluteCapWithoutTouchingDisk();
+  void metadataWriteFailureAfterPayloadCommitCleansUpOrphanPayload();
   void malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir();
 
 private:

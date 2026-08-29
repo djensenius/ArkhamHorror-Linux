@@ -2,9 +2,13 @@
 
 #include "AssetCache.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
 #include <QTest>
 
@@ -21,10 +25,11 @@ void AssetCacheTests::cleanup() { m_tempDir.reset(); }
 namespace {
 
 AssetCache::Config configFor(const QString &dir,
-                             qint64 diskMaxBytes = 1024 * 1024) {
+                             qint64 diskMaxBytes = 1024 * 1024,
+                             qint64 memoryMaxBytes = 8 * 1024 * 1024) {
   AssetCache::Config config;
   config.directory = dir;
-  config.memoryMaxCostBytes = 8 * 1024 * 1024;
+  config.memoryMaxCostBytes = memoryMaxBytes;
   config.diskMaxBytes = diskMaxBytes;
   return config;
 }
@@ -263,18 +268,19 @@ void AssetCacheTests::
   // actual on-disk bytes match both the declared size AND the recorded
   // SHA-256 -- and still be dangerous to trust on read-back, because
   // lookupDisk()/reapAndEnforceQuota() have no way to know whether such a
-  // pair actually came from this cache's own store() (which is only ever
-  // fed encoded bytes that already passed AssetNetworkFetcher's own hard
-  // 20 MiB incremental cap) versus a corrupted or locally-planted file
-  // that simply happens to be internally consistent at some much larger
-  // size. Reading back an entry like that with a single unconditional
-  // readAll() has no upper bound at all. This test constructs exactly
-  // such a pair directly via store() (bypassing the network fetcher's own
-  // cap entirely, which store() itself does not enforce -- verification
-  // happens only on the read-back path) and asserts it is rejected and
-  // cleaned up rather than ever being served, even though every
-  // consistency check that existed before this fix (SHA-256, size-versus-
-  // metadata match) would have passed it.
+  // pair actually came from this cache's own store() (which now refuses
+  // to write anything this large up front -- see
+  // storeRejectsPayloadBeyondAbsoluteCapWithoutTouchingDisk() below)
+  // versus a corrupted/tampered file, a file planted by an attacker with
+  // filesystem access, or a leftover pair from an older, less strict
+  // version of this cache. This test plants exactly such a pair directly
+  // on disk -- bypassing store() entirely, hand-writing the payload and
+  // metadata JSON in the exact shape writeMetadata() itself produces --
+  // and asserts it is rejected and cleaned up rather than ever being
+  // served, even though every consistency check that existed before the
+  // original fix (SHA-256, size-versus-metadata match) would have passed
+  // it. Reading back an entry like that with a single unconditional
+  // readAll() would otherwise have no upper bound at all.
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/oversized.png")));
   const QByteArray oversized(20 * 1024 * 1024 + 4096, 'x');
@@ -283,8 +289,31 @@ void AssetCacheTests::
   const QString metadataPath =
       m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
   {
-    AssetCache cache(configFor(m_tempDirPath, 64LL * 1024 * 1024));
-    cache.store(key, makeEntry(oversized));
+    QFile payload(payloadPath);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(oversized);
+    payload.close();
+
+    const QString sha256Hex = QString::fromLatin1(
+        QCryptographicHash::hash(oversized, QCryptographicHash::Sha256)
+            .toHex());
+    QJsonObject obj;
+    obj[QStringLiteral("formatVersion")] = 1;
+    obj[QStringLiteral("key")] = key;
+    obj[QStringLiteral("contentType")] = QStringLiteral("image/png");
+    obj[QStringLiteral("encodedSize")] = oversized.size();
+    obj[QStringLiteral("width")] = 1;
+    obj[QStringLiteral("height")] = 1;
+    obj[QStringLiteral("sha256")] = sha256Hex;
+    obj[QStringLiteral("etag")] = QString();
+    obj[QStringLiteral("lastModified")] = QString();
+    obj[QStringLiteral("insertedAtMs")] = QDateTime::currentMSecsSinceEpoch();
+    obj[QStringLiteral("lastAccessMs")] = QDateTime::currentMSecsSinceEpoch();
+
+    QFile metadata(metadataPath);
+    QVERIFY(metadata.open(QIODevice::WriteOnly));
+    metadata.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    metadata.close();
   }
   QVERIFY(QFile::exists(payloadPath));
   QVERIFY(QFile::exists(metadataPath));
@@ -297,6 +326,72 @@ void AssetCacheTests::
   QVERIFY(!QFile::exists(payloadPath));
   QVERIFY(!QFile::exists(metadataPath));
   QVERIFY(!freshCache.lookupDisk(key).has_value());
+}
+
+void AssetCacheTests::
+    storeRejectsPayloadBeyondAbsoluteCapWithoutTouchingDisk() {
+  // Regression test: store() itself now enforces the same absolute cap
+  // readVerifiedPayload() has always enforced on read-back
+  // (kMaxSinglePayloadBytesOnDisk == 20 MiB), so an oversized entry is
+  // rejected AT THE POINT OF WRITE and never touches disk at all --
+  // rather than being written and only cleaned up later by a reap sweep
+  // or a subsequent lookup, which would let an unbounded number of such
+  // oversized writes accumulate as real disk usage in the meantime.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/oversized-store.png")));
+  const QByteArray oversized(20 * 1024 * 1024 + 1, 'y');
+  const QString payloadPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
+  const QString metadataPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
+
+  AssetCache cache(
+      configFor(m_tempDirPath, 64LL * 1024 * 1024, 64LL * 1024 * 1024));
+  cache.store(key, makeEntry(oversized));
+
+  QVERIFY(!QFile::exists(payloadPath));
+  QVERIFY(!QFile::exists(metadataPath));
+  // The memory cache is unaffected by this disk-side guard: it still
+  // serves the entry via its own independent, cost-based eviction.
+  QVERIFY(cache.lookupMemory(key).has_value());
+}
+
+void AssetCacheTests::
+    metadataWriteFailureAfterPayloadCommitCleansUpOrphanPayload() {
+  // Regression test: store() writes the payload first (atomically via
+  // QSaveFile) and only then writes metadata, which is the SOLE validity
+  // witness for that payload (see the comment in store()). If metadata
+  // fails to write AFTER the payload commit already succeeded, the
+  // just-committed payload must be deleted immediately -- not left
+  // behind as an orphan that only a later reap/lookup sweep happens to
+  // notice, silently leaking disk usage in the meantime.
+  //
+  // Forces writeMetadata() to fail deterministically (rather than
+  // relying on filesystem permission bits, which are unreliable across
+  // platforms/sandboxes) by pre-creating a DIRECTORY at the exact path
+  // metadataPath() would use: QSaveFile::open() cannot open a directory
+  // for writing, so writeMetadata() fails exactly like a real disk-full
+  // or permission-denied failure would, without depending on any
+  // OS-specific permission enforcement.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/metadata-fail.png")));
+  const QString payloadPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
+  const QString metadataPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
+
+  QVERIFY(QDir(m_tempDirPath).mkpath(key + QStringLiteral(".meta.json")));
+  QVERIFY(QFileInfo(metadataPath).isDir());
+
+  AssetCache cache(configFor(m_tempDirPath));
+  cache.store(key, makeEntry(QByteArrayLiteral("orphan-candidate-bytes")));
+
+  // The payload must never be left behind once its sole validity witness
+  // (metadata) failed to write.
+  QVERIFY(!QFile::exists(payloadPath));
+  // The directory planted at the metadata path is untouched: store()
+  // must never attempt to delete or otherwise overwrite it.
+  QVERIFY(QFileInfo(metadataPath).isDir());
 }
 
 void AssetCacheTests::
