@@ -1,8 +1,8 @@
 #include "AssetLocator.h"
 
 #include "AssetLocaleDigest.h"
-#include "UrlValidator.h"
 
+#include <QHash>
 #include <QLatin1StringView>
 #include <QSet>
 #include <QString>
@@ -10,6 +10,16 @@
 
 using namespace Qt::StringLiterals;
 
+// Every category root, per-category fixed format, leading-'c' stripping
+// rule, and card-side transform below is ported from the real web
+// client's own asset-path helpers (halogenandtoast/ArkhamHorror,
+// frontend/src/arkham/{helpers,cardArt,cardImages}.ts and the various
+// call sites cited inline), NOT re-derived or guessed: this file is a
+// pure, side-effect-free function of an AssetKey to the exact path shape
+// that real host actually serves. No live CDN dependency is exercised at
+// build or test time -- see tests/AssetLocatorTests.cpp's golden-path
+// tests, which assert against literal strings copied from that
+// inspection rather than any network call.
 namespace Arkham {
 
 namespace {
@@ -59,54 +69,146 @@ bool isValidIdentifier(const QString &identifier, qsizetype maxLength) {
   return true;
 }
 
-QLatin1StringView cardSideSuffix(AssetSide side) {
-  switch (side) {
-  case AssetSide::Front:
-    return ""_L1;
-  case AssetSide::Back:
-    return "b"_L1;
-  case AssetSide::AlternateFront:
-    return "a"_L1;
-  case AssetSide::ResolvedFront:
-    return "-resolved"_L1;
-  case AssetSide::MutatedFront:
-    return "-mutated"_L1;
+// Categories whose identifier is a card-code-shaped token that the real
+// web client unconditionally strips a single leading 'c' tag-prefix from
+// before building any path -- see cardArt() in cardImages.ts:
+// `code.replace(/^c/, '')`, applied identically whether or not a leading
+// 'c' was actually present, and the same pattern at the InvestigatorType/
+// SetIcon call sites (e.g. `game.scenario.id.replace(/^c/, '')` in
+// GameRow.vue and similar). No evidence of this strip was found for
+// CampaignBox, HomebrewSet, HomebrewBox, ChaosToken, or SlotIcon
+// identifiers, so it is deliberately NOT applied to those.
+bool categoryStripsLeadingCardCodePrefix(AssetCategory category) {
+  switch (category) {
+  case AssetCategory::Card:
+  case AssetCategory::HomebrewCard:
+  case AssetCategory::InvestigatorPortrait:
+  case AssetCategory::SetIcon:
+    return true;
+  default:
+    return false;
   }
-  Q_UNREACHABLE_RETURN(""_L1);
 }
 
-// Category-specific canonical path segment, matching the current web
-// client's routing scheme (see AssetLocator.h class comment). `localeDir`
-// is the mapped web-locale directory segment (e.g. "ita"), or empty for
-// the English/default candidate.
-QString buildRelativePath(AssetCategory category, const QString &identifier,
-                          AssetSide side, const QString &localeDir,
-                          AssetFormat format) {
-  const QString ext = assetFormatExtension(format);
+QString stripLeadingCardCodePrefix(const QString &identifier) {
+  if (identifier.startsWith(u'c')) {
+    return identifier.mid(1);
+  }
+  return identifier;
+}
+
+// Real per-instance resolved-code overrides the generic "strip a trailing
+// [aceg], append b" rule below would otherwise get wrong -- these exist in
+// the real client specifically because 03276/03279's "resolved" sides do
+// not follow the generic pattern. See resolvedSideArt() in
+// cardImages.ts's RESOLVED_SIDE_OVERRIDES constant.
+const QHash<QString, QString> &resolvedSideOverrides() {
+  static const QHash<QString, QString> overrides = {
+      {QStringLiteral("03276a"), QStringLiteral("03276ab")},
+      {QStringLiteral("03276b"), QStringLiteral("03276bb")},
+      {QStringLiteral("03279a"), QStringLiteral("03279ab")},
+      {QStringLiteral("03279b"), QStringLiteral("03279bb")},
+  };
+  return overrides;
+}
+
+// Pure, always-succeeding transform mirroring resolvedSideArt() in
+// cardImages.ts: (1) consult the fixed override table above; (2) else
+// strip one trailing [aceg] character if present, then append "b".
+QString resolvedSideArtCode(const QString &strippedIdentifier) {
+  const auto &overrides = resolvedSideOverrides();
+  const auto it = overrides.find(strippedIdentifier);
+  if (it != overrides.end()) {
+    return *it;
+  }
+  QString base = strippedIdentifier;
+  if (!base.isEmpty()) {
+    const QChar last = base.back();
+    if (last == u'a' || last == u'c' || last == u'e' || last == u'g') {
+      base.chop(1);
+    }
+  }
+  return base + u'b';
+}
+
+// Computes the final on-CDN "art code" (the strippedIdentifier plus
+// whatever suffix/transform `side` implies) mirroring the exact per-side
+// rules the real web client's cardArt.ts/cardImages.ts apply. Returns
+// std::nullopt when `side` is structurally inapplicable to this specific
+// identifier's shape -- this is NOT a grammar violation, just "no art
+// code is resolvable for this transform" (mirrors altFrontImage()
+// returning null in cardArt.ts for exactly this case).
+std::optional<QString> resolveArtCodeForSide(AssetSide side,
+                                             const QString &strippedIdentifier,
+                                             const QString &mutationId) {
+  switch (side) {
+  case AssetSide::Front:
+    return strippedIdentifier;
+  case AssetSide::Back:
+    return strippedIdentifier + u'b';
+  case AssetSide::AlternateFront:
+    // altFrontImage(): `src.replace(/(\d)\.avif$/, '$1a.avif')` -- only
+    // ever produces a candidate when the base code ends in a digit.
+    if (strippedIdentifier.isEmpty() || !strippedIdentifier.back().isDigit()) {
+      return std::nullopt;
+    }
+    return strippedIdentifier + u'a';
+  case AssetSide::ResolvedFront:
+    return resolvedSideArtCode(strippedIdentifier);
+  case AssetSide::MutatedFront:
+    return strippedIdentifier + u'_' + mutationId;
+  }
+  Q_UNREACHABLE_RETURN(std::nullopt);
+}
+
+// Category-specific canonical path segment, ported from the real web
+// client's routing scheme (see this file's header comment for the exact
+// source citation). `localeDir` is the mapped web-locale directory
+// segment (e.g. "ita"), or empty for the English/default candidate.
+// Every path is rooted under "img/arkham/", matching imgsrc() in
+// helpers.ts -- the current code's historical omission of this prefix was
+// the primary cause of every category resolving to the wrong CDN route.
+QString buildRelativePath(const AssetKey &key, const QString &artCode,
+                          const QString &localeDir) {
+  const QString ext =
+      assetFormatExtension(AssetLocator::canonicalFormatFor(key.category));
   const QString localePrefix =
       localeDir.isEmpty() ? QString() : localeDir + u'/';
 
-  switch (category) {
+  switch (key.category) {
   case AssetCategory::Card:
-    return localePrefix + "cards/"_L1 + identifier + cardSideSuffix(side) +
-           u'.' + ext;
+    return "img/arkham/"_L1 + localePrefix + "cards/"_L1 + artCode + u'.' + ext;
   case AssetCategory::HomebrewCard:
-    return localePrefix + "homebrew/cards/"_L1 + identifier +
-           cardSideSuffix(side) + u'.' + ext;
+    // homebrew/{campaignNamespace}/cards/{code}.avif -- see cardImgPath()
+    // in helpers.ts matching `/^:(.+):(\d+[a-z]*)$/` and building
+    // `homebrew/{campaign}/cards/{cardCode}.avif`.
+    return "img/arkham/"_L1 + localePrefix + "homebrew/"_L1 +
+           key.homebrewNamespace + "/cards/"_L1 + artCode + u'.' + ext;
   case AssetCategory::InvestigatorPortrait:
-    return "investigators/"_L1 + identifier + u'.' + ext;
+    // portraitImage() in cardImages.ts: root is "portraits/", not
+    // "investigators/".
+    return "img/arkham/portraits/"_L1 + artCode + u'.' + ext;
   case AssetCategory::ChaosToken:
-    return "chaos-tokens/"_L1 + identifier + u'.' + ext;
+    // ChaosToken.ts bakes a literal "ct-" prefix onto the token name.
+    return "img/arkham/chaos-tokens/ct-"_L1 + artCode + u'.' + ext;
   case AssetCategory::SetIcon:
-    return "sets/"_L1 + identifier + u'.' + ext;
+    return "img/arkham/sets/"_L1 + artCode + u'.' + ext;
   case AssetCategory::CampaignBox:
-    return "campaigns/"_L1 + identifier + u'.' + ext;
+    // campaignBoxSrc() in ChooseMode.vue: root is "boxes/", not
+    // "campaigns/".
+    return "img/arkham/boxes/"_L1 + artCode + u'.' + ext;
   case AssetCategory::SlotIcon:
-    return "slots/"_L1 + identifier + u'.' + ext;
+    return "img/arkham/slots/"_L1 + artCode + u'.' + ext;
   case AssetCategory::HomebrewSet:
-    return "homebrew/sets/"_L1 + identifier + u'.' + ext;
+    // homebrewSetImagePath() in Cards.vue: the SAME identifier is used as
+    // both the per-homebrew directory and the file name.
+    return "img/arkham/homebrew/"_L1 + artCode + "/sets/"_L1 + artCode + u'.' +
+           ext;
   case AssetCategory::HomebrewBox:
-    return "homebrew/boxes/"_L1 + identifier + u'.' + ext;
+    // ChooseMode.vue homebrew branch: same identifier used twice, as
+    // above.
+    return "img/arkham/homebrew/"_L1 + artCode + "/boxes/"_L1 + artCode + u'.' +
+           ext;
   }
   Q_UNREACHABLE_RETURN(QString());
 }
@@ -142,22 +244,46 @@ qsizetype identifierMaxLengthFor(AssetCategory category) {
 
 } // namespace
 
-QUrl AssetLocator::defaultAssetBase() {
-  return QUrl(QStringLiteral("https://assets.arkhamhorror.app"));
+AssetOutcome<ValidatedAssetSource> AssetLocator::defaultAssetBase() {
+  return ValidatedAssetSource::fromRaw(
+      QStringLiteral("https://assets.arkhamhorror.app"));
+}
+
+AssetFormat AssetLocator::canonicalFormatFor(AssetCategory category) {
+  switch (category) {
+  case AssetCategory::Card:
+  case AssetCategory::HomebrewCard:
+    return AssetFormat::Avif;
+  case AssetCategory::InvestigatorPortrait:
+  case AssetCategory::CampaignBox:
+  case AssetCategory::HomebrewBox:
+    return AssetFormat::Jpeg;
+  case AssetCategory::ChaosToken:
+  case AssetCategory::SetIcon:
+  case AssetCategory::SlotIcon:
+  case AssetCategory::HomebrewSet:
+    return AssetFormat::Png;
+  }
+  Q_UNREACHABLE_RETURN(AssetFormat::Jpeg);
 }
 
 AssetOutcome<QVector<AssetCandidate>>
 AssetLocator::resolveCandidates(const AssetKey &key) {
-  const UrlValidationResult baseValidation =
-      validateCustomUrl(key.assetBase.toString(QUrl::FullyEncoded));
-  if (!baseValidation) {
+  // key.assetBase can only ever be genuinely valid if it was produced by
+  // ValidatedAssetSource::fromRaw() against the caller's original raw
+  // input (see AssetTypes.h) -- there is no QUrl round-trip left here to
+  // "re-validate" defensively, because there is no way to construct a
+  // valid instance that bypassed that policy in the first place. A
+  // default-constructed (never-populated) assetBase fails isValid() and
+  // is rejected exactly like any other invalid base.
+  if (!key.assetBase.isValid()) {
     return AssetError{
         AssetErrorCode::InvalidAssetBase,
-        QStringLiteral("asset base URL failed validation: %1")
-            .arg(baseValidation.error().message),
+        QStringLiteral("asset base was never validated via "
+                       "ValidatedAssetSource::fromRaw()"),
     };
   }
-  const QUrl normalizedBase = *baseValidation;
+  const QUrl &normalizedBase = key.assetBase.normalizedUrl();
 
   if (!isValidIdentifier(key.identifier,
                          identifierMaxLengthFor(key.category))) {
@@ -177,13 +303,75 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
     };
   }
 
+  const bool wantsHomebrewNamespace =
+      key.category == AssetCategory::HomebrewCard;
+  if (wantsHomebrewNamespace) {
+    if (!isValidIdentifier(key.homebrewNamespace,
+                           kHomebrewIdentifierMaxLength)) {
+      return AssetError{
+          AssetErrorCode::InvalidHomebrewNamespace,
+          QStringLiteral("HomebrewCard requires a valid homebrewNamespace"),
+      };
+    }
+  } else if (!key.homebrewNamespace.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidHomebrewNamespace,
+        QStringLiteral("homebrewNamespace must be empty for this category"),
+    };
+  }
+
+  const bool wantsMutationId = key.side == AssetSide::MutatedFront;
+  if (wantsMutationId) {
+    if (!isValidIdentifier(key.mutationId, kOfficialIdentifierMaxLength)) {
+      return AssetError{
+          AssetErrorCode::InvalidMutationId,
+          QStringLiteral("MutatedFront requires a valid mutationId"),
+      };
+    }
+  } else if (!key.mutationId.isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidMutationId,
+        QStringLiteral("mutationId must be empty unless side is "
+                       "MutatedFront"),
+    };
+  }
+
+  if (key.format != canonicalFormatFor(key.category)) {
+    return AssetError{
+        AssetErrorCode::FormatMismatchForCategory,
+        QStringLiteral("this category is always served as %1, not the "
+                       "declared format")
+            .arg(assetFormatExtension(
+                AssetLocator::canonicalFormatFor(key.category))),
+    };
+  }
+
+  const QString strippedIdentifier =
+      categoryStripsLeadingCardCodePrefix(key.category)
+          ? stripLeadingCardCodePrefix(key.identifier)
+          : key.identifier;
+
+  // A direct (non-auto-derived) request for a side that is structurally
+  // inapplicable to this specific identifier's shape (currently only
+  // AlternateFront on an identifier not ending in a digit) has no
+  // candidate at all to offer -- unlike the auto-derived alternate-front
+  // fallback below, which simply omits itself silently in that case.
+  const std::optional<QString> directArtCode =
+      resolveArtCodeForSide(key.side, strippedIdentifier, key.mutationId);
+  if (!directArtCode.has_value()) {
+    return AssetError{
+        AssetErrorCode::InvalidSideForIdentifier,
+        QStringLiteral("the requested side has no valid art code for this "
+                       "identifier"),
+    };
+  }
+
   QVector<AssetCandidate> candidates;
   QSet<QString> seenUrls;
 
   auto tryAppend = [&](const QString &localeDir, const QString &isoLocale,
-                       AssetSide side, bool isAlternateFrontFallback) {
-    const QString relativePath = buildRelativePath(key.category, key.identifier,
-                                                   side, localeDir, key.format);
+                       const QString &artCode, bool isAlternateFrontFallback) {
+    const QString relativePath = buildRelativePath(key, artCode, localeDir);
     const QUrl url = joinBaseAndPath(normalizedBase, relativePath);
     const QString urlString = url.toString(QUrl::FullyEncoded);
     if (seenUrls.contains(urlString)) {
@@ -196,22 +384,30 @@ AssetLocator::resolveCandidates(const AssetKey &key) {
   // 1. Localized candidate, but ONLY if the digest confirms it exists.
   // Skipping here (rather than issuing a network request and relying on a
   // 404) keeps resolution pure/deterministic and avoids a request this
-  // client already knows will fail.
+  // client already knows will fail. The digest is keyed by the same
+  // leading-c-stripped identifier the real path uses.
   if (localizable && !key.locale.isEmpty() && key.locale != "en"_L1) {
     const QString webLocale = AssetLocaleDigest::webLocaleFor(key.locale);
     if (!webLocale.isEmpty() &&
         AssetLocaleDigest::hasLocalizedVariant(webLocale, key.category,
-                                               key.identifier, key.side)) {
-      tryAppend(webLocale, key.locale, key.side, false);
+                                               strippedIdentifier, key.side)) {
+      tryAppend(webLocale, key.locale, *directArtCode, false);
     }
   }
 
   // 2. English/default candidate: always present.
-  tryAppend(QString(), QString(), key.side, false);
+  tryAppend(QString(), QString(), *directArtCode, false);
 
-  // 3. Alternate-front fallback: only for a plain Front card request.
+  // 3. Alternate-front fallback: only for a plain Front card request, and
+  // only when the identifier's shape actually supports one (see
+  // resolveArtCodeForSide()'s AlternateFront case) -- silently omitted,
+  // not an error, exactly mirroring altFrontImage() returning null.
   if (localizable && key.side == AssetSide::Front) {
-    tryAppend(QString(), QString(), AssetSide::AlternateFront, true);
+    const std::optional<QString> altArtCode = resolveArtCodeForSide(
+        AssetSide::AlternateFront, strippedIdentifier, key.mutationId);
+    if (altArtCode.has_value()) {
+      tryAppend(QString(), QString(), *altArtCode, true);
+    }
   }
 
   if (candidates.isEmpty()) {

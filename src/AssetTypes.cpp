@@ -1,8 +1,29 @@
 #include "AssetTypes.h"
 
+#include "UrlValidator.h"
+
 #include <QtAssert>
 
 namespace Arkham {
+
+AssetOutcome<ValidatedAssetSource>
+ValidatedAssetSource::fromRaw(const QString &rawInput) {
+  // Deliberately calls validateCustomUrl() with the caller's ORIGINAL raw
+  // string -- never a QUrl the caller may have already constructed -- so
+  // the raw-authority-only checks inside it (control characters before
+  // trimming, ambiguous loopback spellings, Unicode homoglyphs) still have
+  // the evidence they need. This is the exact same policy
+  // ServerProfile/NetworkAuthenticationClient use; asset bases never fork
+  // a weaker interpretation of it.
+  const UrlValidationResult validated = validateCustomUrl(rawInput);
+  if (!validated) {
+    return AssetError{
+        AssetErrorCode::InvalidAssetBase,
+        validated.error().message,
+    };
+  }
+  return ValidatedAssetSource(*validated);
+}
 
 QString assetFormatExtension(AssetFormat format) {
   switch (format) {

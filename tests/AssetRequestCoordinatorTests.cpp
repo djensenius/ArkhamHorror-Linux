@@ -36,11 +36,75 @@ QByteArray encodePng(int width, int height) {
   return bytes;
 }
 
-AssetKey makeKey(const QUrl &base,
-                 const QString &identifier = QStringLiteral("valid01")) {
+// A minimal, spec-valid ISOBMFF "ftyp" box whose major_brand is "avif":
+// enough for AssetNetworkFetcher's magic-byte sniffing to genuinely
+// identify these bytes as AVIF (see sniffMagicBytes() in
+// AssetNetworkFetcher.cpp), without needing a full, real, pixel-encoded
+// AVIF image. This is deliberately used only to exercise the pipeline up
+// to (and no further than) the Qt-codec-support gate: this build/CI
+// environment has no Qt AVIF decode plugin installed (see issue #17
+// review item 4, not yet implemented), so a genuine Card/HomebrewCard
+// fetch of real bytes is expected to end in AssetErrorCode::UnsupportedCodec
+// here, not a successful decode -- proving every earlier gate (correct
+// candidate URL requested, Content-Type match, magic-byte match) passed
+// for real AVIF-shaped bytes.
+QByteArray minimalAvifFtypBox() {
+  QByteArray bytes;
+  bytes.append(char(0));
+  bytes.append(char(0));
+  bytes.append(char(0));
+  bytes.append(char(16)); // box size = 16, big-endian
+  bytes.append("ftyp");
+  bytes.append("avif"); // major_brand
+  bytes.append(char(0));
+  bytes.append(char(0));
+  bytes.append(char(0));
+  bytes.append(char(0)); // minor_version = 0
+  return bytes;
+}
+
+// A real Card AssetKey (unlike makeKey()'s default SetIcon), for the two
+// alternate-front-fallback tests below, which exercise Card-only
+// candidate-list behaviour (see AssetLocator::resolveCandidates()'s
+// alternate-front fallback, only ever produced for Card/HomebrewCard).
+AssetKey makeCardKey(const QString &rawBase,
+                     const QString &identifier = QStringLiteral("valid01")) {
+  const AssetOutcome<ValidatedAssetSource> base =
+      ValidatedAssetSource::fromRaw(rawBase);
+  if (!base) {
+    qFatal("makeCardKey() fixture base URL failed validation: %s",
+           qPrintable(base.error().message));
+  }
   AssetKey key;
-  key.assetBase = base;
+  key.assetBase = *base;
   key.category = AssetCategory::Card;
+  key.identifier = identifier;
+  key.side = AssetSide::Front;
+  key.format = AssetFormat::Avif;
+  return key;
+}
+
+AssetKey makeKey(const QString &rawBase,
+                 const QString &identifier = QStringLiteral("valid01")) {
+  const AssetOutcome<ValidatedAssetSource> base =
+      ValidatedAssetSource::fromRaw(rawBase);
+  // Copilot review: Q_ASSERT compiles out in release builds, which would
+  // silently turn a fixture-encoding failure here into a confusing
+  // downstream test failure instead of a clear, immediate diagnosis.
+  // qFatal() is enforced in every build configuration.
+  if (!base) {
+    qFatal("makeKey() fixture base URL failed validation: %s",
+           qPrintable(base.error().message));
+  }
+  AssetKey key;
+  key.assetBase = *base;
+  // SetIcon (not Card) so this file's PNG-encoded fixtures match the
+  // real, category-fixed format AssetLocator now enforces (Card is
+  // always AVIF; see AssetLocator::canonicalFormatFor()) -- this suite
+  // exercises AssetRequestCoordinator's cache/coalescing/fallback-status
+  // logic, which (aside from the two alternate-front-fallback tests
+  // below, which need real Card semantics) is category-agnostic.
+  key.category = AssetCategory::SetIcon;
   key.identifier = identifier;
   key.side = AssetSide::Front;
   key.format = AssetFormat::Png;
@@ -67,7 +131,7 @@ void AssetRequestCoordinatorTests::coalescesConcurrentIdenticalRequests() {
   response.slowDrip = true; // slow enough that both requests overlap in flight
   response.chunkSize = 32;
   response.chunkDelayMs = 20;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -77,7 +141,7 @@ void AssetRequestCoordinatorTests::coalescesConcurrentIdenticalRequests() {
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
 
   int completions = 0;
   std::optional<Result> resultA;
@@ -98,7 +162,8 @@ void AssetRequestCoordinatorTests::coalescesConcurrentIdenticalRequests() {
 
   QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
 
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
   QVERIFY(resultA.has_value());
   QVERIFY(resultB.has_value());
   QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
@@ -108,16 +173,17 @@ void AssetRequestCoordinatorTests::coalescesConcurrentIdenticalRequests() {
 
 void AssetRequestCoordinatorTests::
     keysDifferingOnlyByAssetBaseTrailingSlashStillCoalesce() {
-  // Regression test: AssetLocator::resolveCandidates() validates AND
-  // normalises assetBase via UrlValidator::validateCustomUrl() on every
-  // call, which strips a trailing slash -- so an assetBase with a
-  // trailing slash and one without resolve to IDENTICAL candidate URLs
-  // (and therefore identical cache keys). The operation-key identity used
-  // for coalescing must track that same normalised identity: two
-  // concurrent requests differing only by assetBase's trailing slash
-  // are, after normalisation, requests for the exact same resource, and
-  // must coalesce onto a single in-flight operation rather than issuing
-  // two redundant concurrent network fetches.
+  // Regression test: ValidatedAssetSource::fromRaw() runs
+  // UrlValidator::validateCustomUrl() once, at construction, which strips
+  // a trailing slash -- so a raw assetBase string with a trailing slash
+  // and one without produce genuinely EQUAL ValidatedAssetSource values
+  // (same normalised QUrl), not merely two different-looking-but-
+  // equivalent values that some separate coalescing step has to know to
+  // treat as the same. This is a strictly stronger guarantee than the
+  // historical raw-QUrl field ever provided (where such a pair was NOT
+  // operator==-equal and coalescing had to re-normalise independently):
+  // by construction, there is no way to end up with two AssetKey values
+  // that resolve to the same candidate URL yet compare unequal.
   MockHttpServer server;
   MockHttpServer::Response response;
   response.contentType = "image/png";
@@ -125,7 +191,7 @@ void AssetRequestCoordinatorTests::
   response.slowDrip = true; // both requests must overlap in flight
   response.chunkSize = 32;
   response.chunkDelayMs = 20;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -135,17 +201,22 @@ void AssetRequestCoordinatorTests::
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   AssetKey keyA =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
 
+  const AssetOutcome<ValidatedAssetSource> trailingSlashBase =
+      ValidatedAssetSource::fromRaw(
+          QStringLiteral("http://127.0.0.1:%1/").arg(server.port()));
+  QVERIFY2(bool(trailingSlashBase),
+           qPrintable(trailingSlashBase.error().message));
   AssetKey keyB = keyA;
-  keyB.assetBase =
-      QUrl(QStringLiteral("http://127.0.0.1:%1/").arg(server.port()));
+  keyB.assetBase = *trailingSlashBase;
 
-  // The two AssetKey values are NOT operator==-equal (assetBase differs
-  // as a raw QUrl), yet they must still coalesce onto one operation --
-  // confirming that coalescing tracks NORMALISED identity, not raw
-  // operator== equality.
-  QVERIFY(!(keyA == keyB));
+  // The two AssetKey values ARE operator==-equal: ValidatedAssetSource
+  // normalises at construction, so two raw strings that differ only by a
+  // trailing slash produce the identical normalised QUrl. They coalesce
+  // onto one operation for the ordinary reason any two equal AssetKey
+  // values would.
+  QVERIFY(keyA == keyB);
 
   int completions = 0;
   std::optional<Result> resultA;
@@ -163,7 +234,8 @@ void AssetRequestCoordinatorTests::
 
   QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
 
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
   QVERIFY(resultA.has_value());
   QVERIFY(resultB.has_value());
   QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
@@ -208,7 +280,7 @@ void AssetRequestCoordinatorTests::
   response.slowDrip = true; // both requests must overlap in flight
   response.chunkSize = 32;
   response.chunkDelayMs = 20;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -218,7 +290,7 @@ void AssetRequestCoordinatorTests::
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   AssetKey keyA =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   keyA.locale = QStringLiteral("de");
 
   AssetKey keyB = keyA;
@@ -270,7 +342,7 @@ void AssetRequestCoordinatorTests::cancellingOneConsumerNeverAffectsAnother() {
   response.slowDrip = true;
   response.chunkSize = 32;
   response.chunkDelayMs = 20;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -280,7 +352,7 @@ void AssetRequestCoordinatorTests::cancellingOneConsumerNeverAffectsAnother() {
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
 
   std::optional<Result> cancelledResult;
   std::optional<Result> survivorResult;
@@ -311,7 +383,7 @@ void AssetRequestCoordinatorTests::
   response.slowDrip = true;
   response.chunkSize = 16;
   response.chunkDelayMs = 30;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -321,7 +393,7 @@ void AssetRequestCoordinatorTests::
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
 
   std::optional<Result> result;
   const auto handle =
@@ -336,7 +408,7 @@ void AssetRequestCoordinatorTests::
   QVERIFY(QTest::qWaitFor(
       [&]() {
         return server.lastBytesWrittenForSlowDrip(
-                   QStringLiteral("/cards/valid01.png")) >= 0;
+                   QStringLiteral("/img/arkham/sets/valid01.png")) >= 0;
       },
       5000));
 
@@ -348,8 +420,8 @@ void AssetRequestCoordinatorTests::
 
   // Give the server's writer a moment to notice the disconnect.
   QTest::qWait(80);
-  const qint64 flushed =
-      server.lastBytesWrittenForSlowDrip(QStringLiteral("/cards/valid01.png"));
+  const qint64 flushed = server.lastBytesWrittenForSlowDrip(
+      QStringLiteral("/img/arkham/sets/valid01.png"));
   QVERIFY(flushed >= 0);
   QVERIFY2(flushed < response.body.size(),
            qPrintable(QStringLiteral("flushed=%1 total=%2")
@@ -362,12 +434,14 @@ void AssetRequestCoordinatorTests::advancesToNextCandidateOnlyOnNotFound() {
   MockHttpServer::Response notFound;
   notFound.status = 404;
   notFound.reasonPhrase = "Not Found";
-  server.setResponse(QStringLiteral("/cards/valid01.png"), notFound);
+  server.setResponse(QStringLiteral("/img/arkham/cards/valid01.avif"),
+                     notFound);
 
   MockHttpServer::Response altFront;
-  altFront.contentType = "image/png";
-  altFront.body = encodePng(4, 4);
-  server.setResponse(QStringLiteral("/cards/valid01a.png"), altFront);
+  altFront.contentType = "image/avif";
+  altFront.body = minimalAvifFtypBox();
+  server.setResponse(QStringLiteral("/img/arkham/cards/valid01a.avif"),
+                     altFront);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -377,14 +451,29 @@ void AssetRequestCoordinatorTests::advancesToNextCandidateOnlyOnNotFound() {
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   std::optional<Result> result;
   coordinator.request(key, [&](Result r) { result = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
 
-  QVERIFY2(bool(*result), qPrintable(result->error().message));
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01a.png")), 1);
+  // No Qt AVIF decode plugin is installed in this build/CI environment
+  // (see issue #17 review item 4, not yet implemented): the FINAL typed
+  // outcome for genuinely AVIF-shaped bytes is UnsupportedCodec, not a
+  // successful decode. That is expected and, combined with the two
+  // requestCount assertions below, still fully proves the fallback
+  // mechanism itself: the coordinator correctly advanced past the
+  // English candidate's definitive 404 to the alternate-front candidate,
+  // requested exactly the right URL there, and got far enough into
+  // validating that response (past Content-Type and magic-byte checks)
+  // to reach the codec-support gate -- it did not stop early, retry the
+  // same candidate, or skip straight past validation.
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::UnsupportedCodec);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/cards/valid01.avif")), 1);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/cards/valid01a.avif")),
+      1);
 }
 
 void AssetRequestCoordinatorTests::nonNotFoundErrorNeverAdvancesCandidate() {
@@ -392,10 +481,12 @@ void AssetRequestCoordinatorTests::nonNotFoundErrorNeverAdvancesCandidate() {
   MockHttpServer::Response serverError;
   serverError.status = 500;
   serverError.reasonPhrase = "Internal Server Error";
-  server.setResponse(QStringLiteral("/cards/valid01.png"), serverError);
-  // Deliberately leave "/cards/valid01a.png" unregistered: if the
-  // coordinator ever (incorrectly) advanced to it, the default 200-empty
-  // response would be served, which we can detect via requestCount.
+  server.setResponse(QStringLiteral("/img/arkham/cards/valid01.avif"),
+                     serverError);
+  // Deliberately leave "/img/arkham/cards/valid01a.avif" unregistered: if
+  // the coordinator ever (incorrectly) advanced to it, the default
+  // 200-empty response would be served, which we can detect via
+  // requestCount.
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -405,14 +496,16 @@ void AssetRequestCoordinatorTests::nonNotFoundErrorNeverAdvancesCandidate() {
   AssetRequestCoordinator coordinator(cache, fetcher);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeCardKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   std::optional<Result> result;
   coordinator.request(key, [&](Result r) { result = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
 
   QVERIFY(!bool(*result));
   QCOMPARE(result->error().code, AssetErrorCode::UnexpectedStatus);
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01a.png")), 0);
+  QCOMPARE(
+      server.requestCount(QStringLiteral("/img/arkham/cards/valid01a.avif")),
+      0);
 }
 
 void AssetRequestCoordinatorTests::cacheHitShortCircuitsNetworkEntirely() {
@@ -429,7 +522,7 @@ void AssetRequestCoordinatorTests::cacheHitShortCircuitsNetworkEntirely() {
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -452,7 +545,8 @@ void AssetRequestCoordinatorTests::cacheHitShortCircuitsNetworkEntirely() {
   QVERIFY2(bool(*result), qPrintable(result->error().message));
   QCOMPARE((**result).encodedBytes, preSeeded.encodedBytes);
   QVERIFY(!(**result).decodedImage.isNull());
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 0);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           0);
 }
 
 void AssetRequestCoordinatorTests::destructionNeverInvokesStaleCallback() {
@@ -463,7 +557,7 @@ void AssetRequestCoordinatorTests::destructionNeverInvokesStaleCallback() {
   response.slowDrip = true;
   response.chunkSize = 16;
   response.chunkDelayMs = 100;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -473,7 +567,7 @@ void AssetRequestCoordinatorTests::destructionNeverInvokesStaleCallback() {
 
   bool callbackFired = false;
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   {
     AssetRequestCoordinator coordinator(cache, fetcher);
     coordinator.request(key,
@@ -502,7 +596,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -563,7 +657,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -610,7 +704,7 @@ void AssetRequestCoordinatorTests::
   response.contentType = "image/png";
   response.body = encodePng(32, 32); // must never be served to the caller
   response.etagForConditionalMatch = "\"stale-etag\"";
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -619,7 +713,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -643,10 +737,12 @@ void AssetRequestCoordinatorTests::
   QVERIFY2(bool(*result), qPrintable(result->error().message));
   QCOMPARE((**result).encodedBytes, preSeeded.encodedBytes);
   QVERIFY(!(**result).decodedImage.isNull());
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
-  QCOMPARE(server.lastRequestHeaders(QStringLiteral("/cards/valid01.png"))
-               .value("if-none-match"),
-           QByteArrayLiteral("\"stale-etag\""));
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+  QCOMPARE(
+      server.lastRequestHeaders(QStringLiteral("/img/arkham/sets/valid01.png"))
+          .value("if-none-match"),
+      QByteArrayLiteral("\"stale-etag\""));
 }
 
 void AssetRequestCoordinatorTests::
@@ -664,7 +760,7 @@ void AssetRequestCoordinatorTests::
   response.body = encodePng(32, 32); // must never be served to the caller
   response.etagForConditionalMatch = "\"stale-etag\"";
   response.etagOn304Override = "\"refreshed-etag\"";
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -673,7 +769,7 @@ void AssetRequestCoordinatorTests::
   AssetCache seedCache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -694,9 +790,11 @@ void AssetRequestCoordinatorTests::
     coordinator.request(key, [&](Result r) { result = std::move(r); });
     QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
     QVERIFY2(bool(*result), qPrintable(result->error().message));
-    QCOMPARE(server.lastRequestHeaders(QStringLiteral("/cards/valid01.png"))
-                 .value("if-none-match"),
-             QByteArrayLiteral("\"stale-etag\""));
+    QCOMPARE(
+        server
+            .lastRequestHeaders(QStringLiteral("/img/arkham/sets/valid01.png"))
+            .value("if-none-match"),
+        QByteArrayLiteral("\"stale-etag\""));
   }
 
   // Restart #2 (another fresh AssetCache reading only from disk, after
@@ -712,9 +810,11 @@ void AssetRequestCoordinatorTests::
     coordinator.request(key, [&](Result r) { result = std::move(r); });
     QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
     QVERIFY2(bool(*result), qPrintable(result->error().message));
-    QCOMPARE(server.lastRequestHeaders(QStringLiteral("/cards/valid01.png"))
-                 .value("if-none-match"),
-             QByteArrayLiteral("\"refreshed-etag\""));
+    QCOMPARE(
+        server
+            .lastRequestHeaders(QStringLiteral("/img/arkham/sets/valid01.png"))
+            .value("if-none-match"),
+        QByteArrayLiteral("\"refreshed-etag\""));
   }
 }
 
@@ -735,7 +835,7 @@ void AssetRequestCoordinatorTests::
   response.contentType = "image/png";
   response.body = encodePng(32, 32); // must never be served to the caller
   response.etagForConditionalMatch = "\"stale-etag\"";
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -744,7 +844,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -765,7 +865,8 @@ void AssetRequestCoordinatorTests::
   coordinator.request(key, [&](Result r) { firstResult = std::move(r); });
   QVERIFY(QTest::qWaitFor([&]() { return firstResult.has_value(); }, 5000));
   QVERIFY2(bool(*firstResult), qPrintable(firstResult->error().message));
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
 
   // The entry must now be memory-resident, with a decoded image, purely
   // from the 304 confirmation above -- no second request() call needed to
@@ -783,7 +884,8 @@ void AssetRequestCoordinatorTests::
   QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 5000));
   QVERIFY2(bool(*secondResult), qPrintable(secondResult->error().message));
   QVERIFY(!(**secondResult).decodedImage.isNull());
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
 }
 
 void AssetRequestCoordinatorTests::
@@ -794,7 +896,7 @@ void AssetRequestCoordinatorTests::
   response.body = encodePng(32, 32);
   // No etagForConditionalMatch configured: the origin's content genuinely
   // changed, so it answers the conditional GET with a full fresh 200.
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -803,7 +905,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -824,7 +926,8 @@ void AssetRequestCoordinatorTests::
   QVERIFY2(bool(*result), qPrintable(result->error().message));
   QVERIFY((**result).encodedBytes !=
           QByteArrayLiteral("old-bytes-now-outdated"));
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
 
   // The cache must actually be updated with the fresh content, not just
   // the in-memory result returned to this one caller.
@@ -839,7 +942,7 @@ void AssetRequestCoordinatorTests::
   MockHttpServer::Response response;
   response.status = 404;
   response.reasonPhrase = "Not Found";
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -848,7 +951,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -898,7 +1001,7 @@ void AssetRequestCoordinatorTests::
   response.slowDrip = true;
   response.chunkSize = 32;
   response.chunkDelayMs = 20;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -907,7 +1010,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -943,7 +1046,8 @@ void AssetRequestCoordinatorTests::
 
   QVERIFY(QTest::qWaitFor([&]() { return completions == 2; }, 5000));
 
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
   QVERIFY(resultA.has_value());
   QVERIFY(resultB.has_value());
   QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
@@ -977,7 +1081,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
@@ -1008,7 +1112,8 @@ void AssetRequestCoordinatorTests::
            "a successful disk-hit result must never carry a null "
            "decodedImage");
   QCOMPARE((**result).decodedImage.size(), QSize(6, 6));
-  QCOMPARE(server.requestCount(QStringLiteral("/cards/valid01.png")), 0);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           0);
 
   // The decoded image must also have been published back into the memory
   // cache, so a subsequent lookupMemory() hit is already decoded.
@@ -1036,7 +1141,7 @@ void AssetRequestCoordinatorTests::
   AssetCache cache(cacheConfig);
 
   const AssetKey key =
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
   const auto candidates = AssetLocator::resolveCandidates(key);
   QVERIFY(bool(candidates));
   const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);

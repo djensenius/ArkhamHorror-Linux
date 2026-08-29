@@ -12,13 +12,15 @@ namespace Arkham {
 // state; every call is a deterministic function of its input plus the
 // compiled-in AssetLocaleDigest lookup table.
 //
-// Base-URL policy is never re-implemented here: every call re-validates
-// `key.assetBase` against UrlValidator::validateCustomUrl() -- the exact
+// Base-URL policy is never re-implemented here: AssetKey::assetBase can
+// only ever be a genuinely valid ValidatedAssetSource if it was produced
+// by ValidatedAssetSource::fromRaw() against the caller's original raw
+// input string, which runs UrlValidator::validateCustomUrl() -- the exact
 // same policy ServerProfile/NetworkAuthenticationClient use -- rather than
-// forking a weaker, asset-only interpretation. A base URL that fails that
-// validation (wrong scheme, credentials embedded, control characters,
-// etc.) yields AssetErrorCode::InvalidAssetBase before any candidate is
-// built.
+// forking a weaker, asset-only interpretation. A base that is not valid
+// (default-constructed, or the caller's fromRaw() call itself failed and
+// they proceeded anyway) yields AssetErrorCode::InvalidAssetBase before
+// any candidate is built.
 //
 // Per-category identifier grammar is intentionally an allow-list: only
 // ASCII lowercase letters, digits, '-', and '_' are ever accepted, and the
@@ -34,8 +36,17 @@ namespace AssetLocator {
 
 // Returns the default asset base (https://assets.arkhamhorror.app),
 // suitable for AssetKey::assetBase when no site-settings override is
-// injected.
-[[nodiscard]] QUrl defaultAssetBase();
+// injected. Always succeeds: the compiled-in literal is a known-good,
+// pinned constant, never user input.
+[[nodiscard]] AssetOutcome<ValidatedAssetSource> defaultAssetBase();
+
+// The single, caller-non-configurable image format the real asset host
+// serves for `category` (e.g. always AVIF for card art, never
+// caller-selectable). AssetLocator::resolveCandidates() rejects any key
+// whose declared AssetKey::format does not match this with
+// AssetErrorCode::FormatMismatchForCategory rather than silently
+// overriding it.
+[[nodiscard]] AssetFormat canonicalFormatFor(AssetCategory category);
 
 // Validates `key` and resolves it to an ordered candidate list: an
 // optional localized candidate (only when the digest confirms one

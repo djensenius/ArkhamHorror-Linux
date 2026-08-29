@@ -1,7 +1,6 @@
 #include "AssetRequestCoordinator.h"
 
 #include "AssetLocator.h"
-#include "UrlValidator.h"
 
 #include <QMetaObject>
 #include <QPointer>
@@ -29,29 +28,19 @@ QString lengthPrefixed(const QString &field) {
   return QString::number(field.size()) + u':' + field;
 }
 
-// AssetLocator::resolveCandidates() validates AND normalises key.assetBase
-// via UrlValidator::validateCustomUrl() on every call (stripping a
-// trailing slash, treating a bare "/" path as no path at all) before
-// building any candidate URL from it -- so two AssetKey values whose
-// assetBase differs ONLY by a trailing slash always resolve to identical
-// candidate URLs and cache keys. Applying that SAME normalisation here
-// (rather than key.assetBase.toString() verbatim) keeps the operation-key
-// identity used for coalescing aligned with the identity that actually
-// governs cache/network behaviour, so such a pair of requests coalesces
-// into one in-flight operation instead of two redundant concurrent
-// fetches for what is, after normalisation, the exact same resource. A
-// base that fails validation is passed through unnormalised: resolving
-// candidates for it will fail independently with a typed
-// AssetErrorCode::InvalidAssetBase, and every operation sharing that same
-// invalid raw string still coalesces onto the same (doomed) operation key
-// as before.
-QString canonicalizedAssetBase(const QUrl &assetBase) {
-  const QString raw = assetBase.toString(QUrl::FullyEncoded);
-  const UrlValidationResult validated = validateCustomUrl(raw);
-  if (!validated) {
-    return raw;
+// ValidatedAssetSource::fromRaw() already performed the one-and-only
+// normalisation this base URL will ever receive (see AssetTypes.h/.cpp) --
+// there is no separate re-normalisation step left to duplicate here, and
+// no raw string left to fall back to for an invalid base: an
+// AssetKey::assetBase that is not isValid() carries no useful distinguishing
+// information anyway (AssetLocator::resolveCandidates() rejects it
+// identically regardless of how it became invalid), so every such
+// operation deliberately coalesces onto the same fixed sentinel string.
+QString canonicalizedAssetBase(const ValidatedAssetSource &assetBase) {
+  if (!assetBase.isValid()) {
+    return QStringLiteral("<invalid>");
   }
-  return validated->toString(QUrl::FullyEncoded);
+  return assetBase.normalizedUrl().toString(QUrl::FullyEncoded);
 }
 
 QString canonicalOperationKey(const AssetKey &key) {
@@ -59,7 +48,8 @@ QString canonicalOperationKey(const AssetKey &key) {
          lengthPrefixed(QString::number(static_cast<int>(key.category))) +
          lengthPrefixed(key.identifier) +
          lengthPrefixed(QString::number(static_cast<int>(key.side))) +
-         lengthPrefixed(key.locale) +
+         lengthPrefixed(key.locale) + lengthPrefixed(key.homebrewNamespace) +
+         lengthPrefixed(key.mutationId) +
          lengthPrefixed(QString::number(static_cast<int>(key.format)));
 }
 

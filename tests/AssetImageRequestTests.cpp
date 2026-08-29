@@ -34,11 +34,26 @@ QByteArray encodePng(int width, int height) {
   return bytes;
 }
 
-AssetKey makeKey(const QUrl &base,
+AssetKey makeKey(const QString &rawBase,
                  const QString &identifier = QStringLiteral("valid01")) {
+  const AssetOutcome<ValidatedAssetSource> base =
+      ValidatedAssetSource::fromRaw(rawBase);
+  // Copilot review: Q_ASSERT compiles out in release builds, which would
+  // silently turn a fixture-encoding failure here into a confusing
+  // downstream test failure instead of a clear, immediate diagnosis.
+  // qFatal() is enforced in every build configuration.
+  if (!base) {
+    qFatal("makeKey() fixture base URL failed validation: %s",
+           qPrintable(base.error().message));
+  }
   AssetKey key;
-  key.assetBase = base;
-  key.category = AssetCategory::Card;
+  key.assetBase = *base;
+  // SetIcon (not Card) so this file's PNG-encoded fixtures match the
+  // real, category-fixed format AssetLocator now enforces (Card is
+  // always AVIF; see AssetLocator::canonicalFormatFor()) -- this suite
+  // exercises AssetImageRequest's lifecycle/state machine, which is
+  // category-agnostic, not card-art-specific path shape.
+  key.category = AssetCategory::SetIcon;
   key.identifier = identifier;
   key.side = AssetSide::Front;
   key.format = AssetFormat::Png;
@@ -60,7 +75,7 @@ void AssetImageRequestTests::successfulLoadTransitionsIdleLoadingReady() {
   MockHttpServer::Response response;
   response.contentType = "image/png";
   response.body = encodePng(16, 16);
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -76,7 +91,7 @@ void AssetImageRequestTests::successfulLoadTransitionsIdleLoadingReady() {
   QSignalSpy imageSpy(&request, &AssetImageRequest::imageChanged);
 
   request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
   QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
 
   QVERIFY(QTest::qWaitFor(
@@ -98,7 +113,7 @@ void AssetImageRequestTests::
   MockHttpServer::Response response;
   response.contentType = "image/png";
   response.body = encodePng(16, 16);
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -117,7 +132,7 @@ void AssetImageRequestTests::
   // text around it) at every state, including the terminal Ready state
   // where it must appear unchanged.
   request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))),
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
       callerDescription);
   QVERIFY(request.accessibleDescription().contains(callerDescription));
 
@@ -142,9 +157,8 @@ void AssetImageRequestTests::failedLoadTransitionsIdleLoadingError() {
   // "UPPER01" fails AssetLocator's identifier grammar synchronously
   // (before any network I/O), exercising the InvalidIdentifier -> Error
   // path.
-  request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
-              QStringLiteral("UPPER01")));
+  request.load(makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                       QStringLiteral("UPPER01")));
   QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
 
   QVERIFY(QTest::qWaitFor(
@@ -167,7 +181,7 @@ void AssetImageRequestTests::
   response.slowDrip = true;
   response.chunkSize = 16;
   response.chunkDelayMs = 60;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -178,7 +192,7 @@ void AssetImageRequestTests::
   AssetImageRequest request(coordinator);
 
   request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
   QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
 
   request.cancel();
@@ -207,7 +221,7 @@ void AssetImageRequestTests::destructionMidFlightNeverEmitsAfterDestruction() {
   response.slowDrip = true;
   response.chunkSize = 16;
   response.chunkDelayMs = 60;
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -218,8 +232,8 @@ void AssetImageRequestTests::destructionMidFlightNeverEmitsAfterDestruction() {
 
   {
     AssetImageRequest request(coordinator);
-    request.load(makeKey(
-        QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))));
+    request.load(
+        makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
     // request destroyed here, mid-flight -- must not crash and must not
     // touch any destroyed state when the underlying fetch eventually
     // completes/aborts.
@@ -250,7 +264,7 @@ void AssetImageRequestTests::
     // use-after-free: an invalid RequestHandle meant this object's
     // destructor could never suppress the queued delivery.
     request.load(
-        makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
+        makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
                 QStringLiteral("UPPER01")));
     // request destroyed here, before the event loop has run at all.
   }
@@ -265,7 +279,8 @@ void AssetImageRequestTests::
   MockHttpServer::Response firstResponse;
   firstResponse.contentType = "image/png";
   firstResponse.body = encodePng(16, 16);
-  server.setResponse(QStringLiteral("/cards/valid01.png"), firstResponse);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"),
+                     firstResponse);
 
   MockHttpServer::Response secondResponse;
   secondResponse.contentType = "image/png";
@@ -273,7 +288,8 @@ void AssetImageRequestTests::
   secondResponse.slowDrip = true;
   secondResponse.chunkSize = 16;
   secondResponse.chunkDelayMs = 60;
-  server.setResponse(QStringLiteral("/cards/valid02.png"), secondResponse);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid02.png"),
+                     secondResponse);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -284,7 +300,7 @@ void AssetImageRequestTests::
   AssetImageRequest request(coordinator);
 
   request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
   QVERIFY(QTest::qWaitFor(
       [&]() { return request.status() == AssetImageRequest::Status::Ready; },
       5000));
@@ -292,9 +308,8 @@ void AssetImageRequestTests::
 
   // Switch to a second, slow-to-arrive image: the FIRST image must not
   // still be visible while the second load is in its Loading phase.
-  request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
-              QStringLiteral("valid02")));
+  request.load(makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                       QStringLiteral("valid02")));
   QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
   QVERIFY(request.image().isNull());
 
@@ -310,7 +325,7 @@ void AssetImageRequestTests::
   MockHttpServer::Response response;
   response.contentType = "image/png";
   response.body = encodePng(16, 16);
-  server.setResponse(QStringLiteral("/cards/valid01.png"), response);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam);
@@ -323,9 +338,8 @@ void AssetImageRequestTests::
   // First load fails synchronously (before any network I/O): "UPPER01"
   // fails AssetLocator's identifier grammar, exercising the
   // InvalidIdentifier -> Error path and populating errorString/errorCode.
-  request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port())),
-              QStringLiteral("UPPER01")));
+  request.load(makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                       QStringLiteral("UPPER01")));
   QVERIFY(QTest::qWaitFor(
       [&]() { return request.status() == AssetImageRequest::Status::Error; },
       5000));
@@ -340,7 +354,7 @@ void AssetImageRequestTests::
   // never keep showing the first load's error throughout the second
   // load's Loading phase.
   request.load(
-      makeKey(QUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.port()))));
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
   QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
   QVERIFY(request.errorString().isEmpty());
   QCOMPARE(request.errorCode(), 0);
