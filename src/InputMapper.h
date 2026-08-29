@@ -99,8 +99,9 @@ public:
 
   // Binds |physicalKey| to |command|, replacing any existing binding for
   // that exact command (a command may only ever be bound to one physical
-  // key at a time) and evicting whatever command previously held
-  // |physicalKey|, if any.
+  // key at a time). This does *not* steal |physicalKey| away from a
+  // different command it may already be bound to -- see the rejection
+  // rule below -- it only ever moves |command| itself to a new key.
   //
   // Rejected (and the existing binding table is left completely
   // unchanged) when:

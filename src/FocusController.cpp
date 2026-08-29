@@ -159,9 +159,19 @@ bool FocusController::moveFocus(const FocusDirection direction) {
 }
 
 bool FocusController::cycleZone(const bool forward) {
+  // Determine which zones currently have at least one node with a
+  // single O(N) scan over nodes_ (collecting into a set), rather than
+  // calling nodesInZone() -- which itself scans *and* sorts all of
+  // nodes_ -- once per registered zone (that would be O(Z * N log N)
+  // just to find the active zones).
+  QSet<QString> zonesWithNodes;
+  zonesWithNodes.reserve(static_cast<qsizetype>(nodes_.size()));
+  for (auto it = nodes_.constBegin(); it != nodes_.constEnd(); ++it) {
+    zonesWithNodes.insert(it.value().zoneId);
+  }
   QVector<QString> activeZones;
   for (const QString &zoneId : zoneOrder_) {
-    if (!nodesInZone(zoneId).isEmpty()) {
+    if (zonesWithNodes.contains(zoneId)) {
       activeZones.push_back(zoneId);
     }
   }
