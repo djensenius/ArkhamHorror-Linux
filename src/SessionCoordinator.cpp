@@ -802,10 +802,17 @@ void SessionCoordinator::startFrontTokenOp(const QString &profileId) {
     // coordinator depends on it firing for an op that was never admitted
     // (the caller's own generation guard already treats this the same as
     // a stale/never-observed completion).
-    auto finishedOp = queueIt->dequeue();
+    queueIt->dequeue();
     const bool hasMore = !queueIt->isEmpty();
     if (queueIt->isEmpty()) {
       m_tokenQueues.erase(queueIt);
+      // Also drop this profile's dispatch-tracking entry: it was never
+      // marked in-flight on this path (the guard above returns before
+      // dispatch.inFlight is ever set true), so nothing depends on it
+      // surviving, and leaving a stale default-constructed entry behind
+      // in the map would be unbounded per-profile bookkeeping growth for
+      // no benefit.
+      m_tokenDispatch.remove(profileId);
     }
     if (hasMore) {
       startFrontTokenOp(profileId);
