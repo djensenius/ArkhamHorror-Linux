@@ -247,6 +247,30 @@ void AssetCacheTests::touchAfterNotModifiedRefreshesLastAccessAndHeaders() {
   QCOMPARE(touched->encodedBytes, QByteArrayLiteral("etag-bytes"));
 }
 
+void AssetCacheTests::
+    touchAfterNotModifiedWithMissingMetadataRepairsOrphanPayload() {
+  // Copilot review: touchAfterNotModified() is only ever called after a
+  // 304 response to a conditional request the caller issued believing a
+  // valid disk entry existed -- if the metadata file has since gone
+  // missing or become corrupt (e.g. a crash between payload and metadata
+  // commits, or external tampering), this is itself a repair signal, not
+  // merely "nothing to touch." It must clean up any orphaned payload
+  // left behind, exactly as lookupDisk() and reapAndEnforceQuota() do,
+  // rather than silently leaving unreclaimable disk usage behind.
+  AssetCache cache(configFor(m_tempDirPath));
+  const QString key = QStringLiteral("c").repeated(64);
+  QFile payload(m_tempDirPath + u'/' + key + QStringLiteral(".bin"));
+  QVERIFY(payload.open(QIODevice::WriteOnly));
+  payload.write("orphan-touch");
+  payload.close();
+  QVERIFY(QFile::exists(payload.fileName()));
+
+  cache.touchAfterNotModified(key, QStringLiteral("\"v2\""), QString());
+
+  QVERIFY(!QFile::exists(payload.fileName()));
+  QVERIFY(!cache.lookupDisk(key).has_value());
+}
+
 void AssetCacheTests::restartingWithSameDirectorySeesPriorEntries() {
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/restart.png")));

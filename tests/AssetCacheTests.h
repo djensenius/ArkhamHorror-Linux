@@ -26,6 +26,7 @@ private slots:
   void quotaEvictsOldestAccessFirstDownToLowWaterMark();
   void storeSkipsFullReapSweepWhenComfortablyUnderQuota();
   void touchAfterNotModifiedRefreshesLastAccessAndHeaders();
+  void touchAfterNotModifiedWithMissingMetadataRepairsOrphanPayload();
   void restartingWithSameDirectorySeesPriorEntries();
   void oversizedSelfConsistentPayloadBeyondAbsoluteCapIsRejected();
   void storeRejectsPayloadBeyondAbsoluteCapWithoutTouchingDisk();

@@ -162,7 +162,7 @@ def render_header(source_bytes: bytes, data: dict) -> str:
     return "\n".join(lines)
 
 
-def _clang_format(rendered: str) -> str:
+def _clang_format(rendered: str) -> tuple[str, bool]:
     """Runs the rendered header text through clang-format so this script's
     own output is byte-identical to what `mise run format:check`
     validates against src/*.h -- without this, every fresh regeneration
@@ -170,13 +170,23 @@ def _clang_format(rendered: str) -> str:
     reporting the checked-in (already clang-formatted) header as "stale"
     purely due to line-wrapping differences, never actual data drift.
     Falls back to the unformatted text (rather than failing outright) if
-    clang-format isn't on PATH, since --check's real drift signal is the
-    embedded SHA-256, and CI's separate format:check job independently
-    enforces formatting regardless.
+    clang-format isn't on PATH -- or is on PATH but fails to run to
+    completion (a broken install, missing shared libs, a crash, etc.) --
+    since --check's real drift signal is the embedded SHA-256, and CI's
+    separate format:check job independently enforces formatting
+    regardless.
+
+    Returns (text, formatted_ok): `formatted_ok` is True only when
+    clang-format actually ran to completion and its output is being
+    returned -- NOT merely when the binary was found on PATH. Callers
+    that need to know whether `text` is trustworthy for a full-text
+    staleness comparison must check `formatted_ok`, not
+    `shutil.which("clang-format")`, since a present-but-broken install
+    would otherwise silently make that comparison meaningless.
     """
     clang_format = shutil.which("clang-format")
     if clang_format is None:
-        return rendered
+        return rendered, False
     try:
         result = subprocess.run(
             [clang_format, "--assume-filename=AssetLocaleDigestData.generated.h"],
@@ -190,8 +200,8 @@ def _clang_format(rendered: str) -> str:
         # (a broken install, missing shared libs, a crash, etc.) -- honour
         # the same fallback-to-unformatted-output promise as the "not on
         # PATH at all" case above rather than letting the script abort.
-        return rendered
-    return result.stdout
+        return rendered, False
+    return result.stdout, True
 
 
 def _extract_embedded_sha256(header_text: str) -> str | None:
@@ -222,8 +232,7 @@ def main(argv: list[str]) -> int:
     source_bytes = SOURCE_JSON.read_bytes()
     data = json.loads(source_bytes)
     expected_sha256 = hashlib.sha256(source_bytes).hexdigest()
-    clang_format_available = shutil.which("clang-format") is not None
-    rendered = _clang_format(render_header(source_bytes, data))
+    rendered, formatted_ok = _clang_format(render_header(source_bytes, data))
 
     if args.check:
         current = (
@@ -231,24 +240,34 @@ def main(argv: list[str]) -> int:
             if GENERATED_HEADER.exists()
             else ""
         )
-        if clang_format_available:
+        # Copilot review: this must key off whether clang-format actually
+        # ran to completion (`formatted_ok`), not merely whether the
+        # binary was found on PATH. A present-but-broken install (missing
+        # shared libs, crash, etc.) has clang-format on PATH yet still
+        # falls back to unformatted `rendered` text inside
+        # _clang_format() -- keying off PATH presence alone would then
+        # run the full-text comparison below against unformatted output,
+        # reporting a checked-in (already clang-formatted) header as
+        # falsely stale even though the actual data (the embedded
+        # SHA-256) has not drifted at all.
+        if formatted_ok:
             # The full-text comparison is meaningful here: `rendered` was
-            # itself just clang-formatted above, so any difference from
-            # `current` (which is expected to already be clang-formatted,
-            # being checked in) reflects real drift -- either data drift
-            # or a stale formatting pass -- not merely this run's
-            # clang-format availability.
+            # itself successfully clang-formatted above, so any
+            # difference from `current` (which is expected to already be
+            # clang-formatted, being checked in) reflects real drift --
+            # either data drift or a stale formatting pass.
             is_stale = current != rendered
         else:
-            # Without clang-format, `rendered`'s formatting cannot be
-            # trusted to match the checked-in header's -- comparing full
-            # text here would report the header as stale purely because
-            # this particular run lacks clang-format, even when the data
+            # `rendered`'s formatting cannot be trusted to match the
+            # checked-in header's -- comparing full text here would
+            # report the header as stale purely because this particular
+            # run couldn't successfully format it, even when the data
             # itself (the actual drift signal) is unchanged. Fall back to
             # comparing only the embedded SHA-256 of the JSON source
             # against a fresh hash of it: that is the same drift check
             # tests/AssetLocaleDigestTests.cpp performs independently in
-            # C++, and is unaffected by formatting-tool availability.
+            # C++, and is unaffected by formatting-tool availability or
+            # success.
             embedded = _extract_embedded_sha256(current)
             is_stale = embedded != expected_sha256
         if is_stale:

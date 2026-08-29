@@ -402,7 +402,19 @@ void AssetCache::touchAfterNotModified(const QString &key,
   QMutexLocker locker(&m_mutex);
   const std::optional<DiskMetadata> metadata = readMetadata(key);
   if (!metadata) {
-    return; // nothing to touch; a subsequent lookup will simply miss
+    // Metadata missing or corrupt, exactly as lookupDisk() and
+    // reapAndEnforceQuota() both handle: a payload might still be
+    // sitting there as an orphan (e.g. a crash between the payload
+    // commit and the metadata commit, or external corruption), and
+    // this cache would otherwise never reclaim it -- a caller only
+    // reaches touchAfterNotModified() after a 304 response to a
+    // conditional request it issued for what it believed was a valid
+    // disk entry, so missing/corrupt metadata here is itself a repair
+    // signal, not merely "already evicted." Clean it up defensively
+    // for the same reason lookupDisk() does; a subsequent lookup will
+    // simply miss and refetch from scratch.
+    deleteEntry(key);
+    return;
   }
   DiskMetadata refreshed = *metadata;
   refreshed.lastAccessMsecsSinceEpoch = QDateTime::currentMSecsSinceEpoch();
