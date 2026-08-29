@@ -137,8 +137,11 @@ public:
   // Tag::Unknown only: the complete raw decoded object (its "tag" and, if
   // present, "contents", plus any additive keys a future backend release
   // adds), preserved verbatim as a lossless Json::Value (see RawJson.h) --
-  // never QJsonObject, so a huge/duplicate-key-bearing payload this
-  // client cannot interpret still round-trips byte-exact.
+  // never QJsonObject, so a huge numeric literal this client cannot
+  // interpret still round-trips byte-exact. Note that a duplicate object
+  // key anywhere in the payload is rejected by Json::Value::parse()
+  // itself (see RawJson.cpp) and therefore never reaches this
+  // representation in the first place.
   [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
@@ -330,13 +333,14 @@ private:
 // (see RawJson.h), never QJsonValue: catalog.json is a production
 // response this client decodes via the canonical byte-level fromRawBytes()
 // entry point below, and a number nested at any depth inside e.g.
-// `criteria`/`meta`/`customizations` -- or a duplicate key within one of
-// them -- must survive a decode-then-encode round trip exactly, which only
-// the byte-parsed AST (not QJsonValue's double-backed storage) can
-// guarantee. Absent fields decode to Json::Value's default Kind::Undefined
-// and are omitted again by toJson()/toRawJson(), so a round trip of an
-// untouched fixture entry is byte-faithful modulo key order. Required
-// fields are cardCode, name, cardType, and art; every other field is
+// `criteria`/`meta`/`customizations` must survive a decode-then-encode
+// round trip exactly, which only the byte-parsed AST (not QJsonValue's
+// double-backed storage) can guarantee. A duplicate object key anywhere in
+// the payload is rejected by Json::Value::parse() itself (see
+// RawJson.cpp), never silently collapsed. Absent fields decode to Json::Value's
+// default Kind::Undefined and are omitted again by toJson()/toRawJson(), so a
+// round trip of an untouched fixture entry is byte-faithful modulo key order.
+// Required fields are cardCode, name, cardType, and art; every other field is
 // optional, decoding to std::nullopt / an empty container when absent.
 //
 // Deliberate additive-field policy: any top-level object key this type
@@ -447,8 +451,10 @@ struct CardDef {
   // Json::Value::parse() -- never converting the whole tree to QJsonValue
   // first -- so every schema-unconstrained field above survives a
   // decode-then-encode round trip byte-exact, including a number outside
-  // qint64 range, a long fraction, a huge exponent, or a duplicate key
-  // nested at any depth. The one production entry point governed fixtures
+  // qint64 range, a long fraction, or a huge exponent nested at any depth.
+  // A duplicate object key anywhere in the payload is rejected by
+  // Json::Value::parse() itself (see RawJson.cpp), never silently
+  // collapsed. The one production entry point governed fixtures
   // (contracts/fixtures/catalog.json) and any future catalog-endpoint
   // response must use.
   [[nodiscard]] static ValueOrError<CardDef> fromRawJson(const Json::Value &v,

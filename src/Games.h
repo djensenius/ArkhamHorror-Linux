@@ -203,11 +203,13 @@ public:
   // Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue, so no
   // additive key beside "contents" is silently dropped. This is the only
   // representation this class guarantees round-trips byte-exact
-  // (including a huge numeric literal or duplicate-key-bearing payload
-  // this client cannot interpret): use unknownRaw().toJsonBytes() (or
-  // decode it further yourself) whenever exactness beyond a double's
-  // 2^53/int64 range matters. toJson() below is a QJsonObject-typed
-  // convenience for the Unknown case only as exact as
+  // (including a huge numeric literal this client cannot interpret): use
+  // unknownRaw().toJsonBytes() (or decode it further yourself) whenever
+  // exactness beyond a double's 2^53/int64 range matters. Note that a
+  // duplicate object key anywhere in the payload is rejected by
+  // Json::Value::parse() itself (see RawJson.cpp) and therefore never
+  // reaches this representation in the first place. toJson() below is a
+  // QJsonObject-typed convenience for the Unknown case only as exact as
   // Json::Value::toQJson() itself is (see its doc comment in RawJson.h):
   // an exact-int64 numeric literal survives, but anything requiring more
   // precision than QJsonValue's double-backed storage allows does not.
@@ -421,11 +423,13 @@ public:
   // lossless Json::Value (see RawJson.h) -- never QJsonObject/QJsonValue,
   // so no additive key beside "contents" is silently dropped. This is the
   // only representation this class guarantees round-trips byte-exact
-  // (including a huge numeric literal or duplicate-key-bearing payload
-  // this client cannot interpret): use unknownRaw().toJsonBytes() (or
-  // decode it further yourself) whenever exactness beyond a double's
-  // 2^53/int64 range matters. toJson() below is a QJsonObject-typed
-  // convenience for the Unknown case only as exact as
+  // (including a huge numeric literal this client cannot interpret): use
+  // unknownRaw().toJsonBytes() (or decode it further yourself) whenever
+  // exactness beyond a double's 2^53/int64 range matters. Note that a
+  // duplicate object key anywhere in the payload is rejected by
+  // Json::Value::parse() itself (see RawJson.cpp) and therefore never
+  // reaches this representation in the first place. toJson() below is a
+  // QJsonObject-typed convenience for the Unknown case only as exact as
   // Json::Value::toQJson() itself is (see its doc comment in RawJson.h):
   // an exact-int64 numeric literal survives, but anything requiring more
   // precision than QJsonValue's double-backed storage allows does not.

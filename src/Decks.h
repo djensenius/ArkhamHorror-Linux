@@ -146,8 +146,10 @@ struct DeckListInput {
   // never converting the whole tree to QJsonValue first -- so `id`'s
   // numeric variant and any number nested inside `sideSlots` (at any
   // depth) survive a decode byte-exact, including a number outside
-  // qint64/double range, a long fraction, a huge exponent, or a duplicate
-  // key. The one production entry point governed fixtures and any future
+  // qint64/double range, a long fraction, or a huge exponent. A duplicate
+  // object key anywhere in the payload is rejected by Json::Value::parse()
+  // itself (see RawJson.cpp), never silently collapsed. The one production
+  // entry point governed fixtures and any future
   // request/response body this client decodes must use.
   [[nodiscard]] static ValueOrError<DeckListInput>
   fromRawJson(const Json::Value &v, QStringView path);
