@@ -26,6 +26,31 @@ constexpr int kMetadataFormatVersion = 1;
 constexpr double kHighWaterMarkFraction = 0.90;
 constexpr double kLowWaterMarkFraction = 0.75;
 
+// The only legitimate writer of a cache payload is store(), which is only
+// ever fed encoded bytes that already passed AssetNetworkFetcher's own
+// hard incremental cap (`Limits::maxEncodedBytes`, 20 MiB). Mirroring
+// that same ceiling here, independent of whatever either on-disk file
+// claims about its own size, means a corrupted, truncated, or
+// locally-planted payload/metadata pair can never trigger an unbounded
+// read-back allocation -- see readVerifiedPayload() below.
+constexpr qint64 kMaxSinglePayloadBytesOnDisk = 20LL * 1024 * 1024;
+
+// Verifies `payloadFile`'s on-disk size against `expectedSize` (from
+// metadata) and an absolute hard ceiling BEFORE ever calling readAll().
+// A corrupted, truncated, or locally-planted payload file can be
+// arbitrarily large; blindly loading it into memory just to discover a
+// size mismatch afterward is itself an unbounded-allocation / DoS
+// surface, so this rejects on the cheap stat alone whenever the file
+// cannot possibly be a valid entry, never touching its contents.
+std::optional<QByteArray> readVerifiedPayload(QFile &payloadFile,
+                                              qint64 expectedSize) {
+  if (expectedSize < 0 || expectedSize > kMaxSinglePayloadBytesOnDisk ||
+      payloadFile.size() != expectedSize) {
+    return std::nullopt;
+  }
+  return payloadFile.readAll();
+}
+
 // Every valid entry filename matches exactly this shape: a 64-character
 // lowercase hex SHA-256 key, followed by ".bin" or ".meta.json". Anything
 // else found in the cache directory during a sweep (a QSaveFile crash
@@ -173,8 +198,17 @@ AssetCache::lookupDisk(const QString &key) {
     deleteEntry(key);
     return std::nullopt;
   }
-  const QByteArray bytes = payloadFile.readAll();
+  const std::optional<QByteArray> verifiedBytes =
+      readVerifiedPayload(payloadFile, metadata->encodedSize);
   payloadFile.close();
+  if (!verifiedBytes) {
+    // Rejected on size alone before any content was read -- see
+    // readVerifiedPayload()'s comment. Never trust a payload whose
+    // declared or actual size can't possibly be valid.
+    deleteEntry(key);
+    return std::nullopt;
+  }
+  const QByteArray &bytes = *verifiedBytes;
 
   const QString actualSha256 = QString::fromLatin1(
       QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
@@ -406,14 +440,21 @@ void AssetCache::reapAndEnforceQuota() {
     const std::optional<DiskMetadata> metadata = readMetadata(key);
     QFile payloadFile(payloadPath(key));
     const bool payloadReadable = payloadFile.open(QIODevice::ReadOnly);
-    const QByteArray bytes =
-        payloadReadable ? payloadFile.readAll() : QByteArray();
+    const std::optional<QByteArray> verifiedBytes =
+        (payloadReadable && metadata)
+            ? readVerifiedPayload(payloadFile, metadata->encodedSize)
+            : std::nullopt;
     if (payloadReadable) {
       payloadFile.close();
     }
+    if (!metadata || !payloadReadable || !verifiedBytes) {
+      deleteEntry(key); // corrupt pair, or rejected on size alone
+      continue;
+    }
+    const QByteArray &bytes = *verifiedBytes;
     const QString actualSha256 = QString::fromLatin1(
         QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
-    if (!metadata || !payloadReadable || actualSha256 != metadata->sha256Hex ||
+    if (actualSha256 != metadata->sha256Hex ||
         bytes.size() != metadata->encodedSize) {
       deleteEntry(key); // corrupt pair
       continue;

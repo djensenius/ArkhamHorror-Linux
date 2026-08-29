@@ -246,3 +246,45 @@ void AssetCacheTests::restartingWithSameDirectorySeesPriorEntries() {
     QCOMPARE(hit->encodedBytes, QByteArrayLiteral("persisted-across-restart"));
   }
 }
+
+void AssetCacheTests::
+    oversizedSelfConsistentPayloadBeyondAbsoluteCapIsRejected() {
+  // A payload/metadata pair can be internally self-consistent -- the
+  // actual on-disk bytes match both the declared size AND the recorded
+  // SHA-256 -- and still be dangerous to trust on read-back, because
+  // lookupDisk()/reapAndEnforceQuota() have no way to know whether such a
+  // pair actually came from this cache's own store() (which is only ever
+  // fed encoded bytes that already passed AssetNetworkFetcher's own hard
+  // 20 MiB incremental cap) versus a corrupted or locally-planted file
+  // that simply happens to be internally consistent at some much larger
+  // size. Reading back an entry like that with a single unconditional
+  // readAll() has no upper bound at all. This test constructs exactly
+  // such a pair directly via store() (bypassing the network fetcher's own
+  // cap entirely, which store() itself does not enforce -- verification
+  // happens only on the read-back path) and asserts it is rejected and
+  // cleaned up rather than ever being served, even though every
+  // consistency check that existed before this fix (SHA-256, size-versus-
+  // metadata match) would have passed it.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/oversized.png")));
+  const QByteArray oversized(20 * 1024 * 1024 + 4096, 'x');
+  const QString payloadPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".bin");
+  const QString metadataPath =
+      m_tempDirPath + u'/' + key + QStringLiteral(".meta.json");
+  {
+    AssetCache cache(configFor(m_tempDirPath, 64LL * 1024 * 1024));
+    cache.store(key, makeEntry(oversized));
+  }
+  QVERIFY(QFile::exists(payloadPath));
+  QVERIFY(QFile::exists(metadataPath));
+
+  // A fresh instance (simulating a restart) runs reapAndEnforceQuota() in
+  // its own constructor, which must reject and remove this pair on its
+  // own -- no explicit lookupDisk() call should even be necessary to
+  // trigger the cleanup.
+  AssetCache freshCache(configFor(m_tempDirPath, 64LL * 1024 * 1024));
+  QVERIFY(!QFile::exists(payloadPath));
+  QVERIFY(!QFile::exists(metadataPath));
+  QVERIFY(!freshCache.lookupDisk(key).has_value());
+}

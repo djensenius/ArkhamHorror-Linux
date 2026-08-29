@@ -27,6 +27,7 @@ private slots:
   void storeSkipsFullReapSweepWhenComfortablyUnderQuota();
   void touchAfterNotModifiedRefreshesLastAccessAndHeaders();
   void restartingWithSameDirectorySeesPriorEntries();
+  void oversizedSelfConsistentPayloadBeyondAbsoluteCapIsRejected();
 
 private:
   QString m_tempDirPath;
