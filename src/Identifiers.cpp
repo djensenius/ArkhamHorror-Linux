@@ -65,8 +65,15 @@ ValueOrError<CardName> CardName::fromJson(const QJsonValue &v,
 QJsonObject CardName::toJson() const {
   return QJsonObject{
       {QStringLiteral("title"), title},
+      // QJsonValue()'s default constructor is QJsonValue::Null, not
+      // Undefined -- QJsonObject::insert() only drops a key for an
+      // explicit Undefined value, so this key is preserved with an
+      // explicit JSON null. Spelled out explicitly (rather than relying
+      // on the default constructor's less obvious Null default) since
+      // catalog.schema.json requires "subtitle" to be present, just
+      // nullable.
       {QStringLiteral("subtitle"),
-       subtitle ? QJsonValue(*subtitle) : QJsonValue()},
+       subtitle ? QJsonValue(*subtitle) : QJsonValue(QJsonValue::Null)},
   };
 }
 

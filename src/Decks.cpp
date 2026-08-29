@@ -328,7 +328,13 @@ QJsonValue ExternalDeckId::toJson() const {
   case Kind::Absent:
     return QJsonValue(QJsonValue::Undefined);
   case Kind::Null:
-    return QJsonValue();
+    // QJsonValue()'s default constructor is QJsonValue::Null, not
+    // Undefined -- spelled out explicitly here (rather than relying on
+    // the default constructor) to make the distinction from the Absent
+    // case above unambiguous: an explicit JSON null still emits an
+    // "id" key when composed into an enclosing object, unlike Absent's
+    // Undefined which omits the key entirely.
+    return QJsonValue(QJsonValue::Null);
   case Kind::Text:
     return QJsonValue(m_text);
   case Kind::Number:
@@ -484,17 +490,29 @@ ValueOrError<DeckList> DeckList::fromJson(const QJsonValue &v,
 }
 
 QJsonObject DeckList::toJson() const {
+  // Every ternary below uses QJsonValue(QJsonValue::Null) rather than the
+  // bare default-constructed QJsonValue() for the unset case. Both
+  // produce an identical Null-kind value (QJsonValue's default
+  // constructor is QJsonValue::Null, not Undefined -- QJsonObject only
+  // drops a key for an explicit Undefined value), but spelling it out
+  // avoids any ambiguity for a reader about which Qt JSON kind is
+  // intended: decks.schema.json requires each of these keys to be
+  // present, just nullable, so the key must never be omitted here.
   return QJsonObject{
       {QStringLiteral("slots"), encodeCardQuantityMap(cardSlots)},
       {QStringLiteral("sideSlots"), encodeCardQuantityMap(sideSlots)},
       {QStringLiteral("investigator_code"), investigatorCode.toJson()},
       {QStringLiteral("investigator_name"), investigatorName},
-      {QStringLiteral("meta"), meta ? QJsonValue(*meta) : QJsonValue()},
+      {QStringLiteral("meta"),
+       meta ? QJsonValue(*meta) : QJsonValue(QJsonValue::Null)},
       {QStringLiteral("taboo_id"),
-       tabooId ? QJsonValue(*tabooId) : QJsonValue()},
-      {QStringLiteral("url"), url ? QJsonValue(*url) : QJsonValue()},
-      {QStringLiteral("id"), id ? QJsonValue(*id) : QJsonValue()},
-      {QStringLiteral("name"), name ? QJsonValue(*name) : QJsonValue()},
+       tabooId ? QJsonValue(*tabooId) : QJsonValue(QJsonValue::Null)},
+      {QStringLiteral("url"),
+       url ? QJsonValue(*url) : QJsonValue(QJsonValue::Null)},
+      {QStringLiteral("id"),
+       id ? QJsonValue(*id) : QJsonValue(QJsonValue::Null)},
+      {QStringLiteral("name"),
+       name ? QJsonValue(*name) : QJsonValue(QJsonValue::Null)},
   };
 }
 
@@ -547,7 +565,12 @@ QJsonObject Deck::toJson() const {
   return QJsonObject{
       {QStringLiteral("id"), id.toJson()},
       {QStringLiteral("userId"), userId},
-      {QStringLiteral("url"), url ? QJsonValue(*url) : QJsonValue()},
+      // See DeckList::toJson()'s comment above: QJsonValue(Null) rather
+      // than the bare default constructor, to make explicit that this
+      // key must remain present (decks.schema.json requires "url",
+      // nullable) rather than being dropped like an Undefined value.
+      {QStringLiteral("url"),
+       url ? QJsonValue(*url) : QJsonValue(QJsonValue::Null)},
       {QStringLiteral("name"), name},
       {QStringLiteral("investigatorName"), investigatorName},
       {QStringLiteral("list"), list.toJson()},

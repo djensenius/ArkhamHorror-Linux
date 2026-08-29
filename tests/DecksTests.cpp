@@ -69,6 +69,7 @@ private slots:
   // Nullable metadata/url/taboo fields ────────────────────────────────────────
   void nullableFieldsRoundTripAsExplicitNull();
   void normalizedDeckListMissingRequiredKeyRejected();
+  void deckNullUrlRoundTripsAsExplicitNullNotOmitted();
 
   // DeckValidationError / empty success ─────────────────────────────────────
   void unimplementedCardTagRequired();
@@ -288,6 +289,10 @@ void DecksTests::externalIdExplicitNullPreserved() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Null);
+  // A missing key's .value() would be Undefined, whose isNull() is false
+  // (confirmed empirically against Qt's actual behavior), so this pair
+  // genuinely distinguishes "key present with null" from "key omitted".
+  QVERIFY(result->toJson().contains(QStringLiteral("id")));
   QVERIFY(result->toJson().value(QStringLiteral("id")).isNull());
 }
 
@@ -793,6 +798,49 @@ void DecksTests::normalizedDeckListMissingRequiredKeyRejected() {
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("name")),
            qPrintable(result.error()));
+}
+
+void DecksTests::deckNullUrlRoundTripsAsExplicitNullNotOmitted() {
+  // decks.schema.json's Deck.url is required-but-nullable. The fixture in
+  // decksFixture() always has a non-null url, so it alone cannot prove
+  // Deck::toJson() preserves an explicit null (as opposed to silently
+  // omitting the key, which QJsonObject would do only for an explicit
+  // QJsonValue::Undefined -- see ExternalDeckId::Kind::Absent for the
+  // legitimate use of that -- not for QJsonValue::Null).
+  const QJsonObject obj{
+      {QStringLiteral("id"),
+       QStringLiteral("00000000-0000-0000-0000-000000000017")},
+      {QStringLiteral("userId"), 7},
+      {QStringLiteral("url"), QJsonValue()},
+      {QStringLiteral("name"), QStringLiteral("Contract deck")},
+      {QStringLiteral("investigatorName"), QStringLiteral("Roland Banks")},
+      {QStringLiteral("list"),
+       QJsonObject{
+           {QStringLiteral("slots"), QJsonObject{}},
+           {QStringLiteral("sideSlots"), QJsonObject{}},
+           {QStringLiteral("investigator_code"), QStringLiteral("c01001")},
+           {QStringLiteral("investigator_name"),
+            QStringLiteral("Roland Banks")},
+           {QStringLiteral("meta"), QJsonValue()},
+           {QStringLiteral("taboo_id"), QJsonValue()},
+           {QStringLiteral("url"), QJsonValue()},
+           {QStringLiteral("id"), QJsonValue()},
+           {QStringLiteral("name"), QJsonValue()},
+       }},
+  };
+  const auto result = Deck::fromJson(obj, u"deck");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(!result->url.has_value());
+
+  const QJsonObject encoded = result->toJson();
+  // A missing key's .value() is Undefined, whose isNull() is false (see
+  // scratchDiagnosticCheck's empirical confirmation during review); so
+  // this pair of assertions genuinely fails if the key were ever dropped,
+  // not merely if it held the wrong value.
+  QVERIFY(encoded.contains(QStringLiteral("url")));
+  QVERIFY(encoded.value(QStringLiteral("url")).isNull());
+  QCOMPARE(encoded, obj);
 }
 
 void DecksTests::unimplementedCardTagRequired() {
