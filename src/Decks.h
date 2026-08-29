@@ -47,11 +47,14 @@ public:
   [[nodiscard]] static ExternalDeckId absent();
   [[nodiscard]] static ExternalDeckId null();
   [[nodiscard]] static ExternalDeckId text(QString value);
-  // `value` must have come from Json::Value::parse() or
-  // Json::RawNumber::fromInt64() (both guarantee a valid, non-empty digit
-  // string); a default-constructed Json::RawNumber is rejected by
-  // Json::Value::toJsonBytesInner() defensively but should never be
-  // passed here in the first place.
+  // `value` must have come from Json::Value::parse(),
+  // Json::RawNumber::fromInt64(), or be default-constructed: all three
+  // guarantee a valid, non-empty digit string. A default-constructed
+  // Json::RawNumber is specifically the canonical "0" literal (see its
+  // default constructor in RawJson.h), not an unrepresentable
+  // empty-digit state, so it round-trips through
+  // Json::Value::toJsonBytesInner() the same as any parsed or
+  // fromInt64()-produced value.
   [[nodiscard]] static ExternalDeckId number(Json::RawNumber value);
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
