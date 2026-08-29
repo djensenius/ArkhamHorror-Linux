@@ -114,7 +114,12 @@ The current walking skeleton establishes:
   read is merely in-flight, or while an ordinary not-yet-failed delete or
   save is ahead of it in that profile's queue, rebind the single queued
   read's continuation to the newest call rather than enqueueing a
-  duplicate read against the OS secret store. The
+  duplicate read against the OS secret store -- but only when that queued
+  read was admitted under the profile's CURRENT credential-endpoint epoch;
+  a read admitted before a genuine endpoint change is left untouched
+  (never rebound onto a newer continuation) and is guaranteed to complete
+  with no observable effect, while a fresh read is enqueued strictly
+  behind the required deletion reserved for the old endpoint's token. The
   production composition (`AppSessionComposition`) and the hermetic
   `--smoke-test` gate (`AppBootstrap`) ensure smoke-test runs never
   construct the coordinator or touch QSettings/the network/the keychain.
@@ -144,15 +149,24 @@ comment), not a claim of crash-proof durability.
 A stored token is keyed by a profile's stable UUID, so profile storage can
 legitimately reload the same UUID with different content (for example, an
 edited display name or a changed server URL) across a `start()`/reload
-cycle. `SessionCoordinator` treats a display-name-only change as safe to
-keep the existing token, but any change to the profile's canonical network
-endpoint (scheme, host, effective port, or path) invalidates that profile's
-credential epoch and enqueues a required token deletion ahead of any
-restore read or new save, so a token obtained for one server is never read,
-sent, or persisted against a different one. That required deletion follows
-the same durably-retryable, per-profile-serialized semantics as other
-required deletes (see the point above); until it succeeds, later reads/
-saves/sign-ins for that profile remain blocked and retryable.
+cycle. `SessionCoordinator` separates two independent notions of profile
+equality on reload: *observable* equality (exact display name and exact
+exposed `baseUrl()` representation, gating whether `selectedProfile*`
+getters/signals have anything new to announce) and *credential-endpoint*
+equivalence (a more lenient scheme/host/effective-port/path comparison
+that ignores e.g. an explicit default port spelled out where it was
+previously omitted, gating only whether the stored credential is still
+safe to use). A display-name-only change, or a change to only the
+textual `baseUrl()` spelling that remains credential-equivalent, updates
+and announces the profile (exactly one `selectedProfileChanged()`) but is
+safe to keep the existing token for. Any change to the profile's canonical
+network endpoint (scheme, host, effective port, or path) invalidates that
+profile's credential epoch and enqueues a required token deletion ahead of
+any restore read or new save, so a token obtained for one server is never
+read, sent, or persisted against a different one. That required deletion
+follows the same durably-retryable, per-profile-serialized semantics as
+other required deletes (see the point above); until it succeeds, later
+reads/saves/sign-ins for that profile remain blocked and retryable.
 
 ## Prerequisites
 

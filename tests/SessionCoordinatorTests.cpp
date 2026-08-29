@@ -646,6 +646,14 @@ private slots:
   void
   reloadedProfileCanonicallyEquivalentUrlIsNotEndpointChangeButPathCaseIs();
   void reloadedProfileExactUnchangedContentEmitsNoSignals();
+  void
+  reloadedProfileEndpointChangeStaleInFlightReadCannotBypassRequiredDelete();
+  void
+  reloadedProfileEndpointChangeRequiredDeleteFailureAfterStaleReadBlocksThenRetrySucceeds();
+  void
+  reloadedProfileEndpointChangeQueuedNotInFlightOldReadCannotBypassRequiredDelete();
+  void
+  reloadedProfileEndpointChangeRepeatedStartDedupesOnlyFreshReadAndStaleReplayCannotCorruptIt();
 
   // Destruction
   void destructionSuppressesProbeCompletion();
@@ -4068,7 +4076,13 @@ void SessionCoordinatorTests::
   QVERIFY(!pathLower->hasEquivalentEndpoint(*pathUpper));
 
   // End-to-end behavioral proof, part 1: the port-spelling-only reload
-  // above must never trigger a delete at the SessionCoordinator level.
+  // above changes the EXPOSED baseUrl() representation (an explicit
+  // ":443" is textually different from an implicit default, even though
+  // hasEquivalentEndpoint() says they are the same credential-scoped
+  // endpoint) and so must still fire selectedProfileChanged() exactly
+  // once and use the fresh representation for the probe/whoami calls --
+  // but must never trigger a token delete, since the underlying
+  // credential endpoint has not actually changed.
   {
     Harness h;
     h.profileStore.profiles = {*portOmitted};
@@ -4083,17 +4097,31 @@ void SessionCoordinatorTests::
     QVERIFY(selectedProfileSpy.isValid());
 
     h.coordinator->start();
+    // The new (":443") representation is already the coherent, exposed
+    // snapshot synchronously, before any asynchronous probe/token-store
+    // completion -- matching every other transition's coherent-snapshot
+    // publication contract.
+    QCOMPARE(selectedProfileSpy.count(), 1);
+    QCOMPARE(h.coordinator->selectedProfileBaseUrl(),
+             portExplicitDefault->baseUrl().toString());
     QVERIFY(
         pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+    QCOMPARE(h.probeFactory.current()->lastProfile().baseUrl().toString(),
+             portExplicitDefault->baseUrl().toString());
     h.probeFactory.current()->complete(compatibleProbeResult());
     QVERIFY(pumpEventsUntil(
         [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
 
+    // No delete was ever issued: the op dispatched right after the
+    // reload is the credential-restore Read, not a Delete, and exactly
+    // one selectedProfileChanged() was ever fired for this reload.
     QCOMPARE(h.tokenStore.calls.size(), 3);
     QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("read"));
-    QCOMPARE(selectedProfileSpy.count(), 0);
+    QCOMPARE(selectedProfileSpy.count(), 1);
     h.tokenStore.complete(profileId, successReadResult(token));
     QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 3; }));
+    QCOMPARE(h.authClient.calls.at(2).profile.baseUrl().toString(),
+             portExplicitDefault->baseUrl().toString());
     h.authClient.completeUser(
         3,
         userSuccess(QStringLiteral("fay"), QStringLiteral("fay@example.test")));
@@ -4101,6 +4129,7 @@ void SessionCoordinatorTests::
       return h.coordinator->state() == SessionCoordinator::State::SignedIn;
     }));
     QVERIFY(h.tokenStore.storedToken(profileId).has_value());
+    QCOMPARE(selectedProfileSpy.count(), 1);
   }
 
   // End-to-end behavioral proof, part 2: the path-case-only reload above
@@ -4185,6 +4214,401 @@ void SessionCoordinatorTests::
   QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() == SessionCoordinator::State::SignedIn;
   }));
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileEndpointChangeStaleInFlightReadCannotBypassRequiredDelete() {
+  // Exact race from review: an in-flight restore Read admitted for the
+  // OLD endpoint must never be rebound to a continuation for a NEW
+  // endpoint once the same profileId() reloads with a different URL --
+  // it must remain a permanently stale, un-rebound op whose eventual
+  // result is silently discarded, while a FRESH Read (for the new
+  // endpoint) is enqueued strictly BEHIND the required Delete reserved
+  // for the old endpoint's token.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString oldUrl = QStringLiteral("https://old.example.test");
+  const QString newUrl = QStringLiteral("https://new.example.test/app");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), oldUrl);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+
+  // Start once: the initial restore Read dispatches and is held in
+  // flight (never completed yet).
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+  QCOMPARE(h.tokenStore.calls.first().kind, QStringLiteral("read"));
+
+  // Persisted storage now reports a DIFFERENT canonical endpoint (host
+  // AND path both changed) for the SAME stable UUID.
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), newUrl);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  // Restart while the old-endpoint Read is STILL in flight. This must
+  // invalidate the endpoint epoch and reserve a required Delete behind
+  // the still-outstanding old Read, then -- once the fresh probe for the
+  // new endpoint completes BEFORE the old Read ever does, exactly the
+  // review's ordering -- enqueue a FRESH Read behind that Delete,
+  // without ever rebinding the stale one.
+  h.coordinator->start();
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), newUrl);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  // Nothing new has touched the real store yet: the required Delete and
+  // fresh Read are both merely queued behind the still-in-flight old
+  // Read.
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  // NOW the old-endpoint Read finally completes, returning a token that
+  // was scoped to the OLD endpoint.
+  const QString oldToken = QStringLiteral("old-endpoint-token");
+  h.tokenStore.complete(profileId, successReadResult(oldToken));
+
+  // The stale Read's own (now-superseded-generation) continuation must
+  // discard this result entirely: no whoami call of any kind -- to
+  // either endpoint -- may ever be issued carrying it. The required
+  // Delete for the old endpoint's token dispatches next.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+  QCOMPARE(h.tokenStore.calls.at(1).kind, QStringLiteral("delete"));
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  // A duplicate/replayed completion of the stale old Read (simulating a
+  // buggy backend notifying twice) must be equally inert: its captured
+  // (opId, attemptId) no longer matches the profile's current dispatch
+  // record (which now belongs to the required Delete), so it must be
+  // silently rejected rather than corrupt the Delete's own in-flight
+  // dispatch.
+  h.tokenStore.replayLastCompletion(profileId);
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+  QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  // The required Delete for the old endpoint's token completes...
+  h.tokenStore.complete(profileId, successWriteResult());
+
+  // ...and ONLY NOW does the distinct fresh Read (for the NEW endpoint)
+  // ever dispatch.
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("read"));
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  const QString newToken = QStringLiteral("new-endpoint-token");
+  h.tokenStore.complete(profileId, successReadResult(newToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::WhoAmI);
+  const QString sentToken = h.authClient.calls.first().token;
+  QVERIFY(sentToken == newToken);
+  QCOMPARE(h.authClient.calls.first().profile.baseUrl().toString(), newUrl);
+  h.authClient.completeUser(
+      1,
+      userSuccess(QStringLiteral("hank"), QStringLiteral("hank@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), newUrl);
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileEndpointChangeRequiredDeleteFailureAfterStaleReadBlocksThenRetrySucceeds() {
+  // Same race as above, but the required Delete for the old endpoint's
+  // token fails first: the coordinator must durably block (never fall
+  // through to the fresh Read) until retry() succeeds.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString oldUrl = QStringLiteral("https://old.example.test");
+  const QString newUrl = QStringLiteral("https://new.example.test/app");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), oldUrl);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), newUrl);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  const QString oldToken = QStringLiteral("old-endpoint-token");
+  h.tokenStore.complete(profileId, successReadResult(oldToken));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+  QCOMPARE(h.tokenStore.calls.at(1).kind, QStringLiteral("delete"));
+
+  // The required delete fails: this must durably block -- the fresh
+  // Read must never be attempted before it succeeds.
+  h.tokenStore.complete(profileId, backendErrorResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::SecureStorageUnavailable;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("delete"));
+  h.tokenStore.complete(profileId, successWriteResult());
+
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("read"));
+
+  const QString newToken = QStringLiteral("new-endpoint-token");
+  h.tokenStore.complete(profileId, successReadResult(newToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::WhoAmI);
+  const QString sentToken = h.authClient.calls.first().token;
+  QVERIFY(sentToken == newToken);
+  h.authClient.completeUser(1, userSuccess(QStringLiteral("ivy"),
+                                           QStringLiteral("ivy@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileEndpointChangeQueuedNotInFlightOldReadCannotBypassRequiredDelete() {
+  // Variant of the race where the stale-epoch Read is enqueued but NOT
+  // yet dispatched (an ordinary sign-out Delete is the one actually in
+  // flight when the endpoint changes). The same defensive discard must
+  // apply once it does eventually dispatch.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString oldUrl = QStringLiteral("https://old.example.test");
+  const QString newUrl = QStringLiteral("https://new.example.test/app");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), oldUrl);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+
+  const QString firstToken = QStringLiteral("first-token");
+  bootToSignedIn(h, firstToken);
+  QCOMPARE(h.tokenStore.calls.size(), 2); // read, save
+
+  // Sign out: an ordinary Delete dispatches and is held in flight.
+  h.coordinator->signOut();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
+
+  // Restart (same endpoint, no reload yet): the restore Read is enqueued
+  // behind the still in-flight ordinary Delete -- QUEUED, never
+  // dispatched.
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+
+  // NOW the persisted record for the SAME UUID reports a different
+  // endpoint.
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), newUrl);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  h.coordinator->start();
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), newUrl);
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  // Nothing new dispatched yet: the ordinary Delete is still the only
+  // in-flight op; the stale queued Read, the required Delete, and the
+  // fresh Read are all still merely queued behind it.
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+
+  // The in-flight ordinary Delete completes; the queued (never
+  // dispatched) stale-epoch Read now dispatches...
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 4);
+  QCOMPARE(h.tokenStore.calls.at(3).kind, QStringLiteral("read"));
+
+  // ...but completing it must never issue a whoami: its continuation's
+  // captured generation is stale by now, so the required Delete for the
+  // old endpoint's token dispatches next instead.
+  h.tokenStore.complete(profileId, successReadResult(firstToken));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 5);
+  QCOMPARE(h.tokenStore.calls.at(4).kind, QStringLiteral("delete"));
+  QCOMPARE(h.authClient.calls.size(), 2); // unchanged: just the original
+                                          // sign-in's authenticate+whoami
+
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 6);
+  QCOMPARE(h.tokenStore.calls.at(5).kind, QStringLiteral("read"));
+
+  const QString newToken = QStringLiteral("new-endpoint-token");
+  h.tokenStore.complete(profileId, successReadResult(newToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 3; }));
+  QCOMPARE(h.authClient.calls.at(2).kind, FakeAuthClient::CallKind::WhoAmI);
+  const QString sentToken = h.authClient.calls.at(2).token;
+  QVERIFY(sentToken == newToken);
+  QCOMPARE(h.authClient.calls.at(2).profile.baseUrl().toString(), newUrl);
+  h.authClient.completeUser(
+      3,
+      userSuccess(QStringLiteral("iris"), QStringLiteral("iris@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), newUrl);
+}
+
+void SessionCoordinatorTests::
+    reloadedProfileEndpointChangeRepeatedStartDedupesOnlyFreshReadAndStaleReplayCannotCorruptIt() {
+  // After an endpoint change reserves a required Delete and a fresh
+  // Read, calling start() AGAIN (same new endpoint, no further reload)
+  // while that fresh Read is still in flight must dedup onto the SAME
+  // fresh Read -- never create a third Read -- proving the endpoint-
+  // epoch match still correctly handles legitimate repeated-start dedup
+  // even immediately after an endpoint change.
+  Harness h;
+  const QString profileId =
+      QStringLiteral("22222222-2222-2222-2222-222222222222");
+  const QString oldUrl = QStringLiteral("https://old.example.test");
+  const QString newUrl = QStringLiteral("https://new.example.test/app");
+  const auto v1 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), oldUrl);
+  QVERIFY(v1.has_value());
+  h.profileStore.profiles = {*v1};
+  h.profileStore.selectedId = profileId;
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  const auto v2 =
+      ServerProfile::customWithId(profileId, QStringLiteral("Name"), newUrl);
+  QVERIFY(v2.has_value());
+  h.profileStore.profiles[0] = *v2;
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  const QString oldToken = QStringLiteral("old-endpoint-token");
+  h.tokenStore.complete(profileId, successReadResult(oldToken));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+  QCOMPARE(h.tokenStore.calls.at(1).kind, QStringLiteral("delete"));
+
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.calls.at(2).kind, QStringLiteral("read"));
+
+  // The fresh Read for the new endpoint is now in flight. Repeatedly
+  // restart (same endpoint, no reload) while it remains outstanding.
+  for (int i = 0; i < 3; ++i) {
+    h.coordinator->start();
+    QVERIFY(
+        pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+    h.probeFactory.current()->complete(compatibleProbeResult());
+    QVERIFY(pumpEventsUntil([&h] {
+      return h.coordinator->state() ==
+             SessionCoordinator::State::RestoringCredential;
+    }));
+  }
+  // No third (or fourth, fifth...) Read was ever dispatched: still just
+  // the original stale-old Read (already discarded) and this ONE fresh
+  // Read.
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
+
+  // A duplicate replay of the required Delete's (long-since-completed)
+  // callback -- the most recent completion recorded before the fresh
+  // Read was ever dispatched -- must still be inert and must not disturb
+  // the fresh Read's dedup chain or its own in-flight dispatch in any
+  // way: its (opId, attemptId) no longer matches the profile's current
+  // dispatch record, which now belongs to the fresh Read.
+  h.tokenStore.replayLastCompletion(profileId);
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  QCOMPARE(h.tokenStore.calls.size(), 3);
+  QVERIFY(h.authClient.calls.isEmpty());
+
+  const QString newToken = QStringLiteral("new-endpoint-token");
+  h.tokenStore.complete(profileId, successReadResult(newToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::WhoAmI);
+  const QString sentToken = h.authClient.calls.first().token;
+  QVERIFY(sentToken == newToken);
+  h.authClient.completeUser(
+      1,
+      userSuccess(QStringLiteral("jack"), QStringLiteral("jack@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+  QCOMPARE(h.coordinator->selectedProfileBaseUrl(), newUrl);
 }
 
 // ─── Secret-free diagnostics ──────────────────────────────────────────────

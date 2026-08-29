@@ -278,8 +278,24 @@ private:
     // front of the FIFO was abandoned (profile switch, restart, or
     // sign-out) before ever crossing the ITokenStore boundary, and is
     // safely skipped without dispatching it. Read/Delete are never
-    // epoch-gated -- see invalidateProfileCredential()'s class comment.
+    // gated on THIS epoch (which bumps on every restart/switch, endpoint
+    // change or not) -- see invalidateProfileCredential()'s class
+    // comment. See admissionEndpointEpoch below for the narrower counter
+    // that DOES gate a Read.
     quint64 admissionEpoch{0};
+    // Captured from profileEndpointEpoch(profileId) at enqueue time: this
+    // counter bumps ONLY when mutateSelectedProfile() detects a genuine
+    // change of network endpoint for this profileId() (see
+    // invalidateProfileCredentialForEndpointChange()), never on an
+    // ordinary restart/switch that keeps the same endpoint. This is the
+    // credential-admission identity a queued/in-flight Read must match
+    // for startCredentialRestore()'s dedup logic to safely rebind its
+    // continuation: a Read admitted for an endpoint that has since
+    // changed must never be rebound to a continuation targeting the NEW
+    // endpoint (its result could otherwise deliver an old-endpoint token
+    // to a new-endpoint whoami call, ahead of the required Delete
+    // reserved for that old token) -- see startCredentialRestore().
+    quint64 admissionEndpointEpoch{0};
     // Unique for the lifetime of this logical operation: assigned once at
     // enqueue time and never changed, even across repeated retries of a
     // stalled head op (see retryStuckProfileTokenOp()). Lets a completion
@@ -462,6 +478,11 @@ private:
     return m_profileCredentialEpoch.value(profileId, 0);
   }
 
+  // See TokenOp::admissionEndpointEpoch and m_profileEndpointEpoch below.
+  [[nodiscard]] quint64 profileEndpointEpoch(const QString &profileId) const {
+    return m_profileEndpointEpoch.value(profileId, 0);
+  }
+
   // Bumps |profileId|'s credential epoch. If a Save for the previous epoch
   // has already been dispatched to ITokenStore (i.e. is the current
   // in-flight head of that profile's FIFO queue), it cannot be un-sent:
@@ -477,8 +498,14 @@ private:
   void invalidateProfileCredential(const QString &profileId);
 
   // Handles the SAME-profileId, DIFFERENT-endpoint case detected by
-  // mutateSelectedProfile(): performs invalidateProfileCredential()'s
-  // usual epoch bump plus in-flight-Save compensation, and ADDITIONALLY
+  // mutateSelectedProfile(): first bumps this profile's ENDPOINT epoch
+  // (see m_profileEndpointEpoch/TokenOp::admissionEndpointEpoch), which
+  // immediately makes any already-queued or already-in-flight Read for
+  // this profile ineligible for startCredentialRestore()'s rebind-dedup
+  // logic -- it can only ever be rebound to a continuation for the SAME
+  // endpoint it was admitted under, never a newer one. Then performs
+  // invalidateProfileCredential()'s usual (coarser, restart-on-every-call)
+  // epoch bump plus in-flight-Save compensation, and ADDITIONALLY
   // unconditionally reserves a Delete for whatever token may already be
   // durably stored for this profileId() from a prior session at the old
   // endpoint (invalidateProfileCredential() alone only reacts to a Save
@@ -487,7 +514,11 @@ private:
   // and therefore strictly before startCredentialRestore() can ever
   // enqueue a Read for this profile -- guarantees via FIFO ordering alone
   // that no credential from the old endpoint is ever read, sent, or saved
-  // against the new one.
+  // against the new one, even if a Read for the old endpoint was already
+  // in flight when the endpoint changed: it is left orphaned (its
+  // captured continuation is stale-generation by the time it fires) and
+  // a FRESH Read for the new endpoint is enqueued strictly behind this
+  // Delete instead of ever rebinding the orphaned one.
   void invalidateProfileCredentialForEndpointChange(const QString &profileId);
 
   // Assigns the coherent (state, cleared-user) snapshot via
@@ -549,6 +580,18 @@ private:
   // single coordinator-wide UI/session counter). See
   // invalidateProfileCredential() and TokenOp::admissionEpoch.
   QHash<QString, quint64> m_profileCredentialEpoch;
+
+  // Per-profile ENDPOINT epoch: a strictly narrower counter than
+  // m_profileCredentialEpoch above -- it bumps ONLY when
+  // invalidateProfileCredentialForEndpointChange() detects that the same
+  // profileId() now designates a genuinely different network endpoint
+  // (never on an ordinary restart/switch that keeps the same endpoint,
+  // unlike m_profileCredentialEpoch, which bumps on every one of those
+  // too). This is what lets startCredentialRestore()'s dedup logic tell
+  // "a Read admitted before THIS endpoint change" apart from "a Read
+  // admitted for the CURRENT endpoint, just during an earlier ordinary
+  // restart" -- see TokenOp::admissionEndpointEpoch.
+  QHash<QString, quint64> m_profileEndpointEpoch;
 
   // Profiles whose FIFO is durably blocked behind a Delete that has failed
   // at least once and not yet been retried successfully (see

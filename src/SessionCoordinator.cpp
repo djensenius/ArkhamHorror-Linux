@@ -128,19 +128,39 @@ void SessionCoordinator::mutateSelectedProfile(const QString &profileId,
     // point with different content only ever comes from a reload, never
     // from switchProfile() re-targeting itself.
     const ServerProfile &previous = *m_currentProfile;
-    const bool sameEndpoint = previous.hasEquivalentEndpoint(profile);
-    const bool sameName = previous.displayName() == profile.displayName();
-    if (sameEndpoint && sameName) {
-      return; // Exact reload: nothing externally observable changed.
+    // hasEquivalentEndpoint() and full observable equality are
+    // deliberately DIFFERENT questions. hasEquivalentEndpoint() only
+    // decides whether a stored credential may still safely be used
+    // against the freshly loaded record (it normalises away, e.g., an
+    // explicit default port spelled out where it was previously
+    // omitted) -- it must NEVER be used to decide whether the exposed
+    // selectedProfile* getters/QML bindings have anything new to
+    // observe. baseUrl() is compared here via plain QUrl equality (the
+    // exact same encoded representation exposed by selectedProfileBaseUrl()
+    // and handed to the probe/auth client), which correctly distinguishes
+    // e.g. "https://host" from "https://host:443" even though both name
+    // the same credential-scoped endpoint.
+    const bool sameCredentialEndpoint = previous.hasEquivalentEndpoint(profile);
+    const bool observableUnchanged =
+        previous.displayName() == profile.displayName() &&
+        previous.baseUrl() == profile.baseUrl();
+    if (observableUnchanged) {
+      // A genuinely different endpoint always changes at least one of
+      // scheme/host/port/path, which the QUrl equality above would also
+      // catch, so reaching this early return already implies
+      // sameCredentialEndpoint is true: no required credential
+      // invalidation is ever silently skipped by returning here.
+      return;
     }
     m_currentProfile = profile;
     ++m_selectedProfileRevision.mutation;
-    if (!sameEndpoint) {
+    if (!sameCredentialEndpoint) {
       // A credential stored for this profileId() was scoped to the OLD
       // endpoint and must never be read, sent, or saved against the new
-      // one -- a display-name-only change (sameEndpoint == true above)
-      // is safe to keep the existing token for and falls through without
-      // reaching this branch at all.
+      // one -- a credential-equivalent reload (sameCredentialEndpoint ==
+      // true above -- e.g. only the display name changed, or the port
+      // was merely spelled out explicitly) is safe to keep the existing
+      // token for and falls through without reaching this branch at all.
       invalidateProfileCredentialForEndpointChange(profileId);
     }
     return;
@@ -469,13 +489,33 @@ void SessionCoordinator::startCredentialRestore() {
   // or a Save/Delete that has not (yet, or ever) failed, would otherwise
   // each enqueue ANOTHER Read behind whatever is running, causing
   // unbounded queue growth and duplicate secure-store I/O once the head
-  // eventually completes. Only a Read is ever queued for credential
-  // restore purposes (signIn()/registerAccount()/signOut() are all no-ops
-  // while this profile is not yet SignedOut/SignedIn), so at most one can
-  // ever be present; search for it (it may be the in-flight head itself,
-  // or queued behind a still-pending Save/Delete chain) and rebind its
-  // continuation to this call's (current) generation instead of enqueuing
-  // a second one.
+  // eventually completes. At most one Read admitted for the CURRENT
+  // endpoint epoch can ever be present; search for it (it may be the
+  // in-flight head itself, or queued behind a still-pending Save/Delete
+  // chain) and rebind its continuation to this call's (current)
+  // generation instead of enqueuing a second one.
+  //
+  // Critically, a Read is only EVER eligible for this rebind if its
+  // captured admissionEndpointEpoch (see TokenOp's own doc comment) still
+  // matches profileEndpointEpoch(profileId) right now. A Read admitted
+  // BEFORE mutateSelectedProfile() detected an endpoint change for this
+  // profileId() (see invalidateProfileCredentialForEndpointChange(),
+  // which bumps this narrower epoch) was targeting the OLD endpoint --
+  // rebinding it to a continuation for the current (possibly NEW)
+  // endpoint would let whatever token it eventually reads (which may
+  // still be the old-endpoint token, since the required compensating
+  // Delete reserved for it is only guaranteed to run BEFORE a fresh Read,
+  // never before this stale one) be delivered to a whoami call against
+  // the new endpoint, entirely bypassing that required Delete. Such a
+  // stale Read is deliberately left un-rebound here: it remains in the
+  // FIFO with its ORIGINAL (now permanently stale-generation) onComplete,
+  // which will discard its own result the moment it fires (see the
+  // generation check inside that closure, captured above), and a FRESH
+  // Read -- admitted under the CURRENT endpoint epoch -- is enqueued
+  // below, strictly behind whatever required Delete(s)
+  // invalidateProfileCredentialForEndpointChange() already reserved,
+  // guaranteeing the deterministic old-Read -> required-Delete -> fresh-
+  // Read ordering the endpoint-change invariant depends on.
   //
   // Rebinding only ever mutates TokenOp::onComplete -- never opId or
   // attemptId -- so it cannot affect startFrontTokenOp()'s dispatch
@@ -493,8 +533,10 @@ void SessionCoordinator::startCredentialRestore() {
   // would have been a silent no-op once dispatched anyway.
   const auto queueIt = m_tokenQueues.find(profileId);
   if (queueIt != m_tokenQueues.end()) {
+    const quint64 currentEndpointEpoch = profileEndpointEpoch(profileId);
     for (int i = 0; i < queueIt->size(); ++i) {
-      if ((*queueIt)[i].kind == TokenOpKind::Read) {
+      if ((*queueIt)[i].kind == TokenOpKind::Read &&
+          (*queueIt)[i].admissionEndpointEpoch == currentEndpointEpoch) {
         (*queueIt)[i].onComplete = std::move(onComplete);
         return;
       }
@@ -903,6 +945,7 @@ void SessionCoordinator::enqueueTokenOp(
   const bool wasEmpty = queue.isEmpty();
   TokenOp op{kind, std::move(token), std::move(onComplete)};
   op.admissionEpoch = profileCredentialEpoch(profileId);
+  op.admissionEndpointEpoch = profileEndpointEpoch(profileId);
   op.opId = m_nextTokenOpId++;
   queue.enqueue(std::move(op));
   if (wasEmpty) {
@@ -1176,12 +1219,25 @@ void SessionCoordinator::invalidateProfileCredential(const QString &profileId) {
 
 void SessionCoordinator::invalidateProfileCredentialForEndpointChange(
     const QString &profileId) {
-  // First perform the ordinary epoch bump plus in-flight-Save compensation
-  // shared with every other credential-invalidating transition (switching
-  // away from a profile entirely, signing out, restarting): an auth/token
-  // Save that already crossed the ITokenStore boundary under the OLD
-  // epoch must still be compensated for if it later persists a token,
-  // exactly as when abandoning a profile.
+  // Bump the NARROW endpoint epoch FIRST, before anything else below:
+  // this is what makes any Read already queued or in flight for this
+  // profileId() -- necessarily admitted before this call, hence under the
+  // OLD endpoint epoch -- permanently ineligible for
+  // startCredentialRestore()'s rebind-dedup logic from this point
+  // forward (see TokenOp::admissionEndpointEpoch and
+  // startCredentialRestore()'s own comment). Doing this before the
+  // required Delete below is enqueued keeps every TokenOp enqueued from
+  // here on stamped with the new epoch, for consistency, even though only
+  // Read currently consults this particular counter.
+  m_profileEndpointEpoch.insert(profileId,
+                                m_profileEndpointEpoch.value(profileId, 0) + 1);
+
+  // Perform the ordinary (coarser) epoch bump plus in-flight-Save
+  // compensation shared with every other credential-invalidating
+  // transition (switching away from a profile entirely, signing out,
+  // restarting): an auth/token Save that already crossed the ITokenStore
+  // boundary under the OLD epoch must still be compensated for if it
+  // later persists a token, exactly as when abandoning a profile.
   invalidateProfileCredential(profileId);
 
   // Unlike invalidateProfileCredential()'s own conditional compensating
