@@ -12,8 +12,17 @@ MockHttpServer::MockHttpServer(QObject *parent)
   connect(m_server, &QTcpServer::newConnection, this,
           &MockHttpServer::onNewConnection);
   const bool listening = m_server->listen(QHostAddress::LocalHost, 0);
-  Q_ASSERT(listening);
-  Q_UNUSED(listening);
+  // Q_ASSERT is compiled out in release builds (or with QT_NO_DEBUG
+  // defined), which would let a listen() failure pass silently here --
+  // every test using this class would then fail downstream in a
+  // confusing way (e.g. port() == 0, connection-refused errors) rather
+  // than at the actual point of failure. qFatal() is enforced in all
+  // build types, so a bind failure is always reported immediately and
+  // unambiguously, with the real errorString() attached.
+  if (!listening) {
+    qFatal("MockHttpServer failed to listen on 127.0.0.1: %s",
+           qPrintable(m_server->errorString()));
+  }
 }
 
 MockHttpServer::~MockHttpServer() = default;
