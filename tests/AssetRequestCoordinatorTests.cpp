@@ -3589,3 +3589,69 @@ void AssetRequestCoordinatorTests::
   QVERIFY(!bool(*cancelledResult));
   QCOMPARE(cancelledResult->error().code, AssetErrorCode::Cancelled);
 }
+
+void AssetRequestCoordinatorTests::
+    requestAgainstAnInvalidlyConfiguredCacheFailsImmediatelyWithoutNetworkAccess() {
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): a negative diskMaxBytes/memoryMaxCostBytes
+  // makes the WHOLE AssetCache::Config invalid (see
+  // AssetCache::validateConfiguration()) -- previously, an
+  // AssetRequestCoordinator built against such a cache would still
+  // dispatch a real network fetch and only discover the misconfiguration
+  // much later, indirectly, as a confusing CachePersistenceFailed once
+  // store()/lookupDisk() silently failed. This proves the fixed,
+  // immediate-diagnosis behaviour: request() itself refuses to proceed
+  // at all.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  cacheConfig.diskMaxBytes = -1;
+  QVERIFY(AssetCache::validateConfiguration(cacheConfig).has_value());
+  AssetCache cache(cacheConfig);
+  QVERIFY(!cache.isValid());
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+
+  std::optional<Result> result;
+  int completions = 0;
+  const AssetRequestCoordinator::RequestHandle handle =
+      coordinator.request(key, [&](Result r) {
+        ++completions;
+        result = std::move(r);
+      });
+  QVERIFY(handle.isValid());
+
+  // Completion is still delivered asynchronously-deferred (never
+  // synchronously from inside request() itself), exactly like every
+  // other immediate-completion path (e.g. InvalidIdentifier) -- but it
+  // must arrive promptly, without ever waiting on any real network I/O.
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 2000));
+  QCOMPARE(completions, 1);
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::InvalidConfiguration);
+
+  // No network request was ever issued for this key.
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           0);
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 0);
+
+  // A second, concurrent request against the same invalid cache must
+  // independently fail the same way -- this is not accidentally
+  // "coalescing" onto some leftover state from the first call.
+  std::optional<Result> secondResult;
+  coordinator.request(key, [&](Result r) { secondResult = std::move(r); });
+  QVERIFY(QTest::qWaitFor([&]() { return secondResult.has_value(); }, 2000));
+  QVERIFY(!bool(*secondResult));
+  QCOMPARE(secondResult->error().code, AssetErrorCode::InvalidConfiguration);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           0);
+}

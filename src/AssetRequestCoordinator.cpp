@@ -149,6 +149,24 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
   // fresh network fetch) shares exactly one Operation and therefore
   // exactly one decode/fetch, with every consumer's callback appended to
   // that same operation's consumer list (see completeOperation()).
+  //
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): checked FIRST, strictly before coalescing
+  // and strictly before AssetLocator::resolveCandidates() -- an
+  // AssetCache constructed with an invalid Config (see
+  // AssetCache::isValid()/configurationError()) already permanently
+  // disables both its memory and disk tiers, so every request against
+  // it would otherwise eventually surface, several steps downstream, as
+  // a confusing CachePersistenceFailed (or a fallback chain silently
+  // exhausting itself against a cache that can never actually persist
+  // anything) instead of this immediate, exactly-typed diagnosis of the
+  // real, root cause. This coordinator never touches m_cache's disk/
+  // network paths at all once this is true.
+  if (!m_cache.isValid()) {
+    return registerImmediateCompletion(
+        key, std::move(callback),
+        AssetOutcome<AssetCache::CachedEntry>(*m_cache.configurationError()));
+  }
   const QString opKey = canonicalOperationKey(key);
   if (const std::optional<quint64> existingOperationId =
           findInFlightOperation(opKey)) {

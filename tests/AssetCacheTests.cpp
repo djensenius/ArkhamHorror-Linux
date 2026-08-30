@@ -14,6 +14,10 @@
 #include <QRegularExpression>
 #include <QTest>
 
+#if defined(Q_OS_UNIX)
+#include <sys/stat.h>
+#endif
+
 using namespace Arkham;
 
 void AssetCacheTests::init() {
@@ -53,6 +57,27 @@ AssetCache::Config configFor(const QString &dir,
   config.diskMaxBytes = diskMaxBytes;
   return config;
 }
+
+#if defined(Q_OS_UNIX)
+// Round-7 review item 4 ("quota uses logical st_size and omits root
+// allocation, while policy claims physical bytes"): diskUsageBytes()
+// now reports PHYSICAL (st_blocks*512), not logical, byte usage, and
+// now includes the cache root directory's own on-disk allocation --
+// see physicalBytesOverflowSafe()'s comment in AssetCache.cpp. Every
+// test comparing an expected total against a real path must read that
+// path's ACTUAL physical allocation back the same way (never assume it
+// equals the logical size a test happened to write), exactly as
+// strayDirectoryIsRemovedAndCountedTowardDiskUsage() already did for a
+// directory's own entry size before this round.
+qint64 physicalBytesOnDiskForTesting(const QString &path) {
+  struct stat st {};
+  const QByteArray pathUtf8 = QFile::encodeName(path);
+  if (::stat(pathUtf8.constData(), &st) != 0) {
+    return 0;
+  }
+  return static_cast<qint64>(st.st_blocks) * 512;
+}
+#endif
 
 AssetCache::CachedEntry
 makeEntry(const QByteArray &bytes,
@@ -817,6 +842,13 @@ void AssetCacheTests::strayDirectoryIsRemovedAndCountedTowardDiskUsage() {
   // repair sweep and never counted toward the quota gate that decides
   // whether to even run that sweep.
   AssetCache cache(configFor(m_tempDirPath));
+  // Round-7 review item 4: diskUsageBytes() now also credits the cache
+  // root directory's own physical allocation (see
+  // physicalBytesOnDiskForTesting()'s comment above) -- captured here,
+  // on a pristine, freshly-constructed, still-empty cache, rather than
+  // ever assumed to be a fixed/portable constant (it is filesystem- and
+  // platform-dependent) or hardcoded as literal 0.
+  const qint64 emptyCacheBaselineBytes = cache.diskUsageBytes();
 
   const QString strayDirPath =
       m_tempDirPath + QStringLiteral("/stray-planted-directory");
@@ -830,36 +862,91 @@ void AssetCacheTests::strayDirectoryIsRemovedAndCountedTowardDiskUsage() {
   QVERIFY(QFileInfo(strayDirPath).isDir());
   // Round-N+ review (MEDIUM, repeat finding, "directory storage
   // uncounted"): a directory node itself now also contributes its own
-  // on-disk entry size to the total -- read it back via QFileInfo
-  // (filesystem/platform-dependent, never a fixed constant) rather than
+  // on-disk entry size to the total -- read it back directly (physical,
+  // filesystem/platform-dependent, never a fixed constant) rather than
   // assuming the nested file's bytes are the ONLY contribution, exactly
-  // like the cross-mount case already did before this round.
-  const qint64 strayDirEntrySize = QFileInfo(strayDirPath).size();
+  // like the cross-mount case already did before this round. Round-7
+  // review item 4: both the directory's own allocation AND the nested
+  // file's allocation are now PHYSICAL (st_blocks*512), not logical --
+  // read back via physicalBytesOnDiskForTesting() rather than assumed
+  // to equal the 4096 logical bytes actually written.
+  const qint64 strayDirEntryPhysicalBytes =
+      physicalBytesOnDiskForTesting(strayDirPath);
+  const qint64 nestedFilePhysicalBytes = physicalBytesOnDiskForTesting(
+      strayDirPath + QStringLiteral("/nested-file.bin"));
 
   // diskUsageBytes() must count the nested file's bytes even though they
   // sit inside a directory this cache never created, PLUS that
-  // directory's own on-disk entry size.
-  QCOMPARE(cache.diskUsageBytes(), qint64(4096) + strayDirEntrySize);
+  // directory's own on-disk entry size, PLUS the pre-existing empty-
+  // cache baseline (the root directory's own allocation).
+  QCOMPARE(cache.diskUsageBytes(), emptyCacheBaselineBytes +
+                                       nestedFilePhysicalBytes +
+                                       strayDirEntryPhysicalBytes);
 
   cache.reapAndEnforceQuota();
 
   // The entire stray directory (and its contents) must be gone, and
-  // usage accounting must reflect that it is actually gone.
+  // usage accounting must reflect that it is actually gone -- back down
+  // to (never below) the same empty-cache baseline as before anything
+  // was planted, never a hardcoded literal 0.
   QVERIFY(!QFileInfo::exists(strayDirPath));
-  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+  QCOMPARE(cache.diskUsageBytes(), emptyCacheBaselineBytes);
 }
 
 void AssetCacheTests::quotaEvictsOldestAccessFirstDownToLowWaterMark() {
-  // A tiny quota (5 entries of ~1 KiB fit comfortably below it, but 20
-  // don't) forces eviction; the OLDEST-accessed entries must go first,
-  // down to the 75% low-water mark.
-  AssetCache cache(configFor(m_tempDirPath, 20 * 1024));
+  // A tiny quota (a few entries fit comfortably below it, but 20 don't)
+  // forces eviction; the OLDEST-accessed entries must go first, down to
+  // the 75% low-water mark.
+  //
+  // Round-7 review item 4 ("quota uses logical st_size ... policy
+  // claims physical bytes"): diskUsageBytes() now reports real,
+  // block-rounded PHYSICAL allocation, so a quota literal calibrated
+  // against a purely logical per-entry payload size (e.g. "20 entries
+  // of ~900 bytes fit under a 20*1024-byte quota") can be wildly wrong
+  // once each entry's three files (manifest+payload+metadata) each
+  // independently round up to at least one whole filesystem block --
+  // on a filesystem with a large block size, that quota could then be
+  // too small to ever hold even ONE entry, which would falsely turn
+  // this into an "everything gets evicted immediately" test rather
+  // than the "oldest evicted first, newest survives" test it's meant
+  // to be. Measure the real per-entry physical cost at runtime instead
+  // of hardcoding an assumed logical total -- the same pattern already
+  // established by memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry
+  // and
+  // diskUsageBytesReflectsPhysicalAllocationRatherThanLogicalSizeForATinyEntry.
   const QByteArray payload(900, 'x');
+  constexpr int kEntryCount = 20;
 
-  QStringList keys;
-  for (int i = 0; i < 20; ++i) {
+  AssetCache generousCache(configFor(m_tempDirPath, 512 * 1024 * 1024));
+  const qint64 emptyBaselineBytes = generousCache.diskUsageBytes();
+  QStringList probeKeys;
+  for (int i = 0; i < kEntryCount; ++i) {
     const QString key = AssetCache::cacheKeyFor(
         QUrl(QStringLiteral("https://example.com/item-%1.png").arg(i)));
+    probeKeys.append(key);
+    generousCache.store(key, makeEntry(payload));
+  }
+  const qint64 establishedTotalBytes = generousCache.diskUsageBytes();
+  const qint64 perEntryCost =
+      (establishedTotalBytes - emptyBaselineBytes + kEntryCount - 1) /
+      kEntryCount;
+  QVERIFY(perEntryCost > 0);
+
+  // A quota that comfortably fits ~5 entries (plus the empty-root
+  // baseline) but never all 20 -- enough headroom for the low-water
+  // mark's 75% target to always land strictly between "0 entries" and
+  // "kEntryCount entries" regardless of exact block-rounding.
+  const qint64 tightDiskMaxBytes = emptyBaselineBytes + 5 * perEntryCost;
+
+  const QString tightCacheRoot = m_tempDirPath + QStringLiteral("/tight");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("tight")));
+  AssetCache cache(configFor(tightCacheRoot, tightDiskMaxBytes));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  QStringList keys;
+  for (int i = 0; i < kEntryCount; ++i) {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/tight-item-%1.png").arg(i)));
     keys.append(key);
     cache.store(key, makeEntry(payload));
     // Ensure strictly increasing lastAccess ordering regardless of clock
@@ -867,7 +954,7 @@ void AssetCacheTests::quotaEvictsOldestAccessFirstDownToLowWaterMark() {
     QTest::qWait(2);
   }
 
-  QVERIFY(cache.diskUsageBytes() <= 20 * 1024);
+  QVERIFY(cache.diskUsageBytes() <= tightDiskMaxBytes);
   // The earliest-stored (and therefore least-recently-accessed) entries
   // must have been evicted first.
   QVERIFY(!cache.lookupDisk(keys.first()).has_value());
@@ -1530,6 +1617,8 @@ void AssetCacheTests::memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry() {
   const QString neverTouchedAgainKey = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/never-touched-again.png")));
   QStringList fillerKeys;
+  qint64 emptyBaselineBytes = 0;
+  qint64 establishedTotalBytes = 0;
 
   {
     // A generous quota here: nothing is evicted yet in this block. It
@@ -1538,6 +1627,12 @@ void AssetCacheTests::memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry() {
     // differently (tightly) configured instance below actually evicts
     // from.
     AssetCache cache(configFor(m_tempDirPath, /*diskMaxBytes=*/1'000'000));
+    // Round-7 review item 4: diskUsageBytes() now reports PHYSICAL
+    // (st_blocks*512) bytes, including the cache root directory's own
+    // allocation -- both filesystem- and platform-dependent, so the
+    // tight quota below is DERIVED from real, measured usage rather
+    // than a hardcoded literal that assumed logical byte sums.
+    emptyBaselineBytes = cache.diskUsageBytes();
 
     // Stored FIRST, in this order: under a naive wall-clock- or
     // store-order-only LRU scheme, keptWarmKey (stored first) would
@@ -1561,7 +1656,32 @@ void AssetCacheTests::memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry() {
     for (int i = 0; i < 3; ++i) {
       QVERIFY(cache.lookupMemory(keptWarmKey).has_value());
     }
+
+    establishedTotalBytes = cache.diskUsageBytes();
   }
+
+  // Round-7 review item 4: with physical (block-rounded) accounting,
+  // per-entry overhead is no longer a small, precisely-known constant
+  // (payload+manifest+metadata can each independently round up to a
+  // whole filesystem block) -- so the tight quota below is derived from
+  // the ACTUAL measured six-entry total rather than a literal constant
+  // that assumed pure logical-byte sums. `perEntryCost` is the average
+  // physical cost of one of the six (structurally identical: same
+  // payload size, similarly-short URL) entries above.
+  const qint64 perEntryCost =
+      (establishedTotalBytes - emptyBaselineBytes + 5) / 6;
+  QVERIFY(perEntryCost > 0);
+  // Chosen so that: (a) the high-water mark is strictly below the
+  // established six-entry total, guaranteeing the tight cache's own
+  // constructor-time reap actually triggers eviction at all; and (b)
+  // the low-water mark is at or above "baseline + exactly one entry's
+  // cost" (i.e. everything evicted except keptWarmKey), guaranteeing
+  // eviction can never need to reach keptWarmKey (the newest, by
+  // persisted access sequence, of all six) to satisfy its target --
+  // regardless of exactly how many of the four filler entries also get
+  // reclaimed along the way, which this test does not otherwise care
+  // about.
+  const qint64 tightDiskMaxBytes = emptyBaselineBytes + 3 * perEntryCost;
 
   // A second instance, configured with a small quota, stands in for a
   // later point at which this directory is discovered to exceed its
@@ -1570,7 +1690,7 @@ void AssetCacheTests::memoryOnlyHitsKeepAnEntryAliveOverAColderDiskOnlyEntry() {
   // actually checks (no auto-eviction from an earlier store() call in
   // the block above can have fired prematurely, since that block's
   // quota was always generous enough to avoid it).
-  AssetCache tightCache(configFor(m_tempDirPath, /*diskMaxBytes=*/9000));
+  AssetCache tightCache(configFor(m_tempDirPath, tightDiskMaxBytes));
 
   QVERIFY2(!QFile::exists(AssetCache::manifestPathForTesting(
                m_tempDirPath, neverTouchedAgainKey)),
@@ -1799,6 +1919,128 @@ void AssetCacheTests::
         "applicable on this platform");
 #else
   QVERIFY(AssetCache::mountIdentificationSupportedForTesting(m_tempDirPath));
+#endif
+}
+
+namespace {
+// RAII guard around AssetCache::setMountIdentificationDegradedForTesting()
+// -- guarantees the process-wide override is always reset back to false
+// even when a QVERIFY inside the test body triggers an early return, so
+// this never leaks into an unrelated, later test.
+struct MountIdentificationDegradationGuard {
+  MountIdentificationDegradationGuard(bool forceOpenat2Unavailable,
+                                      bool forceMountIdUnavailable) {
+    AssetCache::setMountIdentificationDegradedForTesting(
+        forceOpenat2Unavailable, forceMountIdUnavailable);
+  }
+  MountIdentificationDegradationGuard(
+      const MountIdentificationDegradationGuard &) = delete;
+  MountIdentificationDegradationGuard &
+  operator=(const MountIdentificationDegradationGuard &) = delete;
+  ~MountIdentificationDegradationGuard() {
+    AssetCache::setMountIdentificationDegradedForTesting(false, false);
+  }
+};
+} // namespace
+
+void AssetCacheTests::
+    cleanupAndQuotaDescentFailClosedWhenMountIdentificationIsUnavailableWithoutAnyRealMount() {
+  // Round-N+ review (HIGH, repeat finding, "cleanup can traverse
+  // same-device bind mounts when mount IDs are unavailable"): unlike
+  // crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted()
+  // above (which needs a REAL bind mount and QSKIPs without passwordless
+  // sudo, so it can never run deterministically on every CI runner),
+  // this test forces the exact two conditions a legacy kernel would
+  // present -- openat2() itself unavailable AND STATX_MNT_ID
+  // unavailable -- against a perfectly ordinary, unprivileged, entirely
+  // unmounted stray directory, and proves the fixed cleanup/quota code
+  // now fails closed instead of silently treating it as safe (the
+  // pre-fix bug: those three call sites called the PERMISSIVE
+  // mountIdentityMatches() directly, which degrades to a bare st_dev
+  // check the instant a mount id is unavailable on either side, and
+  // would have wrongly accepted this exact scenario).
+#if !defined(__linux__)
+  QSKIP("mount-identity hardening is a Linux-specific concept; not "
+        "applicable on this platform");
+#else
+  AssetCache cache(configFor(m_tempDirPath));
+
+  // An entirely ordinary same-mount stray directory with nested
+  // content -- exactly the shape
+  // strayDirectoryIsRemovedAndCountedTowardDiskUsage() already proves
+  // cleans up fine in the ordinary (non-degraded) case.
+  const QString strayDirPath =
+      m_tempDirPath + QStringLiteral("/stray-mount-degraded");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("stray-mount-degraded")));
+  {
+    QFile nested(strayDirPath + QStringLiteral("/nested-file.bin"));
+    QVERIFY(nested.open(QIODevice::WriteOnly));
+    nested.write(QByteArray(4096, 'z'));
+  }
+
+  MountIdentificationDegradationGuard guard(
+      /*forceOpenat2Unavailable=*/true, /*forceMountIdUnavailable=*/true);
+
+  // diskUsageBytes() can no longer prove the stray directory remains on
+  // the cache's own mount -- neither the kernel-native openat2()/
+  // RESOLVE_NO_XDEV guarantee nor a real STATX_MNT_ID comparison is
+  // available -- so this must now be treated as genuinely
+  // indeterminate: disk persistence disables itself rather than
+  // reporting a false, safe-looking usage total.
+  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  // The stray directory itself, and its nested file, must be left
+  // completely untouched: a fail-closed refusal to descend must never
+  // be confused with "safe to delete".
+  QVERIFY(QFileInfo::exists(strayDirPath));
+  QVERIFY(QFileInfo::exists(strayDirPath + QStringLiteral("/nested-file.bin")));
+#endif
+}
+
+void AssetCacheTests::
+    cleanupAndQuotaDescentSucceedNormallyWhenMountIdentificationIsFullyAvailable() {
+  // Negative control for the test above: with NEITHER degradation
+  // forced (the ordinary, fully-capable-kernel path this project
+  // actually targets and the default state whenever the test-only
+  // setter above is never called), the exact same directory shape must
+  // still account and clean up completely normally -- proving the
+  // fail-closed behaviour above is specific to the forced degradation
+  // and not a general regression in ordinary operation.
+#if !defined(__linux__)
+  QSKIP("mount-identity hardening is a Linux-specific concept; not "
+        "applicable on this platform");
+#else
+  MountIdentificationDegradationGuard guard(
+      /*forceOpenat2Unavailable=*/false, /*forceMountIdUnavailable=*/false);
+
+  AssetCache cache(configFor(m_tempDirPath));
+  // Round-7 review item 4: see
+  // strayDirectoryIsRemovedAndCountedTowardDiskUsage()'s matching comment above
+  // -- captured on a pristine, empty cache rather than assumed to be 0.
+  const qint64 emptyCacheBaselineBytes = cache.diskUsageBytes();
+
+  const QString strayDirPath =
+      m_tempDirPath + QStringLiteral("/stray-mount-normal");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("stray-mount-normal")));
+  {
+    QFile nested(strayDirPath + QStringLiteral("/nested-file.bin"));
+    QVERIFY(nested.open(QIODevice::WriteOnly));
+    nested.write(QByteArray(4096, 'z'));
+  }
+  const qint64 strayDirEntryPhysicalBytes =
+      physicalBytesOnDiskForTesting(strayDirPath);
+  const qint64 nestedFilePhysicalBytes = physicalBytesOnDiskForTesting(
+      strayDirPath + QStringLiteral("/nested-file.bin"));
+
+  QCOMPARE(cache.diskUsageBytes(), emptyCacheBaselineBytes +
+                                       nestedFilePhysicalBytes +
+                                       strayDirEntryPhysicalBytes);
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  cache.reapAndEnforceQuota();
+  QVERIFY(!QFileInfo::exists(strayDirPath));
+  QCOMPARE(cache.diskUsageBytes(), emptyCacheBaselineBytes);
 #endif
 }
 
@@ -2143,6 +2385,121 @@ void AssetCacheTests::
       QFileInfo(m_tempDirPath + QStringLiteral("/does-not-exist-yet")).isDir());
 }
 
+namespace {
+// RAII guard around a temporary $HOME override -- QDir::homePath()
+// reads $HOME fresh from the environment on every call on Unix (never
+// cached at static-init time), so overriding it here is sufficient to
+// redirect resolveTrustedDirectoryNoFollow()'s home-anchored branch at
+// an entirely fake, test-constructed directory tree. Restores the
+// PRIOR value (or unsets it, if it was never set to begin with) in the
+// destructor so this never leaks into an unrelated, later test -- most
+// importantly init()'s own QTemporaryDir construction, which itself
+// depends on QDir::homePath() to place every test's temp directory.
+struct HomeEnvOverrideGuard {
+  explicit HomeEnvOverrideGuard(const QString &fakeHome)
+      : m_hadOriginal(qEnvironmentVariableIsSet("HOME")),
+        m_originalHome(qgetenv("HOME")) {
+    qputenv("HOME", fakeHome.toUtf8());
+  }
+  HomeEnvOverrideGuard(const HomeEnvOverrideGuard &) = delete;
+  HomeEnvOverrideGuard &operator=(const HomeEnvOverrideGuard &) = delete;
+  ~HomeEnvOverrideGuard() {
+    if (m_hadOriginal) {
+      qputenv("HOME", m_originalHome);
+    } else {
+      qunsetenv("HOME");
+    }
+  }
+  bool m_hadOriginal;
+  QByteArray m_originalHome;
+};
+} // namespace
+
+void AssetCacheTests::
+    intermediateSymlinkWithinTheHomePathItselfIsRejectedEvenForAPreexistingLeaf() {
+  // Round-N+ review (MEDIUM, repeat finding, "default cache still
+  // trusts an already-resolved multi-component home path"): the fake
+  // home's OWN path is
+  // "<tempDir>/fake-home-parent/ancestor-link/actual-home", where
+  // "ancestor-link" -- an ANCESTOR of home, not home's own final
+  // component -- is a symlink to a completely separate sentinel
+  // location. "actual-home" is precreated UNDER the sentinel so the
+  // complete home path resolves successfully via ordinary,
+  // symlink-following path resolution (QFileInfo::exists() on the full
+  // path would report true) -- exactly the shape that defeated the
+  // pre-fix single leaf-only O_NOFOLLOW open() of the whole home path
+  // string, which only ever inspected home's OWN final component.
+  const QString sentinelDir =
+      m_tempDirPath + QStringLiteral("/home-attack-sentinel");
+  QVERIFY(QDir().mkpath(sentinelDir + QStringLiteral("/actual-home")));
+  const QString sentinelFile =
+      sentinelDir + QStringLiteral("/pre-existing.txt");
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("must-not-be-touched"));
+  }
+
+  const QString fakeHomeParent =
+      m_tempDirPath + QStringLiteral("/fake-home-parent");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+  const QString ancestorLink =
+      fakeHomeParent + QStringLiteral("/ancestor-link");
+  QVERIFY(QFile::link(sentinelDir, ancestorLink));
+  QVERIFY(QFileInfo(ancestorLink).isSymLink());
+
+  const QString fakeHome = ancestorLink + QStringLiteral("/actual-home");
+  // Confirm the attack shape is real: the leaf exists (through the
+  // symlink) before this test ever overrides $HOME or calls the
+  // resolver under test.
+  QVERIFY(QFileInfo::exists(fakeHome));
+  QVERIFY(!QFileInfo(fakeHome).isSymLink());
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+
+  // Purely a read-only refusal: nothing was ever created through or
+  // alongside the symlink, and the sentinel's own pre-existing content
+  // is exactly as it was.
+  QVERIFY(!QFileInfo::exists(fakeHome + QStringLiteral("/assets")));
+  QVERIFY(QFileInfo::exists(sentinelFile));
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("must-not-be-touched"));
+  }
+  QVERIFY(QFileInfo(ancestorLink).isSymLink());
+}
+
+void AssetCacheTests::
+    ordinaryMultiComponentHomePathWithNoSymlinksResolvesSuccessfully() {
+  // Negative control for the test above: an entirely ordinary,
+  // symlink-free fake home (still multi-component, still reached only
+  // via a $HOME override) must resolve and even auto-create its owned
+  // suffix normally -- proving the rejection above is specific to the
+  // planted symlink, not a general regression whenever $HOME simply
+  // differs from this test process's own real home.
+  const QString fakeHome =
+      m_tempDirPath + QStringLiteral("/ordinary-fake-home-parent/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+
+  QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
+  QVERIFY(!QFileInfo(configuredUnderFakeHome).isSymLink());
+}
+
 void AssetCacheTests::
     configuredDirectoryWithMissingLeafUnderHomeIsNeverAutoCreated() {
   // Round-9+ review: the new home-anchored walker must preserve the
@@ -2297,6 +2654,25 @@ void AssetCacheTests::
   invalidConfig.diskMaxBytes = -1;
   AssetCache cache(invalidConfig);
   QVERIFY(cache.isDiskCacheDisabledForTesting());
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): the object-level defense-in-depth above
+  // (isDiskCacheDisabledForTesting()) is preserved, but this instance
+  // must ALSO expose the fact that its whole configuration is invalid,
+  // via the same typed AssetErrorCode::InvalidConfiguration
+  // AssetNetworkFetcher already uses for its own analogous
+  // constructor-time validation -- see AssetCache::create()/isValid()/
+  // configurationError(). AssetRequestCoordinatorTests exercises the
+  // consumer-facing half of this: a coordinator built against exactly
+  // this kind of cache must refuse every request immediately rather
+  // than ever reaching this destructive disk logic at all.
+  QVERIFY(!cache.isValid());
+  QVERIFY(cache.configurationError().has_value());
+  QCOMPARE(cache.configurationError()->code,
+           AssetErrorCode::InvalidConfiguration);
+  QVERIFY(AssetCache::validateConfiguration(invalidConfig).has_value());
+  const auto factoryResult = AssetCache::create(invalidConfig);
+  QVERIFY(!factoryResult);
+  QCOMPARE(factoryResult.error().code, AssetErrorCode::InvalidConfiguration);
 
   // The pre-seeded entry on disk must be completely untouched -- the
   // invalid-config instance never enumerated, evicted, or otherwise
@@ -2321,6 +2697,18 @@ void AssetCacheTests::
   invalidConfig.memoryMaxCostBytes = -1;
   AssetCache cache(invalidConfig);
   QVERIFY(!cache.isDiskCacheDisabledForTesting());
+  // Round-N+ review (MEDIUM, repeat finding): same typed-error surface
+  // as the disk-side companion above -- a negative memoryMaxCostBytes
+  // makes the WHOLE config invalid, not just the memory tier, even
+  // though disk persistence itself remains independently functional
+  // for defense-in-depth.
+  QVERIFY(!cache.isValid());
+  QVERIFY(cache.configurationError().has_value());
+  QCOMPARE(cache.configurationError()->code,
+           AssetErrorCode::InvalidConfiguration);
+  const auto factoryResult = AssetCache::create(invalidConfig);
+  QVERIFY(!factoryResult);
+  QCOMPARE(factoryResult.error().code, AssetErrorCode::InvalidConfiguration);
 
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/negative-memory-limit.png")));
@@ -2330,6 +2718,141 @@ void AssetCacheTests::
   // But nothing survives in the in-process memory cache: setMaxCost(0)
   // means QCache evicts on insertion.
   QVERIFY(!cache.lookupMemory(key).has_value());
+}
+
+void AssetCacheTests::
+    validateConfigurationAndCreateAcceptEveryOrdinaryValidConfig() {
+  // Positive control for the two typed-rejection tests below, and for
+  // the negative-limit tests above: an entirely ordinary, valid Config
+  // -- including the exact default-constructed Config() a real caller
+  // would use when it has no reason to override any limit -- must never
+  // be rejected.
+  const AssetCache::Config validConfig = configFor(m_tempDirPath);
+  QVERIFY(!AssetCache::validateConfiguration(validConfig).has_value());
+  const auto factoryResult = AssetCache::create(validConfig);
+  QVERIFY(factoryResult.has_value());
+  QVERIFY(*factoryResult != nullptr);
+  QVERIFY((*factoryResult)->isValid());
+  QVERIFY(!(*factoryResult)->configurationError().has_value());
+
+  QVERIFY(!AssetCache::validateConfiguration(AssetCache::Config()).has_value());
+  const auto defaultFactoryResult = AssetCache::create();
+  QVERIFY(defaultFactoryResult.has_value());
+  QVERIFY((*defaultFactoryResult)->isValid());
+}
+
+void AssetCacheTests::
+    validateConfigurationAndCreateRejectNegativeDiskOrMemoryLimitsAsInvalidConfiguration() {
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): the standalone, pure validator (and the
+  // create() factory built on it) must independently agree with the
+  // constructor's own defense-in-depth disabling -- see
+  // negativeDiskMaxBytesDisablesDiskCacheInsteadOfDestructivelyEvicting()
+  // and negativeMemoryMaxCostBytesDisablesMemoryCacheRatherThanCrashing()
+  // above, which assert the SAME thing from the already-constructed
+  // instance's own side.
+  AssetCache::Config negativeDisk = configFor(m_tempDirPath);
+  negativeDisk.diskMaxBytes = -1;
+  const auto diskError = AssetCache::validateConfiguration(negativeDisk);
+  QVERIFY(diskError.has_value());
+  QCOMPARE(diskError->code, AssetErrorCode::InvalidConfiguration);
+  const auto diskFactoryResult = AssetCache::create(negativeDisk);
+  QVERIFY(!diskFactoryResult.has_value());
+  QCOMPARE(diskFactoryResult.error().code,
+           AssetErrorCode::InvalidConfiguration);
+
+  AssetCache::Config negativeMemory = configFor(m_tempDirPath);
+  negativeMemory.memoryMaxCostBytes = -1;
+  const auto memoryError = AssetCache::validateConfiguration(negativeMemory);
+  QVERIFY(memoryError.has_value());
+  QCOMPARE(memoryError->code, AssetErrorCode::InvalidConfiguration);
+  const auto memoryFactoryResult = AssetCache::create(negativeMemory);
+  QVERIFY(!memoryFactoryResult.has_value());
+  QCOMPARE(memoryFactoryResult.error().code,
+           AssetErrorCode::InvalidConfiguration);
+}
+
+void AssetCacheTests::
+    diskUsageBytesReflectsPhysicalAllocationRatherThanLogicalSizeForATinyEntry() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("st_blocks-based physical accounting is a POSIX/Unix concept; "
+        "not applicable on this platform");
+#else
+  // Round-7 review item 4 ("quota uses logical st_size ... policy
+  // claims physical bytes"): a payload of only a few bytes still
+  // consumes at least one whole filesystem block on real disk (and so
+  // do its sibling manifest/metadata files) -- diskUsageBytes() must
+  // reflect that real, physical cost, never the tiny logical byte
+  // count, or a cache holding many small entries could badly
+  // undercount how much real space it actually occupies, letting
+  // quota enforcement never trip at all.
+  AssetCache cache(configFor(m_tempDirPath));
+  const qint64 emptyBaselineBytes = cache.diskUsageBytes();
+  const qint64 rootBaselinePhysicalBytes =
+      physicalBytesOnDiskForTesting(m_tempDirPath);
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/tiny-payload.png")));
+  const QByteArray tinyPayload(3, 'x'); // far smaller than any real block
+  cache.store(key, makeEntry(tinyPayload));
+
+  const qint64 afterStoreBytes = cache.diskUsageBytes();
+  const qint64 creditedBytes = afterStoreBytes - emptyBaselineBytes;
+
+  // Three logical bytes of payload can never, by itself, explain the
+  // real, physical cost of a payload file PLUS a manifest file PLUS a
+  // metadata file, each independently rounded up to at least one whole
+  // block.
+  QVERIFY2(
+      creditedBytes > tinyPayload.size(),
+      qPrintable(QStringLiteral("expected physical (block-rounded) accounting "
+                                "to exceed the tiny logical payload size of %1 "
+                                "bytes, but credited only %2 bytes")
+                     .arg(tinyPayload.size())
+                     .arg(creditedBytes)));
+
+  // And this must agree EXACTLY with directly stat()-ing the real
+  // payload/manifest/metadata files on disk via the same physical
+  // (st_blocks*512) convention -- never merely "some inflation", but
+  // precisely the same accounting diskUsageBytes() itself now uses.
+  // The generation identifier is a fresh, unique value minted per
+  // store() call (see mintGenerationIdLocked()'s comment) -- NOT a
+  // deterministic function of the payload bytes -- so it must be read
+  // back from the manifest this store() just published, never
+  // recomputed from a hash.
+  const QString manifestPathForKey =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
+  QFile manifestFile(manifestPathForKey);
+  QVERIFY(manifestFile.open(QIODevice::ReadOnly));
+  const QJsonDocument manifestDoc =
+      QJsonDocument::fromJson(manifestFile.readAll());
+  manifestFile.close();
+  QVERIFY(manifestDoc.isObject());
+  const QString generation =
+      manifestDoc.object().value(QStringLiteral("generation")).toString();
+  QVERIFY(!generation.isEmpty());
+  const qint64 manifestPhysicalBytes =
+      physicalBytesOnDiskForTesting(manifestPathForKey);
+  const qint64 payloadPhysicalBytes = physicalBytesOnDiskForTesting(
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation));
+  const qint64 metadataPhysicalBytes = physicalBytesOnDiskForTesting(
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation));
+  // On some real filesystems (e.g. ext4, whose directories store
+  // entries inline in the directory's own data blocks), adding three
+  // new directory entries to the cache root can itself grow the ROOT
+  // directory's own physical allocation -- diskUsageBytesLocked()
+  // legitimately folds that root growth into its total (that's the
+  // whole point of this review item: "include root directory"), so the
+  // credited delta can exceed the sum of the three sibling files' own
+  // physical bytes by exactly however much the root itself grew.
+  // Account for that explicitly rather than assuming the root's own
+  // size never changes.
+  const qint64 rootPhysicalBytesDelta =
+      physicalBytesOnDiskForTesting(m_tempDirPath) - rootBaselinePhysicalBytes;
+  QVERIFY(rootPhysicalBytesDelta >= 0);
+  QCOMPARE(creditedBytes, rootPhysicalBytesDelta + manifestPhysicalBytes +
+                              payloadPhysicalBytes + metadataPhysicalBytes);
+#endif
 }
 
 void AssetCacheTests::

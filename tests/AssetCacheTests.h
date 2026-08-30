@@ -131,6 +131,27 @@ private slots:
   // pre-existing) via the same secure, no-follow walker.
   void cleanInstallWithEntirelyMissingCacheHierarchyIsCreatedSecurely();
 
+  // Round-N+ review (MEDIUM, repeat finding, "default cache still
+  // trusts an already-resolved multi-component home path"): unlike
+  // every OTHER symlink test above (which plants the symlink inside the
+  // CONFIGURED suffix beneath an already-trusted anchor), this plants
+  // the symlink INSIDE the user's own HOME path itself -- an ancestor
+  // of home, not home's final component -- which the pre-fix single
+  // leaf-only O_NOFOLLOW open() of the complete home path string could
+  // never see at all. Overrides $HOME (restored via RAII guard) to a
+  // multi-component fake home whose own ancestor is a symlink pointing
+  // at an external sentinel, and proves resolution is rejected before
+  // ever reaching the caller's owned suffix.
+  void
+  intermediateSymlinkWithinTheHomePathItselfIsRejectedEvenForAPreexistingLeaf();
+  // Positive control for the test above: an entirely ordinary,
+  // symlink-free fake home (still multi-component, still overriding
+  // $HOME) must resolve successfully -- proving the rejection above is
+  // specific to the planted symlink, not a general regression in home
+  // resolution whenever $HOME happens to differ from this test
+  // process's own real home.
+  void ordinaryMultiComponentHomePathWithNoSymlinksResolvesSuccessfully();
+
   // Round-9+ review: for a caller-supplied Config::directory, this
   // resolver must still never auto-create ANY missing component, even
   // when every component up to the last is already present -- exactly
@@ -159,6 +180,24 @@ private slots:
   void negativeDiskMaxBytesDisablesDiskCacheInsteadOfDestructivelyEvicting();
   void negativeMemoryMaxCostBytesDisablesMemoryCacheRatherThanCrashing();
 
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): AssetCache::validateConfiguration()/
+  // create() give a caller a way to reject an invalid Config with a
+  // typed AssetErrorCode::InvalidConfiguration BEFORE ever constructing
+  // anything, mirroring AssetNetworkFetcher::validateConfiguration()/
+  // create()'s own already-established convention exactly.
+  void validateConfigurationAndCreateAcceptEveryOrdinaryValidConfig();
+  void
+  validateConfigurationAndCreateRejectNegativeDiskOrMemoryLimitsAsInvalidConfiguration();
+
+  // Round-7 review item 4 ("quota uses logical st_size and omits root
+  // allocation, while policy claims physical bytes"): diskUsageBytes()
+  // must report REAL, physical (block-rounded) on-disk allocation --
+  // never a tiny entry's merely-logical byte count, which would badly
+  // undercount actual space consumed by many small entries.
+  void
+  diskUsageBytesReflectsPhysicalAllocationRatherThanLogicalSizeForATinyEntry();
+
   // Round-9+ review (HIGH): invalidate()/deleteEntry() must never
   // report a key as durably, authoritatively gone when root
   // verification failing on THIS call is the only reason nothing was
@@ -185,6 +224,29 @@ private slots:
   // empty" -- and must disable disk persistence for this instance
   // rather than silently under-reporting real, resident usage.
   void unreadableNestedSubtreeDisablesPersistenceRatherThanReportingZeroUsage();
+
+  // Round-N+ review (HIGH, repeat finding): cleanup/quota descent used
+  // to reach a same-device bind mount through a bare openat() plus the
+  // PERMISSIVE mountIdentityMatches() comparator at three separate
+  // runtime call sites (safeRemoveEntryAt()'s recursive delete,
+  // safeRemoveTreeRelative()'s own initial open, and
+  // sumUsageRelative()'s recursive descent), none of which were routed
+  // through the fail-closed policy construction-time hardening already
+  // used. Deterministically forces BOTH legacy-kernel degradations
+  // (openat2() unavailable AND STATX_MNT_ID unavailable) against an
+  // entirely ordinary, unprivileged, unmounted directory tree -- no
+  // real bind mount, no sudo, never skipped -- and proves cleanup and
+  // quota accounting now both fail closed rather than silently treating
+  // it as safe to descend.
+  void
+  cleanupAndQuotaDescentFailClosedWhenMountIdentificationIsUnavailableWithoutAnyRealMount();
+  // Negative control for the test above: with NEITHER degradation
+  // forced (the ordinary, fully-capable-kernel path this project
+  // actually targets), the exact same directory tree must still clean
+  // up and account normally -- proving the fail-closed behaviour above
+  // is specific to the forced degradation, not a general regression.
+  void
+  cleanupAndQuotaDescentSucceedNormallyWhenMountIdentificationIsFullyAvailable();
 
 private:
   QString m_tempDirPath;

@@ -152,6 +152,16 @@ private slots:
   // result.
   void staleCancelledAttemptCallbackNeverCorruptsReplacementNetworkFetch();
   void staleCancelledAttemptCallbackNeverCorruptsReplacementRevalidation();
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): a coordinator constructed against a cache
+  // whose Config failed AssetCache::validateConfiguration() (see
+  // AssetCache::isValid()/configurationError()) must refuse to ever
+  // touch it -- every request() completes immediately, synchronously-
+  // deferred exactly like every other immediate-completion path, with
+  // AssetErrorCode::InvalidConfiguration, and no network request is
+  // ever issued at all.
+  void
+  requestAgainstAnInvalidlyConfiguredCacheFailsImmediatelyWithoutNetworkAccess();
 
 private:
   QString m_tempDirPath;

@@ -13,6 +13,7 @@
 #include <QSet>
 #include <QStandardPaths>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -250,6 +251,24 @@ struct MountIdentity {
   bool hasMountId{false};
 };
 
+// Round-N+ review (HIGH, "tests must inject mount-ID unavailable
+// without privileged/skipped mount setup"): every prior test for this
+// area could only exercise the strict, fail-closed, openat2-unavailable
+// path by way of a REAL bind mount, which needs passwordless sudo this
+// environment/CI cannot guarantee, and QSKIPs otherwise -- leaving the
+// actual fail-closed behaviour genuinely UNTESTED whenever that
+// privilege happens to be absent. These two process-wide, test-only
+// overrides let a test deterministically force the exact two
+// degradations a legacy kernel would present -- "openat2() itself is
+// unimplemented" (ENOSYS) and "STATX_MNT_ID is unavailable" -- against
+// perfectly ordinary, unprivileged, non-mounted directories, and
+// observe that the resulting fail-closed refusal is real. Both default
+// to false (the ordinary, fully-capable-kernel path) and are reset in
+// the test's own scope guard; production code paths never read or
+// depend on these outside of a test binary calling the setter below.
+std::atomic<bool> g_forceOpenat2UnavailableForTesting{false};
+std::atomic<bool> g_forceMountIdUnavailableForTesting{false};
+
 #if defined(__linux__) && defined(STATX_MNT_ID)
 std::optional<quint64> mountIdViaStatx(int dirFd, const char *name,
                                        int extraFlags) {
@@ -274,6 +293,9 @@ MountIdentity mountIdentityRelative(int dirFd, const char *name,
                                     const struct stat &st) {
   MountIdentity identity;
   identity.device = static_cast<quint64>(st.st_dev);
+  if (g_forceMountIdUnavailableForTesting.load(std::memory_order_relaxed)) {
+    return identity;
+  }
 #if defined(__linux__) && defined(STATX_MNT_ID)
   if (const auto mountId = mountIdViaStatx(dirFd, name, AT_SYMLINK_NOFOLLOW)) {
     identity.mountId = *mountId;
@@ -297,6 +319,9 @@ MountIdentity mountIdentityForFd(int fd) {
     return identity;
   }
   identity.device = static_cast<quint64>(st.st_dev);
+  if (g_forceMountIdUnavailableForTesting.load(std::memory_order_relaxed)) {
+    return identity;
+  }
 #if defined(__linux__) && defined(STATX_MNT_ID)
   if (const auto mountId = mountIdViaStatx(fd, "", AT_EMPTY_PATH)) {
     identity.mountId = *mountId;
@@ -372,16 +397,18 @@ int openDirectoryComponentNoFollow(int dirFd, const char *name,
     *usedStrongNoXdev = false;
   }
 #if defined(ARKHAM_HAVE_OPENAT2_UAPI)
-  errno = 0;
-  const int viaOpenat2 = openat2NoFollowNoXdev(dirFd, name, true);
-  if (viaOpenat2 >= 0) {
-    if (usedStrongNoXdev) {
-      *usedStrongNoXdev = true;
+  if (!g_forceOpenat2UnavailableForTesting.load(std::memory_order_relaxed)) {
+    errno = 0;
+    const int viaOpenat2 = openat2NoFollowNoXdev(dirFd, name, true);
+    if (viaOpenat2 >= 0) {
+      if (usedStrongNoXdev) {
+        *usedStrongNoXdev = true;
+      }
+      return viaOpenat2;
     }
-    return viaOpenat2;
-  }
-  if (errno != ENOSYS) {
-    return -1;
+    if (errno != ENOSYS) {
+      return -1;
+    }
   }
 #endif
   return openat(dirFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -435,6 +462,63 @@ bool mountIdentityMatchesStrictRequiringMountId(const MountIdentity &actual,
          actual.device == expected.device && actual.mountId == expected.mountId;
 }
 #endif
+
+// Round-N+ review (HIGH, repeat finding, "cleanup can traverse
+// same-device bind mounts when mount IDs are unavailable"): opens `name`
+// (a directory entry relative to `dirFd`) for further no-follow descent,
+// applying EXACTLY the same policy openDirectoryChainNoFollow() already
+// applies while constructing a fresh cache root: prefer the kernel-
+// native openat2()/RESOLVE_NO_XDEV guarantee (which alone already
+// refuses any cross-mount open outright, regardless of whether
+// STATX_MNT_ID happens to be separately available), and -- ONLY when
+// that kernel-native guarantee itself is unavailable on this kernel/
+// build (openat2() reporting ENOSYS) -- fall back to the STRICT,
+// mount-id-REQUIRED comparator that fails closed rather than silently
+// degrading to a bare st_dev comparison.
+//
+// A prior round of this review closed this exact gap for directory-
+// chain CREATION (openDirectoryChainNoFollow()) but left it open for
+// every LATER descent into an already-established cache tree: both
+// `safeRemoveEntryAt()`'s recursive delete and `sumUsageRelative()`'s
+// quota-accounting walk previously called plain `openat()` followed by
+// the PERMISSIVE `mountIdentityMatches()` (which silently accepts a
+// same-device bind mount the instant mount ids are unavailable on
+// either side) directly, rather than going through this shared,
+// fail-closed helper -- meaning a same-device bind mount planted AFTER
+// this cache's own root was constructed (so it was never seen by the
+// construction-time hardening at all) could still be recursively
+// deleted or have its bytes silently counted toward quota. Both call
+// sites now route through this one function instead, so there is a
+// single, shared no-follow-descent-plus-mount-authentication policy for
+// every directory descent this cache ever performs after construction,
+// not three independently-drifting copies of the same logic.
+//
+// Returns -1 (with no descriptor left open) the instant either the open
+// itself fails OR the resulting descriptor cannot be proven to remain on
+// `expectedMount`.
+int openSubdirectoryNoFollowMountChecked(int dirFd, const char *name,
+                                         const MountIdentity &expectedMount) {
+  bool usedStrongNoXdev = false;
+  const int childFd =
+      openDirectoryComponentNoFollow(dirFd, name, &usedStrongNoXdev);
+  if (childFd < 0) {
+    return -1;
+  }
+  bool mountOk;
+#if defined(__linux__)
+  mountOk = usedStrongNoXdev ? mountIdentityMatches(mountIdentityForFd(childFd),
+                                                    expectedMount)
+                             : mountIdentityMatchesStrictRequiringMountId(
+                                   mountIdentityForFd(childFd), expectedMount);
+#else
+  mountOk = mountIdentityMatches(mountIdentityForFd(childFd), expectedMount);
+#endif
+  if (!mountOk) {
+    ::close(childFd);
+    return -1;
+  }
+  return childFd;
+}
 
 // Opens `name` relative to `dirFd` for reading, verifying (via fstat on
 // the RESULTING DESCRIPTOR -- never a second path-based stat) that what
@@ -845,17 +929,22 @@ bool isValidKey(const QString &key) {
 // component is then a hard rejection (std::nullopt) rather than an
 // mkdirat() call, with no duplicated fstatat/openat logic between the
 // two policies.
+// Round-N+ review (MEDIUM, repeat finding, "default cache still trusts
+// an already-resolved multi-component home path"): the per-component
+// no-follow-walk-plus-mount-authentication loop itself, factored out
+// from openDirectoryChainNoFollow() so a caller that has independently
+// derived and explicitly authenticated its own STARTING anchor
+// descriptor (see resolveHomeDirectoryNoFollow()'s comment) can walk a
+// further owned suffix beneath it without ever re-deriving that anchor
+// from a path string -- doing so would reintroduce exactly the "trust a
+// whole path string as one opaque anchor" gap this function's own
+// caller exists to close. Takes ownership of `anchorFd` (closes it, or
+// returns it directly unchanged when `ownedSuffixComponents` is empty).
 std::optional<int>
-openDirectoryChainNoFollow(const QString &trustedAnchorPath,
-                           const QStringList &ownedSuffixComponents,
-                           bool allowCreateMissingComponents = true) {
-  const QByteArray anchorUtf8 = QFile::encodeName(trustedAnchorPath);
-  int currentFd = ::open(anchorUtf8.constData(),
-                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (currentFd < 0) {
-    return std::nullopt;
-  }
-  const MountIdentity anchorMount = mountIdentityForFd(currentFd);
+walkOwnedSuffixNoFollowFromFd(int anchorFd, const MountIdentity &anchorMount,
+                              const QStringList &ownedSuffixComponents,
+                              bool allowCreateMissingComponents) {
+  int currentFd = anchorFd;
   for (const QString &component : ownedSuffixComponents) {
     const QByteArray componentUtf8 = component.toUtf8();
     struct stat st {};
@@ -932,6 +1021,117 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
   return currentFd;
 }
 
+std::optional<int>
+openDirectoryChainNoFollow(const QString &trustedAnchorPath,
+                           const QStringList &ownedSuffixComponents,
+                           bool allowCreateMissingComponents = true) {
+  const QByteArray anchorUtf8 = QFile::encodeName(trustedAnchorPath);
+  const int anchorFd = ::open(anchorUtf8.constData(),
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (anchorFd < 0) {
+    return std::nullopt;
+  }
+  const MountIdentity anchorMount = mountIdentityForFd(anchorFd);
+  return walkOwnedSuffixNoFollowFromFd(anchorFd, anchorMount,
+                                       ownedSuffixComponents,
+                                       allowCreateMissingComponents);
+}
+
+// Round-N+ review (MEDIUM, repeat finding, "default cache still trusts
+// an already-resolved multi-component home path"): resolves the
+// process's own user home directory (QDir::homePath()) as a fully
+// no-follow-WALKED, mount-transition-AUTHENTICATED directory
+// descriptor, rather than trusting the complete, possibly-multi-
+// component home path string as a single opaque anchor opened via one
+// leaf-only O_NOFOLLOW open() call (which protects only home's OWN
+// final path component -- an intermediate symlink earlier in the home
+// path itself, e.g. an attacker-planted "/home" symlink ancestor of
+// "/home/steamuser", was previously followed transparently before any
+// descriptor-relative validation ever began).
+//
+// Every component of home's own path is walked no-follow from the
+// filesystem root "/" -- exactly like an outside-home configured path
+// -- with ONE deliberate, explicitly-authenticated exception: a mount
+// TRANSITION is permitted (recorded, never silently assumed) at the
+// single point where the walk lands on the home directory itself. Home
+// commonly sits on its own separate partition/mount from "/" on a real
+// multi-mount system (e.g. a dedicated "/home" mount) -- that is
+// ordinary, expected configuration, not an attack -- but no OTHER mount
+// transition is permitted anywhere else in home's own ancestor path
+// (walked with the same full same-mount-throughout policy
+// openDirectoryChainNoFollow() already applies to an outside-home
+// path), nor, via the mount identity this function returns becoming the
+// new trusted anchor for whatever the caller walks BENEATH home, in the
+// caller's own owned suffix either.
+std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
+  const QString home = QDir::cleanPath(QDir::homePath());
+  if (home.isEmpty() || !home.startsWith(QLatin1Char('/'))) {
+    return std::nullopt;
+  }
+  if (home == QStringLiteral("/")) {
+    // Degenerate (home IS the filesystem root, e.g. a minimal container
+    // with no dedicated home directory at all) -- "/" can never itself
+    // be a symlink, so it needs no component walk of its own.
+    const int fd = ::open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+      return std::nullopt;
+    }
+    return std::make_pair(fd, mountIdentityForFd(fd));
+  }
+  const QStringList homeComponents =
+      home.mid(1).split(QLatin1Char('/'), Qt::SkipEmptyParts);
+  if (homeComponents.isEmpty()) {
+    return std::nullopt;
+  }
+  const QStringList ancestorComponents =
+      homeComponents.mid(0, homeComponents.size() - 1);
+  const QString finalComponent = homeComponents.last();
+  // Every ancestor of home's own final directory is walked no-follow
+  // from "/", with FULL same-mount-throughout continuity enforced --
+  // exactly the outside-home policy, no transition permitted anywhere
+  // in this part of the walk. `allowCreateMissingComponents=false`:
+  // this application never creates any part of the user's own home
+  // directory hierarchy.
+  const std::optional<int> ancestorFd =
+      openDirectoryChainNoFollow(QStringLiteral("/"), ancestorComponents,
+                                 /*allowCreateMissingComponents=*/false);
+  if (!ancestorFd) {
+    return std::nullopt;
+  }
+  const QByteArray finalComponentUtf8 = finalComponent.toUtf8();
+  struct stat st {};
+  if (fstatat(*ancestorFd, finalComponentUtf8.constData(), &st,
+              AT_SYMLINK_NOFOLLOW) != 0 ||
+      !S_ISDIR(st.st_mode)) {
+    // Missing, or exists but is a symlink node/non-directory object --
+    // AT_SYMLINK_NOFOLLOW's stat reports S_ISLNK for a symlink, never
+    // S_ISDIR, so a home directory itself pre-planted as a symlink is
+    // rejected here too, before any open is even attempted.
+    ::close(*ancestorFd);
+    return std::nullopt;
+  }
+  const int homeFd = openat(*ancestorFd, finalComponentUtf8.constData(),
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  ::close(*ancestorFd);
+  if (homeFd < 0) {
+    return std::nullopt;
+  }
+  struct stat openedSt {};
+  if (::fstat(homeFd, &openedSt) != 0 || !S_ISDIR(openedSt.st_mode)) {
+    // TOCTOU re-check on the actual opened descriptor: refuses a
+    // replace-with-symlink race between the fstatat() above and this
+    // open, exactly like every other no-follow walk step in this file.
+    ::close(homeFd);
+    return std::nullopt;
+  }
+  // The mount transition landing on home itself is explicitly permitted
+  // and recorded here -- deliberately NOT compared against ancestorFd's
+  // mount -- see this function's own comment for why that is the one
+  // authenticated exception to this project's otherwise-strict
+  // same-mount-throughout policy.
+  return std::make_pair(homeFd, mountIdentityForFd(homeFd));
+}
+
 // Round-9+ review (HIGH, repeated across multiple prior rounds without
 // full resolution): resolves `absoluteTargetPathIn` -- either the OS-
 // provided default cache location plus this application's own
@@ -996,6 +1196,24 @@ resolveTrustedDirectoryNoFollow(const QString &absoluteTargetPathIn,
   if (!home.isEmpty() &&
       (absoluteTargetPath == home ||
        absoluteTargetPath.startsWith(home + QLatin1Char('/')))) {
+    // Round-N+ review (MEDIUM, repeat finding, "default cache still
+    // trusts an already-resolved multi-component home path"): home
+    // itself is now resolved via resolveHomeDirectoryNoFollow() -- a
+    // full no-follow walk of home's OWN path components, with an
+    // explicitly authenticated (not silently trusted) single permitted
+    // mount transition landing on home itself -- rather than opened as
+    // one opaque path string via a single leaf-only O_NOFOLLOW open()
+    // (see that function's own comment for the full rationale). The
+    // caller's owned suffix beneath home is then walked from that
+    // ALREADY-OPEN, already-authenticated descriptor via
+    // walkOwnedSuffixNoFollowFromFd(), never by re-deriving a path
+    // string.
+    const std::optional<std::pair<int, MountIdentity>> homeResolved =
+        resolveHomeDirectoryNoFollow();
+    if (!homeResolved) {
+      return std::nullopt;
+    }
+    const auto &[homeFd, homeMount] = *homeResolved;
     const QString relativeToHome =
         absoluteTargetPath == home ? QString()
                                    : absoluteTargetPath.mid(home.length() + 1);
@@ -1003,8 +1221,8 @@ resolveTrustedDirectoryNoFollow(const QString &absoluteTargetPathIn,
         relativeToHome.isEmpty()
             ? QStringList{}
             : relativeToHome.split(QLatin1Char('/'), Qt::SkipEmptyParts);
-    return openDirectoryChainNoFollow(home, components,
-                                      allowCreateMissingComponents);
+    return walkOwnedSuffixNoFollowFromFd(homeFd, homeMount, components,
+                                         allowCreateMissingComponents);
   }
   // Round-N+ review (HIGH, repeat finding): a target outside home used
   // to fall back to "find the longest EXISTING prefix via a plain,
@@ -1114,23 +1332,30 @@ bool safeRemoveEntryAt(int parentFd, const char *name,
                     "guard)";
       return false;
     }
+    // Round-N+ review (HIGH, repeat finding, "cleanup can traverse
+    // same-device bind mounts when mount IDs are unavailable"): the
+    // PARENT-stat-based check just above is a cheap pre-open filter that
+    // still degrades to a permissive st_dev-only comparison when mount
+    // ids are unavailable on either side -- it alone is NOT sufficient.
+    // The authoritative check happens here, on the ACTUAL OPENED
+    // DESCRIPTOR, via openSubdirectoryNoFollowMountChecked(): it prefers
+    // openat2()'s kernel-native RESOLVE_NO_XDEV guarantee, and -- ONLY
+    // when that itself is unavailable on this kernel/build -- requires a
+    // real, matching STATX_MNT_ID on both sides, failing closed rather
+    // than silently accepting a same-device bind mount planted under
+    // this cache's tree after construction. This also closes the same
+    // TOCTOU window the removed fstat()-on-childFd re-check existed
+    // for (the entry could have been replaced between the fstatat()
+    // above and any open): the mount identity here is always derived
+    // from the descriptor actually opened, never a second path lookup.
     const int childFd =
-        openat(parentFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        openSubdirectoryNoFollowMountChecked(parentFd, name, expectedMount);
     if (childFd < 0) {
       // Either genuinely not a directory anymore (replaced by a
-      // symlink between the fstatat() above and here) or some other
-      // open failure -- either way, refuse to proceed rather than
-      // guessing.
-      return false;
-    }
-    // Re-verify the mount on the ACTUAL DESCRIPTOR just opened (never
-    // trusting the fstatat() above alone): closes the TOCTOU window
-    // where the entry could have been replaced by a different-mount
-    // entry between that check and this open.
-    struct stat openedSt {};
-    if (::fstat(childFd, &openedSt) != 0 || !S_ISDIR(openedSt.st_mode) ||
-        !mountIdentityMatches(mountIdentityForFd(childFd), expectedMount)) {
-      ::close(childFd);
+      // symlink between the fstatat() above and here), resolves onto a
+      // mount that cannot be proven identical to the cache root, or
+      // some other open failure -- either way, refuse to proceed rather
+      // than guessing.
       return false;
     }
     if (!safeRemoveDirectoryContentsAt(childFd, expectedMount)) {
@@ -1159,16 +1384,17 @@ bool safeRemoveEntryAt(int parentFd, const char *name,
 bool safeRemoveTreeRelative(int parentFd, const QString &name,
                             const MountIdentity &expectedMount) {
 #if defined(Q_OS_UNIX)
+  // Round-N+ review (HIGH, repeat finding, "cleanup can traverse
+  // same-device bind mounts when mount IDs are unavailable"): routed
+  // through openSubdirectoryNoFollowMountChecked() -- see that
+  // function's own comment -- rather than a bare openat() + the
+  // permissive mountIdentityMatches(), which previously accepted a
+  // same-device bind mount whenever mount ids were unavailable on
+  // either side.
   const QByteArray nameUtf8 = name.toUtf8();
-  const int fd = openat(parentFd, nameUtf8.constData(),
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  const int fd = openSubdirectoryNoFollowMountChecked(
+      parentFd, nameUtf8.constData(), expectedMount);
   if (fd < 0) {
-    return false;
-  }
-  struct stat st {};
-  if (::fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
-      !mountIdentityMatches(mountIdentityForFd(fd), expectedMount)) {
-    ::close(fd);
     return false;
   }
   const bool contentsOk = safeRemoveDirectoryContentsAt(fd, expectedMount);
@@ -1193,9 +1419,44 @@ bool safeRemoveTreeRelative(int parentFd, const QString &name,
 
 } // namespace
 
+std::optional<AssetError>
+AssetCache::validateConfiguration(const Config &config) {
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): mirrors
+  // AssetNetworkFetcher::validateConfiguration()'s own established
+  // convention and reuses configHasValidDiskByteLimit()/
+  // configHasValidMemoryByteLimit() directly, so this can never drift
+  // out of sync with what the constructor itself actually enforces.
+  if (!configHasValidMemoryByteLimit(config)) {
+    return AssetError{
+        AssetErrorCode::InvalidConfiguration,
+        QStringLiteral("asset cache memoryMaxCostBytes must be non-negative")};
+  }
+  if (!configHasValidDiskByteLimit(config)) {
+    return AssetError{
+        AssetErrorCode::InvalidConfiguration,
+        QStringLiteral("asset cache diskMaxBytes must be non-negative")};
+  }
+  return std::nullopt;
+}
+
+AssetOutcome<std::unique_ptr<AssetCache>> AssetCache::create(Config config) {
+  if (std::optional<AssetError> error = validateConfiguration(config)) {
+    return AssetOutcome<std::unique_ptr<AssetCache>>(std::move(*error));
+  }
+  return AssetOutcome<std::unique_ptr<AssetCache>>(
+      std::make_unique<AssetCache>(std::move(config)));
+}
+
 AssetCache::AssetCache(Config config)
     : m_config(std::move(config)),
       m_memory(new QCache<QString, CachedEntry>()) {
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): computed FIRST, from the exact same
+  // validateConfiguration() a caller could have (and, via create(),
+  // should have) already checked BEFORE ever reaching this
+  // constructor -- see isValid()/configurationError()'s own comment.
+  m_configurationError = validateConfiguration(m_config);
   // Round-9+ review (MEDIUM): validated FIRST, before anything else --
   // including the directory resolution immediately below -- so an
   // invalid disk-quota limit can never reach reapAndEnforceQuota()'s
@@ -1484,6 +1745,37 @@ bool addUsageBytesOverflowSafe(qint64 *total, qint64 addition) {
   return true;
 }
 
+// Round-7 review item 4 ("quota uses logical st_size and omits root
+// allocation, while policy claims physical bytes"): `st_size` is a
+// purely LOGICAL byte count -- it says nothing about how many disk
+// blocks a file/directory actually consumes, and can be arbitrarily
+// far from it: a sparse file can report a huge st_size while occupying
+// almost no real storage, while ANY file (however tiny its logical
+// content) still consumes at least one whole filesystem block, and a
+// directory node's own st_size is filesystem-defined and only loosely
+// related to what it truly costs on disk. Every quota/threshold/credit
+// computation in this file must instead use `st_blocks`, which POSIX
+// defines as a count of 512-byte units regardless of the filesystem's
+// own native block size -- this is the number the real "how much
+// physical disk space is this consuming" question actually answers,
+// and it is what `du`/`df`-style accounting uses. Overflow-checked the
+// same way as addUsageBytesOverflowSafe() above: `st_blocks` is
+// `blkcnt_t` (a signed 64-bit type on every target platform here), and
+// the multiplication by 512 must not be allowed to silently wrap
+// either.
+bool physicalBytesOverflowSafe(const struct stat &st, qint64 *outBytes) {
+  const qint64 blocks = static_cast<qint64>(st.st_blocks);
+  if (blocks < 0) {
+    return false;
+  }
+  constexpr qint64 kBytesPerBlock = 512;
+  if (blocks > std::numeric_limits<qint64>::max() / kBytesPerBlock) {
+    return false;
+  }
+  *outBytes = blocks * kBytesPerBlock;
+  return true;
+}
+
 // Recursive, descriptor-relative, no-follow, mount-bounded byte-usage
 // walker (review round-4/5 items 3, 9, 11; round-6 item 5's mount-id
 // strengthening). Returns std::nullopt -- an INDETERMINATE result, not
@@ -1536,23 +1828,40 @@ std::optional<qint64> sumUsageRelative(int dirFd,
       // The directory node's own on-disk size is real, physical usage
       // regardless of which mount it lives on -- see this function's
       // own comment above.
-      if (!addUsageBytesOverflowSafe(&total, st.st_size)) {
+      qint64 dirPhysicalBytes = 0;
+      if (!physicalBytesOverflowSafe(st, &dirPhysicalBytes) ||
+          !addUsageBytesOverflowSafe(&total, dirPhysicalBytes)) {
         closedir(dirStream);
         return std::nullopt;
       }
-      if (!mountIdentityMatches(mountIdentityRelative(dirFd, entry->d_name, st),
-                                expectedMount)) {
-        // Cross-mount entry encountered: this directory can never be
-        // descended into or deleted (see safeRemoveEntryAt()'s matching
-        // refusal), so nothing further is added for it -- its own
-        // directory-entry size (just added above) is the only
-        // contribution this walker can make for it.
+      // Round-N+ review (HIGH, repeat finding, "cleanup/quota can
+      // traverse same-device bind mounts when mount IDs are
+      // unavailable"): a genuinely DIFFERENT device is legitimately
+      // never descended into at all -- this cache's quota was never
+      // meant to count foreign storage, and this directory's own
+      // entry size (already added above) is the whole of its
+      // contribution -- so that case alone is checked first, cheaply,
+      // from the fstatat() `st` above, and is a deliberate SKIP, not a
+      // traversal failure.
+      const MountIdentity relativeMount =
+          mountIdentityRelative(dirFd, entry->d_name, st);
+      if (relativeMount.device != expectedMount.device) {
         errno = 0;
         continue;
       }
-      const int childFd =
-          openat(dirFd, entry->d_name,
-                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      // Same device: the only way to prove this is not a same-device
+      // BIND mount masquerading as an ordinary subdirectory is to open
+      // it and re-verify on the actual descriptor via
+      // openSubdirectoryNoFollowMountChecked() -- see that function's
+      // own comment. Unlike the "different device" case above, this is
+      // genuinely INDETERMINATE when it fails (a same-device bind
+      // mount, or an inability to prove otherwise on a kernel too old
+      // for openat2's RESOLVE_NO_XDEV): silently treating it as "0
+      // additional bytes, keep going" would let quota enforcement
+      // systematically undercount real usage exactly like every other
+      // indeterminate case this function already fails closed for.
+      const int childFd = openSubdirectoryNoFollowMountChecked(
+          dirFd, entry->d_name, expectedMount);
       if (childFd < 0) {
         closedir(dirStream);
         return std::nullopt;
@@ -1564,7 +1873,9 @@ std::optional<qint64> sumUsageRelative(int dirFd,
         return std::nullopt;
       }
     } else {
-      if (!addUsageBytesOverflowSafe(&total, st.st_size)) {
+      qint64 filePhysicalBytes = 0;
+      if (!physicalBytesOverflowSafe(st, &filePhysicalBytes) ||
+          !addUsageBytesOverflowSafe(&total, filePhysicalBytes)) {
         closedir(dirStream);
         return std::nullopt;
       }
@@ -1634,7 +1945,34 @@ qint64 AssetCache::diskUsageBytesLocked() const {
     m_diskCacheDisabled = true;
     return 0;
   }
-  return *usage;
+  // Round-7 review item 4 ("omits root allocation"): sumUsageRelative()
+  // only ever sums the root directory's CHILDREN -- the root directory
+  // node itself (m_rootFd) is never stat'd or credited, even though it,
+  // like every other directory this walker counts, occupies real,
+  // non-reclaimable physical disk blocks of its own. Added here, once,
+  // directly from the already-open, already-anchored `m_rootFd` (no
+  // extra open/close, and no risk of resolving a different node than
+  // the one everything else in this instance is anchored to).
+  struct stat rootStat {};
+  if (fstat(m_rootFd, &rootStat) != 0) {
+    qWarning() << "AssetCache: failed to stat the cache root itself for "
+                  "usage accounting -- disabling disk I/O for this "
+                  "instance rather than reporting a false zero usage";
+    m_diskCacheDisabled = true;
+    return 0;
+  }
+  qint64 rootPhysicalBytes = 0;
+  qint64 total = *usage;
+  if (!physicalBytesOverflowSafe(rootStat, &rootPhysicalBytes) ||
+      !addUsageBytesOverflowSafe(&total, rootPhysicalBytes)) {
+    qWarning() << "AssetCache: disk usage accounting overflowed while "
+                  "crediting the cache root's own physical size -- "
+                  "disabling disk I/O for this instance rather than "
+                  "reporting a wrapped/truncated usage total";
+    m_diskCacheDisabled = true;
+    return 0;
+  }
+  return total;
 #else
   return 0;
 #endif
@@ -2636,7 +2974,21 @@ void AssetCache::reapAndEnforceQuota() {
           0) {
         return 0;
       }
-      return static_cast<qint64>(st.st_size);
+      // Round-7 review item 4: physical (st_blocks-based), not logical
+      // (st_size) -- see physicalBytesOverflowSafe()'s comment. This
+      // credit is later subtracted directly from `totalBytes`, which is
+      // itself computed by diskUsageBytesLocked()/sumUsageRelative() in
+      // the SAME physical units; using a different unit here would
+      // drift the running total during eviction, undershooting or
+      // overshooting the low-water mark. A single-entry overflow here
+      // is not realistically reachable (each file is already bounded by
+      // kMaxSinglePayloadBytesOnDisk), so this simply credits 0 rather
+      // than threading a fallible result through ValidEntry.
+      qint64 physicalBytes = 0;
+      if (!physicalBytesOverflowSafe(st, &physicalBytes)) {
+        return 0;
+      }
+      return physicalBytes;
     };
     const qint64 manifestBytes = sizeOfRelative(manifestPath(key));
     const qint64 payloadBytes = sizeOfRelative(genPayloadPath);
@@ -2849,6 +3201,14 @@ bool AssetCache::mountIdentificationSupportedForTesting(const QString &path) {
   Q_UNUSED(path);
   return false;
 #endif
+}
+
+void AssetCache::setMountIdentificationDegradedForTesting(
+    bool forceOpenat2Unavailable, bool forceMountIdUnavailable) {
+  g_forceOpenat2UnavailableForTesting.store(forceOpenat2Unavailable,
+                                            std::memory_order_relaxed);
+  g_forceMountIdUnavailableForTesting.store(forceMountIdUnavailable,
+                                            std::memory_order_relaxed);
 }
 
 } // namespace Arkham

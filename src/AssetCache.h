@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AssetTypes.h"
+
 #include <QByteArray>
 #include <QDateTime>
 #include <QHash>
@@ -8,6 +10,7 @@
 #include <QSize>
 #include <QString>
 #include <QUrl>
+#include <memory>
 #include <optional>
 
 template <typename Key, typename T> class QCache;
@@ -169,11 +172,72 @@ public:
     }
   };
 
+  // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
+  // publicly constructible"): pure, standalone validation -- matching
+  // AssetNetworkFetcher::validateConfiguration()'s own established
+  // convention exactly -- so a caller can reject an invalid `config`
+  // BEFORE ever constructing anything, with a typed
+  // AssetErrorCode::InvalidConfiguration rather than discovering the
+  // problem only much later as a confusing, seemingly-unrelated
+  // CachePersistenceFailed/CacheCorrupt surprise once disk I/O is
+  // already silently disabled. Returns std::nullopt iff `config` is
+  // fully valid.
+  [[nodiscard]] static std::optional<AssetError>
+  validateConfiguration(const Config &config);
+
+  // Round-N+ review (MEDIUM, repeat finding): the preferred way for any
+  // REAL caller (in particular AssetRequestCoordinator's own
+  // production wiring) to obtain an AssetCache from a `config` that
+  // might not be a hardcoded, statically-known-good literal -- fails
+  // with a typed AssetErrorCode::InvalidConfiguration (via
+  // validateConfiguration() above) rather than ever returning an
+  // already-silently-disabled instance. AssetCache is not movable
+  // (QMutex/mutable POSIX descriptor members), so a validated instance
+  // is heap-allocated and returned by owning std::unique_ptr, mirroring
+  // AssetNetworkFetcher::create()'s exact pattern.
+  [[nodiscard]] static AssetOutcome<std::unique_ptr<AssetCache>>
+  create(Config config = Config());
+
+  // Production/test constructor: an invalid `config` (see
+  // validateConfiguration() above) no longer throws or silently
+  // disables just ONE tier while leaving the object otherwise
+  // seemingly-normal. Instead, this instance enters a permanently
+  // invalid configuration state (see isValid()/configurationError()):
+  // BOTH the memory and disk tiers are disabled for this instance's
+  // entire lifetime, and any AssetRequestCoordinator constructed
+  // against it must -- and, in this codebase, does -- refuse to ever
+  // touch it, completing every request immediately with
+  // AssetErrorCode::InvalidConfiguration instead. Prefer create() over
+  // this constructor directly wherever the caller can act on a typed
+  // error before ever issuing a request at all; this constructor
+  // remains directly usable (fail-closed rather than throwing) so
+  // every existing call site that always passes valid,
+  // statically-known-good configuration (the overwhelming common
+  // case, including every test in this codebase predating this
+  // review round) is never forced to unwrap a factory result it knows
+  // can never be an error.
   explicit AssetCache(Config config = Config());
   ~AssetCache();
 
   [[nodiscard]] const Config &config() const { return m_config; }
   [[nodiscard]] QString directory() const { return m_directory; }
+
+  // Round-N+ review (MEDIUM, repeat finding): true iff `config` (as
+  // passed to the constructor/create()) was fully valid -- see
+  // validateConfiguration(). False here means BOTH cache tiers are
+  // permanently disabled for this instance; a caller that owns this
+  // instance directly (rather than via AssetRequestCoordinator) should
+  // check this before relying on any persistence guarantee at all.
+  [[nodiscard]] bool isValid() const noexcept {
+    return !m_configurationError.has_value();
+  }
+
+  // The specific typed reason isValid() is false, or std::nullopt if
+  // it is true.
+  [[nodiscard]] const std::optional<AssetError> &
+  configurationError() const noexcept {
+    return m_configurationError;
+  }
 
   // SHA-256 (hex) over "assetcache-v1\n" + the fully-encoded resolved
   // candidate URL string. Exposed statically so callers/tests can compute
@@ -382,6 +446,22 @@ public:
   [[nodiscard]] static bool
   mountIdentificationSupportedForTesting(const QString &path);
 
+  // Test-only, deterministic, UNPRIVILEGED injection of the two
+  // degradations a legacy kernel (older than 5.6/5.8, or one built
+  // without openat2()/STATX_MNT_ID support) would actually present --
+  // see the two std::atomic<bool> globals this sets in AssetCache.cpp's
+  // anonymous namespace for the full rationale. Lets a test exercise the
+  // fail-closed strict path against perfectly ordinary, unmounted
+  // directories, without requiring a real (and often privilege-gated)
+  // bind mount. Both parameters independently default to false
+  // (ordinary, fully-capable-kernel behaviour) when this is never
+  // called; a test MUST reset both back to false before returning
+  // (ideally via an RAII scope guard) so this process-wide override
+  // never leaks into an unrelated, later test.
+  static void
+  setMountIdentificationDegradedForTesting(bool forceOpenat2Unavailable,
+                                           bool forceMountIdUnavailable);
+
 private:
   struct DiskMetadata {
     QString key;
@@ -546,6 +626,12 @@ private:
   mutable bool m_diskCacheDisabled{false};
   // Round-7/8 item 7: see invalidateCallCountForTesting()'s comment.
   int m_invalidateCallCountForTesting{0};
+  // Round-N+ review (MEDIUM, repeat finding): set once, at construction,
+  // from validateConfiguration(m_config) -- see isValid()/
+  // configurationError()'s own comment above. Never cleared afterward:
+  // an instance's configuration validity is fixed for its entire
+  // lifetime.
+  std::optional<AssetError> m_configurationError;
   Config m_config;
   QString m_directory;
   mutable QMutex m_mutex;
