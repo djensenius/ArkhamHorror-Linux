@@ -712,11 +712,11 @@ def _read_program_headers(path: Path) -> list[dict[str, str]]:
 # executable, shrink/delete PT_GNU_RELRO, or alter PT_TLS's own
 # template size, and the previous digest would not change one bit.
 #
-# PT_LOAD and PT_DYNAMIC are both deliberately excluded here, for two
-# DIFFERENT documented-legitimate-repack reasons empirically confirmed
-# against a real patchelf 0.14.3 RUNPATH rewrite (this project's own
-# testing, see this module's cumulative-review test suite): PT_LOAD's
-# own per-segment filesz/memsz are NOT stable (moving
+# PT_LOAD, PT_DYNAMIC, and PT_NOTE are all deliberately excluded here,
+# for DIFFERENT documented-legitimate-repack reasons empirically
+# confirmed against a real patchelf 0.14.3 RUNPATH rewrite (this
+# project's own testing, see this module's cumulative-review test
+# suite): PT_LOAD's own per-segment filesz/memsz are NOT stable (moving
 # `.gnu.hash`/`.note.*`/`.dynstr` out of an existing LOAD segment into
 # a brand-new one legitimately shrinks the original segment's own
 # filesz/memsz) -- that segment class is already correctly
@@ -733,29 +733,61 @@ def _read_program_headers(path: Path) -> list[dict[str, str]]:
 # PT_DYNAMIC's raw program-header size is pure redundant bookkeeping
 # for already-covered data, not an independent authentication gap.
 #
+# PT_NOTE's own SEGMENT COUNT/filesz/memsz are, for exactly the same
+# reason, ALSO not stable: a real cumulative-review regression, found
+# only against this project's own actual produced AppImage (this
+# module's own prior synthetic fixtures had at most one real Qt-style
+# extra allocated NOTE section co-resident with `.note.gnu.build-id`,
+# never triggering this split) -- linuxdeploy-plugin-qt's genuine,
+# unmodified-in-substance bundled Qt plugins/QML modules (e.g.
+# plugins/imageformats/libqgif.so) legitimately had ONE PT_NOTE program
+# header covering BOTH `.note.gnu.property` and `.note.qt.metadata`
+# (plus a separate one for `.note.gnu.build-id`) before patchelf's
+# RUNPATH rewrite, but THREE separate PT_NOTE program headers -- one
+# per individual note section -- after it, once the rewrite's
+# `.dynstr`-driven relocation (see the PT_LOAD comment above) moved
+# those note sections into a brand-new, appended LOAD segment and the
+# linker/patchelf re-grouped their own program-header coverage
+# differently. Each individual note SECTION's own content, type, flags,
+# and effective runtime executable-bit are already fully authenticated
+# by the main per-section digest loop in _canonical_load_digest() (none
+# of `.note.gnu.build-id`/`.note.gnu.property`/`.note.qt.metadata`/any
+# other `.note.*` section is in `_CANONICAL_DIGEST_EXCLUDED_SECTIONS`),
+# so PT_NOTE's own raw segment-level grouping/count/filesz/memsz is,
+# exactly like PT_LOAD and PT_DYNAMIC above, pure redundant bookkeeping
+# for already-covered data, not an independent authentication gap --
+# and folding it in as if it WERE content-stable made every genuinely
+# unmodified Qt plugin/QML module with more than one loaded NOTE
+# section fail this digest comparison after every real patchelf run.
+#
 # Entries are returned SORTED by (type, flags, filesz, memsz, align)
 # rather than raw on-disk program-header-table order: this project's
 # own empirical testing found that a real patchelf 0.14.3 RUNPATH
 # rewrite can legitimately REORDER the program-header table itself
-# (e.g. swapping which of two NOTE segments appears first) with no
-# security consequence at all, since the loader consults each entry by
-# its own TYPE/semantics, never by table position. Sorting by full
-# content tuple (rather than raw index) produces a canonical,
-# order-independent representation of the exact same multiset of
-# entries, so a genuine reorder cannot change the digest while any
-# actual value change (flags/filesz/memsz/align) still does.
+# (e.g. swapping which of two GNU_STACK/GNU_RELRO-style segments
+# appears first) with no security consequence at all, since the loader
+# consults each entry by its own TYPE/semantics, never by table
+# position. Sorting by full content tuple (rather than raw index)
+# produces a canonical, order-independent representation of the exact
+# same multiset of entries, so a genuine reorder cannot change the
+# digest while any actual value change (flags/filesz/memsz/align)
+# still does.
 def _non_load_program_header_records(path: Path) -> list[tuple[str, str, str, str, str]]:
     """Returns (type, flags, filesz, memsz, align) for every program
-    header entry in `path` whose type is neither "LOAD" nor "DYNAMIC",
-    sorted into a canonical, table-position-independent order (stable
-    even across duplicate types, e.g. multiple NOTE segments, and
-    across a legitimate patchelf reordering of the table itself) -- see
-    this function's own preceding module comment for exactly which
-    security-relevant segments this closes (PT_GNU_STACK/PT_GNU_RELRO/
-    PT_TLS) and why PT_LOAD/PT_DYNAMIC are both deliberately excluded.
-    Returns an empty list, never raises, if `path`'s program headers
-    cannot be parsed at all (callers already tolerate this the same way
-    they tolerate a missing SONAME/build-id)."""
+    header entry in `path` whose type is none of "LOAD", "DYNAMIC", or
+    "NOTE", sorted into a canonical, table-position-independent order
+    (stable across a legitimate patchelf reordering of the table
+    itself) -- see this function's own preceding module comment for
+    exactly which security-relevant segments this closes
+    (PT_GNU_STACK/PT_GNU_RELRO/PT_TLS) and why PT_LOAD/PT_DYNAMIC/
+    PT_NOTE are all deliberately excluded (each is either already
+    authenticated via a content-stable, section-keyed abstraction
+    elsewhere in this module, or -- for PT_NOTE specifically -- its own
+    raw segment grouping/count is empirically not stable under a real
+    patchelf RUNPATH rewrite at all). Returns an empty list, never
+    raises, if `path`'s program headers cannot be parsed at all
+    (callers already tolerate this the same way they tolerate a
+    missing SONAME/build-id)."""
     try:
         headers = _read_program_headers(path)
     except ElfIdentityError:
@@ -763,7 +795,7 @@ def _non_load_program_header_records(path: Path) -> list[tuple[str, str, str, st
     return sorted(
         (header["type"], header["flags"], header["filesz"], header["memsz"], header["align"])
         for header in headers
-        if header["type"] not in ("LOAD", "DYNAMIC")
+        if header["type"] not in ("LOAD", "DYNAMIC", "NOTE")
     )
 
 
@@ -1036,12 +1068,13 @@ def _canonical_load_digest(path: Path) -> str | None:
         digest.update(("SYMTAB\0" + "\0".join(symbol) + "\0").encode("utf-8"))
     # Third-HIGH-round review ("... executable GNU_STACK, RELRO/TLS/
     # load offsets/sizes can pass with retained build ID"): every
-    # non-LOAD program header (PT_GNU_STACK's own executable-stack
-    # flag, PT_GNU_RELRO's own protected range size, PT_TLS's own
-    # template size/alignment, and so on) is folded in here -- see
-    # _non_load_program_header_records()'s own preceding module comment
-    # for exactly why PT_LOAD itself must stay excluded from this raw
-    # record while every OTHER segment type must not.
+    # non-LOAD/DYNAMIC/NOTE program header (PT_GNU_STACK's own
+    # executable-stack flag, PT_GNU_RELRO's own protected range size,
+    # PT_TLS's own template size/alignment, and so on) is folded in
+    # here -- see _non_load_program_header_records()'s own preceding
+    # module comment for exactly why PT_LOAD/PT_DYNAMIC/PT_NOTE must
+    # stay excluded from this raw record while every OTHER segment type
+    # must not.
     for type_, flags, filesz, memsz, align in _non_load_program_header_records(path):
         digest.update(
             f"PHDR\0{type_}\0{flags}\0{filesz}\0{memsz}\0{align}\0".encode("utf-8")

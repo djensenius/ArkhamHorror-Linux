@@ -1623,6 +1623,139 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
             audit._canonical_load_digest(patched),
         )
 
+    def _build_shared_object_with_extra_note_section(self, output: Path) -> None:
+        """Like _build_rich_shared_object(), but also embeds an extra
+        real, allocated (SHF_ALLOC) `.note.qt.metadata` -- a synthetic
+        stand-in for Qt's own genuine `Q_PLUGIN_METADATA`-driven note
+        section, added via a hand-written assembly Elf64_Nhdr record so
+        this test needs no real Qt SDK at all -- co-resident with GCC's
+        own `.note.gnu.build-id`, exactly mirroring a real Qt plugin's
+        note-section layout. This is the fixture
+        test_canonical_load_digest_is_stable_across_a_patchelf_note_
+        segment_regrouping() below needs to reproduce its own regression:
+        see that test's docstring."""
+        c_source = (
+            "#include <stdlib.h>\n"
+            'static const char message[] = "canonical-load-digest-fixture";\n'
+            "static char scratch_buffer[4096];\n"
+            "__attribute__((constructor)) static void init(void) {\n"
+            "    void *p = malloc(16);\n"
+            "    scratch_buffer[0] = (char)(size_t)p;\n"
+            "    free(p);\n"
+            "}\n"
+            "const char *test_plugin_entry(void) { return message; }\n"
+        )
+        asm_source = (
+            '.section .note.qt.metadata,"a",@note\n'
+            ".align 4\n"
+            ".long 1f - 0f\n"
+            ".long 3f - 2f\n"
+            ".long 0\n"
+            "0:\n"
+            '.asciz "Qt"\n'
+            "1:\n"
+            ".align 4\n"
+            "2:\n"
+            ".byte 0,0,0,0\n"
+            "3:\n"
+            ".align 4\n"
+        )
+        c_path = output.with_suffix(".c")
+        asm_path = output.with_name(output.stem + "_extra_note.s")
+        c_path.write_text(c_source)
+        asm_path.write_text(asm_source)
+        subprocess.run(
+            [self.cc_bin, "-shared", "-fPIC", "-o", str(output), str(c_path), str(asm_path)],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_canonical_load_digest_is_stable_across_a_patchelf_note_segment_regrouping(
+        self,
+    ) -> None:
+        # Real cumulative-review regression, found only against this
+        # project's own actual produced AppImage using a real Qt SDK
+        # and the real pinned linuxdeploy/linuxdeploy-plugin-qt binaries
+        # (never reproduced by this module's own prior synthetic
+        # fixtures, none of which had more than one real, allocated
+        # NOTE section co-resident with `.note.gnu.build-id`): every
+        # genuinely bundled Qt plugin/QML module (e.g.
+        # plugins/imageformats/libqgif.so) legitimately has its own
+        # `.note.qt.metadata` note section, in addition to the usual
+        # `.note.gnu.build-id`/`.note.gnu.property`. This project's own
+        # empirical testing found that a real patchelf 0.14.3 RUNPATH
+        # rewrite, whenever it must relocate `.dynstr` (and whatever
+        # else was co-resident with it, e.g. the note sections) into a
+        # brand-new appended LOAD segment (see the two relocation tests
+        # above), also legitimately CHANGES HOW MANY PT_NOTE program
+        # headers cover those same, byte-for-byte-unchanged note
+        # sections -- e.g. one PT_NOTE program header shrinking/
+        # disappearing while another grows, or a single combined
+        # PT_NOTE splitting into several. Before this was fixed,
+        # _non_load_program_header_records() (and therefore
+        # _canonical_load_digest()) folded PT_NOTE's own raw segment
+        # count/filesz/memsz straight into the digest as if it were
+        # content-stable, exactly like PT_GNU_STACK/PT_GNU_RELRO/PT_TLS
+        # -- so this entirely legitimate, content-preserving repack
+        # produced a DIFFERENT digest, wrongly rejecting every real,
+        # unmodified Qt plugin/QML module with more than one loaded NOTE
+        # section as an unrecognized/substituted library.
+        if not shutil.which("patchelf"):
+            self.skipTest("requires patchelf to simulate a real RUNPATH rewrite")
+        reference = self.root / "reference_note.so"
+        self._build_shared_object_with_extra_note_section(reference)
+        patched = self.root / "patched_note.so"
+        patched.write_bytes(reference.read_bytes())
+        patched.chmod(0o755)
+        long_rpath = "/".join(["deliberately-very-long-rpath-component"] * 40)
+        subprocess.run(
+            ["patchelf", "--set-rpath", long_rpath, str(patched)],
+            check=True,
+            capture_output=True,
+        )
+
+        def _note_header_count(path: Path) -> int:
+            output = subprocess.run(
+                ["readelf", "-lW", str(path)], check=True, capture_output=True, text=True
+            ).stdout
+            return sum(
+                1 for line in output.splitlines() if line.strip().startswith("NOTE ")
+            )
+
+        # Sanity: the RPATH rewrite really did change how many PT_NOTE
+        # program headers cover the (byte-for-byte-unchanged) note
+        # sections -- proving this test actually exercises the reported
+        # bug's exact precondition, not merely an in-place, same-layout
+        # rewrite that would never have exposed it.
+        self.assertNotEqual(
+            _note_header_count(reference),
+            _note_header_count(patched),
+            "fixture did not actually change PT_NOTE program-header grouping -- "
+            "this test would not have caught the reported bug",
+        )
+        # Every individual note SECTION's own bytes are genuinely
+        # unchanged (only their program-header grouping moved).
+        for note_name in (".note.gnu.build-id", ".note.qt.metadata"):
+            ref_offset, ref_size = _test_section_file_range(reference, note_name)
+            with reference.open("rb") as handle:
+                handle.seek(ref_offset)
+                ref_bytes = handle.read(ref_size)
+            pat_offset, pat_size = _test_section_file_range(patched, note_name)
+            with patched.open("rb") as handle:
+                handle.seek(pat_offset)
+                pat_bytes = handle.read(pat_size)
+            self.assertEqual(ref_bytes, pat_bytes)
+        # The real assertion: the fixed, production canonical digest
+        # -- which must never treat PT_NOTE's own raw segment grouping
+        # as content-stable -- is stable across this legitimate repack,
+        # exactly as a genuinely unmodified, merely repackaged Qt
+        # plugin/QML module must be.
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(patched))
+        self.assertEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(patched),
+        )
+
     def test_canonical_load_digest_detects_rodata_mutation(self) -> None:
         reference = self.root / "rodata_ref.so"
         self._build_rich_shared_object(reference)
