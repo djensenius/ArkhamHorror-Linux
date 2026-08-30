@@ -215,6 +215,9 @@ private slots:
   void urlRejectsCredentials();
   void urlRejectsFragment();
   void urlRejectsQuery();
+  void urlRejectsExplicitEmptyFragmentDelimiter();
+  void urlRejectsExplicitEmptyQueryDelimiter();
+  void urlRejectsExplicitEmptyQueryAndFragmentDelimiters();
   void urlRejectsDuplicateApiPathExact();
   void urlRejectsDuplicateApiPathPrefix();
   void urlRejectsDuplicateApiPathInfix();    // /proxy/api/v1
@@ -417,6 +420,33 @@ void NetworkTests::urlRejectsQuery() {
       validateCustomUrl(QStringLiteral("https://example.com?foo=bar"));
   QVERIFY(!r.has_value());
   QCOMPARE(r.error().code, UrlErrorCode::QueryPresent);
+}
+
+void NetworkTests::urlRejectsExplicitEmptyFragmentDelimiter() {
+  // Round-9+ review (MEDIUM): a bare trailing "#" with nothing after it
+  // is still an explicit fragment delimiter -- QUrl::fragment() returns
+  // an EMPTY string for it (indistinguishable, by string emptiness
+  // alone, from "no fragment at all"), but QUrl::hasFragment() correctly
+  // reports true. This must be rejected exactly like a non-empty
+  // fragment.
+  const auto r = validateCustomUrl(QStringLiteral("https://example.com#"));
+  QVERIFY(!r.has_value());
+  QCOMPARE(r.error().code, UrlErrorCode::FragmentPresent);
+}
+
+void NetworkTests::urlRejectsExplicitEmptyQueryDelimiter() {
+  const auto r = validateCustomUrl(QStringLiteral("https://example.com?"));
+  QVERIFY(!r.has_value());
+  QCOMPARE(r.error().code, UrlErrorCode::QueryPresent);
+}
+
+void NetworkTests::urlRejectsExplicitEmptyQueryAndFragmentDelimiters() {
+  const auto r = validateCustomUrl(QStringLiteral("https://example.com?#"));
+  QVERIFY(!r.has_value());
+  // Fragment is checked before query in validateCustomUrl(), so this
+  // exact code is expected deterministically; either would be an
+  // acceptable rejection, but the ordering must remain stable.
+  QCOMPARE(r.error().code, UrlErrorCode::FragmentPresent);
 }
 
 void NetworkTests::urlRejectsDuplicateApiPathExact() {

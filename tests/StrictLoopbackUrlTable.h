@@ -117,6 +117,21 @@ inline QVector<StrictLoopbackUrlRow> strictLoopbackUrlRows() {
        QStringLiteral("https://localhost.evil.example/api/v1/authenticate")},
       {"https-base-path", QStringLiteral("https://example.com/arkham"), true, 0,
        QStringLiteral("https://example.com/arkham/api/v1/authenticate")},
+      // Round-9+ review (MEDIUM): a hostname composed entirely of
+      // characters that happen to overlap hex digits ('a'-'f') must NOT
+      // be misclassified as an "alternate numeric IP spelling" merely for
+      // that overlap -- see looksLikeNumericIshHostText()'s doc comment.
+      // None of these are ever interpreted as numeric by any real
+      // host-parsing implementation, since none carries a "0x" prefix.
+      {"https-all-hex-letters-dotted", QStringLiteral("https://decaf.cafe"),
+       true, 0, QStringLiteral("https://decaf.cafe/api/v1/authenticate")},
+      {"https-all-hex-letters-dotted-short", QStringLiteral("https://abc.de"),
+       true, 0, QStringLiteral("https://abc.de/api/v1/authenticate")},
+      {"https-all-hex-letters-single-label", QStringLiteral("https://abc"),
+       true, 0, QStringLiteral("https://abc/api/v1/authenticate")},
+      {"https-all-hex-letters-with-x-not-prefix",
+       QStringLiteral("https://faced.ace"), true, 0,
+       QStringLiteral("https://faced.ace/api/v1/authenticate")},
 
       // ── Rejected: ambiguous/non-canonical numeric loopback spellings ───
       // Cumulative-review finding (PR #18): every one of these is now
@@ -135,6 +150,8 @@ inline QVector<StrictLoopbackUrlRow> strictLoopbackUrlRows() {
        ambiguousAuthority, QString()},
       {"http-octal-single-integer", QStringLiteral("http://017700000001"),
        false, ambiguousAuthority, QString()},
+      {"http-hex-single-integer", QStringLiteral("http://0x7f000001"), false,
+       ambiguousAuthority, QString()},
       {"http-leading-zero-full", QStringLiteral("http://127.000.000.001"),
        false, ambiguousAuthority, QString()},
       {"http-leading-zero-last-octet", QStringLiteral("http://127.0.0.01"),

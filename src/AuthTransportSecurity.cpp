@@ -214,31 +214,84 @@ bool containsBackslashOrControlCharacter(QStringView text) {
   return false;
 }
 
-// Returns true iff |text| is composed ENTIRELY of characters that could
-// plausibly appear in some alternate numeric IP spelling -- ASCII digits,
-// '.', 'x'/'X' (an "0x..." hex prefix), and 'a'-'f'/'A'-'F' (hex digits).
-// A host text that passes this check but is NOT itself a strict, canonical
-// four-octet dotted-decimal IPv4 literal (see isStrictDottedDecimalIPv4Text)
-// is an ambiguous/alternate numeric spelling (e.g. a shortened form like
-// "127.1", a bare 32-bit integer like "2130706433", or an octal/hex-
-// prefixed octet like "0x7f.0.0.1") and must be rejected outright: some
-// other piece of code (a proxy, a different URL parser, a human operator)
-// could plausibly interpret it as a numeric address while this project's
-// own QUrl-based host handling treats it as an opaque hostname string, and
-// that divergence is exactly the ambiguity this policy exists to close.
-// An ordinary DNS hostname's label characters (most letters, most
-// significantly any of 'g'-'w'/'y'/'z') immediately disqualify it from this
-// "numeric-ish" classification, so legitimate hostnames are never
-// misclassified merely for containing a digit or a dot.
+// Returns true iff |component| (one '.'-separated label from a candidate
+// numeric host, with the dots already stripped by the caller) is itself a
+// literal that SOME real numeric-address parser (inet_aton/strtoul-with-
+// base-0-style rules, as used by many libc/proxy/URL implementations)
+// would actually interpret as a number: either a run of one or more
+// plain ASCII decimal digits (covers both ordinary decimal and, via a
+// leading zero, octal interpretation), or an explicit "0x"/"0X" prefix
+// followed by one or more hex digits. An empty component (from a leading,
+// trailing, or doubled '.') is never numeric.
+bool numericIpAddressComponentText(QStringView component) {
+  if (component.isEmpty()) {
+    return false;
+  }
+  if (component.size() >= 3 && (component[0] == u'0') &&
+      (component[1] == u'x' || component[1] == u'X')) {
+    for (qsizetype i = 2; i < component.size(); ++i) {
+      const ushort u = component[i].unicode();
+      const bool isHexDigit = (u >= u'0' && u <= u'9') ||
+                              (u >= u'a' && u <= u'f') ||
+                              (u >= u'A' && u <= u'F');
+      if (!isHexDigit) {
+        return false;
+      }
+    }
+    return true; // size >= 3 guarantees at least one hex digit after "0x".
+  }
+  for (const QChar c : component) {
+    const ushort u = c.unicode();
+    if (!(u >= u'0' && u <= u'9')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Returns true iff |text|, split on '.', is composed ENTIRELY of
+// components each independently recognisable as a genuine numeric
+// literal (see numericIpAddressComponentText) -- i.e. |text| really is
+// some alternate numeric IP spelling (a shortened form like "127.1", a
+// bare 32-bit integer like "2130706433", an octal-looking octet like
+// "0177.0.0.1", or a "0x"-prefixed hex octet/address) and not merely a
+// hostname that happens to share some characters with hex digits.
+//
+// Round-9+ review (MEDIUM): a hex LETTER ('a'-'f'/'A'-'F') is only ever
+// actually numeric when it follows a proper "0x"/"0X" prefix -- no real
+// host-parsing implementation (inet_aton, strtoul, glibc's own resolver)
+// ever interprets a bare label like "cafe" or "decaf" as a number just
+// because every character in it happens to be a valid hex digit. The
+// previous implementation classified ANY host composed solely of
+// digits/dots/hex-letters/'x' as "numeric-ish", which wrongly rejected
+// entirely valid, ordinary DNS names such as "decaf.cafe", "abc.de", or
+// even a single label like "abc" purely because their letters overlap
+// hex's alphabet. This function instead only recognises the specific,
+// narrow set of textual forms an address parser could actually be
+// confused by, per component.
 bool looksLikeNumericIshHostText(QStringView text) {
+  if (text.isEmpty()) {
+    return false;
+  }
+  // A host containing any character outside the digit/dot/hex-letter/'x'
+  // set can never be any kind of numeric spelling at all: fast-reject it
+  // here before doing the per-component split/parse below (also keeps
+  // the previous, still-correct broad character-class contract that
+  // callers may already depend on).
   for (const QChar c : text) {
     const ushort u = c.unicode();
     const bool isDigit = u >= u'0' && u <= u'9';
     const bool isHexLetter =
         (u >= u'a' && u <= u'f') || (u >= u'A' && u <= u'F');
     const bool isDot = u == u'.';
-    const bool isXPrefix = u == u'x' || u == u'X';
-    if (!isDigit && !isHexLetter && !isDot && !isXPrefix) {
+    const bool isXLetter = u == u'x' || u == u'X';
+    if (!isDigit && !isHexLetter && !isDot && !isXLetter) {
+      return false;
+    }
+  }
+  const QList<QStringView> components = text.split(u'.');
+  for (const QStringView component : components) {
+    if (!numericIpAddressComponentText(component)) {
       return false;
     }
   }
