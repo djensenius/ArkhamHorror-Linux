@@ -1773,6 +1773,14 @@ _SYSTEM_LIBRARY_SEARCH_DIRS: tuple[Path, ...] = (
 _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE: frozenset[str] = frozenset({"icu", "qt"})
 
 
+# The classic top-level directories that are, on every modern (usr-
+# merged) Debian/Ubuntu release, pure symlinks into the equivalent
+# `/usr/...` directory (`/lib -> usr/lib`, `/bin -> usr/bin`, etc.) --
+# used by _dpkg_owning_package() below to generate the "add a `/usr`
+# prefix" candidate for a path that does not already have one.
+_USR_MERGE_TOP_LEVEL_DIRS: tuple[str, ...] = ("/lib", "/lib32", "/lib64", "/libx32", "/bin", "/sbin")
+
+
 def _dpkg_owning_package(path: Path) -> str | None:
     """The name (with any `:architecture` qualifier stripped) of the
     dpkg-installed binary package that owns the real, existing file at
@@ -1783,20 +1791,59 @@ def _dpkg_owning_package(path: Path) -> str | None:
     deliberately non-fatal None), or if no installed package owns this
     exact path.
 
-    Tries `path` exactly first; if that reports no owner, retries with
-    any leading `/usr` prefix stripped. This handles a real, empirically
-    confirmed wrinkle on a modern merged-/usr Ubuntu system: dpkg's own
-    package-contents database still records many system libraries'
-    paths in their pre-usr-merge form (e.g. `/lib/x86_64-linux-gnu/...`)
-    even though `/lib` is now purely a symlink to `/usr/lib` on disk --
-    a literal `dpkg -S /usr/lib/x86_64-linux-gnu/libz.so.1.2.11` was
-    directly observed to report no owner at all on a genuine, unmodified
-    `ubuntu:22.04` system for exactly this reason, while `dpkg -S
-    /lib/x86_64-linux-gnu/libz.so.1.2.11` (the path dpkg's own database
-    actually recorded) correctly resolves it."""
+    Round-N+ review (`appimage-smoke` regression: "16/176 resolved
+    dependencies" captured, i.e. this project's own real distro
+    packages -- libxau6, libglib2.0-0, libxcb1, ... -- were being
+    reported as NOT dpkg-owned on a genuine, unmodified `ubuntu-22.04`
+    CI runner): this function previously ONLY ever tried stripping a
+    leading `/usr` prefix as a fallback, on the theory that dpkg's
+    database always records the OLDER, pre-usr-merge form
+    (`/lib/x86_64-linux-gnu/...`) while `ldd` reports the merged,
+    canonical `/usr/lib/x86_64-linux-gnu/...` form. Directly reproducing
+    this against a real, freshly `apt-get install`ed `ubuntu:22.04`
+    container proved the OPPOSITE is what actually happens for the vast
+    majority of real packages on this exact, currently pinned base
+    image: `ldd` itself reports paths in the `/lib/x86_64-linux-gnu/...`
+    compatibility-symlink form (that is literally the path baked into
+    `/etc/ld.so.cache` by `ldconfig`), while dpkg's own package-contents
+    database records the CANONICAL, merged `/usr/lib/x86_64-linux-gnu/
+    ...` form for those same packages -- e.g. `dpkg -S
+    /usr/lib/x86_64-linux-gnu/libXau.so.6` succeeds while `dpkg -S
+    /lib/x86_64-linux-gnu/libXau.so.6` (the exact form `ldd` reports)
+    fails outright. Ubuntu's usr-merge migration has happened
+    incrementally, package by package, over several release cycles, so
+    a small minority of packages' contents databases may still only
+    know the OLDER pre-merge form (this project's own earlier testing
+    against `libz1g` observed exactly that) -- there is no single
+    universally correct direction. Rather than continuing to guess a
+    single fixed direction, this function now tries EVERY plausible
+    variant symmetrically: `path` exactly as given; with any leading
+    `/usr` prefix stripped (covers dpkg recording the older pre-merge
+    form for an already-canonical input); and, if `path` is not already
+    `/usr`-prefixed but starts with one of the classic usr-merged
+    top-level compatibility symlinks (`/lib`, `/bin`, `/sbin`, ...),
+    with an explicit `/usr` prefix ADDED (covers dpkg recording the
+    canonical merged form for an `ldd`-reported pre-merge-style input --
+    the common case this regression surfaced). The first candidate any
+    installed package actually owns wins; every one of these merely
+    represents the same on-disk file (`/lib` is always purely a symlink
+    to `usr/lib` on any of these systems), never a different file."""
     if shutil.which("dpkg") is None:
         return None
-    for candidate in (path, Path(str(path).removeprefix("/usr"))):
+    candidates: list[Path] = [path]
+    path_str = str(path)
+    if path_str.startswith("/usr/"):
+        stripped = path_str.removeprefix("/usr")
+        if stripped and Path(stripped) not in candidates:
+            candidates.append(Path(stripped))
+    else:
+        for merged_dir in _USR_MERGE_TOP_LEVEL_DIRS:
+            if path_str == merged_dir or path_str.startswith(merged_dir + "/"):
+                prefixed = Path("/usr" + path_str)
+                if prefixed not in candidates:
+                    candidates.append(prefixed)
+                break
+    for candidate in candidates:
         try:
             result = subprocess.run(
                 ["dpkg", "-S", str(candidate)],

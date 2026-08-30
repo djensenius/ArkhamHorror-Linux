@@ -4101,5 +4101,197 @@ class RealSystemPackageProvenanceTests(unittest.TestCase):
         )
 
 
+class DpkgOwningPackageUsrMergePathFormTests(unittest.TestCase):
+    """`appimage-smoke` regression (fresh CI run against exact head
+    5f5886c: "captured distro provenance for 16/176 resolved
+    dependencies" -- nearly every genuinely dpkg-owned real distro
+    library, e.g. libxau6's libXau.so.6, was wrongly reported as NOT
+    dpkg-owned): _dpkg_owning_package() previously only ever tried
+    STRIPPING a leading `/usr` prefix as its one merged-/usr fallback.
+    Directly reproducing this against a real, freshly `apt-get
+    install`ed `ubuntu:22.04` container proved the opposite direction is
+    what actually happens for the vast majority of real packages there:
+    `ldd` reports dependency paths in the pre-merge-compatibility-
+    symlink form (`/lib/x86_64-linux-gnu/...` -- the exact bytes baked
+    into `/etc/ld.so.cache` by `ldconfig`), while dpkg's own package-
+    contents database records the CANONICAL, `/usr`-merged form
+    (`/usr/lib/x86_64-linux-gnu/...`) for those same packages -- the
+    old strip-only fallback could never bridge that gap at all, since
+    stripping `/usr` from an already-`/lib`-form path is a no-op that
+    just retries the identical failing candidate a second time.
+
+    These tests mock `subprocess.run` directly (portable, no real dpkg
+    needed, and deterministic regardless of which direction happens to
+    be true on whatever host runs the test suite) to prove the exact
+    fail-before/pass-after shape of the regression: given a real dpkg
+    database that only recognizes the `/usr`-merged form of a path,
+    `_dpkg_owning_package()` must still find the owner when handed the
+    bare `/lib`-form path `ldd` actually reports (the previously-broken
+    direction), and vice versa -- proving the fix is symmetric rather
+    than merely flipping which single direction happens to work on
+    today's exact CI image (a fragile, non-portable fix this project
+    explicitly wants to avoid repeating)."""
+
+    def test_finds_owner_when_dpkg_only_recognizes_the_usr_merged_form(
+        self,
+    ) -> None:
+        """The exact regression: `ldd` reports the bare, pre-merge
+        `/lib/...` form, but dpkg's database only recognizes the
+        canonical `/usr/lib/...` form (this was the majority case for
+        real packages -- libxau6, libglib2.0-0, libxcb1, ... -- on the
+        real `appimage-smoke` CI runner)."""
+
+        def fake_run(cmd, **kwargs):
+            queried_path = cmd[2]
+            result = mock.Mock()
+            if queried_path == "/usr/lib/x86_64-linux-gnu/libXau.so.6":
+                result.returncode = 0
+                result.stdout = (
+                    "libxau6:amd64: /usr/lib/x86_64-linux-gnu/libXau.so.6\n"
+                )
+            else:
+                result.returncode = 1
+                result.stdout = ""
+            return result
+
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+            owner = audit._dpkg_owning_package(
+                Path("/lib/x86_64-linux-gnu/libXau.so.6")
+            )
+        self.assertEqual(owner, "libxau6")
+
+    def test_finds_owner_when_dpkg_only_recognizes_the_pre_merge_form(
+        self,
+    ) -> None:
+        """The opposite direction (this project's own earlier testing
+        against `libz1g` observed exactly this): `ldd` reports the
+        canonical `/usr/lib/...` form, but dpkg's database only
+        recognizes the older, pre-merge `/lib/...` form."""
+
+        def fake_run(cmd, **kwargs):
+            queried_path = cmd[2]
+            result = mock.Mock()
+            if queried_path == "/lib/x86_64-linux-gnu/libz.so.1":
+                result.returncode = 0
+                result.stdout = "zlib1g:amd64: /lib/x86_64-linux-gnu/libz.so.1\n"
+            else:
+                result.returncode = 1
+                result.stdout = ""
+            return result
+
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+            owner = audit._dpkg_owning_package(
+                Path("/usr/lib/x86_64-linux-gnu/libz.so.1")
+            )
+        self.assertEqual(owner, "zlib1g")
+
+    def test_never_retries_an_identical_no_op_candidate(self) -> None:
+        """Guards directly against the exact old bug shape: stripping
+        `/usr` from a path that is not `/usr`-prefixed is a no-op, so
+        the OLD code's `(path, Path(str(path).removeprefix("/usr")))`
+        tuple silently retried the IDENTICAL failing candidate twice for
+        any `/lib`-form input. Asserts `dpkg -S` is never invoked twice
+        with the same candidate path, and that both the given `/lib`-
+        form path AND its `/usr`-prefixed counterpart are actually
+        tried."""
+        queried: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            queried.append(cmd[2])
+            result = mock.Mock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+            audit._dpkg_owning_package(
+                Path("/lib/x86_64-linux-gnu/libnothing.so.1")
+            )
+        self.assertEqual(
+            len(queried),
+            len(set(queried)),
+            f"duplicate candidate(s) queried: {queried}",
+        )
+        self.assertIn("/lib/x86_64-linux-gnu/libnothing.so.1", queried)
+        self.assertIn("/usr/lib/x86_64-linux-gnu/libnothing.so.1", queried)
+
+    def test_does_not_add_a_usr_prefix_for_an_unrelated_top_level_path(
+        self,
+    ) -> None:
+        """A path that is not itself under one of the classic usr-merged
+        compatibility directories (`/lib`, `/bin`, `/sbin`, ...) must
+        never gain a synthetic, meaningless `/usr`-prefixed candidate --
+        e.g. a Qt SDK reference path like `/opt/qt/lib/libQt6Core.so.6`
+        is never itself a `/usr`-merge compatibility symlink target."""
+        queried: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            queried.append(cmd[2])
+            result = mock.Mock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+            audit._dpkg_owning_package(Path("/opt/qt/lib/libQt6Core.so.6"))
+        self.assertEqual(queried, ["/opt/qt/lib/libQt6Core.so.6"])
+
+
+@unittest.skipUnless(
+    shutil.which("dpkg") and shutil.which("dpkg-query") and shutil.which("ldd"),
+    "requires a real Debian/Ubuntu dpkg database and ldd to authenticate a "
+    "genuine system dependency",
+)
+class RealCaptureDistroSourceProvenancePathFormTests(unittest.TestCase):
+    """Companion to DpkgOwningPackageUsrMergePathFormTests above, proven
+    against a REAL dpkg database/`ldd` rather than mocks: resolves the
+    real `dpkg` binary's own real dynamic dependencies (guaranteed to
+    exist and be dynamically linked on any real Debian/Ubuntu host) and
+    asserts every soname `ldd` resolves to a real, existing, dpkg-owned
+    file is actually captured by capture_distro_source_provenance() --
+    i.e. it does not silently drop a real, dpkg-owned dependency because
+    of a path-form mismatch between what `ldd` reports and what dpkg's
+    database recognizes, regardless of which real libraries happen to
+    be installed on whatever host runs this test."""
+
+    def test_capture_distro_source_provenance_drops_no_real_dpkg_owned_dependency(
+        self,
+    ) -> None:
+        dpkg_path = shutil.which("dpkg")
+        resolved = audit.resolve_ldd_dependencies(Path(dpkg_path))
+        if not resolved:
+            self.skipTest(
+                "ldd resolved zero dependencies for the real dpkg binary"
+            )
+        captured = audit.capture_distro_source_provenance(resolved)
+        missing_but_real = {
+            soname: path
+            for soname, path in resolved.items()
+            if soname not in captured and path.is_file()
+        }
+        # A real dependency may still legitimately be omitted if it is
+        # genuinely not dpkg-owned on this host (e.g. a locally built
+        # library shadowing a system one) -- but every such omission
+        # must be independently re-provable as "no real dpkg owner", not
+        # merely a silent path-form mismatch this test can directly
+        # detect by calling _dpkg_owning_package() itself.
+        for soname, path in missing_but_real.items():
+            self.assertIsNone(
+                audit._dpkg_owning_package(path),
+                f"capture_distro_source_provenance() silently dropped "
+                f"{soname!r} ({path}), but _dpkg_owning_package() proves "
+                f"it IS really dpkg-owned -- this is exactly the "
+                f"path-form regression this test class guards against",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
