@@ -391,10 +391,30 @@ int openat2NoFollowNoXdev(int dirFd, const char *name, bool wantDirectory) {
 // quietly succeed via the weaker path instead. A prior version of this
 // function fell back on ANY openat2 failure whatsoever, discarding this
 // signal entirely; this is exactly the gap this round closes.
-int openDirectoryComponentNoFollow(int dirFd, const char *name,
-                                   bool *usedStrongNoXdev = nullptr) {
+//
+// Round-N+ review (repeat finding, "disk-usage accounting fails closed
+// on a legitimate, kernel-CONFIRMED cross-mount directory instead of
+// treating it as the deliberate skip every other cross-mount code path
+// already handles"): `confirmedCrossMountViaKernel`, when non-null, is
+// set to true iff openat2()'s own EXDEV refusal is what caused this
+// call to fail -- i.e. the kernel itself, not a userspace heuristic,
+// has PROVEN `name` resolves onto a different mount than `dirFd`. This
+// is categorically different from every other failure this function can
+// report (ENOSYS/"try the portable fallback", ELOOP/TOCTOU symlink,
+// EACCES, or any other refusal): those are all genuinely INDETERMINATE
+// ("cannot prove this is safe"), whereas EXDEV is a DEFINITIVE, positive
+// proof of a real mount boundary -- exactly the same kind of certainty
+// the plain "different st_dev" fast path already acts on elsewhere.
+// Callers that only care about "opened and mount-verified, or not" can
+// pass nullptr and treat any -1 uniformly, as before.
+int openDirectoryComponentNoFollow(
+    int dirFd, const char *name, bool *usedStrongNoXdev = nullptr,
+    bool *confirmedCrossMountViaKernel = nullptr) {
   if (usedStrongNoXdev) {
     *usedStrongNoXdev = false;
+  }
+  if (confirmedCrossMountViaKernel) {
+    *confirmedCrossMountViaKernel = false;
   }
 #if defined(ARKHAM_HAVE_OPENAT2_UAPI)
   if (!g_forceOpenat2UnavailableForTesting.load(std::memory_order_relaxed)) {
@@ -405,6 +425,12 @@ int openDirectoryComponentNoFollow(int dirFd, const char *name,
         *usedStrongNoXdev = true;
       }
       return viaOpenat2;
+    }
+    if (errno == EXDEV) {
+      if (confirmedCrossMountViaKernel) {
+        *confirmedCrossMountViaKernel = true;
+      }
+      return -1;
     }
     if (errno != ENOSYS) {
       return -1;
@@ -496,12 +522,32 @@ bool mountIdentityMatchesStrictRequiringMountId(const MountIdentity &actual,
 // Returns -1 (with no descriptor left open) the instant either the open
 // itself fails OR the resulting descriptor cannot be proven to remain on
 // `expectedMount`.
+//
+// Round-N+ review (repeat finding, "disk-usage accounting fails closed
+// on a legitimate, kernel-CONFIRMED cross-mount directory"):
+// `confirmedCrossMount`, when non-null, is set to true iff a -1 return
+// is backed by the kernel's own EXDEV refusal (see
+// openDirectoryComponentNoFollow()'s comment) -- a DEFINITIVE proof
+// `name` is a genuine cross-mount boundary, never merely an
+// inconclusive "could not verify" result. Callers that need to treat
+// "confirmed different mount" (already safely accounted for and
+// deliberately never descended into) differently from "genuinely
+// indeterminate" (must fail closed) inspect this; callers that don't
+// care may pass nullptr and treat every -1 identically, as before.
 int openSubdirectoryNoFollowMountChecked(int dirFd, const char *name,
-                                         const MountIdentity &expectedMount) {
+                                         const MountIdentity &expectedMount,
+                                         bool *confirmedCrossMount = nullptr) {
+  if (confirmedCrossMount) {
+    *confirmedCrossMount = false;
+  }
   bool usedStrongNoXdev = false;
-  const int childFd =
-      openDirectoryComponentNoFollow(dirFd, name, &usedStrongNoXdev);
+  bool confirmedCrossMountViaKernel = false;
+  const int childFd = openDirectoryComponentNoFollow(
+      dirFd, name, &usedStrongNoXdev, &confirmedCrossMountViaKernel);
   if (childFd < 0) {
+    if (confirmedCrossMount) {
+      *confirmedCrossMount = confirmedCrossMountViaKernel;
+    }
     return -1;
   }
   bool mountOk;
@@ -1853,16 +1899,34 @@ std::optional<qint64> sumUsageRelative(int dirFd,
       // BIND mount masquerading as an ordinary subdirectory is to open
       // it and re-verify on the actual descriptor via
       // openSubdirectoryNoFollowMountChecked() -- see that function's
-      // own comment. Unlike the "different device" case above, this is
-      // genuinely INDETERMINATE when it fails (a same-device bind
-      // mount, or an inability to prove otherwise on a kernel too old
-      // for openat2's RESOLVE_NO_XDEV): silently treating it as "0
-      // additional bytes, keep going" would let quota enforcement
-      // systematically undercount real usage exactly like every other
-      // indeterminate case this function already fails closed for.
+      // own comment.
+      //
+      // Round-N+ review (repeat finding, "disk-usage accounting fails
+      // closed on a legitimate, kernel-CONFIRMED same-device bind
+      // mount instead of the deliberate skip every other cross-mount
+      // path already gets"): a kernel-CONFIRMED cross-mount refusal
+      // (`confirmedCrossMount` -- see openSubdirectoryNoFollowMountChecked()'s
+      // comment -- backed by openat2()'s own EXDEV, never a userspace
+      // heuristic) is DEFINITIVE positive proof this is exactly the
+      // same kind of foreign-mount directory the "different device"
+      // fast path above already skips rather than fails on; its own
+      // entry size is already counted above, so it is likewise a
+      // deliberate SKIP, not a traversal failure. Only a genuinely
+      // INDETERMINATE failure -- unable to prove either way (an older
+      // kernel with no openat2 AND no STATX_MNT_ID, some other open
+      // error, or a TOCTOU race) -- still fails closed: silently
+      // treating THAT as "0 additional bytes, keep going" would let
+      // quota enforcement systematically undercount real usage exactly
+      // like every other indeterminate case this function already
+      // fails closed for.
+      bool confirmedCrossMount = false;
       const int childFd = openSubdirectoryNoFollowMountChecked(
-          dirFd, entry->d_name, expectedMount);
+          dirFd, entry->d_name, expectedMount, &confirmedCrossMount);
       if (childFd < 0) {
+        if (confirmedCrossMount) {
+          errno = 0;
+          continue;
+        }
         closedir(dirStream);
         return std::nullopt;
       }
