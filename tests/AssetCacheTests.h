@@ -255,6 +255,34 @@ private slots:
   // ownership/mode alone is never sufficient on its own.
   void
   mountTransitionPolicyRejectsDestinationWhenFilesystemTypeOverrideReportsUnqualified();
+  // Cumulative review (independent re-review round-6, MEDIUM, "Home
+  // policy rejects normal root-owned `/home` but accepts arbitrary
+  // user-owned binds" -- "position-sensitive ownership"): an ordinary,
+  // current-uid-owned, non-writable destination -- exactly the shape
+  // mountTransitionPolicyAcceptsOwnedNonWritableDestinationWhenFilesystemTypeQualifies()
+  // above proves PASSES for a FINAL (account-home) transition -- must
+  // instead be REJECTED when evaluated as an ANCESTOR-position
+  // transition (isFinalAccountHomeTransition=false): an ancestor must
+  // be root-owned, never merely owned by whichever uid happens to be
+  // running this process (an unprivileged attacker sharing that uid
+  // could otherwise satisfy this exact check with a bind mount of a
+  // directory they themselves own). Proves the fail-before/pass-after
+  // contract directly: this exact destination fixture was accepted
+  // under the OLD, position-blind policy and must now be refused.
+  void
+  mountTransitionPolicyRejectsCurrentUidOwnedDestinationForAncestorPositionEvenWhenFilesystemTypeQualifies();
+  // Cumulative review (independent re-review round-6, MEDIUM, same
+  // finding): the complementary positive control -- a genuinely
+  // root-owned, non-writable directory ("/" itself, present and
+  // root-owned mode 0755 on every POSIX system this project targets,
+  // needing no privileged setup at all) correctly QUALIFIES as an
+  // ANCESTOR-position transition destination, modelling a real
+  // distribution's own root-provisioned dedicated "/home" partition --
+  // proving the fix does not merely reject everything, but correctly
+  // accepts the legitimate topology the review demands ("legitimate
+  // dedicated /home ... transitions pass").
+  void
+  mountTransitionPolicyAcceptsRootOwnedDestinationForAncestorPositionWhenFilesystemTypeQualifies();
   // Cumulative review (independent re-review, MEDIUM, "only one
   // transition allowed"): unlike every test above (which permitted at
   // most a single mount transition across the whole home-path walk),
@@ -450,6 +478,22 @@ private slots:
   // forced-fork marker), a fresh AssetCache over a fresh root regains
   // full disk authority normally.
   void constructingAssetCacheAfterSimulatedForkFailsDiskAuthorityClosed();
+  // Cumulative review (independent re-review round-6, MEDIUM, "Pre-fork
+  // live AssetCache objects remain usable in child"): proves the
+  // per-instance hasForkedSinceConstruction() guard's actual, full
+  // effect on an ALREADY-LIVE, previously-fully-functional instance --
+  // using setPreForkLiveInstanceForcedStateForTesting() (see its own
+  // comment) to deterministically put it into exactly the state a real
+  // just-forked child's inherited copy would observe, then exercising
+  // EVERY mutating/reading public method against it and asserting each
+  // one fails closed as a safe no-op/miss, touching neither m_mutex,
+  // m_memory, nor disk -- while the instance's OWN pre-existing entry
+  // (stored before the simulated fork) remains completely untouched,
+  // and the instance fully recovers to normal behavior once the forced
+  // state is cleared (mirroring "require exec for fresh disk authority"
+  // -- clearing the marker here plays the role a real exec() would).
+  void
+  preForkLiveInstanceRejectsEveryInheritedOperationBeforeTouchingStateForTesting();
   // Cumulative review (independent re-review, HIGH, "shared root
   // authority incomplete"): two SIMULTANEOUSLY LIVE same-process
   // instances over the same root -- one sibling's invalidate() must be
@@ -488,6 +532,62 @@ private slots:
   // tokens that predate it, never blocks all future publication for
   // that key.
   void freshlyIssuedTokenAfterInvalidateCanStillPublishNormally();
+  // Cumulative review (independent re-review round-5, HIGH, "Shared
+  // authority remains non-linearizable across coordinators" -- "Old 404
+  // can invalidate newer-issued/finished 200"): an OLDER-issued
+  // generation's recordNegative404() attempt, arriving strictly AFTER a
+  // NEWER-issued generation's store() has already published and applied
+  // for the exact same key, must be rejected by the same CAS gate
+  // store()/invalidate() already use -- never silently overwrite a
+  // fresher success with a stale negative tombstone.
+  void oldIssuedNegative404CannotClobberNewerAppliedSuccess();
+  // Cumulative review (independent re-review round-5, HIGH, "negative
+  // 404 is coordinator-local and can hide sibling-populated cache"): a
+  // negative-404 record written under an OLDER issued generation must
+  // stop being authoritative the instant a NEWER generation's store()
+  // applies for the same key -- proving a sibling's fresher success is
+  // never hidden behind a stale tombstone recorded earlier, even though
+  // the record itself is not actively cleared (only its authoritativeness
+  // check, gated on an exact generation match, changes).
+  void negative404BecomesNonAuthoritativeOnceANewerSuccessAppliesForSameKey();
+  // Cumulative review (independent re-review round-5, HIGH, "old 404 can
+  // invalidate newer-issued/finished 200"): invalidateAndRecordNegative404()
+  // is the ONE combined call dispatchCandidateFetchResult()/
+  // dispatchRevalidationResult() actually use for an authoritative 404 --
+  // this proves its stale-token-skip contract directly at the AssetCache
+  // layer: an older-issued token's invalidate-and-record attempt, arriving
+  // strictly after a newer generation has already applied a success for
+  // the exact same key, must return SkippedStaleGeneration and leave
+  // BOTH the newer entry AND the (absent) negative record completely
+  // untouched -- proving the exact composition bug this method exists to
+  // avoid (a plain invalidate() followed by a separately CAS-gated
+  // recordNegative404() using the SAME already-stale token, which would
+  // always self-reject and silently never write a record at all) cannot
+  // recur.
+  void
+  invalidateAndRecordNegative404SkipsStaleGenerationLeavingNewerSuccessIntact();
+  // Cumulative review (independent re-review round-5, HIGH, "cache
+  // snapshot lookup then issuance in separate critical sections"): two
+  // INDEPENDENT AssetCache instances sharing one root (see
+  // sameProcessMultipleInstancesOverSameRootAllCooperateWithFullDiskAuthority()
+  // above for the same sharing setup) -- one instance's
+  // snapshotAndIssueGeneration() call must observe a fresher store()
+  // another sibling instance already applied, atomically, in the SAME
+  // call that mints its own fresh issuance token (never a stale read
+  // paired, non-atomically, with a fresh token that could otherwise be
+  // used to gate publishing that stale read).
+  void
+  siblingInstanceSnapshotAndIssueGenerationAtomicallyObservesOtherSiblingsPriorStore();
+  // Companion to the test above, from the opposite direction: a sibling
+  // instance's snapshotAndIssueGeneration() call for a key currently
+  // carrying an authoritative negative-404 record (written by ANOTHER
+  // sibling instance) must itself see authoritativeNegative404 == true
+  // and hit == std::nullopt -- proving the negative record, like the
+  // positive cache state, is genuinely shared across sibling instances
+  // sharing one root, not merely readable-by-coincidence via one
+  // instance's own private state.
+  void
+  siblingInstanceSnapshotAndIssueGenerationObservesOtherSiblingsNegative404();
 
 private:
   QString m_tempDirPath;

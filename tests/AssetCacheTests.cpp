@@ -3281,20 +3281,87 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    mountTransitionPolicyRejectsCurrentUidOwnedDestinationForAncestorPositionEvenWhenFilesystemTypeQualifies() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("this policy is POSIX-specific; not applicable on this platform");
+#else
+  const QString dirPath =
+      m_tempDirPath + QStringLiteral("/current-uid-owned-ancestor-position");
+  QVERIFY(QDir().mkpath(dirPath));
+  // QDir::mkpath() already creates directories owned by this very
+  // process's own real uid and neither group- nor world-writable --
+  // the SAME fixture shape
+  // mountTransitionPolicyAcceptsOwnedNonWritableDestinationWhenFilesystemTypeQualifies()
+  // above proves passes for a FINAL transition.
+  QVERIFY(::chmod(QFile::encodeName(dirPath).constData(), S_IRWXU) == 0);
+
+  MountTransitionPolicyQualificationOverrideGuard fsTypeGuard(
+      /*qualified=*/true);
+
+  const std::optional<bool> verdict =
+      AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+          dirPath, /*isFinalAccountHomeTransition=*/false);
+  QVERIFY(verdict.has_value());
+  QVERIFY2(!*verdict,
+           "a current-uid-owned destination must never qualify as an "
+           "ANCESTOR-position mount transition -- only a root-owned one "
+           "may, exactly like a real distribution's own dedicated /home "
+           "partition");
+#endif
+}
+
+void AssetCacheTests::
+    mountTransitionPolicyAcceptsRootOwnedDestinationForAncestorPositionWhenFilesystemTypeQualifies() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("this policy is POSIX-specific; not applicable on this platform");
+#else
+  // "/" itself: present, root-owned, and neither group- nor
+  // world-writable (mode 0755 or stricter) on every POSIX system this
+  // project targets -- needs no privileged test setup at all to model
+  // a genuine root-provisioned dedicated mount destination.
+  struct stat rootSt {};
+  QVERIFY(::stat("/", &rootSt) == 0);
+  if (rootSt.st_uid != 0 || (rootSt.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    QSKIP("this environment's own \"/\" is not root-owned/non-writable; "
+          "cannot exercise the ancestor-position positive control without "
+          "a genuinely root-owned fixture");
+  }
+
+  MountTransitionPolicyQualificationOverrideGuard fsTypeGuard(
+      /*qualified=*/true);
+
+  const std::optional<bool> verdict =
+      AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+          QStringLiteral("/"), /*isFinalAccountHomeTransition=*/false);
+  QVERIFY(verdict.has_value());
+  QVERIFY2(*verdict,
+           "a genuinely root-owned, non-writable destination must qualify "
+           "as an ANCESTOR-position mount transition -- this is the exact "
+           "legitimate topology (a real distribution's own dedicated /home "
+           "partition) the fix must continue to permit");
+#endif
+}
+
+void AssetCacheTests::
     multipleIndependentlyQualifiedMountTransitionsInTheSameHomeWalkAreAllPermitted() {
   // Cumulative review (independent re-review, MEDIUM, "only one
-  // transition allowed"): bind-mounts BOTH an ancestor of home's final
-  // component AND home's own final component onto two SEPARATE real
-  // mounts, modelling a genuine SteamOS-style topology with more than
-  // one legitimate transition in the same walk. Both destinations are
-  // ordinary, unprivileged-created directories/tmpfs-or-local-backed
-  // bind sources with default (non-group/world-writable) ownership and
-  // mode, so both independently pass the real ownership/mode policy;
+  // transition allowed"; independent re-review round-6, MEDIUM,
+  // "position-sensitive ownership"): bind-mounts BOTH an ancestor of
+  // home's final component AND home's own final component onto two
+  // SEPARATE real mounts, modelling a genuine SteamOS-style topology
+  // with more than one legitimate transition in the same walk. The
+  // ANCESTOR-position destination is chowned to root:root (mirroring a
+  // real distribution's own root-provisioned dedicated "/home"
+  // partition -- see directoryDescriptorPassesAncestorOwnerAndModePolicy()'s
+  // comment for why this is now REQUIRED, not merely permitted, for a
+  // non-final transition), while the FINAL, account-home-position
+  // destination remains ordinary, unprivileged-created and owned by the
+  // current uid (exactly as a real user's own home directory must be);
   // the account database is forced to authenticate the final fake
   // $HOME path, and the real /proc/self/mountinfo lookup is exercised
   // unmodified (no filesystem-type override) -- proving genuinely BOTH
-  // transitions are granted through the real, unmodified production
-  // decision path end-to-end.
+  // transitions are granted through the real, unmodified, position-
+  // sensitive production decision path end-to-end.
 #if !defined(__linux__)
   QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
         "platform");
@@ -3310,6 +3377,42 @@ void AssetCacheTests::
   QVERIFY(ancestorBindSourceDir.isValid());
   const QString ancestorBindSource = ancestorBindSourceDir.path();
   QVERIFY(QDir().mkpath(ancestorBindSource + QStringLiteral("/actual-home")));
+
+  // Cumulative review (independent re-review round-6, MEDIUM,
+  // "position-sensitive ownership"): the ANCESTOR-position bind
+  // source itself (never its "actual-home" subdirectory, which the
+  // SECOND, final-position bind mount below shadows entirely) must be
+  // root-owned to model a genuine dedicated-partition topology -- see
+  // directoryDescriptorPassesAncestorOwnerAndModePolicy()'s own
+  // comment. Requires the same passwordless sudo privilege the mount/
+  // umount calls below already require; skips (never fails) when
+  // unavailable, exactly like every other privileged step in this
+  // test.
+  QProcess ancestorChownProc;
+  ancestorChownProc.start(QStringLiteral("sudo"),
+                          {QStringLiteral("-n"), QStringLiteral("chown"),
+                           QStringLiteral("root:root"), ancestorBindSource});
+  const bool ancestorChowned = ancestorChownProc.waitForFinished(5000) &&
+                               ancestorChownProc.exitCode() == 0;
+  if (!ancestorChowned) {
+    QSKIP("passwordless chown privilege unavailable in this environment; "
+          "see the finding's own fail-closed allowance");
+  }
+  // Restores ownership back to this test process's own uid before the
+  // QTemporaryDir destructor tries to remove it -- a root-owned
+  // directory beneath a sticky-bit temp root (common, e.g. /tmp) can
+  // only be unlinked by root itself, which would otherwise leave an
+  // orphaned root-owned directory behind after this test.
+  struct AncestorChownBackGuard {
+    QString path;
+    ~AncestorChownBackGuard() {
+      QProcess::execute(QStringLiteral("sudo"),
+                        {QStringLiteral("-n"), QStringLiteral("chown"),
+                         QString::number(::getuid()) + QLatin1Char(':') +
+                             QString::number(::getgid()),
+                         path});
+    }
+  } ancestorChownBackGuard{ancestorBindSource};
 
   QProcess ancestorMountProc;
   ancestorMountProc.start(QStringLiteral("sudo"),
@@ -4348,6 +4451,98 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    preForkLiveInstanceRejectsEveryInheritedOperationBeforeTouchingStateForTesting() {
+  // RAII-style guaranteed reset -- mirrors
+  // constructingAssetCacheAfterSimulatedForkFailsDiskAuthorityClosed()'s
+  // own guard above.
+  struct ForcedPreForkStateGuard {
+    ~ForcedPreForkStateGuard() {
+      AssetCache::setPreForkLiveInstanceForcedStateForTesting(false);
+    }
+  } guard;
+
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/pre-fork-live-instance.png")));
+
+  // Fully normal, pre-"fork" operation: an entry genuinely published
+  // before the simulated fork, exactly as a real parent process's
+  // already-live cache would have before forking.
+  const quint64 preForkGeneration = cache.issueKeyGeneration(key);
+  cache.store(key, makeEntry(QByteArrayLiteral("pre-fork-bytes")),
+              preForkGeneration);
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QVERIFY(cache.lookupDisk(key).has_value());
+
+  // Now simulate exactly the state a real just-forked child's copy of
+  // this exact, already-constructed object would observe.
+  AssetCache::setPreForkLiveInstanceForcedStateForTesting(true);
+
+  // Fail-before/pass-after (this is the exact bug class the review
+  // flagged: "inherited public methods lock inherited QMutex and may
+  // deadlock/mutate root"): EVERY public operation below must now
+  // fail closed as a safe no-op/miss, never touching m_mutex/m_memory/
+  // disk at all.
+  QVERIFY(!cache.lookupMemory(key).has_value());
+  QVERIFY(!cache.lookupDisk(key).has_value());
+  QCOMPARE(cache.issueKeyGeneration(key), AssetCache::kUnconditionalGeneration);
+  const AssetCache::KeyGenerationSnapshot snapshot =
+      cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/1'000);
+  QVERIFY(!snapshot.hit.has_value());
+  QVERIFY(!snapshot.hitFromMemory);
+  QVERIFY(!snapshot.authoritativeNegative404);
+  QCOMPARE(snapshot.issuedGeneration, AssetCache::kUnconditionalGeneration);
+
+  cache.recordNegative404(key, preForkGeneration, /*nowMonotonicMs=*/1'000,
+                          /*ttlMs=*/60'000);
+  QVERIFY(!cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/1'000));
+  cache.clearNegative404(key); // must not crash/deadlock either.
+
+  const QString otherKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/pre-fork-live-other.png")));
+  cache.store(otherKey, makeEntry(QByteArrayLiteral("post-fork-write-bytes")));
+  QVERIFY(!cache.lookupMemory(otherKey).has_value());
+  QVERIFY(!cache.lookupDisk(otherKey).has_value());
+
+  cache.touchAfterNotModified(key, QStringLiteral("etag"),
+                              QStringLiteral("last-modified"),
+                              preForkGeneration);
+  cache.updateMemoryDecodedImage(key, QImage(), preForkGeneration);
+  cache.promoteToMemory(otherKey, makeEntry(QByteArrayLiteral("promoted")),
+                        preForkGeneration);
+  QVERIFY(!cache.lookupMemory(otherKey).has_value());
+
+  QCOMPARE(cache.invalidate(key),
+           AssetCache::InvalidateResult::PersistenceFailed);
+  QCOMPARE(cache.invalidateAndRecordNegative404(key, preForkGeneration,
+                                                /*nowMonotonicMs=*/1'000,
+                                                /*ttlMs=*/60'000),
+           AssetCache::InvalidateResult::PersistenceFailed);
+  cache.reapAndEnforceQuota(); // must not crash/deadlock either.
+
+  // The pre-fork entry must remain COMPLETELY untouched by every one of
+  // the rejected operations above -- neither evicted, invalidated, nor
+  // silently mutated.
+  AssetCache::setPreForkLiveInstanceForcedStateForTesting(false);
+  const auto stillPresent = cache.lookupMemory(key);
+  QVERIFY(stillPresent.has_value());
+  QCOMPARE(stillPresent->encodedBytes, QByteArrayLiteral("pre-fork-bytes"));
+  QVERIFY(cache.lookupDisk(key).has_value());
+
+  // Recovery: once the simulated fork state clears (mirroring a real
+  // exec()), this exact same instance resumes fully normal behavior --
+  // this guard is a deliberate, temporary rejection, never a permanent
+  // poisoning of the instance.
+  const quint64 postClearGeneration = cache.issueKeyGeneration(otherKey);
+  cache.store(otherKey, makeEntry(QByteArrayLiteral("resumed-bytes")),
+              postClearGeneration);
+  QVERIFY(cache.lookupMemory(otherKey).has_value());
+  QVERIFY(cache.lookupDisk(otherKey).has_value());
+}
+
+void AssetCacheTests::
     siblingInvalidateImmediatelyClearsAnotherSiblingsMemoryView() {
   AssetCache first(configFor(m_tempDirPath));
   QVERIFY(!first.isDiskCacheDisabledForTesting());
@@ -4571,4 +4766,252 @@ void AssetCacheTests::
   first.updateMemoryDecodedImage(key, image, freshToken);
   QCOMPARE(first.lookupMemory(key)->decodedImage.pixelColor(0, 0),
            QColor(Qt::yellow));
+}
+
+void AssetCacheTests::oldIssuedNegative404CannotClobberNewerAppliedSuccess() {
+  // Cumulative review (independent re-review round-5, HIGH, "Old 404 can
+  // invalidate newer-issued/finished 200"): simulates two concurrent
+  // logical attempts against the exact same cache key -- an OLDER one
+  // (issued first, genOld) that is ultimately a 404, and a NEWER one
+  // (issued second, genNew) that is ultimately a 200 -- completing in
+  // the ADVERSARIAL order (the newer 200 finishes and publishes FIRST,
+  // then the older, now-stale 404 arrives afterward). Before this round's
+  // fix, the older attempt's negative-404 record was recorded
+  // unconditionally by whichever coordinator instance owned it (never
+  // gated against the shared applied-generation watermark at all), so it
+  // could silently clobber the fresher success. recordNegative404() is
+  // now gated by the exact same tryApplyKeyGenerationLocked() CAS check
+  // store()/invalidate() already use, so the stale attempt is rejected.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/old-404-vs-new-200.png")));
+
+  const quint64 genOld = cache.issueKeyGeneration(key);
+  const quint64 genNew = cache.issueKeyGeneration(key);
+  QVERIFY2(genNew > genOld,
+           "a later issuance must strictly exceed an earlier one");
+
+  // The NEWER attempt's success publishes first (it happened to win the
+  // network race despite starting second).
+  cache.store(key, makeEntry(QByteArrayLiteral("newer-success-bytes")), genNew);
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("newer-success-bytes"));
+
+  // The OLDER attempt's definitive 404 arrives strictly afterward and
+  // attempts to record a negative-404 tombstone using its own (now
+  // stale) issued generation -- this must be silently rejected, never
+  // resurrecting an authoritative absence over the fresher success.
+  cache.recordNegative404(key, genOld, /*nowMonotonicMs=*/1'000,
+                          /*ttlMs=*/60'000);
+
+  QVERIFY2(!cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/1'000),
+           "a stale, older-issued negative-404 attempt must never become "
+           "authoritative once a newer generation has already applied a "
+           "success for the same key");
+
+  // The newer success must remain fully intact and unaffected -- neither
+  // evicted, invalidated, nor shadowed by the rejected negative record.
+  const auto stillFresh = cache.lookupMemory(key);
+  QVERIFY(stillFresh.has_value());
+  QCOMPARE(stillFresh->encodedBytes, QByteArrayLiteral("newer-success-bytes"));
+
+  const AssetCache::KeyGenerationSnapshot snapshot =
+      cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/1'000);
+  QVERIFY(!snapshot.authoritativeNegative404);
+  QVERIFY(snapshot.hit.has_value());
+  QCOMPARE(snapshot.hit->encodedBytes,
+           QByteArrayLiteral("newer-success-bytes"));
+}
+
+void AssetCacheTests::
+    invalidateAndRecordNegative404SkipsStaleGenerationLeavingNewerSuccessIntact() {
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(QUrl(QStringLiteral(
+      "https://example.com/invalidate-and-record-stale-skip.png")));
+
+  const quint64 genOld = cache.issueKeyGeneration(key);
+  const quint64 genNew = cache.issueKeyGeneration(key);
+  QVERIFY2(genNew > genOld,
+           "a later issuance must strictly exceed an earlier one");
+
+  // The NEWER attempt's success publishes first.
+  cache.store(key, makeEntry(QByteArrayLiteral("newer-success-bytes")), genNew);
+  QVERIFY(cache.lookupMemory(key).has_value());
+
+  // The OLDER attempt's definitive 404 arrives strictly afterward and
+  // calls the SAME combined method the coordinator actually uses --
+  // must be rejected wholesale (both the invalidate AND the
+  // negative-404 record), never partially applied.
+  const AssetCache::InvalidateResult result =
+      cache.invalidateAndRecordNegative404(key, genOld,
+                                           /*nowMonotonicMs=*/3'000,
+                                           /*ttlMs=*/60'000);
+  QCOMPARE(result, AssetCache::InvalidateResult::SkippedStaleGeneration);
+
+  // The newer success must remain fully intact -- neither evicted nor
+  // invalidated by the rejected stale attempt.
+  const auto stillFresh = cache.lookupMemory(key);
+  QVERIFY(stillFresh.has_value());
+  QCOMPARE(stillFresh->encodedBytes, QByteArrayLiteral("newer-success-bytes"));
+
+  // No negative-404 record was written at all -- the exact bug this
+  // method exists to avoid (a plain invalidate() followed by a
+  // separately CAS-gated recordNegative404() using the same already-
+  // stale token would always self-reject silently, but here we prove
+  // the combined method never even attempts the write).
+  QVERIFY2(!cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/3'000),
+           "a stale invalidateAndRecordNegative404() attempt must never "
+           "record a negative-404, even transiently");
+  QCOMPARE(cache.negative404RecordCountForTesting(), 0);
+
+  const AssetCache::KeyGenerationSnapshot snapshot =
+      cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/3'000);
+  QVERIFY(!snapshot.authoritativeNegative404);
+  QVERIFY(snapshot.hit.has_value());
+  QCOMPARE(snapshot.hit->encodedBytes,
+           QByteArrayLiteral("newer-success-bytes"));
+}
+
+void AssetCacheTests::
+    negative404BecomesNonAuthoritativeOnceANewerSuccessAppliesForSameKey() {
+  // Cumulative review (independent re-review round-5, HIGH, "negative
+  // 404 is coordinator-local and can hide sibling-populated cache"): the
+  // OPPOSITE completion order from the test above -- the older attempt's
+  // 404 is recorded FIRST (while it is still legitimately current), and
+  // only afterward does a newer attempt's success apply. The negative
+  // record must stop being authoritative the instant the newer
+  // generation applies, even though the record itself is never actively
+  // cleared by store() (only recordNegative404()'s own CAS gate and
+  // hasNegative404's exact-generation-match check are involved) -- proving
+  // a sibling's fresher success is never permanently hidden behind an
+  // earlier, now-superseded tombstone.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(QUrl(
+      QStringLiteral("https://example.com/negative-then-newer-success.png")));
+
+  const quint64 genOld = cache.issueKeyGeneration(key);
+  cache.recordNegative404(key, genOld, /*nowMonotonicMs=*/2'000,
+                          /*ttlMs=*/60'000);
+  QVERIFY2(cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/2'000),
+           "a negative-404 recorded while still current must be "
+           "authoritative");
+  QCOMPARE(cache.negative404RecordCountForTesting(), 1);
+
+  const AssetCache::KeyGenerationSnapshot beforeNewerSuccess =
+      cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/2'000);
+  QVERIFY(beforeNewerSuccess.authoritativeNegative404);
+  QVERIFY(!beforeNewerSuccess.hit.has_value());
+  const quint64 genNew = beforeNewerSuccess.issuedGeneration;
+  QVERIFY2(genNew > genOld,
+           "snapshotAndIssueGeneration() must mint a strictly newer token "
+           "than the earlier negative-404 attempt's");
+
+  cache.store(key, makeEntry(QByteArrayLiteral("later-sibling-success")),
+              genNew);
+
+  QVERIFY2(!cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/2'000),
+           "a negative-404 record must stop being authoritative once a "
+           "strictly newer generation has applied a success for the same "
+           "key, even though the record itself was never actively "
+           "cleared");
+
+  const AssetCache::KeyGenerationSnapshot afterNewerSuccess =
+      cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/2'000);
+  QVERIFY2(!afterNewerSuccess.authoritativeNegative404,
+           "the shared snapshot call must never report a stale negative "
+           "record as authoritative once superseded");
+  QVERIFY(afterNewerSuccess.hit.has_value());
+  QCOMPARE(afterNewerSuccess.hit->encodedBytes,
+           QByteArrayLiteral("later-sibling-success"));
+}
+
+void AssetCacheTests::
+    siblingInstanceSnapshotAndIssueGenerationAtomicallyObservesOtherSiblingsPriorStore() {
+  // Cumulative review (independent re-review round-5, HIGH, "cache
+  // snapshot lookup then issuance in separate critical sections"): two
+  // INDEPENDENT, simultaneously-live AssetCache instances sharing one
+  // root (see sameProcessMultipleInstancesOverSameRootAllCooperateWith
+  // FullDiskAuthority() above for the identical sharing setup this
+  // relies on) -- a sibling's store() completed strictly BEFORE this
+  // instance's own snapshotAndIssueGeneration() call must be fully,
+  // atomically visible to it: both the hit AND the freshly minted
+  // issuance token are produced by the SAME single locked critical
+  // section on the shared authority, so there is no window in which a
+  // caller could observe stale data paired with a token that appears
+  // current.
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/sibling-atomic-snapshot.png")));
+
+  const quint64 firstToken = first.issueKeyGeneration(key);
+  first.store(key, makeEntry(QByteArrayLiteral("first-sibling-bytes")),
+              firstToken);
+
+  // `second` never directly touched this key before -- its own
+  // snapshotAndIssueGeneration() call must still see `first`'s already-
+  // published entry via the shared memory tier, and mint a token
+  // strictly newer than firstToken.
+  const AssetCache::KeyGenerationSnapshot snapshot =
+      second.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/3'000);
+  QVERIFY(!snapshot.authoritativeNegative404);
+  QVERIFY(snapshot.hit.has_value());
+  QCOMPARE(snapshot.hit->encodedBytes,
+           QByteArrayLiteral("first-sibling-bytes"));
+  QVERIFY(snapshot.hitFromMemory);
+  QVERIFY2(snapshot.issuedGeneration > firstToken,
+           "a sibling's fresh issuance must strictly exceed a token issued "
+           "by the OTHER sibling for the same key -- proving the issuance "
+           "counter is genuinely shared, not per-instance");
+
+  // The freshly minted token is immediately usable to publish through
+  // `second` for the exact same key, proving it is a real, currently-
+  // valid CAS baseline against the shared watermark -- not merely an
+  // opaque, disconnected number.
+  second.store(key, makeEntry(QByteArrayLiteral("second-sibling-bytes")),
+               snapshot.issuedGeneration);
+  QCOMPARE(first.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("second-sibling-bytes"));
+}
+
+void AssetCacheTests::
+    siblingInstanceSnapshotAndIssueGenerationObservesOtherSiblingsNegative404() {
+  // Companion to the test above: a negative-404 tombstone recorded by
+  // ONE sibling instance must be immediately, fully authoritative from
+  // the OTHER sibling instance's OWN snapshotAndIssueGeneration() call --
+  // proving the negative-404 record now lives in the shared authority,
+  // never a private, per-instance map that a sibling could bypass and
+  // silently re-fetch a resource this process already confirmed absent.
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(QUrl(
+      QStringLiteral("https://example.com/sibling-shared-negative404.png")));
+
+  const quint64 firstToken = first.issueKeyGeneration(key);
+  first.recordNegative404(key, firstToken, /*nowMonotonicMs=*/4'000,
+                          /*ttlMs=*/60'000);
+
+  const AssetCache::KeyGenerationSnapshot snapshot =
+      second.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/4'000);
+  QVERIFY2(snapshot.authoritativeNegative404,
+           "a negative-404 record written by one sibling instance must be "
+           "authoritative when observed through a DIFFERENT sibling "
+           "instance sharing the same root");
+  QVERIFY(!snapshot.hit.has_value());
+  QVERIFY2(second.hasNegative404ForTesting(key, /*nowMonotonicMs=*/4'000),
+           "the public test hook must agree with the snapshot result when "
+           "queried from the OTHER sibling instance");
 }

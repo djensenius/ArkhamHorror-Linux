@@ -28,15 +28,20 @@ namespace Arkham {
 // higher-priority candidate (e.g. a localized variant) that has not yet
 // been tried at all. The ONLY thing that authorizes skipping an untried
 // candidate is an exact, authoritative negative-404 record for that exact
-// resolved candidate URL (see hasNegative404()/recordNegative404() in the
-// .cpp) -- recorded only when a real fetch or revalidation for that exact
-// candidate received a definitive 404, NEVER for a timeout, TLS failure,
-// cancellation, 5xx, or any integrity/codec failure (those are transient
-// or ambiguous, not proof of absence). This record is memory-only (never
-// persisted to disk, so it cannot outlive this process) and scoped
-// per-candidate (never generalized to a whole identifier or logical key);
-// it is cleared if that exact candidate is later observed to succeed
-// (defensive: a resource that once 404'd could, in principle, reappear).
+// resolved candidate URL (see AssetCache::snapshotAndIssueGeneration()/
+// recordNegative404() -- this record now lives in the shared AssetCache
+// authority, not this coordinator, so a same-root sibling's fresher
+// success or invalidation is instantly visible to it; see the class-wide
+// "shared root authority" note further below) -- recorded only when a
+// real fetch or revalidation for that exact candidate received a
+// definitive 404, NEVER for a timeout, TLS failure, cancellation, 5xx, or
+// any integrity/codec failure (those are transient or ambiguous, not
+// proof of absence). This record is memory-only (never persisted to
+// disk, so it cannot outlive the process(es) sharing this root) and
+// scoped per-candidate (never generalized to a whole identifier or
+// logical key); it is cleared if that exact candidate is later observed
+// to succeed (defensive: a resource that once 404'd could, in principle,
+// reappear).
 // A revalidation (see startRevalidation()) that itself receives a 404
 // applies the identical rule: the previously-cached entry is evicted (see
 // AssetCache::invalidate()), a negative record is written, and the
@@ -236,24 +241,32 @@ public:
     return 0;
   }
 
-  // Review round-4 item 7: observable sizes of the three per-cache-key
-  // maps (m_negative404, m_cacheKeyGeneration, m_cacheKeyIssuedGeneration)
+  // Review round-4 item 7: observable size of the coordinator-local
+  // per-cache-key maps (m_cacheKeyGeneration, m_cacheKeyIssuedGeneration)
   // that pruneStaleCacheKeyState() bounds -- see its declaration comment
   // for the pruning contract. Test-only; lets a high-cardinality test
   // assert these maps stay bounded (proportional to currently-in-flight
-  // + recently-active cache keys) rather than growing without limit for
-  // the coordinator's entire process lifetime.
+  // cache keys) rather than growing without limit for the coordinator's
+  // entire process lifetime.
+  //
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // negative-404 tombstone record itself no longer lives here at all --
+  // see AssetCache::NegativeCacheRecord's own comment -- so
+  // negative404RecordCountForTesting()/hasNegative404ForTesting() below
+  // now delegate to the shared m_cache instead of a coordinator-local
+  // map.
   [[nodiscard]] int negative404RecordCountForTesting() const {
-    return m_negative404.size();
+    return m_cache.negative404RecordCountForTesting();
   }
   [[nodiscard]] int cacheKeyGenerationStateCountForTesting() const {
     return m_cacheKeyGeneration.size() + m_cacheKeyIssuedGeneration.size();
   }
-  // Test-only exposure of the private hasNegative404() predicate itself,
-  // for asserting a specific cache key's record was (or was not) evicted
-  // by pruning, independent of the aggregate counts above.
+  // Test-only exposure of the shared negative-404 record's
+  // authoritativeness for a specific cache key, independent of the
+  // aggregate count above.
   [[nodiscard]] bool hasNegative404ForTesting(const QString &cacheKey) const {
-    return hasNegative404(cacheKey);
+    return m_cache.hasNegative404ForTesting(cacheKey, m_monotonicNowMs());
   }
 
   // Round-7/8 item 7: the number of DISTINCT shared cache-hit decode
@@ -302,9 +315,15 @@ public:
   // pruning) with a small, fast number of distinct candidates instead of
   // needing thousands of real network round trips to reach the
   // production-sized cap. Test-only; production code always uses the
-  // compiled-in default (see the constructor).
+  // compiled-in default.
+  //
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): forwards
+  // to the shared m_cache, which now owns this ceiling -- see
+  // AssetCache::setMaxTrackedNegative404EntriesForTesting()'s own
+  // comment.
   void setMaxTrackedNegative404EntriesForTesting(int maxEntries) {
-    m_maxTrackedNegative404Entries = maxEntries;
+    m_cache.setMaxTrackedNegative404EntriesForTesting(maxEntries);
   }
 
   // Review round-3 item 13: replaces the real monotonic (steady_clock)
@@ -352,20 +371,15 @@ private:
     QString pendingAttemptKey;
   };
 
-  // Authoritative negative-404 record lookup/write for one exact
-  // resolved-candidate cache key -- see the class comment above for the
-  // full contract (memory-only, per-candidate, 404-only, cleared on a
-  // later success). Review round-3 item 13: NEVER permanent -- bounded by
-  // kNegative404TtlMs, and additionally invalidated the instant
-  // `cacheKey`'s applied generation (see tryApplyCacheKeyMutation()) moves
-  // past the value the record was written under (a later success or a
-  // later negative recording both count, including via a completely
-  // different in-flight operation). `generation` is the exact issuance
-  // value (see issueCacheKeyGeneration()) that was just successfully
-  // applied via tryApplyCacheKeyMutation() when this 404 was recorded.
-  [[nodiscard]] bool hasNegative404(const QString &cacheKey) const;
-  void recordNegative404(const QString &cacheKey, quint64 generation);
-  void clearNegative404(const QString &cacheKey);
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // negative-404 record itself (lookup/write/clear) now lives entirely
+  // in the shared AssetCache authority -- see AssetCache::
+  // NegativeCacheRecord's own comment and snapshotAndIssueGeneration()/
+  // recordNegative404()/clearNegative404() there for the full contract
+  // (still memory-only, per-candidate, 404-only, cleared on a later
+  // success, bounded by kNegative404TtlMs) -- so no coordinator-local
+  // lookup/write/clear method remains here at all.
 
   RequestHandle
   registerImmediateCompletion(const AssetKey &key, ResultCallback callback,
@@ -765,44 +779,44 @@ private:
   // Review round-4 item 7: the exact set of cache keys some CURRENTLY
   // in-flight operation might still complete against right now -- i.e.
   // every distinct AssetCache::cacheKeyFor() value that could still be
-  // the `cacheKey` argument of a future tryApplyCacheKeyMutation()/
-  // recordNegative404() call reachable from an operation already present
-  // in m_operations. One entry per operation: its current candidate's
-  // resolved cache key (or revalidationCacheKey while revalidating).
+  // the `cacheKey` argument of a future tryApplyCacheKeyMutation() call
+  // reachable from an operation already present in m_operations. One
+  // entry per operation: its current candidate's resolved cache key (or
+  // revalidationCacheKey while revalidating).
   // pruneStaleCacheKeyState() treats every key in this set as pinned --
-  // never erased from m_negative404/m_cacheKeyGeneration/
-  // m_cacheKeyIssuedGeneration -- regardless of TTL/generation state.
+  // never erased from m_cacheKeyGeneration/m_cacheKeyIssuedGeneration --
+  // regardless of generation state.
   [[nodiscard]] QSet<QString> activeInFlightCacheKeys() const;
-  // Review round-4 item 7: bounds m_negative404/m_cacheKeyGeneration/
+  // Review round-4 item 7: bounds m_cacheKeyGeneration/
   // m_cacheKeyIssuedGeneration, which previously retained one entry per
   // DISTINCT cache key ever observed for this coordinator's entire
   // process lifetime (a long play session touching thousands of distinct
-  // card arts would grow all three without limit). Called opportunistically
+  // card arts would grow both without limit). Called opportunistically
   // at the end of every completeOperation() -- the natural point at which
   // an operation stops being "in-flight" and its cache key becomes a
   // pruning candidate.
   //
-  // A key is erased from m_negative404 once its record is expired or
-  // superseded (mirrors hasNegative404()'s own "no longer authoritative"
-  // condition, just swept here instead of left in place indefinitely)
-  // AND it is not in activeInFlightCacheKeys(). A key is erased from
-  // m_cacheKeyGeneration/m_cacheKeyIssuedGeneration once it is not in
-  // activeInFlightCacheKeys() AND no (still-valid) m_negative404 record
-  // for it survives the sweep above.
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // negative-404 record itself no longer lives in this coordinator at
+  // all (see AssetCache::recordNegative404()'s own bounded-pruning/
+  // hard-cap enforcement), so a key is erased from
+  // m_cacheKeyGeneration/m_cacheKeyIssuedGeneration purely once it is
+  // not in activeInFlightCacheKeys() -- nothing else pins it.
   //
   // Safety argument ("operation-owned epoch" survives pruning): every
-  // completion lambda that could ever call tryApplyCacheKeyMutation()/
-  // recordNegative404() for a cache key FIRST looks its own operationId
-  // up in m_operations and returns immediately if it is missing (see
-  // completeOperation(), which erases the operation the instant it
-  // completes, before any further async work). Consequently, once ALL
-  // operations referencing a cache key have completed and been erased --
-  // exactly the condition activeInFlightCacheKeys() excludes -- no future
-  // completion can ever reach these maps for that key again, so resetting
-  // its generation counters back to the "never seen" (0) baseline is
-  // indistinguishable from having never touched that key at all. A key
-  // remaining active is never pruned, so an in-flight operation's own
-  // eventual CAS check always sees its true, unbroken generation history.
+  // completion lambda that could ever call tryApplyCacheKeyMutation()
+  // for a cache key FIRST looks its own operationId up in m_operations
+  // and returns immediately if it is missing (see completeOperation(),
+  // which erases the operation the instant it completes, before any
+  // further async work). Consequently, once ALL operations referencing
+  // a cache key have completed and been erased -- exactly the condition
+  // activeInFlightCacheKeys() excludes -- no future completion can ever
+  // reach these maps for that key again, so resetting its generation
+  // counters back to the "never seen" (0) baseline is indistinguishable
+  // from having never touched that key at all. A key remaining active is
+  // never pruned, so an in-flight operation's own eventual CAS check
+  // always sees its true, unbroken generation history.
   void pruneStaleCacheKeyState();
   // Review round-3 item 12: the ONE path every candidate-list transition
   // (the very first look at an untried candidate, and every subsequent
@@ -858,36 +872,16 @@ private:
   QHash<quint64, std::shared_ptr<bool>>
       m_pendingDeliveryCancelled; // consumer handleId -> cancelled flag
 
-  // Review round-3 item 13: a bounded (kNegative404TtlMs), generation-
-  // scoped negative-404 record -- see hasNegative404()'s comment for the
-  // full expiry contract. Replaces a bare QSet<QString> (permanent for
-  // this coordinator's entire lifetime) with this small struct so a
-  // record naturally, deterministically stops being trusted without
-  // requiring an active sweep/timer.
-  struct Negative404Entry {
-    quint64 generation{0};
-    qint64 expiresAtMonotonicMs{0};
-  };
-  // Cache keys (see AssetCache::cacheKeyFor()) for which an exact,
-  // authoritative 404 has been observed by THIS process; never
-  // persisted to disk. See the class comment for the full contract, and
-  // hasNegative404()'s comment for the TTL/generation expiry.
-  QHash<QString, Negative404Entry> m_negative404;
+  // Review round-3 item 13: kNegative404TtlMs -- see
+  // AssetCache::recordNegative404()'s comment for the full expiry
+  // contract this TTL parameterizes. Cumulative review (independent
+  // re-review, HIGH, "negative 404 is coordinator-local and can hide
+  // sibling-populated cache"): the negative-404 RECORD itself (and its
+  // hard cap) now lives entirely in the shared AssetCache authority --
+  // see AssetCache::NegativeCacheRecord's own comment -- so only this
+  // TTL constant (a pure duration, not state) remains here; it is
+  // passed to AssetCache::recordNegative404() at every call site.
   static constexpr qint64 kNegative404TtlMs = 5 * 60 * 1000; // 5 minutes
-  // Review round-4 item 7: a hard ceiling on the number of DISTINCT
-  // unexpired negative-404 records retained at once, independent of
-  // kNegative404TtlMs. pruneStaleCacheKeyState()'s lazy-expiry sweep
-  // alone only removes ALREADY-expired records, so it cannot bound the
-  // (unrealistic, but not impossible) case of an enormous number of
-  // distinct candidates all 404ing within the same TTL window; this cap
-  // evicts the soonest-to-expire non-pinned record(s) once exceeded.
-  // Chosen generously relative to any real card/asset catalogue's size.
-  // A member (not a bare compile-time constant) so
-  // setMaxTrackedNegative404EntriesForTesting() can shrink it for a fast,
-  // deterministic high-cardinality test; production code never changes
-  // it from this default.
-  static constexpr int kMaxTrackedNegative404Entries = 4096;
-  int m_maxTrackedNegative404Entries = kMaxTrackedNegative404Entries;
   // Review round-3 item 13: the monotonic clock negative-404 expiry is
   // measured against -- steady_clock in production (see the .cpp),
   // replaceable via setMonotonicNowForTesting() above. Deliberately NOT
@@ -898,8 +892,11 @@ private:
   // Per-cache-key optimistic-concurrency APPLIED-generation watermark
   // (review item 6, refined by round-3 item 14); see
   // currentCacheKeyGeneration()/tryApplyCacheKeyMutation() and the class
-  // comment's "Cross-logical-key races" paragraph. Memory-only, like
-  // m_negative404.
+  // comment's "Cross-logical-key races" paragraph. Memory-only, scoped
+  // to THIS coordinator instance only (deliberately distinct from the
+  // shared AssetCache-level generation used for cross-instance/sibling
+  // protection -- see completeCacheReadOrQuarantine()'s comment for why
+  // both layers are needed).
   QHash<QString, quint64> m_cacheKeyGeneration;
   // Review round-3 item 14: per-cache-key ISSUANCE counter -- see
   // issueCacheKeyGeneration()'s comment. Deliberately a SEPARATE counter
@@ -921,8 +918,9 @@ private:
   // an entry only ever exists between a leader's registerCacheHitCompletion()
   // call and the moment its single queued completeCoalescedCacheDecode()
   // call actually runs (at most one Qt event-loop hop later), never
-  // persisting across that -- so unlike m_negative404 it needs no separate
-  // TTL/pruning logic.
+  // persisting across that -- so unlike the shared negative-404 record
+  // (AssetCache::NegativeCacheRecord) it needs no separate TTL/pruning
+  // logic.
   QHash<QString, PendingCacheDecode> m_pendingCacheDecodes;
   // Round-7/8 item 7: see realDecodeCallCountForTesting()'s comment.
   int m_realDecodeCallCountForTesting = 0;

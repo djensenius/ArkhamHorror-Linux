@@ -201,37 +201,51 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
     const AssetCandidate &candidate = candidates[candidateIndex];
     const QString cacheKey = AssetCache::cacheKeyFor(candidate.url);
 
-    if (hasNegative404(cacheKey)) {
+    // Cumulative review (independent re-review, HIGH, "shared root
+    // authority incomplete" / "cache snapshot lookup then issuance in
+    // separate critical sections"): the negative-404 check, the
+    // memory-or-disk cache read, and the fresh AssetCache-level
+    // issuance mint all happen inside ONE call, under ONE lock
+    // acquisition on the shared authority -- see
+    // AssetCache::snapshotAndIssueGeneration()'s comment for the exact
+    // race this closes (a sibling's invalidate()+store() can no longer
+    // land in the gap between a separate lookup and a separate mint).
+    const AssetCache::KeyGenerationSnapshot snapshot =
+        m_cache.snapshotAndIssueGeneration(cacheKey, m_monotonicNowMs());
+
+    if (snapshot.authoritativeNegative404) {
       continue; // authoritatively confirmed absent: try the next candidate
     }
 
-    // A same-process memory hit was already validated during this
-    // process's own lifetime: serve it with no network round trip at all.
-    // Routed through registerCacheHitCompletion() (review item 9), not
-    // ensureDecoded() + registerImmediateCompletion() directly: a
-    // decode/integrity failure discovered here must be able to quarantine
-    // this exact entry and retry the SAME candidate over the network
-    // rather than permanently poisoning this key with a fixed, pre-
-    // computed failure outcome.
-    if (auto hit = m_cache.lookupMemory(cacheKey)) {
-      // Review round-3 item 14: mint a fresh ISSUANCE value for this
-      // cache hit (never merely read the current applied watermark --
-      // see issueCacheKeyGeneration()'s comment) so a concurrent network
-      // fetch issued after this exact moment for the same cache key
-      // correctly outranks this cache hit's own eventual decode/promote
-      // side effects, regardless of which one finishes first.
-      // Cumulative review (independent re-review, HIGH, "shared root
-      // authority incomplete"): mint the SEPARATE AssetCache-level token
-      // (m_cache.issueKeyGeneration()) at this exact same moment too --
-      // see CandidateAttempt::assetCacheGeneration's comment.
+    if (snapshot.hit && snapshot.hitFromMemory) {
+      // A same-process memory hit was already validated during this
+      // process's own lifetime: serve it with no network round trip at
+      // all, regardless of any validators it happens to carry (see
+      // KeyGenerationSnapshot::hitFromMemory's comment). Routed through
+      // registerCacheHitCompletion() (review item 9), not
+      // ensureDecoded() + registerImmediateCompletion() directly: a
+      // decode/integrity failure discovered here must be able to
+      // quarantine this exact entry and retry the SAME candidate over
+      // the network rather than permanently poisoning this key with a
+      // fixed, pre-computed failure outcome.
+      //
+      // Review round-3 item 14: mint a fresh coordinator-local ISSUANCE
+      // value for this cache hit too (never merely read the current
+      // applied watermark -- see issueCacheKeyGeneration()'s comment) so
+      // a concurrent network fetch issued after this exact moment for
+      // the same cache key correctly outranks this cache hit's own
+      // eventual decode/promote side effects, regardless of which one
+      // finishes first. snapshot.issuedGeneration is the separate
+      // AssetCache-level token minted atomically above (see
+      // CandidateAttempt::assetCacheGeneration's comment).
       return registerCacheHitCompletion(
-          key, std::move(callback), candidates, candidateIndex, std::move(*hit),
-          cacheKey, issueCacheKeyGeneration(cacheKey),
-          m_cache.issueKeyGeneration(cacheKey));
+          key, std::move(callback), candidates, candidateIndex,
+          std::move(*snapshot.hit), cacheKey, issueCacheKeyGeneration(cacheKey),
+          snapshot.issuedGeneration);
     }
 
-    if (auto hit = m_cache.lookupDisk(cacheKey)) {
-      AssetCache::CachedEntry entry = *hit;
+    if (snapshot.hit) {
+      AssetCache::CachedEntry entry = *snapshot.hit;
       if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
         // Nothing to conditionally revalidate against: serve as-is,
         // exactly like a memory hit (see the comment above).
@@ -240,7 +254,7 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
         return registerCacheHitCompletion(
             key, std::move(callback), candidates, candidateIndex,
             std::move(entry), cacheKey, issueCacheKeyGeneration(cacheKey),
-            m_cache.issueKeyGeneration(cacheKey));
+            snapshot.issuedGeneration);
       }
 
       // A disk hit carrying validators is revalidated with a real
@@ -377,36 +391,6 @@ AssetRequestCoordinator::unsubscribeFromCandidateAttempt(
   return fetchHandle;
 }
 
-bool AssetRequestCoordinator::hasNegative404(const QString &cacheKey) const {
-  const auto it = m_negative404.constFind(cacheKey);
-  if (it == m_negative404.constEnd()) {
-    return false;
-  }
-  // Review round-3 item 13: a record is authoritative only while BOTH
-  // hold: (a) `cacheKey`'s applied generation has not moved past the
-  // exact issuance this record was written under (a later success, or a
-  // later negative recording -- from this operation or a completely
-  // different one -- both count), and (b) its TTL has not yet elapsed
-  // against the injectable monotonic clock. Lazy expiry: an
-  // expired/superseded entry is simply left in place (never actively
-  // swept) until overwritten by a fresh recordNegative404() or removed by
-  // clearNegative404() -- this method never mutates state, consistent
-  // with it being callable from a const context.
-  return it->generation == currentCacheKeyGeneration(cacheKey) &&
-         m_monotonicNowMs() < it->expiresAtMonotonicMs;
-}
-
-void AssetRequestCoordinator::recordNegative404(const QString &cacheKey,
-                                                quint64 generation) {
-  m_negative404.insert(
-      cacheKey,
-      Negative404Entry{generation, m_monotonicNowMs() + kNegative404TtlMs});
-}
-
-void AssetRequestCoordinator::clearNegative404(const QString &cacheKey) {
-  m_negative404.remove(cacheKey);
-}
-
 quint64 AssetRequestCoordinator::currentCacheKeyGeneration(
     const QString &cacheKey) const {
   return m_cacheKeyGeneration.value(cacheKey, 0);
@@ -452,56 +436,24 @@ QSet<QString> AssetRequestCoordinator::activeInFlightCacheKeys() const {
 
 void AssetRequestCoordinator::pruneStaleCacheKeyState() {
   const QSet<QString> active = activeInFlightCacheKeys();
-  const qint64 now = m_monotonicNowMs();
 
-  // See the declaration comment: a negative-404 record is prunable once
-  // it is no longer authoritative (expired, or superseded by a
-  // different generation having since been applied) -- the same
-  // condition hasNegative404() already checks lazily -- AND its cache
-  // key is not pinned by any still-in-flight operation.
-  for (auto it = m_negative404.begin(); it != m_negative404.end();) {
-    const bool stillAuthoritative =
-        it->generation == m_cacheKeyGeneration.value(it.key(), 0) &&
-        now < it->expiresAtMonotonicMs;
-    if (!stillAuthoritative && !active.contains(it.key())) {
-      it = m_negative404.erase(it);
-    } else {
-      ++it;
-    }
-  }
-
-  // Review round-4 item 7: enforce the hard ceiling even when every
-  // surviving record is individually still within its TTL -- evict the
-  // soonest-to-expire non-pinned record(s) first (a reasonable,
-  // deterministic proxy for "oldest" given these records carry no
-  // separate last-access timestamp) until back at or under the cap, or
-  // until every remaining record is pinned by an in-flight operation
-  // (in which case the cap is temporarily, unavoidably exceeded by
-  // however many operations are genuinely still in flight).
-  while (m_negative404.size() > m_maxTrackedNegative404Entries) {
-    auto oldestIt = m_negative404.end();
-    for (auto it = m_negative404.begin(); it != m_negative404.end(); ++it) {
-      if (active.contains(it.key())) {
-        continue;
-      }
-      if (oldestIt == m_negative404.end() ||
-          it->expiresAtMonotonicMs < oldestIt->expiresAtMonotonicMs) {
-        oldestIt = it;
-      }
-    }
-    if (oldestIt == m_negative404.end()) {
-      break;
-    }
-    m_negative404.erase(oldestIt);
-  }
-
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // negative-404 record itself is no longer coordinator-local state at
+  // all -- see AssetCache::NegativeCacheRecord's own comment and
+  // AssetCache::recordNegative404()'s bounded-pruning/hard-cap
+  // enforcement, which now runs opportunistically inside the shared
+  // cache every time a fresh record is written, entirely independent of
+  // this coordinator's own pruning cadence.
+  //
   // Generation-tracking state for a cache key is prunable once nothing
   // still needs to compare against it: no in-flight operation is pinning
-  // it, and no surviving (just-swept, still-authoritative) negative-404
-  // record depends on it either.
+  // it. (Previously ALSO kept alive by a surviving coordinator-local
+  // negative-404 record depending on it -- that record no longer lives
+  // here, so this simplifies to just the in-flight condition.)
   for (auto it = m_cacheKeyGeneration.begin();
        it != m_cacheKeyGeneration.end();) {
-    if (!active.contains(it.key()) && !m_negative404.contains(it.key())) {
+    if (!active.contains(it.key())) {
       it = m_cacheKeyGeneration.erase(it);
     } else {
       ++it;
@@ -509,7 +461,7 @@ void AssetRequestCoordinator::pruneStaleCacheKeyState() {
   }
   for (auto it = m_cacheKeyIssuedGeneration.begin();
        it != m_cacheKeyIssuedGeneration.end();) {
-    if (!active.contains(it.key()) && !m_negative404.contains(it.key())) {
+    if (!active.contains(it.key())) {
       it = m_cacheKeyIssuedGeneration.erase(it);
     } else {
       ++it;
@@ -887,24 +839,32 @@ void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
         operation.candidates[operation.candidateIndex];
     const QString cacheKey = AssetCache::cacheKeyFor(candidate.url);
 
-    if (hasNegative404(cacheKey)) {
+    // Cumulative review (independent re-review, HIGH, "shared root
+    // authority incomplete" / "cache snapshot lookup then issuance in
+    // separate critical sections"): same atomic snapshot+mint used by
+    // request()'s own initial loop -- see its comment and
+    // AssetCache::snapshotAndIssueGeneration()'s own comment.
+    const AssetCache::KeyGenerationSnapshot snapshot =
+        m_cache.snapshotAndIssueGeneration(cacheKey, m_monotonicNowMs());
+
+    if (snapshot.authoritativeNegative404) {
       continue; // authoritatively confirmed absent: try the next candidate
     }
 
-    if (auto hit = m_cache.lookupMemory(cacheKey)) {
-      completeCacheReadOrQuarantine(operationId, std::move(*hit), cacheKey,
-                                    issueCacheKeyGeneration(cacheKey),
-                                    m_cache.issueKeyGeneration(cacheKey),
+    if (snapshot.hit && snapshot.hitFromMemory) {
+      completeCacheReadOrQuarantine(operationId, std::move(*snapshot.hit),
+                                    cacheKey, issueCacheKeyGeneration(cacheKey),
+                                    snapshot.issuedGeneration,
                                     /*promoteOnSuccess=*/false);
       return;
     }
 
-    if (auto hit = m_cache.lookupDisk(cacheKey)) {
-      AssetCache::CachedEntry entry = *hit;
+    if (snapshot.hit) {
+      AssetCache::CachedEntry entry = *snapshot.hit;
       if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
         completeCacheReadOrQuarantine(operationId, std::move(entry), cacheKey,
                                       issueCacheKeyGeneration(cacheKey),
-                                      m_cache.issueKeyGeneration(cacheKey),
+                                      snapshot.issuedGeneration,
                                       /*promoteOnSuccess=*/false);
         return;
       }
@@ -1081,13 +1041,27 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
       // a cache key a more recently issued operation has already
       // populated with a genuinely fresh success.
       if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+        // Cumulative review (independent re-review round-5, HIGH, "old
+        // 404 can invalidate newer-issued/finished 200" / "negative 404
+        // is coordinator-local and can hide sibling-populated cache"):
+        // ONE combined, atomically CAS-gated call against the SEPARATE,
+        // AssetCache-level assetCacheGeneration token (never the
+        // coordinator-local issuedGeneration) -- see
+        // AssetCache::invalidateAndRecordNegative404()'s own comment for
+        // why the invalidate and the negative-404 record MUST share a
+        // single CAS check rather than two separate calls. A same-root
+        // sibling's concurrent fresh success for this exact key now
+        // correctly prevents this possibly-stale 404 from either
+        // invalidating it OR recording a tombstone over it, in addition
+        // to (never instead of) tryApplyCacheKeyMutation()'s own,
+        // coordinator-local protection above.
         const AssetCache::InvalidateResult invalidateResult =
-            m_cache.invalidate(cacheKey);
+            m_cache.invalidateAndRecordNegative404(
+                cacheKey, assetCacheGeneration, m_monotonicNowMs(),
+                kNegative404TtlMs);
         if (invalidateResult ==
             AssetCache::InvalidateResult::PersistenceFailed) {
           notFoundPersistenceFailed = true;
-        } else {
-          recordNegative404(cacheKey, issuedGeneration);
         }
       }
     }
@@ -1099,7 +1073,7 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
     isSuccess = true;
     AssetCache::CachedEntry entry = toCachedEntry(*result->asset);
     if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
-      clearNegative404(cacheKey);
+      m_cache.clearNegative404(cacheKey);
       // Cumulative review (independent re-review, HIGH, "shared root
       // authority incomplete", "store has no token"): thread the
       // SEPARATE, AssetCache-level token through -- see
@@ -1289,12 +1263,18 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     // the full rationale.
     bool persistenceFailed = false;
     if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+      // Cumulative review (independent re-review round-5, HIGH, "old 404
+      // can invalidate newer-issued/finished 200" / "negative 404 is
+      // coordinator-local and can hide sibling-populated cache"): ONE
+      // combined, atomically CAS-gated call -- see
+      // dispatchCandidateFetchResult()'s identical comment and
+      // AssetCache::invalidateAndRecordNegative404()'s own comment.
       const AssetCache::InvalidateResult invalidateResult =
-          m_cache.invalidate(cacheKey);
+          m_cache.invalidateAndRecordNegative404(cacheKey, assetCacheGeneration,
+                                                 m_monotonicNowMs(),
+                                                 kNegative404TtlMs);
       if (invalidateResult == AssetCache::InvalidateResult::PersistenceFailed) {
         persistenceFailed = true;
-      } else {
-        recordNegative404(cacheKey, issuedGeneration);
       }
     }
     verdict = persistenceFailed ? Verdict::NotFoundFailedClosed
@@ -1468,7 +1448,7 @@ void AssetRequestCoordinator::completeOperation(
   m_operations.erase(it);
   // Review round-4 item 7: this operation has just stopped being
   // in-flight -- its (or any other now-inactive operation's) cache key(s)
-  // may now be prunable from m_negative404/m_cacheKeyGeneration/
+  // may now be prunable from m_cacheKeyGeneration/
   // m_cacheKeyIssuedGeneration. See pruneStaleCacheKeyState()'s
   // declaration comment for the full safety argument; called here,
   // opportunistically, rather than on a timer, so these maps' sizes stay
@@ -1631,7 +1611,7 @@ void AssetRequestCoordinator::cancel(RequestHandle handle) {
     // Round-6 item 7: this operation has just stopped being in-flight
     // via cancellation, exactly as much as one that stopped via
     // completeOperation() -- its cache key(s) must be equally eligible
-    // for pruning from m_negative404/m_cacheKeyGeneration/
+    // for pruning from m_cacheKeyGeneration/
     // m_cacheKeyIssuedGeneration (see pruneStaleCacheKeyState()'s
     // comment). Previously only completeOperation() called this, so a
     // burst of uniquely-keyed requests that were each cancelled before

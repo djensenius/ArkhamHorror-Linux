@@ -1386,6 +1386,43 @@ bool directoryDescriptorPassesOwnerAndModePolicy(int fd) {
   return true;
 }
 
+// Cumulative review (independent re-review round-6, MEDIUM, "Home
+// policy rejects normal root-owned `/home` but accepts arbitrary
+// user-owned binds" -- "position-sensitive ownership: trusted
+// root-owned non-writable ancestors, user-owned final account home"):
+// the sibling ownership/mode check for a mount transition occurring at
+// an ANCESTOR of home's own final path component (e.g. "/home" itself,
+// when $HOME is "/home/deck") -- NEVER the same check as
+// directoryDescriptorPassesOwnerAndModePolicy() above, which requires
+// ownership by the CURRENT uid and is only ever correct for the FINAL
+// transition (the account's own home directory, which that account
+// itself must own). An ordinary distribution's dedicated "/home"
+// partition is legitimately owned by root:root, mode 0755 -- requiring
+// current-uid ownership there (the pre-fix policy, applied uniformly to
+// every transition regardless of position) incorrectly rejected that
+// entirely normal topology, while simultaneously accepting an
+// ATTACKER-controlled bind mount planted at that same ancestor position
+// merely because it happened to be owned by the current uid (which an
+// unprivileged attacker sharing the same uid, or a misconfigured
+// deployment, can trivially arrange). Requiring root ownership here
+// closes that gap: an ancestor transition an unprivileged process can
+// unilaterally create (a bind mount of a directory IT owns) can never
+// satisfy this check, while the genuine, root-provisioned system mount
+// still does.
+bool directoryDescriptorPassesAncestorOwnerAndModePolicy(int fd) {
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    return false;
+  }
+  if (st.st_uid != 0) {
+    return false;
+  }
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    return false;
+  }
+  return true;
+}
+
 #if defined(__linux__)
 // Cumulative review (independent re-review, MEDIUM, "home trust still
 // pathname-only" -- "trusted deployment/mount identity independently
@@ -1582,11 +1619,30 @@ bool mountPointHasTrustedLocalFilesystemType(
 // evidence of a TRUSTED mount origin, so this conservatively refuses
 // every transition there unless a test has explicitly forced a
 // deterministic answer via the override below.
-bool mountTransitionIsIndependentlyPolicyQualified(int fd) {
-  if (!directoryDescriptorPassesOwnerAndModePolicy(fd)) {
+//
+// `isFinalAccountHomeTransition` distinguishes WHICH ownership check
+// applies (round-6, MEDIUM, "position-sensitive ownership"): true only
+// for a transition landing exactly on home's own final path component
+// (the account's own home directory itself, which that account must
+// own -- directoryDescriptorPassesOwnerAndModePolicy()'s current-uid
+// check); false for every earlier, ANCESTOR-position transition (e.g.
+// "/home" itself when $HOME is "/home/deck"), which instead requires
+// root ownership (directoryDescriptorPassesAncestorOwnerAndModePolicy())
+// -- see that function's own comment for why conflating the two
+// checks was itself the defect.
+bool mountTransitionIsIndependentlyPolicyQualified(
+    int fd, bool isFinalAccountHomeTransition) {
+  const bool ownershipOk =
+      isFinalAccountHomeTransition
+          ? directoryDescriptorPassesOwnerAndModePolicy(fd)
+          : directoryDescriptorPassesAncestorOwnerAndModePolicy(fd);
+  if (!ownershipOk) {
     qWarning() << "AssetCache: mount transition destination fails the "
-                  "ownership/mode policy (not owned by the current uid, or "
-                  "group/world-writable)";
+                  "ownership/mode policy ("
+               << (isFinalAccountHomeTransition
+                       ? "not owned by the current uid, or group/world-writable"
+                       : "not owned by root, or group/world-writable")
+               << ")";
     return false;
   }
 #if defined(__linux__)
@@ -1695,7 +1751,9 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     return std::nullopt;
   }
   MountIdentity currentMount = mountIdentityForFd(currentFd);
-  for (const QString &component : homeComponents) {
+  for (int componentIndex = 0; componentIndex < homeComponents.size();
+       ++componentIndex) {
+    const QString &component = homeComponents.at(componentIndex);
     const QByteArray componentUtf8 = component.toUtf8();
     struct stat st {};
     if (fstatat(currentFd, componentUtf8.constData(), &st,
@@ -1710,6 +1768,16 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
       ::close(currentFd);
       return std::nullopt;
     }
+    // Cumulative review (independent re-review round-6, MEDIUM,
+    // "position-sensitive ownership"): true only for the LAST component
+    // of home's own path -- the account's own home directory itself --
+    // never for any earlier, ancestor-position component (e.g. "/home"
+    // when $HOME is "/home/deck"). See
+    // mountTransitionIsIndependentlyPolicyQualified()'s own comment for
+    // why the two positions require genuinely different ownership
+    // evidence.
+    const bool isFinalAccountHomeComponent =
+        (componentIndex == homeComponents.size() - 1);
     // A transition is only ever ATTEMPTED (i.e. the kernel-level
     // RESOLVE_NO_XDEV guarantee is deliberately not requested for this
     // one open) when home is authenticated at all -- every OTHER
@@ -1760,7 +1828,8 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
       // Linux, a kernel-recorded trusted-local filesystem type) before
       // it is ever granted.
       if (!transitionMayBeAttemptedHere ||
-          !mountTransitionIsIndependentlyPolicyQualified(nextFd)) {
+          !mountTransitionIsIndependentlyPolicyQualified(
+              nextFd, isFinalAccountHomeComponent)) {
         qWarning() << "AssetCache: refusing to treat" << home
                    << "as a trusted home directory anchor -- component"
                    << component
@@ -2199,6 +2268,13 @@ struct RootAuthority {
   QCache<QString, AssetCache::CachedEntry> memory;
   QHash<QString, quint64> keyIssuedGeneration;
   QHash<QString, quint64> keyAppliedGeneration;
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // shared negative-404 tombstone map -- see AssetCache::
+  // NegativeCacheRecord's own comment for the full contract. Repointed
+  // alongside `memory`/`keyIssuedGeneration`/`keyAppliedGeneration`
+  // above.
+  QHash<QString, AssetCache::NegativeCacheRecord> negative404;
 
   ~RootAuthority() {
     if (lockFd >= 0) {
@@ -2280,6 +2356,16 @@ std::atomic<pid_t> &forkedChildObservedPidStorage() {
 // is never written from inside the real pthread_atfork() handler
 // itself.
 std::atomic<bool> g_forceForkedSinceLastExecForTesting{false};
+
+// Test-only forced override for
+// AssetCache::setPreForkLiveInstanceForcedStateForTesting() -- see that
+// declaration's own comment in AssetCache.h. Deliberately a SEPARATE
+// atomic from g_forceForkedSinceLastExecForTesting above: the two
+// mechanisms guard genuinely different code paths (NEW instance
+// construction/root acquisition vs. an ALREADY-LIVE instance's public
+// methods) and a test exercising one must never accidentally perturb
+// the other.
+std::atomic<bool> g_forcePreForkLiveInstanceForTesting{false};
 
 bool processHasForkedSinceLastExec() {
   if (g_forceForkedSinceLastExecForTesting.load(std::memory_order_relaxed)) {
@@ -2577,6 +2663,12 @@ AssetCache::AssetCache(Config config) : m_config(std::move(config)) {
           m_memory = &authority->memory;
           m_keyIssuedGeneration = &authority->keyIssuedGeneration;
           m_keyAppliedGeneration = &authority->keyAppliedGeneration;
+          // Cumulative review (independent re-review, HIGH, "negative
+          // 404 is coordinator-local and can hide sibling-populated
+          // cache"): repoint m_negative404 too, exactly like the three
+          // fields immediately above -- see NegativeCacheRecord's own
+          // comment.
+          m_negative404 = &authority->negative404;
           m_rootAuthorityHandle = std::move(authority);
         } else {
           qWarning() << "AssetCache: a different process already holds "
@@ -2721,9 +2813,15 @@ QString AssetCache::metadataPathForTesting(const QString &directory,
   return directory + u'/' + key + u'.' + generation + ".meta.json"_L1;
 }
 
+bool AssetCache::hasForkedSinceConstruction() const noexcept {
+  if (g_forcePreForkLiveInstanceForTesting.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  return ::getpid() != m_constructionPid;
+}
+
 std::optional<AssetCache::CachedEntry>
-AssetCache::lookupMemory(const QString &key) {
-  QMutexLocker locker(m_mutex);
+AssetCache::lookupMemoryLocked(const QString &key) {
   CachedEntry *entry = m_memory->object(key);
   if (!entry) {
     return std::nullopt;
@@ -2737,15 +2835,161 @@ AssetCache::lookupMemory(const QString &key) {
   return hit;
 }
 
+std::optional<AssetCache::CachedEntry>
+AssetCache::lookupMemory(const QString &key) {
+  // Cumulative review (independent re-review round-6, MEDIUM, "Pre-fork
+  // live AssetCache objects remain usable in child"): checked BEFORE
+  // touching m_mutex -- see hasForkedSinceConstruction()'s comment.
+  if (hasForkedSinceConstruction()) {
+    return std::nullopt;
+  }
+  QMutexLocker locker(m_mutex);
+  return lookupMemoryLocked(key);
+}
+
 quint64 AssetCache::nextAccessSequenceLocked() {
   return (*m_nextAccessSequence)++;
 }
 
-quint64 AssetCache::issueKeyGeneration(const QString &key) {
-  QMutexLocker locker(m_mutex);
+quint64 AssetCache::issueKeyGenerationLocked(const QString &key) {
   const quint64 next = m_keyIssuedGeneration->value(key, 0) + 1;
   (*m_keyIssuedGeneration)[key] = next;
   return next;
+}
+
+quint64 AssetCache::issueKeyGeneration(const QString &key) {
+  // See lookupMemory()'s identical check for the full rationale. A
+  // no-op-safe kUnconditionalGeneration token: any caller that goes on
+  // to use it can never durably publish anything with it anyway, since
+  // every mutating method below independently re-checks this same
+  // guard before touching state.
+  if (hasForkedSinceConstruction()) {
+    return kUnconditionalGeneration;
+  }
+  QMutexLocker locker(m_mutex);
+  return issueKeyGenerationLocked(key);
+}
+
+AssetCache::KeyGenerationSnapshot
+AssetCache::snapshotAndIssueGeneration(const QString &key,
+                                       qint64 nowMonotonicMs) {
+  // See lookupMemory()'s identical check for the full rationale: a
+  // default-constructed snapshot (no hit, not authoritatively negative,
+  // an unconditional token) forces the caller to treat this exactly
+  // like a genuine cache miss, never touching m_mutex/m_memory/disk.
+  if (hasForkedSinceConstruction()) {
+    KeyGenerationSnapshot snapshot;
+    snapshot.issuedGeneration = kUnconditionalGeneration;
+    return snapshot;
+  }
+  QMutexLocker locker(m_mutex);
+  KeyGenerationSnapshot snapshot;
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): checked
+  // against the SHARED applied-generation watermark
+  // (currentKeyGenerationLocked()) -- the exact same one store()/
+  // invalidate() already gate on -- rather than any coordinator-local
+  // counter, so a sibling's strictly newer success or invalidation since
+  // this record was written is instantly visible here, exactly like it
+  // already is for m_memory.
+  const auto negativeIt = m_negative404->constFind(key);
+  if (negativeIt != m_negative404->constEnd() &&
+      negativeIt->generation == currentKeyGenerationLocked(key) &&
+      nowMonotonicMs < negativeIt->expiresAtMonotonicMs) {
+    snapshot.authoritativeNegative404 = true;
+  } else if (auto memoryHit = lookupMemoryLocked(key)) {
+    // Checked explicitly (rather than simply delegating to
+    // lookupDiskLocked(), which would ALSO check memory first but
+    // cannot report back which layer actually produced the hit) so
+    // KeyGenerationSnapshot::hitFromMemory is accurate -- see its own
+    // comment for why callers need this distinction preserved.
+    snapshot.hit = std::move(memoryHit);
+    snapshot.hitFromMemory = true;
+  } else {
+    // Cumulative review (independent re-review, HIGH, "cache snapshot
+    // lookup then issuance in separate critical sections"): the read
+    // below and the issuance mint at the end of this function happen
+    // under this ONE mutex acquisition -- see KeyGenerationSnapshot's
+    // own comment for the exact race this closes.
+    snapshot.hit = lookupDiskOnlyLocked(key);
+  }
+  snapshot.issuedGeneration = issueKeyGenerationLocked(key);
+  return snapshot;
+}
+
+void AssetCache::recordNegative404(const QString &key, quint64 issuedGeneration,
+                                   qint64 nowMonotonicMs, qint64 ttlMs) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
+  QMutexLocker locker(m_mutex);
+  // Cumulative review (independent re-review, HIGH, "old 404 can
+  // invalidate newer-issued/finished 200"): the SAME CAS gate store()/
+  // touchAfterNotModified()/promoteToMemory()/updateMemoryDecodedImage()
+  // already use -- a stale `issuedGeneration` (superseded by a same-root
+  // sibling's fresher success or invalidate() since it was minted) is
+  // silently rejected here instead of resurrecting a negative record
+  // over state a newer operation already established.
+  if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
+    return;
+  }
+  writeNegative404RecordLocked(key, issuedGeneration, nowMonotonicMs, ttlMs);
+}
+
+void AssetCache::writeNegative404RecordLocked(const QString &key,
+                                              quint64 issuedGeneration,
+                                              qint64 nowMonotonicMs,
+                                              qint64 ttlMs) {
+  (*m_negative404)[key] =
+      NegativeCacheRecord{issuedGeneration, nowMonotonicMs + ttlMs};
+  // Bounded pruning (cumulative review, "bounded pruning"): a cheap,
+  // opportunistic full sweep of every already-expired record, run each
+  // time a fresh one is recorded, keeps this shared map's size
+  // proportional to the number of currently-unexpired negative records
+  // rather than growing without bound for this cache's entire process
+  // lifetime. Deliberately does NOT consult generation at all here (an
+  // expired record is prunable regardless of whether it is still the
+  // current generation) -- only hasNegative404's authoritativeness check
+  // (in snapshotAndIssueGeneration() above) needs both conditions.
+  for (auto it = m_negative404->begin(); it != m_negative404->end();) {
+    if (nowMonotonicMs >= it->expiresAtMonotonicMs) {
+      it = m_negative404->erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // Enforce the hard ceiling even when every surviving record is
+  // individually still within its TTL -- evict the soonest-to-expire
+  // record(s) first (a reasonable, deterministic proxy for "oldest"
+  // given these records carry no separate last-access timestamp) until
+  // back at or under the cap. Unlike the coordinator-local mechanism
+  // this superseded, there is no "pinned by an in-flight operation"
+  // exception here: AssetCache itself has no notion of in-flight
+  // operations at all (that concept is exclusively
+  // AssetRequestCoordinator's), and evicting a negative-404 record early
+  // has no correctness impact on any operation actually in flight -- the
+  // record is only ever consulted at the START of a NEW request, never
+  // by one already under way (see snapshotAndIssueGeneration()'s only
+  // caller, AssetRequestCoordinator::request()/advanceCandidates()).
+  while (m_negative404->size() > m_maxTrackedNegative404Entries) {
+    auto oldestIt = m_negative404->begin();
+    for (auto it = m_negative404->begin(); it != m_negative404->end(); ++it) {
+      if (it->expiresAtMonotonicMs < oldestIt->expiresAtMonotonicMs) {
+        oldestIt = it;
+      }
+    }
+    m_negative404->erase(oldestIt);
+  }
+}
+
+void AssetCache::clearNegative404(const QString &key) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
+  QMutexLocker locker(m_mutex);
+  m_negative404->remove(key);
 }
 
 quint64 AssetCache::currentKeyGenerationLocked(const QString &key) const {
@@ -3491,12 +3735,33 @@ AssetCache::deleteEntry(const QString &key) const {
 
 std::optional<AssetCache::CachedEntry>
 AssetCache::lookupDisk(const QString &key) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return std::nullopt;
+  }
+  QMutexLocker locker(m_mutex);
+  return lookupDiskLocked(key);
+}
+
+std::optional<AssetCache::CachedEntry>
+AssetCache::lookupDiskLocked(const QString &key) {
   // Check memory first: promote-on-disk-hit still applies, but there is no
   // reason to touch the filesystem at all if the entry is already resident.
-  if (auto memoryHit = lookupMemory(key)) {
+  // Cumulative review (independent re-review, HIGH, "cache snapshot
+  // lookup then issuance in separate critical sections"): this now
+  // shares the SAME critical section (m_mutex, acquired once by
+  // lookupDisk()/snapshotAndIssueGeneration() above/below) as the disk
+  // read that may follow, rather than two separate lock acquisitions --
+  // a strict improvement, never a behavioral change, since nothing
+  // could ever legitimately rely on a window between the two existing.
+  if (auto memoryHit = lookupMemoryLocked(key)) {
     return memoryHit;
   }
+  return lookupDiskOnlyLocked(key);
+}
 
+std::optional<AssetCache::CachedEntry>
+AssetCache::lookupDiskOnlyLocked(const QString &key) {
   if (m_diskCacheDisabled) {
     // Review item 7: the configured root was itself a symlink at
     // construction time -- never read through it.
@@ -3510,7 +3775,9 @@ AssetCache::lookupDisk(const QString &key) {
     return std::nullopt;
   }
 
-  QMutexLocker locker(m_mutex);
+  // m_mutex is already held by the caller (lookupDiskLocked()'s memory
+  // check above, or snapshotAndIssueGeneration()) -- see this method's
+  // own declaration comment in AssetCache.h.
 
   if (!verifyRootAnchorLocked()) {
     // Review round-3 item 9: the root has been replaced/removed/mounted
@@ -3626,6 +3893,10 @@ AssetCache::lookupDisk(const QString &key) {
 
 void AssetCache::store(const QString &key, CachedEntry entry,
                        quint64 issuedGeneration) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
   if (!isValidKey(key)) {
     // Never let a malformed key reach payloadPath()/metadataPath() below
     // -- see isValidKey()'s comment. Rejecting the whole store() as a
@@ -3861,6 +4132,10 @@ void AssetCache::touchAfterNotModified(const QString &key,
                                        const QString &newEtag,
                                        const QString &newLastModified,
                                        quint64 issuedGeneration) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
   if (m_diskCacheDisabled) {
     return;
   }
@@ -3929,6 +4204,10 @@ void AssetCache::touchAfterNotModified(const QString &key,
 void AssetCache::updateMemoryDecodedImage(const QString &key,
                                           const QImage &image,
                                           quint64 issuedGeneration) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
   QMutexLocker locker(m_mutex);
   // See store()'s identical check for the full rationale.
   if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
@@ -3950,6 +4229,10 @@ void AssetCache::updateMemoryDecodedImage(const QString &key,
 
 void AssetCache::promoteToMemory(const QString &key, CachedEntry entry,
                                  quint64 issuedGeneration) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
   if (!isValidKey(key)) {
     // Unlike lookupDisk()/store()/touchAfterNotModified(), this method
     // never turns `key` into a filesystem path, so a malformed key can't
@@ -3972,6 +4255,17 @@ void AssetCache::promoteToMemory(const QString &key, CachedEntry entry,
 }
 
 AssetCache::InvalidateResult AssetCache::invalidate(const QString &key) {
+  // Cumulative review (independent re-review round-6, MEDIUM, "Pre-fork
+  // live AssetCache objects remain usable in child"): checked BEFORE
+  // touching m_mutex/m_memory/disk -- see hasForkedSinceConstruction()'s
+  // comment. Nothing was actually confirmed durably absent, so
+  // PersistenceFailed (never DurablyInvalidated) is returned, exactly
+  // like a genuine on-disk unlink/fsync failure -- every existing caller
+  // already treats that as "fail closed", the only safe response when
+  // this instance can no longer trust its own inherited state at all.
+  if (hasForkedSinceConstruction()) {
+    return InvalidateResult::PersistenceFailed;
+  }
   ++m_invalidateCallCountForTesting;
   if (!isValidKey(key)) {
     return InvalidateResult::DurablyInvalidated;
@@ -3994,7 +4288,47 @@ AssetCache::InvalidateResult AssetCache::invalidate(const QString &key) {
                                        : InvalidateResult::PersistenceFailed;
 }
 
+AssetCache::InvalidateResult AssetCache::invalidateAndRecordNegative404(
+    const QString &key, quint64 issuedGeneration, qint64 nowMonotonicMs,
+    qint64 ttlMs) {
+  // See invalidate()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return InvalidateResult::PersistenceFailed;
+  }
+  ++m_invalidateCallCountForTesting;
+  if (!isValidKey(key)) {
+    return InvalidateResult::DurablyInvalidated;
+  }
+  QMutexLocker locker(m_mutex);
+  // Cumulative review (independent re-review round-5, HIGH, "old 404 can
+  // invalidate newer-issued/finished 200"): a SINGLE CAS check gates
+  // BOTH the invalidate and the negative-404 record below -- never
+  // invalidate()'s own advanceKeyGenerationPastAllIssuedLocked()
+  // poisoning, which would unconditionally reject `issuedGeneration`
+  // itself (minted strictly before this call, as it always is for an
+  // authoritative-404 confirmation) and silently prevent the negative
+  // record from EVER being written. See this method's own declaration
+  // comment in AssetCache.h for the full rationale.
+  if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
+    return InvalidateResult::SkippedStaleGeneration;
+  }
+  m_memory->remove(key);
+  const DeleteEntryOutcome outcome = deleteEntry(key);
+  if (!outcome.manifestDurablyAbsent) {
+    // See InvalidateResult::PersistenceFailed's comment: the caller must
+    // never record a negative-404 over a disk state that is not
+    // actually confirmed gone.
+    return InvalidateResult::PersistenceFailed;
+  }
+  writeNegative404RecordLocked(key, issuedGeneration, nowMonotonicMs, ttlMs);
+  return InvalidateResult::DurablyInvalidated;
+}
+
 void AssetCache::reapAndEnforceQuota() {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
   if (m_diskCacheDisabled) {
     // Review item 7: root was a symlink at construction -- never
     // enumerate, follow, or delete anything through it.
@@ -4383,6 +4717,20 @@ int AssetCache::diskEntryCount() const {
 #endif
 }
 
+int AssetCache::negative404RecordCountForTesting() const {
+  QMutexLocker locker(m_mutex);
+  return m_negative404->size();
+}
+
+bool AssetCache::hasNegative404ForTesting(const QString &key,
+                                          qint64 nowMonotonicMs) const {
+  QMutexLocker locker(m_mutex);
+  const auto it = m_negative404->constFind(key);
+  return it != m_negative404->constEnd() &&
+         it->generation == currentKeyGenerationLocked(key) &&
+         nowMonotonicMs < it->expiresAtMonotonicMs;
+}
+
 std::optional<quint64>
 AssetCache::accessSequenceForTesting(const QString &key) const {
   QMutexLocker locker(m_mutex);
@@ -4445,7 +4793,7 @@ bool AssetCache::resolveTrustedDirectoryNoFollowForTesting(
 
 std::optional<bool>
 AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
-    const QString &directoryPath) {
+    const QString &directoryPath, bool isFinalAccountHomeTransition) {
 #if defined(Q_OS_UNIX)
   const QByteArray pathUtf8 = directoryPath.toUtf8();
   const int fd = ::open(pathUtf8.constData(),
@@ -4453,11 +4801,13 @@ AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
   if (fd < 0) {
     return std::nullopt;
   }
-  const bool qualified = mountTransitionIsIndependentlyPolicyQualified(fd);
+  const bool qualified = mountTransitionIsIndependentlyPolicyQualified(
+      fd, isFinalAccountHomeTransition);
   ::close(fd);
   return qualified;
 #else
   Q_UNUSED(directoryPath);
+  Q_UNUSED(isFinalAccountHomeTransition);
   return std::nullopt;
 #endif
 }
@@ -4554,6 +4904,10 @@ void AssetCache::setListAllEntriesRelativeForcedFailureForTesting(bool active) {
 
 void AssetCache::setForkedSinceLastExecForcedStateForTesting(bool active) {
   g_forceForkedSinceLastExecForTesting.store(active, std::memory_order_relaxed);
+}
+
+void AssetCache::setPreForkLiveInstanceForcedStateForTesting(bool active) {
+  g_forcePreForkLiveInstanceForTesting.store(active, std::memory_order_relaxed);
 }
 
 } // namespace Arkham

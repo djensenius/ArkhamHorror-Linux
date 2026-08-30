@@ -2756,11 +2756,16 @@ void AssetRequestCoordinatorTests::
   }
 
   QCOMPARE(coordinator.negative404RecordCountForTesting(), kTestCap);
-  // Generation-tracking state is bounded by the SAME cap (each surviving
-  // negative404 record pins exactly one cacheKeyGeneration and one
-  // cacheKeyIssuedGeneration entry; nothing else is pinned once every
-  // operation above has fully completed).
-  QCOMPARE(coordinator.cacheKeyGenerationStateCountForTesting(), kTestCap * 2);
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // negative-404 record itself now lives entirely in the shared
+  // AssetCache authority (see AssetCache::recordNegative404()'s own
+  // bounded-pruning/hard-cap enforcement), never pinning this
+  // coordinator's own m_cacheKeyGeneration/m_cacheKeyIssuedGeneration
+  // maps at all -- so once every operation above has fully completed
+  // (none is in flight, and pruneStaleCacheKeyState() has run after
+  // each), nothing pins these maps and they are fully empty.
+  QCOMPARE(coordinator.cacheKeyGenerationStateCountForTesting(), 0);
 
   // Stale-completion safety after eviction: a fresh request for one of
   // the EARLIEST (necessarily evicted, since only the most recent

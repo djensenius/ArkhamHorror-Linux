@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <unistd.h>
 
 namespace Arkham {
 
@@ -348,6 +349,107 @@ public:
   // that never participates in this protocol.
   [[nodiscard]] quint64 issueKeyGeneration(const QString &key);
 
+  // Cumulative review (independent re-review, HIGH, "shared authority
+  // remains non-linearizable... negative 404 is coordinator-local and
+  // can hide sibling-populated cache"): a shared, per-key negative-404
+  // tombstone record -- versioned against the EXACT SAME issuance/
+  // applied-watermark this file already uses for store()/invalidate()
+  // (see issueKeyGeneration()'s comment) -- so an authoritative "confirmed
+  // absent" record minted by one AssetRequestCoordinator/AssetCache
+  // sibling instance can never survive, nor hide, a strictly newer
+  // success or invalidation applied by ANY other same-root sibling.
+  // Previously this bookkeeping lived entirely inside
+  // AssetRequestCoordinator, keyed against that ONE coordinator
+  // instance's own private generation counters -- a second coordinator
+  // (or a second AssetCache instance entirely) sharing this exact root
+  // had no way to observe, or be observed by, the first one's negative
+  // records at all.
+  struct NegativeCacheRecord {
+    quint64 generation{0};
+    qint64 expiresAtMonotonicMs{0};
+  };
+
+  // The result of atomically reading `key`'s current state (an
+  // authoritative negative-404 tombstone, a memory/disk cache hit, or
+  // neither) and minting a fresh issuance token for it, all within ONE
+  // locked critical section. Cumulative review (independent re-review,
+  // HIGH, "cache snapshot lookup then issuance in separate critical
+  // sections allows stale v1 to receive newer token"): previously a
+  // caller (AssetRequestCoordinator::request()/advanceCandidates())
+  // called lookupMemory()/lookupDisk() and issueKeyGeneration()
+  // SEPARATELY -- two independent lock acquisitions -- so a same-root
+  // sibling's invalidate()+store() could run in between them: the token
+  // minted by the second call would legitimately be current, but the
+  // ENTRY already captured by the first call would be the now-stale
+  // snapshot from before that concurrent mutation, and threading that
+  // stale entry through a subsequent promoteToMemory()/
+  // updateMemoryDecodedImage() call gated only by the (now current)
+  // token would incorrectly let it publish. snapshotAndIssueGeneration()
+  // closes this by construction: the read this returns and the token it
+  // mints are observed under the exact same mutex acquisition, so no
+  // sibling mutation can possibly be interleaved between them.
+  struct KeyGenerationSnapshot {
+    // A memory or disk cache hit for `key`, or std::nullopt on a genuine
+    // miss. Always std::nullopt whenever `authoritativeNegative404`
+    // below is true (an authoritatively-tombstoned key is never also
+    // looked up for a stale positive hit).
+    std::optional<CachedEntry> hit;
+    // True iff `hit` was served directly from the in-process memory
+    // cache (as opposed to a disk read). Callers that distinguish "a
+    // same-process memory hit is trusted for this process's remaining
+    // lifetime with no revalidation, regardless of any validators it
+    // happens to carry" from "a disk-only hit with validators must be
+    // conditionally revalidated" (see AssetRequestCoordinator::request()/
+    // advanceCandidates()) need this to preserve that distinction: a
+    // stored entry's etag/lastModified fields may be non-empty in EITHER
+    // location (store() always populates both memory and disk from the
+    // same CachedEntry), so `hit.etag`/`hit.lastModified` alone cannot
+    // tell the two cases apart.
+    bool hitFromMemory{false};
+    // True iff a currently-authoritative (matching generation, unexpired)
+    // shared negative-404 tombstone exists for `key` at the moment this
+    // snapshot was taken.
+    bool authoritativeNegative404{false};
+    // A freshly minted issuance token for `key`, captured in the exact
+    // same locked critical section as `hit`/`authoritativeNegative404`
+    // above -- pass this to whichever of store()/touchAfterNotModified()/
+    // promoteToMemory()/updateMemoryDecodedImage()/recordNegative404()
+    // this snapshot's caller may eventually call for `key`.
+    quint64 issuedGeneration{0};
+  };
+
+  // Atomically reads `key`'s current negative-404/cache-hit state and
+  // mints a fresh issuance token for it -- see KeyGenerationSnapshot's
+  // comment for the exact race this closes. `nowMonotonicMs` is supplied
+  // by the caller (in production, AssetRequestCoordinator's own
+  // injectable monotonic clock) rather than read internally, so this
+  // stays deterministic under test-controlled time exactly like the
+  // negative-404 TTL check already was before this record moved here.
+  [[nodiscard]] KeyGenerationSnapshot
+  snapshotAndIssueGeneration(const QString &key, qint64 nowMonotonicMs);
+
+  // Records a shared negative-404 tombstone for `key`, gated by the
+  // SAME cross-instance CAS protocol store()/invalidate() already use:
+  // a no-op if `issuedGeneration` is no longer >= key's current shared
+  // applied watermark (a same-root sibling's fresher success or
+  // invalidation already superseded it) -- see issueKeyGeneration()'s
+  // comment. `ttlMs` from now (`nowMonotonicMs`) bounds how long this
+  // tombstone remains authoritative even if never explicitly cleared.
+  // Performs an opportunistic, bounded sweep of every already-expired
+  // record (across ALL keys, not just this one) each time it is called,
+  // so this shared map's size stays proportional to the number of
+  // currently-unexpired negative records rather than growing without
+  // bound for the cache's entire lifetime.
+  void recordNegative404(const QString &key, quint64 issuedGeneration,
+                         qint64 nowMonotonicMs, qint64 ttlMs);
+
+  // Unconditionally clears any shared negative-404 tombstone for `key`
+  // (called after a successful store() -- a fresh, CAS-confirmed success
+  // is always allowed to clear a stale absence record, regardless of
+  // generation ordering, since the store() call itself already passed
+  // the identical CAS check).
+  void clearNegative404(const QString &key);
+
   // Fast path: memory-only lookup. Review item 11: on a hit, this ALSO
   // refreshes `key`'s PERSISTED on-disk recency witness (monotonic
   // access sequence + wall-clock timestamp), non-durably (see the class
@@ -447,6 +549,17 @@ public:
     PersistenceFailed,  // The manifest unlink and/or the directory fsync
                         // that must follow it genuinely failed; `key`'s
                         // on-disk state is NOT confirmed gone.
+    // Cumulative review (independent re-review round-5, HIGH, "old 404
+    // can invalidate newer-issued/finished 200"): returned ONLY by
+    // invalidateAndRecordNegative404() below, NEVER by the unconditional
+    // invalidate() above -- `issuedGeneration` was superseded by a
+    // strictly newer generation already applied for this key (e.g. a
+    // same-root sibling's fresher success) BEFORE this call could take
+    // effect. Neither memory/disk state nor the negative-404 record was
+    // touched at all: this stale 404 is treated as if it had never been
+    // observed, exactly preserving whatever the newer operation already
+    // published.
+    SkippedStaleGeneration,
   };
 
   // Unconditionally removes `key` from both memory and disk (payload +
@@ -464,7 +577,52 @@ public:
   // durably invisible to every future lookup, which starts from the
   // manifest. See InvalidateResult's comment for why callers must not
   // ignore a PersistenceFailed result.
+  //
+  // NEVER gated by a generation token -- this method ALWAYS invalidates
+  // unconditionally and, via advanceKeyGenerationPastAllIssuedLocked(),
+  // deliberately poisons EVERY currently-issued token for `key` (only a
+  // token minted strictly AFTER this call can publish again). Callers
+  // that need to gate the invalidate itself on a specific token (e.g. an
+  // authoritative-404 confirmation that must never clobber a fresher
+  // sibling success) must use invalidateAndRecordNegative404() instead,
+  // which performs its own CAS check exactly once, atomically covering
+  // both the invalidate and the negative-404 record.
   [[nodiscard]] InvalidateResult invalidate(const QString &key);
+
+  // Cumulative review (independent re-review round-5, HIGH, "old 404 can
+  // invalidate newer-issued/finished 200" / "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // combined, CAS-gated equivalent of invalidate() immediately followed
+  // by recordNegative404() -- but critically, as ONE atomic operation
+  // under ONE mutex acquisition, gated by a SINGLE CAS check against
+  // `issuedGeneration` (the same tryApplyKeyGenerationLocked() gate
+  // store()/touchAfterNotModified()/promoteToMemory()/
+  // updateMemoryDecodedImage() already use), never invalidate()'s own
+  // unconditional advanceKeyGenerationPastAllIssuedLocked() poisoning.
+  //
+  // This exists because calling the separate invalidate() +
+  // recordNegative404() in sequence is UNSOUND: invalidate()
+  // unconditionally poisons every token issued so far for `key`
+  // (including `issuedGeneration` itself, if it was minted before this
+  // call, which it always is for an authoritative-404 confirmation) --
+  // so a subsequent recordNegative404(key, issuedGeneration, ...) call
+  // would ALWAYS be rejected by its own CAS check, silently failing to
+  // ever record a negative-404 at all. Routing both through ONE CAS
+  // check here avoids this self-defeating poisoning entirely: on
+  // success, `issuedGeneration` becomes the new applied watermark
+  // (exactly like store() does), then the entry is invalidated and the
+  // negative-404 record is written under that SAME now-current
+  // generation.
+  //
+  // On a stale `issuedGeneration` (superseded by a strictly newer
+  // generation already applied -- e.g. a same-root sibling's fresher
+  // success completing first), returns SkippedStaleGeneration and
+  // touches NEITHER memory/disk state NOR the negative-404 record at
+  // all: this stale 404 is treated as if it had never been observed,
+  // exactly preserving whatever the newer operation already published.
+  [[nodiscard]] InvalidateResult
+  invalidateAndRecordNegative404(const QString &key, quint64 issuedGeneration,
+                                 qint64 nowMonotonicMs, qint64 ttlMs);
 
   // Repairs orphan payloads, corrupt entries, and stray temp files, then
   // evicts oldest-access entries if disk usage exceeds the 90% high-water
@@ -525,6 +683,26 @@ public:
   // rather than one per waiter.
   [[nodiscard]] int invalidateCallCountForTesting() const {
     return m_invalidateCallCountForTesting;
+  }
+
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local... bounded pruning"): test-only exposure of the
+  // shared negative-404 map's size and a specific key's current
+  // authoritativeness, plus a settable hard-cap override -- mirrors the
+  // equivalent test hooks AssetRequestCoordinator used to own directly
+  // before this record moved into the shared authority. `nowMonotonicMs`
+  // is supplied by the caller exactly like every other negative-404
+  // method here, so a test's own fake clock stays authoritative.
+  [[nodiscard]] int negative404RecordCountForTesting() const;
+  [[nodiscard]] bool hasNegative404ForTesting(const QString &key,
+                                              qint64 nowMonotonicMs) const;
+  // Overrides the production ceiling (kMaxTrackedNegative404Entries) on
+  // the shared negative-404 map so a high-cardinality test can exceed it
+  // with a small, fast number of local round trips. 0 restores the
+  // production default.
+  void setMaxTrackedNegative404EntriesForTesting(int maxEntries) {
+    m_maxTrackedNegative404Entries =
+        maxEntries > 0 ? maxEntries : kMaxTrackedNegative404Entries;
   }
 
   // Test-only exposure of this cache's on-disk generation/manifest
@@ -609,9 +787,16 @@ public:
   // std::nullopt if `directoryPath` itself could not even be opened
   // no-follow (a test setup failure, distinguishable from the real
   // policy decision itself).
+  //
+  // `isFinalAccountHomeTransition` (round-6, MEDIUM, "position-
+  // sensitive ownership"): true (the default every existing caller of
+  // this test hook already assumes) exercises the FINAL, account-home
+  // ownership check (current-uid); false exercises the ANCESTOR
+  // ownership check (root-owned) instead -- see
+  // mountTransitionIsIndependentlyPolicyQualified()'s own comment.
   [[nodiscard]] static std::optional<bool>
   mountTransitionIsIndependentlyPolicyQualifiedForTesting(
-      const QString &directoryPath);
+      const QString &directoryPath, bool isFinalAccountHomeTransition = true);
 
   // Test-only, UNPRIVILEGED witness for whether this build actually
   // resolved the kernel's per-mount identifier (Linux 5.8+'s statx()
@@ -735,6 +920,28 @@ public:
   // scope guard) restores the real, unforced state.
   static void setForkedSinceLastExecForcedStateForTesting(bool active);
 
+  // Test-only, deterministic simulation of "THIS already-live instance
+  // (constructed before some fork()) is now being called through by a
+  // just-forked child" -- see hasForkedSinceConstruction()'s comment for
+  // the real, per-instance mechanism (a lock-free comparison of the pid
+  // captured at construction against the current ::getpid()) this
+  // exercises. Unlike setForkedSinceLastExecForcedStateForTesting()
+  // above (which simulates the state a NEW instance's construction path
+  // would observe), this lets a test exercise the full, ALREADY-LIVE
+  // production object's public methods (lookupMemory()/store()/
+  // invalidate()/etc.) as they would actually behave in a real forked
+  // child -- deterministically and without needing a real (and,
+  // verified elsewhere in this file, SIGABRT-hazardous when it goes on
+  // to construct further Qt/heap state) fork() of this Qt-using test
+  // binary. A process-wide override (mirrors
+  // setForkedSinceLastExecForcedStateForTesting()'s own design): when
+  // active, EVERY AssetCache instance's hasForkedSinceConstruction()
+  // reports true, regardless of its own actual m_constructionPid.
+  // `active=false` (the default, and what a test MUST reset back to
+  // before returning, ideally via an RAII scope guard) restores each
+  // instance's own real, per-instance comparison.
+  static void setPreForkLiveInstanceForcedStateForTesting(bool active);
+
 private:
   struct DiskMetadata {
     QString key;
@@ -835,11 +1042,27 @@ private:
   // DeleteEntryOutcome's comment.
   [[nodiscard]] DeleteEntryOutcome deleteEntry(const QString &key) const;
 
+  // Cumulative review (independent re-review round-5, HIGH, "old 404 can
+  // invalidate newer-issued/finished 200"): the shared body of
+  // recordNegative404()'s write-and-prune logic (writing the record
+  // itself, then the bounded TTL sweep and hard-cap eviction), factored
+  // out so invalidateAndRecordNegative404() can reuse it from within its
+  // own single mutex acquisition without duplicating the pruning logic.
+  // Callers must already hold m_mutex and must have already validated
+  // `issuedGeneration` via tryApplyKeyGenerationLocked() themselves.
+  void writeNegative404RecordLocked(const QString &key,
+                                    quint64 issuedGeneration,
+                                    qint64 nowMonotonicMs, qint64 ttlMs);
+
   // Review item 11: mints the next value of this cache's per-process
   // monotonic access-sequence counter. Callers must already hold
   // m_mutex (the counter is not independently synchronized) -- see the
   // class comment for the recovery/uniqueness argument.
   [[nodiscard]] quint64 nextAccessSequenceLocked();
+  // The locked body of the public issueKeyGeneration() above, factored
+  // out so snapshotAndIssueGeneration() can mint a token from WITHIN its
+  // own single mutex acquisition. Callers must already hold m_mutex.
+  [[nodiscard]] quint64 issueKeyGenerationLocked(const QString &key);
   // Cumulative review (independent re-review, HIGH, "shared root
   // authority incomplete"): the read half of the shared cross-instance
   // issuance/applied-watermark CAS protocol -- see issueKeyGeneration()'s
@@ -893,6 +1116,46 @@ private:
   // (lookupMemory()) and a disk hit (lookupDisk()); callers must already
   // hold m_mutex.
   void touchAccessRecencyLocked(const QString &key);
+  // Cumulative review (independent re-review, HIGH, "cache snapshot
+  // lookup then issuance in separate critical sections"): the locked
+  // bodies of lookupMemory()/lookupDisk() above, factored out so
+  // snapshotAndIssueGeneration() can call them from WITHIN its own
+  // single mutex acquisition (never re-entering/re-acquiring m_mutex,
+  // which QMutex does not support). lookupMemory()/lookupDisk()
+  // themselves now trivially acquire m_mutex once and delegate here,
+  // preserving their exact previous externally-observable behavior.
+  // Callers must already hold m_mutex.
+  [[nodiscard]] std::optional<CachedEntry>
+  lookupMemoryLocked(const QString &key);
+  [[nodiscard]] std::optional<CachedEntry> lookupDiskLocked(const QString &key);
+  // The disk-only portion of lookupDiskLocked() (i.e. everything after
+  // its own leading memory check), factored out so
+  // snapshotAndIssueGeneration() can perform its OWN explicit memory
+  // check first (to accurately populate
+  // KeyGenerationSnapshot::hitFromMemory -- see its comment) and, only
+  // on a memory miss, fall through to exactly the disk read
+  // lookupDiskLocked() itself would have reached, without redundantly
+  // re-checking memory a second time. Callers must already hold
+  // m_mutex.
+  [[nodiscard]] std::optional<CachedEntry>
+  lookupDiskOnlyLocked(const QString &key);
+
+  // Cumulative review (independent re-review round-6, MEDIUM, "Pre-fork
+  // live AssetCache objects remain usable in child"): checked at the
+  // TOP of every public operation, strictly BEFORE any QMutexLocker or
+  // any other touch of m_memory/disk state -- see m_constructionPid's
+  // own comment for the full rationale. A lock-free, single-field
+  // comparison; safe to call at any time, including concurrently from
+  // multiple threads (though only ever meaningfully "true" for every
+  // thread simultaneously the instant a fork() has actually happened).
+  // Implemented in the .cpp (rather than inline here) so it can consult
+  // the same test-only forced-override mechanism
+  // setPreForkLiveInstanceForcedStateForTesting() below installs --
+  // exercising a genuinely already-live instance's full public-method
+  // fail-closed behavior deterministically, without needing a real (and
+  // independently verified elsewhere in this file to be SIGABRT-
+  // hazardous) fork() of this Qt-using test binary.
+  [[nodiscard]] bool hasForkedSinceConstruction() const noexcept;
 
   // Review round-3 item 9: re-validates that `m_directory` still names
   // the EXACT filesystem object (device+inode) this cache anchored to a
@@ -933,6 +1196,25 @@ private:
   [[nodiscard]] qint64 diskUsageBytesLocked() const;
 
   mutable bool m_diskCacheDisabled{false};
+  // Cumulative review (independent re-review round-6, MEDIUM, "Pre-fork
+  // live AssetCache objects remain usable in child"): the PID captured
+  // the instant THIS object's constructor ran, compared against
+  // ::getpid() at the top of EVERY public operation below via
+  // hasForkedSinceConstructionLocked()/rejectIfForkedSinceConstruction().
+  // Unlike processHasForkedSinceLastExec() (a process-wide, atfork-
+  // handler-driven flag guarding NEW instance construction/root
+  // acquisition -- see registerForkSafetyOnce()'s comment), this is a
+  // simple, per-instance, lock-free comparison: a bare fork() always
+  // produces a child with a genuinely different PID from its parent
+  // (POSIX-guaranteed, no atfork registration required to observe this
+  // correctly), so an ALREADY-CONSTRUCTED instance -- one that predates
+  // the fork and is still being called through by the child, which the
+  // process-wide flag alone does not guard against -- can reliably
+  // detect "I am now running in a different process than the one that
+  // constructed me" without ever needing to touch m_mutex (whose state
+  // is undefined post-fork if any other thread held it at fork time) or
+  // any inherited disk/memory state to make that determination.
+  const ::pid_t m_constructionPid{::getpid()};
   // Round-7/8 item 7: see invalidateCallCountForTesting()'s comment.
   int m_invalidateCallCountForTesting{0};
   // Round-N+ review (MEDIUM, repeat finding): set once, at construction,
@@ -981,6 +1263,22 @@ private:
   QHash<QString, quint64> *m_keyAppliedGeneration{
       &m_privateKeyAppliedGenerationFallback};
   QHash<QString, quint64> m_privateKeyAppliedGenerationFallback;
+  // Cumulative review (independent re-review, HIGH, "negative 404 is
+  // coordinator-local and can hide sibling-populated cache"): the
+  // shared negative-404 tombstone map -- see NegativeCacheRecord's own
+  // comment. Repointed alongside m_memory/m_keyIssuedGeneration/
+  // m_keyAppliedGeneration above.
+  QHash<QString, NegativeCacheRecord> *m_negative404{
+      &m_privateNegative404Fallback};
+  QHash<QString, NegativeCacheRecord> m_privateNegative404Fallback;
+  // Cumulative review (independent re-review, HIGH, "bounded pruning"):
+  // hard ceiling on m_negative404's size enforced by recordNegative404()
+  // -- see its own comment. A per-instance (never shared) threshold,
+  // consistent with every other configured limit on this class (e.g.
+  // Config's own byte/count limits) never being shared via
+  // RootAuthority either.
+  static constexpr int kMaxTrackedNegative404Entries = 4096;
+  int m_maxTrackedNegative404Entries{kMaxTrackedNegative404Entries};
   // Review round-3 item 9: an already-open, O_DIRECTORY|O_NOFOLLOW|
   // O_CLOEXEC descriptor for `m_directory`, opened once at construction
   // and retained for this instance's entire lifetime, together with the
