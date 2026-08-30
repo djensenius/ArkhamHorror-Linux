@@ -78,9 +78,16 @@ requireArray(const Json::Value &v, QStringView path);
 [[nodiscard]] ValueOrError<QString> requireStringValue(const Json::Value &v,
                                                        QStringView path);
 // Decodes a JSON number as an exact 64-bit integer: rejects any value that
-// is not a JSON number at all, is not mathematically integral (a
-// fractional double, e.g. "1.5"), or does not fit qint64's range. Reads
-// the value via QJsonValue::toInteger() rather than
+// is not a JSON number at all, or does not fit qint64's range. The
+// "integral" check below runs on the double Qt has already narrowed the
+// underlying JSON number into (QJsonValue::toDouble()) -- not the original
+// JSON source text -- so it rejects a value whose *double representation*
+// has a nonzero fractional part (e.g. "1.5") but is necessarily a
+// best-effort judgment for values outside double's +-2^53 integer-exact
+// range: an extreme fractional literal that Qt has already rounded to a
+// whole-number double before this function ever sees it would pass this
+// check even though the original JSON text was not itself an integer.
+// Reads the value via QJsonValue::toInteger() rather than
 // toDouble()+static_cast, so a value that reached this QJsonValue via
 // RawJson.h's Value::toQJson() int64-exact path (see that function's doc
 // comment) decodes to the identical qint64 -- including magnitudes no
