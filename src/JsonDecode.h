@@ -160,10 +160,18 @@ template <typename Obj, typename ValueDecoder>
 [[nodiscard]] auto requireField(const Obj &obj, QLatin1StringView key,
                                 QStringView path, ValueDecoder valueDecoder)
     -> decltype(valueDecoder(obj.value(key), path)) {
-  if (fieldPresence(obj, key) == FieldPresence::Absent)
+  // A single obj.value(key) lookup -- rather than fieldPresence()'s own
+  // lookup followed by a second, separate obj.value(key) call here --
+  // since both QJsonObject::value() and Json::Value::value() already
+  // return an explicit Undefined value for an absent key (matching what
+  // fieldPresence() itself would report), and this is the workhorse most
+  // require*() field decoders funnel through for nearly every CardDef
+  // field during a catalog fixture decode.
+  auto value = obj.value(key);
+  if (value.isUndefined())
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  return valueDecoder(obj.value(key), path);
+  return valueDecoder(std::move(value), path);
 }
 
 // Required-but-unconstrained-value decoder: fails only if the key itself is

@@ -139,9 +139,18 @@ QString typeName(const Json::Value &v) {
 }
 
 FieldPresence fieldPresence(const Json::Value &obj, QLatin1StringView key) {
-  if (!obj.contains(key))
+  // A single Value::value() lookup -- rather than a separate contains()
+  // check followed by a second value() lookup -- since Value::value()
+  // already distinguishes "absent" (Kind::Undefined, also returned when
+  // `obj` itself is not an object) from "present but JSON null"
+  // (Kind::Null) unambiguously. Halves the QHash<QString,...> lookups
+  // (and QString(key) conversions from the QLatin1StringView parameter)
+  // per field access, which matters on the wide/deep objects a catalog
+  // fixture decode walks through requireField()/requireXValue() above.
+  const Json::Value found = obj.value(key);
+  if (found.isUndefined())
     return FieldPresence::Absent;
-  return obj.value(key).isNull() ? FieldPresence::Null : FieldPresence::Present;
+  return found.isNull() ? FieldPresence::Null : FieldPresence::Present;
 }
 
 ValueOrError<Json::Value> requireObject(const Json::Value &v,
@@ -270,19 +279,23 @@ ValueOrError<QList<Json::Value>> requireArrayField(const Json::Value &obj,
 ValueOrError<QJsonValue> requireRawField(const QJsonObject &obj,
                                          QLatin1StringView key,
                                          QStringView path) {
-  if (fieldPresence(obj, key) == FieldPresence::Absent)
+  // Single obj.value(key) lookup; see requireField()'s doc comment above
+  // for why this is equivalent to fieldPresence()'s own Absent check.
+  QJsonValue v = obj.value(key);
+  if (v.isUndefined())
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  return obj.value(key);
+  return v;
 }
 
 ValueOrError<Json::Value> requireRawField(const Json::Value &obj,
                                           QLatin1StringView key,
                                           QStringView path) {
-  if (fieldPresence(obj, key) == FieldPresence::Absent)
+  Json::Value v = obj.value(key);
+  if (v.isUndefined())
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  return obj.value(key);
+  return v;
 }
 
 ValueOrError<std::optional<QString>> optionalString(const QJsonObject &obj,
@@ -382,16 +395,13 @@ ValueOrError<QJsonValue> optionalRawObjectField(const QJsonObject &obj,
 ValueOrError<std::optional<QString>>
 requireNullableString(const QJsonObject &obj, QLatin1StringView key,
                       QStringView path) {
-  switch (fieldPresence(obj, key)) {
-  case FieldPresence::Absent:
+  // Single obj.value(key) lookup; see requireField()'s doc comment above.
+  const QJsonValue v = obj.value(key);
+  if (v.isUndefined())
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  case FieldPresence::Null:
+  if (v.isNull())
     return std::optional<QString>{};
-  case FieldPresence::Present:
-    break;
-  }
-  const QJsonValue v = obj.value(key);
   if (!v.isString())
     return failure(
         QStringLiteral("%1: expected string, got %2").arg(path, typeName(v)));
@@ -401,16 +411,13 @@ requireNullableString(const QJsonObject &obj, QLatin1StringView key,
 ValueOrError<std::optional<qint64>> requireNullableInt(const QJsonObject &obj,
                                                        QLatin1StringView key,
                                                        QStringView path) {
-  switch (fieldPresence(obj, key)) {
-  case FieldPresence::Absent:
+  const QJsonValue v = obj.value(key);
+  if (v.isUndefined())
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  case FieldPresence::Null:
+  if (v.isNull())
     return std::optional<qint64>{};
-  case FieldPresence::Present:
-    break;
-  }
-  auto result = requireIntValue(obj.value(key), path);
+  auto result = requireIntValue(v, path);
   if (!result)
     return failure(result.error());
   return std::optional<qint64>{*result};
@@ -534,16 +541,12 @@ ValueOrError<Json::Value> optionalRawObjectField(const Json::Value &obj,
 ValueOrError<std::optional<QString>>
 requireNullableString(const Json::Value &obj, QLatin1StringView key,
                       QStringView path) {
-  switch (fieldPresence(obj, key)) {
-  case FieldPresence::Absent:
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined())
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  case FieldPresence::Null:
+  if (v.isNull())
     return std::optional<QString>{};
-  case FieldPresence::Present:
-    break;
-  }
-  const Json::Value v = obj.value(key);
   if (!v.isString())
     return failure(
         QStringLiteral("%1: expected string, got %2").arg(path, typeName(v)));
@@ -553,16 +556,13 @@ requireNullableString(const Json::Value &obj, QLatin1StringView key,
 ValueOrError<std::optional<qint64>> requireNullableInt(const Json::Value &obj,
                                                        QLatin1StringView key,
                                                        QStringView path) {
-  switch (fieldPresence(obj, key)) {
-  case FieldPresence::Absent:
+  const Json::Value v = obj.value(key);
+  if (v.isUndefined())
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  case FieldPresence::Null:
+  if (v.isNull())
     return std::optional<qint64>{};
-  case FieldPresence::Present:
-    break;
-  }
-  auto result = requireIntValue(obj.value(key), path);
+  auto result = requireIntValue(v, path);
   if (!result)
     return failure(result.error());
   return std::optional<qint64>{*result};

@@ -204,6 +204,23 @@ class ClosureTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             vcp.compute_governed_paths(tree)
 
+    def test_manifest_missing_from_backend_tree_rejected(self):
+        # If the pinned backend commit lacked contracts/manifest.json
+        # entirely, RemoteGitTree.blob_bytes() would shell out to `git
+        # cat-file -p <commit>:<path>`, which exits non-zero for a path
+        # that does not exist -- raising an unhandled
+        # subprocess.CalledProcessError that would bypass verify()'s
+        # intended clean RuntimeError/RefEscapeError reporting and surface
+        # as a raw traceback. compute_governed_fixtures() must check
+        # existence via ls_tree() first and fail with a clean RuntimeError
+        # instead, mirroring compute_schema_closure()'s own
+        # ls_tree()-before-blob_bytes() pattern.
+        blobs = _baseline_blobs()
+        del blobs["contracts/manifest.json"]
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
     def test_manifest_missing_fixtures_key_rejected(self):
         # A manifest object entirely lacking the "fixtures" key must be a
         # hard RuntimeError, distinct from a present-but-empty fixtures

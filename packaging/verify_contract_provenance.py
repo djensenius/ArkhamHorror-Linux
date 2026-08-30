@@ -327,6 +327,19 @@ def compute_governed_fixtures(tree: GitTree, schema_paths: set[str]) -> list[str
     actually govern, discovered independently of anything checked into
     this repository."""
     manifest_path = "contracts/manifest.json"
+    if tree.ls_tree(manifest_path) is None:
+        # Mirrors compute_schema_closure()'s own ls_tree()-before-
+        # blob_bytes() existence check: RemoteGitTree.blob_bytes() shells
+        # out to `git cat-file -p <commit>:<path>` via subprocess.run(
+        # check=True, ...), which raises an unhandled
+        # subprocess.CalledProcessError for a path absent at the pinned
+        # commit -- bypassing verify()'s narrow
+        # except (RuntimeError, RefEscapeError) handling and surfacing as
+        # a raw traceback instead of a clean, reported failure.
+        raise RuntimeError(
+            f"{manifest_path}: manifest does not exist in the pinned "
+            "backend commit at all"
+        )
     raw = tree.blob_bytes(manifest_path)
     try:
         text = raw.decode("utf-8")
