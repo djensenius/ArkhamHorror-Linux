@@ -9,6 +9,8 @@
 #include "JsonDecode.h"
 #include "RawJson.h"
 
+#include "DomainJsonTestAdapter.h"
+
 using namespace Arkham;
 using namespace Qt::StringLiterals;
 
@@ -339,7 +341,7 @@ void DecksTests::decodesCreateDeckRequestFromFixture() {
   expectedDeckList = withoutKey(expectedDeckList, "externalField"_L1);
   expectedDeckList = withoutKey(expectedDeckList, "taboo_id"_L1);
   expected.insert(QStringLiteral("deckList"), expectedDeckList);
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, expected);
@@ -353,7 +355,7 @@ void DecksTests::decodesFetchDeckRequestFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->url,
            QStringLiteral("https://arkhamdb.com/decklist/view/4242"));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, fixture.value("fetchDeck"_L1).toObject());
@@ -372,7 +374,7 @@ void DecksTests::decodesValidateDeckListInputFromFixture() {
   // explicit JSON null in the fixture; DeckListInput collapses absent/null
   // to unset and toJson() omits the key once unset, so it too must be
   // stripped from the expected shape.
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QVERIFY(!reencoded->contains(QStringLiteral("externalField")));
@@ -397,7 +399,7 @@ void DecksTests::decodesNormalizedDeckListFromFixture() {
   QCOMPARE(*result->id, QStringLiteral("4242.0"));
   QCOMPARE(*result->name, QStringLiteral("Contract deck"));
 
-  auto reencoded = result->toJson();
+  auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, v.toObject());
@@ -416,7 +418,7 @@ void DecksTests::decodesDeckFromFixture() {
   QCOMPARE(result->investigatorName, QStringLiteral("Roland Banks"));
   QCOMPARE(result->list.investigatorCode.value(), QStringLiteral("c01001"));
 
-  auto reencoded = result->toJson();
+  auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, v.toObject());
@@ -480,7 +482,7 @@ void DecksTests::decodesValidationErrorsFromFixture() {
   QCOMPARE(result->errorList().size(), 1);
   QCOMPARE(result->errorList().at(0).cardCode.value(),
            QStringLiteral("c99999"));
-  auto reencoded = result->toJson();
+  auto reencoded = Arkham::TestOnly::arrayJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, v.toArray());
@@ -495,7 +497,7 @@ void DecksTests::decodesValidationSuccessFromFixture() {
   QCOMPARE(result->kind(), DeckValidationResult::Kind::Success);
   QVERIFY(result->isSuccess());
   QVERIFY(result->errorList().isEmpty());
-  auto reencoded = result->toJson();
+  auto reencoded = Arkham::TestOnly::arrayJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, v.toArray());
@@ -508,7 +510,7 @@ void DecksTests::decodesOperationErrorFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->errorMsg, QStringLiteral("Could not sync deck"));
-  auto reencoded = result->toJson();
+  auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, v.toObject());
@@ -653,7 +655,7 @@ void DecksTests::externalIdAbsentPreserved() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Absent);
   // Omitted on re-encode -- never fabricates a null/zero id.
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QVERIFY(!reencoded->contains(QStringLiteral("id")));
@@ -672,7 +674,7 @@ void DecksTests::externalIdExplicitNullPreserved() {
   // A missing key's .value() would be Undefined, whose isNull() is false
   // (confirmed empirically against Qt's actual behavior), so this pair
   // genuinely distinguishes "key present with null" from "key omitted".
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QVERIFY(reencoded->contains(QStringLiteral("id")));
@@ -690,7 +692,7 @@ void DecksTests::externalIdStringPreserved() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->id.kind(), ExternalDeckId::Kind::Text);
   QCOMPARE(result->id.text(), QStringLiteral("external-9999"));
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(reencoded->value(QStringLiteral("id")).toString(),
@@ -719,7 +721,7 @@ void DecksTests::externalIdLargeIntegerPreservedWithoutPrecisionLoss() {
   // toJson() now succeeds exactly via QJsonValue(qint64) (never a lossy
   // double) since this literal is mathematically integral and fits
   // qint64's range -- see ExternalDeckId::toJson()'s doc comment.
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(reencoded->value(QStringLiteral("id")).toInteger(),
@@ -743,7 +745,7 @@ void DecksTests::externalIdDecimalPreserved() {
   // rounding through a double -- this is the exact scenario the
   // "public outbound request QJson encoders silently round exact
   // ExternalDeckId" review finding forbids: there is no safe fallback.
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!reencoded.has_value());
   QVERIFY2(reencoded.error().contains(QStringLiteral("42.5")),
            qPrintable(reencoded.error()));
@@ -773,7 +775,7 @@ void DecksTests::externalIdToJsonPreservesLargeIntegerExactlyAsQJsonInteger() {
   // QJsonValue must be backed by the exact qint64, not a rounded double.
   const auto id =
       ExternalDeckId::number(Json::RawNumber::fromInt64(9007199254740993LL));
-  const auto encoded = id.toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(id);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->toInteger(), qint64(9007199254740993LL));
@@ -794,7 +796,7 @@ void DecksTests::
     QFAIL(qPrintable(parsed.error()));
   QVERIFY(parsed->isNumber());
   const auto id = ExternalDeckId::number(parsed->toRawNumber());
-  const auto encoded = id.toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(id);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("1e128")),
            qPrintable(encoded.error()));
@@ -809,7 +811,7 @@ void DecksTests::externalIdToJsonRejectsFractionWithoutRoundingOrFallback() {
   if (!parsed)
     QFAIL(qPrintable(parsed.error()));
   const auto id = ExternalDeckId::number(parsed->toRawNumber());
-  const auto encoded = id.toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(id);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("42.5")),
            qPrintable(encoded.error()));
@@ -1070,7 +1072,7 @@ void DecksTests::sideSlotsAbsentStaysUndefinedNotEmptyMap() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->sideSlots.isUndefined());
-  const auto reencodedJson = result->toJson();
+  const auto reencodedJson = Arkham::TestOnly::objectJson(*result);
   if (!reencodedJson)
     QFAIL(qPrintable(reencodedJson.error()));
   QVERIFY(!reencodedJson->contains(QStringLiteral("sideSlots")));
@@ -1262,7 +1264,7 @@ void DecksTests::nullableFieldsRoundTripAsExplicitNull() {
   QVERIFY(!result->url.has_value());
   QVERIFY(!result->id.has_value());
   QVERIFY(!result->name.has_value());
-  auto reencoded = result->toJson();
+  auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, obj);
@@ -1321,7 +1323,7 @@ void DecksTests::deckNullUrlRoundTripsAsExplicitNullNotOmitted() {
     QFAIL(qPrintable(result.error()));
   QVERIFY(!result->url.has_value());
 
-  auto encodedResult = result->toJson();
+  auto encodedResult = Arkham::TestOnly::objectJson(*result);
   if (!encodedResult)
     QFAIL(qPrintable(encodedResult.error()));
   const QJsonObject encoded = *encodedResult;
@@ -1365,11 +1367,11 @@ void DecksTests::deckValidationResultSuccessAndErrorsAreDistinctKinds() {
   if (!errorsResult)
     QFAIL(qPrintable(errorsResult.error()));
   QVERIFY(success != *errorsResult);
-  auto successEncoded = success.toJson();
+  auto successEncoded = Arkham::TestOnly::arrayJson(success);
   if (!successEncoded)
     QFAIL(qPrintable(successEncoded.error()));
   QCOMPARE(*successEncoded, QJsonArray{});
-  auto errorsEncoded = errorsResult->toJson();
+  auto errorsEncoded = Arkham::TestOnly::arrayJson(*errorsResult);
   if (!errorsEncoded)
     QFAIL(qPrintable(errorsEncoded.error()));
   QCOMPARE(*errorsEncoded,
@@ -1456,14 +1458,14 @@ void DecksTests::deckListInputToJsonRejectsProgrammaticEmptyCardSlotsKey() {
       .cardSlots = {{QString(), 2}},
       .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
   };
-  const auto encoded = input.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(input);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("slots")),
            qPrintable(encoded.error()));
 
   // A non-empty key still encodes fine.
   input.cardSlots = {{QStringLiteral("01001"), 2}};
-  const auto validEncoded = input.toJson();
+  const auto validEncoded = Arkham::TestOnly::objectJson(input);
   if (!validEncoded)
     QFAIL(qPrintable(validEncoded.error()));
   QCOMPARE(validEncoded->value(QStringLiteral("slots"))
@@ -1511,7 +1513,7 @@ void DecksTests::deckListInputToJsonRejectsSideSlotsWithNestedUndefined() {
            {QStringLiteral("vanishes"), Json::Value{}}}),
       .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
   };
-  const auto encoded = input.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(input);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("sideSlots")),
            qPrintable(encoded.error()));
@@ -1526,7 +1528,7 @@ void DecksTests::deckListInputToJsonRejectsSideSlotsWithDuplicateKey() {
             Json::Value::makeNumber(Json::RawNumber::fromInt64(2))}}),
       .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
   };
-  const auto encoded = input.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(input);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("sideSlots")),
            qPrintable(encoded.error()));
@@ -1565,7 +1567,7 @@ void DecksTests::
   // Value::toExactQJson() call would have silently accepted this via
   // toExactInt64()'s all-zero shortcut, in spite of the encoded number
   // exceeding production's digit budget.
-  const auto encoded = input.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(input);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("sideSlots")),
            qPrintable(encoded.error()));
@@ -1599,7 +1601,7 @@ void DecksTests::createDeckRequestToJsonRejectsMaliciousSideSlots() {
       .deckName = QStringLiteral("X"),
       .deckList = input,
   };
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -1616,7 +1618,7 @@ void DecksTests::deckListInputToJsonRejectsLoneSurrogateInInvestigatorCode() {
   const DeckListInput input{
       .investigatorCode = *InvestigatorRef::parse(lone),
   };
-  const auto encoded = input.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(input);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = input.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -1637,7 +1639,7 @@ void DecksTests::
   const DeckListInput input{
       .investigatorCode = *InvestigatorRef::parse(overLong),
   };
-  const auto encoded = input.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(input);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("length")),
            qPrintable(encoded.error()));
@@ -1659,7 +1661,7 @@ void DecksTests::createDeckRequestToJsonRejectsLoneSurrogateInDeckName() {
       .deckList = {.investigatorCode =
                        *InvestigatorRef::parse(QStringLiteral("01001"))},
   };
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -1674,7 +1676,7 @@ void DecksTests::fetchDeckRequestToJsonRejectsLoneSurrogateInUrl() {
   QString lone;
   lone += QChar(0xD800);
   const FetchDeckRequest request{.url = lone};
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -1692,7 +1694,7 @@ void DecksTests::investigatorRefToJsonRejectsLoneSurrogateDirectly() {
   const auto ref = InvestigatorRef::parse(lone);
   if (!ref)
     QFAIL(qPrintable(ref.error()));
-  const auto encoded = ref->toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(*ref);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
@@ -1711,7 +1713,7 @@ void DecksTests::
   const auto ref = InvestigatorRef::parse(overLong);
   if (!ref)
     QFAIL(qPrintable(ref.error()));
-  const auto encoded = ref->toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(*ref);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("length")),
            qPrintable(encoded.error()));
@@ -1727,7 +1729,7 @@ void DecksTests::cardCodeToJsonRejectsLoneSurrogateDirectly() {
   const auto code = CardCode::parse(lone);
   if (!code)
     QFAIL(qPrintable(code.error()));
-  const auto encoded = code->toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(*code);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
@@ -1744,7 +1746,7 @@ void DecksTests::cardCodeToJsonRejectsStringExceedingProductionLengthBudget() {
   const auto code = CardCode::parse(overLong);
   if (!code)
     QFAIL(qPrintable(code.error()));
-  const auto encoded = code->toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(*code);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("length")),
            qPrintable(encoded.error()));
@@ -1757,7 +1759,7 @@ void DecksTests::cardNameToJsonRejectsLoneSurrogateInTitle() {
   QString lone;
   lone += QChar(0xD800);
   const CardName name{.title = lone, .subtitle = std::nullopt};
-  const auto encoded = name.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(name);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("title")),
            qPrintable(encoded.error()));
@@ -1768,7 +1770,7 @@ void DecksTests::cardNameToJsonRejectsLoneSurrogateInSubtitle() {
   lone += QChar(0xDC00);
   const CardName name{.title = QStringLiteral("Roland Banks"),
                       .subtitle = lone};
-  const auto encoded = name.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(name);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("subtitle")),
            qPrintable(encoded.error()));
@@ -1784,7 +1786,7 @@ void DecksTests::cardNameToJsonRejectsTitleExceedingProductionLengthBudget() {
   const QString overLong(Json::ParseLimits::production().maxStringLength + 1,
                          u'a');
   const CardName name{.title = overLong, .subtitle = std::nullopt};
-  const auto encoded = name.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(name);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("title")),
            qPrintable(encoded.error()));
@@ -1799,7 +1801,7 @@ void DecksTests::externalDeckIdTextKindToJsonRejectsLoneSurrogate() {
   lone += QChar(0xD800);
   const auto id = ExternalDeckId::text(lone);
   QCOMPARE(id.kind(), ExternalDeckId::Kind::Text);
-  const auto encoded = id.toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(id);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
@@ -1829,7 +1831,7 @@ void DecksTests::
     QFAIL(qPrintable(parsedNumber.error()));
   QVERIFY(parsedNumber->isNumber());
   const auto id = ExternalDeckId::number(parsedNumber->toRawNumber());
-  const auto encoded = id.toJson();
+  const auto encoded = Arkham::TestOnly::scalarJson(id);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1848,7 +1850,7 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInCardSlotsKey() {
       .cardSlots = {{*loneCode, 1}},
       .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
   };
-  const auto encoded = list.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(list);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
@@ -1861,7 +1863,7 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInInvestigatorName() {
       .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
       .investigatorName = lone,
   };
-  const auto encoded = list.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(list);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("investigator_name")),
            qPrintable(encoded.error()));
@@ -1875,7 +1877,7 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInMeta() {
       .investigatorName = QStringLiteral("Name"),
       .meta = lone,
   };
-  const auto encoded = list.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(list);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("meta")),
            qPrintable(encoded.error()));
@@ -1889,7 +1891,7 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInUrl() {
       .investigatorName = QStringLiteral("Name"),
       .url = lone,
   };
-  const auto encoded = list.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(list);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("url")),
            qPrintable(encoded.error()));
@@ -1903,7 +1905,7 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInId() {
       .investigatorName = QStringLiteral("Name"),
       .id = lone,
   };
-  const auto encoded = list.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(list);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("id")),
            qPrintable(encoded.error()));
@@ -1917,7 +1919,7 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInName() {
       .investigatorName = QStringLiteral("Name"),
       .name = lone,
   };
-  const auto encoded = list.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(list);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("name")),
            qPrintable(encoded.error()));
@@ -1938,7 +1940,7 @@ void DecksTests::deckToJsonRejectsLoneSurrogateInName() {
                            *CardCode::parse(QStringLiteral("c01001")),
                        .investigatorName = QStringLiteral("Name")},
   };
-  const auto encoded = deck.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(deck);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("name")),
            qPrintable(encoded.error()));
@@ -1960,7 +1962,7 @@ void DecksTests::deckToJsonRejectsLoneSurrogateInUrl() {
                            *CardCode::parse(QStringLiteral("c01001")),
                        .investigatorName = QStringLiteral("Name")},
   };
-  const auto encoded = deck.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(deck);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("url")),
            qPrintable(encoded.error()));
@@ -1984,7 +1986,7 @@ void DecksTests::deckValidationResultToJsonRejectsOverArrayElementLimit() {
   auto overLimit = DeckValidationResult::errors(errors);
   if (!overLimit)
     QFAIL(qPrintable(overLimit.error()));
-  const auto overLimitEncoded = overLimit->toJson();
+  const auto overLimitEncoded = Arkham::TestOnly::arrayJson(*overLimit);
   QVERIFY(!overLimitEncoded.has_value());
 
   errors.removeLast();
@@ -1992,7 +1994,7 @@ void DecksTests::deckValidationResultToJsonRejectsOverArrayElementLimit() {
   auto atLimit = DeckValidationResult::errors(errors);
   if (!atLimit)
     QFAIL(qPrintable(atLimit.error()));
-  const auto atLimitEncoded = atLimit->toJson();
+  const auto atLimitEncoded = Arkham::TestOnly::arrayJson(*atLimit);
   if (!atLimitEncoded)
     QFAIL(qPrintable(atLimitEncoded.error()));
   QCOMPARE(atLimitEncoded->size(), 20'000);
@@ -2009,7 +2011,7 @@ void DecksTests::deckOperationErrorToJsonRejectsLoneSurrogateInErrorMsg() {
   QString lone = QStringLiteral("Could not sync deck ");
   lone += QChar(0xD800);
   const DeckOperationError err{.errorMsg = lone};
-  const auto encoded = err.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(err);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
@@ -2029,7 +2031,7 @@ void DecksTests::
   const DeckList list{
       .investigatorCode = *CardCode::parse(overLong),
   };
-  const auto encoded = list.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(list);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("length")),
            qPrintable(encoded.error()));
@@ -2055,7 +2057,7 @@ void DecksTests::
       .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
       .id = ExternalDeckId::number(parsedNumber->toRawNumber()),
   };
-  const auto encoded = input.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(input);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = input.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -2185,7 +2187,7 @@ void DecksTests::deckValidationResultMoveConstructLeavesSourceErrorsIntact() {
 
   // Reuse the moved-from source end-to-end through its own encoder: it
   // must still encode as a 2-element array, never `[]`.
-  auto encoded = source.toJson();
+  auto encoded = Arkham::TestOnly::arrayJson(source);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->size(), 2);
@@ -2206,7 +2208,7 @@ void DecksTests::deckValidationResultMoveAssignLeavesSourceErrorsIntact() {
   // `source` just as valid/reusable as move-construction does above.
   QCOMPARE(source.kind(), DeckValidationResult::Kind::Errors);
   QCOMPARE(source.errorList().size(), 1);
-  auto encoded = source.toJson();
+  auto encoded = Arkham::TestOnly::arrayJson(source);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->size(), 1);
@@ -2242,7 +2244,7 @@ void DecksTests::externalDeckIdMoveConstructLeavesSourceTextIntact() {
   QCOMPARE(source.text(), QStringLiteral("legacy-42"));
 
   // Reuse the moved-from source through its own fragment encoder.
-  auto encoded = source.toJson();
+  auto encoded = Arkham::TestOnly::scalarJson(source);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, QJsonValue(QStringLiteral("legacy-42")));

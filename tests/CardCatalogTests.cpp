@@ -9,6 +9,8 @@
 #include "CardCatalog.h"
 #include "RawJson.h"
 
+#include "DomainJsonTestAdapter.h"
+
 using namespace Arkham;
 using namespace Qt::StringLiterals;
 
@@ -301,7 +303,7 @@ void CardCatalogTests::decodesFullCardFromFixture() {
 
   // Byte-faithful round trip (QJsonObject equality is key-set and value
   // exact, independent only of key ordering).
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, cards.at(0).toObject());
@@ -330,7 +332,7 @@ void CardCatalogTests::decodesHomebrewCardFromFixture() {
   QCOMPARE(*result->healthDamage->singleAmount(), qint64(1));
   QVERIFY(!result->sanityDamage.has_value());
 
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, homebrew.at(0).toObject());
@@ -357,7 +359,7 @@ void CardCatalogTests::decodesMinimalInvestigatorCardFromFixture() {
   QVERIFY(result->skills.isEmpty());
   QVERIFY(result->cardSlots.isEmpty());
 
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, card.toObject());
@@ -568,7 +570,7 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     const auto result = CardCost::fromJson(obj, u"cost");
     if (!result)
       QFAIL(qPrintable(result.error()));
-    const auto encoded = result->toJson();
+    const auto encoded = Arkham::TestOnly::objectJson(*result);
     if (!encoded)
       QFAIL(qPrintable(encoded.error()));
     QCOMPARE(*encoded, obj);
@@ -585,7 +587,7 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     const auto result = CardCost::fromJson(obj, u"cost");
     if (!result)
       QFAIL(qPrintable(result.error()));
-    const auto encoded = result->toJson();
+    const auto encoded = Arkham::TestOnly::objectJson(*result);
     if (!encoded)
       QFAIL(qPrintable(encoded.error()));
     QCOMPARE(*encoded, obj);
@@ -603,7 +605,8 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     QFAIL(qPrintable(matchingEnemyFieldResult.error()));
   QVERIFY(matchingEnemyFieldResult->rawContents() ==
           toRawJson(QJsonValue(matchingEnemyFieldContents)));
-  const auto matchingEnemyFieldEncoded = matchingEnemyFieldResult->toJson();
+  const auto matchingEnemyFieldEncoded =
+      Arkham::TestOnly::objectJson(*matchingEnemyFieldResult);
   if (!matchingEnemyFieldEncoded)
     QFAIL(qPrintable(matchingEnemyFieldEncoded.error()));
   QCOMPARE(*matchingEnemyFieldEncoded, matchingEnemyFieldObj);
@@ -615,7 +618,7 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
   if (!staticResult)
     QFAIL(qPrintable(staticResult.error()));
   QCOMPARE(*staticResult->staticAmount(), qint64(5));
-  const auto staticEncoded = staticResult->toJson();
+  const auto staticEncoded = Arkham::TestOnly::objectJson(*staticResult);
   if (!staticEncoded)
     QFAIL(qPrintable(staticEncoded.error()));
   QCOMPARE(*staticEncoded, staticObj);
@@ -627,7 +630,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r1 = GameValue::fromJson(staticObj, u"gv");
   if (!r1)
     QFAIL(qPrintable(r1.error()));
-  auto r1Encoded = r1->toJson();
+  auto r1Encoded = Arkham::TestOnly::objectJson(*r1);
   if (!r1Encoded)
     QFAIL(qPrintable(r1Encoded.error()));
   QCOMPARE(*r1Encoded, staticObj);
@@ -638,7 +641,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r2 = GameValue::fromJson(perPlayerObj, u"gv");
   if (!r2)
     QFAIL(qPrintable(r2.error()));
-  auto r2Encoded = r2->toJson();
+  auto r2Encoded = Arkham::TestOnly::objectJson(*r2);
   if (!r2Encoded)
     QFAIL(qPrintable(r2Encoded.error()));
   QCOMPARE(*r2Encoded, perPlayerObj);
@@ -650,7 +653,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   if (!r3)
     QFAIL(qPrintable(r3.error()));
   QCOMPARE(r3->contents(), (QList<qint64>{qint64(3), qint64(1)}));
-  auto r3Encoded = r3->toJson();
+  auto r3Encoded = Arkham::TestOnly::objectJson(*r3);
   if (!r3Encoded)
     QFAIL(qPrintable(r3Encoded.error()));
   QCOMPARE(*r3Encoded, staticWithPerPlayerObj);
@@ -663,7 +666,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
     QFAIL(qPrintable(r4.error()));
   QCOMPARE(r4->contents(),
            (QList<qint64>{qint64(2), qint64(3), qint64(4), qint64(5)}));
-  auto r4Encoded = r4->toJson();
+  auto r4Encoded = Arkham::TestOnly::objectJson(*r4);
   if (!r4Encoded)
     QFAIL(qPrintable(r4Encoded.error()));
   QCOMPARE(*r4Encoded, byPlayerCountObj);
@@ -673,7 +676,7 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
     auto r = GameValue::fromJson(obj, u"gv");
     if (!r)
       QFAIL(qPrintable(r.error()));
-    auto encoded = r->toJson();
+    auto encoded = Arkham::TestOnly::objectJson(*r);
     if (!encoded)
       QFAIL(qPrintable(encoded.error()));
     QCOMPARE(*encoded, obj);
@@ -709,7 +712,7 @@ void CardCatalogTests::
   const QJsonObject expected{
       {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
       {QStringLiteral("contents"), QJsonArray{10, 20, 30, 40}}};
-  auto encoded = value.toJson();
+  auto encoded = Arkham::TestOnly::objectJson(value);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, expected);
@@ -727,7 +730,7 @@ void CardCatalogTests::allSkillIconVariantsRoundTrip() {
     if (!r)
       QFAIL(qPrintable(r.error()));
     QCOMPARE(*r->skill(), skill);
-    auto encoded = r->toJson();
+    auto encoded = Arkham::TestOnly::objectJson(*r);
     if (!encoded)
       QFAIL(qPrintable(encoded.error()));
     QCOMPARE(*encoded, obj);
@@ -739,7 +742,7 @@ void CardCatalogTests::allSkillIconVariantsRoundTrip() {
     if (!r)
       QFAIL(qPrintable(r.error()));
     QVERIFY(!r->skill().has_value());
-    auto encoded = r->toJson();
+    auto encoded = Arkham::TestOnly::objectJson(*r);
     if (!encoded)
       QFAIL(qPrintable(encoded.error()));
     QCOMPARE(*encoded, obj);
@@ -766,7 +769,7 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
   QCOMPARE(result->tag(), CardCostTag::Unknown);
   QVERIFY(!result->staticAmount().has_value());
   QVERIFY(result->unknownRaw() == toRawJson(withContents));
-  const auto withContentsEncoded = result->toJson();
+  const auto withContentsEncoded = Arkham::TestOnly::objectJson(*result);
   if (!withContentsEncoded)
     QFAIL(qPrintable(withContentsEncoded.error()));
   QCOMPARE(*withContentsEncoded, withContents);
@@ -778,7 +781,7 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
     QFAIL(qPrintable(result2.error()));
   QCOMPARE(result2->tag(), CardCostTag::Unknown);
   QVERIFY(result2->unknownRaw() == toRawJson(withoutContents));
-  const auto withoutContentsEncoded = result2->toJson();
+  const auto withoutContentsEncoded = Arkham::TestOnly::objectJson(*result2);
   if (!withoutContentsEncoded)
     QFAIL(qPrintable(withoutContentsEncoded.error()));
   QCOMPARE(*withoutContentsEncoded, withoutContents);
@@ -799,7 +802,7 @@ void CardCatalogTests::unrecognizedGameValueTagPreservedNotRejected() {
   // "ValueUnknown".
   QVERIFY(result->tag() != GameValueTag::ValueUnknown);
   QVERIFY(result->unknownRaw() == toRawJson(obj));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -813,7 +816,7 @@ void CardCatalogTests::unrecognizedSkillIconTagPreservedNotRejected() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tag(), SkillIconTag::Unknown);
   QVERIFY(result->unknownRaw() == toRawJson(obj));
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -993,7 +996,7 @@ void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
     if (!nullResult)
       QFAIL(qPrintable(nullResult.error()));
     QVERIFY(nullResult->rawContents().isNull());
-    const auto nullEncoded = nullResult->toJson();
+    const auto nullEncoded = Arkham::TestOnly::objectJson(*nullResult);
     if (!nullEncoded)
       QFAIL(qPrintable(nullEncoded.error()));
     QCOMPARE(*nullEncoded, nullContents);
@@ -1057,7 +1060,8 @@ void CardCatalogTests::rawPayloadCardCostFactoriesValidateContents() {
   QCOMPARE(matchingEnemyFieldCost->tag(), CardCostTag::MatchingEnemyFieldCost);
   QVERIFY(matchingEnemyFieldCost->rawContents() ==
           validMatchingEnemyFieldContents);
-  const auto matchingEnemyFieldCostEncoded = matchingEnemyFieldCost->toJson();
+  const auto matchingEnemyFieldCostEncoded =
+      Arkham::TestOnly::objectJson(*matchingEnemyFieldCost);
   if (!matchingEnemyFieldCostEncoded)
     QFAIL(qPrintable(matchingEnemyFieldCostEncoded.error()));
   QCOMPARE(
@@ -1187,7 +1191,7 @@ void CardCatalogTests::unconstrainedFieldsPreservedVerbatim() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->meta == toRawJson(QJsonValue(rawMeta)));
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->value(QStringLiteral("meta")).toObject(), rawMeta);
@@ -1211,7 +1215,7 @@ void CardCatalogTests::bondedWithRoundTrips() {
   QCOMPARE(result->bondedWith.size(), 2);
   QCOMPARE(result->bondedWith.at(0).first, qint64(2));
   QCOMPARE(result->bondedWith.at(0).second.value(), QStringLiteral("c00002"));
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -1240,7 +1244,7 @@ void CardCatalogTests::alternateSkillsAndErrataRoundTrip() {
   QCOMPARE(result->alternateSkills.value(QStringLiteral("c00002")).size(), 1);
   QCOMPARE(result->alternateErrata.value(QStringLiteral("c00002")),
            QStringLiteral("Errata text"));
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -1332,7 +1336,7 @@ void CardCatalogTests::absentNonNullableScalarFieldsDecodeToNullopt() {
   QVERIFY(!result->commitTrigger.has_value());
   QVERIFY(!result->errata.has_value());
   // Round trip stays byte-faithful: none of these absent fields reappear.
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QVERIFY(!encoded->contains(QStringLiteral("level")));
@@ -1427,7 +1431,7 @@ void CardCatalogTests::
   QVERIFY(result->commitRestrictions ==
           toRawJson(QJsonValue(rawCommitRestrictions)));
   QVERIFY(result->meta == toRawJson(QJsonValue(rawMeta)));
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -1493,7 +1497,7 @@ void CardCatalogTests::duplicateTagsAllowedNoUniquenessConstraint() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->tags.size(), 2);
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -1812,7 +1816,7 @@ void CardCatalogTests::
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
   QCOMPARE(decoded->tag(), SkillIconTag::Unknown);
-  const auto encoded = decoded->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*decoded);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1834,7 +1838,7 @@ void CardCatalogTests::
   const auto decoded = SkillIcon::fromRawJson(raw, u"skill");
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
-  const auto encoded = decoded->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*decoded);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1854,7 +1858,7 @@ void CardCatalogTests::
   const auto decoded = SkillIcon::fromRawJson(raw, u"skill");
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
-  const auto encoded = decoded->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*decoded);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1865,7 +1869,7 @@ void CardCatalogTests::cardCostToJsonRejectsHugeExponentInUnknownTagContents() {
       CardCost::fromRawJson(*Json::Value::parse(bytes, u"cost"), u"cost");
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
-  const auto encoded = decoded->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*decoded);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1877,7 +1881,7 @@ void CardCatalogTests::
       GameValue::fromRawJson(*Json::Value::parse(bytes, u"gv"), u"gv");
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
-  const auto encoded = decoded->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*decoded);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1898,7 +1902,7 @@ void CardCatalogTests::cardDefToJsonRejectsHugeExponentInMetaField() {
   const auto result = CardDef::fromRawBytes(bytes, u"card");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1916,7 +1920,7 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeCardType() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->cardType = static_cast<CardType>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("cardType")),
            qPrintable(encoded.error()));
@@ -1927,7 +1931,7 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeCardSubType() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->cardSubType = static_cast<CardSubType>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("cardSubType")),
            qPrintable(encoded.error()));
@@ -1938,7 +1942,7 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeClassSymbolInArray() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->classSymbols = {static_cast<ClassSymbol>(999)};
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("classSymbols")),
            qPrintable(encoded.error()));
@@ -1949,7 +1953,7 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeRevelation() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->revelation = static_cast<Revelation>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("revelation")),
            qPrintable(encoded.error()));
@@ -1960,7 +1964,7 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeCardSlotInArray() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->cardSlots = {static_cast<SlotType>(999)};
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("slots")),
            qPrintable(encoded.error()));
@@ -1971,7 +1975,7 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeOutOfPlayEffectInArray() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->outOfPlayEffects = {static_cast<OutOfPlayEffect>(999)};
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("outOfPlayEffects")),
            qPrintable(encoded.error()));
@@ -1982,7 +1986,7 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeWhenDiscarded() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->whenDiscarded = static_cast<WhenDiscarded>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("whenDiscarded")),
            qPrintable(encoded.error()));
@@ -2101,7 +2105,7 @@ void CardCatalogTests::
   const QJsonObject expected{
       {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
       {QStringLiteral("contents"), QJsonArray{10, 20, 30, 40}}};
-  auto sourceEncoded = source.toJson();
+  auto sourceEncoded = Arkham::TestOnly::objectJson(source);
   if (!sourceEncoded)
     QFAIL(qPrintable(sourceEncoded.error()));
   QCOMPARE(*sourceEncoded, expected);
@@ -2144,7 +2148,7 @@ void CardCatalogTests::skillIconUnknownTagMoveConstructLeavesSourceRawIntact() {
 
   QCOMPARE(source.tag(), SkillIconTag::Unknown);
   QVERIFY(source.unknownRaw() == toRawJson(obj));
-  auto encoded = source.toJson();
+  auto encoded = Arkham::TestOnly::objectJson(source);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -2168,7 +2172,7 @@ void CardCatalogTests::cardCostUnknownTagMoveConstructLeavesSourceRawIntact() {
   // original raw object.
   QCOMPARE(source.tag(), CardCostTag::Unknown);
   QVERIFY(source.unknownRaw() == toRawJson(obj));
-  auto sourceEncoded = source.toJson();
+  auto sourceEncoded = Arkham::TestOnly::objectJson(source);
   if (!sourceEncoded)
     QFAIL(qPrintable(sourceEncoded.error()));
   QCOMPARE(*sourceEncoded, obj);

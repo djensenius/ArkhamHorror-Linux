@@ -5,6 +5,8 @@
 #include "Games.h"
 #include "RawJson.h"
 
+#include "DomainJsonTestAdapter.h"
+
 using namespace Arkham;
 using namespace Qt::StringLiterals;
 
@@ -48,6 +50,32 @@ encodeCampaignOrScenarioFragment(const CampaignOrScenario &campaignOrScenario) {
            qPrintable(encoded.error()));
   return *encoded;
 }
+
+// Test-only reverse encoder relocated here (see "structurally eliminate
+// all public domain toJson()/QJson-returning encoders" review round):
+// this exact fragment/logic previously lived as the public
+// `ValueOrError<QJsonArray> encodeOpenSeats(const QList<CardCode>&)` free
+// function in Games.h/.cpp, but had zero production callers -- only
+// encodeOpenSeatsRejectsLoneSurrogateInCardCode() and
+// encodeOpenSeatsRejectsOverArrayElementLimit() below (plus this file's
+// own round-trip caller) ever invoked it. Unlike
+// encodeCampaignOrScenarioFragment() above, this stays genuinely
+// fallible (not qFatal-on-failure): both tests named above specifically
+// assert on a typed encode *failure*, not merely construct a fixture.
+// Builds the complete array as a Json::Value AST and converts ONCE via
+// Value::toExactQJsonArray() (see RawJson.h), rather than appending each
+// element's individually-exact CardCode raw result into a QJsonArray by
+// hand: the latter would have no bound of its own on the total
+// element/node count, letting an otherwise-valid list of individually-
+// exact codes still bypass ParseLimits::production()'s overall
+// array-length/total-node-count limit.
+ValueOrError<QJsonArray> encodeOpenSeats(const QList<CardCode> &seats) {
+  QList<Json::Value> raw;
+  raw.reserve(seats.size());
+  for (const auto &seat : seats)
+    raw.append(seat.toRawJson());
+  return Json::Value::makeArray(raw).toExactQJsonArray();
+}
 } // namespace
 
 class GamesTests final : public QObject {
@@ -67,11 +95,13 @@ private slots:
   // GameListRow::fromRawBytes), not merely GameState in isolation.
   void gameListRowFromRawBytesPreservesUnknownGameStateHugeNestedNumber();
   // Round-9/10 item 4: the ENCODE side must be equally lossless, not just
-  // decode -- a GameListRow (and the whole encodeGameList array) built
-  // from an Unknown gameState carrying a numeric literal beyond
+  // decode -- a GameListRow (and the whole encodeGameListToRawJson array)
+  // built from an Unknown gameState carrying a numeric literal beyond
   // IEEE-754 double's exact-integer range must reproduce that exact
   // literal via toJsonBytes()/encodeGameListToJsonBytes(), never through
-  // the QJsonObject-typed toJson()/encodeGameList() convenience.
+  // a QJsonObject-typed convenience (no such public encoder exists for
+  // this collection; see encodeGameListToRawJson()'s doc comment in
+  // Games.h).
   void
   gameListRowToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode();
   void
@@ -369,7 +399,7 @@ void GamesTests::decodesPendingRowFromFixture() {
   QCOMPARE(*result->multiplayerVariant(), MultiplayerVariant::Solo);
   QVERIFY(!result->hasOpenSeats());
 
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows.at(0).toObject());
@@ -399,7 +429,7 @@ void GamesTests::decodesChooseDecksRowFromFixture() {
   QCOMPARE(*result->multiplayerVariant(), MultiplayerVariant::WithFriends);
   QVERIFY(result->hasOpenSeats());
 
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows.at(1).toObject());
@@ -411,7 +441,7 @@ void GamesTests::decodesActiveRowFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->gameState()->kind(), GameState::Kind::Active);
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows.at(2).toObject());
@@ -423,7 +453,7 @@ void GamesTests::decodesOverRowFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->gameState()->kind(), GameState::Kind::Over);
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows.at(3).toObject());
@@ -436,7 +466,7 @@ void GamesTests::decodesFailureRowFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind(), GameListRow::Kind::Failure);
   QCOMPARE(result->error(), QStringLiteral("Contract fixture failed to load."));
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows.at(4).toObject());
@@ -448,7 +478,8 @@ void GamesTests::decodeGameListRoundTripsWholeFixtureByteExact() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->size(), 5);
-  auto encoded = encodeGameList(*result);
+  auto encoded =
+      Arkham::TestOnly::arrayJsonFromRaw(encodeGameListToRawJson(*result));
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows);
@@ -528,7 +559,7 @@ void GamesTests::
   const auto decoded = GameListRow::fromRawBytes(bytes, u"row");
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
-  const auto encoded = decoded->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*decoded);
   QVERIFY(!encoded.has_value());
 }
 
@@ -595,7 +626,7 @@ void GamesTests::unknownGameStateTagPreservedAndRoundTrips() {
   QCOMPARE(result->kind(), GameState::Kind::Unknown);
   QCOMPARE(result->unknownTag(), QStringLiteral("IsSuspended"));
   QVERIFY(result->unknownContents().isUndefined());
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -619,7 +650,7 @@ void GamesTests::unknownGameStateTagWithContentsPreservedAndRoundTrips() {
   QCOMPARE(
       result->unknownContents().value(QLatin1StringView("reason")).toString(),
       QStringLiteral("maintenance"));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -718,7 +749,7 @@ void GamesTests::gameStateRawBytesPreserveAdditiveFieldBesideTagAndContents() {
                .toRawNumber()
                .literal(),
            QStringLiteral("123456"));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->value(QStringLiteral("since")).toInt(), 123456);
@@ -757,7 +788,7 @@ void GamesTests::
   // normal-looking-but-altered QJsonObject. toJsonBytes() (see
   // gameStateToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode()
   // below) remains the canonical lossless encoder for this same input.
-  const auto reencodedResult = result->toJson();
+  const auto reencodedResult = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!reencodedResult.has_value());
   QVERIFY2(reencodedResult.error().contains(QStringLiteral("1e300")),
            qPrintable(reencodedResult.error()));
@@ -951,7 +982,7 @@ void GamesTests::decodesCreateGameFromFixture() {
 
   // Fixture carries an additive "unknownField" this client does not model;
   // re-encoding correctly drops it.
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, withoutKey(createGame.toObject(), "unknownField"_L1));
@@ -981,7 +1012,7 @@ void GamesTests::decodesCreateGameDefaultsFromFixture() {
   // strictAsIfAt/asIfRuling are omitted (not merely null) on re-encode, but
   // ultimatumsAndBoons/achievementsEnabled are always emitted (already
   // resolved to their default) even though the fixture itself omits them.
-  const auto reencodedResult = result->toJson();
+  const auto reencodedResult = Arkham::TestOnly::objectJson(*result);
   if (!reencodedResult)
     QFAIL(qPrintable(reencodedResult.error()));
   const QJsonObject reencoded = *reencodedResult;
@@ -1012,7 +1043,7 @@ void GamesTests::createGameSupports64BitPlayerCount() {
     QFAIL(qPrintable(result.error()));
 
   QCOMPARE(result->playerCount, largePlayerCount);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->value(QStringLiteral("playerCount")).toInteger(),
@@ -1124,7 +1155,7 @@ void GamesTests::createGameDefaultsAndNullDefaultsDecodeIdentically() {
 
   // Re-encoding the explicit-null fixture also omits the keys (there is
   // nothing left to distinguish once decoded).
-  const auto reencodedResult = nullDefaults->toJson();
+  const auto reencodedResult = Arkham::TestOnly::objectJson(*nullDefaults);
   if (!reencodedResult)
     QFAIL(qPrintable(reencodedResult.error()));
   const QJsonObject reencoded = *reencodedResult;
@@ -1149,7 +1180,7 @@ void GamesTests::createGameRequestToJsonRejectsProgrammaticNullDeckId() {
       .multiplayerVariant = MultiplayerVariant::Solo,
       .includeTarotReadings = false,
   };
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("deckIds")),
            qPrintable(encoded.error()));
@@ -1158,7 +1189,7 @@ void GamesTests::createGameRequestToJsonRejectsProgrammaticNullDeckId() {
   request.deckIds = {
       std::nullopt,
       QUuid(QStringLiteral("00000000-0000-0000-0000-000000000017"))};
-  const auto validEncoded = request.toJson();
+  const auto validEncoded = Arkham::TestOnly::objectJson(request);
   if (!validEncoded)
     QFAIL(qPrintable(validEncoded.error()));
   const QJsonArray deckIdsArr =
@@ -1190,7 +1221,7 @@ void GamesTests::decodesChooseDeckFromFixture() {
   QJsonObject expectedDeckList =
       withoutKey(expected.value("deckList"_L1).toObject(), "taboo_id"_L1);
   expected.insert(QStringLiteral("deckList"), expectedDeckList);
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, expected);
@@ -1205,7 +1236,7 @@ void GamesTests::decodesContinueWithoutUpgradeFromFixture() {
   QCOMPARE(result->investigatorId.value(), QStringLiteral("c01001"));
   QVERIFY(!result->deckUrl.has_value());
   QVERIFY(!result->deckList.has_value());
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, v.toObject());
@@ -1218,7 +1249,7 @@ void GamesTests::decodesClaimSeatFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->investigatorId.value(), QStringLiteral("01001"));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, withoutKey(v.toObject(), "unknownField"_L1));
@@ -1274,7 +1305,7 @@ void GamesTests::unknownCampaignOptionWithContentsPreservedAndRoundTrips() {
   QCOMPARE(result->text(), QStringLiteral("SomeFutureOption"));
   QCOMPARE(result->unknownContents(),
            toRawJson(QJsonValue(QStringLiteral("payload"))));
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -1288,7 +1319,7 @@ void GamesTests::unknownCampaignOptionWithoutContentsPreservedAndRoundTrips() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind(), CampaignOption::Kind::Unknown);
   QVERIFY(result->unknownContents().isUndefined());
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -1300,7 +1331,7 @@ void GamesTests::knownCampaignOptionRoundTrips() {
   if (!optionResult)
     QFAIL(qPrintable(optionResult.error()));
   const CampaignOption option = *optionResult;
-  auto encoded = option.toJson();
+  auto encoded = Arkham::TestOnly::objectJson(option);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, (QJsonObject{{QStringLiteral("tag"),
@@ -1317,7 +1348,7 @@ void GamesTests::campaignVariantOptionRoundTrips() {
   const QJsonObject expected{
       {QStringLiteral("tag"), QStringLiteral("CampaignVariant")},
       {QStringLiteral("contents"), QStringLiteral("return-to")}};
-  auto encoded = option.toJson();
+  auto encoded = Arkham::TestOnly::objectJson(option);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, expected);
@@ -1364,10 +1395,10 @@ void GamesTests::knownCampaignOptionNarrowsToRequestOption() {
     QFAIL(qPrintable(narrowed.error()));
   QCOMPARE(narrowed->kind(), CampaignOptionRequest::Kind::Known);
   QCOMPARE(*narrowed->known(), KnownCampaignOption::TakeTheNecronomicon);
-  auto narrowedEncoded = narrowed->toJson();
+  auto narrowedEncoded = Arkham::TestOnly::objectJson(*narrowed);
   if (!narrowedEncoded)
     QFAIL(qPrintable(narrowedEncoded.error()));
-  auto knownEncoded = known.toJson();
+  auto knownEncoded = Arkham::TestOnly::objectJson(known);
   if (!knownEncoded)
     QFAIL(qPrintable(knownEncoded.error()));
   QCOMPARE(*narrowedEncoded, *knownEncoded);
@@ -1379,10 +1410,10 @@ void GamesTests::knownCampaignOptionNarrowsToRequestOption() {
     QFAIL(qPrintable(narrowedVariant.error()));
   QCOMPARE(narrowedVariant->kind(), CampaignOptionRequest::Kind::Variant);
   QCOMPARE(narrowedVariant->text(), QStringLiteral("return-to"));
-  auto narrowedVariantEncoded = narrowedVariant->toJson();
+  auto narrowedVariantEncoded = Arkham::TestOnly::objectJson(*narrowedVariant);
   if (!narrowedVariantEncoded)
     QFAIL(qPrintable(narrowedVariantEncoded.error()));
-  auto variantEncoded = variant.toJson();
+  auto variantEncoded = Arkham::TestOnly::objectJson(variant);
   if (!variantEncoded)
     QFAIL(qPrintable(variantEncoded.error()));
   QCOMPARE(*narrowedVariantEncoded, *variantEncoded);
@@ -1415,7 +1446,7 @@ void GamesTests::
   QCOMPARE(result->text(), QStringLiteral("SomeFutureOption"));
   QVERIFY(result->rawJson().isObject());
   QVERIFY(result->rawJson().value(QLatin1StringView("isSuspended")).toBool());
-  auto encoded = result->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(QJsonDocument(*encoded).toJson(QJsonDocument::Compact),
@@ -1490,7 +1521,7 @@ void GamesTests::campaignOptionToJsonRejectsHugeExponentInUnknownTagContents() {
   const auto decoded = CampaignOption::fromRawBytes(bytes, u"option");
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
-  const auto encoded = decoded->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*decoded);
   QVERIFY(!encoded.has_value());
 }
 
@@ -1512,7 +1543,7 @@ void GamesTests::
 
   // The complete raw object (including the explicit null "contents" and
   // the additive "isSuspended") re-encodes byte-exact ...
-  auto encoded = decoded->toJson();
+  auto encoded = Arkham::TestOnly::objectJson(*decoded);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, obj);
@@ -1617,7 +1648,7 @@ void GamesTests::strictAsIfAtOmittedWhenUnset() {
       fixture.value("createGameDefaults"_L1), u"createGameDefaults");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QVERIFY(!encoded->contains(QStringLiteral("strictAsIfAt")));
@@ -1629,7 +1660,7 @@ void GamesTests::asIfRulingOmittedWhenUnset() {
       fixture.value("createGameDefaults"_L1), u"createGameDefaults");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QVERIFY(!encoded->contains(QStringLiteral("asIfRuling")));
@@ -1669,7 +1700,7 @@ void GamesTests::asIfRulingLegacySpellingDecodesToCanonicalValue() {
   QVERIFY(*legacyResult == *shortResult);
   // Re-encode always uses the canonical short form, even when decoded from
   // the legacy spelling.
-  const auto legacyEncoded = legacyResult->toJson();
+  const auto legacyEncoded = Arkham::TestOnly::objectJson(*legacyResult);
   if (!legacyEncoded)
     QFAIL(qPrintable(legacyEncoded.error()));
   QCOMPARE(legacyEncoded->value(QStringLiteral("asIfRuling")).toString(),
@@ -1679,7 +1710,7 @@ void GamesTests::asIfRulingLegacySpellingDecodesToCanonicalValue() {
       buildRequest(QStringLiteral("Chapter2AsIfRuling")), u"request");
   if (!legacy2)
     QFAIL(qPrintable(legacy2.error()));
-  const auto legacy2Encoded = legacy2->toJson();
+  const auto legacy2Encoded = Arkham::TestOnly::objectJson(*legacy2);
   if (!legacy2Encoded)
     QFAIL(qPrintable(legacy2Encoded.error()));
   QCOMPARE(legacy2Encoded->value(QStringLiteral("asIfRuling")).toString(),
@@ -1772,7 +1803,7 @@ void GamesTests::chooseDeckUrlAbsentAndExplicitNullResolveIdentically() {
     QFAIL(qPrintable(nullResult.error()));
   QCOMPARE(absentResult->deckUrl, nullResult->deckUrl);
   QVERIFY(!absentResult->deckUrl.has_value());
-  const auto reencoded = absentResult->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*absentResult);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QVERIFY(!reencoded->contains(QStringLiteral("deckUrl")));
@@ -1798,7 +1829,7 @@ void GamesTests::deckListInputTabooIdAbsentAndExplicitNullResolveIdentically() {
     QFAIL(qPrintable(nullResult.error()));
   QCOMPARE(absentResult->tabooId, nullResult->tabooId);
   QVERIFY(!absentResult->tabooId.has_value());
-  const auto reencoded = absentResult->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*absentResult);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QVERIFY(!reencoded->contains(QStringLiteral("taboo_id")));
@@ -1917,7 +1948,7 @@ void GamesTests::additiveUnknownFieldsIgnoredInChooseDeck() {
   const auto result = ChooseDeckRequest::fromJson(obj, u"chooseDeck");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const auto reencoded = result->toJson();
+  const auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QVERIFY(!reencoded->contains(QStringLiteral("aFutureField")));
@@ -1931,7 +1962,7 @@ void GamesTests::additiveUnknownFieldsIgnoredInClaimSeat() {
   const auto result = ClaimSeatRequest::fromJson(obj, u"claimSeat");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QVERIFY(!encoded->contains(QStringLiteral("aFutureField")));
@@ -1943,7 +1974,7 @@ void GamesTests::chooseDeckWithDeckListRoundTrips() {
   const auto result = ChooseDeckRequest::fromJson(v, u"chooseDeck");
   if (!result)
     QFAIL(qPrintable(result.error()));
-  const auto reencodedResult = result->toJson();
+  const auto reencodedResult = Arkham::TestOnly::objectJson(*result);
   if (!reencodedResult)
     QFAIL(qPrintable(reencodedResult.error()));
   const QJsonObject reencoded = *reencodedResult;
@@ -2029,7 +2060,7 @@ void GamesTests::chooseDeckRequestToJsonRejectsSideSlotsWithNestedUndefined() {
       .investigatorId = *InvestigatorRef::parse(QStringLiteral("01001")),
       .deckList = deckList,
   };
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -2038,7 +2069,7 @@ void GamesTests::chooseDeckRequestToJsonRejectsSideSlotsWithNestedUndefined() {
 void GamesTests::claimSeatRoundTrips() {
   const ClaimSeatRequest request{
       .investigatorId = *InvestigatorRef::parse(QStringLiteral("c01001"))};
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, (QJsonObject{{QStringLiteral("investigatorId"),
@@ -2089,7 +2120,7 @@ void GamesTests::investigatorSummaryToJsonRejectsOutOfRangeClassSymbol() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->classSymbol = static_cast<ClassSymbol>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("classSymbol")),
            qPrintable(encoded.error()));
@@ -2108,7 +2139,7 @@ void GamesTests::scenarioSummaryToJsonRejectsOutOfRangeDifficulty() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->difficulty = static_cast<Difficulty>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("difficulty")),
            qPrintable(encoded.error()));
@@ -2124,7 +2155,7 @@ void GamesTests::campaignSummaryToJsonRejectsOutOfRangeDifficulty() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->difficulty = static_cast<Difficulty>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("difficulty")),
            qPrintable(encoded.error()));
@@ -2140,7 +2171,7 @@ void GamesTests::campaignSummaryToJsonRejectsOutOfRangeCurrentCampaignMode() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   result->currentCampaignMode = static_cast<CampaignPart>(999);
-  const auto encoded = result->toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("currentCampaignMode")),
            qPrintable(encoded.error()));
@@ -2162,7 +2193,7 @@ CreateGameRequest minimalCreateGameRequest() {
 void GamesTests::createGameRequestToJsonRejectsOutOfRangeDifficulty() {
   auto request = minimalCreateGameRequest();
   request.difficulty = static_cast<Difficulty>(999);
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("difficulty")),
            qPrintable(encoded.error()));
@@ -2171,7 +2202,7 @@ void GamesTests::createGameRequestToJsonRejectsOutOfRangeDifficulty() {
 void GamesTests::createGameRequestToJsonRejectsOutOfRangeMultiplayerVariant() {
   auto request = minimalCreateGameRequest();
   request.multiplayerVariant = static_cast<MultiplayerVariant>(999);
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("multiplayerVariant")),
            qPrintable(encoded.error()));
@@ -2180,7 +2211,7 @@ void GamesTests::createGameRequestToJsonRejectsOutOfRangeMultiplayerVariant() {
 void GamesTests::createGameRequestToJsonRejectsOutOfRangeAsIfRuling() {
   auto request = minimalCreateGameRequest();
   request.asIfRuling = static_cast<AsIfRulingValue>(999);
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("asIfRuling")),
            qPrintable(encoded.error()));
@@ -2190,7 +2221,7 @@ void GamesTests::
     createGameRequestToJsonRejectsOutOfRangeUltimatumOrBoonInArray() {
   auto request = minimalCreateGameRequest();
   request.ultimatumsAndBoons = {static_cast<UltimatumOrBoon>(999)};
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("ultimatumsAndBoons")),
            qPrintable(encoded.error()));
@@ -2225,7 +2256,7 @@ void GamesTests::
   lone += QChar(0xD800);
   const CampaignOptionRequest request =
       CampaignOptionRequest::variantOption(lone);
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -2236,7 +2267,7 @@ void GamesTests::chooseDeckRequestToJsonRejectsLoneSurrogateInInvestigatorId() {
   lone += QChar(0xDC00);
   const ChooseDeckRequest request{.investigatorId =
                                       *InvestigatorRef::parse(lone)};
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -2253,7 +2284,7 @@ void GamesTests::claimSeatRequestToJsonRejectsLoneSurrogateInInvestigatorId() {
   lone += QChar(0xD800);
   const ClaimSeatRequest request{.investigatorId =
                                      *InvestigatorRef::parse(lone)};
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -2269,7 +2300,7 @@ void GamesTests::createGameRequestToJsonRejectsLoneSurrogateInCampaignName() {
   QString lone;
   lone += QChar(0xD800);
   request.campaignName = lone;
-  const auto encoded = request.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(request);
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
@@ -2435,7 +2466,7 @@ void GamesTests::investigatorSummaryToJsonRejectsLoneSurrogateInId() {
     QFAIL(qPrintable(loneCode.error()));
   const InvestigatorSummary summary{.id = *loneCode,
                                     .classSymbol = ClassSymbol::Guardian};
-  const auto encoded = summary.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(summary);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("id")),
            qPrintable(encoded.error()));
@@ -2452,7 +2483,7 @@ void GamesTests::scenarioSummaryToJsonRejectsLoneSurrogateInName() {
       .name = CardName{.title = lone, .subtitle = std::nullopt},
       .variant = std::nullopt,
   };
-  const auto encoded = summary.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(summary);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("name")),
            qPrintable(encoded.error()));
@@ -2473,7 +2504,7 @@ void GamesTests::scenarioSummaryToJsonRejectsLoneSurrogateInVariant() {
           CardName{.title = QStringLiteral("Name"), .subtitle = std::nullopt},
       .variant = lone,
   };
-  const auto encoded = summary.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(summary);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("variant")),
            qPrintable(encoded.error()));
@@ -2491,7 +2522,7 @@ void GamesTests::campaignSummaryToJsonRejectsLoneSurrogateInId() {
   const CampaignSummary summary{.id = *campaignId,
                                 .difficulty = Difficulty::Standard,
                                 .currentCampaignMode = std::nullopt};
-  const auto encoded = summary.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(summary);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("id")),
            qPrintable(encoded.error()));
@@ -2525,7 +2556,7 @@ void GamesTests::
       QList<InvestigatorSummary>{InvestigatorSummary{
           .id = *loneCode, .classSymbol = ClassSymbol::Guardian}},
       QList<InvestigatorSummary>{}, MultiplayerVariant::Solo, false);
-  const auto encoded = row.toJson();
+  const auto encoded = Arkham::TestOnly::objectJson(row);
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("investigators")),
            qPrintable(encoded.error()));
@@ -2583,7 +2614,7 @@ void GamesTests::gameStateUnknownTagMoveConstructLeavesSourceRawIntact() {
   QCOMPARE(source.kind(), GameState::Kind::Unknown);
   QCOMPARE(source.unknownTag(), QStringLiteral("IsSuspended"));
   QVERIFY(source.unknownRaw() == toRawJson(obj));
-  const auto sourceEncoded = source.toJson();
+  const auto sourceEncoded = Arkham::TestOnly::objectJson(source);
   if (!sourceEncoded)
     QFAIL(qPrintable(sourceEncoded.error()));
   QCOMPARE(*sourceEncoded, obj);
@@ -2624,7 +2655,7 @@ void GamesTests::gameListRowSuccessMoveConstructLeavesSourceFieldsIntact() {
   QCOMPARE(source.investigators().size(), 1);
 
   // Reuse the moved-from source end-to-end through its own encoder.
-  auto encoded = source.toJson();
+  auto encoded = Arkham::TestOnly::objectJson(source);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->value("name"_L1).toString(), QStringLiteral("Test Game"));
@@ -2645,7 +2676,7 @@ void GamesTests::gameListRowFailureMoveConstructLeavesSourceErrorIntact() {
   // different, misleading message.
   QCOMPARE(source.kind(), GameListRow::Kind::Failure);
   QCOMPARE(source.error(), QStringLiteral("game not found"));
-  auto encoded = source.toJson();
+  auto encoded = Arkham::TestOnly::objectJson(source);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(encoded->value("error"_L1).toString(),
