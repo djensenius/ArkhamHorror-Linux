@@ -391,18 +391,26 @@ InvestigatorSummary::fromJson(const Json::Value &v, QStringView path) {
 }
 
 ValueOrError<QJsonObject> InvestigatorSummary::toJson() const {
+  // Builds the complete response as a Json::Value AST and converts once
+  // via Value::toExactQJsonObject() (see RawJson.h) -- rather than
+  // returning a hand-built QJsonObject literal directly -- so this stays
+  // structurally identical to every other encoder in this file even
+  // though id/classSymbol are already individually validated; a future
+  // field added here with no validating factory of its own (e.g. a plain
+  // QString) would otherwise inherit this function's own bypass of the
+  // resource-limit/lone-surrogate checks the aggregate conversion below
+  // enforces.
   auto classSymbolEncoded =
       Json::encodeClosedEnum(classSymbol, kClassSymbolTable);
   if (!classSymbolEncoded)
     return failure(
         QStringLiteral("classSymbol: %1").arg(classSymbolEncoded.error()));
-  auto idEncoded = id.toJson();
-  if (!idEncoded)
-    return failure(QStringLiteral("id: %1").arg(idEncoded.error()));
-  return QJsonObject{
-      {QStringLiteral("id"), *idEncoded},
-      {QStringLiteral("classSymbol"), *classSymbolEncoded},
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("id"), Json::Value::makeString(id.value())},
+      {QStringLiteral("classSymbol"),
+       Json::Value::makeString(*classSymbolEncoded)},
   };
+  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
 }
 
 ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const QJsonValue &v,
@@ -449,27 +457,31 @@ ValueOrError<CampaignSummary> CampaignSummary::fromJson(const Json::Value &v,
 }
 
 ValueOrError<QJsonObject> CampaignSummary::toJson() const {
+  // See InvestigatorSummary::toJson() above: composes a complete
+  // Json::Value AST and converts once via toExactQJsonObject(), rather
+  // than returning a hand-built QJsonObject literal directly, for the
+  // same structural-consistency/defense-in-depth reason.
   auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
   if (!difficultyEncoded)
     return failure(
         QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
-  QJsonValue currentCampaignModeValue = QJsonValue(QJsonValue::Null);
+  Json::Value currentCampaignModeValue = Json::Value::makeNull();
   if (currentCampaignMode) {
     auto currentCampaignModeEncoded =
         Json::encodeClosedEnum(*currentCampaignMode, kCampaignPartTable);
     if (!currentCampaignModeEncoded)
       return failure(QStringLiteral("currentCampaignMode: %1")
                          .arg(currentCampaignModeEncoded.error()));
-    currentCampaignModeValue = QJsonValue(*currentCampaignModeEncoded);
+    currentCampaignModeValue =
+        Json::Value::makeString(*currentCampaignModeEncoded);
   }
-  auto idEncoded = id.toJson();
-  if (!idEncoded)
-    return failure(QStringLiteral("id: %1").arg(idEncoded.error()));
-  return QJsonObject{
-      {QStringLiteral("id"), *idEncoded},
-      {QStringLiteral("difficulty"), *difficultyEncoded},
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("id"), Json::Value::makeString(id.value())},
+      {QStringLiteral("difficulty"),
+       Json::Value::makeString(*difficultyEncoded)},
       {QStringLiteral("currentCampaignMode"), currentCampaignModeValue},
   };
+  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
 }
 
 ValueOrError<GameState> GameState::pending(QList<QUuid> playerIds) {

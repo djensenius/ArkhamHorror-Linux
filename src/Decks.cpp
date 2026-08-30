@@ -1010,10 +1010,15 @@ DeckOperationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QJsonObject> DeckOperationError::toJson() const {
-  auto exact = Json::Value::makeString(errorMsg).toExactQJson();
-  if (!exact)
-    return failure(QStringLiteral("errorMsg: %1").arg(exact.error()));
-  return QJsonObject{{QStringLiteral("errorMsg"), *exact}};
+  // Composes a complete Json::Value AST and converts once via
+  // toExactQJsonObject() -- rather than validating errorMsg individually
+  // via toExactQJson() and then returning a hand-built QJsonObject
+  // literal directly -- for the same structural-consistency reason as
+  // every other encoder in this domain (see e.g. CardDef::toJson()).
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("errorMsg"), Json::Value::makeString(errorMsg)},
+  };
+  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
 }
 
 } // namespace Arkham
