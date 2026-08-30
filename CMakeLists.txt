@@ -73,71 +73,110 @@ if(NOT TARGET Qt6Keychain::Qt6Keychain)
     add_library(Qt6Keychain::Qt6Keychain ALIAS qt6keychain)
 endif()
 
-add_library(arkham_foundation STATIC
+# The canonical, explicit list of every header in this project's own
+# strict-domain-model foundation library. Kept as a `set()` variable
+# (rather than inlined directly into add_library() below) so it can also
+# be handed to arkham_check_domain_header_inventory() below and to the
+# generated tests/DomainHeaderInventory.h.in header used by
+# tests/EncoderHygieneTests.cpp -- a single source of truth for "every
+# header this build compiles," rather than three independently
+# hand-maintained lists that could silently drift apart.
+set(ARKHAM_FOUNDATION_HEADERS
     src/AppBootstrap.h
-    src/AppSessionComposition.cpp
     src/AppSessionComposition.h
-    src/AuthModels.cpp
     src/AuthModels.h
-    src/AuthTransportSecurity.cpp
     src/AuthTransportSecurity.h
-    src/CardCatalog.cpp
     src/CardCatalog.h
-    src/CompatibilityEvaluator.cpp
     src/CompatibilityEvaluator.h
-    src/ContractPin.cpp
     src/ContractPin.h
-    src/ContractRevision.cpp
     src/ContractRevision.h
-    src/ControllerGlyphs.cpp
     src/ControllerGlyphs.h
-    src/Decks.cpp
     src/Decks.h
-    src/FocusController.cpp
     src/FocusController.h
-    src/Games.cpp
     src/Games.h
     src/IAuthenticationClient.h
-    src/Identifiers.cpp
-    src/Identifiers.h
-    src/JsonDecode.cpp
-    src/JsonDecode.h
     src/ICapabilityProbe.h
+    src/Identifiers.h
     src/IKeychainJobFactory.h
-    src/InputMapper.cpp
     src/InputMapper.h
-    src/InputRouter.cpp
     src/InputRouter.h
     src/IProfileStore.h
     src/ITokenStore.h
-    src/NetworkAuthenticationClient.cpp
+    src/JsonDecode.h
     src/NetworkAuthenticationClient.h
-    src/NetworkCapabilityProbe.cpp
     src/NetworkCapabilityProbe.h
     src/ProbeResult.h
-    src/QSettingsProfileStore.cpp
     src/QSettingsProfileStore.h
-    src/QtKeychainJobFactory.cpp
     src/QtKeychainJobFactory.h
-    src/QtKeychainTokenStore.cpp
     src/QtKeychainTokenStore.h
-    src/RawJson.cpp
     src/RawJson.h
-    src/SemanticCommand.cpp
     src/SemanticCommand.h
-    src/ServerCapabilities.cpp
     src/ServerCapabilities.h
-    src/ServerProfile.cpp
     src/ServerProfile.h
-    src/SessionCoordinator.cpp
     src/SessionCoordinator.h
-    src/TokenEnvelope.cpp
     src/TokenEnvelope.h
-    src/TokenValidation.cpp
     src/TokenValidation.h
-    src/UrlValidator.cpp
     src/UrlValidator.h
     src/ValueOrError.h
+)
+
+set(ARKHAM_FOUNDATION_SOURCES
+    ${ARKHAM_FOUNDATION_HEADERS}
+    src/AppSessionComposition.cpp
+    src/AuthModels.cpp
+    src/AuthTransportSecurity.cpp
+    src/CardCatalog.cpp
+    src/CompatibilityEvaluator.cpp
+    src/ContractPin.cpp
+    src/ContractRevision.cpp
+    src/ControllerGlyphs.cpp
+    src/Decks.cpp
+    src/FocusController.cpp
+    src/Games.cpp
+    src/Identifiers.cpp
+    src/JsonDecode.cpp
+    src/InputMapper.cpp
+    src/InputRouter.cpp
+    src/NetworkAuthenticationClient.cpp
+    src/NetworkCapabilityProbe.cpp
+    src/QSettingsProfileStore.cpp
+    src/QtKeychainJobFactory.cpp
+    src/QtKeychainTokenStore.cpp
+    src/RawJson.cpp
+    src/SemanticCommand.cpp
+    src/ServerCapabilities.cpp
+    src/ServerProfile.cpp
+    src/SessionCoordinator.cpp
+    src/TokenEnvelope.cpp
+    src/TokenValidation.cpp
+    src/UrlValidator.cpp
+)
+
+# Structural enforcement (see cmake/DomainHeaderInventory.cmake): fails
+# CMake *configuration* -- not merely a test, and not merely a source-text
+# scan of already-known files -- the moment ARKHAM_FOUNDATION_HEADERS above
+# drifts from what actually exists under src/**/*.h, in either direction
+# (a new/nested header added to disk but never declared here, or a
+# declared header deleted from disk). This is what makes "add a new nested
+# header and never register it" fail the build itself, rather than relying
+# on any runtime directory scan (recursive or not) that a test executable
+# performs on its own -- see tests/cmake/DomainHeaderInventoryPolicyTest.cmake
+# for the mutation tests proving this function itself behaves correctly on
+# all three cases (match / undeclared-extra / declared-but-missing).
+include(cmake/DomainHeaderInventory.cmake)
+arkham_check_domain_header_inventory(
+    BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    HEADER_GLOB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    DECLARED_HEADERS ${ARKHAM_FOUNDATION_HEADERS}
+    OUT_ERROR _arkham_header_inventory_error
+)
+if(_arkham_header_inventory_error)
+    message(FATAL_ERROR "${_arkham_header_inventory_error}")
+endif()
+unset(_arkham_header_inventory_error)
+
+add_library(arkham_foundation STATIC
+    ${ARKHAM_FOUNDATION_SOURCES}
 )
 
 target_include_directories(arkham_foundation PUBLIC src)
@@ -252,16 +291,53 @@ if(BUILD_TESTING)
     )
     add_test(NAME raw_json COMMAND arkham-raw-json-tests)
 
+    # Single source of truth for tests/EncoderHygieneTests.cpp's header
+    # inventory: rendered directly from ARKHAM_FOUNDATION_HEADERS (the
+    # exact list add_library(arkham_foundation ...) above compiles, whose
+    # completeness against the real src/ tree the FATAL_ERROR gate above
+    # already verified at configure time -- including any header inside a
+    # newly added nested subdirectory) via configure_file(), so the C++
+    # scanner test can no longer independently drift from what the build
+    # actually compiles, and gets full recursive-subdirectory coverage
+    # "for free": there is no runtime directory walk left in the real
+    # policy check for a nested/unregistered header to evade.
+    set(ARKHAM_DOMAIN_HEADER_INVENTORY_QT_LITERALS "")
+    foreach(_arkham_header IN LISTS ARKHAM_FOUNDATION_HEADERS)
+        string(APPEND ARKHAM_DOMAIN_HEADER_INVENTORY_QT_LITERALS
+            "      QStringLiteral(\"${CMAKE_CURRENT_SOURCE_DIR}/${_arkham_header}\"),\n")
+    endforeach()
+    configure_file(
+        tests/DomainHeaderInventory.h.in
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/DomainHeaderInventory.h"
+        @ONLY
+    )
+    unset(ARKHAM_DOMAIN_HEADER_INVENTORY_QT_LITERALS)
+
     qt_add_executable(arkham-encoder-hygiene-tests
         tests/EncoderHygieneTests.cpp
     )
-    target_compile_definitions(arkham-encoder-hygiene-tests PRIVATE
-        ARKHAM_TEST_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src"
+    target_include_directories(arkham-encoder-hygiene-tests PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
     )
     target_link_libraries(arkham-encoder-hygiene-tests PRIVATE
         Qt6::Test
     )
     add_test(NAME encoder_hygiene COMMAND arkham-encoder-hygiene-tests)
+
+    # A dedicated CMake-script ctest case (run via `cmake -P`, not
+    # compiled into any C++ test binary) directly proving
+    # arkham_check_domain_header_inventory() itself -- the function whose
+    # FATAL_ERROR gate above is what actually makes a new/nested/
+    # unregistered header fail CMake configuration -- behaves correctly
+    # on all three of its possible outcomes, exercised against a
+    # synthetic scratch tree independent of this project's real src/
+    # layout. See tests/cmake/DomainHeaderInventoryPolicyTest.cmake.
+    add_test(NAME cmake_header_inventory_policy
+        COMMAND ${CMAKE_COMMAND}
+            -DARKHAM_MODULE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/cmake
+            -DARKHAM_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/domain_header_inventory_policy_scratch
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/DomainHeaderInventoryPolicyTest.cmake
+    )
 
     qt_add_executable(arkham-network-tests
         tests/NetworkTests.cpp

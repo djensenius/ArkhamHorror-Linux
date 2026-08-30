@@ -553,44 +553,6 @@ QStringList Value::keys() const {
   return result;
 }
 
-QJsonValue Value::toLossyQJsonForTestingOnly() const {
-  switch (m_kind) {
-  case Kind::Undefined:
-    return QJsonValue(QJsonValue::Undefined);
-  case Kind::Null:
-    return QJsonValue(QJsonValue::Null);
-  case Kind::Bool:
-    return QJsonValue(m_bool);
-  case Kind::Number:
-    // Preserve full int64 precision whenever the literal is mathematically
-    // integral and in range (see RawNumber::toExactInt64()): Qt's
-    // QCborValue-backed QJsonValue(qint64) constructor stores such a value
-    // exactly (QJsonValue::toInteger() on the result returns the identical
-    // qint64, unlike a value built via the double constructor -- verified
-    // against Qt 6.11's QJsonValue/QCborValue implementation). Every other
-    // literal (a genuine decimal, or an integral value outside qint64's
-    // range) still round-trips only as closely as IEEE-754 double allows.
-    if (auto exact = m_number.toExactInt64())
-      return QJsonValue(*exact);
-    return QJsonValue(m_number.toDouble());
-  case Kind::String:
-    return QJsonValue(m_string);
-  case Kind::Array: {
-    QJsonArray array;
-    for (const auto &element : m_array)
-      array.append(element.toLossyQJsonForTestingOnly());
-    return array;
-  }
-  case Kind::Object: {
-    QJsonObject object;
-    for (const auto &[k, v] : m_object)
-      object.insert(k, v.toLossyQJsonForTestingOnly());
-    return object;
-  }
-  }
-  return QJsonValue(QJsonValue::Undefined);
-}
-
 // Declared publicly in RawJson.h (see its doc comment there for the
 // rationale for exposing this outside RawJson.cpp): also shared with
 // appendJsonEncodedString()'s own surrogate handling below, and with

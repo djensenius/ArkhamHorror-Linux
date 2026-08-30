@@ -4,10 +4,12 @@
 #include <limits>
 
 #include "RawJson.h"
+#include "RawJsonLossyTestOnly.h"
 
 using Arkham::Failure;
 using Arkham::Json::ParseLimits;
 using Arkham::Json::RawNumber;
+using Arkham::Json::rawValueToLossyQJsonForTestingOnly;
 using Arkham::Json::Value;
 
 using namespace Qt::StringLiterals;
@@ -582,7 +584,7 @@ void RawJsonTests::makeObjectDuplicateKeyResolvesToFirstOccurrence() {
 
 void RawJsonTests::toLossyQJsonForTestingOnlyConvertsEveryKind() {
   auto value = mustParse(R"({"a":1,"b":"s","c":true,"d":null,"e":[1,2]})");
-  auto json = value.toLossyQJsonForTestingOnly();
+  auto json = rawValueToLossyQJsonForTestingOnly(value);
   QVERIFY(json.isObject());
   auto object = json.toObject();
   QCOMPARE(object.value("a"_L1).toDouble(), 1.0);
@@ -722,10 +724,11 @@ void RawJsonTests::fromInt64RoundTripsFullRange() {
 void RawJsonTests::
     toLossyQJsonForTestingOnlyPreservesInt64ExactlyBeyondDoublePrecision() {
   auto value = mustParse(R"({"id":9007199254740993})");
-  auto json = value.toLossyQJsonForTestingOnly();
+  auto json = rawValueToLossyQJsonForTestingOnly(value);
   // toInteger() recovers the exact qint64 even though .isDouble()/
   // .toDouble() report the rounded double -- see
-  // Value::toLossyQJsonForTestingOnly()'s doc comment.
+  // Arkham::Json::Test::rawValueToLossyQJsonForTestingOnly()'s doc comment
+  // in tests/RawJsonLossyTestOnly.h.
   QCOMPARE(json.toObject().value("id"_L1).toInteger(), 9007199254740993LL);
 }
 

@@ -47,13 +47,9 @@
 // must route through them instead of hand-building a QJsonObject/
 // QJsonArray.
 
-// Forward-declared (global namespace, never Arkham::Json) solely so
-// Value's toLossyQJsonForTestingOnly() below can grant it -- and only
-// it -- friend access via an explicit ::RawJsonTests qualification; see
-// that method's own doc comment.
-class RawJsonTests;
-
 namespace Arkham::Json {
+
+class Value;
 
 // Resource bounds enforced by Value::parse(), and -- for every field
 // except maxInputBytes, which is meaningless against an AST already
@@ -368,8 +364,11 @@ public:
     return m_object;
   }
 
-  // Recursive, fallible counterpart of toLossyQJsonForTestingOnly()
-  // below: identical
+  // Recursive, fallible counterpart of
+  // rawValueToLossyQJsonForTestingOnly() (tests/RawJsonLossyTestOnly.h,
+  // not part of this production header/target -- see the friend
+  // declaration's own doc comment below, in this class's private
+  // section, for how that stays true): identical
   // conversion, except a Number node whose literal is not exactly
   // representable as a qint64 (a genuine fraction, or an integral value
   // outside qint64's range -- see RawNumber::toExactInt64()) is a typed
@@ -487,33 +486,30 @@ private:
   toExactQJsonInner(const ParseLimits &limits, int depth,
                     qsizetype &totalNodes) const;
 
-  // Recursively converts to a standard Qt JSON value WITHOUT any of
-  // toExactQJson()'s invariant checks: lossless for every Kind except a
-  // Number whose literal is not RawNumber::toExactInt64() (i.e. a genuine
-  // decimal or an integral value outside qint64's range), which
-  // round-trips only as closely as IEEE-754 double allows, and silently
-  // collapses a duplicate object key / drops a nested Kind::Undefined
-  // member rather than rejecting either. Deliberately private and named
-  // unmistakably: this is the exact lossy behavior every production
-  // encoder in this codebase must NOT exhibit (see the cumulative-review
-  // history in CardCatalog.cpp/Games.cpp/Decks.cpp -- every public
-  // toJson()/toQJson()-shaped response or request encoder was rewritten
-  // to build a complete Json::Value AST and convert it exactly once via
-  // toExactQJson()/toExactQJsonObject()/toExactQJsonArray() instead of
-  // ever calling this). Retained ONLY so RawJsonTests.cpp can assert this
-  // documented lossy fallback behavior still exists in the underlying
-  // AST type itself (i.e. that toExactQJson() is a deliberate, tested
-  // divergence from it, not an accidental one) -- no production
-  // domain/wire model may call it, enforced here by access control
-  // rather than convention alone.
-  [[nodiscard]] QJsonValue toLossyQJsonForTestingOnly() const;
-
   friend class Parser;
-  // Grants RawJsonTests (tests/RawJsonTests.cpp) -- and ONLY that test
-  // class -- access to toLossyQJsonForTestingOnly() above; see its own
-  // doc comment for why this must never be reachable from production
-  // code.
-  friend class ::RawJsonTests;
+  // A "hidden friend" (see Herb Sutter's naming for this idiom): declared
+  // here, UNQUALIFIED, with no separate forward declaration anywhere
+  // else in this header, so this is the ONLY line in the whole
+  // production header that mentions it at all. This grants ONLY
+  // rawValueToLossyQJsonForTestingOnly() -- findable afterwards solely
+  // via argument-dependent lookup on a Value argument, from
+  // tests/RawJsonLossyTestOnly.h (never compiled into the production
+  // arkham_foundation target -- see CMakeLists.txt), where its actual
+  // body is defined out-of-line, matching this declaration exactly --
+  // access to this class's private representation, so RawJsonTests.cpp
+  // can assert the underlying AST's documented lossy-conversion behavior
+  // (lossless for every Kind except a Number whose literal is not
+  // RawNumber::toExactInt64(), which round-trips only as closely as
+  // IEEE-754 double allows, and silently collapses a duplicate object
+  // key / drops a nested Kind::Undefined member rather than rejecting
+  // either -- i.e. that toExactQJson() is a deliberate, tested
+  // divergence from it, not an accidental one) without that lossy
+  // conversion existing as a *callable, linkable* method or free
+  // function anywhere production code can reach it: this declaration has
+  // no body here, and no translation unit compiled into
+  // arkham_foundation ever defines it, so any production code that
+  // somehow referenced it (nothing does) would fail to link.
+  friend QJsonValue rawValueToLossyQJsonForTestingOnly(const Value &value);
 
   Kind m_kind{Kind::Undefined};
   bool m_bool = false;
