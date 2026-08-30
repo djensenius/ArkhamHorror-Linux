@@ -2656,20 +2656,46 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
         # substitution(): each of the OTHER governed header identity
         # fields must likewise change the digest even when the program
         # headers and section bytes stay otherwise identical.
+        #
+        # "class" (32/64-bit) and "data" (endianness) are NOT like
+        # "osabi"/"type": they are structural interpretation switches
+        # that change how every OTHER field in the file is decoded, not
+        # cosmetic identity metadata layered on top of an otherwise
+        # unchanged byte layout. A real `readelf` asked to re-parse a
+        # class/data-flipped copy of a genuine 64-bit little-endian
+        # object legitimately produces DIFFERENT (or empty) section/
+        # program-header listings -- not because any section or segment
+        # byte actually moved, but because the exact same bytes are now
+        # being decoded under the wrong word-width/endianness assumption
+        # entirely. Asserting section/segment-table equality for those
+        # two fields would therefore assert something real `readelf`
+        # cannot honestly satisfy; only "osabi"/"type" -- which change
+        # no structural offset or width at all -- support that stronger
+        # same-shape assertion. Every field, including class/data, must
+        # still (a) visibly change in the parsed header identity itself
+        # and (b) change the canonical digest.
         reference = self.root / "header_fields_ref.so"
         self._build_rich_shared_object(reference)
+        reference_identity = audit._read_elf_header_identity(reference)
+        assert reference_identity is not None
         for field in ("class", "data", "osabi", "type"):
             with self.subTest(field=field):
                 mutated = self.root / f"header_fields_{field}.so"
                 mutated.write_bytes(reference.read_bytes())
                 _test_mutate_elf_header_identity_field(mutated, field)
-                self.assertEqual(
-                    audit._read_section_headers(reference),
-                    audit._read_section_headers(mutated),
-                )
-                self.assertEqual(
-                    audit._ordered_load_segment_flags(reference),
-                    audit._ordered_load_segment_flags(mutated),
+                if field in ("osabi", "type"):
+                    self.assertEqual(
+                        audit._read_section_headers(reference),
+                        audit._read_section_headers(mutated),
+                    )
+                    self.assertEqual(
+                        audit._ordered_load_segment_flags(reference),
+                        audit._ordered_load_segment_flags(mutated),
+                    )
+                mutated_identity = audit._read_elf_header_identity(mutated)
+                assert mutated_identity is not None
+                self.assertNotEqual(
+                    reference_identity[field], mutated_identity[field]
                 )
                 self.assertNotEqual(
                     audit._canonical_load_digest(reference),
