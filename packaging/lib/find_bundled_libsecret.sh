@@ -136,3 +136,19 @@ find_bundled_libstdcxx() {
 find_bundled_libz() {
   find_bundled_library 'libz.so.1*' "$@"
 }
+
+# find_bundled_libcomerr [search_root...]
+#
+# Thin wrapper over find_bundled_library for libcom_err.so.2. Bundled
+# libgssapi_krb5/libkrb5 (transitively required by libsecret-1's own
+# glib/gio closure on some distros) require Kerberos's "common error"
+# support library -- but, verified directly against a real
+# linuxdeploy run's own "Skipping deployment of blacklisted library"
+# diagnostic, linuxdeploy's default blacklist excludes libcom_err from
+# automatic bundling the same way it excludes libgpg-error above, on the
+# same (for a portable AppImage, incorrect) assumption that a compatible
+# system copy is always already present. Force-bundling it here closes
+# that gap the same way.
+find_bundled_libcomerr() {
+  find_bundled_library 'libcom_err.so.2*' "$@"
+}

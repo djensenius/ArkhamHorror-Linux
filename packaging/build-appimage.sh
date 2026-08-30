@@ -149,6 +149,21 @@ libz_so="$(find_bundled_libz)"
   exit 2
 }
 
+# libcom_err is required transitively by bundled libgssapi_krb5/libkrb5
+# (themselves pulled in by libsecret-1's own glib/gio closure on some
+# distros), but -- verified directly against a real linuxdeploy run's own
+# "Skipping deployment of blacklisted library" diagnostic -- is excluded
+# from linuxdeploy's automatic bundling by its own default blacklist, the
+# same (for a portable AppImage, incorrect) assumption as libgpg-error
+# above. Force-bundling it here closes that gap the same way.
+# shellcheck disable=SC2119
+libcomerr_so="$(find_bundled_libcomerr)"
+[[ -n "$libcomerr_so" && -e "$libcomerr_so" ]] || {
+  echo "Could not locate libcom_err.so.2 to bundle into the AppImage." \
+    "Install libkrb5-3 (runtime) or libkrb5-dev." >&2
+  exit 2
+}
+
 
 # AVIF card art (djensenius/ArkhamHorror-Linux#17) is decoded directly
 # against libavif's own C API (see src/AssetAvifDecoder.cpp), linked as an
@@ -206,6 +221,7 @@ export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
   --library "$libgccs_so" \
   --library "$libstdcxx_so" \
   --library "$libz_so" \
+  --library "$libcomerr_so" \
   --plugin qt
 
 bundled_search_root="$app_dir/usr"

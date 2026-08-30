@@ -166,6 +166,34 @@ class ClassifyTests(unittest.TestCase):
             with self.subTest(basename=basename):
                 self.assertEqual(audit.classify(basename), expected)
 
+    def test_third_review_wave_of_bundled_system_libraries_classifies(
+        self,
+    ) -> None:
+        # A real Linux+Qt+linuxdeploy build (used to investigate a
+        # different, genuine CI-only closure-audit failure -- missing
+        # libcom_err/libfontconfig/libfreetype) surfaced two further
+        # previously-unmapped bundled libraries in the same produced
+        # AppImage's `usr/lib`: libbz2 (pulled in transitively by Qt/
+        # util-linux's own closure) and libsharpyuv (libwebp's own
+        # standalone YUV<->RGB helper, pulled in transitively by
+        # libavif's closure -- a genuinely separate upstream project
+        # from Google's libyuv above, despite the similarly named
+        # libraries). libcom_err (force-bundled the same way as
+        # libgpg-error, since linuxdeploy's own default blacklist
+        # excludes it too) joins the existing "krb5" component rather
+        # than a new one, since it ships as part of the same MIT
+        # Kerberos 5 distribution. See third_party/bzip2/NOTICE.md and
+        # third_party/sharpyuv/NOTICE.md for exactly why each is
+        # bundled.
+        cases = {
+            "libbz2.so.1.0": "bzip2",
+            "libsharpyuv.so.0": "sharpyuv",
+            "libcom_err.so.2": "krb5",
+        }
+        for basename, expected in cases.items():
+            with self.subTest(basename=basename):
+                self.assertEqual(audit.classify(basename), expected)
+
     def test_xcb_util_family_are_distinct_components_from_base_xcb(self) -> None:
         # A later cumulative review found the single wildcard `libxcb.*`
         # pattern this test previously encoded incorrectly conflated

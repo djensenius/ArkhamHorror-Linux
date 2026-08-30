@@ -699,10 +699,12 @@ jobs:
         # dependency purely because no hand-picked --root list happened to
         # reach it.
         #
-        # Base X11/xcb/xkbcommon/GL-EGL client libraries are the one
-        # deliberate, explicitly documented exception
-        # (X11_DESKTOP_ABI_ALLOWLIST in audit_dependency_closure.py,
-        # opted into here via --allow-x11-desktop-stack): matching
+        # Base X11/xcb/xkbcommon/GL-EGL client libraries and the host's own
+        # fontconfig/FreeType font-rendering stack are the two deliberate,
+        # explicitly documented exceptions (X11_DESKTOP_ABI_ALLOWLIST and
+        # FONT_RENDERING_ABI_ALLOWLIST in audit_dependency_closure.py,
+        # opted into here via --allow-x11-desktop-stack and
+        # --allow-font-rendering-stack respectively): matching
         # linuxdeploy's own default blacklist convention (verified via
         # linuxdeploy's public documentation: base X11/xcb libraries are
         # treated as "always already present on the target", the same
@@ -710,13 +712,18 @@ jobs:
         # possibly-mismatched xcb/X11 stack alongside a *different* host
         # X server/XWayland compositor -- including SteamOS's Gamescope --
         # can break in the opposite, non-obvious direction: protocol/ABI
-        # skew between client and server), these are intentionally NOT
-        # bundled and are asserted, by exact name, to be host-provided.
-        # This was previously an unstated, inconsistent assumption (this
-        # same workflow already `apt-get install`s libxkbcommon0/libgl1/
-        # libopengl0/libegl1 into the offscreen-smoke container below
-        # specifically because they are assumed host-provided) -- this
-        # step makes it complete and auditable in one explicit place
+        # skew between client and server; and directly confirmed against a
+        # real linuxdeploy run's own "Skipping deployment of blacklisted
+        # library" diagnostic for libfontconfig.so.1/libfreetype.so.6:
+        # bundling one's own fontconfig/FreeType is a well-known
+        # font-cache/config-path compatibility hazard distinct from an ABI
+        # guarantee), these are intentionally NOT bundled and are asserted,
+        # by exact name, to be host-provided. This was previously an
+        # unstated, inconsistent assumption (this same workflow already
+        # `apt-get install`s libxkbcommon0/libgl1/libopengl0/libegl1 *and*
+        # fontconfig/fonts-dejavu-core into the offscreen-smoke container
+        # below specifically because they are assumed host-provided) --
+        # this step makes it complete and auditable in one explicit place
         # rather than leaving new gaps in the same category undetected.
         run: |
           set -euo pipefail
@@ -728,7 +735,8 @@ jobs:
           }
           echo "Auditing the exhaustive closure of every real bundled ELF under $usr_root ..."
           python3 packaging/audit_dependency_closure.py "$usr_root" \
-            --auto-roots "$usr_root" --allow-x11-desktop-stack
+            --auto-roots "$usr_root" --allow-x11-desktop-stack \
+            --allow-font-rendering-stack
       - name: Verify bundled libsecret dependency closure has no host fallback
         # The static recursive closure audit above is the primary,
         # host-independent proof that every non-ABI transitive dependency

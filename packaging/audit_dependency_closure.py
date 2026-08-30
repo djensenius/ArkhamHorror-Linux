@@ -177,6 +177,39 @@ X11_DESKTOP_ABI_ALLOWLIST: frozenset[str] = frozenset(
     }
 )
 
+# A third, separately-documented allowlist for the host's own font-rendering
+# stack (fontconfig/FreeType), kept apart from both ABI_ALLOWLIST (glibc)
+# and X11_DESKTOP_ABI_ALLOWLIST (X11/xcb/GL protocol libraries) because the
+# rationale for trusting these is different again in kind from either:
+# bundling one's own fontconfig/FreeType inside a portable AppImage is a
+# well-known font-rendering compatibility hazard, distinct from an ABI
+# guarantee -- fontconfig's on-disk cache format and its config/cache file
+# *paths* (e.g. `/etc/fonts`, `~/.cache/fontconfig`) are version- and
+# host-specific, so a bundled fontconfig can silently read/write a cache
+# the *host's* fontconfig does not understand (or vice versa), corrupting
+# font rendering for the AppImage, the host, or both, in a way a simple
+# missing-symbol ABI break never would. Verified directly against a real
+# linuxdeploy run's own "Skipping deployment of blacklisted library"
+# diagnostic: linuxdeploy's default blacklist already excludes both
+# libfontconfig and libfreetype from automatic bundling for exactly this
+# reason. This project's own CI already relies on this assumption in
+# practice -- its own "Launch the packaged AppImage headlessly to verify
+# real startup" smoke-test steps `apt-get install fontconfig
+# fonts-dejavu-core` into the bare container specifically so Qt Gui's text
+# layout has a real font-rendering stack to use, alongside the X11/GL
+# stack -- what was missing was ever making that assumption explicit,
+# complete, and auditable in this same closure audit. Gated behind its own
+# explicit --allow-font-rendering-stack flag, never implied by
+# --allow-x11-desktop-stack or ABI_ALLOWLIST alone, so a caller auditing a
+# closure where this assumption is inappropriate (e.g. the narrower
+# libsecret-only/libavif-only audits) never has it silently applied.
+FONT_RENDERING_ABI_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "libfontconfig.so.1",
+        "libfreetype.so.6",
+    }
+)
+
 _NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[(?P<name>[^\]]+)\]")
 _ELF_MAGIC = b"\x7fELF"
 
@@ -437,6 +470,16 @@ def main(argv: list[str]) -> int:
         "differently-justified assumption.",
     )
     parser.add_argument(
+        "--allow-font-rendering-stack",
+        action="store_true",
+        help="Additionally treat FONT_RENDERING_ABI_ALLOWLIST "
+        "(libfontconfig/libfreetype) as satisfied by the host -- a "
+        "separate opt-in from --allow-x11-desktop-stack since the "
+        "rationale differs (font-cache/config-path compatibility, not "
+        "windowing-protocol ABI); never implied by --allow-x11-desktop-"
+        "stack or ABI_ALLOWLIST alone.",
+    )
+    parser.add_argument(
         "--list-only",
         action="store_true",
         help="On success, print only the resolved closure's bundled library "
@@ -474,7 +517,10 @@ def main(argv: list[str]) -> int:
         if root not in roots:
             roots.append(root)
 
-    extra_allowlist = X11_DESKTOP_ABI_ALLOWLIST if args.allow_x11_desktop_stack else frozenset()
+    extra_allowlist = frozenset().union(
+        X11_DESKTOP_ABI_ALLOWLIST if args.allow_x11_desktop_stack else frozenset(),
+        FONT_RENDERING_ABI_ALLOWLIST if args.allow_font_rendering_stack else frozenset(),
+    )
     allowlist = ABI_ALLOWLIST | extra_allowlist
 
     try:

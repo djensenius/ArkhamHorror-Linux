@@ -106,7 +106,15 @@ COMPONENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^librav1e\.so"), "rav1e"),
     (re.compile(r"^libSvtAv1.*\.so"), "svt-av1"),
     (re.compile(r"^libyuv\.so"), "libyuv"),
+    # SharpYuv is libwebp's own standalone YUV<->RGB helper library
+    # (a genuinely separate upstream project from Google's libyuv above,
+    # despite the confusingly similar name) that libavif's bundled
+    # closure transitively pulls in -- see third_party/sharpyuv/NOTICE.md.
+    (re.compile(r"^libsharpyuv\.so"), "sharpyuv"),
     (re.compile(r"^libjpeg\.so"), "libjpeg"),
+    # bzip2 is pulled in transitively by Qt/util-linux's own closure --
+    # see third_party/bzip2/NOTICE.md.
+    (re.compile(r"^libbz2\.so"), "bzip2"),
     (re.compile(r"^libabsl_.*\.so"), "abseil"),
     (re.compile(r"^libQt6.*\.so"), "qt"),
     # QtKeychain's dlopen()-only D-Bus Secret Service backend (see
@@ -180,7 +188,10 @@ COMPONENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^libmd\.so"), "libmd"),
     (re.compile(r"^libcap\.so"), "libcap"),
     (re.compile(r"^libdbus-1\.so"), "dbus"),
-    (re.compile(r"^lib(krb5support|gssapi_krb5|k5crypto|krb5)\.so"), "krb5"),
+    (
+        re.compile(r"^lib(krb5support|gssapi_krb5|k5crypto|krb5|com_err)\.so"),
+        "krb5",
+    ),
     (re.compile(r"^libicu(data|i18n|uc)\.so"), "icu"),
     (re.compile(r"^libkeyutils\.so"), "libkeyutils"),
     (re.compile(r"^liblz4\.so"), "lz4"),

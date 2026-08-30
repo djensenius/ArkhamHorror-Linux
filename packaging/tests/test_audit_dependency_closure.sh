@@ -404,6 +404,54 @@ echo "$output_15" | grep -qi "ambiguous" \
   && fail "case 15: non-ELF same-basename files were incorrectly treated as ambiguous: $output_15"
 echo "PASS: same-basename non-ELF files (e.g. Qt QML modules' own plugins.qmltypes) are never treated as ambiguous"
 
+# --- Case 16: --allow-font-rendering-stack. Builds a root that NEEDs a
+# stub library sharing an exact FONT_RENDERING_ABI_ALLOWLIST SONAME
+# (libfontconfig.so.1) -- never a real system fontconfig, just a
+# same-named stub compiled locally -- then removes it from the AppDir
+# entirely (as real packaging deliberately does not bundle fontconfig/
+# FreeType) and proves the audit fails by default (the flag is not
+# silently on, and is not implied by --allow-x11-desktop-stack) but
+# passes once --allow-font-rendering-stack is explicitly given.
+font_dir="$work_dir/appdir_font"
+mkdir -p "$font_dir"
+cat > fontroot.c <<'EOF'
+int test_font_stub(void);
+int test_font_root(void) { return test_font_stub(); }
+EOF
+cat > fontstub.c <<'EOF'
+int test_font_stub(void) { return 1; }
+EOF
+"$cc_bin" -shared -fPIC -Wl,-soname,libfontconfig.so.1 \
+  -o "$work_dir/libfontconfig.so.1.tmp" fontstub.c
+cp "$work_dir/libfontconfig.so.1.tmp" "$font_dir/libfontconfig.so.1"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestfontroot.so.1 \
+  -o "$font_dir/libtestfontroot.so.1" fontroot.c -L"$font_dir" -l:libfontconfig.so.1
+# Remove the stub itself -- only the NEEDED entry naming it remains --
+# simulating linuxdeploy correctly refusing to bundle fontconfig/FreeType.
+rm "$font_dir/libfontconfig.so.1"
+
+set +e
+output_16_default="$(python3 "$auditor" "$font_dir" --root libtestfontroot.so.1 2>&1)"
+case16_default_status=$?
+set -e
+[[ $case16_default_status -ne 0 ]] \
+  || fail "case 16 (default): expected non-zero exit for missing libfontconfig.so.1 without --allow-font-rendering-stack"
+echo "$output_16_default" | grep -q "libfontconfig.so.1" \
+  || fail "case 16 (default): failure output did not name libfontconfig.so.1: $output_16_default"
+echo "PASS: libfontconfig.so.1 is reported missing by default (the font-rendering allowlist is opt-in, never implicit)"
+
+set +e
+output_16_x11_only="$(python3 "$auditor" "$font_dir" --root libtestfontroot.so.1 --allow-x11-desktop-stack 2>&1)"
+case16_x11_only_status=$?
+set -e
+[[ $case16_x11_only_status -ne 0 ]] \
+  || fail "case 16 (--allow-x11-desktop-stack only): expected --allow-x11-desktop-stack to NOT also permit libfontconfig.so.1"
+echo "PASS: --allow-x11-desktop-stack alone does not implicitly permit the font-rendering stack"
+
+python3 "$auditor" "$font_dir" --root libtestfontroot.so.1 --allow-font-rendering-stack >/dev/null \
+  || fail "case 16 (--allow-font-rendering-stack): expected exit 0 once the flag is explicitly given"
+echo "PASS: --allow-font-rendering-stack explicitly permits libfontconfig.so.1 to resolve from the host"
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the
