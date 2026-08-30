@@ -605,6 +605,167 @@ python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" --list-only 
   || fail "case 19 (baseline): expected the genuine, unmutated testapp executable's own PT_INTERP to pass validation"
 echo "PASS: a genuine, unmutated executable's own PT_INTERP (the host-guaranteed loader) passes validation"
 
+# --- Case 20: stripped-section-header PT_INTERP (round-N+ review HIGH,
+# "auditor can disagree with kernel/glibc: reads `.interp` section
+# rather than PT_INTERP"). A real toolchain is free to remove a binary's
+# ENTIRE section-header table (e_shnum/e_shstrndx zeroed) while leaving
+# every PROGRAM header -- including PT_INTERP and its underlying bytes
+# -- completely intact and exec()-able; the kernel and every dynamic
+# loader never consult section headers at all. Simulate this precisely
+# (zero e_shnum/e_shstrndx in the ELF header, leaving e_shoff/the
+# original table bytes untouched but unreferenced) and prove the
+# auditor still correctly reads and validates PT_INTERP via `readelf
+# -l`, never silently treating "no .interp SECTION" as "not an
+# executable at all".
+strip_dir="$work_dir/appdir_stripped_shdrs"
+mkdir -p "$strip_dir"
+cp "$auto_root_tree/bin/testapp" "$strip_dir/testapp"
+python3 - "$strip_dir/testapp" <<'PYEOF'
+import struct
+import sys
+
+path = sys.argv[1]
+with open(path, "r+b") as f:
+    data = bytearray(f.read())
+    # ELF64 header offsets: e_shnum at 0x3C (2 bytes), e_shstrndx at
+    # 0x3E (2 bytes) -- see elf(5). Leave e_shoff (0x28) untouched: the
+    # original section-header-table bytes remain physically present in
+    # the file but are no longer referenced by the ELF header at all,
+    # exactly matching a real "section headers stripped" toolchain
+    # output; program headers (e_phoff/e_phnum, including PT_INTERP)
+    # are completely unaffected by this.
+    struct.pack_into("<H", data, 0x3C, 0)
+    struct.pack_into("<H", data, 0x3E, 0)
+    f.seek(0)
+    f.write(data)
+PYEOF
+chmod +x "$strip_dir/testapp"
+# The binary must still genuinely execute (proving this is a realistic
+# mutation, not one that happens to also break the executable itself).
+"$strip_dir/testapp" || fail "case 20: section-header-stripped testapp no longer executes at all"
+# readelf's own section-based view must now report no .interp section
+# (proving this really does simulate the "stripped .interp section"
+# case the old, now-fixed code path would have silently mis-treated as
+# "not an executable").
+# readelf's own section-based view must now be unable to produce an
+# actual .interp string dump (proving this really does simulate the
+# "stripped .interp section" case the old, now-fixed code path would
+# have silently mis-treated as "not an executable") -- real readelf
+# builds report this either as an explicit "no such section" message or
+# (since e_shoff still points at now-unreferenced bytes) a "corrupt ELF
+# file header" warning; either way, no genuine "[ 0] /path" string dump
+# line is ever produced.
+readelf -p .interp "$strip_dir/testapp" 2>&1 | grep -q '^\s*\[\s*0\s*\]' \
+  && fail "case 20: readelf -p .interp unexpectedly still produced a real string dump -- section-header stripping did not take effect as intended"
+python3 "$auditor" "$strip_dir" --auto-roots "$strip_dir" --list-only >/dev/null \
+  || fail "case 20: expected a section-header-stripped executable's still-intact PT_INTERP program header to pass validation, not be silently treated as a non-executable"
+echo "PASS: PT_INTERP is validated via program headers even when the section-header table is entirely stripped"
+
+# --- Case 21: allowed-basename-invalid-path (round-N+ review HIGH,
+# "... allows nonexistent paths by basename"). An interpreter string
+# whose final path COMPONENT matches the allowlisted loader name, but
+# whose full path is some OTHER directory than the one real, canonical,
+# host-guaranteed absolute path (LOADER_CANONICAL_PATH) -- e.g. a
+# build-host-only path -- must be rejected: a basename match alone
+# proves nothing about whether that exact absolute path exists, at a
+# compatible ABI, on any real target machine.
+if command -v objcopy >/dev/null 2>&1; then
+  basename_dir="$work_dir/appdir_basename_only"
+  mkdir -p "$basename_dir"
+  cp "$auto_root_tree/bin/testapp" "$basename_dir/testapp"
+  printf '/opt/not-the-real-loader-dir/ld-linux-x86-64.so.2\0' \
+    > "$work_dir/basename-only-interp.bin"
+  if objcopy --update-section .interp="$work_dir/basename-only-interp.bin" \
+      "$basename_dir/testapp" 2>/dev/null; then
+    chmod +x "$basename_dir/testapp"
+
+    set +e
+    output_21="$(python3 "$auditor" "$basename_dir" --auto-roots "$basename_dir" 2>&1)"
+    case21_status=$?
+    set -e
+    [[ $case21_status -ne 0 ]] \
+      || fail "case 21: expected non-zero exit for a PT_INTERP whose basename matches the allowlisted loader but whose full path does not"
+    echo "$output_21" | grep -qi "interpreter" \
+      || fail "case 21: failure output did not mention the interpreter problem: $output_21"
+    echo "PASS: a PT_INTERP matching the loader's basename but not its exact canonical path is rejected"
+  else
+    echo "SKIP (case 21): objcopy could not update .interp on this system; cannot mutate PT_INTERP for this regression."
+  fi
+else
+  echo "SKIP (case 21): objcopy not available; cannot mutate PT_INTERP for this regression."
+fi
+
+# --- Case 22: external RPATH precedence (round-N+ review MEDIUM,
+# "silently drops external DT_RPATH that runtime may search before
+# LD_LIBRARY_PATH"). A bundled library recording a DT_RPATH entry that
+# resolves OUTSIDE the AppDir being audited must fail the WHOLE audit
+# loudly, never merely being reported as "unreachable" and otherwise
+# tolerated: a real loader on some target machine would still search
+# that exact external directory, and for a legacy DT_RPATH, would
+# search it BEFORE this project's own bundled LD_LIBRARY_PATH entries.
+external_rpath_dir="$work_dir/external_rpath_target"
+mkdir -p "$external_rpath_dir"
+external_rpath_appdir="$work_dir/appdir_external_rpath"
+mkdir -p "$external_rpath_appdir"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestleaf.so.1 \
+  -o "$external_rpath_appdir/libtestleaf.so.1" leaf.c
+ln -sf libtestleaf.so.1 "$external_rpath_appdir/libtestleaf.so"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestexternalrpathroot.so.1 \
+  -Wl,-rpath,"$external_rpath_dir" \
+  -o "$external_rpath_appdir/libtestexternalrpathroot.so.1" mid.c \
+  -L"$external_rpath_appdir" -l:libtestleaf.so.1
+set +e
+output_22="$(python3 "$auditor" "$external_rpath_appdir" \
+  --root libtestexternalrpathroot.so.1 2>&1)"
+case22_status=$?
+set -e
+[[ $case22_status -ne 0 ]] \
+  || fail "case 22: expected non-zero exit for a bundled library carrying an external DT_RPATH entry"
+echo "$output_22" | grep -q "$external_rpath_dir" \
+  || fail "case 22: failure output did not name the external RPATH directory: $output_22"
+echo "PASS: a bundled library's own external DT_RPATH entry fails the whole audit, rather than being silently dropped or merely reported unreachable"
+
+# --- Case 23: byte-identical plugin copies at different $ORIGIN
+# contexts (round-9+ review item 4, "seen keyed only SONAME skips same
+# dependency from different requester/RPATH contexts"; round-N+ review
+# "duplicate-byte plugin/different-$ORIGIN"). Two requesters that are
+# genuinely BYTE-IDENTICAL copies of the same plugin (not merely
+# same-named-but-different-content, as case 18 above already covers)
+# must still each be independently reachability-checked via their own,
+# DIFFERENT $ORIGIN context -- one bundled beside its real dependency,
+# the other bundled alone -- so per-edge reachability is proven
+# independent of content-hash sameness, never short-circuited by an
+# earlier identical-content success.
+dup_byte_tree="$work_dir/appdir_dup_byte_identical"
+mkdir -p "$dup_byte_tree/plugin_ok" "$dup_byte_tree/plugin_broken"
+"$cc_bin" -shared -fPIC -Wl,-soname,libdupbyteleaf.so.1 \
+  -o "$dup_byte_tree/plugin_ok/libdupbyteleaf.so.1" leaf.c
+ln -sf libdupbyteleaf.so.1 "$dup_byte_tree/plugin_ok/libdupbyteleaf.so"
+"$cc_bin" -shared -fPIC -Wl,-soname,libdupbyteplugin.so.1 \
+  -Wl,-rpath,'$ORIGIN' \
+  -o "$dup_byte_tree/plugin_ok/libdupbyteplugin.so.1" mid.c \
+  -L"$dup_byte_tree/plugin_ok" -l:libdupbyteleaf.so.1
+# The "broken" copy is a byte-for-byte identical copy of the SAME
+# plugin file -- but placed in a directory with no dependency beside
+# it, and its own recorded RPATH ($ORIGIN, same as the original) can
+# therefore never actually reach a same-named leaf from THIS location.
+cp "$dup_byte_tree/plugin_ok/libdupbyteplugin.so.1" \
+  "$dup_byte_tree/plugin_broken/libdupbyteplugin.so.1"
+cmp -s "$dup_byte_tree/plugin_ok/libdupbyteplugin.so.1" \
+  "$dup_byte_tree/plugin_broken/libdupbyteplugin.so.1" \
+  || fail "case 23: the two plugin copies must be genuinely byte-identical for this regression to be meaningful"
+
+output_23="$(python3 "$auditor" "$dup_byte_tree" --auto-roots "$dup_byte_tree" 2>&1)" && \
+  fail "case 23: expected non-zero exit -- plugin_broken's identical-content copy cannot reach libdupbyteleaf.so.1 from its own location"
+echo "$output_23" | grep -q "libdupbyteleaf.so.1" \
+  || fail "case 23: failure output did not name the unreachable dependency: $output_23"
+rm "$dup_byte_tree/plugin_broken/libdupbyteplugin.so.1"
+python3 "$auditor" "$dup_byte_tree" --auto-roots "$dup_byte_tree" --list-only >/dev/null \
+  || fail "case 23 (baseline): expected plugin_ok's own copy, beside its real dependency, to resolve cleanly once the broken duplicate is removed"
+echo "PASS: byte-identical plugin copies at different \$ORIGIN contexts are independently reachability-checked, never short-circuited by content-hash sameness"
+
+
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the

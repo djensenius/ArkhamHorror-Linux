@@ -112,25 +112,32 @@ class EffectiveSearchDirsPrecedenceTests(unittest.TestCase):
     def test_runpath_entry_outside_appdir_is_never_included(self) -> None:
         # Round-9+ review item 4 ("boolean resolver permits external
         # path"): an absolute RUNPATH entry naming a directory OUTSIDE
-        # the AppDir being audited must never appear in the effective
-        # search dirs at all -- trusting it would let whatever happens to
-        # exist at that path on the specific machine running the audit
-        # (never guaranteed to exist, or to be ABI-compatible, on a real
-        # target machine) silently satisfy a dependency.
+        # the AppDir being audited must never be silently trusted --
+        # whatever happens to exist at that path on the specific machine
+        # running the audit is never guaranteed to exist, or to be
+        # ABI-compatible, on a real target machine.
+        #
+        # Round-N+ review (MEDIUM, "silently drops external DT_RPATH
+        # that runtime may search before LD_LIBRARY_PATH"): merely
+        # OMITTING it (as if it simply weren't present) is not enough
+        # either -- a real ld.so still searches that exact external
+        # directory, so this must be a hard, reported failure, never a
+        # silent pass-through to whatever bundled directory comes next.
         with tempfile.TemporaryDirectory() as external:
             text = _needed_and_runpath_text([], external)
-            dirs = audit._effective_search_dirs(
-                self.requester, text, [], self.lib_dir.resolve()
-            )
-            self.assertEqual(dirs, [])
+            with self.assertRaises(audit.ClosureAuditError):
+                audit._effective_search_dirs(
+                    self.requester, text, [], self.lib_dir.resolve()
+                )
 
     def test_rpath_entry_outside_appdir_is_never_included(self) -> None:
         with tempfile.TemporaryDirectory() as external:
             text = _needed_and_rpath_text([], external)
-            dirs = audit._effective_search_dirs(
-                self.requester, text, [], self.lib_dir.resolve()
-            )
-            self.assertEqual(dirs, [])
+            with self.assertRaises(audit.ClosureAuditError):
+                audit._effective_search_dirs(
+                    self.requester, text, [], self.lib_dir.resolve()
+                )
+
 
 
 class PerEdgeReachabilityTests(unittest.TestCase):
@@ -234,10 +241,16 @@ class PerEdgeReachabilityTests(unittest.TestCase):
 
 class ExternalPathLeakageTests(unittest.TestCase):
     """Round-9+ review item 4 ("boolean resolver permits external path
-    and recurses arbitrary bundled same-basename"): an absolute RUNPATH
-    entry pointing outside the AppDir must never make a dependency appear
-    reachable, even when a same-named file genuinely exists at that
-    external path on the machine running the audit."""
+    and recurses arbitrary bundled same-basename") plus round-N+ review
+    (MEDIUM, "silently drops external DT_RPATH that runtime may search
+    before LD_LIBRARY_PATH"): an absolute RUNPATH entry pointing outside
+    the AppDir must never make a dependency appear reachable, even when a
+    same-named file genuinely exists at that external path on the
+    machine running the audit -- and, since a REAL loader on some target
+    machine would still search that exact external directory (possibly
+    before this project's own bundled search directories for a legacy
+    DT_RPATH), the whole audit must fail loudly rather than silently
+    reporting the edge as merely "unreachable" and continuing."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -268,25 +281,21 @@ class ExternalPathLeakageTests(unittest.TestCase):
             self.lib_shared_bundled: _needed_and_runpath_text([], None),
         }
 
-    def test_external_runpath_directory_never_satisfies_a_dependency(self) -> None:
+    def test_external_runpath_directory_fails_the_whole_audit(self) -> None:
         def fake_dynamic_text(path: Path) -> str:
             return self.dynamic_text[path]
 
         with mock.patch.object(
             audit, "_readelf_dynamic_text", side_effect=fake_dynamic_text
         ):
-            bundled_closure, missing, unreachable, _ = audit.audit_closure(
-                self.lib_dir, ["libroot.so.1"]
-            )
+            with self.assertRaises(audit.ClosureAuditError) as ctx:
+                audit.audit_closure(self.lib_dir, ["libroot.so.1"])
 
-        # The dependency IS bundled somewhere in the tree, so it must
-        # never be reported as entirely MISSING -- but it must also never
-        # be treated as resolved via the external directory: the correct
-        # outcome is UNREACHABLE (bundled in the AppDir, but not
-        # reachable from this exact requester's own real search context).
-        self.assertEqual(missing, {})
-        self.assertIn("libshared.so.1", unreachable)
-        self.assertNotIn("libshared.so.1", bundled_closure)
+        # The error must name the offending requester and the external
+        # directory itself, so a real failure is actually actionable.
+        self.assertIn(str(self.root), str(ctx.exception))
+        self.assertIn(str(self.external_dir), str(ctx.exception))
+
 
 
 class ExactReachablePathIsUsedForRecursionTests(unittest.TestCase):

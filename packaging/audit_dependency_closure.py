@@ -96,6 +96,24 @@ ABI_ALLOWLIST: frozenset[str] = frozenset(
     }
 )
 
+# Round-N+ review (HIGH, "auditor can disagree with kernel/glibc: ...
+# allows nonexistent paths by basename"): the dynamic loader's BASENAME
+# alone is not enough to trust a recorded PT_INTERP value -- a basename
+# match only proves the string ends the same way, never that the
+# absolute path is one the kernel could actually open on a real glibc
+# x86_64 host. glibc's own ABI fixes the loader's install location at
+# exactly this one canonical absolute path on every glibc-based x86_64
+# Linux distribution (this is the same path stock, unpatched
+# linuxdeploy/gcc/ld always records in every executable this project's
+# own build produces) -- an interpreter string that merely shares this
+# basename while naming some OTHER directory (e.g. a build-host-only
+# path, or a typo) would exec() successfully only by accident on THIS
+# specific host, and would simply fail outright on a real target with
+# no reason to have anything at that other path at all.
+LOADER_CANONICAL_PATH: dict[str, str] = {
+    "ld-linux-x86-64.so.2": "/lib64/ld-linux-x86-64.so.2",
+}
+
 # A second, separately-documented allowlist for the base X11/xcb/GL
 # "desktop stack" -- deliberately kept apart from ABI_ALLOWLIST above (which
 # is reserved for the dynamic loader and core glibc-provided libraries)
@@ -252,39 +270,61 @@ def _parse_needed(dynamic_text: str) -> list[str]:
     return [m.group("name") for m in _NEEDED_RE.finditer(dynamic_text)]
 
 
-_INTERP_STRING_RE = re.compile(r"^\s*\[\s*\d+\]\s+(?P<value>\S.*\S|\S)\s*$", re.MULTILINE)
+# Round-N+ review (HIGH, "auditor can disagree with kernel/glibc: reads
+# `.interp` section rather than PT_INTERP"): the KERNEL exec() path (and
+# every dynamic loader) resolves the program interpreter exclusively via
+# the PT_INTERP PROGRAM header -- section headers (including a
+# conventionally-named `.interp` SECTION) are pure debugging/linking
+# metadata the kernel never even looks at, and a real toolchain is free
+# to drop the section-header table entirely (e.g. via a strip variant
+# that zeroes e_shnum/e_shstrndx) while leaving every program header,
+# including PT_INTERP and its underlying bytes, perfectly intact and
+# exec()-able. `readelf -l` walks the PROGRAM header table (e_phoff/
+# e_phnum), which is independent of section headers, and annotates a
+# PT_INTERP entry with exactly this line.
+_PT_INTERP_ANNOTATION_RE = re.compile(
+    r"Requesting program interpreter:\s*(?P<value>\S+)\s*\]"
+)
 
 
 def _read_interp(path: Path) -> str | None:
-    """Returns the ELF interpreter path recorded in `path`'s own .interp
-    section (e.g. "/lib64/ld-linux-x86-64.so.2"), or None if this ELF
-    file carries no .interp section at all.
+    """Returns the ELF interpreter path recorded in `path`'s own PT_INTERP
+    PROGRAM header (e.g. "/lib64/ld-linux-x86-64.so.2"), or None if this
+    ELF file carries no PT_INTERP segment at all.
 
-    Presence of .interp is itself the real, on-disk distinction between
+    Presence of PT_INTERP is itself the real, on-disk distinction between
     "this file is directly exec()'d by the kernel, which will hand it to
     exactly this recorded interpreter" (an actual executable) and "this
     file is only ever dlopen()/dlsym()'d by a process that already has
     its own interpreter" (an ordinary shared library) -- never a
     name/extension guess, matching every other detection in this script.
+    Deliberately reads this via `readelf -l` (program headers), NEVER
+    `readelf -p .interp` (a SECTION-header-table lookup by name): the
+    latter silently reports "no such section" -- indistinguishable from
+    "not an executable" -- for any ELF whose section-header table has
+    been stripped/zeroed, even though such a file's PT_INTERP program
+    header (which is what the kernel and every dynamic loader actually
+    consult) remains completely intact and this is still a directly
+    exec()able program interpreter binding this audit must validate.
     """
     result = subprocess.run(
-        ["readelf", "-p", ".interp", str(path)],
+        ["readelf", "-l", "-W", str(path)],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         return None
-    match = _INTERP_STRING_RE.search(result.stdout)
+    match = _PT_INTERP_ANNOTATION_RE.search(result.stdout)
     return match.group("value") if match is not None else None
 
 
 def validate_interp(path: Path, allowlist: frozenset[str]) -> str | None:
     """Round-N+ review (HIGH, "validate PT_INTERP for executables"):
     returns None if `path` is not a directly-executable ELF at all (no
-    .interp section), or if it is one whose own recorded interpreter is
-    genuinely one of the host-guaranteed dynamic-loader names in
-    `allowlist` -- otherwise returns a human-readable description of the
-    problem.
+    PT_INTERP program header), or if it is one whose own recorded
+    interpreter is genuinely the EXACT, canonical, host-guaranteed
+    absolute path for one of the loader names in `allowlist` --
+    otherwise returns a human-readable description of the problem.
 
     Deliberately a SEPARATE, narrower check from the DT_NEEDED closure
     walk above, not folded into it: PT_INTERP resolution is an entirely
@@ -295,6 +335,14 @@ def validate_interp(path: Path, allowlist: frozenset[str]) -> str | None:
     entries), so treating it as just another same-shaped dependency edge
     would silently apply reachability semantics that do not actually
     describe how a real kernel resolves it.
+
+    Round-N+ review (HIGH, "... allows nonexistent paths by basename"):
+    checking only `Path(interp).name` would accept ANY directory at all,
+    provided the final path component happened to match -- including a
+    build-host-only path that would simply not exist on a real target.
+    The interpreter string must equal LOADER_CANONICAL_PATH's exact,
+    documented absolute path for an allowlisted loader name, never
+    merely share its basename.
 
     This project's own build (packaging/build-appimage.sh) relies
     entirely on stock, unpatched linuxdeploy output: every bundled
@@ -309,8 +357,19 @@ def validate_interp(path: Path, allowlist: frozenset[str]) -> str | None:
     interp = _read_interp(path)
     if interp is None:
         return None
-    if Path(interp).name in allowlist:
-        return None
+    name = Path(interp).name
+    if name in allowlist and name in LOADER_CANONICAL_PATH:
+        if interp == LOADER_CANONICAL_PATH[name]:
+            return None
+        return (
+            f"{path} records program interpreter '{interp}', whose final "
+            f"path component ('{name}') matches an allowlisted loader "
+            f"name, but whose full path is not the exact canonical "
+            f"absolute path ('{LOADER_CANONICAL_PATH[name]}') every real "
+            "glibc-based x86_64 host guarantees it at -- refusing to "
+            "assume a same-named directory elsewhere will resolve on a "
+            "target host."
+        )
     return (
         f"{path} records program interpreter '{interp}', which is neither "
         "the host-guaranteed dynamic loader (ABI_ALLOWLIST) nor anything "
@@ -391,6 +450,25 @@ def _effective_search_dirs(
     `lib_dir_resolved` -- the AppDir actually being audited -- is never
     included at all, regardless of what may or may not happen to exist
     at that absolute path on the specific machine running this audit.
+
+    Round-N+ review (MEDIUM, "silently drops external DT_RPATH that
+    runtime may search before LD_LIBRARY_PATH"): merely OMITTING such an
+    entry from the returned search-dir list is not enough -- a real
+    ld.so still SEARCHES that exact external directory (and, for a
+    legacy DT_RPATH, searches it BEFORE this project's own bundled
+    LD_LIBRARY_PATH entries, so if some ABI-incompatible or malicious
+    library of the identical SONAME happens to sit there on a given
+    target machine, the REAL runtime resolves to THAT one, never this
+    audit's own carefully-verified bundled copy, regardless of what this
+    audit itself concludes). Silently proceeding as though the entry
+    were simply absent would let this function report a dependency as
+    "reachable via our own bundled directory" even though a real load on
+    some target machine could resolve to a completely different,
+    unaudited file first. An external RPATH/RUNPATH entry is therefore
+    always treated as a hard packaging defect -- this project's own
+    build must never emit one at all -- and raises immediately rather
+    than being tolerated in either direction (neither trusted, per the
+    comment above, nor quietly ignored).
     Trusting such a path would let a dependency be misreported as
     "reachable" purely because the AUDIT HOST happens to have a
     same-named library sitting there -- exactly the host-dependent
@@ -412,7 +490,17 @@ def _effective_search_dirs(
     for entry in entries:
         expanded = _expand_origin(entry, origin_dir)
         if not expanded.is_relative_to(lib_dir_resolved):
-            continue
+            raise ClosureAuditError(
+                f"{requester_path} carries a {'DT_RPATH' if kind == 'rpath' else 'DT_RUNPATH'} "
+                f"entry ('{entry}', resolving to {expanded}) outside the "
+                f"AppDir being audited ({lib_dir_resolved}). A real "
+                "loader on some target machine would still search this "
+                "exact external directory -- and, for a legacy RPATH, "
+                "before this project's own bundled search directories -- "
+                "so this can never be silently ignored: fix the build so "
+                "no bundled object ever records an external RPATH/RUNPATH "
+                "entry at all."
+            )
         if expanded not in own_dirs:
             own_dirs.append(expanded)
 
