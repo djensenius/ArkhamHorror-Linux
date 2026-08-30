@@ -273,6 +273,11 @@ target_link_libraries(arkham_domain_models PUBLIC
 # list, so it cannot silently drift from what this target actually
 # compiles, the same guarantee arkham_check_domain_header_inventory()
 # above already gives the *build* itself.
+# file(WRITE) has created missing parent directories itself since CMake
+# 3.20 (below our 3.25 floor), but this MAKE_DIRECTORY stays explicit so
+# the two file(WRITE) calls below never rely on that implicit behavior.
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
 set(_arkham_domain_headers_manifest_lines "")
 foreach(_arkham_header IN LISTS ARKHAM_DOMAIN_HEADERS)
     string(APPEND _arkham_domain_headers_manifest_lines
