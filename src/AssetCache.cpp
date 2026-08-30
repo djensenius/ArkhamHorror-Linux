@@ -14,6 +14,7 @@
 #include <QStandardPaths>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -338,21 +339,49 @@ int openat2NoFollowNoXdev(int dirFd, const char *name, bool wantDirectory) {
 // Opens the single path component `name` relative to `dirFd`, refusing
 // a symlink node and (when the running kernel supports it) refusing any
 // cross-mount traversal atomically via openat2() -- see
-// openat2NoFollowNoXdev()'s comment. Falls back to plain
-// openat(O_NOFOLLOW) (the pre-existing, portable mechanism, still
-// independently re-verified by the caller's own
-// fstatat()+mountIdentityMatches() sequence) on any non-Linux platform
-// or when the running kernel refuses openat2 itself (old kernel): that
-// fallback is an EQUIVALENT-STRENGTH, not weaker, guarantee for
-// symlinks (O_NOFOLLOW), and for mount continuity it is exactly the
-// pre-existing STATX_MNT_ID-when-available / st_dev-only-otherwise
-// policy this file has always documented -- never silently downgraded
-// any further by this function.
-int openDirectoryComponentNoFollow(int dirFd, const char *name) {
+// openat2NoFollowNoXdev()'s comment. `usedStrongNoXdev`, when non-null,
+// is set to true iff the kernel-native openat2()/RESOLVE_NO_XDEV path
+// actually completed the open (the caller uses this to decide how much
+// additional userspace mount-identity verification it still needs to
+// perform -- see openDirectoryChainNoFollow()'s comment).
+//
+// Round-N+ review (HIGH, repeat finding): openat2() FAILING is not
+// automatically "try the weaker fallback". Only ENOSYS -- this kernel
+// does not implement the syscall AT ALL -- says nothing about whether
+// `name` itself is safe, and is the sole condition this function treats
+// as "openat2 unavailable, use the portable path instead". Any OTHER
+// errno -- EXDEV (the kernel refused because completing the open would
+// cross a mount boundary), ELOOP (the kernel found `name` to actually be
+// a symlink, including via a TOCTOU race the caller's own PRECEDING
+// fstatat() check could never observe, since that check and this open
+// are two separate syscalls with a window between them), EACCES, or
+// anything else -- is the kernel's own, authoritative, INTENTIONAL
+// refusal of this exact request and must propagate as a hard failure
+// right here. Silently retrying such a refusal via plain
+// openat(O_NOFOLLOW) -- which has no concept of "cross mount" at all,
+// and for ELOOP specifically would (correctly) refuse a symlink that is
+// STILL a symlink at retry time, but would NOT refuse the TOCTOU case
+// where the entry has since been replaced back by something openat()
+// alone accepts -- would let exactly the request openat2 just refused
+// quietly succeed via the weaker path instead. A prior version of this
+// function fell back on ANY openat2 failure whatsoever, discarding this
+// signal entirely; this is exactly the gap this round closes.
+int openDirectoryComponentNoFollow(int dirFd, const char *name,
+                                   bool *usedStrongNoXdev = nullptr) {
+  if (usedStrongNoXdev) {
+    *usedStrongNoXdev = false;
+  }
 #if defined(ARKHAM_HAVE_OPENAT2_UAPI)
+  errno = 0;
   const int viaOpenat2 = openat2NoFollowNoXdev(dirFd, name, true);
   if (viaOpenat2 >= 0) {
+    if (usedStrongNoXdev) {
+      *usedStrongNoXdev = true;
+    }
     return viaOpenat2;
+  }
+  if (errno != ENOSYS) {
+    return -1;
   }
 #endif
   return openat(dirFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -375,6 +404,37 @@ bool mountIdentityMatches(const MountIdentity &actual,
   }
   return true;
 }
+
+#if defined(__linux__)
+// Round-N+ review (HIGH, repeat finding, "fail closed when mount ID
+// unavailable for no-xdev"): a STRICTER sibling of mountIdentityMatches()
+// used ONLY by openDirectoryChainNoFollow()'s owned-suffix walk, and
+// only for the one specific case where openat2()'s own kernel-native
+// RESOLVE_NO_XDEV guarantee was NOT available for this component (see
+// openDirectoryComponentNoFollow()'s `usedStrongNoXdev` out-param). In
+// that situation the ONLY remaining evidence of mount continuity is
+// STATX_MNT_ID; degrading further to a bare st_dev comparison here would
+// admit a same-device bind mount with NO real protection left at all
+// (exactly the "root-component loop doesn't enforce mount identity"/
+// "mount ID missing falls to st_dev" gap prior rounds already fixed for
+// the strong-signal case). This function therefore FAILS (returns
+// false) whenever a mount id is not available on EITHER side, rather
+// than silently accepting on st_dev alone. This is deliberately Linux-
+// only and used only for this one no-openat2 fallback path: every OTHER
+// call site (verifyRootAnchorLocked()'s ongoing per-request checks,
+// safeRemoveEntryAt()'s delete-time checks, and the openat2-succeeded
+// case here) keeps using the existing, permissive mountIdentityMatches()
+// documented above, since those are unrelated to this specific finding
+// and changing them would be a wider, unrequested behaviour change
+// (e.g. permanently disabling disk cache on any older kernel that lacks
+// STATX_MNT_ID but still has openat2, which already provides a strong,
+// independent no-xdev guarantee of its own).
+bool mountIdentityMatchesStrictRequiringMountId(const MountIdentity &actual,
+                                                const MountIdentity &expected) {
+  return actual.hasMountId && expected.hasMountId &&
+         actual.device == expected.device && actual.mountId == expected.mountId;
+}
+#endif
 
 // Opens `name` relative to `dirFd` for reading, verifying (via fstat on
 // the RESULTING DESCRIPTOR -- never a second path-based stat) that what
@@ -828,13 +888,36 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
       ::close(currentFd);
       return std::nullopt;
     }
-    const int nextFd =
-        openDirectoryComponentNoFollow(currentFd, componentUtf8.constData());
+    bool usedStrongNoXdev = false;
+    const int nextFd = openDirectoryComponentNoFollow(
+        currentFd, componentUtf8.constData(), &usedStrongNoXdev);
     if (nextFd < 0) {
       ::close(currentFd);
       return std::nullopt;
     }
-    if (!mountIdentityMatches(mountIdentityForFd(nextFd), anchorMount)) {
+    // Round-N+ review (HIGH, "fail closed when mount ID unavailable for
+    // no-xdev"): when this component's open actually went through the
+    // kernel-native openat2()/RESOLVE_NO_XDEV path, that syscall ALONE
+    // already refused a cross-mount request outright -- the permissive
+    // mountIdentityMatches() below is pure defense in depth for that
+    // case. When it did NOT (openat2 itself unavailable on this kernel/
+    // build, Linux-only), that kernel-native guarantee simply does not
+    // exist for this component at all, and mountIdentityMatches()'s own
+    // silent degrade-to-st_dev-only behaviour would then be the ONLY
+    // check standing between this walk and a same-device bind mount --
+    // so this uses the stricter, fail-closed comparator instead in
+    // exactly (and only) that situation.
+    bool mountOk;
+#if defined(__linux__)
+    mountOk =
+        usedStrongNoXdev
+            ? mountIdentityMatches(mountIdentityForFd(nextFd), anchorMount)
+            : mountIdentityMatchesStrictRequiringMountId(
+                  mountIdentityForFd(nextFd), anchorMount);
+#else
+    mountOk = mountIdentityMatches(mountIdentityForFd(nextFd), anchorMount);
+#endif
+    if (!mountOk) {
       qWarning() << "AssetCache: refusing owned-suffix component" << component
                  << "-- resolves onto a different mount than its trusted "
                     "anchor (bind-mount escape guard during directory-"
@@ -896,11 +979,11 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
 // When `absoluteTargetPathIn` is NOT itself a descendant of home (an
 // unusual, explicit system-wide configuration choice -- e.g. an admin
 // pointing this cache at a shared "/srv/..." location), this instead
-// falls back to the pre-existing "longest existing prefix is a single
-// trusted anchor, only the not-yet-existing remainder is walked
-// no-follow" policy: a narrower guarantee for that uncommon case, but
-// not a regression from the behaviour that shipped before this fix, and
-// clearly narrower-scope rather than silently unsafe.
+// walks EVERY component from "/" itself -- see the fallback branch's
+// own comment below for why "/" (rather than any "longest existing
+// prefix", which a prior version of this fallback trusted as a single
+// opaque anchor) is the only anchor usable here that needs no
+// independent trust derivation at all.
 std::optional<int>
 resolveTrustedDirectoryNoFollow(const QString &absoluteTargetPathIn,
                                 bool allowCreateMissingComponents) {
@@ -923,26 +1006,40 @@ resolveTrustedDirectoryNoFollow(const QString &absoluteTargetPathIn,
     return openDirectoryChainNoFollow(home, components,
                                       allowCreateMissingComponents);
   }
-  // Fallback for a target outside home: find the longest EXISTING
-  // prefix (by simple, symlink-FOLLOWING existence -- matching exactly
-  // what a single opaque trusted-anchor open would have accepted
-  // before this fix, so this is not a narrower guarantee than what
-  // shipped previously for this uncommon case) and walk only whatever
-  // remains beneath it no-follow, exactly like the home-anchored case
-  // above.
-  QString existingPrefix = absoluteTargetPath;
-  QStringList missingSuffix;
-  while (existingPrefix != QLatin1String("/") &&
-         !QFileInfo::exists(existingPrefix)) {
-    const int idx = existingPrefix.lastIndexOf(QLatin1Char('/'));
-    const QString lastComponent = existingPrefix.mid(idx + 1);
-    if (lastComponent.isEmpty()) {
-      break;
-    }
-    missingSuffix.prepend(lastComponent);
-    existingPrefix = idx <= 0 ? QStringLiteral("/") : existingPrefix.left(idx);
-  }
-  return openDirectoryChainNoFollow(existingPrefix, missingSuffix,
+  // Round-N+ review (HIGH, repeat finding): a target outside home used
+  // to fall back to "find the longest EXISTING prefix via a plain,
+  // symlink-FOLLOWING QFileInfo::exists() check, trust THAT prefix as a
+  // single opaque anchor". That shortcut is exactly as unsafe as the
+  // single-opaque-anchor design this whole function replaced: when the
+  // ENTIRE configured path already exists -- even purely by virtue of
+  // an attacker-planted INTERMEDIATE symlink somewhere in the middle --
+  // the "existing prefix" IS the whole path, "missing suffix" is empty,
+  // and nothing is ever walked no-follow at all. The final leaf being a
+  // real, non-symlink directory (which it can legitimately be, e.g. the
+  // symlink's own target directory) does not help: openDirectoryChain-
+  // NoFollow()'s own anchor-open is a single ::open(path, O_NOFOLLOW),
+  // and POSIX's O_NOFOLLOW only ever inspects the FINAL path component;
+  // every intermediate component is resolved by the kernel exactly like
+  // an ordinary, unhardened open() would.
+  //
+  // There is no analogous "obviously safe, never walked" anchor for an
+  // outside-home path the way home itself serves the common case above
+  // (an explicit admin-configured location carries no such standing
+  // trust). The only anchor that requires no independent trust
+  // derivation AT ALL is the filesystem root itself -- "/" can never be
+  // a symlink -- so every single component of the path, from "/" to the
+  // leaf, is walked no-follow here exactly like the home-anchored case,
+  // with NO "already exists" shortcut of any kind. This intentionally
+  // means an admin-configured location that happens to sit beneath a
+  // legitimate OS-bootstrap symlink (this project's actual Linux/
+  // SteamOS deployment target does not, in practice, symlink "/var",
+  // "/srv", "/opt", or "/mnt" themselves the way some non-Linux systems
+  // symlink "/var") is rejected too, failing disk persistence closed
+  // for that uncommon configuration rather than silently trusting an
+  // unwalked intermediate component.
+  const QStringList allComponentsFromRoot =
+      absoluteTargetPath.mid(1).split(QLatin1Char('/'), Qt::SkipEmptyParts);
+  return openDirectoryChainNoFollow(QStringLiteral("/"), allComponentsFromRoot,
                                     allowCreateMissingComponents);
 }
 #endif
@@ -1372,31 +1469,57 @@ QString AssetCache::mintGenerationIdLocked(quint64 accessSequence) {
 
 #if defined(Q_OS_UNIX)
 namespace {
+// Round-N+ review (MEDIUM, repeat finding): adds `st.st_size` to
+// `*total`, failing (returning false, leaving `*total` untouched) on
+// qint64 overflow instead of silently wrapping -- every size this
+// walker ever adds is a real, non-negative on-disk byte count, but an
+// adversarially deep/wide tree of maximal-sized entries should never
+// be allowed to silently wrap the running total into a small or
+// negative number that would then look "under quota".
+bool addUsageBytesOverflowSafe(qint64 *total, qint64 addition) {
+  if (addition < 0 || *total > std::numeric_limits<qint64>::max() - addition) {
+    return false;
+  }
+  *total += addition;
+  return true;
+}
+
 // Recursive, descriptor-relative, no-follow, mount-bounded byte-usage
 // walker (review round-4/5 items 3, 9, 11; round-6 item 5's mount-id
-// strengthening): sums the on-disk size of every regular
-// file/symlink-node entry found anywhere under `dirFd` (which must be
-// open for exactly one call -- this function always closes it),
-// recursing into subdirectories ONLY while they remain on
-// `expectedMount`; a same-mount directory's OWN entry size is never
-// counted (only the files found underneath it), matching this walker's
-// historical QDir::Files-equivalent semantics. A subdirectory found to
-// be a different mount (a stray bind mount planted under this cache's
-// exclusively-owned directory -- including a SAME-DEVICE bind mount,
-// which mountIdentityMatches() now also detects) is never descended
-// into -- but its OWN directory-entry size IS added in that one case,
-// so it can never simply vanish from the total the way silently
-// skipping it would; quota enforcement must see it as real,
-// non-reclaimable usage (see safeRemoveEntryAt()'s matching refusal to
-// ever delete across that same boundary) rather than falsely reporting
-// the cache as "under budget" while genuinely undeletable/unaccounted
-// bytes remain resident.
-qint64 sumUsageRelative(int dirFd, const MountIdentity &expectedMount) {
+// strengthening). Returns std::nullopt -- an INDETERMINATE result, not
+// zero -- the instant ANY step of the traversal cannot be completed
+// with full confidence: `fdopendir()` failing, an individual entry's
+// `fstatat()` failing, a subdirectory's `openat()` failing, `readdir()`
+// itself failing (round-N+ review: distinguished from genuine end-of-
+// directory by checking `errno` after the loop, not merely treating
+// every non-entry return as "done"), or the running total overflowing
+// qint64. A prior version of this function silently treated every one
+// of these as "contributes 0 bytes" -- fdopendir() failure returned a
+// flat 0 for the entire (sub)tree, a single unreadable entry was merely
+// skipped, an unopenable subdirectory simply vanished from the total,
+// and readdir()'s own errno was never even inspected -- so a
+// filesystem fault (a permissions problem, an EIO, a transient
+// unmount) could make a cache that is actually AT or OVER quota falsely
+// report as comfortably empty, defeating quota enforcement entirely
+// rather than erring toward safety. Every caller of this walker must
+// now treat std::nullopt as "usage is genuinely unknown" -- see
+// diskUsageBytesLocked()'s comment for how that propagates to disabling
+// persistence entirely, never to a numeric zero being trusted for
+// quota math.
+//
+// Round-N+ review (MEDIUM, repeat finding, "directory storage
+// uncounted"): a same-mount subdirectory's OWN directory-entry size is
+// now also added (in addition to recursing into it) -- a directory
+// node occupies real, non-reclaimable disk blocks of its own, exactly
+// like the cross-mount case immediately below already accounted for;
+// treating it as free undercounted genuine, physical usage.
+std::optional<qint64> sumUsageRelative(int dirFd,
+                                       const MountIdentity &expectedMount) {
   qint64 total = 0;
   DIR *dirStream = fdopendir(dirFd);
   if (!dirStream) {
     ::close(dirFd);
-    return 0;
+    return std::nullopt;
   }
   errno = 0;
   while (struct dirent *entry = readdir(dirStream)) {
@@ -1406,38 +1529,56 @@ qint64 sumUsageRelative(int dirFd, const MountIdentity &expectedMount) {
     }
     struct stat st {};
     if (fstatat(dirFd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-      errno = 0;
-      continue;
+      closedir(dirStream);
+      return std::nullopt;
     }
     if (S_ISDIR(st.st_mode)) {
+      // The directory node's own on-disk size is real, physical usage
+      // regardless of which mount it lives on -- see this function's
+      // own comment above.
+      if (!addUsageBytesOverflowSafe(&total, st.st_size)) {
+        closedir(dirStream);
+        return std::nullopt;
+      }
       if (!mountIdentityMatches(mountIdentityRelative(dirFd, entry->d_name, st),
                                 expectedMount)) {
         // Cross-mount entry encountered: this directory can never be
         // descended into or deleted (see safeRemoveEntryAt()'s matching
-        // refusal), so its own directory-entry size is counted here as
-        // an irreducible placeholder -- otherwise it would simply
-        // vanish from the total, letting quota enforcement falsely
-        // believe the cache is under budget while genuinely
-        // undeletable/unaccounted bytes remain resident. A same-mount
-        // directory is never counted this way (matching this walker's
-        // historical QDir::Files-equivalent semantics): only the
-        // regular files found underneath it contribute bytes.
-        total += st.st_size;
+        // refusal), so nothing further is added for it -- its own
+        // directory-entry size (just added above) is the only
+        // contribution this walker can make for it.
         errno = 0;
         continue;
       }
       const int childFd =
           openat(dirFd, entry->d_name,
                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (childFd >= 0) {
-        total += sumUsageRelative(childFd, expectedMount); // closes childFd
+      if (childFd < 0) {
+        closedir(dirStream);
+        return std::nullopt;
+      }
+      const std::optional<qint64> childTotal =
+          sumUsageRelative(childFd, expectedMount); // closes childFd
+      if (!childTotal || !addUsageBytesOverflowSafe(&total, *childTotal)) {
+        closedir(dirStream);
+        return std::nullopt;
       }
     } else {
-      total += st.st_size;
+      if (!addUsageBytesOverflowSafe(&total, st.st_size)) {
+        closedir(dirStream);
+        return std::nullopt;
+      }
     }
     errno = 0;
   }
+  const int readdirErrno = errno;
   closedir(dirStream); // also closes dirFd
+  if (readdirErrno != 0) {
+    // readdir() itself failed (as opposed to a genuine, error-free
+    // end-of-directory) -- the listing this total was built from may
+    // be incomplete.
+    return std::nullopt;
+  }
   return total;
 }
 } // namespace
@@ -1461,11 +1602,39 @@ qint64 AssetCache::diskUsageBytesLocked() const {
 #if defined(Q_OS_UNIX)
   const int freshFd = openFreshHandleToSameDirectory(m_rootFd);
   if (freshFd < 0) {
+    // Round-N+ review (MEDIUM, repeat finding): cannot even open a
+    // fresh handle to inventory this instance's own root -- genuinely
+    // indeterminate, not "zero usage". Fail closed exactly like every
+    // other indeterminate-traversal case this function now handles: a
+    // false "0" here could let quota enforcement (and the high-water-
+    // mark check that decides whether to run it at all) believe an
+    // over-quota cache is empty.
+    qWarning() << "AssetCache: failed to open a fresh handle for usage "
+                  "accounting -- disabling disk I/O for this instance "
+                  "rather than reporting a false zero usage";
+    m_diskCacheDisabled = true;
     return 0;
   }
-  return sumUsageRelative(freshFd,
-                          MountIdentity{m_rootDevice, m_rootMountId,
-                                        m_rootHasMountId}); // closes freshFd
+  const std::optional<qint64> usage = sumUsageRelative(
+      freshFd, MountIdentity{m_rootDevice, m_rootMountId,
+                             m_rootHasMountId}); // closes freshFd
+  if (!usage) {
+    // Round-N+ review (MEDIUM, repeat finding): the traversal itself
+    // could not be completed with full confidence (see
+    // sumUsageRelative()'s comment for every case this now covers) --
+    // disable persistence for this instance's entire remaining
+    // lifetime rather than silently trusting a partial/zero total for
+    // quota math. Every other disk-touching method already treats
+    // m_diskCacheDisabled as a hard, permanent stop, so no further
+    // write can ever compound whatever made this traversal
+    // indeterminate in the first place.
+    qWarning() << "AssetCache: disk usage accounting could not be "
+                  "completed -- disabling disk I/O for this instance "
+                  "rather than reporting a false zero usage";
+    m_diskCacheDisabled = true;
+    return 0;
+  }
+  return *usage;
 #else
   return 0;
 #endif
@@ -1673,15 +1842,31 @@ AssetCache::readMetadata(const QString &metadataFilePath,
 AssetCache::DeleteEntryOutcome
 AssetCache::deleteEntry(const QString &key) const {
   if (m_diskCacheDisabled) {
-    // Disk I/O has been disabled for this instance's ENTIRE lifetime
-    // (a symlink detected at construction, an invalid Config byte
-    // limit, or an EARLIER call that already latched this via
-    // verifyRootAnchorLocked() below) -- there never was, and never
-    // will be, any disk for THIS instance to persist an entry to, so
-    // "everything reclaimed" / "manifest durably absent" really are
-    // vacuously true for every observable purpose this instance itself
-    // cares about.
-    return {true, true};
+    // Round-N+ review (HIGH, repeat finding): a PRE-latched disable --
+    // set at construction (an invalid Config byte limit, the configured
+    // directory itself being a symlink, or the trusted-anchor walk
+    // failing) OR by an EARLIER call within this same instance's
+    // lifetime (verifyRootAnchorLocked() detecting the root was
+    // replaced/removed since construction) -- is NOT the same thing as
+    // "this instance's configured directory could never possibly have
+    // held a real, on-disk manifest for `key`". A prior successful run
+    // of THIS SAME application (before a symlink was planted, before
+    // the config broke, or before the root was replaced) may well have
+    // already written a completely genuine manifest at this exact
+    // location -- and this call, having never gotten anywhere near
+    // attempting to touch it, cannot honestly claim it is now
+    // "durably absent". A caller (invalidate(), and through it an
+    // authoritative negative-404 tombstone) that trusted a vacuous
+    // "durably absent" answer here would let that untouched manifest
+    // silently "revive" the moment a fresh process (or this same
+    // process, restarted with the config/symlink/root problem since
+    // resolved) opens it again -- exactly the class of bug a prior
+    // round already fixed for the narrower "verification fails on THIS
+    // call" case immediately below; a disable LATCHED BEFORE this call
+    // even started must get the identical honest answer, not the
+    // opposite one. `PersistenceFailed` is therefore always reported
+    // here: never a free "nothing to do" pass.
+    return {false, false};
   }
   if (!verifyRootAnchorLocked()) {
     // Round-9+ review (HIGH): root verification failing HERE, on THIS

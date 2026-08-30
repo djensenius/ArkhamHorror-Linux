@@ -10,6 +10,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QTest>
 
@@ -827,10 +828,18 @@ void AssetCacheTests::strayDirectoryIsRemovedAndCountedTowardDiskUsage() {
     nested.write(QByteArray(4096, 'z'));
   }
   QVERIFY(QFileInfo(strayDirPath).isDir());
+  // Round-N+ review (MEDIUM, repeat finding, "directory storage
+  // uncounted"): a directory node itself now also contributes its own
+  // on-disk entry size to the total -- read it back via QFileInfo
+  // (filesystem/platform-dependent, never a fixed constant) rather than
+  // assuming the nested file's bytes are the ONLY contribution, exactly
+  // like the cross-mount case already did before this round.
+  const qint64 strayDirEntrySize = QFileInfo(strayDirPath).size();
 
   // diskUsageBytes() must count the nested file's bytes even though they
-  // sit inside a directory this cache never created.
-  QCOMPARE(cache.diskUsageBytes(), qint64(4096));
+  // sit inside a directory this cache never created, PLUS that
+  // directory's own on-disk entry size.
+  QCOMPARE(cache.diskUsageBytes(), qint64(4096) + strayDirEntrySize);
 
   cache.reapAndEnforceQuota();
 
@@ -2019,6 +2028,97 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    precreatedLeafBehindIntermediateSymlinkOutsideHomeIsRejectedAndSentinelUntouched() {
+  // The OUTSIDE-home counterpart to the test immediately above. Uses a
+  // base directory rooted at the canonicalized system temp location
+  // (NEVER under home, so this genuinely exercises the "/"-anchored
+  // fallback branch) rather than `m_tempDirPath` (which `init()`
+  // deliberately places under home to exercise the common,
+  // home-anchored branch instead -- see its own comment). The base is
+  // canonicalized FIRST specifically so any legitimate OS-bootstrap
+  // symlink an ancestor of the system temp directory might itself be
+  // (e.g. macOS's `/tmp` -> `/private/tmp`, `/var` -> `/private/var`)
+  // is already resolved away before this test plants its OWN, entirely
+  // deliberate intermediate symlink -- isolating exactly the one
+  // symlink this test means to exercise from any incidental OS one.
+  const QString canonicalBase = QFileInfo(QDir::tempPath()).canonicalFilePath();
+  QVERIFY(!canonicalBase.isEmpty());
+  const QString home = QDir::cleanPath(QDir::homePath());
+  QVERIFY2(canonicalBase != home &&
+               !canonicalBase.startsWith(home + QLatin1Char('/')),
+           "test precondition: the canonicalized system temp directory must "
+           "be outside home for this test to exercise the outside-home "
+           "fallback branch at all");
+
+  const QString scratchDir =
+      canonicalBase + QStringLiteral("/arkham-outside-home-symlink-test-%1")
+                          .arg(QRandomGenerator::global()->generate());
+  QVERIFY(QDir().mkpath(scratchDir));
+  struct ScopedScratchRemoval {
+    QString outerSymlink;
+    QString base;
+    ~ScopedScratchRemoval() {
+      // Remove the symlink node itself FIRST (QFile::remove never
+      // follows it) so the subsequent recursive removal of `base`
+      // cannot possibly descend through it into the sentinel a second
+      // time via two different paths.
+      QFile::remove(outerSymlink);
+      QDir(base).removeRecursively();
+    }
+  };
+
+  const QString sentinelDir = scratchDir + QStringLiteral("/sentinel");
+  QVERIFY(QDir().mkpath(sentinelDir + QStringLiteral("/inner-normal")));
+  QVERIFY(
+      QDir().mkpath(sentinelDir + QStringLiteral("/inner-normal/cache-leaf")));
+  const QString sentinelFile =
+      sentinelDir + QStringLiteral("/pre-existing.txt");
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("must-not-be-touched"));
+  }
+
+  const QString outerSymlink = scratchDir + QStringLiteral("/outer-symlink");
+  ScopedScratchRemoval cleanupGuard{outerSymlink, scratchDir};
+  QVERIFY(QFile::link(sentinelDir, outerSymlink));
+  QVERIFY(QFileInfo(outerSymlink).isSymLink());
+
+  const QString configuredDirectory =
+      outerSymlink + QStringLiteral("/inner-normal/cache-leaf");
+  // The leaf genuinely exists THROUGH the symlinked path -- exactly
+  // what defeats a "longest existing prefix" shortcut, and exactly why
+  // this test's base is deliberately OUTSIDE home (only that fallback
+  // branch ever used such a shortcut).
+  QVERIFY(QFileInfo::exists(configuredDirectory));
+  QVERIFY(!QFileInfo(configuredDirectory).isSymLink());
+  QVERIFY(!configuredDirectory.startsWith(home + QLatin1Char('/')));
+
+  AssetCache cache(configFor(configuredDirectory));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  // Purely a read-only refusal: the sentinel's own pre-existing content
+  // is exactly as it was, and nothing was ever created or touched
+  // anywhere along or beneath the symlinked path.
+  QVERIFY(QFileInfo::exists(sentinelFile));
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("must-not-be-touched"));
+  }
+
+  // The memory cache still works; only disk persistence is disabled.
+  const QString key = QString::fromLatin1(
+      QCryptographicHash::hash(
+          QByteArrayLiteral("outside-home-intermediate-symlink-key"),
+          QCryptographicHash::Sha256)
+          .toHex());
+  cache.store(key, makeEntry(QByteArrayLiteral("payload-bytes")));
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+}
+
+void AssetCacheTests::
     cleanInstallWithEntirelyMissingCacheHierarchyIsCreatedSecurely() {
   // Round-9+ review (MEDIUM, "clean install"): the default cache
   // location's own ancestor components (everything the OS/desktop
@@ -2295,4 +2395,114 @@ void AssetCacheTests::
   QVERIFY(revived.has_value());
   QCOMPARE(revived->encodedBytes,
            QByteArrayLiteral("still-live-on-disk-bytes"));
+}
+
+void AssetCacheTests::
+    invalidateWithAlreadyLatchedDiskDisabledReportsPersistenceFailedNotDurable() {
+  // Round-N+ review (HIGH, repeat finding): deleteEntry()'s OLD guard
+  // for the PRE-latched case -- `if (m_diskCacheDisabled) return {true,
+  // true};`, unconditionally, regardless of WHY or WHEN it was latched
+  // -- let a manifest that genuinely still exists on the ORIGINAL root
+  // object "revive" once a fresh instance (or this very config, fixed)
+  // opens it again. This test latches m_diskCacheDisabled via an
+  // EARLIER, unrelated disk-touching call (lookupDisk() for a different
+  // key, after the same root-replacement the test above exercises) --
+  // so the LATER invalidate(key) call below hits the pre-latched branch
+  // (m_diskCacheDisabled already true going in) rather than freshly
+  // discovering the failure itself, which is the specific gap this
+  // round closes.
+  const QString cacheRoot =
+      m_tempDirPath + QStringLiteral("/invalidate-prelatched-root");
+  QVERIFY(
+      QDir(m_tempDirPath).mkpath(QStringLiteral("invalidate-prelatched-root")));
+
+  AssetCache cache(configFor(cacheRoot));
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/prelatched.png")));
+  cache.store(key, makeEntry(QByteArrayLiteral("still-live-prelatched-bytes")));
+  QVERIFY(cache.lookupDisk(key).has_value());
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString renamedAwayRoot =
+      m_tempDirPath +
+      QStringLiteral("/invalidate-prelatched-root-renamed-away");
+  QVERIFY(QDir().rename(cacheRoot, renamedAwayRoot));
+  QVERIFY(
+      QDir(m_tempDirPath).mkpath(QStringLiteral("invalidate-prelatched-root")));
+
+  // An EARLIER, unrelated disk-touching call latches m_diskCacheDisabled
+  // now, for an entirely different key -- this is the call that
+  // actually discovers the root replacement.
+  const QString otherKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/prelatched-other.png")));
+  QVERIFY(!cache.lookupDisk(otherKey).has_value());
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  // THIS is the call under test: m_diskCacheDisabled is ALREADY true
+  // going in, so this exercises the pre-latched early-return branch,
+  // not a fresh verifyRootAnchorLocked() failure.
+  const AssetCache::InvalidateResult result = cache.invalidate(key);
+  QCOMPARE(result, AssetCache::InvalidateResult::PersistenceFailed);
+
+  // The manifest this call never actually touched must still be fully
+  // intact under the ORIGINAL (renamed-away) directory.
+  AssetCache freshCacheOverOriginal(configFor(renamedAwayRoot));
+  const auto revived = freshCacheOverOriginal.lookupDisk(key);
+  QVERIFY(revived.has_value());
+  QCOMPARE(revived->encodedBytes,
+           QByteArrayLiteral("still-live-prelatched-bytes"));
+}
+
+void AssetCacheTests::
+    unreadableNestedSubtreeDisablesPersistenceRatherThanReportingZeroUsage() {
+  // Round-N+ review (MEDIUM, repeat finding): sumUsageRelative()'s
+  // recursive walk used to silently treat an unopenable/unreadable
+  // subdirectory as contributing 0 bytes (and, at the top level,
+  // fdopendir() failing on the root itself as 0 for the ENTIRE tree) --
+  // letting a filesystem fault make an actually-full cache falsely
+  // report as empty, defeating quota enforcement. Plant a real entry
+  // (so the cache root's usage is genuinely non-zero to begin with),
+  // then a SEPARATE stray subdirectory whose contents cannot be
+  // enumerated (permission-based, exactly the same deterministic fault
+  // deleteEntryUnlinksManifestDurablyEvenWhenPrefixEnumerationCannotBeCompleted()
+  // above already relies on: revoke read, keep write+exec, which blocks
+  // opendir()/readdir() while by-name operations on the PARENT
+  // continue to work). diskUsageBytes() must now report 0 AND
+  // permanently disable disk persistence for this instance -- an
+  // indeterminate result, never a number a caller could mistake for
+  // "actually empty".
+  AssetCache cache(configFor(m_tempDirPath));
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/unreadable-subtree.png")));
+  cache.store(key, makeEntry(QByteArray(256, 'q')));
+  QVERIFY(cache.lookupDisk(key).has_value());
+  QVERIFY(cache.diskUsageBytes() > qint64(0));
+
+  const QString unreadableSubtreeDir =
+      m_tempDirPath + QStringLiteral("/unreadable-subtree");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("unreadable-subtree")));
+  {
+    QFile nested(unreadableSubtreeDir + QStringLiteral("/nested-file.bin"));
+    QVERIFY(nested.open(QIODevice::WriteOnly));
+    nested.write(QByteArray(128, 'r'));
+  }
+
+  struct ScopedDirectoryPermissionLock {
+    QString path;
+    ~ScopedDirectoryPermissionLock() {
+      QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner |
+                                      QFile::ExeOwner);
+    }
+  } permissionGuard{unreadableSubtreeDir};
+  // -wx: write + execute, but deliberately NO read -- blocks
+  // opendir()/readdir() enumeration of THIS subdirectory's own
+  // contents specifically (the cache root itself, and every OTHER
+  // entry directly inside it, remains fully listable).
+  QVERIFY(QFile::setPermissions(unreadableSubtreeDir,
+                                QFile::WriteOwner | QFile::ExeOwner));
+  QVERIFY(QDir(unreadableSubtreeDir).entryList(QDir::NoDotAndDotDot).isEmpty());
+
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
 }
