@@ -12,6 +12,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStandardPaths>
+#include <QVector>
 #include <algorithm>
 #include <atomic>
 #include <climits>
@@ -2268,6 +2269,13 @@ struct RootAuthority {
   QCache<QString, AssetCache::CachedEntry> memory;
   QHash<QString, quint64> keyIssuedGeneration;
   QHash<QString, quint64> keyAppliedGeneration;
+  // Independent cumulative re-review (HIGH, "root authority... m_key
+  // issued/applied maps never prune"): shared "last touched" real
+  // steady-clock-ms bookkeeping for
+  // touchAndPruneKeyGenerationMapsLocked()'s bounded eviction -- see its
+  // own comment in AssetCache.h. Repointed alongside
+  // keyIssuedGeneration/keyAppliedGeneration above.
+  QHash<QString, qint64> keyGenerationLastTouchSteadyMs;
   // Cumulative review (independent re-review, HIGH, "negative 404 is
   // coordinator-local and can hide sibling-populated cache"): the
   // shared negative-404 tombstone map -- see AssetCache::
@@ -2663,6 +2671,12 @@ AssetCache::AssetCache(Config config) : m_config(std::move(config)) {
           m_memory = &authority->memory;
           m_keyIssuedGeneration = &authority->keyIssuedGeneration;
           m_keyAppliedGeneration = &authority->keyAppliedGeneration;
+          // Independent cumulative re-review (HIGH, "root authority...
+          // m_key issued/applied maps never prune"): repoint the shared
+          // touch-order bookkeeping too, exactly like the two fields
+          // immediately above.
+          m_keyGenerationLastTouchSteadyMs =
+              &authority->keyGenerationLastTouchSteadyMs;
           // Cumulative review (independent re-review, HIGH, "negative
           // 404 is coordinator-local and can hide sibling-populated
           // cache"): repoint m_negative404 too, exactly like the three
@@ -2854,6 +2868,7 @@ quint64 AssetCache::nextAccessSequenceLocked() {
 quint64 AssetCache::issueKeyGenerationLocked(const QString &key) {
   const quint64 next = m_keyIssuedGeneration->value(key, 0) + 1;
   (*m_keyIssuedGeneration)[key] = next;
+  touchAndPruneKeyGenerationMapsLocked(key);
   return next;
 }
 
@@ -3005,10 +3020,57 @@ bool AssetCache::tryApplyKeyGenerationLocked(const QString &key,
     // participant might still legitimately need to satisfy.
     return true;
   }
+  // Independent cumulative re-review (HIGH, "root authority... compare
+  // to highest ISSUED, not applied"): a literal "reject whenever ANY
+  // strictly newer token has ever been issued, regardless of whether it
+  // has applied (or even will ever apply)" reading was implemented and
+  // then measured against production-seam tests: it reintroduces a
+  // LIVELOCK for perfectly legitimate, non-conflicting concurrency --
+  // two independent operations that both legitimately resolve to the
+  // SAME cache key (e.g. two AssetKeys differing only by locale, both
+  // falling back to the same underlying candidate URL; see
+  // AssetRequestCoordinatorTests::
+  // keysDifferingOnlyByHostileLocaleContentNeverCoalesce(), which
+  // regressed under that reading) can each keep re-minting a fresh
+  // "highest issued" token that invalidates the other's still entirely
+  // legitimate, non-superseding fetch, forever, since re-minting a token
+  // is itself a side effect of this very rejection (see
+  // dispatchCandidateFetchResult()'s/dispatchRevalidationResult()'s
+  // staleRetryNeeded handling, which resnapshots -- and thus reissues --
+  // on rejection). A token being "issued" only records that SOME
+  // operation for `key` STARTED; it makes no claim about whether that
+  // operation will ever actually decide anything, so gating on it
+  // conflates "someone else is also looking at this key" with "someone
+  // else has superseded me," which are not the same thing.
+  //
+  // Comparing against the previously-APPLIED watermark instead -- this
+  // method's entire prior, and now restored, behavior -- is the
+  // textbook version-stamped optimistic-concurrency invariant: every
+  // successful apply strictly monotonically advances
+  // `m_keyAppliedGeneration[key]`, and EVERY subsequent apply attempt
+  // (regardless of arrival order) is compared against whatever that
+  // watermark holds AT THE MOMENT OF ITS OWN ATTEMPT, under this same
+  // mutex. This already gives exactly the property the review is
+  // actually chasing -- "an older, since-superseded result can never
+  // clobber something a newer operation already established" -- because
+  // any token that has already lost a race to apply first necessarily
+  // leaves a HIGHER watermark behind for every later token to be
+  // compared against; a token can only ever succeed by being
+  // numerically >= whatever has actually been durably decided so far,
+  // never merely by being un-preceded by a rival's mere issuance. The
+  // three concrete defects this review's "compare to issued" framing was
+  // actually describing -- an ungated clearNegative404() call preceding
+  // store()'s own CAS, and dispatch delivering/advancing on a result its
+  // OWN CAS had already rejected as SkippedStaleGeneration -- are fixed
+  // directly at their call sites (see store()'s and
+  // dispatch{CandidateFetchResult,RevalidationResult}()'s own comments)
+  // and do not require (and are actively undermined by) this comparison
+  // itself becoming issued-based.
   if (issuedGeneration < currentKeyGenerationLocked(key)) {
     return false;
   }
   (*m_keyAppliedGeneration)[key] = issuedGeneration;
+  touchAndPruneKeyGenerationMapsLocked(key);
   return true;
 }
 
@@ -3030,6 +3092,66 @@ void AssetCache::advanceKeyGenerationPastAllIssuedLocked(const QString &key) {
   // remain permanently unable to satisfy the new watermark.
   if (m_keyIssuedGeneration->value(key, 0) < newWatermark) {
     (*m_keyIssuedGeneration)[key] = newWatermark;
+  }
+  touchAndPruneKeyGenerationMapsLocked(key);
+}
+
+qint64 AssetCache::keyGenerationIdleNowMs() {
+  // Independent cumulative re-review (HIGH, "root authority... Track
+  // in-flight tokens and bounded prune"): deliberately a REAL
+  // std::chrono::steady_clock reading, never the caller-suppliable
+  // "nowMonotonicMs" negative404 uses elsewhere in this class -- see
+  // touchAndPruneKeyGenerationMapsLocked()'s own comment for why a
+  // test-controllable clock would defeat this safeguard's entire
+  // purpose (a test -- or, in principle, anything else that could
+  // influence a caller-supplied timestamp -- could otherwise fast-
+  // forward eviction eligibility for a key with a genuinely
+  // still-outstanding token).
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void AssetCache::touchAndPruneKeyGenerationMapsLocked(const QString &key) {
+  const qint64 nowMs = keyGenerationIdleNowMs();
+  (*m_keyGenerationLastTouchSteadyMs)[key] = nowMs;
+  if (m_keyIssuedGeneration->size() <= m_maxTrackedKeyGenerationEntries) {
+    return;
+  }
+  // Gather eviction candidates: keys whose issued/applied watermarks are
+  // CURRENTLY EQUAL (no known outstanding gap) AND have been idle at
+  // least m_keyGenerationIdleEvictionThresholdMs -- see this method's
+  // own declaration comment in AssetCache.h for the full rationale on
+  // why BOTH conditions are required. Sorted oldest-touched first so
+  // eviction proceeds in genuine least-recently-used order among
+  // eligible keys.
+  QVector<QString> candidates;
+  candidates.reserve(m_keyIssuedGeneration->size());
+  for (auto it = m_keyIssuedGeneration->constBegin();
+       it != m_keyIssuedGeneration->constEnd(); ++it) {
+    const QString &candidateKey = it.key();
+    if (m_keyAppliedGeneration->value(candidateKey, 0) != it.value()) {
+      continue; // A genuinely outstanding gap -- never evict.
+    }
+    const qint64 lastTouchMs =
+        m_keyGenerationLastTouchSteadyMs->value(candidateKey, nowMs);
+    if (nowMs - lastTouchMs < m_keyGenerationIdleEvictionThresholdMs) {
+      continue; // Not idle long enough yet.
+    }
+    candidates.append(candidateKey);
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [this](const QString &lhs, const QString &rhs) {
+              return m_keyGenerationLastTouchSteadyMs->value(lhs, 0) <
+                     m_keyGenerationLastTouchSteadyMs->value(rhs, 0);
+            });
+  for (const QString &evictKey : std::as_const(candidates)) {
+    if (m_keyIssuedGeneration->size() <= m_maxTrackedKeyGenerationEntries) {
+      break;
+    }
+    m_keyIssuedGeneration->remove(evictKey);
+    m_keyAppliedGeneration->remove(evictKey);
+    m_keyGenerationLastTouchSteadyMs->remove(evictKey);
   }
 }
 
@@ -3891,11 +4013,16 @@ AssetCache::lookupDiskOnlyLocked(const QString &key) {
   return entry;
 }
 
-void AssetCache::store(const QString &key, CachedEntry entry,
-                       quint64 issuedGeneration) {
-  // See lookupMemory()'s identical check for the full rationale.
+AssetCache::MutationOutcome AssetCache::store(const QString &key,
+                                              CachedEntry entry,
+                                              quint64 issuedGeneration) {
+  // See lookupMemory()'s identical check for the full rationale. A fork
+  // makes this instance's own CAS bookkeeping untrustworthy -- see
+  // MutationOutcome::SkippedStaleGeneration's own comment for why this
+  // is the correct return here (never Applied, and never a silent
+  // no-op the caller cannot distinguish from a real success).
   if (hasForkedSinceConstruction()) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   if (!isValidKey(key)) {
     // Never let a malformed key reach payloadPath()/metadataPath() below
@@ -3904,7 +4031,7 @@ void AssetCache::store(const QString &key, CachedEntry entry,
     // under an untrusted key) keeps the invariant simple: an entry only
     // ever exists, in memory or on disk, under a key this cache itself
     // considers well-formed.
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
 
   const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -3926,6 +4053,15 @@ void AssetCache::store(const QString &key, CachedEntry entry,
       QCryptographicHash::hash(entry.encodedBytes, QCryptographicHash::Sha256)
           .toHex());
 
+  // Independent cumulative re-review (HIGH, "root authority... store has
+  // no token"): tracks whether disk persistence was genuinely EXPECTED
+  // to succeed (disk enabled, root anchor valid, payload within the
+  // on-disk size cap) but some phase of the multi-phase durable write
+  // below actually failed -- as opposed to disk persistence being
+  // intentionally skipped (disabled instance, oversized payload), which
+  // is not itself a failure at all. Drives this call's MutationOutcome
+  // return.
+  bool diskPersistenceFailed = false;
   {
     QMutexLocker locker(m_mutex);
     // Cumulative review (independent re-review, HIGH, "shared root
@@ -3936,8 +4072,19 @@ void AssetCache::store(const QString &key, CachedEntry entry,
     // this ENTIRE publish to be dropped as stale, never a partial
     // memory-only (or disk-only) apply.
     if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
-      return;
+      return MutationOutcome::SkippedStaleGeneration;
     }
+    // Independent cumulative re-review (HIGH, "root authority...
+    // Unversioned clearNegative404 before CAS"): clear any shared
+    // negative-404 tombstone for `key` HERE, from WITHIN the exact same
+    // locked critical section the CAS check immediately above just
+    // passed -- never as a separate, later, ungated call (see
+    // clearNegative404()'s own comment for the exact race this closes).
+    // A fresh, CAS-confirmed success is always allowed to clear a stale
+    // absence record, regardless of what generation it was recorded
+    // under, since this store() call itself just passed the identical
+    // CAS check that any negative404 write would also have had to pass.
+    m_negative404->remove(key);
     auto *heapEntry = new CachedEntry(entry);
     m_memory->insert(key, heapEntry, static_cast<qsizetype>(entry.costBytes()));
 
@@ -4025,6 +4172,16 @@ void AssetCache::store(const QString &key, CachedEntry entry,
             removeFileRelative(m_rootFd, genPayloadPath);
           }
         }
+        if (!phase1Ok) {
+          // Independent cumulative re-review (HIGH, "root authority...
+          // Create atomic success/304/404 authority methods returning
+          // Applied/SkippedStale/PersistenceFailed"): either the payload
+          // write or the metadata write genuinely failed -- disk
+          // persistence was genuinely expected to work on this code path
+          // (disk enabled, root anchor valid, payload within the
+          // on-disk size cap) but did not.
+          diskPersistenceFailed = true;
+        }
 
         if (phase1Ok) {
           // Round-4/5 review item 4/10: REQUIRED barrier #1 -- fsync the
@@ -4045,6 +4202,7 @@ void AssetCache::store(const QString &key, CachedEntry entry,
             removeFileRelative(m_rootFd, genPayloadPath);
             removeFileRelative(m_rootFd, genMetadataPath);
             phase1Ok = false;
+            diskPersistenceFailed = true;
           }
         }
 
@@ -4092,6 +4250,15 @@ void AssetCache::store(const QString &key, CachedEntry entry,
                   << "AssetCache: directory fsync failed after publishing"
                   << key
                   << "-- retaining previous generation as a durability hedge";
+              // Independent cumulative re-review (HIGH, "root
+              // authority... PersistenceFailed"): the manifest rename
+              // itself already succeeded at the syscall level (this
+              // generation IS now what it names), but this fsync could
+              // not confirm that rename is durable across a crash -- see
+              // PersistenceFailed's own comment: the in-memory publish
+              // above is fine to use for THIS request, but must not be
+              // assumed durable.
+              diskPersistenceFailed = true;
             }
           } else {
             // Manifest publish failed: this generation's files become
@@ -4100,6 +4267,7 @@ void AssetCache::store(const QString &key, CachedEntry entry,
             // any) remains untouched and still live.
             removeFileRelative(m_rootFd, genPayloadPath);
             removeFileRelative(m_rootFd, genMetadataPath);
+            diskPersistenceFailed = true;
           }
         }
       }
@@ -4126,23 +4294,25 @@ void AssetCache::store(const QString &key, CachedEntry entry,
   if (!m_diskCacheDisabled && diskUsageBytes() > highWaterMark) {
     reapAndEnforceQuota();
   }
+  return diskPersistenceFailed ? MutationOutcome::PersistenceFailed
+                               : MutationOutcome::Applied;
 }
 
-void AssetCache::touchAfterNotModified(const QString &key,
-                                       const QString &newEtag,
-                                       const QString &newLastModified,
-                                       quint64 issuedGeneration) {
+AssetCache::MutationOutcome
+AssetCache::touchAfterNotModified(const QString &key, const QString &newEtag,
+                                  const QString &newLastModified,
+                                  quint64 issuedGeneration) {
   // See lookupMemory()'s identical check for the full rationale.
   if (hasForkedSinceConstruction()) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   if (m_diskCacheDisabled) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   if (!isValidKey(key)) {
     // Never let a malformed key reach manifestPath()/
     // generationMetadataPath() below -- see isValidKey()'s comment.
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   QMutexLocker locker(m_mutex);
   // Cumulative review (independent re-review, HIGH, "shared root
@@ -4151,10 +4321,10 @@ void AssetCache::touchAfterNotModified(const QString &key,
   // issued must drop this ENTIRE publish (memory refresh included),
   // never leave a stale disk metadata rewrite or memory touch behind.
   if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   if (!verifyRootAnchorLocked()) {
-    return;
+    return MutationOutcome::PersistenceFailed;
   }
   const std::optional<QString> generation = readManifestGeneration(key);
   const std::optional<DiskMetadata> metadata =
@@ -4170,7 +4340,7 @@ void AssetCache::touchAfterNotModified(const QString &key,
     // lookupDisk() does; a subsequent lookup will simply miss and
     // refetch from scratch.
     (void)deleteEntry(key);
-    return;
+    return MutationOutcome::PersistenceFailed;
   }
   DiskMetadata refreshed = *metadata;
   refreshed.lastAccessMsecsSinceEpoch = QDateTime::currentMSecsSinceEpoch();
@@ -4188,7 +4358,8 @@ void AssetCache::touchAfterNotModified(const QString &key,
   // only its metadata (etag/lastModified/lastAccess) is rewritten in
   // place, atomically, via the same generation-scoped file; the
   // manifest is untouched since the live generation hasn't changed.
-  (void)writeMetadata(generationMetadataPath(key, *generation), refreshed);
+  const bool metadataWritten =
+      writeMetadata(generationMetadataPath(key, *generation), refreshed);
 
   if (CachedEntry *entry = m_memory->object(key)) {
     entry->lastAccessMsecsSinceEpoch = refreshed.lastAccessMsecsSinceEpoch;
@@ -4199,23 +4370,28 @@ void AssetCache::touchAfterNotModified(const QString &key,
       entry->lastModified = newLastModified;
     }
   }
+  return metadataWritten ? MutationOutcome::Applied
+                         : MutationOutcome::PersistenceFailed;
 }
 
-void AssetCache::updateMemoryDecodedImage(const QString &key,
-                                          const QImage &image,
-                                          quint64 issuedGeneration) {
+AssetCache::MutationOutcome
+AssetCache::updateMemoryDecodedImage(const QString &key, const QImage &image,
+                                     quint64 issuedGeneration) {
   // See lookupMemory()'s identical check for the full rationale.
   if (hasForkedSinceConstruction()) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   QMutexLocker locker(m_mutex);
   // See store()'s identical check for the full rationale.
   if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   CachedEntry *existing = m_memory->object(key);
   if (!existing) {
-    return; // evicted since the caller's lookup; a later lookup redecodes
+    return MutationOutcome::Applied; // evicted since the caller's lookup;
+                                     // a later lookup redecodes -- the CAS
+                                     // itself still succeeded, there is
+                                     // simply nothing left to patch.
   }
   // A full copy-then-reinsert (rather than mutating *existing in place)
   // is required here, unlike touchAfterNotModified()'s in-place field
@@ -4225,13 +4401,15 @@ void AssetCache::updateMemoryDecodedImage(const QString &key,
   auto *updated = new CachedEntry(*existing);
   updated->decodedImage = image;
   m_memory->insert(key, updated, static_cast<qsizetype>(updated->costBytes()));
+  return MutationOutcome::Applied;
 }
 
-void AssetCache::promoteToMemory(const QString &key, CachedEntry entry,
-                                 quint64 issuedGeneration) {
+AssetCache::MutationOutcome
+AssetCache::promoteToMemory(const QString &key, CachedEntry entry,
+                            quint64 issuedGeneration) {
   // See lookupMemory()'s identical check for the full rationale.
   if (hasForkedSinceConstruction()) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   if (!isValidKey(key)) {
     // Unlike lookupDisk()/store()/touchAfterNotModified(), this method
@@ -4242,16 +4420,17 @@ void AssetCache::promoteToMemory(const QString &key, CachedEntry entry,
     // Silently accepting anything else here would let this one method
     // create an inconsistency future callers/entry points can't rely on
     // -- see isValidKey()'s comment.
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   QMutexLocker locker(m_mutex);
   // See store()'s identical check for the full rationale.
   if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
-    return;
+    return MutationOutcome::SkippedStaleGeneration;
   }
   auto *heapEntry = new CachedEntry(std::move(entry));
   m_memory->insert(key, heapEntry,
                    static_cast<qsizetype>(heapEntry->costBytes()));
+  return MutationOutcome::Applied;
 }
 
 AssetCache::InvalidateResult AssetCache::invalidate(const QString &key) {
@@ -4720,6 +4899,11 @@ int AssetCache::diskEntryCount() const {
 int AssetCache::negative404RecordCountForTesting() const {
   QMutexLocker locker(m_mutex);
   return m_negative404->size();
+}
+
+int AssetCache::trackedKeyGenerationEntryCountForTesting() const {
+  QMutexLocker locker(m_mutex);
+  return m_keyIssuedGeneration->size();
 }
 
 bool AssetCache::hasNegative404ForTesting(const QString &key,

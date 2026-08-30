@@ -11,6 +11,8 @@
 #include <QSize>
 #include <QString>
 #include <QUrl>
+#include <chrono>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -321,6 +323,54 @@ public:
   static constexpr quint64 kUnconditionalGeneration =
       (std::numeric_limits<quint64>::max)();
 
+  // Independent cumulative re-review (HIGH, "root authority... Create
+  // atomic success/304/404 authority methods returning Applied/
+  // SkippedStale/PersistenceFailed"): the typed outcome every CAS-gated
+  // mutating method below (store()/touchAfterNotModified()/
+  // promoteToMemory()/updateMemoryDecodedImage()) now returns, replacing
+  // their previous `void` return -- a caller (in production, exclusively
+  // AssetRequestCoordinator) MUST inspect this and never treat its own
+  // raw network/candidate result as authoritative once it sees
+  // SkippedStaleGeneration: a same-root sibling already applied
+  // something strictly newer for this exact key, so this call's own
+  // publish was correctly discarded, and the caller must re-derive
+  // whatever it delivers to its own consumers from the cache's CURRENT
+  // state instead (see AssetRequestCoordinator::advanceCandidates()),
+  // never from the stale result it already has in hand. This closes the
+  // exact defect class the review identified: previously every one of
+  // these methods silently no-op'd on a failed CAS with no way for the
+  // caller to tell "genuinely applied" apart from "silently discarded as
+  // stale", so a coordinator dispatch routine could (and did) go on to
+  // deliver its own already-known-stale network result to its
+  // subscribers, or drive a 404-triggered candidate-fallback decision,
+  // regardless of whether the shared authority actually accepted the
+  // publish at all.
+  enum class MutationOutcome {
+    Applied,                // The CAS succeeded and this mutation is now
+                            // this key's current, authoritative state
+                            // (memory always; disk too, unless disk
+                            // persistence is disabled/degraded for this
+                            // instance, which is not itself a failure --
+                            // see PersistenceFailed's own comment for the
+                            // distinction).
+    SkippedStaleGeneration, // `issuedGeneration` was superseded by a
+                            // strictly newer generation some same-root
+                            // sibling already applied for this key
+                            // BEFORE this call could take effect; NEITHER
+                            // memory NOR disk state was touched at all.
+    PersistenceFailed,      // The CAS itself succeeded (this IS now the
+                            // authoritative in-memory state for this
+                            // key), but the accompanying durable disk
+                            // write genuinely failed (an fsync/rename/
+                            // metadata-write failure, never merely "disk
+                            // persistence is intentionally disabled for
+                            // this instance") -- the in-memory publish
+                            // this exact call produced is still safe for
+                            // a caller to use for ITS OWN, currently-in-
+                            // flight request, but must not be assumed
+                            // durable across a restart.
+  };
+
   // Mints and returns a fresh, strictly-increasing per-key ISSUANCE
   // token, shared across every same-process, same-root sibling
   // AssetCache instance (via the process-wide RootAuthority -- see its
@@ -443,11 +493,27 @@ public:
   void recordNegative404(const QString &key, quint64 issuedGeneration,
                          qint64 nowMonotonicMs, qint64 ttlMs);
 
-  // Unconditionally clears any shared negative-404 tombstone for `key`
-  // (called after a successful store() -- a fresh, CAS-confirmed success
-  // is always allowed to clear a stale absence record, regardless of
-  // generation ordering, since the store() call itself already passed
-  // the identical CAS check).
+  // Unconditionally (i.e. NOT gated by any generation/CAS check at all)
+  // clears any shared negative-404 tombstone for `key`.
+  //
+  // Independent cumulative re-review (HIGH, "root authority... Unversioned
+  // clearNegative404 before CAS"): production code must NEVER call this
+  // directly any more. store()'s own successful-CAS path now clears the
+  // tombstone itself, from WITHIN the exact same locked critical section
+  // its own tryApplyKeyGenerationLocked() CAS check just passed -- see
+  // store()'s own comment. Calling this SEPARATELY (as
+  // AssetRequestCoordinator's dispatch routines previously did,
+  // immediately before invoking store()) is unsound: it clears the
+  // tombstone unconditionally, with no generation check of its own,
+  // strictly BEFORE store()'s own CAS has even run -- so a caller whose
+  // OWN coordinator-local CAS happened to pass, but whose subsequent
+  // store() call is then itself rejected as stale (a same-root sibling
+  // applied something newer in between), would still have already
+  // erased a legitimate, currently-authoritative tombstone a sibling's
+  // fresher 404 had just recorded, with nothing left to restore it.
+  // Retained here only as a low-level, explicitly ungated primitive for
+  // direct test fixtures that need to manipulate negative-404 state
+  // without going through a full store() publish at all.
   void clearNegative404(const QString &key);
 
   // Fast path: memory-only lookup. Review item 11: on a hit, this ALSO
@@ -486,16 +552,28 @@ public:
   // AssetRequestCoordinator) must capture a real token via
   // issueKeyGeneration() at the moment it begins the operation that
   // produced `entry`, and pass that token here instead.
-  void store(const QString &key, CachedEntry entry,
-             quint64 issuedGeneration = kUnconditionalGeneration);
+  //
+  // Independent cumulative re-review (HIGH, "root authority... store has
+  // no token" / "Unversioned clearNegative404 before CAS"): returns
+  // MutationOutcome (see its own comment) instead of the previous
+  // `void` -- a real caller MUST inspect this before treating `entry` as
+  // this key's new authoritative state. On Applied/PersistenceFailed,
+  // this call ALSO clears any shared negative-404 tombstone for `key`,
+  // from within the exact same locked, CAS-guarded critical section that
+  // just confirmed `issuedGeneration` is current -- never as a separate,
+  // ungated call (see clearNegative404()'s own comment for why that was
+  // unsound).
+  [[nodiscard]] MutationOutcome
+  store(const QString &key, CachedEntry entry,
+        quint64 issuedGeneration = kUnconditionalGeneration);
 
   // After a successful conditional (304) response: refresh lastAccess (and
   // optionally a renewed ETag/Last-Modified) without touching the payload
   // bytes at all.
   //
-  // See store()'s comment for `issuedGeneration`'s exact contract and
-  // default.
-  void
+  // See store()'s comment for `issuedGeneration`'s exact contract,
+  // default, and MutationOutcome return.
+  [[nodiscard]] MutationOutcome
   touchAfterNotModified(const QString &key, const QString &newEtag,
                         const QString &newLastModified,
                         quint64 issuedGeneration = kUnconditionalGeneration);
@@ -510,9 +588,11 @@ public:
   // encodedBytes/metadata are ever persisted to disk), so a later
   // lookupMemory() hit for the same key does not need to redecode.
   //
-  // See store()'s comment for `issuedGeneration`'s exact contract and
-  // default.
-  void
+  // See store()'s comment for `issuedGeneration`'s exact contract,
+  // default, and MutationOutcome return (this method never touches disk,
+  // so it can only ever return Applied or SkippedStaleGeneration, never
+  // PersistenceFailed).
+  [[nodiscard]] MutationOutcome
   updateMemoryDecodedImage(const QString &key, const QImage &image,
                            quint64 issuedGeneration = kUnconditionalGeneration);
 
@@ -528,10 +608,13 @@ public:
   // a subsequent same-process request short-circuits via lookupMemory()
   // instead of repeating the conditional GET.
   //
-  // See store()'s comment for `issuedGeneration`'s exact contract and
-  // default.
-  void promoteToMemory(const QString &key, CachedEntry entry,
-                       quint64 issuedGeneration = kUnconditionalGeneration);
+  // See store()'s comment for `issuedGeneration`'s exact contract,
+  // default, and MutationOutcome return (this method never touches disk
+  // either, so it too can only ever return Applied or
+  // SkippedStaleGeneration).
+  [[nodiscard]] MutationOutcome
+  promoteToMemory(const QString &key, CachedEntry entry,
+                  quint64 issuedGeneration = kUnconditionalGeneration);
 
   // Round-6 item 6: whether invalidate() managed to durably commit
   // `key`'s tombstone -- i.e. whether the manifest naming its live
@@ -703,6 +786,53 @@ public:
   void setMaxTrackedNegative404EntriesForTesting(int maxEntries) {
     m_maxTrackedNegative404Entries =
         maxEntries > 0 ? maxEntries : kMaxTrackedNegative404Entries;
+  }
+
+  // Independent cumulative re-review (HIGH, "root authority... m_key
+  // issued/applied maps never prune"): the shared issuance/applied-
+  // watermark maps (keyIssuedGeneration/keyAppliedGeneration -- see
+  // issueKeyGeneration()'s own comment) previously grew, entirely
+  // unbounded, by one entry per distinct cache key EVER seen for this
+  // root's entire process lifetime -- unlike m_negative404, which
+  // already bounds itself via recordNegative404()'s own opportunistic
+  // sweep+hard-cap. pruneKeyGenerationMapsLocked() (see the .cpp) now
+  // performs the equivalent bounded eviction here, opportunistically,
+  // whenever a fresh issuance/apply pushes the map over
+  // kMaxTrackedKeyGenerationEntries -- but, unlike negative404 (which
+  // has no ordering-correctness dependency on any individual record's
+  // survival), this eviction is restricted to only ever remove a key
+  // whose issued and applied watermarks are CURRENTLY EQUAL (i.e.
+  // nothing is known to be outstanding for it at the moment of the
+  // sweep), oldest-touched first, so a key with a genuinely in-flight
+  // (issued-but-not-yet-applied) token is never evicted regardless of
+  // how large the map grows or how long ago that key was last touched.
+  [[nodiscard]] int trackedKeyGenerationEntryCountForTesting() const;
+  // Overrides the production ceiling (kMaxTrackedKeyGenerationEntries)
+  // the same way setMaxTrackedNegative404EntriesForTesting() does. 0
+  // restores the production default.
+  void setMaxTrackedKeyGenerationEntriesForTesting(int maxEntries) {
+    m_maxTrackedKeyGenerationEntries =
+        maxEntries > 0 ? maxEntries : kMaxTrackedKeyGenerationEntries;
+  }
+  // Independent cumulative re-review (HIGH, "root authority... Track
+  // in-flight tokens and bounded prune"):
+  // touchAndPruneKeyGenerationMapsLocked() (see its own .cpp comment)
+  // additionally requires a key to have been quiescent for at least this many
+  // milliseconds, by a real std::chrono::steady_clock reading (see
+  // keyGenerationIdleNowMs()), before it becomes eviction-eligible -- a large
+  // default (see kDefaultKeyGenerationIdleEvictionThresholdMs) makes it
+  // overwhelmingly implausible for any genuinely still-outstanding real network
+  // operation (bounded by this project's own request timeouts, always
+  // far shorter) to still be in flight for a key by the time it is
+  // considered idle enough to evict its bookkeeping. Settable to a tiny
+  // value (e.g. 0) purely so a test can exercise the eviction path
+  // itself deterministically, without a real sleep.
+  static constexpr qint64 kDefaultKeyGenerationIdleEvictionThresholdMs =
+      15 * 60 * 1000;
+  void setKeyGenerationIdleEvictionThresholdMsForTesting(qint64 thresholdMs) {
+    m_keyGenerationIdleEvictionThresholdMs =
+        thresholdMs >= 0 ? thresholdMs
+                         : kDefaultKeyGenerationIdleEvictionThresholdMs;
   }
 
   // Test-only exposure of this cache's on-disk generation/manifest
@@ -1099,6 +1229,47 @@ private:
   // watermark (never permanently stuck behind it). Callers must already
   // hold m_mutex.
   void advanceKeyGenerationPastAllIssuedLocked(const QString &key);
+  // Independent cumulative re-review (HIGH, "root authority... m_key
+  // issued/applied maps never prune"): records `key`'s entry in the
+  // shared "last touched" real steady-clock-ms map
+  // (m_keyGenerationLastTouchSteadyMs) as touched right now, then, only
+  // once the tracked-key count exceeds kMaxTrackedKeyGenerationEntries,
+  // evicts the oldest-touched keys down to a low-water mark -- but ONLY
+  // keys that satisfy BOTH of:
+  //   (1) issued == applied watermark (no known outstanding gap -- see
+  //       tryApplyKeyGenerationLocked()'s own comment for why an older,
+  //       still-outstanding issued token must never be allowed to
+  //       silently regain the ability to publish after eviction), AND
+  //   (2) idle for at least m_keyGenerationIdleEvictionThresholdMs by a
+  //       REAL std::chrono::steady_clock reading (keyGenerationIdleNowMs()
+  //       -- never the caller-supplied, test-fakeable "nowMonotonicMs"
+  //       negative404 uses, since that value is under a TEST's control
+  //       and could otherwise be used to defeat this safeguard).
+  // Condition (1) alone is not sufficient by itself to prove no
+  // operation is still genuinely in flight for a key (AssetCache has no
+  // visibility into AssetRequestCoordinator's own live candidate/
+  // operation bookkeeping) -- condition (2)'s generous default (15
+  // minutes, kDefaultKeyGenerationIdleEvictionThresholdMs) makes it
+  // implausible for any real network operation (bounded by this
+  // project's own, far shorter, request timeouts) to still be
+  // outstanding for a key by the time its bookkeeping becomes
+  // eviction-eligible. This is a documented, bounded residual risk
+  // rather than an airtight proof (a true airtight fix would require
+  // AssetRequestCoordinator to explicitly report its own live in-flight
+  // key set down into AssetCache, which is out of scope for this fix),
+  // consistent with the "STATX_MNT_ID unavailable" fallback documented
+  // elsewhere in this class.
+  // Called from issueKeyGenerationLocked() and
+  // tryApplyKeyGenerationLocked() -- the only two places that ever touch
+  // a key's issued/applied watermark -- so every key that is ever
+  // issued or applied at all is covered. Callers must already hold
+  // m_mutex.
+  void touchAndPruneKeyGenerationMapsLocked(const QString &key);
+  // Real (never test-fakeable) std::chrono::steady_clock reading in
+  // milliseconds, used exclusively by touchAndPruneKeyGenerationMapsLocked()'s
+  // idle-eviction-eligibility check -- see its own comment for why this
+  // must be independent of any caller-suppliable clock.
+  [[nodiscard]] static qint64 keyGenerationIdleNowMs();
   // Round-4/5 review item 4: mints a fresh, unique generation identifier
   // for a single store() transaction -- see DiskMetadata::generationId's
   // comment for why this must be independent of the payload's own
@@ -1263,6 +1434,17 @@ private:
   QHash<QString, quint64> *m_keyAppliedGeneration{
       &m_privateKeyAppliedGenerationFallback};
   QHash<QString, quint64> m_privateKeyAppliedGenerationFallback;
+  // Independent cumulative re-review (HIGH, "root authority... m_key
+  // issued/applied maps never prune"): the shared "last touched" real
+  // steady-clock-ms map touchAndPruneKeyGenerationMapsLocked() uses to
+  // decide both eviction ORDER (oldest-touched first) and eviction
+  // ELIGIBILITY (only once idle at least
+  // m_keyGenerationIdleEvictionThresholdMs) -- see its own comment.
+  // Repointed alongside m_keyIssuedGeneration/m_keyAppliedGeneration
+  // above (same RootAuthority, same sharing rules).
+  QHash<QString, qint64> *m_keyGenerationLastTouchSteadyMs{
+      &m_privateKeyGenerationLastTouchSteadyMsFallback};
+  QHash<QString, qint64> m_privateKeyGenerationLastTouchSteadyMsFallback;
   // Cumulative review (independent re-review, HIGH, "negative 404 is
   // coordinator-local and can hide sibling-populated cache"): the
   // shared negative-404 tombstone map -- see NegativeCacheRecord's own
@@ -1279,6 +1461,16 @@ private:
   // RootAuthority either.
   static constexpr int kMaxTrackedNegative404Entries = 4096;
   int m_maxTrackedNegative404Entries{kMaxTrackedNegative404Entries};
+  // Independent cumulative re-review (HIGH, "root authority... m_key
+  // issued/applied maps never prune"): per-instance (never shared, same
+  // rationale as kMaxTrackedNegative404Entries above) ceiling on the
+  // shared keyIssuedGeneration/keyAppliedGeneration/
+  // keyGenerationLastTouchSteadyMs maps' combined size, enforced by
+  // touchAndPruneKeyGenerationMapsLocked().
+  static constexpr int kMaxTrackedKeyGenerationEntries = 4096;
+  int m_maxTrackedKeyGenerationEntries{kMaxTrackedKeyGenerationEntries};
+  qint64 m_keyGenerationIdleEvictionThresholdMs{
+      kDefaultKeyGenerationIdleEvictionThresholdMs};
   // Review round-3 item 9: an already-open, O_DIRECTORY|O_NOFOLLOW|
   // O_CLOEXEC descriptor for `m_directory`, opened once at construction
   // and retained for this instance's entire lifetime, together with the

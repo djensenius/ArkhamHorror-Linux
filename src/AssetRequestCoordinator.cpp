@@ -720,13 +720,23 @@ void AssetRequestCoordinator::completeCacheReadGroupOrQuarantine(
         // Cumulative review (independent re-review, HIGH, "shared root
         // authority incomplete"): thread each waiter's own, SEPARATE
         // AssetCache-level token through -- see GroupWaiter::
-        // assetCacheGeneration's comment.
-        m_cache.updateMemoryDecodedImage(cacheKey,
-                                         perWaiterOutcome->decodedImage,
-                                         waiter.assetCacheGeneration);
+        // assetCacheGeneration's comment. Both calls' MutationOutcome
+        // returns are deliberately discarded (never checked/acted upon)
+        // -- SkippedStaleGeneration here means only that a same-root
+        // sibling raced ahead and already replaced/invalidated this key
+        // in the interim, which is not itself a failure of anything:
+        // this waiter's OWN delivery below (perWaiterOutcome, the
+        // already-decoded, already-valid entry it looked up) is
+        // completely unaffected either way, and there is nothing further
+        // for this best-effort memory-cache republish to do once a
+        // newer sibling state already exists -- leaving that newer
+        // state undisturbed IS the correct outcome.
+        (void)m_cache.updateMemoryDecodedImage(cacheKey,
+                                               perWaiterOutcome->decodedImage,
+                                               waiter.assetCacheGeneration);
         if (promoteOnSuccess) {
-          m_cache.promoteToMemory(cacheKey, *perWaiterOutcome,
-                                  waiter.assetCacheGeneration);
+          (void)m_cache.promoteToMemory(cacheKey, *perWaiterOutcome,
+                                        waiter.assetCacheGeneration);
         }
       }
       completeOperation(waiter.operationId, std::move(perWaiterOutcome));
@@ -1030,17 +1040,39 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
   bool notFoundPersistenceFailed = false;
   bool isSuccess = false;
   std::optional<AssetCache::CachedEntry> successEntry;
+  // Independent cumulative re-review (HIGH, "root authority... dispatch
+  // ignores SkippedStale"): true whenever EITHER this coordinator's own
+  // local CAS (tryApplyCacheKeyMutation()) rejected this mutation as
+  // stale, OR the AssetCache-level call itself reports
+  // SkippedStaleGeneration/its InvalidateResult equivalent -- meaning a
+  // same-root sibling (this coordinator or a different one) already
+  // applied something strictly NEWER for this exact key before this
+  // result could take effect. In that case, NEITHER isDefinitiveNotFound
+  // NOR isSuccess/successEntry (however they were tentatively set above)
+  // may be delivered to any subscriber below: this result is stale and
+  // must be silently discarded in favor of a fresh resnapshot/retry of
+  // the SAME candidate (see the subscriber loop below), never
+  // interpreted as authoritative just because the raw network call
+  // itself happened to succeed or 404.
+  bool staleRetryNeeded = false;
 
   if (!result) {
     if (result.error().code == AssetErrorCode::NotFound) {
-      isDefinitiveNotFound = true;
       // See startCandidate()'s previous (pre-round-6-item-8) comment for
       // the full rationale: a definitive 404 both tombstones any
       // existing entry and records a negative-404, gated by the CAS
       // check so a stale 404 can never resurrect a negative record over
       // a cache key a more recently issued operation has already
       // populated with a genuinely fresh success.
-      if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+      if (!tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+        // Independent cumulative re-review (HIGH, "old404 after newer
+        // localized200 incorrectly advances fallback"): the
+        // coordinator-local CAS itself already rejected this as stale --
+        // isDefinitiveNotFound must NEVER be set from this branch in
+        // that case (it previously was, unconditionally, before this
+        // very check even ran).
+        staleRetryNeeded = true;
+      } else {
         // Cumulative review (independent re-review round-5, HIGH, "old
         // 404 can invalidate newer-issued/finished 200" / "negative 404
         // is coordinator-local and can hide sibling-populated cache"):
@@ -1060,8 +1092,19 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
                 cacheKey, assetCacheGeneration, m_monotonicNowMs(),
                 kNegative404TtlMs);
         if (invalidateResult ==
-            AssetCache::InvalidateResult::PersistenceFailed) {
+            AssetCache::InvalidateResult::SkippedStaleGeneration) {
+          // Independent cumulative re-review (HIGH, "dispatch ignores
+          // SkippedStale"): the AssetCache-level CAS rejected this too --
+          // this coordinator's own local CAS passing is not sufficient
+          // by itself; a same-root sibling's fresher success/invalidate
+          // already superseded this 404 at the shared-authority level.
+          staleRetryNeeded = true;
+        } else if (invalidateResult ==
+                   AssetCache::InvalidateResult::PersistenceFailed) {
           notFoundPersistenceFailed = true;
+          isDefinitiveNotFound = true;
+        } else {
+          isDefinitiveNotFound = true;
         }
       }
     }
@@ -1070,10 +1113,10 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
     // is unreachable in practice -- handled defensively only, exactly as
     // before.
   } else {
-    isSuccess = true;
     AssetCache::CachedEntry entry = toCachedEntry(*result->asset);
-    if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
-      m_cache.clearNegative404(cacheKey);
+    if (!tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+      staleRetryNeeded = true;
+    } else {
       // Cumulative review (independent re-review, HIGH, "shared root
       // authority incomplete", "store has no token"): thread the
       // SEPARATE, AssetCache-level token through -- see
@@ -1085,9 +1128,28 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
       // possibly-stale 200 from republishing, in addition to (never
       // instead of) tryApplyCacheKeyMutation()'s own, coordinator-local
       // protection above.
-      m_cache.store(cacheKey, entry, assetCacheGeneration);
+      //
+      // Independent cumulative re-review (HIGH, "Unversioned
+      // clearNegative404 before CAS"): store() itself now clears any
+      // shared negative-404 tombstone for `cacheKey`, from WITHIN its
+      // own CAS'd critical section, ONLY on a genuine (non-stale)
+      // apply -- never as a separate, earlier, ungated call here (the
+      // old `m_cache.clearNegative404(cacheKey);` call site immediately
+      // before store() has been removed entirely).
+      const AssetCache::MutationOutcome storeOutcome =
+          m_cache.store(cacheKey, entry, assetCacheGeneration);
+      if (storeOutcome == AssetCache::MutationOutcome::SkippedStaleGeneration) {
+        // Independent cumulative re-review (HIGH, "dispatch ignores
+        // SkippedStale"): the AssetCache-level CAS rejected this
+        // publish -- a same-root sibling already applied something
+        // strictly newer for this key. This coordinator-local CAS
+        // passing is not sufficient by itself.
+        staleRetryNeeded = true;
+      } else {
+        isSuccess = true;
+        successEntry = entry;
+      }
     }
-    successEntry = entry;
   }
 
   for (const quint64 subscriberId : subscribers) {
@@ -1097,6 +1159,24 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
     }
     Operation &operation = opIt.value();
     operation.pendingAttemptKey.clear();
+
+    if (staleRetryNeeded) {
+      // Independent cumulative re-review (HIGH, "root authority...
+      // dispatch on stale resnapshots/retries and never returns/
+      // advances"): this result must never be delivered, and the
+      // candidate index must never be advanced past the CURRENT
+      // candidate on account of it -- re-examine the SAME candidate
+      // completely fresh instead, via the exact same primitive used for
+      // the very first attempt. advanceCandidates() re-runs
+      // snapshotAndIssueGeneration() from scratch, so it will correctly
+      // observe whatever a same-root sibling actually published in the
+      // meantime (a fresh hit, an authoritative negative-404, or -- if
+      // truly nothing has changed yet -- simply issue a brand-new
+      // network fetch), never re-deriving a verdict from this now-
+      // discarded, already-stale result.
+      advanceCandidates(subscriberId);
+      continue;
+    }
 
     if (!result) {
       if (isDefinitiveNotFound) {
@@ -1252,6 +1332,17 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     StaleIfError,
     NotModifiedPromote,
     FreshReplace,
+    // Independent cumulative re-review (HIGH, "root authority... dispatch
+    // ignores SkippedStale"): either this coordinator's own local CAS
+    // (tryApplyCacheKeyMutation()) rejected this mutation as stale, or
+    // the AssetCache-level call itself reported
+    // SkippedStaleGeneration/its equivalent -- a same-root sibling
+    // already applied something strictly newer for this exact key
+    // before this result could take effect. This result must never be
+    // delivered to any subscriber, and the candidate index must never be
+    // advanced past the CURRENT candidate on account of it -- see the
+    // switch case below.
+    StaleRetryViaResnapshot,
   };
   Verdict verdict;
   AssetCache::CachedEntry freshEntry;
@@ -1262,7 +1353,10 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     // startRevalidation()'s previous (pre-round-6-item-8) comment for
     // the full rationale.
     bool persistenceFailed = false;
-    if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+    bool staleGeneration = false;
+    if (!tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+      staleGeneration = true;
+    } else {
       // Cumulative review (independent re-review round-5, HIGH, "old 404
       // can invalidate newer-issued/finished 200" / "negative 404 is
       // coordinator-local and can hide sibling-populated cache"): ONE
@@ -1273,12 +1367,19 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
           m_cache.invalidateAndRecordNegative404(cacheKey, assetCacheGeneration,
                                                  m_monotonicNowMs(),
                                                  kNegative404TtlMs);
-      if (invalidateResult == AssetCache::InvalidateResult::PersistenceFailed) {
+      if (invalidateResult ==
+          AssetCache::InvalidateResult::SkippedStaleGeneration) {
+        // Independent cumulative re-review (HIGH, "dispatch ignores
+        // SkippedStale"): the AssetCache-level CAS rejected this too.
+        staleGeneration = true;
+      } else if (invalidateResult ==
+                 AssetCache::InvalidateResult::PersistenceFailed) {
         persistenceFailed = true;
       }
     }
-    verdict = persistenceFailed ? Verdict::NotFoundFailedClosed
-                                : Verdict::NotFoundAdvance;
+    verdict = staleGeneration     ? Verdict::StaleRetryViaResnapshot
+              : persistenceFailed ? Verdict::NotFoundFailedClosed
+                                  : Verdict::NotFoundAdvance;
   } else if (!result) {
     // "Stale-if-error": every OTHER revalidation failure (transport
     // error, timeout, TLS failure, 5xx, an integrity/codec failure,
@@ -1291,7 +1392,10 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     // the 304 itself refreshed -- see startRevalidation()'s previous
     // comment for the full rationale, including why no separate "post-
     // touch generation" is needed.
-    if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+    bool staleGeneration = false;
+    if (!tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+      staleGeneration = true;
+    } else {
       // Cumulative review (independent re-review, HIGH, "shared root
       // authority incomplete"): thread the SEPARATE, AssetCache-level
       // token -- see dispatchCandidateFetchResult()'s identical
@@ -1300,11 +1404,18 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
       // sibling's concurrent invalidate() (a newer definitive 404, or a
       // newer fetch that already replaced this entry) now correctly
       // prevents this stale confirmation from clobbering it.
-      m_cache.touchAfterNotModified(cacheKey, result->refreshedEtag,
-                                    result->refreshedLastModified,
-                                    assetCacheGeneration);
+      const AssetCache::MutationOutcome touchOutcome =
+          m_cache.touchAfterNotModified(cacheKey, result->refreshedEtag,
+                                        result->refreshedLastModified,
+                                        assetCacheGeneration);
+      if (touchOutcome == AssetCache::MutationOutcome::SkippedStaleGeneration) {
+        // Independent cumulative re-review (HIGH, "dispatch ignores
+        // SkippedStale"): the AssetCache-level CAS rejected this too.
+        staleGeneration = true;
+      }
     }
-    verdict = Verdict::NotModifiedPromote;
+    verdict = staleGeneration ? Verdict::StaleRetryViaResnapshot
+                              : Verdict::NotModifiedPromote;
   } else if (!result->asset.has_value()) {
     // Defensive only: AssetNetworkFetcher never returns notModified==
     // false with an empty asset.
@@ -1313,10 +1424,20 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     // The origin sent a fresh 200 body despite our conditional headers
     // (its content genuinely changed): replace the cached entry.
     freshEntry = toCachedEntry(*result->asset);
-    if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
-      m_cache.store(cacheKey, freshEntry, assetCacheGeneration);
+    bool staleGeneration = false;
+    if (!tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+      staleGeneration = true;
+    } else {
+      const AssetCache::MutationOutcome storeOutcome =
+          m_cache.store(cacheKey, freshEntry, assetCacheGeneration);
+      if (storeOutcome == AssetCache::MutationOutcome::SkippedStaleGeneration) {
+        // Independent cumulative re-review (HIGH, "dispatch ignores
+        // SkippedStale"): the AssetCache-level CAS rejected this too.
+        staleGeneration = true;
+      }
     }
-    verdict = Verdict::FreshReplace;
+    verdict = staleGeneration ? Verdict::StaleRetryViaResnapshot
+                              : Verdict::FreshReplace;
   }
 
   // Round-9+ review item 3/7: accumulators for the batched, single-decode
@@ -1339,6 +1460,19 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     const AssetCache::CachedEntry stale = *operation.staleEntry;
 
     switch (verdict) {
+    case Verdict::StaleRetryViaResnapshot:
+      // Independent cumulative re-review (HIGH, "root authority...
+      // dispatch on stale resnapshots/retries and never returns/
+      // advances"): never deliver this discarded, already-stale result,
+      // and never advance operation.candidateIndex past the CURRENT
+      // candidate on account of it -- advanceCandidates() re-runs
+      // snapshotAndIssueGeneration() from scratch for the SAME index
+      // (it also resets isRevalidation/staleEntry, which this verdict
+      // implies should no longer apply), so it will correctly observe
+      // whatever a same-root sibling actually published in the
+      // meantime.
+      advanceCandidates(subscriberId);
+      break;
     case Verdict::NotFoundFailedClosed:
       completeOperation(subscriberId,
                         AssetOutcome<AssetCache::CachedEntry>(AssetError{

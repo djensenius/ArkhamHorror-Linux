@@ -3704,6 +3704,21 @@ void AssetRequestCoordinatorTests::
   // proves the production dispatch path -- not merely AssetCache's own
   // direct unit tests -- genuinely closes it, via a real, slow-dripped
   // in-flight HTTP fetch.
+  //
+  // Most recent independent re-review ("dispatch on stale resnapshots/
+  // retries and never returns/advances"): the correct response to a
+  // superseded in-flight result is NOT to permanently fail the
+  // operation as though the key were durably confirmed absent (this
+  // test's own prior assertion, before this fix) -- `cacheB.invalidate()`
+  // below only clears the entry; it never records a negative-404
+  // tombstone, so nothing has actually confirmed the resource is gone.
+  // The correct, and now-implemented, behavior is to discard the
+  // now-stale in-flight result and transparently RE-SNAPSHOT and
+  // RE-FETCH the SAME candidate from scratch, exactly as if this were a
+  // brand new request; a real, uncontested second round trip to the
+  // origin (proved below via a genuinely incremented requestCount(),
+  // never merely re-publishing the discarded first response's bytes)
+  // is what may legitimately republish afterward.
   MockHttpServer server;
   const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
   MockHttpServer::Response response;
@@ -3749,36 +3764,48 @@ void AssetRequestCoordinatorTests::
   QVERIFY(
       QTest::qWaitFor([&]() { return server.requestCount(path) > 0; }, 5000));
   QVERIFY(!result.has_value());
+  QCOMPARE(server.requestCount(path), 1);
 
-  // The sibling instance now durably invalidates this exact cache key --
-  // standing in for a second, independent coordinator/process that has
-  // already discovered and persisted a definitive, authoritative 404 for
-  // the identical resolved candidate while A's fetch is still in flight.
+  // The sibling instance now invalidates this exact cache key -- standing
+  // in for a second, independent coordinator/process that raced ahead of
+  // A (e.g. a corruption/quarantine recovery, or any other reason to
+  // clear the entry) while A's own fetch for the identical key is still
+  // in flight. Deliberately the plain invalidate() (never
+  // invalidateAndRecordNegative404()): nothing has actually confirmed
+  // this resource is gone, so a subsequent genuine re-fetch finding it
+  // still present and re-publishing it is entirely correct.
   QCOMPARE(cacheB.invalidate(cacheKey),
            AssetCache::InvalidateResult::DurablyInvalidated);
   QVERIFY(!cacheA.lookupDisk(cacheKey).has_value());
   QVERIFY(!cacheA.lookupMemory(cacheKey).has_value());
 
-  // Let A's in-flight, now-stale 200 finish arriving.
-  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+  // Let A's in-flight, now-stale 200 finish arriving, and its dispatch
+  // discard it and transparently re-snapshot/re-fetch the same
+  // candidate. Wait for the resulting SECOND real HTTP round trip to
+  // actually begin -- proving the stale result truly was discarded and
+  // a fresh network fetch genuinely followed, never merely a silent
+  // direct republish of the first, already-stale response.
+  QVERIFY(
+      QTest::qWaitFor([&]() { return server.requestCount(path) >= 2; }, 5000));
 
-  // A's own caller still genuinely receives its real network result --
-  // this fix must never suppress DELIVERY to the consumer who asked for
-  // it, only the stale CACHE PERSISTENCE that would otherwise resurrect
-  // a sibling's newer, authoritative invalidate().
+  // A's own caller still genuinely receives a real, valid network
+  // result -- this fix must never suppress DELIVERY to the consumer who
+  // asked for it, only the STALE cache persistence that would otherwise
+  // resurrect B's invalidate() with the discarded first response's
+  // bytes.
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
   QVERIFY2(bool(*result), qPrintable(result->error().message));
   QCOMPARE((**result).encodedBytes, response.body);
 
-  // Fail-before/pass-after: prior to threading assetCacheGeneration
-  // through dispatchCandidateFetchResult()'s store() call, A's stale
-  // success would unconditionally overwrite B's authoritative
-  // invalidate() the instant it completed. It must instead remain
-  // durably absent from disk and memory, from BOTH siblings' point of
-  // view, exactly as B left it.
-  QVERIFY(!cacheA.lookupDisk(cacheKey).has_value());
-  QVERIFY(!cacheB.lookupDisk(cacheKey).has_value());
-  QVERIFY(!cacheA.lookupMemory(cacheKey).has_value());
-  QVERIFY(!cacheB.lookupMemory(cacheKey).has_value());
+  // The fresh, uncontested re-fetch's own store() call is now free to
+  // publish normally (nothing raced IT), and both sibling instances
+  // observe the SAME, freshly re-published entry.
+  const auto diskEntryA = cacheA.lookupDisk(cacheKey);
+  QVERIFY(diskEntryA.has_value());
+  QCOMPARE(diskEntryA->encodedBytes, response.body);
+  const auto diskEntryB = cacheB.lookupDisk(cacheKey);
+  QVERIFY(diskEntryB.has_value());
+  QCOMPARE(diskEntryB->encodedBytes, response.body);
 }
 
 void AssetRequestCoordinatorTests::
@@ -3893,4 +3920,111 @@ void AssetRequestCoordinatorTests::
   // proof the confirmed-304 path, not some fallback full refetch, is
   // what actually ran.
   QCOMPARE(server.requestCount(path), 1);
+}
+
+void AssetRequestCoordinatorTests::
+    crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidationFreshReplacePreventsStaleOverwrite() {
+  // Companion to the two tests above, for dispatchRevalidationResult()'s
+  // FreshReplace (fresh-200-despite-conditional-headers) branch, which
+  // this same independent re-review's "compare to highest ISSUED, not
+  // applied"/"dispatch ignores SkippedStale" finding also specifically
+  // named (`store()`'s and `touchAfterNotModified()`'s calls in
+  // dispatchRevalidationResult() were BOTH previously ungated). A
+  // disk-hit-with-validators triggers a real conditional GET; the origin
+  // answers with a genuinely fresh 200 (its ETag no longer matches what
+  // the client sent), slow-dripped so there is a deterministic window in
+  // which a sibling AssetCache instance can durably invalidate AND
+  // republish an even-newer entry for the identical key before A's own
+  // stale 200 finishes arriving.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  // Deliberately not "v1-etag" (what A's conditional GET actually sends)
+  // -- guarantees the origin never answers 304, always the full fresh
+  // response below, exactly modelling "content genuinely changed since
+  // the client's cached validator."
+  response.etagForConditionalMatch =
+      QStringLiteral("\"unrelated-etag\"").toUtf8();
+  response.body = encodePng(8, 8);
+  response.slowDrip = true;
+  response.chunkSize = 32;
+  response.chunkDelayMs = 20;
+  server.setResponse(path, response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  {
+    // See crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidation
+    // PreventsStaleTouch()'s identical comment for why this seed instance
+    // must be scoped and destroyed before cacheA is constructed below.
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry v1;
+    v1.encodedBytes = encodePng(4, 4);
+    v1.contentType = QStringLiteral("image/png");
+    v1.dimensions = QSize(4, 4);
+    v1.etag = QStringLiteral("\"v1-etag\"");
+    QCOMPARE(seedCache.store(cacheKey, v1),
+             AssetCache::MutationOutcome::Applied);
+  }
+
+  AssetCache cacheA(cacheConfig);
+  AssetRequestCoordinator coordinatorA(cacheA, fetcher);
+
+  std::optional<Result> result;
+  coordinatorA.request(key, [&](Result r) { result = std::move(r); });
+
+  QVERIFY(
+      QTest::qWaitFor([&]() { return server.requestCount(path) > 0; }, 5000));
+  QVERIFY(!result.has_value());
+  QCOMPARE(server.requestCount(path), 1);
+
+  // A second, independent AssetCache instance over the identical root
+  // durably invalidates A's stale v1 entry and republishes a genuinely
+  // newer v2 while A's own conditional GET is still slow-dripping its
+  // (now-stale, since-superseded) fresh-200 response.
+  AssetCache cacheB(cacheConfig);
+  QCOMPARE(cacheB.invalidate(cacheKey),
+           AssetCache::InvalidateResult::DurablyInvalidated);
+  AssetCache::CachedEntry v2;
+  v2.encodedBytes = encodePng(6, 6);
+  v2.contentType = QStringLiteral("image/png");
+  v2.dimensions = QSize(6, 6);
+  v2.etag = QStringLiteral("\"v2-etag\"");
+  QCOMPARE(cacheB.store(cacheKey, v2), AssetCache::MutationOutcome::Applied);
+
+  // Wait for the resnapshot-retry to resolve: since v2 was published into
+  // the SHARED memory cache (same physical root -- see RootAuthority's
+  // comment), a re-snapshot immediately observes it as a fresh memory
+  // hit and short-circuits without any further network round trip,
+  // which is itself additional proof this path is now driven by an
+  // actual fresh lookup rather than the discarded, stale in-flight
+  // result.
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+
+  // The delivered result must reflect v2 (6x6), never A's own discarded,
+  // already-stale fresh-200 body (8x8) -- the core "fail-before/pass-
+  // after" property this test exists to prove.
+  QCOMPARE((**result).encodedBytes, v2.encodedBytes);
+
+  // v2 must never have been clobbered by A's discarded, already-stale
+  // fresh-200 body, from either sibling's point of view.
+  const auto afterCompletion = cacheB.lookupDisk(cacheKey);
+  QVERIFY(afterCompletion.has_value());
+  QCOMPARE(afterCompletion->etag, QStringLiteral("\"v2-etag\""));
+  QCOMPARE(afterCompletion->encodedBytes, v2.encodedBytes);
+  const auto afterCompletionA = cacheA.lookupDisk(cacheKey);
+  QVERIFY(afterCompletionA.has_value());
+  QCOMPARE(afterCompletionA->encodedBytes, v2.encodedBytes);
 }

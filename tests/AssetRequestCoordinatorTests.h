@@ -178,6 +178,8 @@ private slots:
   crossInstanceSiblingDefinitiveInvalidateDuringInFlightFetchPreventsStalePublish();
   void
   crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidationPreventsStaleTouch();
+  void
+  crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidationFreshReplacePreventsStaleOverwrite();
 
 private:
   QString m_tempDirPath;
