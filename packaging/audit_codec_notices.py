@@ -176,7 +176,21 @@ _SECTION_TO_SEGMENT_LINE_RE = re.compile(
 # ITS OWN section by NAME rather than volatile index) is instead
 # authenticated via _read_dynamic_symbols()'s decoded, index-independent
 # view, exactly mirroring how _resolve_dynamic_tag_value() handles the
-# same class of problem for `.dynamic`'s own address-valued tags. No
+# same class of problem for `.dynamic`'s own address-valued tags.
+# `.symtab` (the full, non-dynamic symbol table, present only on an
+# UNSTRIPPED object -- this project's own actual bundled Qt plugins are
+# always stripped release builds with no `.symtab` at all, but an
+# ABI_ALLOWLIST-covered host system library or a distro-packaged
+# component compared via package provenance may genuinely be unstripped)
+# carries the EXACT SAME class of raw st_shndx section-index field as
+# `.dynsym`, for exactly the same reason, and is excluded here for the
+# same reason -- authenticated instead via _read_symtab_symbols()'s own
+# decoded, index-independent view. `.strtab` (the plain string table
+# `.symtab`'s own st_name fields index into, exactly analogous to how
+# `.dynstr` relates to `.dynsym`) is excluded alongside it for the same
+# "physical layout may legitimately shift, but decoded symbol NAMES are
+# what is actually authenticated" reason as `.dynstr` above -- never
+# because either table's real content is otherwise untrustworthy. No
 # other section is excluded -- deliberately, so that any tampering with
 # actually behavior-bearing content (`.text`, `.rodata`, `.data`,
 # `.got`, `.init_array`, `.fini_array`, `.rela.*`, `.note.*`,
@@ -184,7 +198,7 @@ _SECTION_TO_SEGMENT_LINE_RE = re.compile(
 # empirically confirmed stable across this project's own real
 # packaging pipeline's rpath rewrite) is still caught.
 _CANONICAL_DIGEST_EXCLUDED_SECTIONS: frozenset[str] = frozenset(
-    {".dynstr", ".dynamic", ".interp", ".dynsym"}
+    {".dynstr", ".dynamic", ".interp", ".dynsym", ".symtab", ".strtab"}
 )
 
 # `.dynamic`'s raw bytes are excluded wholesale above (its physical
@@ -290,6 +304,122 @@ _DYNAMIC_SYMBOL_RE = re.compile(
 )
 
 
+def _resolve_symbol_address(value: str, sections: list[dict[str, str]]) -> str:
+    """Resolves a symbol table entry's own raw `st_value` field (a bare
+    hex virtual address, e.g. readelf --syms's "0000000000020030"
+    column -- always plain hex here, unlike a dynamic tag's decoded
+    value, so no "0x" prefix is expected or required) to
+    "-> <section name>+0x<offset>" using whichever loaded section's own
+    [addr, addr + size) range contains it, or "-> <unmapped address>"
+    if none does (itself a meaningful, detectable difference -- e.g. a
+    genuinely undefined/zero-valued symbol, or a real hijack pointing
+    outside any legitimate section). This is the SAME "resolve a
+    volatile raw address to the STABLE section it falls within" idea
+    _resolve_dynamic_tag_value() already applies to `.dynamic` tags --
+    necessary here because this project's own empirical testing found
+    that a SECTION-typed `.symtab`/`.dynsym` entry's value is exactly
+    that section's own base address, which legitimately shifts whenever
+    patchelf physically relocates that section (see
+    _CANONICAL_DIGEST_EXCLUDED_SECTIONS' own docstring) -- but, unlike a
+    dynamic tag, the OFFSET *within* the section is preserved (not just
+    the section identity), since a real FUNC/OBJECT symbol's value is a
+    meaningful offset into a section that does NOT itself relocate
+    (only special linker-synthesized SECTION/ABS symbols coincide with
+    a section's own base address); collapsing to section-name alone
+    would blind this digest to a symbol legitimately/illegitimately
+    moving to a different offset within an otherwise-untouched
+    section. Callers should NOT invoke this for a known
+    linker-synthesized ABS alias symbol (see
+    _LINKER_SYNTHESIZED_ABS_ALIAS_SYMBOL_NAMES) -- see that constant's
+    own docstring for why such a symbol's address must be excluded
+    entirely rather than resolved."""
+    try:
+        address = int(value, 16)
+    except ValueError:
+        return value
+    for section in sections:
+        if not section["name"] or "A" not in section["flags"]:
+            continue
+        start = int(section["addr"], 16)
+        size = int(section["size"], 16)
+        if size and start <= address < start + size:
+            return f"-> {section['name']}+0x{address - start:x}"
+    return "-> <unmapped address>"
+
+
+# `_DYNAMIC` and `_GLOBAL_OFFSET_TABLE_` are linker-synthesized, ABS-
+# indexed (per the ELF spec, "not associated with any section")
+# absolute-address aliases the link editor computes to equal
+# `.dynamic`'s and `.got`'s own respective base addresses at LINK time.
+# This project's own empirical testing against a real patchelf 0.14.3
+# rpath rewrite that physically relocates `.dynamic` (see
+# _CANONICAL_DIGEST_EXCLUDED_SECTIONS' own docstring) found that
+# patchelf updates every REAL runtime consumer of that address (the
+# ELF program header's own PT_DYNAMIC entry, and every DT_* dynamic
+# tag) but does NOT update these two symbol table entries' own stale
+# `st_value` fields, which keep pointing at `.dynamic`'s/`.got`'s OLD,
+# pre-relocation address -- a well-known, harmless patchelf quirk (no
+# real ELF loader resolves "_DYNAMIC"/"_GLOBAL_OFFSET_TABLE_" by NAME
+# at runtime; both are resolved structurally via AT_PHDR/PT_DYNAMIC and
+# the GOT's own self-referential first entry respectively, so a stale
+# symtab alias has zero runtime effect). Address-resolving these two
+# symbols the same way as any other would false-positive on this
+# entirely legitimate repack whenever `.dynamic`/`.got` happens to
+# relocate; their value is therefore excluded from the digest entirely
+# (mirroring how DT_STRSZ/RPATH/RUNPATH are excluded from
+# _DYNAMIC_TAGS_EXCLUDED_FROM_DIGEST for the same class of reason) --
+# every OTHER field of these two entries (size/type/bind/vis/ndx/name)
+# remains fully authenticated.
+_LINKER_SYNTHESIZED_ABS_ALIAS_SYMBOL_NAMES = frozenset(
+    {"_DYNAMIC", "_GLOBAL_OFFSET_TABLE_"}
+)
+
+
+def _decode_symbol_table_entries(
+    output: str, sections: list[dict[str, str]]
+) -> list[tuple[str, str, str, str, str, str, str]]:
+    """Shared decoding logic for both `.dynsym` (via _read_dynamic_
+    symbols()) and `.symtab` (via _read_symtab_symbols()) -- see either
+    caller's own docstring for why each entry's raw st_shndx section-
+    header-table index must be resolved to a stable section NAME rather
+    than hashed as a raw, potentially-legitimately-shifting index, and
+    _resolve_symbol_address()'s own docstring for why each entry's raw
+    st_value address field must likewise be resolved to a stable
+    section-relative form. `_LINKER_SYNTHESIZED_ABS_ALIAS_SYMBOL_NAMES`
+    members are special-cased: see that constant's own docstring."""
+    results: list[tuple[str, str, str, str, str, str, str]] = []
+    for match in _DYNAMIC_SYMBOL_RE.finditer(output):
+        ndx = match.group("ndx")
+        name = match.group("name")
+        if ndx not in ("UND", "ABS", "COM"):
+            try:
+                index = int(ndx)
+            except ValueError:
+                ndx = f"<unparseable section index {ndx!r}>"
+            else:
+                ndx = (
+                    sections[index]["name"]
+                    if 0 <= index < len(sections)
+                    else f"<unmapped section index {index}>"
+                )
+        if ndx == "ABS" and name in _LINKER_SYNTHESIZED_ABS_ALIAS_SYMBOL_NAMES:
+            value = "<linker-synthesized ABS alias, address excluded>"
+        else:
+            value = _resolve_symbol_address(match.group("value"), sections)
+        results.append(
+            (
+                value,
+                match.group("size"),
+                match.group("type"),
+                match.group("bind"),
+                match.group("vis"),
+                ndx,
+                name,
+            )
+        )
+    return results
+
+
 def _read_dynamic_symbols(
     path: Path, sections: list[dict[str, str]]
 ) -> list[tuple[str, str, str, str, str, str, str]]:
@@ -311,32 +441,59 @@ def _read_dynamic_symbols(
         output = _readelf(path, "--dyn-syms", "-W")
     except ElfIdentityError:
         return []
-    results: list[tuple[str, str, str, str, str, str, str]] = []
-    for match in _DYNAMIC_SYMBOL_RE.finditer(output):
-        ndx = match.group("ndx")
-        if ndx not in ("UND", "ABS", "COM"):
-            try:
-                index = int(ndx)
-            except ValueError:
-                ndx = f"<unparseable section index {ndx!r}>"
-            else:
-                ndx = (
-                    sections[index]["name"]
-                    if 0 <= index < len(sections)
-                    else f"<unmapped section index {index}>"
-                )
-        results.append(
-            (
-                match.group("value"),
-                match.group("size"),
-                match.group("type"),
-                match.group("bind"),
-                match.group("vis"),
-                ndx,
-                match.group("name"),
-            )
+    return _decode_symbol_table_entries(output, sections)
+
+
+# `readelf --syms -W` (unlike `--dyn-syms`) prints EVERY symbol table an
+# object has, each preceded by its own "Symbol table '<name>' contains
+# N entries:" header line -- an object with both `.dynsym` and
+# `.symtab` (i.e. an unstripped shared object) therefore emits two
+# separate such blocks in the same invocation's output. Matched here
+# purely to locate the START of the `.symtab` block; the following
+# entries are parsed by the exact same `_DYNAMIC_SYMBOL_RE` used for
+# `--dyn-syms` output, since readelf renders both tables in an
+# identical per-entry column format.
+_SYMBOL_TABLE_HEADER_RE = re.compile(
+    r"^Symbol table '(?P<name>[^']+)' contains \d+ entries:$",
+    re.MULTILINE,
+)
+
+
+def _read_symtab_symbols(
+    path: Path, sections: list[dict[str, str]]
+) -> list[tuple[str, str, str, str, str, str, str]]:
+    """Returns every entry of `path`'s own `.symtab` (the full,
+    non-dynamic symbol table present only on an UNSTRIPPED object) as a
+    (value, size, type, bind, vis, resolved_ndx, name) tuple, in
+    readelf's own decoded, human-readable form -- deliberately NOT
+    `.symtab`'s raw bytes (see _CANONICAL_DIGEST_EXCLUDED_SECTIONS' own
+    docstring: each entry's raw st_shndx field is EXACTLY the same
+    class of legitimately-renumbered section-header-table index as
+    `.dynsym`'s own, for the identical reason). Returns an empty list,
+    never raises, for a stripped object with no `.symtab` at all (this
+    project's own actually bundled Qt plugins are always stripped
+    release builds; only an ABI_ALLOWLIST-covered host system library
+    or an unstripped distro-packaged component compared via package
+    provenance would ever genuinely have one) -- a missing `.symtab` is
+    not itself an error, exactly like a missing `.dynamic` section on a
+    statically-linked executable in _read_dynamic_tags()."""
+    try:
+        output = _readelf(path, "--syms", "-W")
+    except ElfIdentityError:
+        return []
+    headers = list(_SYMBOL_TABLE_HEADER_RE.finditer(output))
+    for index, header in enumerate(headers):
+        if header.group("name") != ".symtab":
+            continue
+        block_start = header.end()
+        block_end = (
+            headers[index + 1].start() if index + 1 < len(headers) else len(output)
         )
-    return results
+        return _decode_symbol_table_entries(output[block_start:block_end], sections)
+    return []
+
+
+
 
 
 # Deliberately duplicated from (not imported from)
@@ -575,7 +732,24 @@ def _canonical_load_digest(path: Path) -> str | None:
     docstring for why its raw st_shndx fields are not stable across a
     legitimate repack) and is instead folded in via
     _read_dynamic_symbols()'s own decoded, index-independent view, so a
-    hijacked/redirected dynamic symbol is still detected too."""
+    hijacked/redirected dynamic symbol is still detected too. `.symtab`
+    (present only on an unstripped object) is excluded and re-folded
+    the identical way, via _read_symtab_symbols(), for the identical
+    st_shndx-renumbering reason; `.strtab` is excluded alongside it
+    exactly as `.dynstr` is excluded alongside `.dynsym`.
+
+    A real cumulative-review regression, found only against this
+    project's own actual produced AppImage (never reproduced by this
+    module's own synthetic unit tests, which do not exercise a real
+    patchelf rewrite large enough to trigger it): a SHT_NOBITS section
+    (`.bss`/`.tbss`) has NO real file content at all -- its own
+    sh_offset is simply wherever a subsequent section with real content
+    would have started, not a pointer to reserved storage -- so its
+    content is never actually read here (see the inline comment at the
+    `.bss`-skipping `if` below for the full explanation); only its
+    header identity (name/type/flags/effective runtime executable-bit/
+    declared size) is authenticated, exactly as for every other
+    section."""
     try:
         sections = _read_section_headers(path)
     except ElfIdentityError:
@@ -616,14 +790,43 @@ def _canonical_load_digest(path: Path) -> str | None:
                     f"{runtime_executable}\0{size}\0"
                 ).encode("utf-8")
                 digest.update(header)
-                handle.seek(offset)
-                remaining = size
-                while remaining > 0:
-                    chunk = handle.read(min(remaining, 1024 * 1024))
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    remaining -= len(chunk)
+                # A SHT_NOBITS section (`.bss`/`.tbss`) is, by the ELF
+                # spec itself, defined to occupy NO file space at all:
+                # its own sh_offset is merely wherever the next
+                # sequential section WOULD have started had it had real
+                # content, not a pointer to any actually-reserved
+                # storage for it. Reading sh_size bytes from that offset
+                # therefore does not read this section's own content at
+                # all (there is none on disk to read) -- it reads
+                # whatever unrelated bytes a LATER, real section happens
+                # to occupy at that same file position. A real,
+                # empirically confirmed cumulative-review regression:
+                # this project's own actual produced AppImage's
+                # linuxdeploy-patchelf run occasionally needs a full
+                # section-table rewrite (observed for
+                # plugins/tls/libqopensslbackend.so and
+                # qml/.../FluentWinUI3/libqtquickcontrols2fluentwinui3
+                # styleplugin.so specifically, both bundled genuinely
+                # unmodified in substance), which moves several
+                # sections earlier in the file to new positions after
+                # `.bss` -- changing the accidental bytes previously
+                # read at `.bss`'s own sh_offset even though `.bss`
+                # itself, having no content, could not possibly have
+                # changed. Every OTHER field of this section's own
+                # identity (name/type/flags/effective runtime
+                # executable-bit/declared size, all already folded into
+                # `header` above) is still fully authenticated -- only
+                # the meaningless, always-implicitly-zero-initialized
+                # "content" is skipped, for NOBITS sections exclusively.
+                if section["type"] != "NOBITS":
+                    handle.seek(offset)
+                    remaining = size
+                    while remaining > 0:
+                        chunk = handle.read(min(remaining, 1024 * 1024))
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        remaining -= len(chunk)
     except OSError:
         return None
     try:
@@ -639,6 +842,8 @@ def _canonical_load_digest(path: Path) -> str | None:
         digest.update(f"DYNAMIC\0{tag}\0{resolved_value}\0".encode("utf-8"))
     for symbol in sorted(_read_dynamic_symbols(path, sections)):
         digest.update(("DYNSYM\0" + "\0".join(symbol) + "\0").encode("utf-8"))
+    for symbol in sorted(_read_symtab_symbols(path, sections)):
+        digest.update(("SYMTAB\0" + "\0".join(symbol) + "\0").encode("utf-8"))
     return digest.hexdigest()
 
 

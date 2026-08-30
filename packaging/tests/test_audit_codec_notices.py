@@ -1299,14 +1299,20 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
         """A single small `.so` deliberately exercising every ELF
         feature this round's findings are concerned with: a real
         `DT_NEEDED` (libc), an `.init_array` constructor entry, real
-        `.got`/`.got.plt` relocations (via malloc/free calls), and
-        `.rodata` content -- so every mutation test below exercises a
-        genuine, realistic binary rather than a degenerate fixture."""
+        `.got`/`.got.plt` relocations (via malloc/free calls), a
+        non-empty `.bss` (an uninitialized global -- see
+        test_canonical_load_digest_is_stable_across_a_bss_bearing_
+        patchelf_relocation()'s own docstring for why this specific,
+        real cumulative-review regression required one), and `.rodata`
+        content -- so every mutation test below exercises a genuine,
+        realistic binary rather than a degenerate fixture."""
         source = (
             "#include <stdlib.h>\n"
             'static const char message[] = "canonical-load-digest-fixture";\n'
+            "static char scratch_buffer[4096];\n"
             "__attribute__((constructor)) static void init(void) {\n"
             "    void *p = malloc(16);\n"
+            "    scratch_buffer[0] = (char)(size_t)p;\n"
             "    free(p);\n"
             "}\n"
             "const char *test_plugin_entry(void) { return message; }\n"
@@ -1363,6 +1369,81 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
             )
         )
         self.assertGreater(load_count_after, load_count_before)
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(patched))
+        self.assertEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(patched),
+        )
+
+    def test_canonical_load_digest_is_stable_across_a_bss_bearing_patchelf_relocation(
+        self,
+    ) -> None:
+        # Real cumulative-review regression, found only against this
+        # project's own actual produced AppImage (never against this
+        # module's own prior synthetic fixtures, none of which had a
+        # non-empty `.bss`): a SHT_NOBITS section such as `.bss` has NO
+        # real file content at all -- its own sh_offset is merely
+        # wherever a LATER, real section happens to start, not a
+        # pointer to reserved storage for `.bss` itself. Two genuinely
+        # bundled Qt files in the real AppImage build
+        # (plugins/tls/libqopensslbackend.so and
+        # qml/.../FluentWinUI3/libqtquickcontrols2fluentwinui3
+        # styleplugin.so) were wrongly reported unmapped/substituted
+        # because patchelf's RPATH-relocation path (see the previous
+        # test) moved whichever real section used to occupy the file
+        # bytes at `.bss`'s own sh_offset, changing the ACCIDENTAL
+        # bytes previously (and wrongly) read as `.bss`'s own
+        # "content" even though `.bss`, having no content, could not
+        # itself have changed at all.
+        if not shutil.which("patchelf"):
+            self.skipTest("requires patchelf to simulate a real RUNPATH rewrite")
+        reference = self.root / "reference_bss.so"
+        self._build_rich_shared_object(reference)
+        patched = self.root / "patched_bss.so"
+        patched.write_bytes(reference.read_bytes())
+        patched.chmod(0o755)
+        long_rpath = "/".join(["deliberately-very-long-rpath-component"] * 40)
+        subprocess.run(
+            ["patchelf", "--set-rpath", long_rpath, str(patched)],
+            check=True,
+            capture_output=True,
+        )
+        # Sanity: a real, non-empty `.bss` genuinely exists in both
+        # files (the fixture's whole reason for existing), and the
+        # RPATH rewrite really did relocate other sections around it
+        # (proving this test actually exercises the reported bug's
+        # exact precondition, not merely an in-place, same-offset
+        # rewrite that would never have exposed it).
+        bss_offset_before, bss_size = _test_section_file_range(reference, ".bss")
+        bss_offset_after, bss_size_after = _test_section_file_range(patched, ".bss")
+        self.assertGreater(bss_size, 0)
+        self.assertEqual(bss_size, bss_size_after)
+        # The actual regression proof: independently (using this test's
+        # own reader, never production code) read the raw bytes that
+        # USED to be wrongly hashed as ".bss content" at its own
+        # sh_offset in each file. These must genuinely DIFFER here --
+        # proving that a digest implementation which naively read
+        # `.bss`'s declared size at its declared file offset (the
+        # actual, now-fixed bug) would have produced two DIFFERENT
+        # hashes for this entirely legitimate, content-preserving
+        # repack, i.e. would have wrongly rejected it exactly as the
+        # real AppImage build did.
+        with reference.open("rb") as handle:
+            handle.seek(bss_offset_before)
+            stale_bytes_before = handle.read(bss_size)
+        with patched.open("rb") as handle:
+            handle.seek(bss_offset_after)
+            stale_bytes_after = handle.read(bss_size)
+        self.assertNotEqual(
+            stale_bytes_before,
+            stale_bytes_after,
+            "fixture did not actually relocate file content around .bss's own "
+            "sh_offset -- this test would not have caught the reported bug",
+        )
+        # The real assertion: the fixed, production canonical digest
+        # -- which must never read `.bss`'s nonexistent "content" at
+        # all -- is stable across this legitimate repack, exactly as a
+        # genuinely unmodified, merely repackaged Qt plugin must be.
         self.assertNotEqual(audit._sha256(reference), audit._sha256(patched))
         self.assertEqual(
             audit._canonical_load_digest(reference),
