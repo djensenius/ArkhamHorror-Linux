@@ -239,7 +239,7 @@ Value mustParse(QByteArrayView bytes) {
 // accessors (kind(), toBool(), toRawNumber(), toString(), toArray(),
 // members(); RawNumber::toExactInt64()/toDouble()) -- no friend grant,
 // no private-state access, no declaration or hook of any kind in
-// src/RawJson.h. Earlier revisions instead relocated this exact logic
+// src/domain/RawJson.h. Earlier revisions instead relocated this exact logic
 // to an includable tests/RawJsonLossyTestOnly.h granted access via a
 // "hidden friend" declared in RawJson.h; a cumulative review correctly
 // demonstrated that ANY translation unit -- production or test -- could

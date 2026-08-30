@@ -73,8 +73,6 @@ if(NOT TARGET Qt6Keychain::Qt6Keychain)
     add_library(Qt6Keychain::Qt6Keychain ALIAS qt6keychain)
 endif()
 
-# The canonical, explicit list of every header in this project's own
-# strict-domain-model foundation library. Kept as a `set()` variable
 # The strict value-semantic contract/domain-model layer (card catalog,
 # decks, game list/lifecycle, validated identifiers, the raw JSON AST +
 # its one canonical exact-QJson adapter family, and the shared JSON
@@ -88,42 +86,51 @@ endif()
 # layer may ever depend back on any of that, so a future accidental
 # `#include "NetworkAuthenticationClient.h"` from e.g. Decks.cpp would
 # fail to compile (that header is not on this target's include path at
-# all -- see target_include_directories() below, which is scoped to this
-# target only, not shared build-wide).
+# all -- see target_include_directories() below, which is scoped to only
+# src/domain, not shared build-wide with arkham_foundation's own "src"
+# include root). This is a verified, compiled guarantee, not merely an
+# asserted one: tests/probes/DomainFoundationIsolationProbe.cpp and the
+# domain_foundation_isolation ctest below reproduce the exact opposite
+# scenario (a domain-linked translation unit #include-ing a
+# foundation-only header, AuthModels.h) and require it to fail to
+# compile.
 #
-# This split is also what makes tools/check_encoder_hygiene.py's AST scan
-# (see packaging/check_encoder_hygiene.py and the
-# cmake/DomainHeaderManifest.cmake-generated manifest consumed by it)
-# well-scoped by *target/file-set membership*, not by a hand-maintained
-# path list independently prone to drift: it inspects exactly (and only)
-# the public headers registered in this target's HEADERS file set below,
-# so a pre-existing, unrelated header elsewhere in this codebase (e.g.
-# AuthModels.h, which is *not* part of this target) can never collide
-# with -- or need to be carved out via a basename exception from -- the
-# small set of legitimate QJson-returning symbols this domain layer
-# itself declares (RawJson.h's three canonical toExactQJson*() adapters,
-# and JsonDecode.h's decode-direction field/array/object helpers).
+# This split is also what makes packaging/check_encoder_hygiene.py's AST
+# scan (see the domain_headers.txt/domain_sources.txt and
+# foundation_headers.txt/foundation_sources.txt manifests
+# arkham_write_path_manifest() -- cmake/PathManifest.cmake -- writes
+# below) well-scoped by *target/file-set membership*, not by a
+# hand-maintained path list independently prone to drift: it
+# independently, exhaustively parses exactly (and only) the public
+# headers registered in each target's own HEADERS file set, so a
+# pre-existing, unrelated header elsewhere in this codebase (e.g.
+# AuthModels.h, which is *not* part of arkham_domain_models's file set)
+# can never collide with -- or need to be carved out via a basename
+# exception from -- the small set of legitimate QJson-returning symbols
+# this domain layer itself declares (RawJson.h's three canonical
+# toExactQJson*() adapters, and JsonDecode.h's decode-direction
+# field/array/object helpers).
 set(ARKHAM_DOMAIN_HEADERS
-    src/CardCatalog.h
-    src/ContractPin.h
-    src/ContractRevision.h
-    src/Decks.h
-    src/Games.h
-    src/Identifiers.h
-    src/JsonDecode.h
-    src/RawJson.h
-    src/ValueOrError.h
+    src/domain/CardCatalog.h
+    src/domain/ContractPin.h
+    src/domain/ContractRevision.h
+    src/domain/Decks.h
+    src/domain/Games.h
+    src/domain/Identifiers.h
+    src/domain/JsonDecode.h
+    src/domain/RawJson.h
+    src/domain/ValueOrError.h
 )
 
 set(ARKHAM_DOMAIN_SOURCES
-    src/CardCatalog.cpp
-    src/ContractPin.cpp
-    src/ContractRevision.cpp
-    src/Decks.cpp
-    src/Games.cpp
-    src/Identifiers.cpp
-    src/JsonDecode.cpp
-    src/RawJson.cpp
+    src/domain/CardCatalog.cpp
+    src/domain/ContractPin.cpp
+    src/domain/ContractRevision.cpp
+    src/domain/Decks.cpp
+    src/domain/Games.cpp
+    src/domain/Identifiers.cpp
+    src/domain/JsonDecode.cpp
+    src/domain/RawJson.cpp
 )
 
 # Every other header this build compiles (networking, auth, session,
@@ -223,6 +230,7 @@ unset(_arkham_dup_check_index)
 # HEADER_SUFFIXES below for the full list of suffixes a header-like file
 # anywhere under src/ is recognized under -- not just "*.h".
 include(cmake/DomainHeaderInventory.cmake)
+include(cmake/PathManifest.cmake)
 arkham_check_domain_header_inventory(
     BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
     HEADER_GLOB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -251,33 +259,35 @@ add_library(arkham_domain_models STATIC
 # target_include_directories() below, so consumers see the identical
 # `#include "RawJson.h"`-style paths as before this split.
 #
-# ARKHAM_DOMAIN_HEADERS entries are declared relative to
-# CMAKE_CURRENT_SOURCE_DIR (e.g. "src/RawJson.h") because that is what
-# every other consumer of the list needs (the inventory check, and the
-# encoder-hygiene manifest write below, both join it against
-# CMAKE_CURRENT_SOURCE_DIR directly). FILE_SET's own relative-path
-# resolution rule for FILES is "relative to CMAKE_CURRENT_SOURCE_DIR",
-# the same rule ordinary target_sources() uses -- NOT relative to
-# BASE_DIRS, despite how that reads at a glance -- so passing the list
-# unmodified already resolves correctly today. To remove any doubt (for
-# a reader or reviewer comparing the BASE_DIRS suffix "/src" against a
-# FILES entry that starts with "src/") without depending on that
-# resolution rule at all, FILES below is built as this target's own
-# absolute paths instead: unambiguously a descendant of BASE_DIRS under
-# any interpretation, and identical to what CMake was already resolving
-# these relative entries to.
+# BASE_DIRS is src/domain, NOT src -- domain headers physically live in
+# their own subdirectory, and this target's public include path (see
+# target_include_directories() below) is scoped to exactly that
+# subdirectory too. This is a real, compiler-enforced boundary, not just
+# a comment: a review round demonstrated that when both this target and
+# arkham_foundation exposed the *same* public "src" include root, nothing
+# actually stopped a domain header/source from directly
+# `#include`-ing a foundation-only header such as AuthModels.h (e.g. to
+# derive a domain-local type from AuthenticateRequest and reuse its
+# inherited toJson() -- a lossy public encoder the domain policy scan
+# never inspects, since AuthModels.h is intentionally out of its scope).
+# With BASE_DIRS/the include path narrowed to src/domain only, such an
+# #include cannot even find the file (a hard "file not found" compile
+# error), rather than merely being disallowed by convention. See
+# tests/probes/DomainFoundationIsolationProbe.cpp and the
+# domain_foundation_isolation ctest below, which compiles exactly that
+# scenario and requires it to fail.
 list(TRANSFORM ARKHAM_DOMAIN_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/"
     OUTPUT_VARIABLE _arkham_domain_headers_absolute)
 target_sources(arkham_domain_models
     PUBLIC
         FILE_SET arkham_domain_headers
         TYPE HEADERS
-        BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src/domain"
         FILES ${_arkham_domain_headers_absolute}
 )
 unset(_arkham_domain_headers_absolute)
 
-target_include_directories(arkham_domain_models PUBLIC src)
+target_include_directories(arkham_domain_models PUBLIC src/domain)
 target_link_libraries(arkham_domain_models PUBLIC
     Qt6::Core
 )
@@ -286,40 +296,28 @@ target_link_libraries(arkham_domain_models PUBLIC
 # manifest (not JSON -- these paths are simple filesystem paths with no
 # characters that would need escaping, so a text format avoids any
 # CMake-side JSON-escaping subtlety) naming exactly the headers and
-# sources above, regenerated by CMake every time it reconfigures. This is
+# sources above, regenerated by CMake every time it reconfigures, via
+# arkham_write_path_manifest() (see cmake/PathManifest.cmake). This is
 # the single source of truth the AST policy script's own scan is scoped
 # to -- it never independently re-derives or hand-maintains this file
 # list, so it cannot silently drift from what this target actually
 # compiles, the same guarantee arkham_check_domain_header_inventory()
-# above already gives the *build* itself.
-# file(WRITE) has created missing parent directories itself since CMake
-# 3.20 (below our 3.25 floor), but this MAKE_DIRECTORY stays explicit so
-# the two file(WRITE) calls below never rely on that implicit behavior.
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
-
-set(_arkham_domain_headers_manifest_lines "")
-foreach(_arkham_header IN LISTS ARKHAM_DOMAIN_HEADERS)
-    string(APPEND _arkham_domain_headers_manifest_lines
-        "${CMAKE_CURRENT_SOURCE_DIR}/${_arkham_header}\n")
-endforeach()
-unset(_arkham_header)
-file(WRITE
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_headers.txt"
-    "${_arkham_domain_headers_manifest_lines}"
+# above already gives the *build* itself. The matching foundation_*.txt
+# manifests are written just below, once ARKHAM_FOUNDATION_HEADERS/
+# ARKHAM_FOUNDATION_SOURCES are populated, so the policy script can
+# independently, exhaustively audit AuthModels.h's two legitimate
+# non-domain encoders too -- not merely trust that nothing else in
+# foundation needs auditing.
+arkham_write_path_manifest(
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_headers.txt"
+    BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    PATHS ${ARKHAM_DOMAIN_HEADERS}
 )
-unset(_arkham_domain_headers_manifest_lines)
-
-set(_arkham_domain_sources_manifest_lines "")
-foreach(_arkham_source IN LISTS ARKHAM_DOMAIN_SOURCES)
-    string(APPEND _arkham_domain_sources_manifest_lines
-        "${CMAKE_CURRENT_SOURCE_DIR}/${_arkham_source}\n")
-endforeach()
-unset(_arkham_source)
-file(WRITE
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_sources.txt"
-    "${_arkham_domain_sources_manifest_lines}"
+arkham_write_path_manifest(
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_sources.txt"
+    BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    PATHS ${ARKHAM_DOMAIN_SOURCES}
 )
-unset(_arkham_domain_sources_manifest_lines)
 
 add_library(arkham_foundation STATIC
     ${ARKHAM_FOUNDATION_SOURCES}
@@ -339,6 +337,17 @@ target_sources(arkham_foundation
         FILES ${_arkham_foundation_headers_absolute}
 )
 unset(_arkham_foundation_headers_absolute)
+
+arkham_write_path_manifest(
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/foundation_headers.txt"
+    BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    PATHS ${ARKHAM_FOUNDATION_HEADERS}
+)
+arkham_write_path_manifest(
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/foundation_sources.txt"
+    BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    PATHS ${ARKHAM_FOUNDATION_SOURCES}
+)
 
 target_include_directories(arkham_foundation PUBLIC src)
 target_link_libraries(arkham_foundation PUBLIC
@@ -482,6 +491,32 @@ if(BUILD_TESTING)
             -DARKHAM_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/domain_header_inventory_policy_scratch
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/DomainHeaderInventoryPolicyTest.cmake
     )
+
+    # Compiled proof that arkham_domain_models cannot #include a
+    # foundation-only header (see tests/probes/DomainFoundationIsolationProbe.cpp
+    # for the exact reviewer-reported scenario this reproduces). This
+    # target links ONLY arkham_domain_models -- never arkham_foundation --
+    # and is EXCLUDE_FROM_ALL so its deliberately permanent compile failure
+    # never breaks the normal `all`/default build or `cmake --build .`
+    # without an explicit target. The ctest case below builds exactly this
+    # one target on demand and is registered WILL_FAIL TRUE, so ctest
+    # PASSES precisely when this probe FAILS to compile (proving
+    # isolation) and FAILS if the probe ever unexpectedly starts
+    # compiling (proving a regression of the include-root separation).
+    add_executable(arkham-domain-foundation-isolation-probe
+        EXCLUDE_FROM_ALL
+        tests/probes/DomainFoundationIsolationProbe.cpp
+    )
+    target_link_libraries(arkham-domain-foundation-isolation-probe PRIVATE
+        arkham_domain_models
+    )
+    add_test(NAME domain_foundation_isolation
+        COMMAND ${CMAKE_COMMAND}
+            --build ${CMAKE_BINARY_DIR}
+            --target arkham-domain-foundation-isolation-probe
+            --config $<CONFIG>
+    )
+    set_tests_properties(domain_foundation_isolation PROPERTIES WILL_FAIL TRUE)
 
     qt_add_executable(arkham-network-tests
         tests/NetworkTests.cpp

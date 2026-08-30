@@ -8,7 +8,7 @@ substitute, or something added and never actually vendored from upstream.
 
 ContractDriftTests (see tests/ContractDriftTests.cpp) already re-hashes
 every vendored file and compares it against the digest table in
-src/ContractPin.cpp. That is real and useful (it catches accidental drift:
+src/domain/ContractPin.cpp. That is real and useful (it catches accidental drift:
 edit-without-re-hash), but it has two structural blind spots this script
 closes:
 
@@ -430,7 +430,7 @@ def compute_governed_paths(tree: GitTree) -> set[str]:
     is bound to and must byte/mode-match the pinned backend on" -- built
     entirely from ROOT_SCHEMAS/ROOT_DOCUMENTS/ROOT_EXTRA_FIXTURES plus the
     backend-tree-derived closures above. Never consults any local,
-    mutable file (e.g. src/ContractPin.cpp) to decide *which* files to
+    mutable file (e.g. src/domain/ContractPin.cpp) to decide *which* files to
     check -- only used, elsewhere, to cross-check the digests recorded
     there once the set and bytes are already independently known."""
     schema_closure = compute_schema_closure(tree, ROOT_SCHEMAS)
@@ -562,7 +562,7 @@ def verify(
     and `repo_root` (the local working tree), returning a list of
     human-readable failure descriptions (empty if everything checks out).
     `governed_digests` is an optional {contracts-relative path: sha256} map
-    (e.g. cross-checked against src/ContractPin.cpp) used only as a
+    (e.g. cross-checked against src/domain/ContractPin.cpp) used only as a
     secondary, offline-friendly belt-and-suspenders check -- never as the
     source of which paths to verify."""
     failures: list[str] = []
@@ -650,7 +650,7 @@ def verify(
             if recomputed != recorded:
                 failures.append(
                     f"{relative_path}: byte-identical to the pinned backend "
-                    f"blob, but src/ContractPin.cpp's recorded digest "
+                    f"blob, but src/domain/ContractPin.cpp's recorded digest "
                     f"{recorded} does not match the recomputed digest "
                     f"{recomputed} -- ContractPin.cpp is stale"
                 )
@@ -667,7 +667,7 @@ def verify(
 
 
 # ---------------------------------------------------------------------------
-# Optional, secondary cross-check against src/ContractPin.cpp's own digest
+# Optional, secondary cross-check against src/domain/ContractPin.cpp's own digest
 # table. This NEVER decides which paths are governed (see verify()'s
 # docstring) -- it only flags a stale/forgotten digest update once the
 # governed set and correct bytes are already known independently.
@@ -688,7 +688,9 @@ def _adjacent_literal_concat(raw: str) -> str:
 
 
 def read_contract_pin_digests(repo_root: Path) -> dict[str, str]:
-    text = (repo_root / "src" / "ContractPin.cpp").read_text(encoding="utf-8")
+    text = (repo_root / "src" / "domain" / "ContractPin.cpp").read_text(
+        encoding="utf-8"
+    )
     return {
         f"contracts/{path}": _adjacent_literal_concat(digest_literal)
         for path, digest_literal in _GOVERNED_DIGEST_ENTRY_RE.findall(text)

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Unit tests for packaging/check_encoder_hygiene.py's pure decision logic
-(classify(), the ALLOWLIST membership rule, compile-argument sanitization,
-and the "missing allowlist entry" staleness check), using synthetic
-Finding records rather than a real compiler invocation (fast,
-deterministic, no Clang/libclang dependency for this file specifically --
-the real AST walk against the actual project sources is exercised
-separately by `mise run contracts:check-encoder-hygiene`, which this test
-suite intentionally does not invoke).
+(AllowlistEntry, classify(), the ALLOWLIST/ALLOWLIST_BY_KEY exact-count
+membership rule, compile-argument sanitization, representative-compile-
+args selection, and the "missing/miscounted allowlist entry" staleness
+check), using synthetic Finding/AllowlistEntry records and fake
+compile_commands.json-shaped data rather than a real compiler invocation
+(fast, deterministic, no Clang/libclang dependency for this file
+specifically -- the real, header-driven AST walk against the actual
+project sources is exercised separately by
+`mise run contracts:check-encoder-hygiene`, which this test suite
+intentionally does not invoke).
 
 Run directly: `python3 packaging/check_encoder_hygiene_test.py`
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,7 +27,7 @@ import check_encoder_hygiene as ceh
 
 
 def _finding(
-    file: str = "RawJson.h",
+    file: str = "src/domain/RawJson.h",
     line: int = 1,
     display_name: str = "someMethod()",
     canonical_return_type: str = "QJsonObject",
@@ -43,14 +47,46 @@ class ClassifyTests(unittest.TestCase):
         finding = _finding(canonical_return_type="Arkham::ValueOrError<QString>", usr="c:@N@Foo@F@bar#1")
         self.assertEqual(ceh.classify(finding), "allowed")
 
-    def test_exact_allowlisted_entry_is_allowed(self) -> None:
-        file, usr = next(iter(ceh.ALLOWLIST))
-        finding = _finding(file=file, usr=usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>")
+    def test_exact_allowlisted_entry_is_allowed_with_matching_count(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = _finding(
+            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+        )
+        counts = Counter({entry.key(): entry.expected_count})
+        self.assertEqual(ceh.classify(finding, counts), "allowed")
+
+    def test_allowlisted_entry_is_allowed_without_counts_argument(self) -> None:
+        # classify() must stay usable for a single ad-hoc Finding with no
+        # surrounding dataset (counts=None) -- membership alone is enough
+        # when no occurrence-count context is supplied.
+        entry = ceh.ALLOWLIST[0]
+        finding = _finding(
+            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+        )
         self.assertEqual(ceh.classify(finding), "allowed")
+
+    def test_allowlisted_entry_with_too_few_occurrences_is_a_violation(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = _finding(
+            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+        )
+        counts = Counter({entry.key(): 0})
+        self.assertEqual(ceh.classify(finding, counts), "violation")
+
+    def test_allowlisted_entry_with_too_many_occurrences_is_a_violation(self) -> None:
+        # This is the "a third identical encoder is unobserved" evasion a
+        # review round demonstrated: membership alone is not enough, the
+        # EXACT expected occurrence count must match too.
+        entry = ceh.ALLOWLIST[0]
+        finding = _finding(
+            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+        )
+        counts = Counter({entry.key(): entry.expected_count + 1})
+        self.assertEqual(ceh.classify(finding, counts), "violation")
 
     def test_qjson_return_type_not_in_allowlist_is_a_violation(self) -> None:
         finding = _finding(
-            file="Decks.h",
+            file="src/domain/Decks.h",
             usr="c:@N@Arkham@S@DeckOperationError@F@sneaky#1",
             canonical_return_type="QJsonObject",
         )
@@ -60,7 +96,7 @@ class ClassifyTests(unittest.TestCase):
         for family_type in ("QJsonObject", "QJsonArray", "QJsonValue"):
             with self.subTest(family_type=family_type):
                 finding = _finding(
-                    file="Decks.h",
+                    file="src/domain/Decks.h",
                     usr="c:@N@Arkham@S@X@F@y#1",
                     canonical_return_type=family_type,
                 )
@@ -71,7 +107,7 @@ class ClassifyTests(unittest.TestCase):
         # spellings libclang reports for the legitimate exact adapters --
         # substring containment must still catch these when NOT allowlisted.
         finding = _finding(
-            file="Decks.h",
+            file="src/domain/Decks.h",
             usr="c:@N@Arkham@S@X@F@y#1",
             canonical_return_type="Arkham::ValueOrError<QJsonObject>",
         )
@@ -81,7 +117,7 @@ class ClassifyTests(unittest.TestCase):
         for spelling in ("QJsonObject &", "const QJsonObject &", "QJsonObject *"):
             with self.subTest(spelling=spelling):
                 finding = _finding(
-                    file="Decks.h", usr="c:@N@Arkham@S@X@F@y#1", canonical_return_type=spelling
+                    file="src/domain/Decks.h", usr="c:@N@Arkham@S@X@F@y#1", canonical_return_type=spelling
                 )
                 self.assertEqual(ceh.classify(finding), "violation")
 
@@ -91,10 +127,10 @@ class ClassifyTests(unittest.TestCase):
         # DIFFERENT file than the one legitimate adapter/helper it is
         # named after must not silently match by USR alone. (file, usr)
         # must BOTH match.
-        _, usr = next(iter(ceh.ALLOWLIST))
+        entry = ceh.ALLOWLIST[0]
         finding = _finding(
-            file="SomeUnexpectedNewHeader.h",
-            usr=usr,
+            file="src/domain/SomeUnexpectedNewHeader.h",
+            usr=entry.usr,
             canonical_return_type="Arkham::ValueOrError<QJsonObject>",
         )
         self.assertEqual(ceh.classify(finding), "violation")
@@ -102,63 +138,154 @@ class ClassifyTests(unittest.TestCase):
     def test_allowlisted_file_with_an_unexpected_usr_is_still_a_violation(self) -> None:
         # Symmetric case: right file, but a different (e.g. renamed/
         # overloaded) symbol -- must not match by file alone either.
-        file, _ = next(iter(ceh.ALLOWLIST))
+        entry = ceh.ALLOWLIST[0]
         finding = _finding(
-            file=file,
+            file=entry.file,
             usr="c:@N@Arkham@N@Json@S@Value@F@toExactQJsonButDifferentOverload#I#1",
             canonical_return_type="Arkham::ValueOrError<QJsonObject>",
         )
         self.assertEqual(ceh.classify(finding), "violation")
 
+    def test_same_basename_different_full_path_does_not_collide(self) -> None:
+        # Direct regression coverage for the reviewer-identified dedup
+        # bug: a Finding.file that is only a basename would let a
+        # DIFFERENT file sharing that basename (e.g. a same-named header
+        # cloned into an unrelated directory) incorrectly match an
+        # allowlist entry. Finding.file/AllowlistEntry.file are now full,
+        # repo-root-relative paths specifically to prevent this.
+        entry = next(e for e in ceh.ALLOWLIST if "/" in e.file)
+        basename = entry.file.rsplit("/", 1)[-1]
+        cloned_path = f"tests/probes/{basename}"
+        self.assertNotEqual(cloned_path, entry.file)
+        finding = _finding(
+            file=cloned_path,
+            usr=entry.usr,
+            canonical_return_type="Arkham::ValueOrError<QJsonObject>",
+        )
+        self.assertEqual(ceh.classify(finding), "violation")
+
+
+class AllowlistEntryTests(unittest.TestCase):
+    def test_key_is_file_and_usr_pair(self) -> None:
+        entry = ceh.AllowlistEntry(file="src/domain/RawJson.h", usr="some-usr")
+        self.assertEqual(entry.key(), ("src/domain/RawJson.h", "some-usr"))
+
+    def test_default_expected_count_is_one(self) -> None:
+        entry = ceh.AllowlistEntry(file="src/domain/RawJson.h", usr="some-usr")
+        self.assertEqual(entry.expected_count, 1)
+
+    def test_explicit_expected_count_is_preserved(self) -> None:
+        entry = ceh.AllowlistEntry(file="src/domain/RawJson.h", usr="some-usr", expected_count=3)
+        self.assertEqual(entry.expected_count, 3)
+
 
 class AllowlistShapeTests(unittest.TestCase):
-    def test_allowlist_has_exactly_twelve_entries(self) -> None:
-        self.assertEqual(len(ceh.ALLOWLIST), 12)
+    def test_domain_allowlist_has_exactly_twelve_entries(self) -> None:
+        self.assertEqual(len(ceh.DOMAIN_ALLOWLIST), 12)
+
+    def test_foundation_allowlist_has_exactly_two_entries(self) -> None:
+        self.assertEqual(len(ceh.FOUNDATION_ALLOWLIST), 2)
+
+    def test_combined_allowlist_has_fourteen_entries(self) -> None:
+        self.assertEqual(len(ceh.ALLOWLIST), 14)
 
     def test_allowlist_entries_are_unique(self) -> None:
-        # ALLOWLIST is itself a frozenset built from two tuples; this
-        # guards against an accidental duplicate entry silently shrinking
-        # the effective coverage without anyone noticing.
-        combined = list(ceh._CANONICAL_ADAPTERS) + list(ceh._DECODE_HELPERS)
-        self.assertEqual(len(combined), len(set(combined)))
+        # Guards against an accidental duplicate entry silently shrinking
+        # the effective coverage without anyone noticing; ALLOWLIST_BY_KEY
+        # itself already asserts this at import time -- this test
+        # additionally proves the real, current ALLOWLIST content passes.
+        keys = [e.key() for e in ceh.ALLOWLIST]
+        self.assertEqual(len(keys), len(set(keys)))
 
-    def test_allowlist_only_names_rawjson_and_jsondecode_headers(self) -> None:
-        for file, _usr in ceh.ALLOWLIST:
-            self.assertIn(file, ("RawJson.h", "JsonDecode.h"))
+    def test_allowlist_by_key_has_one_entry_per_allowlist_member(self) -> None:
+        self.assertEqual(len(ceh.ALLOWLIST_BY_KEY), len(ceh.ALLOWLIST))
+
+    def test_domain_allowlist_only_names_domain_rawjson_and_jsondecode_headers(self) -> None:
+        for entry in ceh.DOMAIN_ALLOWLIST:
+            self.assertIn(entry.file, ("src/domain/RawJson.h", "src/domain/JsonDecode.h"))
+
+    def test_foundation_allowlist_only_names_authmodels_header(self) -> None:
+        for entry in ceh.FOUNDATION_ALLOWLIST:
+            self.assertEqual(entry.file, "src/AuthModels.h")
+
+    def test_domain_and_foundation_allowlists_share_no_files(self) -> None:
+        # Structural proof the two audited header sets are disjoint by
+        # construction, matching the physical src/domain vs. src include-
+        # root separation this same change enforces at the CMake level.
+        domain_files = {e.file for e in ceh.DOMAIN_ALLOWLIST}
+        foundation_files = {e.file for e in ceh.FOUNDATION_ALLOWLIST}
+        self.assertEqual(domain_files & foundation_files, set())
 
 
-class MissingAllowlistEntryDetectionTests(unittest.TestCase):
-    """Exercises the same set-difference logic main() uses to fail loudly
-    if an allowlisted symbol was renamed/removed (rather than silently
-    reporting "zero violations" for the wrong reason -- an allowlist that
-    no longer matches anything real has quietly stopped constraining
+class MissingOrMiscountedAllowlistEntryDetectionTests(unittest.TestCase):
+    """Exercises the same Counter-based exact-occurrence-count logic
+    main() uses to fail loudly if an allowlisted symbol was renamed/
+    removed/duplicated (rather than silently reporting "zero violations"
+    for the wrong reason -- an allowlist that no longer matches reality
+    at its exact expected count has quietly stopped constraining
     anything)."""
 
-    def test_missing_entry_detected_when_not_observed(self) -> None:
-        observed = {key for key in ceh.ALLOWLIST if key != next(iter(ceh.ALLOWLIST))}
-        missing = ceh.ALLOWLIST - observed
-        self.assertEqual(len(missing), 1)
+    def test_missing_entry_detected_when_not_observed_at_all(self) -> None:
+        counts: Counter[tuple[str, str]] = Counter()
+        missing = [e for e in ceh.ALLOWLIST if counts[e.key()] != e.expected_count]
+        self.assertEqual(len(missing), len(ceh.ALLOWLIST))
 
-    def test_no_missing_entries_when_all_observed(self) -> None:
-        observed = set(ceh.ALLOWLIST)
-        missing = ceh.ALLOWLIST - observed
-        self.assertEqual(missing, set())
+    def test_no_missing_entries_when_all_observed_at_exact_count(self) -> None:
+        counts = Counter({e.key(): e.expected_count for e in ceh.ALLOWLIST})
+        missing = [e for e in ceh.ALLOWLIST if counts[e.key()] != e.expected_count]
+        self.assertEqual(missing, [])
+
+    def test_single_entry_observed_twice_instead_of_once_is_flagged(self) -> None:
+        counts = Counter({e.key(): e.expected_count for e in ceh.ALLOWLIST})
+        target = ceh.ALLOWLIST[0]
+        counts[target.key()] += 1
+        missing = [e for e in ceh.ALLOWLIST if counts[e.key()] != e.expected_count]
+        self.assertEqual(missing, [target])
+
+
+class RepresentativeCompileArgsTests(unittest.TestCase):
+    def test_selects_and_sanitizes_first_source_entry(self) -> None:
+        compile_commands = [
+            {
+                "file": "/repo/src/domain/RawJson.cpp",
+                "command": "/usr/bin/clang++ -std=c++23 -Isrc/domain -o x.o -c /repo/src/domain/RawJson.cpp",
+            },
+            {
+                "file": "/repo/src/domain/Decks.cpp",
+                "command": "/usr/bin/clang++ -std=c++23 -Isrc/domain -DOTHER -o y.o -c /repo/src/domain/Decks.cpp",
+            },
+        ]
+        sources = [Path("/repo/src/domain/RawJson.cpp")]
+        result = ceh._representative_compile_args(compile_commands, sources, "domain")
+        self.assertEqual(result, ["-std=c++23", "-Isrc/domain"])
+
+    def test_raises_when_no_sources_given(self) -> None:
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._representative_compile_args([], [], "domain")
+
+    def test_raises_when_representative_source_missing_from_compile_commands(self) -> None:
+        compile_commands = [
+            {"file": "/repo/src/domain/Decks.cpp", "command": "clang++ -DFOO /repo/src/domain/Decks.cpp"},
+        ]
+        sources = [Path("/repo/src/domain/RawJson.cpp")]
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._representative_compile_args(compile_commands, sources, "domain")
 
 
 class SanitizeCompileArgsTests(unittest.TestCase):
     def test_drops_compiler_executable_and_output_and_source(self) -> None:
-        command = "/usr/bin/clang++ -std=c++23 -Isrc -o CMakeFiles/x.o -c src/RawJson.cpp"
-        result = ceh._sanitize_compile_args(command, "src/RawJson.cpp")
+        command = "/usr/bin/clang++ -std=c++23 -Isrc -o CMakeFiles/x.o -c src/domain/RawJson.cpp"
+        result = ceh._sanitize_compile_args(command, "src/domain/RawJson.cpp")
         self.assertEqual(result, ["-std=c++23", "-Isrc"])
 
     def test_drops_arch_and_debug_flags(self) -> None:
-        command = "clang++ -arch arm64 -g -DFOO=1 src/Decks.cpp"
-        result = ceh._sanitize_compile_args(command, "src/Decks.cpp")
+        command = "clang++ -arch arm64 -g -DFOO=1 src/domain/Decks.cpp"
+        result = ceh._sanitize_compile_args(command, "src/domain/Decks.cpp")
         self.assertEqual(result, ["-DFOO=1"])
 
     def test_preserves_order_and_values_of_remaining_flags(self) -> None:
-        command = "clang++ -DA -DB -Ifoo -Ibar src/Games.cpp"
-        result = ceh._sanitize_compile_args(command, "src/Games.cpp")
+        command = "clang++ -DA -DB -Ifoo -Ibar src/domain/Games.cpp"
+        result = ceh._sanitize_compile_args(command, "src/domain/Games.cpp")
         self.assertEqual(result, ["-DA", "-DB", "-Ifoo", "-Ibar"])
 
     def test_source_file_not_trailing_is_left_untouched(self) -> None:
@@ -166,15 +293,15 @@ class SanitizeCompileArgsTests(unittest.TestCase):
         # does not end with the exact source file (e.g. a quoting
         # difference), this must not accidentally eat an unrelated
         # trailing flag.
-        command = "clang++ -DFOO src/Games.cpp -Wall"
-        result = ceh._sanitize_compile_args(command, "src/Games.cpp")
-        self.assertEqual(result, ["-DFOO", "src/Games.cpp", "-Wall"])
+        command = "clang++ -DFOO src/domain/Games.cpp -Wall"
+        result = ceh._sanitize_compile_args(command, "src/domain/Games.cpp")
+        self.assertEqual(result, ["-DFOO", "src/domain/Games.cpp", "-Wall"])
 
 
 class FindingKeyTests(unittest.TestCase):
     def test_key_is_file_and_usr_pair(self) -> None:
-        finding = _finding(file="RawJson.h", usr="some-usr")
-        self.assertEqual(finding.key(), ("RawJson.h", "some-usr"))
+        finding = _finding(file="src/domain/RawJson.h", usr="some-usr")
+        self.assertEqual(finding.key(), ("src/domain/RawJson.h", "some-usr"))
 
 
 class RealLibclangBasenameTests(unittest.TestCase):
