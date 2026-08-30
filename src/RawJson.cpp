@@ -588,11 +588,28 @@ ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
                                                   qsizetype &totalNodes) const {
   // Mirrors toJsonBytesInner()'s own bookkeeping exactly (see its doc
   // comment / definition below): every node -- scalar or container --
-  // counts once against maxTotalNodes, and every array/object nesting
-  // level counts against maxDepth, so a pathological or adversarially
-  // deep/wide programmatically-built AST cannot recurse unboundedly or
-  // exhaust memory converting it to a QJsonValue tree, any more than it
-  // could serializing straight to bytes.
+  // counts once against maxTotalNodes and is checked against maxDepth at
+  // its own nesting level *before* dispatching on kind, using the same
+  // `depth > limits.maxDepth` bound recursing at depth + 1 into children.
+  // Checking depth uniformly here (rather than only inside the
+  // Array/Object cases below) matters at the boundary: a leaf scalar
+  // sitting exactly one level past maxDepth (reached only because its
+  // *parent* container's shallower depth passed) must still be rejected
+  // here, exactly as it would be by parseValue()/toJsonBytesInner() --
+  // not silently accepted because scalars have no bound of their own.
+  // Likewise using `>` (not `>=`) lets a well-formed container sitting
+  // exactly at depth == maxDepth (e.g. an empty array with no children to
+  // push past the limit) still succeed, matching what parse()/
+  // toJsonBytes() themselves accept for the identical bytes; a stricter
+  // `>=` here would reject input the rest of this type accepts, a
+  // pathological or adversarially deep/wide programmatically-built AST
+  // still cannot recurse unboundedly or exhaust memory converting it to a
+  // QJsonValue tree, any more than it could serializing straight to
+  // bytes.
+  if (depth > limits.maxDepth)
+    return failure(QStringLiteral(
+        "Value::toExactQJson: nesting depth exceeds the configured "
+        "maximum"));
   if (++totalNodes > limits.maxTotalNodes)
     return failure(QStringLiteral(
         "Value::toExactQJson: total node count exceeds the configured "
@@ -632,10 +649,6 @@ ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
             "exactly as a QJsonValue; use toJsonBytes()/the raw AST instead")
             .arg(m_number.literal()));
   case Kind::Array: {
-    if (depth >= limits.maxDepth)
-      return failure(
-          QStringLiteral("Value::toExactQJson: nesting depth exceeds the "
-                         "configured maximum"));
     if (m_array.size() > limits.maxArrayElements)
       return failure(QStringLiteral(
           "Value::toExactQJson: array exceeds the configured maximum "
@@ -663,10 +676,6 @@ ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
     return QJsonValue(array);
   }
   case Kind::Object: {
-    if (depth >= limits.maxDepth)
-      return failure(
-          QStringLiteral("Value::toExactQJson: nesting depth exceeds the "
-                         "configured maximum"));
     if (m_object.size() > limits.maxObjectMembers)
       return failure(QStringLiteral(
           "Value::toExactQJson: object exceeds the configured maximum "

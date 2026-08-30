@@ -160,6 +160,8 @@ private slots:
   void toExactQJsonRejectsDepthExceedingLimitOnProgrammaticAst();
   void toExactQJsonRejectsArrayExceedingMaxArrayElements();
   void toExactQJsonAcceptsValidNestedAstAndPreservesExactInt64();
+  void toExactQJsonAcceptsEmptyArrayExactlyAtMaxDepth();
+  void toExactQJsonAcceptsScalarExactlyAtMaxDepthAndRejectsOneDeeper();
 
   // Round-14 item 1 companion: toExactQJsonObject() is the new helper
   // every request-facing toJson() composes with toRawJson() (see
@@ -1273,6 +1275,58 @@ void RawJsonTests::toExactQJsonAcceptsValidNestedAstAndPreservesExactInt64() {
            QStringLiteral("hello"));
   QVERIFY(array.at(1).isNull());
   QCOMPARE(array.at(2).toBool(), false);
+}
+
+void RawJsonTests::toExactQJsonAcceptsEmptyArrayExactlyAtMaxDepth() {
+  // Round-15 fix: toExactQJsonInner()'s Array/Object cases used to check
+  // `depth >= limits.maxDepth`, rejecting a container sitting exactly at
+  // depth == maxDepth even though (being empty) it has no children left
+  // to push past the limit -- the exact same bytes parse()/toJsonBytes()
+  // both accept for an identically-shaped, identically-deep AST. Nest an
+  // empty array exactly maxDepth levels deep (matching what those two
+  // functions themselves accept as their boundary) and confirm this
+  // conversion now agrees with them instead of being stricter for no
+  // representational reason.
+  Value nested = Value::makeArray({});
+  for (int i = 0; i < ParseLimits::production().maxDepth; ++i)
+    nested = Value::makeArray({nested});
+  auto result = nested.toExactQJson();
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  // Round-trip through toJsonBytes()/parse() to prove this exact AST is
+  // genuinely within the shared, symmetric maxDepth bound -- not merely
+  // an artifact of a still-mismatched conversion.
+  auto bytes = nested.toJsonBytes();
+  QVERIFY(bytes.has_value());
+  QVERIFY(Value::parse(*bytes, u"test").has_value());
+}
+
+void RawJsonTests::
+    toExactQJsonAcceptsScalarExactlyAtMaxDepthAndRejectsOneDeeper() {
+  // Round-15 fix: parseValue()/toJsonBytesInner() check maxDepth
+  // uniformly for every node regardless of kind (scalar or container).
+  // The old toExactQJsonInner() only checked it inside the Array/Object
+  // cases, so a leaf scalar reached one level past maxDepth -- whose
+  // *parent* container's shallower depth had already passed its own
+  // check -- would slip through with no bound of its own. Confirm a
+  // number visited at exactly depth == maxDepth still succeeds, while
+  // one visited at depth == maxDepth + 1 is now rejected, matching
+  // parse()/toJsonBytes() exactly at both boundaries.
+  const auto buildNestedNumber = [](int wraps) {
+    Value nested = Value::makeNumber(RawNumber::fromInt64(7));
+    for (int i = 0; i < wraps; ++i)
+      nested = Value::makeArray({nested});
+    return nested;
+  };
+  const int maxDepth = ParseLimits::production().maxDepth;
+
+  auto atLimit = buildNestedNumber(maxDepth).toExactQJson();
+  if (!atLimit)
+    QFAIL(qPrintable(atLimit.error()));
+
+  auto oneOver = buildNestedNumber(maxDepth + 1).toExactQJson();
+  QVERIFY(!oneOver.has_value());
 }
 
 void RawJsonTests::toExactQJsonObjectConvertsObjectSuccessfully() {
