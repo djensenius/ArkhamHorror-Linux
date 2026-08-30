@@ -7,6 +7,7 @@
 #include "MockHttpServer.h"
 
 #include <QBuffer>
+#include <QDir>
 #include <QImage>
 #include <QNetworkAccessManager>
 #include <QSignalSpy>
@@ -63,7 +64,11 @@ AssetKey makeKey(const QString &rawBase,
 } // namespace
 
 void AssetImageRequestTests::init() {
-  m_tempDir = std::make_unique<QTemporaryDir>();
+  // Round-9+ review: rooted under home so this exercises AssetCache's
+  // real home-anchored directory-resolution code path -- see
+  // AssetCacheTests::init()'s comment for the full rationale.
+  m_tempDir = std::make_unique<QTemporaryDir>(
+      QDir::homePath() + QStringLiteral("/.arkham-asset-image-test-XXXXXX"));
   QVERIFY(m_tempDir->isValid());
   m_tempDirPath = m_tempDir->path();
 }

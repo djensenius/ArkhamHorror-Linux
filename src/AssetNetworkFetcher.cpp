@@ -55,13 +55,15 @@ AssetOutcome<AssetFetchUrl> AssetFetchUrl::validate(const QUrl &url) {
   // Neither a query string nor a fragment is ever legitimately part of a
   // resolved asset candidate URL -- matching
   // UrlValidator::validateCustomUrl()'s policy for the same reason (see
-  // UrlValidator.cpp).
+  // UrlValidator.cpp), including round-9+ review's hasFragment()-not-
+  // fragment().isEmpty() fix: an explicit but empty "#" or "?#" delimiter
+  // must be rejected exactly like a non-empty one.
   if (url.hasQuery()) {
     return AssetError{
         AssetErrorCode::InvalidCandidateUrl,
         QStringLiteral("fetch URL must not contain a query string (?...)")};
   }
-  if (!url.fragment().isEmpty()) {
+  if (url.hasFragment()) {
     return AssetError{
         AssetErrorCode::InvalidCandidateUrl,
         QStringLiteral("fetch URL must not contain a fragment (#...)")};

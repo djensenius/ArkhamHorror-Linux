@@ -499,6 +499,15 @@ void AssetNetworkFetcherTests::
   QTest::newRow("fragment-present")
       << QStringLiteral("https://example.com/a.png#frag")
       << AssetErrorCode::InvalidCandidateUrl;
+  // Round-9+ review (MEDIUM): an explicit but empty "?" or "#" delimiter
+  // must be rejected exactly like a non-empty one -- see
+  // AssetFetchUrl::validate()'s hasQuery()/hasFragment() comment.
+  QTest::newRow("query-present-empty")
+      << QStringLiteral("https://example.com/a.png?")
+      << AssetErrorCode::InvalidCandidateUrl;
+  QTest::newRow("fragment-present-empty")
+      << QStringLiteral("https://example.com/a.png#")
+      << AssetErrorCode::InvalidCandidateUrl;
   // Deliberately NOT tested here: "http://127.1/a.png" and other
   // ambiguous numeric-loopback spellings. AssetFetchUrl::validate()
   // necessarily operates on an already-QUrl-parsed candidate URL (every
