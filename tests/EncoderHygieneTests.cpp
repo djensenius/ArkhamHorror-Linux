@@ -94,6 +94,8 @@ private slots:
   void scannerFlagsATypedefOfABannedContainer();
   void scannerFlagsABareDeducedAutoFunctionRegardlessOfItsBody();
   void scannerFlagsBothOverloadsSharingAName();
+  void scannerFlagsADeclarationSplitByAnEmptyBlockComment();
+  void scannerFlagsADeclarationSplitByAnEmptyLineComment();
   void scannerIgnoresALegitimateTrailingReturnType();
   void scannerIgnoresACommentMentioningABannedType();
   void scannerIgnoresAStringLiteralMentioningABannedType();
@@ -139,18 +141,43 @@ QString stripCommentsAndLiterals(const QString &source) {
   while (i < n) {
     const QChar c = source.at(i);
     if (c == u'/' && i + 1 < n && source.at(i + 1) == u'/') {
-      while (i < n && source.at(i) != u'\n')
+      // Every character of a "//" comment, including its own leading
+      // delimiter, becomes a space -- not merely skipped -- so a
+      // same-line comment with little or no content (e.g. "//") still
+      // separates whatever tokens surrounded it by at least one space
+      // after stripping, exactly as it did before stripping, rather
+      // than only the comment's *content* becoming whitespace while its
+      // delimiter silently vanishes and could concatenate the tokens
+      // on either side of it.
+      while (i < n && source.at(i) != u'\n') {
+        out.append(u' ');
         ++i;
+      }
       continue;
     }
     if (c == u'/' && i + 1 < n && source.at(i + 1) == u'*') {
+      // Same principle for "/* */": both delimiters become whitespace
+      // too, so an empty block comment ("/**/") between two tokens
+      // still leaves 4 spaces of separation rather than 0 -- see
+      // scannerFlagsADeclarationSplitByAnEmptyBlockComment() below,
+      // which is exactly the false negative an unpatched version of
+      // this function could produce.
+      out.append(u' ');
+      out.append(u' ');
       i += 2;
       while (i < n &&
              !(source.at(i) == u'*' && i + 1 < n && source.at(i + 1) == u'/')) {
         out.append(source.at(i) == u'\n' ? u'\n' : u' ');
         ++i;
       }
-      i = qMin(i + 2, n);
+      if (i < n) {
+        out.append(u' ');
+        ++i;
+      }
+      if (i < n) {
+        out.append(u' ');
+        ++i;
+      }
       continue;
     }
     if (c == u'"' || c == u'\'') {
@@ -451,6 +478,39 @@ void EncoderHygieneTests::scannerFlagsBothOverloadsSharingAName() {
       findViolations(u"T.h"_s, u"  QJsonObject toJson() const;\n"
                                "  QJsonObject toJson(bool legacy) const;\n"_s);
   QCOMPARE(v.size(), 2);
+}
+
+void EncoderHygieneTests::scannerFlagsADeclarationSplitByAnEmptyBlockComment() {
+  // A prior version of stripCommentsAndLiterals() silently skipped a
+  // block comment's own "/*"/"*/" delimiters instead of turning them
+  // into whitespace like the rest of the comment; for a short/empty
+  // comment this could concatenate the return type and the name into a
+  // single token ("QJsonObjecttoJson"), which the \b-bounded return-type
+  // regex would then fail to match -- a genuine false negative for
+  // otherwise-valid, declaration-splitting C++ like
+  // `QJsonObject/**/toJson()`. Every character of both delimiters must
+  // become whitespace so the boundary is always preserved.
+  const auto v =
+      findViolations(u"T.h"_s, u"  QJsonObject/**/toJson() const;\n"_s);
+  QCOMPARE(v.size(), 1);
+  QCOMPARE(v.first().rule, u"return-type"_s);
+
+  const auto withContent =
+      findViolations(u"T.h"_s, u"  QJsonObject/*x*/toJson() const;\n"_s);
+  QCOMPARE(withContent.size(), 1);
+  QCOMPARE(withContent.first().rule, u"return-type"_s);
+}
+
+void EncoderHygieneTests::scannerFlagsADeclarationSplitByAnEmptyLineComment() {
+  // Same principle for "//": its own delimiter must become whitespace,
+  // not vanish, even though a trailing "//" comment always runs to the
+  // (separately preserved) newline in practice and so this specific form
+  // did not previously reproduce the bug -- kept as an explicit parity
+  // regression for the sibling block-comment fix.
+  const auto v =
+      findViolations(u"T.h"_s, u"  QJsonObject//\n  toJson() const;\n"_s);
+  QCOMPARE(v.size(), 1);
+  QCOMPARE(v.first().rule, u"return-type"_s);
 }
 
 void EncoderHygieneTests::scannerIgnoresALegitimateTrailingReturnType() {
