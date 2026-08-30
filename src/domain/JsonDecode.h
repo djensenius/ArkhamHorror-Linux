@@ -15,6 +15,7 @@
 #include <array>
 #include <limits>
 #include <optional>
+#include <utility>
 
 namespace Arkham::Json {
 

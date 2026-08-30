@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QSet>
 #include <array>
+#include <utility>
 
 using namespace Qt::StringLiterals;
 

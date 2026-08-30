@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <new>
+#include <utility>
 
 using namespace Qt::StringLiterals;
 

@@ -14,6 +14,7 @@
 #include <QStringView>
 #include <QUuid>
 #include <optional>
+#include <utility>
 
 // Models for contracts/schemas/game-list.schema.json and
 // game-lifecycle.schema.json: the list of in-progress games and the

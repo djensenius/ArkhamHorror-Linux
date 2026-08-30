@@ -2,6 +2,8 @@
 #include <QJsonDocument>
 #include <QtTest>
 
+#include <utility>
+
 #include "Games.h"
 #include "RawJson.h"
 

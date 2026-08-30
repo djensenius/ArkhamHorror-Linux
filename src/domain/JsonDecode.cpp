@@ -6,6 +6,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <utility>
 
 using namespace Qt::StringLiterals;
 
