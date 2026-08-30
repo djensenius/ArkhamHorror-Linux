@@ -97,6 +97,8 @@ private slots:
   void scannerFlagsBothOverloadsSharingAName();
   void scannerFlagsADeclarationSplitByAnEmptyBlockComment();
   void scannerFlagsADeclarationSplitByAnEmptyLineComment();
+  void scannerFlagsAReferenceReturnTypeDeclaration();
+  void scannerFlagsAPointerReturnTypeDeclaration();
   void scannerIgnoresALegitimateTrailingReturnType();
   void scannerIgnoresACommentMentioningABannedType();
   void scannerIgnoresAStringLiteralMentioningABannedType();
@@ -219,17 +221,18 @@ QString snippetAt(const QString &strippedText, qsizetype start,
 }
 
 // Matches a banned Qt JSON container name immediately followed (only
-// whitespace, an optional generic-wrapper prefix, and any number of
+// whitespace, an optional generic-wrapper prefix/suffix, an optional
+// `const`/reference/pointer return-type qualifier, and any number of
 // closing '>' characters in between) by an identifier and its parameter
 // list's opening '(' -- the textual shape of "this declaration's return
-// type is (or wraps) a banned type", independent of how many lines it
-// spans and independent of a hidden body. A parameter usage such as
-// `const QJsonValue &v` or `QJsonObject obj = QJsonObject()` never has an
-// identifier *directly* followed by '(' immediately after the type name,
-// so it cannot match this adjacency.
+// type is (or wraps, or refers/points to) a banned type", independent of
+// how many lines it spans and independent of a hidden body. A parameter
+// usage such as `const QJsonValue &v` or `QJsonObject obj = QJsonObject()`
+// never has an identifier *directly* followed by '(' immediately after
+// the type name, so it cannot match this adjacency.
 const QRegularExpression &returnTypePattern() {
   static const QRegularExpression re(
-      uR"((?:(?:ValueOrError|std::optional)\s*<\s*)*\b(?:QJsonObject|QJsonArray|QJsonValue)\b\s*>*\s*[A-Za-z_]\w*\s*\()"_s);
+      uR"((?:(?:ValueOrError|std::optional)\s*<\s*)*\b(?:QJsonObject|QJsonArray|QJsonValue)\b\s*>*\s*(?:const\s*)?[&*]*\s*[A-Za-z_]\w*\s*\()"_s);
   return re;
 }
 
@@ -510,6 +513,30 @@ void EncoderHygieneTests::scannerFlagsADeclarationSplitByAnEmptyLineComment() {
   // regression for the sibling block-comment fix.
   const auto v =
       findViolations(u"T.h"_s, u"  QJsonObject//\n  toJson() const;\n"_s);
+  QCOMPARE(v.size(), 1);
+  QCOMPARE(v.first().rule, u"return-type"_s);
+}
+
+void EncoderHygieneTests::scannerFlagsAReferenceReturnTypeDeclaration() {
+  // Reported gap: a banned type returned by reference (or rvalue
+  // reference) breaks the plain "type-then-whitespace-then-name"
+  // adjacency the original regex required, letting it slip past
+  // undetected even though it is exactly the same prohibited return
+  // type. The qualifier is now tolerated between the type and the name.
+  const auto lvalueRef =
+      findViolations(u"T.h"_s, u"  QJsonObject& mutableJson();\n"_s);
+  QCOMPARE(lvalueRef.size(), 1);
+  QCOMPARE(lvalueRef.first().rule, u"return-type"_s);
+
+  const auto rvalueRef =
+      findViolations(u"T.h"_s, u"  ValueOrError<QJsonArray>&& takeRows();\n"_s);
+  QCOMPARE(rvalueRef.size(), 1);
+  QCOMPARE(rvalueRef.first().rule, u"return-type"_s);
+}
+
+void EncoderHygieneTests::scannerFlagsAPointerReturnTypeDeclaration() {
+  const auto v =
+      findViolations(u"T.h"_s, u"  const QJsonValue* g() const;\n"_s);
   QCOMPARE(v.size(), 1);
   QCOMPARE(v.first().rule, u"return-type"_s);
 }
