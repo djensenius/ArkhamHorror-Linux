@@ -256,6 +256,39 @@ public:
     return hasNegative404(cacheKey);
   }
 
+  // Round-7/8 item 7: the number of DISTINCT shared cache-hit decode
+  // groups (see PendingCacheDecode's declaration comment) currently
+  // waiting on their single queued decode -- lets a test assert N
+  // concurrent cache-hit requests for aliased logical keys resolving to
+  // the same (cacheKey, format) genuinely share one pending group (this
+  // count stays 1 regardless of N) before its queued decode actually
+  // runs.
+  [[nodiscard]] int pendingCacheDecodeGroupCountForTesting() const {
+    return m_pendingCacheDecodes.size();
+  }
+  // The number of waiters currently attached to the pending decode group
+  // for `cacheKey`/`format` (0 if no such group exists), so a test can
+  // assert every expected aliased request actually joined the same
+  // group rather than each scheduling its own independent decode.
+  [[nodiscard]] int
+  pendingCacheDecodeWaiterCountForTesting(const QString &cacheKey,
+                                          AssetFormat format) const {
+    return m_pendingCacheDecodes
+        .value(cacheDecodeCoalescingKey(cacheKey, format))
+        .waiters.size();
+  }
+  // Round-7/8 item 7: the number of times ensureDecoded() has actually
+  // performed a REAL decode (i.e. entry.decodedImage was null on entry,
+  // so m_fetcher.decodeAndValidate() genuinely ran) since this
+  // coordinator was constructed -- as opposed to its already-decoded
+  // short-circuit. Lets a test assert a burst of coalesced requests
+  // sharing one cached entry genuinely decoded it exactly once, rather
+  // than merely trusting the pending-decode-group bookkeeping above
+  // implies it.
+  [[nodiscard]] int realDecodeCallCountForTesting() const {
+    return m_realDecodeCallCountForTesting;
+  }
+
   // Review round-4 item 7: force an immediate prune (production code
   // only ever prunes opportunistically, at the end of
   // completeOperation()) so a test can assert the post-prune bound
@@ -511,6 +544,95 @@ private:
                                      const QString &cacheKey,
                                      quint64 expectedGeneration,
                                      bool promoteOnSuccess);
+
+  // Round-7/8 item 7 (MEDIUM, "cache-hit read/decode occurs before
+  // operation coalescing"): candidateAttemptKey()/CandidateAttempt above
+  // already coalesce the NETWORK round trip for aliased logical keys
+  // resolving to the same candidate -- but a decode driven by a CACHE
+  // HIT (memory or disk, including every stale-served/304/revalidation
+  // branch) previously had no equivalent: each Operation independently
+  // called ensureDecoded() -- a full, potentially near-32-megapixel
+  // image decode -- even when N simultaneous requests (e.g. several QML
+  // Image elements for the same card, differing only in a locale that
+  // happens to fall back to the same English candidate) resolve to the
+  // exact same (cacheKey, format) pair at the exact same moment. A
+  // GroupWaiter is one Operation's stake in a shared decode: its own
+  // operationId (so a waiter cancelled before delivery is silently
+  // skipped -- see completeCacheReadGroupOrQuarantine()'s comment) and
+  // its own independently-minted expectedGeneration (see
+  // issueCacheKeyGeneration()'s comment) -- CAS-gated exactly as if it
+  // had decoded independently, so the final applied generation and any
+  // quarantine/invalidate/retry decision is bit-for-bit identical to
+  // what fully independent processing in request order would have
+  // produced.
+  struct GroupWaiter {
+    quint64 operationId{0};
+    quint64 expectedGeneration{0};
+  };
+  // One (cacheKey, format) pair's currently in-flight, not-yet-decoded
+  // shared cache read: `entry` is the bytes exactly one Operation (the
+  // "leader") looked up and captured at registration time; every LATER
+  // registerCacheHitCompletion() call for the identical (cacheKey,
+  // format) pair, made before this group's single queued decode actually
+  // runs, joins as an additional waiter instead of scheduling its own
+  // independent decode -- see completeCoalescedCacheDecode()'s comment.
+  struct PendingCacheDecode {
+    AssetCache::CachedEntry entry;
+    QString cacheKey;
+    AssetFormat format{AssetFormat::Png};
+    QVector<GroupWaiter> waiters;
+  };
+  // Identifies a PendingCacheDecode group. Distinct from
+  // candidateAttemptKey() (which additionally distinguishes conditional-
+  // validator snapshots for network-level coalescing): a cache-hit decode
+  // has no validators of its own to distinguish -- the SAME already-
+  // cached bytes are what every waiter in a group shares.
+  [[nodiscard]] static QString cacheDecodeCoalescingKey(const QString &cacheKey,
+                                                        AssetFormat format);
+  // Decodes `entry` against `expectedFormat` via ensureDecoded() exactly
+  // ONCE (regardless of how many waiters share it -- see
+  // ensureDecoded()'s comment for why this is safe: it is deliberately
+  // side-effect-free, and the resulting QImage is implicitly shared, so
+  // copying the outcome into each waiter's own completion below is O(1),
+  // never a pixel-buffer duplication), then applies the outcome to every
+  // waiter independently and in order:
+  //   - success: each waiter's own CAS-gated memory publish/promotion,
+  //     exactly as completeCacheReadOrQuarantine() already did for a
+  //     single operation -- processed in ascending-generation (i.e.
+  //     registration) order so the FINAL applied generation matches
+  //     whatever fully independent per-operation processing would have
+  //     left behind.
+  //   - a non-quarantine-worthy failure: each waiter's own completion
+  //     with that same failure, unchanged.
+  //   - a quarantine-worthy failure: AssetCache::invalidate(cacheKey) is
+  //     called EXACTLY ONCE for the whole group (never once per waiter),
+  //     the moment the FIRST waiter whose own CAS still applies is
+  //     found; every waiter whose CAS applies then independently retries
+  //     its OWN candidate via startCandidate() (which itself coalesces
+  //     with any sibling waiter's retry at the network layer via
+  //     candidateAttemptKey() -- see the class comment), so the group as
+  //     a whole performs one invalidate and, in practice, one shared
+  //     refetch, never N of either.
+  // A waiter already cancelled (absent from m_operations) by the time
+  // this runs -- see cancel()'s comment -- is silently skipped and never
+  // participates in the CAS/invalidate/retry decision at all: one
+  // consumer cancelling never affects any sibling waiter sharing this
+  // same decode.
+  void completeCacheReadGroupOrQuarantine(const QVector<GroupWaiter> &waiters,
+                                          AssetCache::CachedEntry entry,
+                                          const QString &cacheKey,
+                                          AssetFormat expectedFormat,
+                                          bool promoteOnSuccess);
+  // Queued entry point for a PendingCacheDecode group's single shared
+  // decode: looks up (and removes) `decodeKey`'s current entry in
+  // m_pendingCacheDecodes -- capturing its final waiter list, which may
+  // have grown since the leader's registerCacheHitCompletion() call
+  // scheduled this closure, if any sibling requests joined in the
+  // meantime -- then defers to completeCacheReadGroupOrQuarantine(). A
+  // missing entry (defensive only: nothing else ever erases
+  // m_pendingCacheDecodes except this method) is a silent no-op.
+  void completeCoalescedCacheDecode(const QString &decodeKey);
+
   // Per-cache-key optimistic-concurrency counter (review item 6); see the
   // class comment's "Cross-logical-key races" paragraph. A cache key
   // never observed before implicitly starts at generation 0. This is the
@@ -697,6 +819,17 @@ private:
   // issues the shared fetch and the moment that fetch completes (or every
   // subscriber cancels, unsubscribing it back down to empty).
   QHash<QString, CandidateAttempt> m_candidateAttempts;
+
+  // Round-7/8 item 7: see PendingCacheDecode's declaration comment above.
+  // Memory-only and inherently transient/bounded, like m_candidateAttempts:
+  // an entry only ever exists between a leader's registerCacheHitCompletion()
+  // call and the moment its single queued completeCoalescedCacheDecode()
+  // call actually runs (at most one Qt event-loop hop later), never
+  // persisting across that -- so unlike m_negative404 it needs no separate
+  // TTL/pruning logic.
+  QHash<QString, PendingCacheDecode> m_pendingCacheDecodes;
+  // Round-7/8 item 7: see realDecodeCallCountForTesting()'s comment.
+  int m_realDecodeCallCountForTesting = 0;
 };
 
 } // namespace Arkham

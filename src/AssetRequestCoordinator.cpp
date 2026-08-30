@@ -500,6 +500,7 @@ AssetRequestCoordinator::ensureDecoded(AssetCache::CachedEntry entry,
     return AssetOutcome<AssetCache::CachedEntry>(std::move(entry));
   }
 
+  ++m_realDecodeCallCountForTesting;
   const AssetOutcome<QImage> decoded =
       m_fetcher.decodeAndValidate(entry.encodedBytes, format);
   if (!decoded) {
@@ -591,6 +592,16 @@ AssetRequestCoordinator::registerCacheHitCompletion(
   const quint64 handleId = m_nextHandle++;
   const quint64 operationId = m_nextOperationId++;
 
+  // Same "candidate's own format, not the logical key's" rule
+  // completeCacheReadOrQuarantine() applies -- computed here, before
+  // `candidates` is moved into the Operation below, so it can also key
+  // this registration's shared-decode group (see PendingCacheDecode's
+  // comment).
+  const AssetFormat expectedFormat =
+      candidateIndex >= 0 && candidateIndex < candidates.size()
+          ? candidates[candidateIndex].format
+          : key.format;
+
   Operation operation;
   operation.key = key;
   // The full candidate vector and this exact index are kept (not just
@@ -604,15 +615,49 @@ AssetRequestCoordinator::registerCacheHitCompletion(
   m_operations.insert(operationId, std::move(operation));
   m_handleToOperation.insert(handleId, operationId);
 
+  // Round-7/8 item 7 ("cache-hit read/decode occurs before operation
+  // coalescing"): join (or become the leader of) a shared decode for this
+  // exact (cacheKey, format) pair instead of always scheduling an
+  // independent one -- see PendingCacheDecode's declaration comment.
+  QString decodeKey = cacheDecodeCoalescingKey(cacheKey, expectedFormat);
+  auto pendingIt = m_pendingCacheDecodes.find(decodeKey);
+  if (pendingIt != m_pendingCacheDecodes.end()) {
+    if (pendingIt->entry.encodedBytes == entry.encodedBytes) {
+      // A leader is already registered for the identical cached bytes:
+      // attach as an additional waiter. No second queued decode is
+      // scheduled -- the leader's own already-queued
+      // completeCoalescedCacheDecode() call delivers to every waiter,
+      // including this one, once it runs.
+      pendingIt->waiters.append(GroupWaiter{operationId, expectedGeneration});
+      return RequestHandle{handleId};
+    }
+    // Defensive only: the cache's live bytes for this exact key changed
+    // between two near-simultaneous lookups (e.g. an unrelated fetch
+    // completed and republished the key in between this call and the
+    // still-pending leader's queued decode). Never silently merge two
+    // different byte sequences into one waiter list, and never overwrite
+    // the existing map slot either -- doing so would orphan the existing
+    // leader's already-queued closure and strand its waiters. Disambiguate
+    // this call's own key instead, so it becomes an independent leader
+    // that can never collide with the existing group; this is exactly as
+    // safe as (merely not any MORE coalesced than) the pre-coalescing
+    // behaviour of always scheduling an independent decode.
+    decodeKey += QLatin1Char('#') + QString::number(operationId);
+  }
+
+  m_pendingCacheDecodes.insert(
+      decodeKey,
+      PendingCacheDecode{std::move(entry),
+                         cacheKey,
+                         expectedFormat,
+                         {GroupWaiter{operationId, expectedGeneration}}});
+
   QPointer<AssetRequestCoordinator> self(this);
   QMetaObject::invokeMethod(
       this,
-      [self, operationId, entry = std::move(entry),
-       cacheKey = std::move(cacheKey), expectedGeneration]() mutable {
+      [self, decodeKey]() {
         if (self) {
-          self->completeCacheReadOrQuarantine(operationId, std::move(entry),
-                                              cacheKey, expectedGeneration,
-                                              /*promoteOnSuccess=*/false);
+          self->completeCoalescedCacheDecode(decodeKey);
         }
       },
       Qt::QueuedConnection);
@@ -644,7 +689,7 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
   if (it == m_operations.end()) {
     return; // cancelled/destroyed before this queued call ran
   }
-  Operation &operation = it.value();
+  const Operation &operation = it.value();
   // Item 1 follow-on: a cached entry's expected format is the CANDIDATE's
   // format (see AssetCandidate::format), not the logical key's -- a
   // CardBackKind::GenericEncounterBack/GenericPlayerBack/CustomBack
@@ -654,6 +699,27 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
       operation.candidateIndex < operation.candidates.size()
           ? operation.candidates[operation.candidateIndex].format
           : operation.key.format;
+  // A single-waiter group: see completeCacheReadGroupOrQuarantine()'s
+  // comment. Every one of the branches that method implements (success/
+  // CAS/promote, non-quarantine-worthy failure, quarantine-worthy
+  // invalidate-once-then-retry) is bit-for-bit identical to what this
+  // method used to implement directly for exactly one operationId.
+  completeCacheReadGroupOrQuarantine(
+      {GroupWaiter{operationId, expectedGeneration}}, std::move(entry),
+      cacheKey, expectedFormat, promoteOnSuccess);
+}
+
+QString
+AssetRequestCoordinator::cacheDecodeCoalescingKey(const QString &cacheKey,
+                                                  AssetFormat format) {
+  return cacheKey + QLatin1Char('|') +
+         QString::number(static_cast<int>(format));
+}
+
+void AssetRequestCoordinator::completeCacheReadGroupOrQuarantine(
+    const QVector<GroupWaiter> &waiters, AssetCache::CachedEntry entry,
+    const QString &cacheKey, AssetFormat expectedFormat,
+    bool promoteOnSuccess) {
   AssetOutcome<AssetCache::CachedEntry> outcome =
       ensureDecoded(std::move(entry), expectedFormat);
 
@@ -661,67 +727,85 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
     // Review round-3 items 14/15: gate BOTH the memory-decoded-image
     // republish (ensureDecoded() is deliberately side-effect-free -- see
     // its comment) and, when requested, the full promoteToMemory() behind
-    // the SAME issuance-ordered CAS (tryApplyCacheKeyMutation()). A
-    // decode that raced a newer-issued operation's own publish can
-    // therefore never mutate the current live memory entry with stale
-    // pixels, regardless of which operation's disk read/decode happens
-    // to finish first.
-    if (tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
-      m_cache.updateMemoryDecodedImage(cacheKey, outcome->decodedImage);
-      if (promoteOnSuccess) {
-        m_cache.promoteToMemory(cacheKey, *outcome);
+    // the SAME issuance-ordered CAS (tryApplyCacheKeyMutation()), applied
+    // independently per waiter and in registration order -- so the FINAL
+    // applied generation for `cacheKey` is exactly what fully independent,
+    // one-decode-per-operation processing would have left behind, even
+    // though the decode itself ran only once for the whole group.
+    for (const GroupWaiter &waiter : waiters) {
+      if (m_operations.find(waiter.operationId) == m_operations.end()) {
+        continue; // cancelled before delivery -- see header comment
       }
+      AssetOutcome<AssetCache::CachedEntry> perWaiterOutcome(*outcome);
+      if (tryApplyCacheKeyMutation(cacheKey, waiter.expectedGeneration)) {
+        m_cache.updateMemoryDecodedImage(cacheKey,
+                                         perWaiterOutcome->decodedImage);
+        if (promoteOnSuccess) {
+          m_cache.promoteToMemory(cacheKey, *perWaiterOutcome);
+        }
+      }
+      completeOperation(waiter.operationId, std::move(perWaiterOutcome));
     }
-    completeOperation(operationId, std::move(outcome));
     return;
   }
 
   if (!isQuarantineWorthy(outcome.error().code)) {
-    completeOperation(operationId, std::move(outcome));
+    for (const GroupWaiter &waiter : waiters) {
+      if (m_operations.find(waiter.operationId) == m_operations.end()) {
+        continue;
+      }
+      completeOperation(waiter.operationId,
+                        AssetOutcome<AssetCache::CachedEntry>(outcome.error()));
+    }
     return;
   }
 
-  if (!tryApplyCacheKeyMutation(cacheKey, expectedGeneration)) {
-    // Review round-3 item 14: some more recently ISSUED operation has
-    // already applied its own mutation for this exact cache key since
-    // this entry was read (or since this revalidation was issued) --
-    // this now-outdated view failing to decode is NOT proof the CURRENT
-    // entry is bad, so never invalidate (which could destroy a newer,
-    // perfectly valid entry) and never retry the candidate over the
-    // network on this stale path either (which could itself race with,
-    // and overwrite, whatever the newer operation just published). Simply
-    // report the failure this stale view genuinely observed to this
-    // operation's own consumers.
-    completeOperation(operationId, std::move(outcome));
-    return;
+  // Review item 9 (refined by round-7/8 item 6, "cache-hit read/decode
+  // occurs before operation coalescing"): this exact cached generation
+  // just failed a format/magic/decode/dimension/pixel-budget re-check
+  // against CURRENT limits -- it must never be served again as-is, and
+  // never silently keep failing every future request for the same key
+  // forever. Evict both the memory and disk state for this exact
+  // resolved-candidate cache key EXACTLY ONCE for the whole group (never
+  // once per waiter -- see the header comment), then let every waiter
+  // whose own CAS still applies independently retry precisely the SAME
+  // candidate as a genuine network miss; a waiter whose CAS no longer
+  // applies (superseded by a newer issuance since this entry was read)
+  // simply reports the failure this stale view genuinely observed,
+  // exactly as the single-operation path always did.
+  bool invalidatedThisGroup = false;
+  for (const GroupWaiter &waiter : waiters) {
+    auto it = m_operations.find(waiter.operationId);
+    if (it == m_operations.end()) {
+      continue;
+    }
+    if (!tryApplyCacheKeyMutation(cacheKey, waiter.expectedGeneration)) {
+      completeOperation(waiter.operationId,
+                        AssetOutcome<AssetCache::CachedEntry>(outcome.error()));
+      continue;
+    }
+    if (!invalidatedThisGroup) {
+      (void)m_cache.invalidate(cacheKey);
+      invalidatedThisGroup = true;
+    }
+    Operation &operation = it.value();
+    operation.isRevalidation = false;
+    operation.staleEntry.reset();
+    startCandidate(waiter.operationId);
   }
+}
 
-  // Review item 9: this exact cached generation just failed a format/
-  // magic/decode/dimension/pixel-budget re-check against CURRENT limits
-  // -- it must never be served again as-is, and never silently keep
-  // failing every future request for the same key forever. Evict both
-  // the memory and disk state for this exact resolved-candidate cache
-  // key, then retry precisely the SAME candidate as a genuine network
-  // miss. isRevalidation/staleEntry are reset first so the retry goes
-  // through the ordinary unconditional-fetch path (startCandidate()),
-  // never back into startRevalidation() for bytes that no longer exist
-  // anywhere. A decode failure on the freshly-refetched bytes (if any)
-  // completes via startCandidate()'s own normal fetch-failure handling,
-  // which never re-enters this method -- so a bad origin resource can
-  // fail at most once more, never loop. The CAS application above already
-  // recorded this exact issuance as the new current generation, so no
-  // separate bump is needed here. Note: unlike the definitive-404 case
-  // handled in startCandidate()/startRevalidation()'s NotFound branches,
-  // this invalidate() call's result is not itself load-bearing for
-  // correctness -- store()'s own crash-durable generation/manifest
-  // replacement (not this eager best-effort cleanup) is what actually
-  // guarantees the freshly-refetched replacement below supersedes this
-  // corrupt entry, whether or not this particular unlink attempt
-  // succeeds durably first.
-  (void)m_cache.invalidate(cacheKey);
-  operation.isRevalidation = false;
-  operation.staleEntry.reset();
-  startCandidate(operationId);
+void AssetRequestCoordinator::completeCoalescedCacheDecode(
+    const QString &decodeKey) {
+  auto it = m_pendingCacheDecodes.find(decodeKey);
+  if (it == m_pendingCacheDecodes.end()) {
+    return; // defensive only -- see header comment
+  }
+  PendingCacheDecode pending = std::move(it.value());
+  m_pendingCacheDecodes.erase(it);
+  completeCacheReadGroupOrQuarantine(pending.waiters, std::move(pending.entry),
+                                     pending.cacheKey, pending.format,
+                                     /*promoteOnSuccess=*/false);
 }
 
 void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {

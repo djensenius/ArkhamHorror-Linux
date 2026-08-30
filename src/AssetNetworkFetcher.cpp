@@ -810,13 +810,65 @@ AssetNetworkFetcher::decodeAndValidate(const QByteArray &encodedBytes,
         QStringLiteral("JPEG body has no genuine End-Of-Image marker "
                        "(response was likely truncated in transit)")});
   }
+  PngStructuralInfo pngInfo;
   if (expectedFormat == AssetFormat::Png &&
-      !pngChunksAreStrictlyValid(encodedBytes)) {
+      !pngChunksAreStrictlyValid(encodedBytes, &pngInfo)) {
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
         QStringLiteral("PNG chunk structure is malformed, contains a "
-                       "checksum mismatch, carries animation data, or has "
-                       "trailing bytes after IEND")});
+                       "checksum mismatch, carries animation data, an "
+                       "interlaced/invalid IHDR, or a compressed ancillary "
+                       "chunk (zTXt/iCCP/compressed iTXt), or has trailing "
+                       "bytes after IEND")});
+  }
+  if (expectedFormat == AssetFormat::Png) {
+    // Enforce the dimension/pixel-budget caps against IHDR's own
+    // width/height BEFORE ever touching zlib or QImageReader: this is the
+    // exact same policy already applied below (via QImageReader::size())
+    // for defense in depth, just applied as early as this project can
+    // possibly apply it -- which matters because
+    // pngIdatDecompressesToExactExpectedSize() just below needs these
+    // caps to already hold in order to keep its own bounded-decompression
+    // output-buffer allocation itself bounded.
+    if (pngInfo.width > static_cast<quint32>(m_limits.maxDimensionPixels) ||
+        pngInfo.height > static_cast<quint32>(m_limits.maxDimensionPixels)) {
+      return AssetOutcome<QImage>(AssetError{
+          AssetErrorCode::DimensionTooLarge,
+          QStringLiteral("PNG dimension %1x%2 exceeds the configured cap "
+                         "of %3 pixels per side")
+              .arg(pngInfo.width)
+              .arg(pngInfo.height)
+              .arg(m_limits.maxDimensionPixels)});
+    }
+    // Overflow-safe: both operands are already bounded by
+    // maxDimensionPixels above.
+    const qint64 pngTotalPixels = static_cast<qint64>(pngInfo.width) *
+                                  static_cast<qint64>(pngInfo.height);
+    if (pngTotalPixels > m_limits.maxTotalPixels) {
+      return AssetOutcome<QImage>(
+          AssetError{AssetErrorCode::PixelBudgetExceeded,
+                     QStringLiteral("PNG pixel count %1 exceeds the configured "
+                                    "budget of %2 pixels")
+                         .arg(pngTotalPixels)
+                         .arg(m_limits.maxTotalPixels)});
+    }
+    // Cumulative-review finding (PR #18, exact head 4a47ea34): a
+    // CRC-valid IDAT run can contain a complete, valid image zlib stream
+    // followed by extra bytes or an entirely separate second zlib
+    // stream -- libpng only warns about this, and QImageReader has no
+    // way to surface that warning, so it would otherwise happily decode
+    // and this project would happily cache the result. See
+    // AssetPngValidator.h's doc comment for the full rationale.
+    if (!pngIdatDecompressesToExactExpectedSize(
+            pngInfo.idatPayload, pngInfo.width, pngInfo.height,
+            pngInfo.bitDepth, pngInfo.colorType)) {
+      return AssetOutcome<QImage>(AssetError{
+          AssetErrorCode::MalformedImage,
+          QStringLiteral(
+              "PNG IDAT zlib stream does not decompress to exactly the "
+              "expected scanline byte count (truncated, corrupt, or "
+              "carries trailing/second-stream data)")});
+    }
   }
 
   // AVIF is decoded directly against libavif's own C API (see

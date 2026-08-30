@@ -9,6 +9,36 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(QT_QML_GENERATE_QMLLS_INI ON)
 
+# Cumulative-review finding (PR #18, exact head 4a47ea34): the previous
+# AssetJpegDecoder.cpp kept its libjpeg cinfo/error-manager state as plain
+# automatic (stack) locals mutated after the setjmp() checkpoint --
+# formally undefined behavior per [csetjmp.syn], even though every
+# compiler actually observed happened to preserve their values across
+# longjmp() regardless (see AssetJpegDecoder.cpp's own restructuring to
+# heap-allocated, unchanged-pointer-reached state, which is what actually
+# fixes this at the root). This option lets CI additionally PROVE the fix
+# under Clang/GCC's UndefinedBehaviorSanitizer in an optimized
+# (RelWithDebInfo/Release) build -- exactly the configuration most likely
+# to have actually miscompiled the previous code, since only an optimizer
+# aggressive enough to register-allocate/reorder around setjmp()'s own
+# (deliberately limited) guarantees could turn this from "happens to
+# work" into an observable failure. Default OFF: this is an opt-in
+# diagnostic configuration, never the default developer/CI build (which
+# would be slower and would reject some otherwise-fine third-party code
+# this project does not control, e.g. inside Qt itself, if ever linked
+# statically).
+option(ARKHAM_ENABLE_UBSAN
+      "Build with -fsanitize=undefined (Clang/GCC only; opt-in diagnostic build, never the default)"
+      OFF)
+if(ARKHAM_ENABLE_UBSAN)
+  if(NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
+    message(FATAL_ERROR "ARKHAM_ENABLE_UBSAN requires Clang or GCC")
+  endif()
+  add_compile_options(-fsanitize=undefined -fno-sanitize-recover=undefined
+                      -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=undefined)
+endif()
+
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Network Quick QuickControls2 WebSockets)
 
 qt_standard_project_setup(REQUIRES 6.8)
@@ -44,6 +74,27 @@ pkg_check_modules(LIBAVIF REQUIRED IMPORTED_TARGET libavif)
 # above. See mise.toml's setup:macos task and .github/workflows/ci.yml for
 # how each environment installs it.
 pkg_check_modules(LIBJPEG REQUIRED IMPORTED_TARGET libjpeg)
+
+# --- zlib (zlib License; https://zlib.net/) --------------------------------
+# Cumulative-review finding (PR #18, exact head 4a47ea34): a CRC-valid PNG
+# IDAT run can contain a complete, valid image zlib stream followed by
+# extra bytes or an entirely second zlib stream -- libpng only warns about
+# this (and Qt's qpng plugin surfaces no way to observe that warning), so
+# QImageReader/QImage happily decodes and this project would happily cache
+# the result. AssetPngValidator.cpp closes this by concatenating every
+# IDAT chunk's payload (already gathered while walking the chunk sequence
+# for pngChunksAreStrictlyValid()) and inflating it directly against
+# zlib's own C API, requiring the decompressed byte count to exactly equal
+# the expected (width/height/bit-depth/colour-type-derived) scanline byte
+# count, Z_STREAM_END to be reached, and every input byte to be consumed --
+# rejecting both truncated streams and any trailing/second-stream bytes.
+# Qt's own qUncompress()/qCompress() are NOT usable for this: they require
+# Qt's own wire format (a 4-byte big-endian uncompressed-length prefix
+# ahead of the zlib stream), not the bare zlib stream PNG's IDAT chunks
+# actually contain, so the real zlib C API is called directly here, exactly
+# mirroring how AssetAvifDecoder.cpp/AssetJpegDecoder.cpp call libavif/
+# libjpeg directly rather than going through Qt's own image plugins.
+find_package(ZLIB REQUIRED)
 
 
 # include(CTest) establishes the real BUILD_TESTING cache value (default ON)
@@ -189,6 +240,7 @@ target_link_libraries(arkham_foundation PUBLIC
     Qt6Keychain::Qt6Keychain
     PkgConfig::LIBAVIF
     PkgConfig::LIBJPEG
+    ZLIB::ZLIB
 )
 
 qt_add_executable(arkham-horror

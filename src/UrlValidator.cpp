@@ -117,6 +117,25 @@ UrlValidationResult validateCustomUrl(const QString &input) {
     };
   }
 
+  // Cumulative-review finding (PR #18): the raw, pre-QUrl authority text
+  // must be unambiguous and well-formed for EVERY scheme (not merely
+  // gated behind the http-loopback exception below) -- QUrl silently
+  // normalises percent-escaped hosts, folds certain Unicode look-alike
+  // characters, and canonicalises alternate numeric IP spellings at parse
+  // time, and an https URL is just as capable of carrying one of these
+  // ambiguities as an http one. See
+  // rawAuthorityHostIsUnambiguousAndWellFormed()'s doc comment in
+  // AuthTransportSecurity.h for the exact policy.
+  if (!rawAuthorityHostIsUnambiguousAndWellFormed(trimmedInput)) {
+    return UrlValidationError{
+        UrlErrorCode::AmbiguousAuthority,
+        QStringLiteral("URL authority is malformed or ambiguous (percent-"
+                       "escaped, non-ASCII, backslash/control characters, "
+                       "or an alternate numeric IP spelling are not "
+                       "permitted in the host)"),
+    };
+  }
+
   // http is only permitted to an exact canonical loopback spelling. This
   // check MUST run against the raw, not-yet-normalised trimmedInput text --
   // not url.host() -- because QUrl itself silently canonicalises ambiguous

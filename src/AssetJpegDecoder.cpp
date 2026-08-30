@@ -19,26 +19,71 @@ namespace Arkham {
 
 namespace {
 
-// Every piece of per-decode state lives here, as a plain stack local
-// (never static, never shared) -- see AssetJpegDecoder.h's header comment
-// for why this is what actually fixes the concurrency bug the previous
-// ScopedJpegDecodeWarningDetector had. A pointer to this struct is
-// threaded through libjpeg's own cinfo.client_data -- a field libjpeg
-// defines and documents specifically for carrying arbitrary per-call
-// caller state, safe to read back with a plain static_cast regardless of
-// this struct's own layout. This deliberately does NOT reinterpret_cast
-// cinfo->err (the jpeg_error_mgr*) back to this struct via a "pub is the
-// first member" base-pointer trick: while JpegErrorManager likely still
-// qualifies as a standard-layout type even with a QString member (that
-// C-style idiom's pointer-interconvertibility guarantee is about the
-// STRUCT's own shape, not its members' types), relying on that is
-// needlessly fragile and easy to invalidate by a future member reordering
-// or addition -- client_data exists in libjpeg's own public API
-// precisely so callers never need to reason about this at all.
+// Cumulative-review finding (PR #18, exact head 4a47ea34): the previous
+// version of this file kept `jpeg_decompress_struct cinfo` and
+// `JpegErrorManager errorManager` (which itself held a QString) as plain
+// automatic (stack) locals declared BEFORE the setjmp() checkpoint below,
+// and both are mutated (via pointers to them threaded through libjpeg)
+// AFTER that checkpoint -- exactly the shape [csetjmp.syn] describes as
+// producing indeterminate values on the longjmp() recovery path: "values
+// of objects of automatic storage duration that are local to the function
+// containing the invocation of the corresponding setjmp macro that do not
+// have volatile-qualified type ... and have been changed between the
+// setjmp invocation and longjmp call are indeterminate". The previous
+// code's own comment argued that taking cinfo/errorManager's address (to
+// pass to libjpeg) was sufficient to force the compiler to keep them
+// memory-resident and thereby sidestep this in practice -- true for every
+// compiler actually observed, but the standard's text grants no such
+// "address taken" exception, so this remained formally UB and a
+// plausible target for future/aggressive optimizers (or a stricter
+// sanitizer) to exploit.
+//
+// This is fixed at the root by moving every piece of per-decode mutable
+// state (cinfo, the error manager, and the scanline buffer pointer) into
+// ONE heap-allocated (not automatic-storage) block, reached for the rest
+// of this function exclusively through a single `volatile`-qualified
+// local pointer that is assigned its final value exactly once, before
+// the setjmp() checkpoint is ever reached, and never reassigned
+// afterward. [csetjmp.syn]'s indeterminate-value rule applies only to
+// automatic-storage-duration OBJECTS local to the setjmp-containing
+// function -- it says nothing about, and does not reach through, a
+// pointer to dynamically-allocated (heap) memory: the heap block itself
+// has no "automatic storage duration" for the rule to apply to, and the
+// one local pointer used to reach it is additionally volatile-qualified
+// (matching this project's own pre-existing idiom for exactly this
+// hazard, previously applied only to the scanline buffer) so its own
+// value is unambiguously well-defined too. Because this struct is a
+// plain aggregate of C types (a C struct, a C array, and a raw pointer --
+// no QString, no other type with a non-trivial constructor/destructor),
+// it is trivially constructible: a single std::malloc() + std::memset()
+// fully initializes it with no placement-new and nothing for a longjmp
+// to skip past. A JpegErrorManager pointer is threaded through libjpeg's
+// own cinfo.client_data -- a field libjpeg defines and documents
+// specifically for carrying arbitrary per-call caller state, safe to
+// read back with a plain static_cast regardless of this struct's own
+// layout, deliberately never relying on a "pub is the first member"
+// base-pointer reinterpret_cast trick instead.
 struct JpegErrorManager {
   jpeg_error_mgr pub;
   jmp_buf setjmpBuffer;
-  QString fatalMessage;
+  // A fixed-size C buffer, not QString: format_message() writes directly
+  // into it from inside error_exit(), which runs on the very edge of the
+  // longjmp() boundary -- keeping this a trivial POD field (rather than a
+  // type with allocation/copy machinery of its own) means there is
+  // nothing here that could itself throw, allocate, or otherwise
+  // misbehave while still "inside" the region a longjmp() might unwind
+  // out of. It is converted to a QString only after decodeJpegImage() has
+  // fully left the setjmp-protected region below.
+  char fatalMessage[JMSG_LENGTH_MAX];
+};
+
+// All per-decode mutable state, heap-allocated as a single block and
+// reached via one unchanged, volatile-qualified pointer -- see the
+// JpegErrorManager comment above for the full rationale.
+struct JpegDecodeState {
+  jpeg_decompress_struct cinfo;
+  JpegErrorManager errorManager;
+  unsigned char *scanlineBuffer;
 };
 
 // error_exit is libjpeg's designated hard-failure hook: it is called
@@ -54,9 +99,7 @@ struct JpegErrorManager {
 // a bug -- it always does.
 void jpegErrorExit(j_common_ptr cinfo) {
   auto *errorManager = static_cast<JpegErrorManager *>(cinfo->client_data);
-  char buffer[JMSG_LENGTH_MAX];
-  (*cinfo->err->format_message)(cinfo, buffer);
-  errorManager->fatalMessage = QString::fromLatin1(buffer);
+  (*cinfo->err->format_message)(cinfo, errorManager->fatalMessage);
   longjmp(errorManager->setjmpBuffer, 1);
 }
 
@@ -79,35 +122,35 @@ void jpegOutputMessageNoop(j_common_ptr) {}
 AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
                                      int maxDimensionPixels,
                                      qint64 maxTotalPixels) {
-  jpeg_decompress_struct cinfo;
-  std::memset(&cinfo, 0, sizeof(cinfo));
+  // Heap-allocate ALL mutable libjpeg/error state up front, entirely
+  // before the setjmp() checkpoint below is ever reached, and access it
+  // for the rest of this function only through this single local
+  // pointer. It is `volatile`-qualified (matching this project's existing
+  // idiom, previously applied to the scanline buffer alone) and assigned
+  // its final, only value here -- never reassigned again anywhere else in
+  // this function -- so its own value is well-defined after any
+  // longjmp(), and the heap memory it points to is entirely outside
+  // [csetjmp.syn]'s indeterminate-value rule regardless, since that rule
+  // only ever applies to automatic-storage-duration objects. See the
+  // JpegDecodeState/JpegErrorManager comments above for the full
+  // rationale for this restructuring.
+  JpegDecodeState *volatile state =
+      static_cast<JpegDecodeState *>(std::malloc(sizeof(JpegDecodeState)));
+  if (!state) {
+    return AssetOutcome<QImage>(
+        AssetError{AssetErrorCode::MalformedImage,
+                   QStringLiteral("Failed to allocate JPEG decode state")});
+  }
+  // JpegDecodeState is a trivial aggregate of C types (jpeg_decompress_struct,
+  // a jmp_buf array, a fixed char buffer, and a raw pointer) -- a plain
+  // memset is a complete, valid initialization; no placement-new and no
+  // constructor for a longjmp to ever skip past.
+  std::memset(state, 0, sizeof(*state));
 
-  JpegErrorManager errorManager;
-  cinfo.err = jpeg_std_error(&errorManager.pub);
-  errorManager.pub.error_exit = jpegErrorExit;
-  errorManager.pub.output_message = jpegOutputMessageNoop;
-  cinfo.client_data = &errorManager;
-
-  // Deliberately a raw, manually `free()`d buffer -- NOT a QImage or any
-  // other C++ type with a non-trivial destructor. [csetjmp.syn] makes it
-  // undefined behavior for a setjmp/longjmp pair to skip past the point
-  // where a non-trivial destructor for some automatic object would
-  // otherwise run (exactly as if replacing them with catch/throw would
-  // invoke it): every libjpeg call below this setjmp() checkpoint can
-  // fail via error_exit() -> longjmp(), unwinding straight back to the
-  // `if (setjmp(...))` below WITHOUT running any destructor for an
-  // object that was constructed after this point. A raw pointer has no
-  // destructor at all, so nothing is skipped -- worst case on any
-  // failure path is a `free()` a few lines below reclaiming it, which
-  // every exit path (including the recovery branch itself) does. It is
-  // declared `volatile` because it (unlike `errorManager`/`cinfo`, whose
-  // addresses are taken and passed to other functions, which forces the
-  // compiler to keep them memory-resident regardless) is read directly,
-  // by name, inside the very `if (setjmp(...))` recovery branch below
-  // after being assigned only via ordinary (non-pointer) code further
-  // down in this same function -- exactly the shape the standard calls
-  // out as otherwise indeterminate after a longjmp.
-  unsigned char *volatile scanlineBuffer = nullptr;
+  state->cinfo.err = jpeg_std_error(&state->errorManager.pub);
+  state->errorManager.pub.error_exit = jpegErrorExit;
+  state->errorManager.pub.output_message = jpegOutputMessageNoop;
+  state->cinfo.client_data = &state->errorManager;
 
   // Canonical libjpeg usage (see libjpeg's own documented example.c):
   // the setjmp() checkpoint must be established BEFORE
@@ -115,19 +158,32 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   // (e.g. on a version-mismatch or allocation failure). Every `goto`-free
   // early return below this point on the fatal-error path funnels through
   // this single `if`.
-  if (setjmp(errorManager.setjmpBuffer)) {
-    const QString message = errorManager.fatalMessage;
-    std::free(scanlineBuffer);
-    jpeg_destroy_decompress(&cinfo);
+  if (setjmp(state->errorManager.setjmpBuffer)) {
+    // Re-derived from the single volatile pointer captured above -- see
+    // its declaration comment for why this is well-defined. Everything
+    // read/freed here lives in the heap block it points to, never in
+    // this function's own automatic storage.
+    JpegDecodeState *const failedState = state;
+    char messageCopy[JMSG_LENGTH_MAX];
+    std::memcpy(messageCopy, failedState->errorManager.fatalMessage,
+                sizeof(messageCopy));
+    std::free(failedState->scanlineBuffer);
+    jpeg_destroy_decompress(&failedState->cinfo);
+    std::free(failedState);
+    // QString construction happens only here, strictly after this
+    // function has permanently left the setjmp-protected region above --
+    // there is no remaining code path that could possibly longjmp() back
+    // into this function again.
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
         QStringLiteral("libjpeg failed to decode the JPEG payload: %1")
-            .arg(message)});
+            .arg(QString::fromLatin1(messageCopy))});
   }
 
-  jpeg_create_decompress(&cinfo);
+  jpeg_create_decompress(&state->cinfo);
   jpeg_mem_src(
-      &cinfo, reinterpret_cast<const unsigned char *>(encodedBytes.constData()),
+      &state->cinfo,
+      reinterpret_cast<const unsigned char *>(encodedBytes.constData()),
       static_cast<unsigned long>(encodedBytes.size()));
 
   // jpeg_read_header() only parses the JPEG frame header (SOF) to learn
@@ -136,19 +192,23 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   // See the header comment: the dimension/pixel-budget checks below run
   // strictly before jpeg_start_decompress()/jpeg_read_scanlines() ever
   // decode a single MCU.
-  jpeg_read_header(&cinfo, TRUE);
+  jpeg_read_header(&state->cinfo, TRUE);
 
-  if (cinfo.image_width == 0 || cinfo.image_height == 0) {
-    jpeg_destroy_decompress(&cinfo);
+  if (state->cinfo.image_width == 0 || state->cinfo.image_height == 0) {
+    jpeg_destroy_decompress(&state->cinfo);
+    std::free(state);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
         QStringLiteral("JPEG header declares a non-positive dimension")});
   }
-  if (cinfo.image_width > static_cast<unsigned int>(maxDimensionPixels) ||
-      cinfo.image_height > static_cast<unsigned int>(maxDimensionPixels)) {
-    const unsigned int width = cinfo.image_width;
-    const unsigned int height = cinfo.image_height;
-    jpeg_destroy_decompress(&cinfo);
+  if (state->cinfo.image_width >
+          static_cast<unsigned int>(maxDimensionPixels) ||
+      state->cinfo.image_height >
+          static_cast<unsigned int>(maxDimensionPixels)) {
+    const unsigned int width = state->cinfo.image_width;
+    const unsigned int height = state->cinfo.image_height;
+    jpeg_destroy_decompress(&state->cinfo);
+    std::free(state);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::DimensionTooLarge,
         QStringLiteral("JPEG dimension %1x%2 exceeds the configured cap of "
@@ -162,10 +222,11 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   // fits comfortably in the qint64 accumulator with enormous headroom
   // before any 64-bit overflow could occur, exactly mirroring
   // decodeAvifImage()'s equivalent check.
-  const qint64 totalPixels = static_cast<qint64>(cinfo.image_width) *
-                             static_cast<qint64>(cinfo.image_height);
+  const qint64 totalPixels = static_cast<qint64>(state->cinfo.image_width) *
+                             static_cast<qint64>(state->cinfo.image_height);
   if (totalPixels > maxTotalPixels) {
-    jpeg_destroy_decompress(&cinfo);
+    jpeg_destroy_decompress(&state->cinfo);
+    std::free(state);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::PixelBudgetExceeded,
         QStringLiteral("JPEG pixel count %1 exceeds the configured budget "
@@ -181,22 +242,23 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   // CMYK/YCCK variants) fails via jpeg_start_decompress()'s own
   // error_exit -> longjmp() -> the MalformedImage path above, which is a
   // fail-closed (never silently-wrong-color) outcome, not a security gap.
-  cinfo.out_color_space = JCS_RGB;
+  state->cinfo.out_color_space = JCS_RGB;
 
-  jpeg_start_decompress(&cinfo);
+  jpeg_start_decompress(&state->cinfo);
 
-  const int outWidth = static_cast<int>(cinfo.output_width);
-  const int outHeight = static_cast<int>(cinfo.output_height);
+  const int outWidth = static_cast<int>(state->cinfo.output_width);
+  const int outHeight = static_cast<int>(state->cinfo.output_height);
   // A tightly-packed (no padding) row stride: this raw buffer is never
   // handed to Qt directly, so it has none of QImage's own per-platform
   // scanline-alignment requirements -- those are applied once, below,
   // when copying into the real QImage after every libjpeg call that
   // could possibly longjmp() has already returned successfully.
   const size_t rowStride = static_cast<size_t>(outWidth) * 3;
-  scanlineBuffer = static_cast<unsigned char *>(
+  state->scanlineBuffer = static_cast<unsigned char *>(
       std::malloc(rowStride * static_cast<size_t>(outHeight)));
-  if (!scanlineBuffer) {
-    jpeg_destroy_decompress(&cinfo);
+  if (!state->scanlineBuffer) {
+    jpeg_destroy_decompress(&state->cinfo);
+    std::free(state);
     return AssetOutcome<QImage>(AssetError{
         AssetErrorCode::MalformedImage,
         QStringLiteral(
@@ -204,14 +266,14 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
             "dimensions")});
   }
 
-  while (cinfo.output_scanline < cinfo.output_height) {
-    JSAMPROW rowPointer[1] = {scanlineBuffer +
-                              static_cast<size_t>(cinfo.output_scanline) *
-                                  rowStride};
-    jpeg_read_scanlines(&cinfo, rowPointer, 1);
+  while (state->cinfo.output_scanline < state->cinfo.output_height) {
+    JSAMPROW rowPointer[1] = {
+        state->scanlineBuffer +
+        static_cast<size_t>(state->cinfo.output_scanline) * rowStride};
+    jpeg_read_scanlines(&state->cinfo, rowPointer, 1);
   }
 
-  jpeg_finish_decompress(&cinfo);
+  jpeg_finish_decompress(&state->cinfo);
 
   // See jpegOutputMessageNoop()'s comment: num_warnings is incremented by
   // libjpeg's own (untouched) default emit_message() implementation for
@@ -223,13 +285,17 @@ AssetOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   // exactly the same "did libjpeg have to recover from corrupt/incomplete
   // entropy-coded data" question -- this project never blesses a silently
   // recovered partial decode as success.
-  const long numWarnings = errorManager.pub.num_warnings;
-  jpeg_destroy_decompress(&cinfo);
+  const long numWarnings = state->errorManager.pub.num_warnings;
+  jpeg_destroy_decompress(&state->cinfo);
 
   // Every libjpeg call that could possibly reach error_exit() -> longjmp()
   // has now returned normally: no further code path in this function can
-  // ever reach the setjmp() checkpoint above, so constructing a C++
-  // object with a non-trivial destructor (QImage) from here on is safe.
+  // ever reach the setjmp() checkpoint above, so it is safe from here on
+  // to free the heap state block (nothing further needs it) and to
+  // construct a C++ object with a non-trivial destructor (QImage).
+  unsigned char *const scanlineBuffer = state->scanlineBuffer;
+  std::free(state);
+
   if (numWarnings > 0) {
     std::free(scanlineBuffer);
     return AssetOutcome<QImage>(AssetError{

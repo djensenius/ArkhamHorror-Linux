@@ -278,6 +278,17 @@ public:
     return m_diskCacheDisabled;
   }
 
+  // Round-7/8 item 7: the number of times invalidate() has actually run
+  // since this instance was constructed. Lets a test assert a group of
+  // coalesced cache-hit decode waiters sharing a single quarantine-worthy
+  // failure genuinely triggers exactly ONE invalidate() call for the
+  // whole group -- see
+  // AssetRequestCoordinator::completeCacheReadGroupOrQuarantine()'s comment --
+  // rather than one per waiter.
+  [[nodiscard]] int invalidateCallCountForTesting() const {
+    return m_invalidateCallCountForTesting;
+  }
+
   // Test-only exposure of this cache's on-disk generation/manifest
   // layout (review item 8 -- see the class comment above), so
   // fault-injection tests can construct exact crash-boundary scenarios
@@ -510,6 +521,8 @@ private:
   [[nodiscard]] qint64 diskUsageBytesLocked() const;
 
   mutable bool m_diskCacheDisabled{false};
+  // Round-7/8 item 7: see invalidateCallCountForTesting()'s comment.
+  int m_invalidateCallCountForTesting{0};
   Config m_config;
   QString m_directory;
   mutable QMutex m_mutex;

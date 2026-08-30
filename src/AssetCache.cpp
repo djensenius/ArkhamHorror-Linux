@@ -457,17 +457,30 @@ int openFreshHandleToSameDirectory(int dirFd) {
 // caller's own `dirFd`, and never sharing its read offset). Used by
 // deleteEntry()'s name-prefix sweep, replacing a QDir::entryList() glob
 // that would otherwise re-resolve `m_directory` by path.
-QStringList listNamesWithPrefixRelative(int dirFd, const QString &prefix) {
-  QStringList names;
+//
+// Round-7/8 item 6 (MEDIUM): returns std::nullopt when the enumeration
+// itself could not be completed at all -- openat()/fdopendir() failure,
+// or a readdir() call that fails partway through a scan (readdir()
+// returns nullptr on BOTH a genuine end-of-directory and a failure;
+// only checking `errno` after the loop distinguishes the two) -- rather
+// than silently returning an empty (or truncated) list indistinguishable
+// from "genuinely nothing matched". A caller that treated those two
+// outcomes the same way would report a key's on-disk footprint as fully
+// reclaimed purely because a transient, unrelated enumeration failure
+// happened to occur, when files it would have named may still be
+// sitting on disk, occupying real quota, entirely untouched.
+std::optional<QStringList> listNamesWithPrefixRelative(int dirFd,
+                                                       const QString &prefix) {
   const int freshFd = openFreshHandleToSameDirectory(dirFd);
   if (freshFd < 0) {
-    return names;
+    return std::nullopt;
   }
   DIR *dirStream = fdopendir(freshFd);
   if (!dirStream) {
     ::close(freshFd);
-    return names;
+    return std::nullopt;
   }
+  QStringList names;
   errno = 0;
   while (struct dirent *entry = readdir(dirStream)) {
     if (qstrcmp(entry->d_name, ".") == 0 || qstrcmp(entry->d_name, "..") == 0) {
@@ -480,7 +493,11 @@ QStringList listNamesWithPrefixRelative(int dirFd, const QString &prefix) {
     }
     errno = 0;
   }
+  const bool readdirFailedPartway = errno != 0;
   closedir(dirStream); // also closes freshFd
+  if (readdirFailedPartway) {
+    return std::nullopt;
+  }
   return names;
 }
 
@@ -621,15 +638,40 @@ bool isValidKey(const QString &key) {
 // named in `ownedSuffixComponents`, by contrast (the "assets/v1"
 // this class itself appends to the OS cache base, in the default-
 // location case), is a subtree this application EXCLUSIVELY owns and
-// creates; nothing else should ever legitimately place a symlink there,
-// so every component of it is verified no-follow regardless of whether
-// it happens to already exist or was just created by QDir::mkpath()
-// (which itself has no symlink-awareness at all -- it is the
-// equivalent of `mkdir -p`, and would otherwise silently create
-// whatever trailing components don't yet exist THROUGH an
-// attacker-planted symlink for an ancestor one or more levels above the
-// final leaf, producing a perfectly ordinary, non-symlink leaf
-// directory that a single final O_NOFOLLOW open could never detect).
+// creates; nothing else should ever legitimately place a symlink OR a
+// bind mount there, so every component of it is verified no-follow AND
+// mount-identity-continuous with the trusted anchor, and any MISSING
+// component is created directly here via mkdirat() -- never via
+// QDir::mkpath(), which this function's caller (the constructor) no
+// longer invokes at all. QDir::mkpath() is a plain path-based `mkdir
+// -p` with no symlink-awareness whatsoever: given a path string, it
+// re-resolves and creates each ancestor from the filesystem root on
+// every call, so it would silently create whatever trailing components
+// don't yet exist THROUGH an attacker-planted symlink for an ancestor
+// one or more levels above the final leaf -- producing a perfectly
+// ordinary, non-symlink leaf directory living wherever that symlink
+// pointed (round-7/8 review: "destructively recovers foreign dir"),
+// which a single final O_NOFOLLOW open could never detect after the
+// fact. Creating each owned-suffix component via mkdirat() relative to
+// the already-open, already-verified PARENT fd has no such path
+// re-resolution step at all: there is no path string for an attacker's
+// symlink to be substituted into.
+//
+// Round-7/8 review ("root-component loop doesn't enforce mount
+// identity"): a bind mount planted for one of these owned-suffix path
+// segments shares the SAME kernel mount table depth as an ordinary
+// subdirectory would, and previously nothing in this loop ever compared
+// device/mount identity between the anchor and each subsequent step --
+// only the FINAL resulting fd's mount identity was recorded (by the
+// constructor, for ONGOING verifyRootAnchorLocked() comparisons), never
+// checked against the anchor it was supposed to be nested under in the
+// first place. Every step below now requires mountIdentityMatches()
+// against the anchor's own MountIdentity (captured once, immediately
+// after opening it), degrading to the same st_dev-only comparison
+// mountIdentityMatches() already documents when mount-id support is
+// unavailable on this platform/kernel -- rejecting the whole resolution
+// outright (never silently continuing) the instant any component
+// resolves onto a different mount than the anchor itself.
 std::optional<int>
 openDirectoryChainNoFollow(const QString &trustedAnchorPath,
                            const QStringList &ownedSuffixComponents) {
@@ -639,21 +681,55 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
   if (currentFd < 0) {
     return std::nullopt;
   }
+  const MountIdentity anchorMount = mountIdentityForFd(currentFd);
   for (const QString &component : ownedSuffixComponents) {
     const QByteArray componentUtf8 = component.toUtf8();
     struct stat st {};
     if (fstatat(currentFd, componentUtf8.constData(), &st,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !S_ISDIR(st.st_mode)) {
+                AT_SYMLINK_NOFOLLOW) != 0) {
+      if (errno != ENOENT) {
+        ::close(currentFd);
+        return std::nullopt;
+      }
+      // Missing: create it now, relative to the already-open, already
+      // no-follow-verified parent -- never via a path string, so there
+      // is no ancestor path resolution step an attacker's symlink could
+      // ever be substituted into.
+      if (mkdirat(currentFd, componentUtf8.constData(), 0700) != 0 &&
+          errno != EEXIST) {
+        ::close(currentFd);
+        return std::nullopt;
+      }
+      if (fstatat(currentFd, componentUtf8.constData(), &st,
+                  AT_SYMLINK_NOFOLLOW) != 0) {
+        ::close(currentFd);
+        return std::nullopt;
+      }
+    }
+    if (!S_ISDIR(st.st_mode)) {
+      // Exists but is a symlink node, a regular file, or some other
+      // non-directory object -- AT_SYMLINK_NOFOLLOW's stat reports
+      // S_ISLNK for a symlink, never S_ISDIR, so this also rejects the
+      // exact "component pre-planted as a symlink" attack.
       ::close(currentFd);
       return std::nullopt;
     }
     const int nextFd = openat(currentFd, componentUtf8.constData(),
                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    ::close(currentFd);
     if (nextFd < 0) {
+      ::close(currentFd);
       return std::nullopt;
     }
+    if (!mountIdentityMatches(mountIdentityForFd(nextFd), anchorMount)) {
+      qWarning() << "AssetCache: refusing owned-suffix component" << component
+                 << "-- resolves onto a different mount than its trusted "
+                    "anchor (bind-mount escape guard during directory-"
+                    "chain creation)";
+      ::close(currentFd);
+      ::close(nextFd);
+      return std::nullopt;
+    }
+    ::close(currentFd);
     currentFd = nextFd;
   }
   return currentFd;
@@ -836,17 +912,49 @@ AssetCache::AssetCache(Config config)
     m_directory = m_config.directory;
   }
   // Review item 7: if the configured cache directory ALREADY exists as a
-  // symlink, refuse to use it at all -- never mkpath() through it (which
-  // would silently follow the symlink and start writing at whatever it
-  // points to), and never let any later store()/lookupDisk()/reap call
-  // touch it either. QFileInfo::isSymLink() (unlike QDir::exists(), which
-  // follows) reports the entry's own type without resolving it. The
-  // memory cache still works normally -- only disk persistence is
-  // disabled for this instance's entire lifetime.
+  // symlink, refuse to use it at all -- never follow it (which would
+  // silently start writing at whatever it points to), and never let any
+  // later store()/lookupDisk()/reap call touch it either.
+  // QFileInfo::isSymLink() (unlike QDir::exists(), which follows) reports
+  // the entry's own type without resolving it. The memory cache still
+  // works normally -- only disk persistence is disabled for this
+  // instance's entire lifetime.
+  //
+  // Round-7/8 review (HIGH): a path-based QDir::mkpath(m_directory) call
+  // used to run here, UNCONDITIONALLY and BEFORE any fd-based no-follow
+  // validation ever happened below. QDir::mkpath() is a plain path-based
+  // `mkdir -p`: it has no symlink-awareness at all and re-resolves the
+  // ENTIRE path from the filesystem root on every call, so it would
+  // silently create whatever trailing components didn't yet exist
+  // THROUGH an attacker-planted symlink for ANY ancestor -- including
+  // ones one or more levels above the final leaf that the single
+  // symlink check above can never see -- producing a perfectly
+  // ordinary, non-symlink leaf directory living wherever that symlink
+  // pointed. The no-follow open performed further below would then
+  // happily "verify" and start operating against that already-created,
+  // already-foreign directory (this class's periodic quota-eviction/
+  // reap sweep is destructive: it deletes files it believes are stray),
+  // which is exactly the "destructively recovers foreign dir" failure
+  // mode the review describes. That call is now removed entirely, with
+  // NO replacement path-based creation of any kind:
+  //   - In the default-location case, the OS/desktop-environment-
+  //     provided cache base (`trustedAnchorPath`) is assumed to already
+  //     exist (this application never creates it), and this
+  //     application's own exclusively-owned "assets"/"v1" suffix is
+  //     created below by openDirectoryChainNoFollow() itself, via
+  //     mkdirat() relative to an already-open, already-verified parent
+  //     descriptor -- never a path string an attacker's symlink could
+  //     be substituted into.
+  //   - In the explicit Config::directory case, the ENTIRE configured
+  //     directory must already exist as a genuine, non-symlink
+  //     directory: this application never creates any part of a
+  //     caller-supplied custom cache directory. If it does not already
+  //     exist, the no-follow open below simply fails (ENOENT) and disk
+  //     persistence is disabled for this instance -- a safe, fully
+  //     inert fail-closed outcome, never a silent creation through
+  //     whatever the path currently resolves to.
   if (QFileInfo(m_directory).isSymLink()) {
     m_diskCacheDisabled = true;
-  } else {
-    QDir().mkpath(m_directory);
   }
 #if defined(Q_OS_UNIX)
   // Review round-3 item 9: open and retain a directory descriptor for
@@ -1397,28 +1505,41 @@ AssetCache::deleteEntry(const QString &key) const {
   if (m_rootFd < 0) {
     return {true, true};
   }
-  const QStringList matches = listNamesWithPrefixRelative(m_rootFd, key + u'.');
   const QString manifestName = manifestPath(key);
 
-  // Round-6 item 6: the manifest is the ONE file whose presence/absence
-  // actually decides whether a future lookup can ever find this key
-  // again -- every other matched file is only reachable BY WAY OF the
-  // manifest naming its generation (see readManifestGeneration()).
-  // Unlink it, and only it, first; then fsync the root directory so that
-  // unlink is durable before this function does anything else. A crash
-  // at any point after this fsync returns leaves the manifest genuinely
-  // gone, even if the process never gets to reclaim the generation
-  // files below (those become ordinary orphans reapAndEnforceQuota()
-  // already knows how to reclaim later).
-  bool manifestRemoveOk = true;
-  bool manifestFsyncOk = true;
-  if (matches.contains(manifestName)) {
-    manifestRemoveOk = removeFileRelative(m_rootFd, manifestName);
-    if (manifestRemoveOk) {
-      manifestFsyncOk = fsyncRootLocked();
-    }
-  }
+  // Round-6 item 6 / round-7/8 item 6: the manifest is the ONE file
+  // whose presence/absence actually decides whether a future lookup can
+  // ever find this key again -- every other matched file is only
+  // reachable BY WAY OF the manifest naming its generation (see
+  // readManifestGeneration()). Unlink it UNCONDITIONALLY -- never gated
+  // on whether a (possibly-failed) prefix enumeration happened to list
+  // it first -- then fsync the root directory so that unlink is durable
+  // before this function does anything else. removeFileRelative()
+  // already treats an already-absent file (ENOENT) as success, so this
+  // is exactly as safe to call when the manifest never existed as it is
+  // when it does; the prior "only unlink if the listing found it" gate
+  // meant a transient enumeration failure (a temporarily exhausted fd
+  // table, a directory-stream allocation failure, etc.) silently
+  // skipped this unlink entirely while still reporting the manifest as
+  // durably gone, letting the OLD entry revive after the process
+  // restarts or the negative-cache TTL for a definitive 404 expires.
+  const bool manifestRemoveOk = removeFileRelative(m_rootFd, manifestName);
+  const bool manifestFsyncOk = manifestRemoveOk && fsyncRootLocked();
   const bool manifestDurablyAbsent = manifestRemoveOk && manifestFsyncOk;
+
+  // Round-7/8 item 6: an unavailable directory listing is NOT the same
+  // as "durably nothing left to reclaim" -- if the prefix enumeration
+  // itself could not be completed, this key's remaining on-disk
+  // footprint (any orphaned generation payload/metadata file) cannot be
+  // confirmed reclaimed at all, so this must report `allFilesReclaimed
+  // = false` rather than vacuously `true`. The manifest's own durable
+  // removal above is entirely unaffected either way: it never depended
+  // on this listing succeeding in the first place.
+  const std::optional<QStringList> matches =
+      listNamesWithPrefixRelative(m_rootFd, key + u'.');
+  if (!matches) {
+    return {false, manifestDurablyAbsent};
+  }
 
   // Review item 11: report whether EVERY matched file was actually
   // removed. A failed unlink (e.g. a permission error, or -- in tests --
@@ -1426,7 +1547,7 @@ AssetCache::deleteEntry(const QString &key) const {
   // footprint was NOT fully reclaimed; a caller doing quota accounting
   // must not credit itself with bytes that are still genuinely occupied.
   bool allRemoved = manifestRemoveOk;
-  for (const QString &name : matches) {
+  for (const QString &name : *matches) {
     if (name == manifestName) {
       continue; // already handled, durably, above
     }
@@ -1893,6 +2014,7 @@ void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
 }
 
 AssetCache::InvalidateResult AssetCache::invalidate(const QString &key) {
+  ++m_invalidateCallCountForTesting;
   if (!isValidKey(key)) {
     return InvalidateResult::DurablyInvalidated;
   }

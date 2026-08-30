@@ -27,30 +27,44 @@ bool isStrictDecimalOctet(QStringView text) {
   return ok && value >= 0 && value <= 255;
 }
 
+// Matches exactly "A.B.C.D" where A, B, C, D are each strict decimal
+// octets (see isStrictDecimalOctet) -- i.e. ANY canonical, unambiguous
+// four-octet dotted-decimal IPv4 literal, regardless of its value (not
+// restricted to the 127.0.0.0/8 loopback range). Used to distinguish a
+// legitimate, unambiguous dotted-decimal IPv4 host from an "alternate
+// numeric IP" spelling (shortened form, bare 32-bit integer, octal/hex
+// octet) that this project's raw-authority policy rejects outright for
+// every host, not just loopback ones.
+bool isStrictDottedDecimalIPv4Text(QStringView text) {
+  const qsizetype firstDot = text.indexOf(u'.');
+  if (firstDot < 0) {
+    return false;
+  }
+  const QStringView octetA = text.left(firstDot);
+  const QStringView afterA = text.mid(firstDot + 1);
+  const qsizetype secondDot = afterA.indexOf(u'.');
+  if (secondDot < 0) {
+    return false;
+  }
+  const QStringView octetB = afterA.left(secondDot);
+  const QStringView afterB = afterA.mid(secondDot + 1);
+  const qsizetype thirdDot = afterB.indexOf(u'.');
+  if (thirdDot < 0) {
+    return false;
+  }
+  const QStringView octetC = afterB.left(thirdDot);
+  const QStringView octetD = afterB.mid(thirdDot + 1);
+  return isStrictDecimalOctet(octetA) && isStrictDecimalOctet(octetB) &&
+         isStrictDecimalOctet(octetC) && isStrictDecimalOctet(octetD);
+}
+
 // Matches exactly "127.A.B.C" where A, B, C are each strict decimal octets
 // (see isStrictDecimalOctet) -- i.e. the canonical, unambiguous dotted-
 // decimal spelling of a 127.0.0.0/8 loopback address, and nothing else
 // (no shortened forms, no octal/hex, no extra components).
 bool isCanonicalLoopbackIPv4Text(QStringView text) {
   static constexpr QStringView kPrefix = u"127.";
-  if (!text.startsWith(kPrefix)) {
-    return false;
-  }
-  const QStringView rest = text.mid(kPrefix.size());
-  const qsizetype firstDot = rest.indexOf(u'.');
-  if (firstDot < 0) {
-    return false;
-  }
-  const QStringView octetB = rest.left(firstDot);
-  const QStringView afterB = rest.mid(firstDot + 1);
-  const qsizetype secondDot = afterB.indexOf(u'.');
-  if (secondDot < 0) {
-    return false;
-  }
-  const QStringView octetC = afterB.left(secondDot);
-  const QStringView octetD = afterB.mid(secondDot + 1);
-  return isStrictDecimalOctet(octetB) && isStrictDecimalOctet(octetC) &&
-         isStrictDecimalOctet(octetD);
+  return text.startsWith(kPrefix) && isStrictDottedDecimalIPv4Text(text);
 }
 
 // Extracts the raw authority substring (userinfo@host:port, as literally
@@ -184,6 +198,74 @@ bool isAsciiCaseInsensitiveLocalhost(QStringView text) {
   return true;
 }
 
+// Returns true iff every code unit in |text| is either a C0 control
+// character (U+0000-U+001F), DELETE (U+007F), a C1 control
+// (U+0080-U+009F), or a backslash -- i.e. any character this project's
+// raw-authority host policy never permits, regardless of position.
+// Checked separately from isAsciiOnly() (backslash is plain ASCII, and a
+// non-ASCII code point is rejected on its own merits by that check) so
+// each rejection reason stays independently testable.
+bool containsBackslashOrControlCharacter(QStringView text) {
+  for (const QChar c : text) {
+    if (c == u'\\' || c.category() == QChar::Other_Control) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Returns true iff |text| is composed ENTIRELY of characters that could
+// plausibly appear in some alternate numeric IP spelling -- ASCII digits,
+// '.', 'x'/'X' (an "0x..." hex prefix), and 'a'-'f'/'A'-'F' (hex digits).
+// A host text that passes this check but is NOT itself a strict, canonical
+// four-octet dotted-decimal IPv4 literal (see isStrictDottedDecimalIPv4Text)
+// is an ambiguous/alternate numeric spelling (e.g. a shortened form like
+// "127.1", a bare 32-bit integer like "2130706433", or an octal/hex-
+// prefixed octet like "0x7f.0.0.1") and must be rejected outright: some
+// other piece of code (a proxy, a different URL parser, a human operator)
+// could plausibly interpret it as a numeric address while this project's
+// own QUrl-based host handling treats it as an opaque hostname string, and
+// that divergence is exactly the ambiguity this policy exists to close.
+// An ordinary DNS hostname's label characters (most letters, most
+// significantly any of 'g'-'w'/'y'/'z') immediately disqualify it from this
+// "numeric-ish" classification, so legitimate hostnames are never
+// misclassified merely for containing a digit or a dot.
+bool looksLikeNumericIshHostText(QStringView text) {
+  for (const QChar c : text) {
+    const ushort u = c.unicode();
+    const bool isDigit = u >= u'0' && u <= u'9';
+    const bool isHexLetter =
+        (u >= u'a' && u <= u'f') || (u >= u'A' && u <= u'F');
+    const bool isDot = u == u'.';
+    const bool isXPrefix = u == u'x' || u == u'X';
+    if (!isDigit && !isHexLetter && !isDot && !isXPrefix) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Returns true iff every character in a bracketed IPv6 literal's inner
+// text (already stripped of its '[' and ']' by
+// extractRawHostFromAuthority()) is a hex digit, ':', or '.' (the last
+// permitted only for an IPv4-mapped/embedded form, e.g.
+// "::ffff:127.0.0.1") -- i.e. the only characters a syntactically valid
+// IPv6 literal can ever contain. Rejects a percent-escape, a zone/scope
+// id ("%eth0"), or any other stray character smuggled inside the
+// brackets.
+bool isPlausibleIPv6LiteralText(QStringView text) {
+  for (const QChar c : text) {
+    const ushort u = c.unicode();
+    const bool isHexDigit = (u >= u'0' && u <= u'9') ||
+                            (u >= u'a' && u <= u'f') ||
+                            (u >= u'A' && u <= u'F');
+    if (!isHexDigit && u != u':' && u != u'.') {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 bool isCanonicalLoopbackHostText(const QStringView hostText) {
@@ -250,6 +332,50 @@ bool isSecureOrLoopbackAuthTransport(const QUrl &url) {
     return isCanonicalLoopbackHostText(url.host());
   }
   return false;
+}
+
+bool rawAuthorityHostIsUnambiguousAndWellFormed(const QString &rawUrlText) {
+  const QStringView authority = extractRawAuthority(rawUrlText);
+  if (authority.isEmpty()) {
+    return false; // Could not identify an authority; fail closed.
+  }
+  if (authority.contains(u'@')) {
+    // A userinfo-like construct is present in the raw text -- see
+    // isCleartextAuthAllowedForRawInput()'s identical check for why this
+    // is rejected independent of how QUrl itself would later parse
+    // userinfo vs. host.
+    return false;
+  }
+  const bool isBracketedIPv6 = authority.startsWith(u'[');
+  const QStringView hostText = extractRawHostFromAuthority(authority);
+  if (hostText.isEmpty()) {
+    return false; // Empty host, or a malformed/empty/out-of-range port
+                  // (see extractRawHostFromAuthority()'s own contract).
+  }
+  if (hostText.contains(u'%')) {
+    return false; // Percent-escape in the host: never legitimate here.
+  }
+  if (!isAsciiOnly(hostText)) {
+    return false; // No Unicode/IDNA hostnames: see this function's own
+                  // doc comment for the Unicode case-fold rationale.
+  }
+  if (containsBackslashOrControlCharacter(hostText)) {
+    return false;
+  }
+  if (isBracketedIPv6) {
+    // A bracketed IPv6 literal's inner text must contain only characters
+    // that can ever legitimately appear in one.
+    return isPlausibleIPv6LiteralText(hostText);
+  }
+  if (looksLikeNumericIshHostText(hostText) &&
+      !isStrictDottedDecimalIPv4Text(hostText)) {
+    // "Numeric-ish" (digits/dots/hex-letters/'x' only) but not itself a
+    // strict, canonical four-octet dotted-decimal IPv4 literal: an
+    // ambiguous/alternate numeric IP spelling -- see
+    // looksLikeNumericIshHostText()'s doc comment.
+    return false;
+  }
+  return true;
 }
 
 } // namespace Arkham
