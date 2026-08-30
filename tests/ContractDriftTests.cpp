@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QSet>
+#include <QStringList>
 #include <QtTest>
 
 #include "ContractPin.h"
