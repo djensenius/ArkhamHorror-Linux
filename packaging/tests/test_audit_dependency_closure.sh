@@ -379,6 +379,31 @@ echo "$output_14" | grep -qi "ambiguous" \
   || fail "case 14: failure output did not explain the ambiguous-duplicate rejection: $output_14"
 echo "PASS: an ambiguous duplicate basename with genuinely different content is rejected, not silently resolved"
 
+# --- Case 15: non-ELF files sharing a basename must NEVER be treated as
+# ambiguous, even with genuinely different content -- this is the exact
+# real regression this project's own CI hit: every bundled Qt QML module
+# ships its own "plugins.qmltypes" (module-specific metadata, never a
+# shared object, never nameable by any DT_NEEDED tag), so two different,
+# legitimately-present QML modules' own "plugins.qmltypes" files sharing
+# that basename must be silently ignored by the indexer entirely, not
+# raise the same "ambiguous duplicate basename" error case 14 above
+# rightly raises for two genuinely-different ELF libraries.
+nonelf_tree="$work_dir/appdir_nonelf_dup_basename"
+mkdir -p "$nonelf_tree/qml/QtQml" "$nonelf_tree/qml/QML"
+printf 'module A metadata\n' >"$nonelf_tree/qml/QtQml/plugins.qmltypes"
+printf 'module B metadata, deliberately different content\n' \
+  >"$nonelf_tree/qml/QML/plugins.qmltypes"
+# A real root library must still be present so the walk has something to
+# resolve; the two non-ELF files above are otherwise-unrelated bystanders
+# in the very same recursively-audited tree.
+"$cc_bin" -shared -fPIC -Wl,-soname,libnonelfcheck.so.1 \
+  -o "$nonelf_tree/libnonelfcheck.so.1" dupa.c
+output_15="$(python3 "$auditor" "$nonelf_tree" --root libnonelfcheck.so.1 2>&1)" \
+  || fail "case 15: expected success auditing a tree with same-basename non-ELF files, got: $output_15"
+echo "$output_15" | grep -qi "ambiguous" \
+  && fail "case 15: non-ELF same-basename files were incorrectly treated as ambiguous: $output_15"
+echo "PASS: same-basename non-ELF files (e.g. Qt QML modules' own plugins.qmltypes) are never treated as ambiguous"
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the

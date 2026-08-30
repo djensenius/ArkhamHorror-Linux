@@ -231,12 +231,13 @@ def _file_digest(path: Path) -> str | None:
 
 
 def _index_lib_dir(lib_dir: Path) -> dict[str, Path]:
-    """Maps every file/symlink basename actually present anywhere under
-    lib_dir (recursively) to its path, so a NEEDED entry's exact SONAME
-    string (e.g. "libsecret-1.so.0") can be looked up directly -- AppImage
-    bundling copies both a library's real file and its SONAME symlink, so
-    exact-name lookup (rather than a version-stripping heuristic) is both
-    correct and simple here.
+    """Maps every real ELF shared-object basename (or symlink resolving to
+    one) actually present anywhere under lib_dir (recursively) to its
+    path, so a NEEDED entry's exact SONAME string (e.g.
+    "libsecret-1.so.0") can be looked up directly -- AppImage bundling
+    copies both a library's real file and its SONAME symlink, so exact-name
+    lookup (rather than a version-stripping heuristic) is both correct and
+    simple here.
 
     Recursive (rglob) rather than the original flat iterdir() so a single
     invocation can be pointed at an entire AppDir usr/ tree (usr/bin, usr/lib,
@@ -246,17 +247,32 @@ def _index_lib_dir(lib_dir: Path) -> dict[str, Path]:
     old flat iterdir() found, so existing single-directory callers are
     unaffected other than also seeing any genuine subdirectory contents.
 
-    Raises ClosureAuditError if two entries anywhere in the tree share an
-    exact basename but resolve to genuinely different file content (by
-    sha256, not merely a different path -- an independently-copied,
-    byte-identical duplicate is harmless and common in real bundling, so
-    is not treated as ambiguous). A real content difference could
-    otherwise cause a NEEDED lookup to silently resolve to the wrong one
-    of two same-named files, masking a genuine substitution risk.
+    Only entries that are themselves a real ELF shared object (checked via
+    `_is_elf_file()`'s own magic-byte sniff, which transparently follows a
+    symlink to its ultimate regular-file target -- never a filename/
+    extension guess) are indexed. A DT_NEEDED tag can, by the ELF/ld.so
+    SONAME convention, only ever name a real shared object -- never an
+    arbitrary data file -- so any other file under this tree (Qt QML
+    modules' own "plugins.qmltypes" metadata, ".qml"/".json"/license-notice
+    files, etc.) is irrelevant to a NEEDED lookup and must not be indexed
+    at all: real AppDir trees legitimately contain many same-basename,
+    genuinely-different non-library files (every bundled QML module ships
+    its own "plugins.qmltypes", "qmldir", etc.), and indexing those too
+    would make this basename-uniqueness check fire on totally unrelated
+    files that a NEEDED lookup could never resolve to in the first place.
+
+    Raises ClosureAuditError if two indexed (ELF) entries anywhere in the
+    tree share an exact basename but resolve to genuinely different file
+    content (by sha256, not merely a different path -- an
+    independently-copied, byte-identical duplicate is harmless and common
+    in real bundling, so is not treated as ambiguous). A real content
+    difference could otherwise cause a NEEDED lookup to silently resolve
+    to the wrong one of two same-named files, masking a genuine
+    substitution risk.
     """
     index: dict[str, Path] = {}
     for entry in lib_dir.rglob("*"):
-        if not (entry.is_file() or entry.is_symlink()):
+        if not _is_elf_file(entry):
             continue
         existing = index.get(entry.name)
         if existing is not None and _file_digest(existing) != _file_digest(entry):
