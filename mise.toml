@@ -73,3 +73,7 @@ run = "python3 packaging/check_encoder_hygiene.py"
 [tasks."contracts:test-encoder-hygiene-script"]
 description = "Unit-test check_encoder_hygiene.py's classify()/allowlist/sanitize-args logic with synthetic data (no compiler invocation)"
 run = "python3 packaging/check_encoder_hygiene_test.py"
+
+[tasks."contracts:test-encoder-hygiene-ast-mutations"]
+description = "Real libclang fail-before/pass-after mutation tests for check_encoder_hygiene.py's AST core: source-only encoder declarations, non-const output/inout parameters, base-class/using-declaration inheritance exposure, and inclusion-graph dependency-direction/system-header/external-root classification (bare/../absolute/symlink #include spellings). Requires a real libclang, same as contracts:check-encoder-hygiene."
+run = "python3 packaging/check_encoder_hygiene_ast_test.py"

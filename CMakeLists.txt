@@ -65,6 +65,28 @@ FetchContent_MakeAvailable(qtkeychain)
 set(BUILD_TESTING "${_arkham_saved_build_testing}" CACHE BOOL "" FORCE)
 unset(_arkham_saved_build_testing)
 
+# packaging/check_encoder_hygiene.py's inclusion-graph audit (see that
+# script's module docstring) must classify qtkeychain's own vendored/
+# generated files as external (never subject to the domain/foundation
+# dependency-direction closure check). A review round demonstrated an
+# earlier revision derived that exemption from a hand-guessed, purely
+# lexical `<clang-build-dir>/_deps` path -- unsound because nothing ties
+# that exact subtree name to what FetchContent actually, truly used, and
+# a differently-configured/future FetchContent layout could silently
+# stop matching it. `qtkeychain_SOURCE_DIR`/`qtkeychain_BINARY_DIR` are
+# themselves the real, authoritative CMake variables FetchContent_
+# MakeAvailable() just populated above (see
+# https://cmake.org/cmake/help/latest/module/FetchContent.html#command:fetchcontent_makeavailable) --
+# this is genuine dependency-package metadata, not a guess -- so this
+# manifest is generated directly from them instead. Written once, here,
+# rather than per-target: qtkeychain is a shared external dependency of
+# the whole project, not scoped to either arkham_domain_models or
+# arkham_foundation individually.
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
+    "${qtkeychain_SOURCE_DIR}\n${qtkeychain_BINARY_DIR}\n"
+)
+
 # FetchContent builds qtkeychain via add_subdirectory(), so the namespaced
 # alias normally created by the installed QtKeychainConfig.cmake does not
 # exist; create it ourselves so downstream target_link_libraries() calls are
@@ -397,6 +419,18 @@ cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         TARGET arkham_domain_models
         OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_sources.txt"
 )
+# See arkham_append_target_autogen_root()'s own doc comment in
+# cmake/PathManifest.cmake for why this target's own AUTOMOC-generated
+# per-class moc_*.cpp fragments (transitively #include-d from the
+# mocs_compilation.cpp registered above) must be registered as a
+# trusted, generated root rather than requiring their own manifest
+# entry -- deferred for the identical reason (AUTOGEN_BUILD_DIR is not
+# guaranteed to be finalized until end-of-directory processing).
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    CALL arkham_append_target_autogen_root
+        TARGET arkham_domain_models
+        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
+)
 arkham_write_path_manifest(
     OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_fragments.txt"
     BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -431,6 +465,12 @@ cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     CALL arkham_write_target_source_manifest
         TARGET arkham_foundation
         OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/foundation_sources.txt"
+)
+# See the matching arkham_domain_models call above.
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    CALL arkham_append_target_autogen_root
+        TARGET arkham_foundation
+        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
 )
 arkham_write_path_manifest(
     OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/foundation_fragments.txt"

@@ -60,13 +60,56 @@ parses every real source in both manifests directly (see
 _parse_source_as_own_tu()/_scan_sources()) -- each with its own exact
 compile_commands.json entry, never a borrowed one, since (unlike a
 header) a real .cpp already has its own -- and audits its complete
-resolved inclusion graph exactly like a header's. Source scanning
-deliberately never collects new QJson-family findings, only inclusion-
-graph violations (see _scan_sources()'s own doc comment for why: every
-allowlisted encoder is declared in a header but *defined* out-of-line in
-its own .cpp, so naively scanning declarations located in a source
-itself would misclassify every legitimate encoder's own definition as an
-unrecognized violation).
+resolved inclusion graph exactly like a header's.
+
+A further review round demonstrated that this doc comment's earlier
+claim -- "an out-of-line-only symbol has no way to be called from
+another translation unit" -- was simply false: any TU can write its own
+`extern` forward declaration of a namespace-scope, externally-linked
+symbol and call it, whether or not that symbol also happens to have a
+declaration in some header. Source scanning therefore now ALSO collects
+QJson-family Findings for genuinely NEW, source-only declarations (see
+_scan_sources()): for every function-like/constructor declaration found
+directly in a real .cpp, this script asks libclang for that
+declaration's *canonical* cursor (clang_getCanonicalCursor(), which
+always resolves to the FIRST declaration of that entity anywhere in the
+TU). If the canonical cursor's own file is a header already covered by
+the header scan, the .cpp cursor is merely that header declaration's
+out-of-line *definition* and is silently skipped here (it was already
+counted, correctly, while scanning its header). If the canonical
+cursor's own file is the .cpp itself (no earlier declaration anywhere),
+this is a genuinely new declaration -- and it is recorded as a Finding
+(which can never match any ALLOWLIST entry, since every entry is keyed
+to a header path) if, and only if, it also has genuinely external
+linkage (clang_getCursorLinkage() == CXLinkage_External): a `static`- or
+anonymous-namespace-scoped helper has internal/unique-external linkage
+and categorically cannot be referenced from another translation unit at
+all, so it is correctly never flagged, no matter its own nominal access
+specifier.
+
+A further review round also demonstrated that this script's shape check
+inspected only a declaration's own RESULT type, never (a) a non-const
+QJson-family reference/pointer OUTPUT or INOUT parameter (e.g. a public/
+friend `void encode(QJsonObject &out)`, or an equivalent constructor),
+which is exactly as capable of smuggling a lossy value out of an
+otherwise return-type-clean signature as a lossy return type is, nor (b)
+encoder-shaped members made newly accessible purely through public/
+protected inheritance or a using-declaration, with no new textual
+declaration of their own at all (e.g. a new struct publicly deriving
+from an already-allowlisted AuthenticateRequest, or privately deriving
+it and using-declaring its toJson() back to public). This script now
+also inspects every function-like/constructor declaration's own
+parameters for a non-const QJson-family reference/pointer (see
+_is_encoder_shaped()), and separately walks every class/struct/
+class-template definition's own base-specifiers and using-declarations
+(see _inherited_and_reexported_encoders()) to discover exactly this kind
+of newly-exposed-without-a-new-declaration member, recursively through a
+multi-level inheritance chain, attributing any resulting Finding to the
+EXPOSING class's own file/line (which, keyed against ALLOWLIST_BY_KEY,
+can never match the original declaring class's own allowlist entry, so
+it fails closed as a violation with zero change to the allowlist
+mechanism itself).
+
 
 An even earlier version of this check (see git history:
 tests/EncoderHygieneTests.cpp) was a purely source-text regex/parser,
@@ -85,21 +128,38 @@ script asks Clang to determine that fact directly, via libclang's AST
 an ever-growing fragment of C++ parsing by hand:
 
   - For every public function-like declaration (ordinary methods, free
-    functions, conversion operators, function templates) whose *own*
-    location (after macro expansion) is exactly the one header currently
-    being probed, this script asks libclang for the *canonical* result
-    type (i.e. with every typedef/using-alias/decltype/auto/template
-    parameter already resolved to its underlying real type by the
-    compiler itself) and its USR (Unified Symbol Resolution -- a stable,
-    fully qualified, signature-and-overload-aware identity Clang
-    computes for every declaration; see
-    https://clang.llvm.org/docs/USRs.html), together with its access
-    specifier and exact source file.
-  - A declaration is a *violation* if its canonical return type is in the
-    QJson family (QJsonObject/QJsonArray/QJsonValue, with or without a
-    reference/pointer/const qualifier) and its (file, USR) pair, counted
-    by *exact occurrence count*, is not one of the ALLOWLIST entries
-    below. There is no general "looks like a decode helper" heuristic
+    functions, friend functions, conversion operators, function
+    templates, constructors) whose *own* location (after macro
+    expansion) is exactly the one header currently being probed, this
+    script asks libclang for the *canonical* result type (i.e. with
+    every typedef/using-alias/decltype/auto/template parameter already
+    resolved to its underlying real type by the compiler itself) AND
+    inspects every one of its parameters (constructors included) for a
+    non-const-qualified reference/pointer whose own canonical pointee
+    type is likewise QJson-family -- an output/inout parameter is
+    exactly as capable of smuggling a lossy value out as a lossy return
+    type is (see _is_encoder_shaped()) -- together with its USR (Unified
+    Symbol Resolution -- a stable, fully qualified,
+    signature-and-overload-aware identity Clang computes for every
+    declaration; see https://clang.llvm.org/docs/USRs.html), access
+    specifier, and exact source file.
+  - For every class/struct/class-template DEFINITION whose own location
+    is likewise exactly the header currently being probed, this script
+    additionally walks its base-specifiers and using-declarations (see
+    _inherited_and_reexported_encoders()) to discover any encoder-shaped
+    member function made newly, transitively accessible through public/
+    protected inheritance or a using-declaration alone, with no new
+    textual declaration of its own -- attributing the resulting Finding
+    to the EXPOSING class's own file/line rather than the original
+    declaring class's file, so it cannot masquerade as an
+    already-audited, already-allowlisted symbol.
+  - A declaration is a *violation* if its canonical return type (or, for
+    an output/inout parameter, that parameter's own canonical pointee
+    type) is in the QJson family (QJsonObject/QJsonArray/QJsonValue,
+    with or without a reference/pointer/const qualifier) and its (file,
+    USR) pair, counted by *exact occurrence count*, is not one of the
+    ALLOWLIST entries below. There is no general "looks like a decode
+    helper" heuristic
     (e.g. "takes a QJson parameter, so it must be inbound-only") -- that
     itself would be a new textual/structural loophole (e.g. a lossy
     per-DTO `toJson(QJsonObject seed)` padded with an unused QJson-typed
@@ -397,16 +457,43 @@ class _CXUnsavedFile(ctypes.Structure):
     _fields_ = [("Filename", ctypes.c_char_p), ("Contents", ctypes.c_char_p), ("Length", ctypes.c_ulong)]
 
 
-# Cursor kinds this script cares about (see clang-c/Index.h).
-_CXCursor_FunctionDecl = 8
+# Cursor kinds this script cares about (see clang-c/Index.h). Every value
+# below was independently, empirically re-confirmed against this
+# project's own pinned libclang via clang_getCursorKindSpelling() (which
+# reports Clang's own name for a given integer kind) rather than trusted
+# from memory/documentation alone -- a review round demonstrated exactly
+# this kind of unverified-constant risk was real:
+# _CXCursor_StructDecl was previously (wrongly) defined as 3, which is
+# actually CXCursor_UnionDecl; the correct value is 2. That mistake had
+# no observable effect before this round only because nothing in this
+# script actually consumed _CXCursor_StructDecl until the inheritance-
+# exposure walk added below started doing so.
+_CXCursor_StructDecl = 2
 _CXCursor_ClassDecl = 4
-_CXCursor_StructDecl = 3
 _CXCursor_ClassTemplate = 31
+_CXCursor_FunctionDecl = 8
 _CXCursor_CXXMethod = 21
 _CXCursor_Namespace = 22
 _CXCursor_ConversionFunction = 26
 _CXCursor_FunctionTemplate = 30
+_CXCursor_Constructor = 24
+_CXCursor_CXXBaseSpecifier = 44
+_CXCursor_UsingDeclaration = 35
+_CXCursor_OverloadedDeclRef = 49
+_CXCursor_FriendDecl = 603
 
+# The "shape-eligible" record/class-template kinds this script walks for
+# base-specifier/using-declaration inheritance exposure (see
+# _inherited_and_reexported_encoders()).
+_RECORD_LIKE_KINDS = frozenset({_CXCursor_StructDecl, _CXCursor_ClassDecl, _CXCursor_ClassTemplate})
+
+# Function-like declaration kinds whose own RESULT type is inspected for
+# QJson-family shape (see _is_encoder_shaped()). Constructors are
+# deliberately excluded here -- clang_getCursorResultType() has no
+# meaningful "return type" concept for a constructor -- but ARE included
+# in _OUTPARAM_CHECKED_KINDS below, since a constructor can still take a
+# non-const QJson-family output/inout reference or pointer parameter
+# exactly like an ordinary function can.
 _FUNCTION_LIKE_KINDS = frozenset(
     {
         _CXCursor_FunctionDecl,
@@ -416,12 +503,58 @@ _FUNCTION_LIKE_KINDS = frozenset(
     }
 )
 
+# Every declaration kind whose PARAMETERS are inspected for a non-const
+# QJson-family output/inout reference or pointer (see
+# _is_encoder_shaped()) -- a review round demonstrated a public/friend
+# `void encode(QJsonObject &out)` (or an equivalent constructor) was a
+# real, undetected bypass of the return-type-only check.
+_OUTPARAM_CHECKED_KINDS = _FUNCTION_LIKE_KINDS | {_CXCursor_Constructor}
+
 # CX_CXXAccessSpecifier (see clang-c/Index.h): 0 is "invalid" -- reported
 # for cursors that are not class members at all (ordinary namespace-scope
-# free functions), which are public by definition; 1 is explicitly public.
+# free functions, and friend declarations regardless of which access
+# section they are textually written under -- both empirically
+# confirmed), which are public by definition; 1 is explicitly public; 2
+# is protected; 3 is private.
 _CX_CXXInvalidAccessSpecifier = 0
 _CX_CXXPublic = 1
+_CX_CXXProtected = 2
+_CX_CXXPrivate = 3
 _PUBLIC_ACCESS_SPECIFIERS = frozenset({_CX_CXXInvalidAccessSpecifier, _CX_CXXPublic})
+
+# A public OR protected base class/using-declaration still exposes its
+# encoder-shaped members to the outside world (directly for a public
+# base, or to any further subclass -- which can then re-expose it
+# publicly with a single additional using-declaration or public
+# inheritance step of its own -- for a protected one); only a PRIVATE
+# base/using-declaration genuinely blocks further exposure. See
+# _inherited_and_reexported_encoders().
+_INHERITABLE_ACCESS_SPECIFIERS = frozenset({_CX_CXXPublic, _CX_CXXProtected})
+
+# CXTypeKind values (see clang-c/Index.h) this script's output/inout
+# parameter check needs to recognize a non-const reference/pointer,
+# empirically re-confirmed the same way as the cursor kinds above.
+_CXType_Pointer = 101
+_CXType_LValueReference = 103
+_CXType_RValueReference = 104
+_REFERENCE_OR_POINTER_TYPE_KINDS = frozenset(
+    {_CXType_Pointer, _CXType_LValueReference, _CXType_RValueReference}
+)
+
+# CXLinkageKind values (see clang-c/Index.h): only a declaration with
+# genuinely external linkage can be referenced (e.g. via an ad-hoc
+# `extern` forward declaration) from another translation unit at all --
+# Internal (an explicit `static`) and UniqueExternal (anonymous-
+# namespace-scoped) declarations cannot be, no matter their own access
+# specifier, and must not be misclassified as a new, externally-callable
+# public-API bypass when found only in a source file with no header
+# declaration (see _scan_sources()'s new declaration-classification
+# logic, added to close exactly the source-only-declaration bypass a
+# review round demonstrated).
+_CXLinkage_Internal = 2
+_CXLinkage_UniqueExternal = 3
+_CXLinkage_External = 4
+
 
 
 _REAL_LIBCLANG_BASENAME_RE = _re.compile(r"^libclang(-\d+)?\.so(\.\d+)*$")
@@ -550,6 +683,112 @@ class _LibClang:
 
         lib.clang_getCursorKind.restype = ctypes.c_int
         lib.clang_getCursorKind.argtypes = [_CXCursor]
+
+        # --- New bindings added to close the source-only-declaration,
+        # output-parameter, and inheritance/using-declaration exposure
+        # bypasses a review round demonstrated (see _is_encoder_shaped(),
+        # _inherited_and_reexported_encoders(), and _scan_sources()'s new
+        # declaration-classification logic). Every one of these was
+        # empirically verified against this project's own pinned
+        # libclang (parsing real, on-disk project sources/synthetic
+        # fixtures and inspecting the exact cursors/types produced)
+        # before being relied upon here, not merely assumed correct from
+        # documentation.
+
+        # clang_getCanonicalCursor(): resolves any declaration cursor to
+        # the FIRST declaration of that same entity anywhere in the
+        # translation unit -- for a member declared in a header and
+        # defined out-of-line in a .cpp, this is always the header
+        # declaration, regardless of which of the two cursors (the
+        # header declaration or the .cpp's own out-of-line definition)
+        # this is called on; for an entity with no earlier declaration
+        # anywhere (a genuinely new, source-only declaration), this
+        # resolves to itself. This is exactly the mechanism
+        # _scan_sources() now uses to distinguish "this source cursor is
+        # merely the out-of-line definition of an already
+        # header-declared (and therefore already counted by
+        # _scan_headers()) symbol" from "this is a brand new declaration
+        # with no header declaration anywhere," without needing to
+        # cross-reference the allowlist or any manifest by hand.
+        lib.clang_getCanonicalCursor.restype = _CXCursor
+        lib.clang_getCanonicalCursor.argtypes = [_CXCursor]
+
+        # clang_getCursorLinkage(): see _CXLinkage_* above -- used to
+        # exclude `static`/anonymous-namespace-scoped source-only
+        # declarations (CXLinkage_Internal/CXLinkage_UniqueExternal) from
+        # _scan_sources()'s new-declaration classification, since neither
+        # can be referenced from another translation unit at all, unlike
+        # an ordinary externally-linked (CXLinkage_External) one.
+        lib.clang_getCursorLinkage.restype = ctypes.c_int
+        lib.clang_getCursorLinkage.argtypes = [_CXCursor]
+
+        # clang_getCursorType(): the (non-canonical) type of an arbitrary
+        # cursor -- used on each function-like declaration's own
+        # parameter (ParmDecl) cursors, obtained via
+        # clang_Cursor_getArgument() below, to inspect their type for the
+        # output-parameter check.
+        lib.clang_getCursorType.restype = _CXType
+        lib.clang_getCursorType.argtypes = [_CXCursor]
+
+        # clang_Cursor_getNumArguments()/clang_Cursor_getArgument(): work
+        # directly on a function-like DECLARATION cursor (not merely a
+        # call-expression, which is the more commonly documented use),
+        # empirically confirmed -- this is what makes each parameter's
+        # own type independently inspectable for the output-parameter
+        # check in _is_encoder_shaped(), without needing to parse the
+        # cursor's own display name/spelling text.
+        lib.clang_Cursor_getNumArguments.restype = ctypes.c_int
+        lib.clang_Cursor_getNumArguments.argtypes = [_CXCursor]
+        lib.clang_Cursor_getArgument.restype = _CXCursor
+        lib.clang_Cursor_getArgument.argtypes = [_CXCursor, ctypes.c_uint]
+
+        # clang_getPointeeType()/clang_isConstQualifiedType(): given a
+        # reference or pointer CXType, resolve the type it refers to and
+        # ask whether that pointee is const-qualified -- a const pointee
+        # (`const QJsonObject &`/`const QJsonObject *`) is an ordinary
+        # input parameter; a non-const one (`QJsonObject &`/
+        # `QJsonObject *`) is a genuine output/inout parameter capable of
+        # smuggling a lossy QJson-family value out of an otherwise
+        # return-type-clean function, exactly like a lossy return type
+        # would.
+        lib.clang_getPointeeType.restype = _CXType
+        lib.clang_getPointeeType.argtypes = [_CXType]
+        lib.clang_isConstQualifiedType.restype = ctypes.c_uint
+        lib.clang_isConstQualifiedType.argtypes = [_CXType]
+
+        # clang_isCursorDefinition(): distinguishes a declaration-only
+        # cursor from one that also carries a body/definition -- used
+        # only for readability/defensive assertions around the
+        # canonical-cursor logic above, not itself load-bearing for any
+        # pass/fail decision.
+        lib.clang_isCursorDefinition.restype = ctypes.c_uint
+        lib.clang_isCursorDefinition.argtypes = [_CXCursor]
+
+        # clang_getTypeDeclaration(): given a CXType naming a class/
+        # struct (e.g. a base-specifier's own type), resolve the cursor
+        # that actually declares/defines that class -- this is what lets
+        # _inherited_and_reexported_encoders() walk into a base class's
+        # own member declarations (which may live in an entirely
+        # different header from the derived class currently being
+        # scanned) to discover encoder-shaped members it makes
+        # accessible to the derived class.
+        lib.clang_getTypeDeclaration.restype = _CXCursor
+        lib.clang_getTypeDeclaration.argtypes = [_CXType]
+
+        # clang_getNumOverloadedDecls()/clang_getOverloadedDecl(): a
+        # using-declaration's own OverloadedDeclRef child cursor (kind
+        # _CXCursor_OverloadedDeclRef, empirically confirmed -- present
+        # even when the using-declaration resolves to exactly one target,
+        # not merely for genuine overload sets) is how libclang exposes
+        # the actual declaration(s) a using-declaration re-exports;
+        # clang_getCursorReferenced() on that child (or on the
+        # using-declaration cursor itself) does NOT resolve to a useful
+        # cursor for this case, empirically confirmed -- only this pair
+        # does.
+        lib.clang_getNumOverloadedDecls.restype = ctypes.c_uint
+        lib.clang_getNumOverloadedDecls.argtypes = [_CXCursor]
+        lib.clang_getOverloadedDecl.restype = _CXCursor
+        lib.clang_getOverloadedDecl.argtypes = [_CXCursor, ctypes.c_uint]
         lib.clang_getCursorDisplayName.restype = _CXString
         lib.clang_getCursorDisplayName.argtypes = [_CXCursor]
         lib.clang_getCursorUSR.restype = _CXString
@@ -583,6 +822,37 @@ class _LibClang:
         # hard failure rather than silently trusting that it did.
         lib.clang_getFile.restype = ctypes.c_void_p
         lib.clang_getFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+        # clang_getLocation()/clang_Location_isInSystemHeader(): used
+        # together by _audit_inclusion_graph() to ask the COMPILER
+        # ITSELF (not a lexical "is this path outside the repo root?"
+        # guess) whether an included file was reached via a genuine
+        # system/toolchain include path (`-isystem`/`-iframework`/the
+        # macOS `-isysroot` SDK root) -- this is real, authoritative
+        # Clang classification, confirmed empirically against this
+        # project's own real compile commands: Qt's own include
+        # directories are passed via `-isystem`/`-iframework` (CMake
+        # automatically marks an IMPORTED target's own
+        # INTERFACE_INCLUDE_DIRECTORIES as SYSTEM for consuming
+        # targets), so every Qt/macOS-SDK header is correctly classified
+        # here, while qtkeychain's own FetchContent-vendored headers are
+        # passed via an ordinary `-I` (confirmed directly against this
+        # project's own real compile commands too) and are therefore
+        # correctly NOT classified as a system header by Clang -- hence
+        # `external_roots` (see _external_roots(), now itself sourced
+        # from real FetchContent package metadata rather than a lexical
+        # `_deps` guess) remains a necessary, SEPARATE classification for
+        # genuinely-external dependency code that is not compiler-
+        # system-classified. A review round demonstrated the previous
+        # blanket "anything outside repo_root is external" rule
+        # exempted ANY generated file placed outside the repository
+        # entirely, with no real system/dependency justification at
+        # all -- this pair of bindings is what replaces that lexical
+        # guess with the compiler's own, authoritative answer.
+        lib.clang_getLocation.restype = _CXSourceLocation
+        lib.clang_getLocation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+        lib.clang_Location_isInSystemHeader.restype = ctypes.c_uint
+        lib.clang_Location_isInSystemHeader.argtypes = [_CXSourceLocation]
 
         # clang_getInclusions() is what makes the *resolved inclusion
         # graph* of a wrapper TU (see _audit_inclusion_graph()) directly
@@ -638,6 +908,12 @@ class Finding:
     file: str  # repo-root-relative, forward-slash path, e.g. "src/domain/RawJson.h"
     line: int
     display_name: str
+    # Normally the plain canonical return-type spelling; for an
+    # output/inout-parameter violation (see _is_encoder_shaped()) this is
+    # instead a human-readable description of the offending parameter
+    # (still containing the actual QJson-family type name, so
+    # classify()'s substring-based _is_qjson_family() check keeps working
+    # unmodified either way).
     canonical_return_type: str
     usr: str
 
@@ -649,6 +925,164 @@ def _is_qjson_family(canonical_type_spelling: str) -> bool:
     return any(family in canonical_type_spelling for family in _QJSON_FAMILY) or _is_qvariant_json_container(
         canonical_type_spelling
     )
+
+
+def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tuple[bool, str]:
+    """True if this function-like/constructor declaration is
+    "encoder-shaped": either its own canonical RESULT type (checked only
+    for kinds in _FUNCTION_LIKE_KINDS -- a constructor has no meaningful
+    return type) or any of its non-const-qualified reference/pointer
+    PARAMETER types (checked for every kind in _OUTPARAM_CHECKED_KINDS)
+    is in the QJson/QVariant-JSON-container family (see
+    _is_qjson_family()).
+
+    Returns (True, a human-readable description of the offending return
+    type or parameter) when encoder-shaped, else (False, the plain
+    canonical return-type spelling).
+
+    A review round demonstrated the original return-type-only check
+    missed a public/friend `void encode(QJsonObject &out)` (or an
+    equivalent constructor writing through a non-const reference/pointer
+    parameter) entirely: passing a non-const reference/pointer to a
+    QJson-family type is exactly as capable of smuggling a lossy value
+    out of an otherwise clean-looking signature as a lossy return type
+    is. A CONST-qualified reference/pointer parameter (an ordinary INPUT
+    parameter -- e.g. every JsonDecode.h decode helper takes one) must
+    never be flagged, and is not: only a non-const pointee triggers this
+    check."""
+
+    result_type = clang.lib.clang_getCursorResultType(cursor)
+    canonical_result = clang.lib.clang_getCanonicalType(result_type)
+    result_spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical_result))
+    if kind in _FUNCTION_LIKE_KINDS and _is_qjson_family(result_spelling):
+        return True, result_spelling
+
+    if kind in _OUTPARAM_CHECKED_KINDS:
+        num_args = clang.lib.clang_Cursor_getNumArguments(cursor)
+        for arg_index in range(max(num_args, 0)):
+            parm_cursor = clang.lib.clang_Cursor_getArgument(cursor, arg_index)
+            parm_type = clang.lib.clang_getCursorType(parm_cursor)
+            canonical_parm = clang.lib.clang_getCanonicalType(parm_type)
+            if canonical_parm.kind not in _REFERENCE_OR_POINTER_TYPE_KINDS:
+                continue
+            pointee = clang.lib.clang_getPointeeType(canonical_parm)
+            if clang.lib.clang_isConstQualifiedType(pointee):
+                continue  # A const reference/pointer is an ordinary input parameter, never flagged.
+            canonical_pointee = clang.lib.clang_getCanonicalType(pointee)
+            pointee_spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical_pointee))
+            if _is_qjson_family(pointee_spelling):
+                qualifier = "&" if canonical_parm.kind != _CXType_Pointer else "*"
+                return (
+                    True,
+                    f"non-const output/inout parameter #{arg_index}: {pointee_spelling} {qualifier}",
+                )
+
+    return False, result_spelling
+
+
+def _resolve_using_declaration_targets(clang: "_LibClang", using_cursor: "_CXCursor") -> list:
+    """A using-declaration's actual re-exported target(s) are exposed by
+    libclang only via its own OverloadedDeclRef child cursor's
+    clang_getNumOverloadedDecls()/clang_getOverloadedDecl() pair --
+    empirically confirmed present even when the using-declaration
+    resolves to exactly one, non-overloaded target, not merely for a
+    genuine overload set. clang_getCursorReferenced() on either the
+    using-declaration cursor itself or its OverloadedDeclRef child does
+    NOT resolve usefully for this case -- only this pair does."""
+
+    targets: list = []
+
+    def visit(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        if clang.lib.clang_getCursorKind(cursor) == _CXCursor_OverloadedDeclRef:
+            count = clang.lib.clang_getNumOverloadedDecls(cursor)
+            for i in range(count):
+                targets.append(clang.lib.clang_getOverloadedDecl(cursor, i))
+        return 2  # CXChildVisit_Recurse
+
+    cb = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(using_cursor, cb, None)
+    return targets
+
+
+_MAX_INHERITANCE_DEPTH = 16
+
+
+def _inherited_and_reexported_encoders(
+    clang: "_LibClang", class_cursor: "_CXCursor", depth: int = 0
+) -> list:
+    """Walk `class_cursor`'s own direct children for:
+
+      - a PUBLIC or PROTECTED base-specifier (see
+        _INHERITABLE_ACCESS_SPECIFIERS): every one of that base class's
+        own public/protected member functions becomes newly accessible
+        through `class_cursor` itself (directly, for a public base; to
+        any further subclass, for a protected one) with no new textual
+        declaration inside `class_cursor` at all -- recursed
+        transitively (with a depth guard against a pathological/cyclic
+        hierarchy), so a multi-level inheritance chain is fully covered.
+      - a PUBLIC or PROTECTED using-declaration (see
+        _resolve_using_declaration_targets()): explicitly re-exports one
+        or more inherited member(s) -- often from an otherwise PRIVATE
+        base, which alone would have blocked exposure -- as new members
+        of `class_cursor` itself.
+
+    Returns a list of (source_cursor, attribution_cursor) pairs: for each
+    newly-exposed member function found this way, `source_cursor` is the
+    ORIGINAL member declaration (whose own shape/USR must still be
+    checked by the caller), and `attribution_cursor` is the
+    base-specifier or using-declaration cursor responsible for exposing
+    it -- physically located inside `class_cursor`'s own body, in
+    `class_cursor`'s own file, which is what lets the caller attribute a
+    resulting Finding to the newly-exposing class/file rather than to
+    the base's own original declaration file (where it may already be
+    correctly allowlisted, entirely independently of this new exposure).
+
+    A review round demonstrated this exact bypass: a new struct publicly
+    inheriting from AuthenticateRequest (or privately inheriting it and
+    using-declaring its toJson() back to public) exposes an
+    already-allowlisted encoder as new, unaudited public API, entirely
+    without writing any new textual declaration of its own."""
+
+    if depth > _MAX_INHERITANCE_DEPTH:
+        raise EncoderHygieneError(
+            "Inheritance-exposure walk exceeded a sane recursion depth "
+            f"({_MAX_INHERITANCE_DEPTH}) -- this is almost certainly a "
+            "pathological/cyclic class hierarchy, not real production code."
+        )
+
+    exposed: list = []
+    bases: list = []
+
+    def visit(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        kind = clang.lib.clang_getCursorKind(cursor)
+        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        if kind == _CXCursor_CXXBaseSpecifier and access in _INHERITABLE_ACCESS_SPECIFIERS:
+            bases.append(cursor)
+        elif kind == _CXCursor_UsingDeclaration and access in _INHERITABLE_ACCESS_SPECIFIERS:
+            for target in _resolve_using_declaration_targets(clang, cursor):
+                exposed.append((target, cursor))
+        return 1  # CXChildVisit_Continue: never descend into member function bodies here.
+
+    cb = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(class_cursor, cb, None)
+
+    for base_specifier in bases:
+        base_type = clang.lib.clang_getCursorType(base_specifier)
+        base_decl = clang.lib.clang_getTypeDeclaration(base_type)
+
+        def visit_base_member(cursor: "_CXCursor", _parent: "_CXCursor", _client_data, _base=base_specifier) -> int:
+            member_kind = clang.lib.clang_getCursorKind(cursor)
+            member_access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+            if member_kind in _FUNCTION_LIKE_KINDS and member_access in _INHERITABLE_ACCESS_SPECIFIERS:
+                exposed.append((cursor, _base))
+            return 1  # CXChildVisit_Continue
+
+        member_cb = clang._visitor_func_type(visit_base_member)
+        clang.lib.clang_visitChildren(base_decl, member_cb, None)
+
+        exposed.extend(_inherited_and_reexported_encoders(clang, base_decl, depth + 1))
+
+    return exposed
 
 
 def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -> str:
@@ -887,79 +1321,85 @@ def _audit_inclusion_graph(
     header: Path,
     wrapper_filename: str,
     allowed_closure: frozenset[Path],
-    repo_root: Path,
     external_roots: frozenset[Path],
 ) -> list[str]:
     """Ask libclang for the complete resolved inclusion graph of
     `header`'s own wrapper TU (via clang_getInclusions() -- see the
     _LibClang binding above and the module docstring) and return one
-    violation description per project-owned file (i.e. one whose own
-    resolved, symlink-followed real path lies inside this repository's
-    tracked source tree AND is not a member of any registered
-    `external_roots` -- see _external_roots() -- anything outside the
-    repository entirely, such as a Qt/system/toolchain header, is
-    always unconditionally external) it reaches that is not a member of
-    `allowed_closure`.
+    violation description per project-owned file it reaches that is not
+    a member of `allowed_closure`.
 
-    A review round demonstrated that an earlier revision blanket-exempted
-    EVERYTHING resolving under this script's own dedicated Clang-toolchain
-    build directory (by default `<repo_root>/build-encoder-hygiene`,
-    physically NESTED inside the repository) as "external", reasoning
-    that CMake's FetchContent (see CMakeLists.txt's QtKeychain
-    declaration) downloads/builds genuinely external third-party source
-    and generated build artifacts (e.g. qkeychain_export.h) directly
-    under it. That blanket exemption also silently exempted any
-    genuinely PROJECT-generated header/fragment placed anywhere else
-    under that same build directory (e.g. a hypothetical
-    `<build-dir>/generated/Lossy.inc` reached by a real header's
-    #include) -- proven by a review round that planted exactly such a
-    file with a lossy `QJsonObject` declaration and showed this check
-    stayed green. `external_roots` is therefore now a small, EXPLICIT
-    set of genuinely-external subtrees (currently: only
-    `<clang-build-dir>/_deps`, where FetchContent vendors/builds
-    qtkeychain's own real third-party source) -- everything else
-    resolving inside the repository, including every OTHER path under
-    the build directory (AUTOMOC's own internal per-target
-    `*_autogen/` directories, this script's own `generated/*.txt`
-    manifests, or any future project-generated header placed anywhere
-    else under it), is audited exactly like any other project file: it
-    must be a member of `allowed_closure` or this is a hard violation,
-    never a silent skip.
+    A file is classified as genuinely EXTERNAL (and therefore exempt
+    from the `allowed_closure` membership check entirely) if, and only
+    if, EITHER:
+
+      - `clang_Location_isInSystemHeader()` reports it was reached via a
+        real compiler/toolchain system-include mechanism
+        (`-isystem`/`-iframework`/the macOS SDK `-isysroot` root) --
+        this is the COMPILER's own authoritative classification, not a
+        lexical guess, and empirically confirmed (against this
+        project's own real compile commands) to correctly cover every
+        Qt header (CMake automatically marks an IMPORTED target's own
+        include directories as SYSTEM for consumers) and every macOS
+        SDK/libc++ header; or
+      - its own resolved, symlink-followed real path lies inside one of
+        the small, EXPLICIT `external_roots` (see _external_roots(),
+        itself sourced from real CMake FetchContent package metadata,
+        not a lexical `_deps` guess) -- needed because a
+        FetchContent-vendored dependency's OWN headers (e.g.
+        qtkeychain's) are, empirically confirmed, compiled via an
+        ordinary `-I`, not `-isystem`, and are therefore NOT classified
+        as a system header by Clang itself.
+
+    EVERY other resolved file -- including one physically located
+    outside this repository's own tracked source tree entirely, which a
+    review round demonstrated an earlier revision blanket-exempted as
+    always external purely by virtue of being outside `repo_root` -- is
+    still audited exactly like any other project file: it must be a
+    member of `allowed_closure` or this is a hard violation, never a
+    silent skip. (In practice such a file categorically CANNOT be a
+    member of `allowed_closure` at all, since every closure entry is
+    independently required, by _validate_closure_rootedness(), to
+    physically reside inside this repository's own src/domain or src/
+    root -- so this now correctly, unconditionally fails closed instead
+    of silently exempting it.)
 
     This is independent of however the #include that reached the
-    forbidden file was spelled: bare, "../"-relative, absolute, through
+    file was spelled: bare, "../"-relative, absolute, through
     a symlink, or via a project-generated wrapper header all resolve to
     the same real file identity here, which is exactly what a
     compile-flag/include-path-based defense alone cannot guarantee (see
     module docstring)."""
 
     violations: list[str] = []
-    included: list[Path] = []
+    included: list[tuple[Path, ctypes.c_void_p]] = []
 
     def visitor(included_file, _inclusion_stack, _include_len, _client_data) -> None:
         if not included_file:
             return
         name = clang.to_str(clang.lib.clang_getFileName(included_file))
         if name:
-            included.append(Path(name))
+            included.append((Path(name), included_file))
 
     cb = clang._inclusion_visitor_func_type(visitor)
     clang.lib.clang_getInclusions(tu, cb, None)
 
-    wrapper_basename = Path(wrapper_filename).name
-    for included_path in included:
+    wrapper_real = Path(wrapper_filename).resolve()
+    for included_path, included_file in included:
+        real = included_path.resolve()
         # The wrapper's own synthetic "main file" is not a real
         # #include at all -- clang_getInclusions() reports it anyway
         # (with an empty inclusion stack), so it must be recognized and
-        # skipped by exact name before any closure-membership check
-        # (it would otherwise be misclassified as an unregistered
-        # project-owned file, since it lives right next to the real
-        # header on disk, lexically).
-        if included_path.name == wrapper_basename:
+        # skipped by its EXACT resolved identity, never merely by
+        # basename -- a review round demonstrated a basename-only
+        # comparison cannot distinguish the wrapper's own synthetic file
+        # from a second, differently-located real project file that
+        # happens to share the same basename.
+        if real == wrapper_real:
             continue
-        real = included_path.resolve()
-        if not real.is_relative_to(repo_root):
-            continue  # Outside the repo entirely: Qt/system/toolchain header, always external.
+        location = clang.lib.clang_getLocation(tu, included_file, 1, 1)
+        if clang.lib.clang_Location_isInSystemHeader(location):
+            continue  # A genuine compiler/system/toolchain header (see this function's own doc comment).
         if any(real.is_relative_to(root) for root in external_roots):
             continue  # Explicitly-registered external subtree (e.g. FetchContent-vendored source/build).
         if real not in allowed_closure:
@@ -976,25 +1416,46 @@ def _audit_inclusion_graph(
 
 def _external_roots(clang_build_dir: Path) -> frozenset[Path]:
     """The small, EXPLICIT set of subtrees this script treats as
-    genuinely external (never subject to the domain/foundation
-    dependency-direction closure check), independent of the blanket
-    "anything under the build directory" exemption a review round
+    genuinely external/trusted-generated (never subject to the domain/
+    foundation dependency-direction closure check), independent of the
+    blanket "anything under the build directory" (or, later, "anything
+    outside repo_root") exemption two separate review rounds
     demonstrated was unsound (see _audit_inclusion_graph()'s own doc
-    comment for the exact bypass this replaces).
+    comment for the exact bypasses this replaces).
 
-    Currently this is exactly one root: `<clang-build-dir>/_deps`, where
-    CMake's FetchContent (see CMakeLists.txt's QtKeychain declaration)
-    downloads and builds qtkeychain's own real, genuinely third-party
-    source and generates its own build artifacts (e.g.
-    qkeychain_export.h) -- confirmed directly against this project's own
-    FetchContent_Declare() call, never assumed. Anything else resolving
-    under the build directory (this script's own `generated/*.txt`
-    manifests, AUTOMOC's per-target `*_autogen/` directories, or any
-    future project-generated header placed anywhere else under it) is
-    deliberately NOT included here, so it remains subject to the same
-    closure-membership audit as any other project file."""
+    Read from `<clang-build-dir>/generated/external_roots.txt`, which
+    CMakeLists.txt/cmake/PathManifest.cmake populate from two distinct,
+    always CMake-metadata-derived (never hand-authored/lexically
+    guessed) sources:
 
-    return frozenset({(clang_build_dir / "_deps").resolve()})
+      - The REAL, FetchContent-populated `qtkeychain_SOURCE_DIR`/
+        `qtkeychain_BINARY_DIR` variables (written eagerly, right after
+        `FetchContent_MakeAvailable(qtkeychain)`) -- genuine third-party
+        dependency package metadata, replacing a previous
+        `<clang-build-dir>/_deps` lexical guess that happened to work
+        only because this project currently has exactly one FetchContent
+        dependency at exactly that conventional location.
+      - Each production target's own AUTOMOC `AUTOGEN_BUILD_DIR` (see
+        arkham_append_target_autogen_root() in cmake/PathManifest.cmake,
+        appended once both targets are fully configured) -- needed
+        because a real build showed that AUTOMOC's own generated
+        `mocs_compilation.cpp` (already independently scanned as a
+        SOURCE) transitively `#include`s per-class `moc_*.cpp`
+        fragments physically written under that directory, which are
+        mechanically generated in full by Qt's `moc` tool directly from
+        an already-audited Q_OBJECT/Q_GADGET header and can never
+        introduce a public API surface of their own, so requiring them
+        to have their own manifest entry would be auditing generated
+        boilerplate that cannot possibly differ from what its source
+        header already declares.
+
+    Either way, this stays correct automatically if qtkeychain's own
+    FetchContent declaration changes, a new dependency is added, or
+    AUTOGEN_BUILD_DIR's own CMake default ever changes, with no change
+    needed to this script."""
+
+    manifest = clang_build_dir / "generated" / "external_roots.txt"
+    return frozenset(root.resolve() for root in _read_manifest(manifest))
 
 
 def _scan_headers(
@@ -1006,7 +1467,7 @@ def _scan_headers(
     repo_root: Path,
     external_roots: frozenset[Path],
     allowed_closure: frozenset[Path],
-    seen: set[tuple[str, int, str]],
+    seen: set[tuple],
     structural_violations: list[str],
 ) -> list[Finding]:
     """Independently parse every header/fragment in `headers` as its own
@@ -1017,48 +1478,124 @@ def _scan_headers(
         `allowed_closure` (see _audit_inclusion_graph()), appending any
         violation found to `structural_violations` -- a hard,
         never-allowlist-able failure (see run_check()).
-      - Records a Finding for every public, QJson-family-returning,
-        function-like declaration whose OWN resolved location is a
-        member of `allowed_closure` -- not merely "== the header
-        currently being probed": a header may legitimately #include
-        another member of its own closure (e.g. Decks.h #include-ing
-        ValueOrError.h), and that included file's declarations must
-        still be attributed to their own true source file. `seen` is a
-        single (resolved file, line, USR) dedup set shared across the
-        *entire* run (both the domain and foundation passes), so a
-        legitimately shared/cross-included file's declarations are
-        recorded exactly once no matter how many headers in its own
-        closure #include it -- never once per including header."""
+      - Records a Finding for every public, encoder-shaped (see
+        _is_encoder_shaped(): QJson-family return type OR non-const
+        QJson-family output/inout parameter), function-like/constructor
+        declaration whose OWN resolved location is a member of
+        `allowed_closure` -- not merely "== the header currently being
+        probed": a header may legitimately #include another member of
+        its own closure (e.g. Decks.h #include-ing ValueOrError.h), and
+        that included file's declarations must still be attributed to
+        their own true source file.
+      - For every class/struct/class-template DEFINITION whose own
+        resolved location is a member of `allowed_closure`, additionally
+        walks its base-class/using-declaration inheritance exposure (see
+        _inherited_and_reexported_encoders()) and records a SEPARATE
+        Finding -- attributed to the EXPOSING class's own file/line, not
+        the original declaration's file -- for every encoder-shaped
+        member function it newly makes accessible; this deliberately
+        does not affect classify()/ALLOWLIST_BY_KEY, since the
+        (exposing file, usr) key will never match an allowlist entry
+        keyed to the original declaring file, closing the "derive from
+        an already-allowlisted encoder type" bypass without any change
+        to the allowlist mechanism itself.
+
+    `seen` is a single dedup set shared across the *entire* run (both
+    the domain and foundation passes, and both header and source scans):
+    each entry is either a 3-tuple `(resolved file, line, USR)` for an
+    own-declaration Finding, or a 4-tuple
+    `(resolved file, line, USR, "inherited")` for an inheritance/using-
+    declaration-exposure Finding -- the differing tuple shapes guarantee
+    the two kinds can never collide with each other even at the exact
+    same nominal (file, line, usr), while still deduplicating repeats of
+    the *same* kind (e.g. a legitimately shared/cross-included file's
+    declarations, recorded exactly once no matter how many headers in
+    its own closure #include it -- never once per including header)."""
 
     findings: list[Finding] = []
 
+    def record_if_new(
+        *,
+        dedup_key: tuple,
+        real: Path,
+        line: int,
+        display_name: str,
+        shape_description: str,
+        usr: str,
+    ) -> None:
+        if dedup_key in seen:
+            return
+        seen.add(dedup_key)
+        findings.append(
+            Finding(
+                file=real.relative_to(repo_root).as_posix(),
+                line=line,
+                display_name=display_name,
+                canonical_return_type=shape_description,
+                usr=usr,
+            )
+        )
+
+    def handle_own_declaration(cursor: _CXCursor, kind: int) -> None:
+        filename, line = clang.cursor_file_and_line(cursor)
+        if filename is None:
+            return
+        real = Path(filename).resolve()
+        if real not in allowed_closure:
+            return
+        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        if access not in _PUBLIC_ACCESS_SPECIFIERS:
+            return
+        is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
+        if not is_shaped:
+            return
+        usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+        record_if_new(
+            dedup_key=(str(real), line, usr),
+            real=real,
+            line=line,
+            display_name=clang.to_str(clang.lib.clang_getCursorDisplayName(cursor)),
+            shape_description=shape_description,
+            usr=usr,
+        )
+
+    def handle_inheritance_exposure(class_cursor: _CXCursor) -> None:
+        filename, _def_line = clang.cursor_file_and_line(class_cursor)
+        if filename is None:
+            return
+        if Path(filename).resolve() not in allowed_closure:
+            return
+        for source_cursor, attribution_cursor in _inherited_and_reexported_encoders(clang, class_cursor):
+            source_kind = clang.lib.clang_getCursorKind(source_cursor)
+            is_shaped, shape_description = _is_encoder_shaped(clang, source_cursor, source_kind)
+            if not is_shaped:
+                continue
+            attribution_filename, attribution_line = clang.cursor_file_and_line(attribution_cursor)
+            if attribution_filename is None:
+                continue
+            attribution_real = Path(attribution_filename).resolve()
+            if attribution_real not in allowed_closure:
+                continue
+            usr = clang.to_str(clang.lib.clang_getCursorUSR(source_cursor))
+            record_if_new(
+                dedup_key=(str(attribution_real), attribution_line, usr, "inherited"),
+                real=attribution_real,
+                line=attribution_line,
+                display_name=(
+                    f"{clang.to_str(clang.lib.clang_getCursorDisplayName(source_cursor))} "
+                    "(exposed via inheritance/using-declaration)"
+                ),
+                shape_description=shape_description,
+                usr=usr,
+            )
+
     def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
         kind = clang.lib.clang_getCursorKind(cursor)
-        if kind in _FUNCTION_LIKE_KINDS:
-            filename, line = clang.cursor_file_and_line(cursor)
-            if filename is not None:
-                real = Path(filename).resolve()
-                if real in allowed_closure:
-                    access = clang.lib.clang_getCXXAccessSpecifier(cursor)
-                    if access in _PUBLIC_ACCESS_SPECIFIERS:
-                        result_type = clang.lib.clang_getCursorResultType(cursor)
-                        canonical = clang.lib.clang_getCanonicalType(result_type)
-                        spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
-                        if _is_qjson_family(spelling):
-                            usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
-                            dedup_key = (str(real), line, usr)
-                            if dedup_key not in seen:
-                                seen.add(dedup_key)
-                                display = clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
-                                findings.append(
-                                    Finding(
-                                        file=real.relative_to(repo_root).as_posix(),
-                                        line=line,
-                                        display_name=display,
-                                        canonical_return_type=spelling,
-                                        usr=usr,
-                                    )
-                                )
+        if kind in _RECORD_LIKE_KINDS and clang.lib.clang_isCursorDefinition(cursor):
+            handle_inheritance_exposure(cursor)
+            return 2  # CXChildVisit_Recurse: still walk this class's own direct members normally.
+        if kind in _OUTPARAM_CHECKED_KINDS:  # Superset of _FUNCTION_LIKE_KINDS, includes constructors.
+            handle_own_declaration(cursor, kind)
             return 1  # CXChildVisit_Continue: do not descend into the body.
         return 2  # CXChildVisit_Recurse: keep looking for nested declarations.
 
@@ -1067,13 +1604,12 @@ def _scan_headers(
     for header in headers:
         tu, wrapper_filename = _parse_header_as_own_tu(clang, idx, header, compile_args, sysroot_args)
         structural_violations.extend(
-            _audit_inclusion_graph(
-                clang, tu, header, wrapper_filename, allowed_closure, repo_root, external_roots
-            )
+            _audit_inclusion_graph(clang, tu, header, wrapper_filename, allowed_closure, external_roots)
         )
         root = clang.lib.clang_getTranslationUnitCursor(tu)
         clang.lib.clang_visitChildren(root, visitor_cb, None)
         clang.lib.clang_disposeTranslationUnit(tu)
+
 
     return findings
 
@@ -1196,51 +1732,140 @@ def _scan_sources(
     repo_root: Path,
     external_roots: frozenset[Path],
     allowed_closure: frozenset[Path],
-) -> list[str]:
+    seen: set[tuple],
+) -> tuple[list[str], list[Finding]]:
     """Independently parse every REAL production .cpp in `sources` as its
     own translation unit (see _parse_source_as_own_tu()) -- each with its
     own exact compile_commands.json entry, never a borrowed/
-    "representative" one -- and audit its complete resolved inclusion
-    graph against `allowed_closure`, exactly like _scan_headers() already
-    does for headers/fragments (see _audit_inclusion_graph(), reused
-    unchanged here: a source's own file is skipped from the graph the
-    identical way a header's own wrapper "main file" entry is, by
-    passing the source's own path as the self-filtering
-    `wrapper_filename` argument).
+    "representative" one -- and:
 
-    Unlike _scan_headers(), this deliberately collects NO QJson-family
-    Finding objects from a source's own declarations. Every one of this
-    project's 14 allowlisted encoders is declared in a header but
-    *defined out-of-line* in its own .cpp (e.g.
-    src/domain/RawJson.cpp's `Value::toExactQJson()`,
-    src/AuthModels.cpp's `AuthenticateRequest::toJson()`) -- naively
-    collecting findings for declarations whose own resolved file is the
-    source itself would misclassify every legitimate encoder's own
-    out-of-line *definition* as an unrecognized new violation, since
-    ALLOWLIST keys each entry by its *header's* repo-relative path, not
-    its .cpp's (an out-of-line definition shares its declaration's USR
-    but not its declaration's file). Any genuinely *new* QJson-family
-    declaration would still have to be declared in some header to be
-    part of this project's public API surface at all -- an
-    out-of-line-only symbol with no header declaration has no way to be
-    called from another translation unit -- so header/fragment scanning
-    alone remains the correct, complete surface for Finding collection;
-    this function exists purely to close the inclusion-graph/
-    dependency-direction audit gap for real production sources a review
-    round demonstrated was completely unaudited."""
+      - audit its complete resolved inclusion graph against
+        `allowed_closure`, exactly like _scan_headers() already does for
+        headers/fragments (see _audit_inclusion_graph(), reused
+        unchanged here: a source's own file is skipped from the graph
+        the identical way a header's own wrapper "main file" entry is,
+        by passing the source's own path as the self-filtering
+        `wrapper_filename` argument);
+      - collect a Finding for every genuinely NEW, source-only,
+        externally-linked, encoder-shaped declaration this source
+        introduces -- i.e. one with no earlier declaration anywhere,
+        such as a namespace-scope `QJsonObject encodeDeck(const
+        DeckList&)` written directly in a .cpp with no header
+        declaration at all, which a review round demonstrated compiles
+        and remains callable from another translation unit via an
+        ad-hoc `extern` forward declaration despite this script
+        previously collecting zero findings from source scanning.
+
+    An out-of-line DEFINITION of an already header-declared symbol (e.g.
+    src/domain/RawJson.cpp's `Value::toExactQJson()`, or
+    src/AuthModels.cpp's `AuthenticateRequest::toJson()`) is correctly
+    NOT re-flagged here: for each function-like/constructor cursor found
+    in this source, clang_getCanonicalCursor() is used to resolve it to
+    its own FIRST declaration anywhere in the TU. When that canonical
+    cursor's own file is a header already covered by _scan_headers()
+    (i.e. a member of `allowed_closure`), this cursor is merely that
+    header declaration's out-of-line definition, already correctly
+    counted while scanning its header, and is silently skipped. Only
+    when the canonical cursor's own file is the .cpp itself (no earlier
+    declaration anywhere) -- and that declaration has genuinely EXTERNAL
+    linkage (clang_getCursorLinkage() == CXLinkage_External; a `static`-
+    or anonymous-namespace-scoped helper has internal/unique-external
+    linkage and categorically cannot be referenced from another
+    translation unit, so is correctly never flagged) -- is a new Finding
+    recorded, keyed by the *source*'s own repo-relative path (which can
+    never match any ALLOWLIST entry, since every entry is keyed to a
+    header path), so it always, correctly, classifies as a violation.
+
+    `seen` is the SAME whole-run dedup set _scan_headers() uses (3-tuple
+    `(resolved file, line, USR)` entries): a source-only declaration's
+    dedup key uses the source's own resolved path, so it can never
+    collide with a header-scan entry, but a source scanned more than
+    once (impossible in this script's normal flow, since each manifest
+    entry is scanned exactly once, but kept for defensive consistency
+    with _scan_headers()) would still be deduplicated correctly."""
 
     violations: list[str] = []
+    findings: list[Finding] = []
+
+    def make_visitor(source_real: Path):
+        def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
+            kind = clang.lib.clang_getCursorKind(cursor)
+            filename, _line = clang.cursor_file_and_line(cursor)
+            if filename is not None and Path(filename).resolve() != source_real:
+                # This cursor (and everything beneath it) belongs entirely to a
+                # different, transitively-#include-d file -- e.g. a project header
+                # already independently covered by _scan_headers(), or a Qt/system
+                # header entirely out of scope here. Declarations reached only by
+                # recursing into another file's own AST must never be attributed to
+                # THIS source, so this subtree is not descended into at all.
+                return 1  # CXChildVisit_Continue
+
+            if kind in _RECORD_LIKE_KINDS:
+                return 2  # CXChildVisit_Recurse: a source-defined class/struct is not itself
+                # flagged here (constructing new *types* in a .cpp is not how this bypass
+                # works; only a source-only *function*/constructor declaration is), but its
+                # own members, physically written in this same source, must still be
+                # visited normally.
+            if kind not in _OUTPARAM_CHECKED_KINDS:  # Superset of _FUNCTION_LIKE_KINDS, includes constructors.
+                return 2  # CXChildVisit_Recurse: keep looking for nested declarations.
+
+            canonical = clang.lib.clang_getCanonicalCursor(cursor)
+            canonical_filename, canonical_line = clang.cursor_file_and_line(canonical)
+            if canonical_filename is None:
+                return 1  # CXChildVisit_Continue: no location at all (e.g. built-in); nothing to check.
+            canonical_real = Path(canonical_filename).resolve()
+            if canonical_real in allowed_closure:
+                return 1  # Already declared (and already counted) in a scanned header; this source
+                # cursor is merely that declaration's out-of-line definition.
+            if not canonical_real.is_relative_to(repo_root):
+                return 1  # The canonical declaration belongs to an entirely external (e.g. Qt/
+                # system) header -- this is a specialization/instantiation of pre-existing
+                # external API, not a new source-only project declaration.
+
+            linkage = clang.lib.clang_getCursorLinkage(cursor)
+            if linkage != _CXLinkage_External:
+                return 1  # `static`/anonymous-namespace-scoped: cannot be referenced from another TU.
+
+            access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+            if access not in _PUBLIC_ACCESS_SPECIFIERS:
+                return 1  # A private/protected member of a class defined only in this source is not
+                # reachable from outside that class regardless of its own linkage.
+
+            is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
+            if not is_shaped:
+                return 1
+
+            usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+            dedup_key = (str(canonical_real), canonical_line, usr)
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                findings.append(
+                    Finding(
+                        file=canonical_real.relative_to(repo_root).as_posix(),
+                        line=canonical_line,
+                        display_name=clang.to_str(clang.lib.clang_getCursorDisplayName(cursor)),
+                        canonical_return_type=shape_description,
+                        usr=usr,
+                    )
+                )
+            return 1
+
+        return visitor
+
     for source in sources:
         tu = _parse_source_as_own_tu(clang, idx, source, compile_commands, sysroot_args)
         try:
             violations.extend(
                 _audit_inclusion_graph(
-                    clang, tu, source, str(source.resolve()), allowed_closure, repo_root, external_roots
+                    clang, tu, source, str(source.resolve()), allowed_closure, external_roots
                 )
             )
+            root = clang.lib.clang_getTranslationUnitCursor(tu)
+            visitor_cb = clang._visitor_func_type(make_visitor(source.resolve()))
+            clang.lib.clang_visitChildren(root, visitor_cb, None)
         finally:
             clang.lib.clang_disposeTranslationUnit(tu)
-    return violations
+    return violations, findings
 
 
 def _read_manifest(path: Path) -> list[Path]:
@@ -1419,48 +2044,59 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             structural_violations,
         )
 
-        # See _scan_sources()'s own doc comment for why REAL production
-        # .cpp files are audited for inclusion-graph/dependency-direction
-        # violations only (never for new QJson-family Finding objects):
-        # a review round demonstrated this script previously never
+        # A review round demonstrated this script previously never
         # independently parsed a single real source file at all --
         # domain_sources.txt/foundation_sources.txt were read only to
         # borrow one "representative" compile-args list for scanning
         # *headers* -- so a production .cpp could #include an
         # absolute/"../"-relative/symlinked/generated forbidden header,
         # inherit whatever lossy encoders it declares, and compile with
-        # this check staying green. Each source here is parsed with its
-        # own exact compile_commands.json entry (never a borrowed one),
-        # and both source manifests are themselves generated directly
-        # from arkham_domain_models'/arkham_foundation's own live CMake
-        # SOURCES metadata (see arkham_write_target_source_manifest() in
+        # this check staying green. A further review round demonstrated
+        # that even after independent source parsing was added, it only
+        # ever checked the inclusion graph, never collecting new
+        # QJson-family Finding objects at all -- a genuinely new,
+        # source-only, externally-linked encoder declaration (with no
+        # header declaration anywhere) passed unaudited (see
+        # _scan_sources()'s own doc comment for exactly how this is now
+        # closed via clang_getCanonicalCursor()/clang_getCursorLinkage()).
+        # Each source here is parsed with its own exact
+        # compile_commands.json entry (never a borrowed one), and both
+        # source manifests are themselves generated directly from
+        # arkham_domain_models'/arkham_foundation's own live CMake
+        # SOURCES/INTERFACE_SOURCES (+ AUTOMOC-generated
+        # mocs_compilation.cpp, when applicable) metadata (see
+        # arkham_write_target_source_manifest() in
         # cmake/PathManifest.cmake) -- never a hand-authored variable --
         # so this scan can never silently miss a source added via a
-        # later target_sources() call either.
-        structural_violations.extend(
-            _scan_sources(
-                clang,
-                idx,
-                domain_sources,
-                compile_commands,
-                sysroot_args,
-                repo_root,
-                external_roots,
-                domain_closure,
-            )
+        # later target_sources() call, an INTERFACE_SOURCES entry, or a
+        # Qt AUTOMOC-generated compilation unit either.
+        domain_source_violations, domain_source_findings = _scan_sources(
+            clang,
+            idx,
+            domain_sources,
+            compile_commands,
+            sysroot_args,
+            repo_root,
+            external_roots,
+            domain_closure,
+            seen,
         )
-        structural_violations.extend(
-            _scan_sources(
-                clang,
-                idx,
-                foundation_sources,
-                compile_commands,
-                sysroot_args,
-                repo_root,
-                external_roots,
-                foundation_closure,
-            )
+        structural_violations.extend(domain_source_violations)
+        findings += domain_source_findings
+
+        foundation_source_violations, foundation_source_findings = _scan_sources(
+            clang,
+            idx,
+            foundation_sources,
+            compile_commands,
+            sysroot_args,
+            repo_root,
+            external_roots,
+            foundation_closure,
+            seen,
         )
+        structural_violations.extend(foundation_source_violations)
+        findings += foundation_source_findings
     finally:
         clang.lib.clang_disposeIndex(idx)
 

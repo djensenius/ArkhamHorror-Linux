@@ -80,6 +80,36 @@ endfunction()
 # has been processed, regardless of where in CMakeLists.txt this
 # function itself happens to be called from.
 #
+# A THIRD review round showed this function still only reads HEADER_SETS
+# (the names of this target's own PUBLIC/PRIVATE FILE_SET-registered
+# header sets), never INTERFACE_HEADER_SETS (the analogous property for
+# INTERFACE-visibility FILE_SET registrations -- see
+# https://cmake.org/cmake/help/latest/prop_tgt/INTERFACE_HEADER_SETS.html).
+# Neither of this project's two targets currently registers an INTERFACE
+# header set, but nothing about this function's own logic actually
+# depended on that being true -- an INTERFACE FILE_SET added later would
+# have silently produced a header this manifest, and therefore the AST
+# policy script's scan, never saw at all. This function now unions BOTH
+# properties' NAME lists into one deduplicated list, then reads every
+# name's own file list from the SAME `HEADER_SET_<name>` property --
+# real, empirical testing against this project's own pinned CMake
+# 4.4.3 (`cmake --help-property-list`, and a real scratch-project
+# generator-expression probe) showed there is no separate
+# `INTERFACE_HEADER_SET_<name>` property at all: an earlier revision of
+# this function assumed one existed and read it for INTERFACE-visibility
+# names specifically, which always silently generated an EMPTY result
+# (not an error), so an INTERFACE-only FILE_SET's headers were being
+# unconditionally DROPPED from this manifest the whole time, exactly
+# opposite of the fix this comment originally claimed. `HEADER_SET_<name>`
+# alone (see
+# https://cmake.org/cmake/help/latest/prop_tgt/HEADER_SET_NAME.html,
+# which documents no INTERFACE-prefixed counterpart) correctly resolves
+# for a name regardless of which list (HEADER_SETS or
+# INTERFACE_HEADER_SETS) it came from. See
+# tests/cmake/DeferredTargetManifestPolicyTest.cmake's
+# InterfaceHeaderSetIsIncludedInManifestTest for the real, fail-before/
+# pass-after CMake mutation test proving this.
+#
 # A LATER review round showed this alone is still not sufficient:
 # HEADER_SETS itself (see the doc comment inside the function body
 # below) is read via a plain, immediate get_target_property() call --
@@ -136,31 +166,77 @@ function(arkham_write_target_header_set_manifest)
     # directly/immediately, this would only see whichever FILE_SET
     # registrations happened to precede the call site textually, exactly
     # the bug a review round demonstrated.
-    get_target_property(_arkham_thsm_names ${ARG_TARGET} HEADER_SETS)
-    if(NOT _arkham_thsm_names)
+    get_target_property(_arkham_thsm_public_names ${ARG_TARGET} HEADER_SETS)
+    get_target_property(_arkham_thsm_interface_names ${ARG_TARGET} INTERFACE_HEADER_SETS)
+    if(NOT _arkham_thsm_public_names AND NOT _arkham_thsm_interface_names)
         message(FATAL_ERROR
             "arkham_write_target_header_set_manifest: target '${ARG_TARGET}' has no "
-            "HEADERS-type FILE_SET registered at all -- nothing for the encoder-hygiene "
-            "AST scanner to audit for this target, which is almost certainly a build "
-            "misconfiguration rather than an intentionally headerless target.")
+            "HEADERS-type FILE_SET registered at all (neither PUBLIC/PRIVATE nor "
+            "INTERFACE) -- nothing for the encoder-hygiene AST scanner to audit for "
+            "this target, which is almost certainly a build misconfiguration rather "
+            "than an intentionally headerless target.")
     endif()
+    if(NOT _arkham_thsm_public_names)
+        set(_arkham_thsm_public_names "")
+    endif()
+    if(NOT _arkham_thsm_interface_names)
+        set(_arkham_thsm_interface_names "")
+    endif()
+
+    # A real, empirically-verified-against-this-project's-own-pinned-
+    # CMake-4.4.3 `cmake --help-property-list` run showed there is NO
+    # such property as `INTERFACE_HEADER_SET_<name>` at all -- an earlier
+    # revision of this function assumed one existed (by false analogy
+    # with INTERFACE_SOURCES/SOURCES being genuinely distinct properties
+    # below) and read it for every INTERFACE-visibility name, which
+    # always silently resolves to an EMPTY generator-expression result,
+    # not an error -- so an INTERFACE-only FILE_SET's headers were
+    # SILENTLY DROPPED from this manifest entirely despite
+    # INTERFACE_HEADER_SETS correctly listing the set's *name*. The one
+    # real, universal property for ANY named header set's own file
+    # list, regardless of whether that name came from HEADER_SETS or
+    # INTERFACE_HEADER_SETS, is `HEADER_SET_<name>` (confirmed directly:
+    # `$<TARGET_PROPERTY:tgt,HEADER_SET_someInterfaceSetName>` correctly
+    # resolves to that set's files even when the set itself was
+    # registered via `target_sources(tgt INTERFACE FILE_SET
+    # someInterfaceSetName ...)` -- see
+    # https://cmake.org/cmake/help/latest/prop_tgt/HEADER_SET_NAME.html,
+    # which documents no INTERFACE-prefixed counterpart). Both name
+    # lists are therefore combined into ONE deduplicated list here and
+    # every name (whatever its originating visibility) is read via the
+    # SAME `HEADER_SET_<name>` property below. See
+    # tests/cmake/DeferredTargetManifestPolicyTest.cmake's
+    # InterfaceHeaderSetIsIncludedInManifestTest for the real,
+    # fail-before/pass-after mutation test proving both that this
+    # specific bug was real and reproducible, and that this fix closes
+    # it.
+    set(_arkham_thsm_all_names "")
+    list(APPEND _arkham_thsm_all_names ${_arkham_thsm_public_names})
+    list(APPEND _arkham_thsm_all_names ${_arkham_thsm_interface_names})
+    if(_arkham_thsm_all_names)
+        list(REMOVE_DUPLICATES _arkham_thsm_all_names)
+    endif()
+    unset(_arkham_thsm_public_names)
+    unset(_arkham_thsm_interface_names)
 
     # Build ONE combined generator expression naming every one of this
     # target's header-set names' own file lists, joined with real
-    # newlines: $<JOIN:$<TARGET_PROPERTY:tgt,HEADER_SET_name1>;$<TARGET_PROPERTY:tgt,HEADER_SET_name2>;...,\n>
+    # newlines:
+    # $<JOIN:$<TARGET_PROPERTY:tgt,HEADER_SET_name1>;$<TARGET_PROPERTY:tgt,HEADER_SET_name2>;...,\n>
     # Nested generator expressions evaluate inside-out, so each
     # HEADER_SET_<name> resolves to that set's own semicolon-separated
     # absolute file list first, and the outer $<JOIN:...> then flattens
     # the whole thing (however many names there turn out to be, now or
-    # after some future second FILE_SET is added) into one newline-per-path manifest --
-    # exactly the format packaging/check_encoder_hygiene.py's
-    # _read_manifest() already expects, with zero changes needed there.
+    # after some future second FILE_SET is added, of either visibility)
+    # into one newline-per-path manifest -- exactly the format
+    # packaging/check_encoder_hygiene.py's _read_manifest() already
+    # expects, with zero changes needed there.
     set(_arkham_thsm_pieces "")
-    foreach(_arkham_thsm_name IN LISTS _arkham_thsm_names)
+    foreach(_arkham_thsm_name IN LISTS _arkham_thsm_all_names)
         list(APPEND _arkham_thsm_pieces "$<TARGET_PROPERTY:${ARG_TARGET},HEADER_SET_${_arkham_thsm_name}>")
     endforeach()
     unset(_arkham_thsm_name)
-    unset(_arkham_thsm_names)
+    unset(_arkham_thsm_all_names)
 
     file(GENERATE OUTPUT "${ARG_OUTPUT_FILE}"
         CONTENT "$<JOIN:${_arkham_thsm_pieces},\n>\n"
@@ -202,6 +278,67 @@ endfunction()
 # tests/cmake/DeferredTargetManifestPolicyTest.cmake for the matching
 # fail-before/pass-after mutation coverage.
 #
+# A THIRD review round showed two further gaps here:
+#
+#   - Only plain SOURCES was read, never INTERFACE_SOURCES (the
+#     analogous property for sources a target exposes to its consumers
+#     without compiling itself -- see
+#     https://cmake.org/cmake/help/latest/prop_tgt/INTERFACE_SOURCES.html).
+#     Neither of this project's two targets currently registers any
+#     INTERFACE sources, but exactly like INTERFACE_HEADER_SETS above,
+#     nothing about this function's logic actually depended on that
+#     staying true. Both properties' lists are now unioned (in that
+#     order, with SOURCE_DIR-relative entries resolved against this
+#     target's own SOURCE_DIR either way) before being written out.
+#   - This project's global `set(CMAKE_AUTOMOC ON)` (see CMakeLists.txt)
+#     means both arkham_domain_models and arkham_foundation each get a
+#     real, separately-compiled AUTOMOC-generated `mocs_compilation.cpp`
+#     translation unit -- confirmed directly against this project's own
+#     dedicated Clang build directory's compile_commands.json, which
+#     lists exactly one such entry per target, at CMake's own stable,
+#     documented default location
+#     (https://cmake.org/cmake/help/latest/prop_tgt/AUTOGEN_BUILD_DIR.html):
+#     `<AUTOGEN_BUILD_DIR>/mocs_compilation.cpp`, where AUTOGEN_BUILD_DIR
+#     itself defaults to `<dir-matching-CMAKE_CURRENT_BINARY_DIR>/
+#     <target-name>_autogen` when never explicitly overridden. This file
+#     is neither in SOURCES nor INTERFACE_SOURCES (AUTOMOC's generated
+#     compilation unit is not a property CMake exposes through either
+#     one), so it was previously invisible to this manifest -- and
+#     therefore to packaging/check_encoder_hygiene.py's dependency-
+#     direction/inclusion-graph audit -- entirely, even though it is
+#     genuinely compiled as part of the target and does appear in the
+#     real compile_commands.json (proven directly: this project has no
+#     Q_OBJECT/Q_GADGET types in either target today, so
+#     arkham_domain_models's own mocs_compilation.cpp is presently a
+#     trivial "no moc" stub, but arkham_foundation's is not -- it
+#     #includes several real per-class moc_*.cpp files, e.g. for
+#     SessionCoordinator/InputRouter/NetworkAuthenticationClient). This
+#     function now appends that target's own computed
+#     mocs_compilation.cpp path whenever CMake's own AUTOMOC target
+#     property is enabled for it, so a future Q_OBJECT/Q_GADGET type
+#     added to either target's generated moc output is audited exactly
+#     like any other compiled translation unit, never silently skipped.
+#     packaging/check_encoder_hygiene.py's own
+#     _find_compile_command_for_source() independently enforces the
+#     other half of this: every source this manifest lists (including
+#     this appended mocs_compilation.cpp entry) MUST have its own exact
+#     compile_commands.json entry, or the scan hard-fails outright --
+#     this manifest can never silently list a source Ninja/Make itself
+#     never actually compiled. (compile_commands.json entries carry no
+#     per-target attribution field a generator-agnostic reverse check
+#     could key on -- e.g. the Ninja generator this project's own
+#     packaging/check_encoder_hygiene.py build uses gives every entry the
+#     SAME top-level build "directory" regardless of which target owns
+#     it -- so the manifest-to-target-SOURCES direction covered by
+#     arkham_write_target_source_manifest() itself, plus this function's
+#     analogous AUTOGEN_BUILD_DIR/trusted-root registration for the one
+#     concrete generated-TU gap a real build actually exposed, is what
+#     this project actually enforces; see tests/cmake/
+#     DeferredTargetManifestPolicyTest.cmake's
+#     AutomocGeneratedCompilationUnitIsIncludedInManifestTest for the
+#     real, fail-before/pass-after CMake mutation test proving this
+#     specific fix.)
+#
 # Arguments:
 #   TARGET       The target whose SOURCES this manifest is derived from.
 #   OUTPUT_FILE  Absolute path of the manifest file to write.
@@ -224,14 +361,32 @@ function(arkham_write_target_source_manifest)
     unset(_arkham_tsm_dir)
 
     get_target_property(_arkham_tsm_source_dir ${ARG_TARGET} SOURCE_DIR)
-    get_target_property(_arkham_tsm_sources ${ARG_TARGET} SOURCES)
-    if(NOT _arkham_tsm_sources)
+    get_target_property(_arkham_tsm_own_sources ${ARG_TARGET} SOURCES)
+    get_target_property(_arkham_tsm_interface_sources ${ARG_TARGET} INTERFACE_SOURCES)
+    if(NOT _arkham_tsm_own_sources AND NOT _arkham_tsm_interface_sources)
         message(FATAL_ERROR
             "arkham_write_target_source_manifest: target '${ARG_TARGET}' has no "
-            "SOURCES at all -- nothing for the encoder-hygiene AST scanner to "
-            "audit for this target, which is almost certainly a build "
+            "SOURCES or INTERFACE_SOURCES at all -- nothing for the encoder-hygiene "
+            "AST scanner to audit for this target, which is almost certainly a build "
             "misconfiguration rather than an intentionally sourceless target.")
     endif()
+    if(NOT _arkham_tsm_own_sources)
+        set(_arkham_tsm_own_sources "")
+    endif()
+    if(NOT _arkham_tsm_interface_sources)
+        set(_arkham_tsm_interface_sources "")
+    endif()
+    # Deliberately UNQUOTED expansions below: list(APPEND var "") always
+    # adds one literal empty-string element (an unwanted stray manifest
+    # line resolving to just this target's own SOURCE_DIR), whereas an
+    # unquoted expansion of an empty-string variable supplies zero
+    # arguments, correctly appending nothing when a property was never
+    # set at all.
+    set(_arkham_tsm_sources "")
+    list(APPEND _arkham_tsm_sources ${_arkham_tsm_own_sources})
+    list(APPEND _arkham_tsm_sources ${_arkham_tsm_interface_sources})
+    unset(_arkham_tsm_own_sources)
+    unset(_arkham_tsm_interface_sources)
 
     # FILE_SET-registered headers do NOT appear in a target's plain
     # SOURCES property (a separate CMake property/concept entirely) --
@@ -254,6 +409,87 @@ function(arkham_write_target_source_manifest)
     unset(_arkham_tsm_sources)
     unset(_arkham_tsm_source_dir)
 
+    # AUTOMOC's own generated aggregation translation unit is compiled as
+    # part of this target (see the doc comment above this function) but
+    # is exposed through neither SOURCES nor INTERFACE_SOURCES -- append
+    # its own, CMake-documented default path directly whenever AUTOMOC is
+    # enabled for this target, so it is never silently missing from this
+    # manifest (and therefore from the AST policy scan) the way a review
+    # round demonstrated it previously was.
+    get_target_property(_arkham_tsm_automoc ${ARG_TARGET} AUTOMOC)
+    if(_arkham_tsm_automoc)
+        get_target_property(_arkham_tsm_autogen_dir ${ARG_TARGET} AUTOGEN_BUILD_DIR)
+        if(NOT _arkham_tsm_autogen_dir)
+            get_target_property(_arkham_tsm_binary_dir ${ARG_TARGET} BINARY_DIR)
+            set(_arkham_tsm_autogen_dir "${_arkham_tsm_binary_dir}/${ARG_TARGET}_autogen")
+            unset(_arkham_tsm_binary_dir)
+        endif()
+        string(APPEND _arkham_tsm_lines "${_arkham_tsm_autogen_dir}/mocs_compilation.cpp\n")
+        unset(_arkham_tsm_autogen_dir)
+    endif()
+    unset(_arkham_tsm_automoc)
+
     file(WRITE "${ARG_OUTPUT_FILE}" "${_arkham_tsm_lines}")
     unset(_arkham_tsm_lines)
+endfunction()
+
+# A real, running build subsequently showed that once
+# arkham_write_target_source_manifest() (above) started registering each
+# target's own AUTOMOC-generated `mocs_compilation.cpp` as a genuine,
+# independently-scanned SOURCE, that translation unit's OWN transitive
+# `#include`s of the individual per-Q_OBJECT-class `moc_*.cpp` fragments
+# AUTOMOC generates (e.g. `moc_FocusController.cpp`, physically written
+# under that same target's AUTOGEN_BUILD_DIR) were then, correctly,
+# reached by packaging/check_encoder_hygiene.py's inclusion-graph audit
+# for the first time -- and, having no manifest entry of their own,
+# failed as unregistered project files. These fragments are not
+# hand-authored project code at all: each one is mechanically generated,
+# in full, by Qt's `moc` tool directly from an already
+# FILE_SET-registered, already independently AST-scanned Q_OBJECT/
+# Q_GADGET header, and can only ever reference members that header
+# itself already declares -- moc cannot invent a new public API surface
+# of its own. This function registers a target's own AUTOGEN_BUILD_DIR
+# (computed identically to arkham_write_target_source_manifest()'s own
+# mocs_compilation.cpp path logic above) as a trusted, GENERATED root in
+# the same manifest packaging/check_encoder_hygiene.py's
+# `_external_roots()` reads for genuinely-external FetchContent
+# dependencies (see the `generated/external_roots.txt` writer in
+# CMakeLists.txt) -- appended via file(APPEND ...), never overwriting
+# the FetchContent-derived lines already written there. This is real,
+# CMake-derived target metadata (AUTOMOC/AUTOGEN_BUILD_DIR properties),
+# never a lexical "build directory" guess, so it stays correct
+# automatically if CMake's own AUTOGEN_BUILD_DIR default ever changes or
+# is explicitly overridden for either target.
+#
+# Arguments:
+#   TARGET       The target whose AUTOGEN_BUILD_DIR (if AUTOMOC-enabled)
+#                is registered.
+#   OUTPUT_FILE  Absolute path of the (already-existing) external-roots
+#                manifest file to append to.
+function(arkham_append_target_autogen_root)
+    set(oneValueArgs TARGET OUTPUT_FILE)
+    cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
+
+    if(NOT ARG_TARGET)
+        message(FATAL_ERROR "arkham_append_target_autogen_root: TARGET is required")
+    endif()
+    if(NOT ARG_OUTPUT_FILE)
+        message(FATAL_ERROR "arkham_append_target_autogen_root: OUTPUT_FILE is required")
+    endif()
+    if(NOT TARGET ${ARG_TARGET})
+        message(FATAL_ERROR "arkham_append_target_autogen_root: no such target '${ARG_TARGET}'")
+    endif()
+
+    get_target_property(_arkham_tar_automoc ${ARG_TARGET} AUTOMOC)
+    if(_arkham_tar_automoc)
+        get_target_property(_arkham_tar_autogen_dir ${ARG_TARGET} AUTOGEN_BUILD_DIR)
+        if(NOT _arkham_tar_autogen_dir)
+            get_target_property(_arkham_tar_binary_dir ${ARG_TARGET} BINARY_DIR)
+            set(_arkham_tar_autogen_dir "${_arkham_tar_binary_dir}/${ARG_TARGET}_autogen")
+            unset(_arkham_tar_binary_dir)
+        endif()
+        file(APPEND "${ARG_OUTPUT_FILE}" "${_arkham_tar_autogen_dir}\n")
+        unset(_arkham_tar_autogen_dir)
+    endif()
+    unset(_arkham_tar_automoc)
 endfunction()

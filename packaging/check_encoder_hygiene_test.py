@@ -247,37 +247,77 @@ class QVariantJsonContainerTests(unittest.TestCase):
 class ExternalRootsTests(unittest.TestCase):
     """Coverage for _external_roots(): the small, explicit set of
     subtrees exempted from the domain/foundation dependency-direction
-    closure check, replacing the unsound blanket "anything under the
-    build directory" exemption a review round demonstrated let a
-    genuinely project-generated header/fragment placed anywhere else
-    under the build directory evade the audit (see
-    _audit_inclusion_graph()'s own doc comment)."""
+    closure check -- sourced from a REAL, CMake-generated
+    `<clang-build-dir>/generated/external_roots.txt` manifest (see
+    cmake/PathManifest.cmake's eager FetchContent-derived writer and
+    arkham_append_target_autogen_root()), never a hand-authored/
+    hardcoded `_deps` guess -- replacing the earlier, unsound blanket
+    "anything under the build directory" exemption a review round
+    demonstrated let a genuinely project-generated header/fragment
+    placed anywhere else under the build directory evade the audit (see
+    _audit_inclusion_graph()'s own doc comment).
 
-    def test_returns_exactly_the_deps_subtree(self) -> None:
-        build_dir = Path("/repo/build-encoder-hygiene")
-        roots = ceh._external_roots(build_dir)
-        self.assertEqual(roots, frozenset({(build_dir / "_deps").resolve()}))
+    Uses a real scratch directory tree (rooted under this repository's
+    own gitignored build/ directory, never the system temp directory)
+    with an actual `generated/external_roots.txt` file written directly,
+    exactly as CMake itself would -- proving _external_roots() reads
+    real manifest content rather than deriving anything lexically from
+    the build directory path itself."""
+
+    def setUp(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        scratch_parent = repo_root / "build"
+        scratch_parent.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=str(scratch_parent))
+        self.build_dir = Path(self._tmp.name)
+        self.generated_dir = self.build_dir / "generated"
+        self.generated_dir.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_manifest(self, *roots: Path) -> None:
+        (self.generated_dir / "external_roots.txt").write_text(
+            "".join(f"{root}\n" for root in roots), encoding="utf-8"
+        )
+
+    def test_returns_exactly_the_manifested_roots(self) -> None:
+        deps = self.build_dir / "_deps"
+        autogen = self.build_dir / "arkham_foundation_autogen"
+        self._write_manifest(deps, autogen)
+        roots = ceh._external_roots(self.build_dir)
+        self.assertEqual(roots, frozenset({deps.resolve(), autogen.resolve()}))
 
     def test_does_not_exempt_the_build_dir_itself(self) -> None:
-        build_dir = Path("/repo/build-encoder-hygiene")
-        roots = ceh._external_roots(build_dir)
-        self.assertNotIn(build_dir.resolve(), roots)
+        self._write_manifest(self.build_dir / "_deps")
+        roots = ceh._external_roots(self.build_dir)
+        self.assertNotIn(self.build_dir.resolve(), roots)
 
-    def test_does_not_exempt_a_generated_subdirectory_of_the_build_dir(self) -> None:
+    def test_does_not_exempt_a_generated_subdirectory_never_manifested(self) -> None:
         # Direct regression coverage for the reviewer-reported bypass: a
         # genuinely project-generated header/fragment placed at
         # <build-dir>/generated/Lossy.inc must NOT be exempt merely for
-        # residing somewhere under the build directory.
-        build_dir = Path("/repo/build-encoder-hygiene")
-        roots = ceh._external_roots(build_dir)
-        generated = (build_dir / "generated" / "Lossy.inc").resolve()
+        # residing somewhere under the build directory -- only entries
+        # this manifest actually lists are ever exempt.
+        self._write_manifest(self.build_dir / "_deps")
+        roots = ceh._external_roots(self.build_dir)
+        generated = (self.generated_dir / "Lossy.inc").resolve()
         self.assertFalse(any(generated.is_relative_to(root) for root in roots))
 
-    def test_exempts_a_real_path_nested_under_deps(self) -> None:
-        build_dir = Path("/repo/build-encoder-hygiene")
-        roots = ceh._external_roots(build_dir)
-        nested = (build_dir / "_deps" / "qtkeychain-src" / "keychain.h").resolve()
+    def test_exempts_a_real_path_nested_under_a_manifested_root(self) -> None:
+        self._write_manifest(self.build_dir / "_deps")
+        roots = ceh._external_roots(self.build_dir)
+        nested = (self.build_dir / "_deps" / "qtkeychain-src" / "keychain.h").resolve()
         self.assertTrue(any(nested.is_relative_to(root) for root in roots))
+
+    def test_missing_manifest_is_a_hard_failure_never_a_silent_empty_result(self) -> None:
+        # No generated/external_roots.txt written at all in this scratch
+        # build_dir -- must raise, never silently return an empty
+        # frozenset (which would be indistinguishable from "this build
+        # genuinely has zero external roots" and could mask a
+        # misconfigured/unconfigured build directory).
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._external_roots(self.build_dir)
 
 
 class FindCompileCommandForSourceTests(unittest.TestCase):

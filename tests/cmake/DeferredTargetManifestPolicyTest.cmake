@@ -3,7 +3,15 @@
 # arkham_write_target_source_manifest() (both in cmake/PathManifest.cmake)
 # MUST be invoked via cmake_language(DEFER DIRECTORY ... CALL ...), never
 # directly/immediately -- see the doc comments above each of those
-# functions for the full narrative.
+# functions for the full narrative -- and, alongside that, that both
+# functions genuinely union PUBLIC/PRIVATE and INTERFACE-visibility
+# FILE_SET/source registrations (reading every named header set's files
+# via the single real `HEADER_SET_<name>` property regardless of which
+# visibility it came from, since no separate `INTERFACE_HEADER_SET_<name>`
+# property actually exists), and that arkham_append_target_autogen_root()
+# (also in cmake/PathManifest.cmake) correctly registers an AUTOMOC-
+# enabled target's own AUTOGEN_BUILD_DIR while leaving an AUTOMOC-
+# disabled target's manifest untouched.
 #
 # cmake_language(DEFER DIRECTORY <dir> CALL ...) requires <dir> to be a
 # directory CMake is actually (or has already finished) processing as
@@ -30,15 +38,46 @@
 #   - a SECOND FILE_SET (headers2/B.h) and a second ordinary source
 #     (dummy2.cpp) registered AFTER both pairs of manifest-writing calls,
 #     mirroring exactly the "a later target_sources() call" scenario a
-#     review round reported as unobserved.
+#     review round reported as unobserved;
+#   - a THIRD, INTERFACE-visibility FILE_SET (headers3/C.h) and
+#     INTERFACE source (dummy3.cpp) -- InterfaceHeaderSetIsIncludedInManifestTest
+#     below -- registered alongside the above, plus a locally-defined
+#     REGRESSED reproduction of the real functions' pre-fix logic (run
+#     side by side, never affecting the real manifests) so this test can
+#     prove BOTH that the historical INTERFACE-visibility gaps were real
+#     and reproducible (fail-before) and that the real, current functions
+#     close them (pass-after), all without needing this file's own git
+#     history;
+#   - a SEPARATE `probe_target_automoc` OBJECT library with AUTOMOC
+#     explicitly enabled (AutomocGeneratedCompilationUnitIsIncludedInManifestTest),
+#     proving arkham_write_target_source_manifest() appends that
+#     target's own AUTOMOC-generated mocs_compilation.cpp, and that
+#     arkham_append_target_autogen_root() registers its AUTOGEN_BUILD_DIR
+#     into a shared external-roots manifest -- alongside the same kind of
+#     regressed pre-fix reproduction, and a negative control proving
+#     arkham_append_target_autogen_root() appends NOTHING at all for
+#     probe_target (AUTOMOC left OFF, the default).
 #
 # Expected, asserted outcomes:
 #   - The two "_immediate" manifests must contain ONLY the first
 #     header/source (headers1/A.h, dummy.cpp) -- proving the early-
 #     snapshot bug is real and reproducible, not hypothetical.
-#   - The two "_deferred" manifests must contain BOTH the first and
-#     second header/source -- proving cmake_language(DEFER) actually
-#     closes the gap.
+#   - The two "_deferred" manifests must contain the first, second, AND
+#     third (INTERFACE-visibility) header/source -- proving
+#     cmake_language(DEFER) actually closes the "later target_sources()
+#     call" gap AND that both PUBLIC/PRIVATE and INTERFACE visibilities
+#     are unioned correctly.
+#   - Each "_regressed_interface_bug" manifest (using the historical,
+#     pre-fix logic) must be MISSING its own INTERFACE-only entry
+#     (headers3/C.h / dummy3.cpp respectively) -- proving the gap this
+#     test guards against was genuinely reproducible, not merely assumed.
+#   - sources_automoc.txt must contain probe_target_automoc's own
+#     mocs_compilation.cpp; sources_automoc_regressed.txt (the pre-AUTOMOC-
+#     fix reproduction) must be missing it.
+#   - external_roots_probe.txt must contain EXACTLY ONE line, matching
+#     probe_target_automoc's own AUTOGEN_BUILD_DIR -- proving both that
+#     the AUTOMOC-enabled target's root IS registered and that the
+#     AUTOMOC-disabled target's call correctly appended nothing.
 # A regression that made either function's real implementation stop
 # using/needing DEFER (or a future edit that accidentally called it
 # directly again in the real CMakeLists.txt) would not, by itself, be
@@ -69,11 +108,14 @@ if(EXISTS "${ARKHAM_SCRATCH_DIR}")
 endif()
 file(MAKE_DIRECTORY "${ARKHAM_SCRATCH_DIR}/headers1")
 file(MAKE_DIRECTORY "${ARKHAM_SCRATCH_DIR}/headers2")
+file(MAKE_DIRECTORY "${ARKHAM_SCRATCH_DIR}/headers3")
 
 file(WRITE "${ARKHAM_SCRATCH_DIR}/headers1/A.h" "// scratch header, not part of the real project\n")
 file(WRITE "${ARKHAM_SCRATCH_DIR}/headers2/B.h" "// scratch header, not part of the real project\n")
+file(WRITE "${ARKHAM_SCRATCH_DIR}/headers3/C.h" "// scratch header, not part of the real project\n")
 file(WRITE "${ARKHAM_SCRATCH_DIR}/dummy.cpp" "int arkham_deferred_manifest_probe_dummy() { return 0; }\n")
 file(WRITE "${ARKHAM_SCRATCH_DIR}/dummy2.cpp" "int arkham_deferred_manifest_probe_dummy2() { return 1; }\n")
+file(WRITE "${ARKHAM_SCRATCH_DIR}/dummy3.cpp" "int arkham_deferred_manifest_probe_dummy3() { return 2; }\n")
 
 file(WRITE "${ARKHAM_SCRATCH_DIR}/CMakeLists.txt" [=[
 cmake_minimum_required(VERSION 3.25)
@@ -121,6 +163,124 @@ target_sources(probe_target PUBLIC
     FILES "${CMAKE_CURRENT_SOURCE_DIR}/headers2/B.h"
 )
 target_sources(probe_target PRIVATE dummy2.cpp)
+
+# --- INTERFACE-visibility FILE_SET/source: proves both that
+# INTERFACE_HEADER_SETS/INTERFACE_SOURCES are unioned in at all, and
+# that each named set's files are read back via the one REAL universal
+# `HEADER_SET_<name>` property (empirically confirmed via
+# `cmake --help-property-list` against this project's own pinned CMake
+# 4.4.3 and a real generator-expression probe: there is no separate
+# `INTERFACE_HEADER_SET_<name>` property at all) rather than a
+# plausible-sounding but nonexistent INTERFACE-prefixed one. ---
+target_sources(probe_target INTERFACE
+    FILE_SET headers3 TYPE HEADERS
+    BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}"
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/headers3/C.h"
+)
+target_sources(probe_target INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/dummy3.cpp")
+
+# A minimal, deliberately-REGRESSED reproduction of the historical,
+# pre-fix arkham_write_target_header_set_manifest() logic -- assumes a
+# separate `INTERFACE_HEADER_SET_<name>` property exists and reads THAT
+# for INTERFACE-visibility names, which always silently contributes
+# nothing (not an error) -- run side by side with the real function
+# (never substituting for it) so this test can prove the historical gap
+# was genuinely reproducible, not merely asserted.
+function(regressed_header_manifest_pre_interface_fix)
+    set(oneValueArgs TARGET OUTPUT_FILE)
+    cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
+    get_target_property(_names ${ARG_TARGET} HEADER_SETS)
+    get_target_property(_iface_names ${ARG_TARGET} INTERFACE_HEADER_SETS)
+    if(NOT _names)
+        set(_names "")
+    endif()
+    if(NOT _iface_names)
+        set(_iface_names "")
+    endif()
+    set(_pieces "")
+    foreach(_n IN LISTS _names)
+        list(APPEND _pieces "$<TARGET_PROPERTY:${ARG_TARGET},HEADER_SET_${_n}>")
+    endforeach()
+    foreach(_n IN LISTS _iface_names)
+        list(APPEND _pieces "$<TARGET_PROPERTY:${ARG_TARGET},INTERFACE_HEADER_SET_${_n}>")
+    endforeach()
+    file(GENERATE OUTPUT "${ARG_OUTPUT_FILE}" CONTENT "$<JOIN:${_pieces},\n>\n")
+endfunction()
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
+    regressed_header_manifest_pre_interface_fix
+    TARGET probe_target
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/manifest_regressed_interface_bug.txt"
+)
+
+# A minimal, deliberately-REGRESSED reproduction of the historical,
+# pre-fix arkham_write_target_source_manifest() logic (plain SOURCES
+# only -- no INTERFACE_SOURCES union, no AUTOMOC mocs_compilation.cpp
+# append at all). Reused below for BOTH probe_target (proving the
+# INTERFACE_SOURCES gap) and probe_target_automoc (proving the AUTOMOC
+# gap), since both historical bugs share the exact same "just read
+# plain SOURCES" shape.
+function(regressed_source_manifest_sources_property_only)
+    set(oneValueArgs TARGET OUTPUT_FILE)
+    cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
+    get_target_property(_srcdir ${ARG_TARGET} SOURCE_DIR)
+    get_target_property(_srcs ${ARG_TARGET} SOURCES)
+    if(NOT _srcs)
+        set(_srcs "")
+    endif()
+    set(_lines "")
+    foreach(_s IN LISTS _srcs)
+        cmake_path(IS_RELATIVE _s _is_rel)
+        if(_is_rel)
+            string(APPEND _lines "${_srcdir}/${_s}\n")
+        else()
+            string(APPEND _lines "${_s}\n")
+        endif()
+    endforeach()
+    file(WRITE "${ARG_OUTPUT_FILE}" "${_lines}")
+endfunction()
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
+    regressed_source_manifest_sources_property_only
+    TARGET probe_target
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/sources_regressed_interface_bug.txt"
+)
+
+# --- AUTOMOC-generated compilation-unit registration: a separate probe
+# target, so its Qt-less "AUTOMOC disabled" configure-time author
+# warning (expected and harmless in this Qt-free scratch project --
+# confirmed empirically that CMake still leaves the AUTOMOC target
+# property itself reporting ON, and AUTOGEN_BUILD_DIR still resolves to
+# its normal default, even though no Qt was found to actually run moc)
+# cannot be confused with the FILE_SET/source scenarios above. ---
+add_library(probe_target_automoc OBJECT dummy.cpp)
+set_target_properties(probe_target_automoc PROPERTIES AUTOMOC ON)
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
+    arkham_write_target_source_manifest
+    TARGET probe_target_automoc
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/sources_automoc.txt"
+)
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
+    regressed_source_manifest_sources_property_only
+    TARGET probe_target_automoc
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/sources_automoc_regressed.txt"
+)
+
+# arkham_append_target_autogen_root(): the shared external-roots
+# manifest starts empty; probe_target_automoc (AUTOMOC ON) must append
+# its own AUTOGEN_BUILD_DIR, while probe_target (AUTOMOC left at its
+# CMake default of OFF) must append NOTHING at all -- a negative
+# control proving the function's own AUTOMOC guard is real, not a
+# no-op that always appends regardless.
+file(WRITE "${CMAKE_BINARY_DIR}/external_roots_probe.txt" "")
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
+    arkham_append_target_autogen_root
+    TARGET probe_target_automoc
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/external_roots_probe.txt"
+)
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
+    arkham_append_target_autogen_root
+    TARGET probe_target
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/external_roots_probe.txt"
+)
 ]=])
 
 execute_process(
@@ -163,14 +323,15 @@ endif()
 message(STATUS "Case 1 (immediate header-set manifest correctly omits the later-registered headers2/B.h) passed.")
 
 # --- Case 2 (pass-after, headers): the deferred header-set manifest must
-# contain BOTH headers1/A.h and headers2/B.h. ---
-list(FILTER _headers_deferred INCLUDE REGEX "headers1/A\\.h$|headers2/B\\.h$")
+# contain headers1/A.h, headers2/B.h (PUBLIC/PRIVATE visibility), AND
+# headers3/C.h (INTERFACE visibility). ---
+list(FILTER _headers_deferred INCLUDE REGEX "headers1/A\\.h$|headers2/B\\.h$|headers3/C\\.h$")
 list(LENGTH _headers_deferred _headers_deferred_count)
-if(NOT _headers_deferred_count EQUAL 2)
+if(NOT _headers_deferred_count EQUAL 3)
     message(FATAL_ERROR
-        "Case 2 (deferred header-set manifest) expected exactly headers1/A.h and headers2/B.h (2 entries) but found ${_headers_deferred_count}: ${_headers_deferred}")
+        "Case 2 (deferred header-set manifest) expected exactly headers1/A.h, headers2/B.h, and headers3/C.h (3 entries) but found ${_headers_deferred_count}: ${_headers_deferred}")
 endif()
-message(STATUS "Case 2 (deferred header-set manifest correctly contains both headers1/A.h and headers2/B.h) passed.")
+message(STATUS "Case 2 (deferred header-set manifest correctly contains headers1/A.h, headers2/B.h, and headers3/C.h) passed.")
 
 # --- Case 3 (fail-before, sources): the immediate source manifest must
 # be missing the later-registered dummy2.cpp. ---
@@ -182,13 +343,94 @@ endif()
 message(STATUS "Case 3 (immediate source manifest correctly omits the later-registered dummy2.cpp) passed.")
 
 # --- Case 4 (pass-after, sources): the deferred source manifest must
-# contain BOTH dummy.cpp and dummy2.cpp. ---
-list(FILTER _sources_deferred INCLUDE REGEX "dummy\\.cpp$|dummy2\\.cpp$")
+# contain dummy.cpp, dummy2.cpp (plain SOURCES), AND dummy3.cpp
+# (INTERFACE_SOURCES). ---
+list(FILTER _sources_deferred INCLUDE REGEX "/dummy\\.cpp$|dummy2\\.cpp$|dummy3\\.cpp$")
 list(LENGTH _sources_deferred _sources_deferred_count)
-if(NOT _sources_deferred_count EQUAL 2)
+if(NOT _sources_deferred_count EQUAL 3)
     message(FATAL_ERROR
-        "Case 4 (deferred source manifest) expected exactly dummy.cpp and dummy2.cpp (2 entries) but found ${_sources_deferred_count}: ${_sources_deferred}")
+        "Case 4 (deferred source manifest) expected exactly dummy.cpp, dummy2.cpp, and dummy3.cpp (3 entries) but found ${_sources_deferred_count}: ${_sources_deferred}")
 endif()
-message(STATUS "Case 4 (deferred source manifest correctly contains both dummy.cpp and dummy2.cpp) passed.")
+message(STATUS "Case 4 (deferred source manifest correctly contains dummy.cpp, dummy2.cpp, and dummy3.cpp) passed.")
 
-message(STATUS "DeferredTargetManifestPolicyTest: all 4 cases passed.")
+# --- InterfaceHeaderSetIsIncludedInManifestTest: Case 5 (fail-before)
+# proves the historical "assumed INTERFACE_HEADER_SET_<name> property"
+# bug was real -- the regressed reproduction's manifest must be MISSING
+# the INTERFACE-only headers3/C.h entirely (it may still legitimately
+# contain headers1/A.h and headers2/B.h, since those go through the
+# correctly-named HEADER_SET_<name> property in both the real and
+# regressed functions alike; only the INTERFACE-visibility entry is
+# expected to differ). ---
+_arkham_dtm_read_manifest_lines("${ARKHAM_SCRATCH_DIR}/build/manifest_regressed_interface_bug.txt" _headers_regressed)
+list(FILTER _headers_regressed INCLUDE REGEX "headers3/C\\.h$")
+if(NOT "${_headers_regressed}" STREQUAL "")
+    message(FATAL_ERROR
+        "Case 5 (InterfaceHeaderSetIsIncludedInManifestTest, fail-before) expected the regressed pre-fix reproduction (which reads a nonexistent INTERFACE_HEADER_SET_<name> property) to be MISSING headers3/C.h, but it was present. Either CMake started supporting that property, or the regressed reproduction itself no longer matches the historical bug -- re-examine the scenario.")
+endif()
+message(STATUS "Case 5 (InterfaceHeaderSetIsIncludedInManifestTest, fail-before: regressed pre-fix header manifest correctly omits the INTERFACE-only headers3/C.h) passed.")
+# Case 5's pass-after half is Case 2 above: the REAL, current
+# arkham_write_target_header_set_manifest() (manifest_deferred.txt)
+# already asserted to contain headers3/C.h alongside headers1/A.h and
+# headers2/B.h.
+message(STATUS "Case 5 (InterfaceHeaderSetIsIncludedInManifestTest, pass-after: see Case 2) passed.")
+
+# --- Case 6 (fail-before): the regressed pre-fix source-manifest
+# reproduction (plain SOURCES only) must be MISSING the INTERFACE-only
+# dummy3.cpp. ---
+_arkham_dtm_read_manifest_lines("${ARKHAM_SCRATCH_DIR}/build/sources_regressed_interface_bug.txt" _sources_regressed)
+list(FILTER _sources_regressed INCLUDE REGEX "dummy3\\.cpp$")
+if(NOT "${_sources_regressed}" STREQUAL "")
+    message(FATAL_ERROR
+        "Case 6 (fail-before) expected the regressed pre-fix source-manifest reproduction (plain SOURCES only) to be MISSING dummy3.cpp, but it was present.")
+endif()
+message(STATUS "Case 6 (fail-before: regressed pre-fix source manifest correctly omits the INTERFACE-only dummy3.cpp) passed.")
+# Case 6's pass-after half is Case 4 above.
+message(STATUS "Case 6 (pass-after: see Case 4) passed.")
+
+# --- AutomocGeneratedCompilationUnitIsIncludedInManifestTest: Case 7
+# (pass-after) proves the REAL arkham_write_target_source_manifest()
+# appends probe_target_automoc's own AUTOMOC-generated
+# mocs_compilation.cpp. ---
+_arkham_dtm_read_manifest_lines("${ARKHAM_SCRATCH_DIR}/build/sources_automoc.txt" _sources_automoc)
+list(FILTER _sources_automoc INCLUDE REGEX "probe_target_automoc_autogen/mocs_compilation\\.cpp$")
+list(LENGTH _sources_automoc _sources_automoc_count)
+if(NOT _sources_automoc_count EQUAL 1)
+    message(FATAL_ERROR
+        "Case 7 (AutomocGeneratedCompilationUnitIsIncludedInManifestTest, pass-after) expected exactly one probe_target_automoc_autogen/mocs_compilation.cpp entry in sources_automoc.txt but found ${_sources_automoc_count}: ${_sources_automoc}")
+endif()
+message(STATUS "Case 7 (AutomocGeneratedCompilationUnitIsIncludedInManifestTest, pass-after: real source manifest contains probe_target_automoc's own mocs_compilation.cpp) passed.")
+
+# --- Case 8 (fail-before): the regressed pre-AUTOMOC-fix reproduction
+# (plain SOURCES only, same function reused from Case 6) must be
+# MISSING mocs_compilation.cpp entirely, proving the historical
+# "AUTOMOC's own generated TU has no SOURCES/INTERFACE_SOURCES entry at
+# all" gap was real. ---
+_arkham_dtm_read_manifest_lines("${ARKHAM_SCRATCH_DIR}/build/sources_automoc_regressed.txt" _sources_automoc_regressed)
+list(FILTER _sources_automoc_regressed INCLUDE REGEX "mocs_compilation\\.cpp$")
+if(NOT "${_sources_automoc_regressed}" STREQUAL "")
+    message(FATAL_ERROR
+        "Case 8 (AutomocGeneratedCompilationUnitIsIncludedInManifestTest, fail-before) expected the regressed pre-fix reproduction to be MISSING any mocs_compilation.cpp entry, but found: ${_sources_automoc_regressed}")
+endif()
+message(STATUS "Case 8 (AutomocGeneratedCompilationUnitIsIncludedInManifestTest, fail-before: regressed pre-fix source manifest correctly omits mocs_compilation.cpp) passed.")
+
+# --- Case 9: arkham_append_target_autogen_root() must append EXACTLY
+# ONE line overall to the shared external-roots manifest -- proving
+# both that probe_target_automoc's (AUTOMOC ON) own AUTOGEN_BUILD_DIR IS
+# registered, and that probe_target's (AUTOMOC left OFF, the default)
+# call correctly appended NOTHING at all, i.e. the function's own
+# AUTOMOC guard is real and not a no-op that always appends regardless
+# of whether AUTOMOC is actually enabled. ---
+_arkham_dtm_read_manifest_lines("${ARKHAM_SCRATCH_DIR}/build/external_roots_probe.txt" _external_roots_probe)
+list(LENGTH _external_roots_probe _external_roots_probe_count)
+if(NOT _external_roots_probe_count EQUAL 1)
+    message(FATAL_ERROR
+        "Case 9 (arkham_append_target_autogen_root) expected exactly one line in external_roots_probe.txt (probe_target_automoc's own AUTOGEN_BUILD_DIR, with probe_target's AUTOMOC-disabled call contributing nothing) but found ${_external_roots_probe_count}: ${_external_roots_probe}")
+endif()
+list(GET _external_roots_probe 0 _external_roots_probe_only_line)
+if(NOT _external_roots_probe_only_line MATCHES "probe_target_automoc_autogen$")
+    message(FATAL_ERROR
+        "Case 9 (arkham_append_target_autogen_root) expected the one registered root to be probe_target_automoc's own AUTOGEN_BUILD_DIR, but found: ${_external_roots_probe_only_line}")
+endif()
+message(STATUS "Case 9 (arkham_append_target_autogen_root correctly registers only the AUTOMOC-enabled target's own AUTOGEN_BUILD_DIR, and appends nothing for the AUTOMOC-disabled target) passed.")
+
+message(STATUS "DeferredTargetManifestPolicyTest: all 9 cases passed.")
