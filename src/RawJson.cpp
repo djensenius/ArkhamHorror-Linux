@@ -1006,13 +1006,16 @@ ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
   case Kind::Bool:
     return QByteArray(m_bool ? "true" : "false");
   case Kind::Number:
-    // A default-constructed RawNumber (m_intDigits empty) is not a value
-    // Value::parse() or RawNumber::fromInt64() can ever produce -- it can
-    // only arise from a caller directly default-constructing a RawNumber
-    // and handing it to Value::makeNumber() -- but literal() would still
-    // silently emit an empty, syntactically-invalid token for it with no
-    // other check in this function ever catching that. Reject explicitly
-    // rather than ever emitting invalid JSON bytes.
+    // RawNumber's default constructor now yields the canonical "0" (see
+    // RawNumber's own doc comment in RawJson.h), and its copy/pseudo-move
+    // operations always preserve a valid digit string, so an empty
+    // m_intDigits is no longer reachable through any publicly documented
+    // construction path (default construction, Value::parse(),
+    // RawNumber::fromInt64(), copy, or move). This check is retained as
+    // pure defense-in-depth -- e.g. against a future internal path that
+    // might bypass RawNumber's own invariants -- so literal() can never
+    // silently emit an empty, syntactically-invalid token with no other
+    // check in this function ever catching that.
     if (m_number.integerDigits().isEmpty())
       return failure(
           QStringLiteral("Json::Value::toJsonBytes: number has no digits"));
