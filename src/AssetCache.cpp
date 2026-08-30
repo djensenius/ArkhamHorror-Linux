@@ -380,10 +380,22 @@ MountIdentity mountIdentityForFd(int fd) {
 // treat -1 as "try the portable fallback", not as a definitive
 // rejection, since an old kernel's ENOSYS says nothing about whether
 // `name` is actually safe.
-int openat2NoFollowNoXdev(int dirFd, const char *name, bool wantDirectory) {
+// `enforceNoXdev`: RESOLVE_NO_XDEV is included by default for every
+// ordinary no-follow walk, where a mount transition is never legitimate.
+// The SOLE exception is opening home's own final path component from its
+// parent (see resolveHomeDirectoryNoFollow()'s comment): a real
+// multi-mount system very commonly has home itself on a dedicated
+// partition, so that one specific open must be allowed to CROSS a mount
+// boundary at the kernel level -- the decision of whether that
+// transition is actually trustworthy is made afterward, in userspace,
+// by an INDEPENDENT authoritative source (the account database), never
+// by silently disabling the kernel's own symlink protection too.
+int openat2NoFollowNoXdev(int dirFd, const char *name, bool wantDirectory,
+                          bool enforceNoXdev = true) {
   struct open_how how {};
   how.flags = O_RDONLY | O_CLOEXEC | (wantDirectory ? O_DIRECTORY : 0);
-  how.resolve = RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_NO_XDEV;
+  how.resolve = RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH |
+                (enforceNoXdev ? RESOLVE_NO_XDEV : 0);
   const long result = ::syscall(SYS_openat2, dirFd, name, &how, sizeof(how));
   if (result < 0) {
     return -1;
@@ -438,9 +450,24 @@ int openat2NoFollowNoXdev(int dirFd, const char *name, bool wantDirectory) {
 // the plain "different st_dev" fast path already acts on elsewhere.
 // Callers that only care about "opened and mount-verified, or not" can
 // pass nullptr and treat any -1 uniformly, as before.
-int openDirectoryComponentNoFollow(
-    int dirFd, const char *name, bool *usedStrongNoXdev = nullptr,
-    bool *confirmedCrossMountViaKernel = nullptr) {
+//
+// `allowMountTransition`, when true, disables the kernel-level
+// RESOLVE_NO_XDEV enforcement entirely for this one open -- used ONLY
+// by resolveHomeDirectoryNoFollow() for home's own single final path
+// component, where a real multi-mount system very commonly (and
+// legitimately) places home on its own dedicated partition. This never
+// widens what is ultimately TRUSTED: the caller is still responsible
+// for independently verifying mount identity/authentication afterward
+// in userspace exactly as it already does for the disallowed-transition
+// case -- this flag only stops the kernel from refusing the open before
+// that userspace decision ever gets a chance to run. `usedStrongNoXdev`
+// is therefore always reported false when this is true (the kernel
+// provided no no-follow-cross-mount guarantee for this open at all, by
+// deliberate request), and EXDEV is never treated specially either.
+int openDirectoryComponentNoFollow(int dirFd, const char *name,
+                                   bool *usedStrongNoXdev = nullptr,
+                                   bool *confirmedCrossMountViaKernel = nullptr,
+                                   bool allowMountTransition = false) {
   if (usedStrongNoXdev) {
     *usedStrongNoXdev = false;
   }
@@ -450,14 +477,16 @@ int openDirectoryComponentNoFollow(
 #if defined(ARKHAM_HAVE_OPENAT2_UAPI)
   if (!g_forceOpenat2UnavailableForTesting.load(std::memory_order_relaxed)) {
     errno = 0;
-    const int viaOpenat2 = openat2NoFollowNoXdev(dirFd, name, true);
+    const int viaOpenat2 = openat2NoFollowNoXdev(dirFd, name, true,
+                                                 /*enforceNoXdev=*/
+                                                 !allowMountTransition);
     if (viaOpenat2 >= 0) {
-      if (usedStrongNoXdev) {
+      if (usedStrongNoXdev && !allowMountTransition) {
         *usedStrongNoXdev = true;
       }
       return viaOpenat2;
     }
-    if (errno == EXDEV) {
+    if (errno == EXDEV && !allowMountTransition) {
       if (confirmedCrossMountViaKernel) {
         *confirmedCrossMountViaKernel = true;
       }
@@ -1345,9 +1374,23 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     ::close(*ancestorFd);
     return std::nullopt;
   }
-  bool usedStrongNoXdev = false;
+  // Round-N+ review (HIGH, "RESOLVE_NO_XDEV rejects a legitimate
+  // dedicated-/home mount before the authenticated-transition check
+  // below ever runs"): this open of home's own final path component
+  // deliberately does NOT enforce the kernel-level RESOLVE_NO_XDEV
+  // guarantee every other no-follow open in this file uses -- a real
+  // multi-mount system very commonly (and legitimately) places home on
+  // its own dedicated partition (e.g. SteamOS's "/home/deck"), and that
+  // is EXACTLY the transition `homeIsAuthenticated` exists to permit.
+  // Symlink rejection (RESOLVE_NO_SYMLINKS/O_NOFOLLOW) is still fully
+  // enforced either way; only the cross-mount refusal is deferred to
+  // the explicit, independently-sourced userspace check immediately
+  // below, which now ALWAYS uses the strict, mount-id-REQUIRED
+  // comparator (since the kernel provided no no-follow-cross-mount
+  // guarantee for this specific open, by deliberate request above).
   const int homeFd = openDirectoryComponentNoFollow(
-      *ancestorFd, finalComponentUtf8.constData(), &usedStrongNoXdev);
+      *ancestorFd, finalComponentUtf8.constData(), /*usedStrongNoXdev=*/nullptr,
+      /*confirmedCrossMountViaKernel=*/nullptr, /*allowMountTransition=*/true);
   ::close(*ancestorFd);
   if (homeFd < 0) {
     return std::nullopt;
@@ -1360,15 +1403,12 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     // exactly like every other component walkOwnedSuffixNoFollowFromFd()
     // authenticates, rather than silently granting the mount-transition
     // exception to an unauthenticated path.
-    bool mountOk;
 #if defined(__linux__)
-    mountOk =
-        usedStrongNoXdev
-            ? mountIdentityMatches(mountIdentityForFd(homeFd), ancestorMount)
-            : mountIdentityMatchesStrictRequiringMountId(
-                  mountIdentityForFd(homeFd), ancestorMount);
+    const bool mountOk = mountIdentityMatchesStrictRequiringMountId(
+        mountIdentityForFd(homeFd), ancestorMount);
 #else
-    mountOk = mountIdentityMatches(mountIdentityForFd(homeFd), ancestorMount);
+    const bool mountOk =
+        mountIdentityMatches(mountIdentityForFd(homeFd), ancestorMount);
 #endif
     if (!mountOk) {
       qWarning() << "AssetCache: refusing to treat" << home

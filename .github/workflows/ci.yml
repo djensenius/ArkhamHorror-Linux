@@ -176,7 +176,11 @@ jobs:
             -DBUILD_TESTING=ON \
             -DARKHAM_ENABLE_UBSAN=ON
       - name: Build asset test binary under UBSan
-        run: cmake --build build-ubsan --target arkham-asset-tests --parallel
+        # arkham-asset-cache-lock-holder is a real subprocess helper the
+        # cross-process cache-authority tests spawn (see AssetCacheTests'
+        # secondProcessHoldingRootLockForcesThisProcessMemoryOnlyUntilReleased);
+        # it must be built alongside the test binary itself, not omitted.
+        run: cmake --build build-ubsan --target arkham-asset-tests arkham-asset-cache-lock-holder --parallel
       - name: Run asset tests under UBSan
         env:
           QT_QPA_PLATFORM: offscreen
