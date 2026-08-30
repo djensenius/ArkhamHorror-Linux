@@ -50,8 +50,13 @@ QString hexSha256(const QByteArray &bytes) {
 // paths in a different order from one run (or platform) to the next,
 // making diagnostics harder to diff/compare. Sorting first makes the
 // message deterministic without changing which paths are reported.
+// Uses QSet::values() (Qt's own dedicated set-to-list conversion) rather
+// than constructing QStringList directly from a QSet iterator pair, to
+// avoid depending on QList's templated iterator-range constructor
+// resolving correctly for QSet<QString>::const_iterator on every
+// supported Qt/compiler combination.
 QString sortedJoined(const QSet<QString> &values) {
-  QStringList sorted(values.begin(), values.end());
+  QStringList sorted = values.values();
   sorted.sort();
   return sorted.join(QStringLiteral(", "));
 }
