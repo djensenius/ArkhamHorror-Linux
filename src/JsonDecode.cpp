@@ -98,7 +98,7 @@ ValueOrError<qint64> requireIntValue(const QJsonValue &v, QStringView path) {
   // QJsonValue::toInteger() is documented to read the value's underlying
   // storage directly and return the *exact* qint64 when the value fits
   // (this holds both for a QJsonValue built via the qint64 constructor --
-  // see RawJson.h's Value::toLossyQJsonForTestingOnly() -- and for one parsed
+  // see RawJson.cpp's Value::toExactQJson() family -- and for one parsed
   // by Qt's own QJsonDocument::fromJson() from a bare integer literal), and to
   // return the default value (0) when it does not fit. Re-widening that result
   // back to double and comparing against `d` -- rather than trusting the

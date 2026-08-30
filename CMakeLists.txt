@@ -75,41 +75,91 @@ endif()
 
 # The canonical, explicit list of every header in this project's own
 # strict-domain-model foundation library. Kept as a `set()` variable
-# (rather than inlined directly into add_library() below) so it can also
-# be handed to arkham_check_domain_header_inventory() below and to the
-# generated tests/DomainHeaderInventory.h.in header used by
-# tests/EncoderHygieneTests.cpp -- a single source of truth for "every
-# header this build compiles," rather than three independently
-# hand-maintained lists that could silently drift apart.
+# The strict value-semantic contract/domain-model layer (card catalog,
+# decks, game list/lifecycle, validated identifiers, the raw JSON AST +
+# its one canonical exact-QJson adapter family, and the shared JSON
+# decode helpers/utilities they are built from) lives in its own
+# `arkham_domain_models` library (see add_library() below), deliberately
+# kept independent of Qt Gui/Network/Widgets/Keychain -- it links only
+# Qt6::Core. This is a real, compiler-enforced dependency boundary (not a
+# convention/comment): every other part of this codebase (networking,
+# auth, session/profile management, keychain storage, input/controller
+# UI glue) may depend on this domain-model layer, but nothing in this
+# layer may ever depend back on any of that, so a future accidental
+# `#include "NetworkAuthenticationClient.h"` from e.g. Decks.cpp would
+# fail to compile (that header is not on this target's include path at
+# all -- see target_include_directories() below, which is scoped to this
+# target only, not shared build-wide).
+#
+# This split is also what makes tools/check_encoder_hygiene.py's AST scan
+# (see packaging/check_encoder_hygiene.py and the
+# cmake/DomainHeaderManifest.cmake-generated manifest consumed by it)
+# well-scoped by *target/file-set membership*, not by a hand-maintained
+# path list independently prone to drift: it inspects exactly (and only)
+# the public headers registered in this target's HEADERS file set below,
+# so a pre-existing, unrelated header elsewhere in this codebase (e.g.
+# AuthModels.h, which is *not* part of this target) can never collide
+# with -- or need to be carved out via a basename exception from -- the
+# small set of legitimate QJson-returning symbols this domain layer
+# itself declares (RawJson.h's three canonical toExactQJson*() adapters,
+# and JsonDecode.h's decode-direction field/array/object helpers).
+set(ARKHAM_DOMAIN_HEADERS
+    src/CardCatalog.h
+    src/ContractPin.h
+    src/ContractRevision.h
+    src/Decks.h
+    src/Games.h
+    src/Identifiers.h
+    src/JsonDecode.h
+    src/RawJson.h
+    src/ValueOrError.h
+)
+
+set(ARKHAM_DOMAIN_SOURCES
+    src/CardCatalog.cpp
+    src/ContractPin.cpp
+    src/ContractRevision.cpp
+    src/Decks.cpp
+    src/Games.cpp
+    src/Identifiers.cpp
+    src/JsonDecode.cpp
+    src/RawJson.cpp
+)
+
+# Every other header this build compiles (networking, auth, session,
+# keychain, input/controller UI glue, app composition) -- explicitly
+# kept as a *separate* declared list from ARKHAM_DOMAIN_HEADERS above
+# (rather than one combined list that the domain/non-domain split would
+# then have to re-derive by filtering), so the FILE_SET registered on
+# each of the two targets below is unambiguous, and so
+# arkham_check_domain_header_inventory() below can still positively
+# prove -- at CMake *configuration* time, not merely via a test's own
+# runtime scan -- that their union, and only their union, matches every
+# header that actually exists under src/ (in any nested subdirectory,
+# under any of the several header suffixes it now globs), the same
+# guarantee this project has relied on since the single-list version of
+# this check was first introduced.
 set(ARKHAM_FOUNDATION_HEADERS
     src/AppBootstrap.h
     src/AppSessionComposition.h
     src/AuthModels.h
     src/AuthTransportSecurity.h
-    src/CardCatalog.h
     src/CompatibilityEvaluator.h
-    src/ContractPin.h
-    src/ContractRevision.h
     src/ControllerGlyphs.h
-    src/Decks.h
     src/FocusController.h
-    src/Games.h
     src/IAuthenticationClient.h
     src/ICapabilityProbe.h
-    src/Identifiers.h
     src/IKeychainJobFactory.h
     src/InputMapper.h
     src/InputRouter.h
     src/IProfileStore.h
     src/ITokenStore.h
-    src/JsonDecode.h
     src/NetworkAuthenticationClient.h
     src/NetworkCapabilityProbe.h
     src/ProbeResult.h
     src/QSettingsProfileStore.h
     src/QtKeychainJobFactory.h
     src/QtKeychainTokenStore.h
-    src/RawJson.h
     src/SemanticCommand.h
     src/ServerCapabilities.h
     src/ServerProfile.h
@@ -117,24 +167,15 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/TokenEnvelope.h
     src/TokenValidation.h
     src/UrlValidator.h
-    src/ValueOrError.h
 )
 
 set(ARKHAM_FOUNDATION_SOURCES
-    ${ARKHAM_FOUNDATION_HEADERS}
     src/AppSessionComposition.cpp
     src/AuthModels.cpp
     src/AuthTransportSecurity.cpp
-    src/CardCatalog.cpp
     src/CompatibilityEvaluator.cpp
-    src/ContractPin.cpp
-    src/ContractRevision.cpp
     src/ControllerGlyphs.cpp
-    src/Decks.cpp
     src/FocusController.cpp
-    src/Games.cpp
-    src/Identifiers.cpp
-    src/JsonDecode.cpp
     src/InputMapper.cpp
     src/InputRouter.cpp
     src/NetworkAuthenticationClient.cpp
@@ -142,7 +183,6 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/QSettingsProfileStore.cpp
     src/QtKeychainJobFactory.cpp
     src/QtKeychainTokenStore.cpp
-    src/RawJson.cpp
     src/SemanticCommand.cpp
     src/ServerCapabilities.cpp
     src/ServerProfile.cpp
@@ -152,22 +192,42 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/UrlValidator.cpp
 )
 
+# Fail configuration outright (not merely a test) if the same header were
+# ever accidentally declared in both lists above -- e.g. a careless merge
+# leaving a domain header duplicated into ARKHAM_FOUNDATION_HEADERS too --
+# which would silently widen the domain target's own header file set out
+# from under the AST policy scan's intended scope.
+foreach(_arkham_dup_check_header IN LISTS ARKHAM_DOMAIN_HEADERS)
+    list(FIND ARKHAM_FOUNDATION_HEADERS "${_arkham_dup_check_header}" _arkham_dup_check_index)
+    if(NOT _arkham_dup_check_index EQUAL -1)
+        message(FATAL_ERROR
+            "${_arkham_dup_check_header} is declared in both ARKHAM_DOMAIN_HEADERS and ARKHAM_FOUNDATION_HEADERS; every header must belong to exactly one of the two.")
+    endif()
+endforeach()
+unset(_arkham_dup_check_header)
+unset(_arkham_dup_check_index)
+
 # Structural enforcement (see cmake/DomainHeaderInventory.cmake): fails
 # CMake *configuration* -- not merely a test, and not merely a source-text
-# scan of already-known files -- the moment ARKHAM_FOUNDATION_HEADERS above
-# drifts from what actually exists under src/**/*.h, in either direction
-# (a new/nested header added to disk but never declared here, or a
-# declared header deleted from disk). This is what makes "add a new nested
-# header and never register it" fail the build itself, rather than relying
-# on any runtime directory scan (recursive or not) that a test executable
-# performs on its own -- see tests/cmake/DomainHeaderInventoryPolicyTest.cmake
-# for the mutation tests proving this function itself behaves correctly on
-# all three cases (match / undeclared-extra / declared-but-missing).
+# scan of already-known files -- the moment the union of
+# ARKHAM_DOMAIN_HEADERS and ARKHAM_FOUNDATION_HEADERS above drifts from
+# what actually exists under src/**, in either direction (a new/nested
+# header of any registered suffix added to disk but never declared here,
+# or a declared header deleted from disk). This is what makes "add a new
+# nested header and never register it" fail the build itself, rather than
+# relying on any runtime directory scan (recursive or not) that a test
+# executable performs on its own -- see
+# tests/cmake/DomainHeaderInventoryPolicyTest.cmake for the mutation
+# tests proving this function itself behaves correctly on all three
+# cases (match / undeclared-extra / declared-but-missing), and
+# HEADER_SUFFIXES below for the full list of suffixes a header-like file
+# anywhere under src/ is recognized under -- not just "*.h".
 include(cmake/DomainHeaderInventory.cmake)
 arkham_check_domain_header_inventory(
     BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
     HEADER_GLOB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    DECLARED_HEADERS ${ARKHAM_FOUNDATION_HEADERS}
+    HEADER_SUFFIXES h hpp hh hxx
+    DECLARED_HEADERS ${ARKHAM_DOMAIN_HEADERS} ${ARKHAM_FOUNDATION_HEADERS}
     OUT_ERROR _arkham_header_inventory_error
 )
 if(_arkham_header_inventory_error)
@@ -175,13 +235,83 @@ if(_arkham_header_inventory_error)
 endif()
 unset(_arkham_header_inventory_error)
 
+add_library(arkham_domain_models STATIC
+    ${ARKHAM_DOMAIN_SOURCES}
+)
+
+# CMake's FILE_SET HEADERS mechanism (available since this project's
+# already-declared cmake_minimum_required(VERSION 3.25)) is what makes
+# this target's public header *set* an actual first-class piece of build
+# metadata -- reflected in generated build system files, the target's own
+# HEADER_SET_all/HEADER_DIRS_all properties, and any future `cmake
+# --install`/export -- rather than merely "whatever happens to be
+# reachable by #include from files listed as ordinary sources", which a
+# text-glob-based inventory alone (see cmake/DomainHeaderInventory.cmake)
+# cannot itself prove. BASE_DIRS matches this target's own
+# target_include_directories() below, so consumers see the identical
+# `#include "RawJson.h"`-style paths as before this split.
+target_sources(arkham_domain_models
+    PUBLIC
+        FILE_SET arkham_domain_headers
+        TYPE HEADERS
+        BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        FILES ${ARKHAM_DOMAIN_HEADERS}
+)
+
+target_include_directories(arkham_domain_models PUBLIC src)
+target_link_libraries(arkham_domain_models PUBLIC
+    Qt6::Core
+)
+
+# See packaging/check_encoder_hygiene.py: a plain, one-path-per-line
+# manifest (not JSON -- these paths are simple filesystem paths with no
+# characters that would need escaping, so a text format avoids any
+# CMake-side JSON-escaping subtlety) naming exactly the headers and
+# sources above, regenerated by CMake every time it reconfigures. This is
+# the single source of truth the AST policy script's own scan is scoped
+# to -- it never independently re-derives or hand-maintains this file
+# list, so it cannot silently drift from what this target actually
+# compiles, the same guarantee arkham_check_domain_header_inventory()
+# above already gives the *build* itself.
+set(_arkham_domain_headers_manifest_lines "")
+foreach(_arkham_header IN LISTS ARKHAM_DOMAIN_HEADERS)
+    string(APPEND _arkham_domain_headers_manifest_lines
+        "${CMAKE_CURRENT_SOURCE_DIR}/${_arkham_header}\n")
+endforeach()
+unset(_arkham_header)
+file(WRITE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_headers.txt"
+    "${_arkham_domain_headers_manifest_lines}"
+)
+unset(_arkham_domain_headers_manifest_lines)
+
+set(_arkham_domain_sources_manifest_lines "")
+foreach(_arkham_source IN LISTS ARKHAM_DOMAIN_SOURCES)
+    string(APPEND _arkham_domain_sources_manifest_lines
+        "${CMAKE_CURRENT_SOURCE_DIR}/${_arkham_source}\n")
+endforeach()
+unset(_arkham_source)
+file(WRITE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_sources.txt"
+    "${_arkham_domain_sources_manifest_lines}"
+)
+unset(_arkham_domain_sources_manifest_lines)
+
 add_library(arkham_foundation STATIC
     ${ARKHAM_FOUNDATION_SOURCES}
 )
 
+target_sources(arkham_foundation
+    PUBLIC
+        FILE_SET arkham_foundation_headers
+        TYPE HEADERS
+        BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        FILES ${ARKHAM_FOUNDATION_HEADERS}
+)
+
 target_include_directories(arkham_foundation PUBLIC src)
 target_link_libraries(arkham_foundation PUBLIC
-    Qt6::Core
+    arkham_domain_models
     Qt6::Gui
     Qt6::Network
     Qt6Keychain::Qt6Keychain
@@ -291,38 +421,21 @@ if(BUILD_TESTING)
     )
     add_test(NAME raw_json COMMAND arkham-raw-json-tests)
 
-    # Single source of truth for tests/EncoderHygieneTests.cpp's header
-    # inventory: rendered directly from ARKHAM_FOUNDATION_HEADERS (the
-    # exact list add_library(arkham_foundation ...) above compiles, whose
-    # completeness against the real src/ tree the FATAL_ERROR gate above
-    # already verified at configure time -- including any header inside a
-    # newly added nested subdirectory) via configure_file(), so the C++
-    # scanner test can no longer independently drift from what the build
-    # actually compiles, and gets full recursive-subdirectory coverage
-    # "for free": there is no runtime directory walk left in the real
-    # policy check for a nested/unregistered header to evade.
-    set(ARKHAM_DOMAIN_HEADER_INVENTORY_QT_LITERALS "")
-    foreach(_arkham_header IN LISTS ARKHAM_FOUNDATION_HEADERS)
-        string(APPEND ARKHAM_DOMAIN_HEADER_INVENTORY_QT_LITERALS
-            "      QStringLiteral(\"${CMAKE_CURRENT_SOURCE_DIR}/${_arkham_header}\"),\n")
-    endforeach()
-    configure_file(
-        tests/DomainHeaderInventory.h.in
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/DomainHeaderInventory.h"
-        @ONLY
-    )
-    unset(ARKHAM_DOMAIN_HEADER_INVENTORY_QT_LITERALS)
-
-    qt_add_executable(arkham-encoder-hygiene-tests
-        tests/EncoderHygieneTests.cpp
-    )
-    target_include_directories(arkham-encoder-hygiene-tests PRIVATE
-        "${CMAKE_CURRENT_BINARY_DIR}/generated"
-    )
-    target_link_libraries(arkham-encoder-hygiene-tests PRIVATE
-        Qt6::Test
-    )
-    add_test(NAME encoder_hygiene COMMAND arkham-encoder-hygiene-tests)
+    # Encoder hygiene (the structural proof that no public domain-model
+    # header exposes a lossy QJson-returning encoder outside the tiny
+    # canonical adapter/decode-helper allowlist) is no longer a compiled
+    # C++ source-text scanner test here. It is now a compiler-AST-based
+    # Python tool -- see packaging/check_encoder_hygiene.py -- run via the
+    # `mise run contracts:check-encoder-hygiene` /
+    # `mise run contracts:test-encoder-hygiene-script` tasks and a
+    # dedicated "Encoder hygiene" CI job (.github/workflows/ci.yml),
+    # exactly mirroring how packaging/verify_contract_provenance.py's own
+    # live-network check and offline unit tests are run outside ctest.
+    # This keeps it decoupled from this project's own default compiler
+    # (which may not be Clang/expose libclang), and from this ctest binary
+    # dir's own compile_commands.json (the tool configures its own
+    # dedicated Clang-toolchain build directory internally). See that
+    # script's module docstring for the full architecture rationale.
 
     # A dedicated CMake-script ctest case (run via `cmake -P`, not
     # compiled into any C++ test binary) directly proving

@@ -222,8 +222,8 @@ public:
   // toJsonBytes() below for outbound request bytes -- so unknownRaw()'s
   // complete original object (including any numeric literal beyond
   // double precision) survives an encode-then-decode round trip
-  // byte-exact via toJsonBytes(), not merely as closely as
-  // Json::Value::toLossyQJsonForTestingOnly() allows.
+  // byte-exact via toJsonBytes(), not merely as closely as a lossy,
+  // double-rounding QJsonValue conversion allows.
   [[nodiscard]] Json::Value toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -565,8 +565,8 @@ public:
   // Value::toExactQJsonObject() adapter (see RawJson.h), or uses
   // toJsonBytes() below for outbound bytes -- so rawJson()'s complete
   // original object survives an encode-then-decode round trip byte-exact
-  // via toJsonBytes(), not merely as closely as
-  // Json::Value::toLossyQJsonForTestingOnly() allows. Fails only if this
+  // via toJsonBytes(), not merely as closely as a lossy, double-rounding
+  // QJsonValue conversion allows. Fails only if this
   // instance's KnownCampaignOption was fabricated via static_cast from an
   // out-of-table value bypassing knownOption()'s validation (impossible
   // through any public API this class itself exposes).

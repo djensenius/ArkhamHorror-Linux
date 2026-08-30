@@ -100,3 +100,47 @@ message(STATUS "Case 3 (declared-but-missing header) passed: error named src/nes
 file(REMOVE_RECURSE "${ARKHAM_SCRATCH_DIR}")
 
 message(STATUS "DomainHeaderInventoryPolicyTest: all cases passed.")
+
+# --- Case 4: HEADER_SUFFIXES mutation fixture ------------------------------
+# A `.hpp` header is invisible to a default ("*.h"-only) scan -- proving
+# the historical gap the review explicitly called out ("missing
+# .hpp/other header sources") -- but is caught the moment the caller (see
+# CMakeLists.txt) widens HEADER_SUFFIXES to include "hpp". This is a
+# direct fail-before/pass-after mutation fixture for that exact evasion
+# vector, independent of the real src/ layout.
+file(MAKE_DIRECTORY "${ARKHAM_SCRATCH_DIR}/src")
+file(WRITE "${ARKHAM_SCRATCH_DIR}/src/Declared.h" "// scratch header\n")
+file(WRITE "${ARKHAM_SCRATCH_DIR}/src/Undeclared.hpp" "// undeclared .hpp header\n")
+
+arkham_check_domain_header_inventory(
+    BASE_DIR "${ARKHAM_SCRATCH_DIR}"
+    HEADER_GLOB_DIR "${ARKHAM_SCRATCH_DIR}/src"
+    DECLARED_HEADERS "src/Declared.h"
+    OUT_ERROR _error_case4_default_suffix
+)
+if(NOT "${_error_case4_default_suffix}" STREQUAL "")
+    message(FATAL_ERROR
+        "Case 4a (default HEADER_SUFFIXES, undeclared .hpp present) expected an empty OUT_ERROR (proving the historical *.h-only blind spot existed) but got:\n${_error_case4_default_suffix}")
+endif()
+message(STATUS "Case 4a (default HEADER_SUFFIXES does not see .hpp) passed: confirms the gap this widening closes.")
+
+arkham_check_domain_header_inventory(
+    BASE_DIR "${ARKHAM_SCRATCH_DIR}"
+    HEADER_GLOB_DIR "${ARKHAM_SCRATCH_DIR}/src"
+    HEADER_SUFFIXES h hpp
+    DECLARED_HEADERS "src/Declared.h"
+    OUT_ERROR _error_case4_widened_suffix
+)
+if("${_error_case4_widened_suffix}" STREQUAL "")
+    message(FATAL_ERROR
+        "Case 4b (HEADER_SUFFIXES h;hpp, undeclared .hpp present) expected a non-empty OUT_ERROR but got none -- an unregistered .hpp header must fail once that suffix is registered.")
+endif()
+if(NOT _error_case4_widened_suffix MATCHES "src/Undeclared\\.hpp")
+    message(FATAL_ERROR
+        "Case 4b (HEADER_SUFFIXES h;hpp) error did not name the offending file src/Undeclared.hpp:\n${_error_case4_widened_suffix}")
+endif()
+message(STATUS "Case 4b (HEADER_SUFFIXES h;hpp catches the undeclared .hpp header) passed.")
+
+file(REMOVE_RECURSE "${ARKHAM_SCRATCH_DIR}")
+
+message(STATUS "DomainHeaderInventoryPolicyTest: all cases (including HEADER_SUFFIXES mutation) passed.")

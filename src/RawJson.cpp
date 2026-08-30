@@ -655,7 +655,7 @@ ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
     // integral and in range (see RawNumber::toExactInt64()); every other
     // literal (a genuine decimal, or an integral value outside qint64's
     // range) has no exact QJsonValue representation, so this is a typed
-    // failure rather than toLossyQJsonForTestingOnly()'s silent
+    // failure rather than a lossy conversion's silent
     // double-rounding fallback.
     if (auto exact = m_number.toExactInt64())
       return QJsonValue(*exact);

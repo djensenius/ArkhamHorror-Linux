@@ -100,8 +100,8 @@ public:
   // .cpp), and both reject a nested Kind::Undefined member with a typed
   // failure rather than silently dropping the key -- so forgetting this
   // precondition fails loudly at encode time, it does not silently omit
-  // the field. (Only the separate, non-canonical, display/log-only
-  // Json::Value::toLossyQJsonForTestingOnly() conversion would silently drop
+  // the field. (Only a separate, non-canonical, test-only lossy
+  // conversion -- see tests/RawJsonTests.cpp -- would silently drop
   // such a member, matching QJsonObject::insert()'s own documented behavior for
   // QJsonValue::Undefined; no outbound request encoder uses that path.)
   [[nodiscard]] Json::Value toRawJson() const;

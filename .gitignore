@@ -1,5 +1,6 @@
 build/
 build-asan/
+build-encoder-hygiene/
 .cache/
 .qt/
 .qmlls.ini

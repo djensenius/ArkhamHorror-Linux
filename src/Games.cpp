@@ -1583,7 +1583,7 @@ ValueOrError<DeckListInput> decodeDeckListInputValue(const Json::Value &v,
 // decodeDeckListInputValue's Json::Value overload for the fromRawBytes()
 // path, so a numeric literal nested inside its sideSlots survives exactly
 // rather than only as closely as QJsonValue's double-backed storage
-// allows -- no toLossyQJsonForTestingOnly()-then-reparse round trip is needed,
+// allows -- no lossy-conversion-then-reparse round trip is needed,
 // unlike the collapse-then-patch pattern this replaces.
 template <typename Obj>
 ValueOrError<ChooseDeckRequest> decodeChooseDeckRequest(const Obj &obj,

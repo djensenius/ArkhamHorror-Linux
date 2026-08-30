@@ -117,6 +117,30 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - run: mise run build
 
+  encoder-hygiene:
+    name: Encoder hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.14
+          cache: true
+      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          cache: true
+      - name: Install QtKeychain build dependencies and the Clang toolchain (incl. libclang, used via ctypes -- no pip clang/libclang package involved)
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config clang libclang-dev
+      # Offline unit tests for the checker script's own classify()/
+      # allowlist/compile-argument-sanitization logic against synthetic
+      # data, run before the real AST scan below so a regression in the
+      # checker itself is caught even if it would otherwise still "pass"
+      # against the actual, currently-clean project sources.
+      - run: mise run contracts:test-encoder-hygiene-script
+      - run: mise run contracts:check-encoder-hygiene
+
   appimage-smoke:
     name: AppImage smoke artifact
     runs-on: ubuntu-22.04

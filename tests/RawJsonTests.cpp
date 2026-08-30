@@ -4,12 +4,10 @@
 #include <limits>
 
 #include "RawJson.h"
-#include "RawJsonLossyTestOnly.h"
 
 using Arkham::Failure;
 using Arkham::Json::ParseLimits;
 using Arkham::Json::RawNumber;
-using Arkham::Json::rawValueToLossyQJsonForTestingOnly;
 using Arkham::Json::Value;
 
 using namespace Qt::StringLiterals;
@@ -234,6 +232,75 @@ Value mustParse(QByteArrayView bytes) {
   if (!result)
     qFatal("expected successful parse but got: %s", qPrintable(result.error()));
   return *result;
+}
+
+// A lossy Value -> QJsonValue conversion, local to this translation
+// unit, implemented ENTIRELY through Value's/RawNumber's own public
+// accessors (kind(), toBool(), toRawNumber(), toString(), toArray(),
+// members(); RawNumber::toExactInt64()/toDouble()) -- no friend grant,
+// no private-state access, no declaration or hook of any kind in
+// src/RawJson.h. Earlier revisions instead relocated this exact logic
+// to an includable tests/RawJsonLossyTestOnly.h granted access via a
+// "hidden friend" declared in RawJson.h; a cumulative review correctly
+// demonstrated that ANY translation unit -- production or test -- could
+// include that header and call the friended function successfully,
+// since the friend declaration and a matching out-of-line definition
+// are both ordinary, linkable C++ constructs once written down anywhere
+// reachable, regardless of which CMake target compiles them. Keeping
+// this function local to this one .cpp file, calling only public API,
+// removes that risk structurally: there is no production header
+// declaration for any other translation unit to reference at all, and
+// nothing to link against even if one tried.
+//
+// This is deliberately WITHOUT any of Value::toExactQJson()'s invariant
+// checks: lossless for every Kind except a Number whose literal is not
+// RawNumber::toExactInt64() (i.e. a genuine decimal, or an integral
+// value outside qint64's range), which round-trips only as closely as
+// IEEE-754 double allows, and silently collapses a duplicate object key
+// / drops a nested Kind::Undefined member rather than rejecting either
+// (both already only reachable via makeObject()/makeArray(), since
+// parse() itself rejects a duplicate key outright). This is the exact
+// lossy behavior every production encoder in this codebase must NOT
+// exhibit -- it exists here ONLY so this test suite can assert that
+// documented lossy fallback behavior still exists in the underlying AST
+// type itself, i.e. that toExactQJson() is a deliberate, tested
+// divergence from it, not an accidental one.
+QJsonValue lossyQJsonForTestingOnly(const Value &value) {
+  switch (value.kind()) {
+  case Value::Kind::Undefined:
+    return QJsonValue(QJsonValue::Undefined);
+  case Value::Kind::Null:
+    return QJsonValue(QJsonValue::Null);
+  case Value::Kind::Bool:
+    return QJsonValue(value.toBool());
+  case Value::Kind::Number:
+    // Preserve full int64 precision whenever the literal is mathematically
+    // integral and in range (see RawNumber::toExactInt64()): Qt's
+    // QCborValue-backed QJsonValue(qint64) constructor stores such a value
+    // exactly (QJsonValue::toInteger() on the result returns the identical
+    // qint64, unlike a value built via the double constructor -- verified
+    // against Qt 6.11's QJsonValue/QCborValue implementation). Every other
+    // literal (a genuine decimal, or an integral value outside qint64's
+    // range) still round-trips only as closely as IEEE-754 double allows.
+    if (auto exact = value.toRawNumber().toExactInt64())
+      return QJsonValue(*exact);
+    return QJsonValue(value.toRawNumber().toDouble());
+  case Value::Kind::String:
+    return QJsonValue(value.toString());
+  case Value::Kind::Array: {
+    QJsonArray array;
+    for (const auto &element : value.toArray())
+      array.append(lossyQJsonForTestingOnly(element));
+    return array;
+  }
+  case Value::Kind::Object: {
+    QJsonObject object;
+    for (const auto &[k, v] : value.members())
+      object.insert(k, lossyQJsonForTestingOnly(v));
+    return object;
+  }
+  }
+  return QJsonValue(QJsonValue::Undefined);
 }
 } // namespace
 
@@ -584,7 +651,7 @@ void RawJsonTests::makeObjectDuplicateKeyResolvesToFirstOccurrence() {
 
 void RawJsonTests::toLossyQJsonForTestingOnlyConvertsEveryKind() {
   auto value = mustParse(R"({"a":1,"b":"s","c":true,"d":null,"e":[1,2]})");
-  auto json = rawValueToLossyQJsonForTestingOnly(value);
+  auto json = lossyQJsonForTestingOnly(value);
   QVERIFY(json.isObject());
   auto object = json.toObject();
   QCOMPARE(object.value("a"_L1).toDouble(), 1.0);
@@ -724,11 +791,11 @@ void RawJsonTests::fromInt64RoundTripsFullRange() {
 void RawJsonTests::
     toLossyQJsonForTestingOnlyPreservesInt64ExactlyBeyondDoublePrecision() {
   auto value = mustParse(R"({"id":9007199254740993})");
-  auto json = rawValueToLossyQJsonForTestingOnly(value);
+  auto json = lossyQJsonForTestingOnly(value);
   // toInteger() recovers the exact qint64 even though .isDouble()/
   // .toDouble() report the rounded double -- see
-  // Arkham::Json::Test::rawValueToLossyQJsonForTestingOnly()'s doc comment
-  // in tests/RawJsonLossyTestOnly.h.
+  // lossyQJsonForTestingOnly()'s own doc comment above, in this file's
+  // anonymous namespace.
   QCOMPARE(json.toObject().value("id"_L1).toInteger(), 9007199254740993LL);
 }
 
