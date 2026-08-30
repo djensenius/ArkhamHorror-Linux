@@ -1010,8 +1010,11 @@ DeckOperationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*raw, path);
 }
 
-QJsonObject DeckOperationError::toJson() const {
-  return QJsonObject{{QStringLiteral("errorMsg"), errorMsg}};
+ValueOrError<QJsonObject> DeckOperationError::toJson() const {
+  auto exact = Json::Value::makeString(errorMsg).toExactQJson();
+  if (!exact)
+    return failure(QStringLiteral("errorMsg: %1").arg(exact.error()));
+  return QJsonObject{{QStringLiteral("errorMsg"), *exact}};
 }
 
 } // namespace Arkham

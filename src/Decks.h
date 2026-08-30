@@ -543,7 +543,14 @@ struct DeckOperationError {
   // decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<DeckOperationError>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion (see DeckValidationError::toJson()'s
+  // identical rationale above) -- errorMsg is validated the same
+  // bounded/lone-surrogate-safe way rather than inserted into the
+  // QJsonObject directly, since a backend response's errorMsg is
+  // decoded, unvalidated-for-encodability QString content that could
+  // otherwise re-serialize silently as an unencodable QJsonObject.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const DeckOperationError &,
                          const DeckOperationError &) = default;

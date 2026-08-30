@@ -181,6 +181,7 @@ private slots:
   void cardNameToJsonRejectsLoneSurrogateInSubtitle();
   void externalDeckIdTextKindToJsonRejectsLoneSurrogate();
   void deckListToJsonRejectsLoneSurrogateInCardSlotsKey();
+  void deckOperationErrorToJsonRejectsLoneSurrogateInErrorMsg();
   // Round-18-cumulative-review item 1: every retained fragment toJson()
   // above used to check *only* for a lone/mismatched UTF-16 surrogate,
   // never against ParseLimits::production()'s string-length/number-
@@ -483,7 +484,10 @@ void DecksTests::decodesOperationErrorFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->errorMsg, QStringLiteral("Could not sync deck"));
-  QCOMPARE(result->toJson(), v.toObject());
+  auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, v.toObject());
 }
 
 void DecksTests::deckListExtraTopLevelFieldRejected() {
@@ -1820,6 +1824,23 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInCardSlotsKey() {
       .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
   };
   const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckOperationErrorToJsonRejectsLoneSurrogateInErrorMsg() {
+  // DeckOperationError::errorMsg is a plain, unvalidated QString (no
+  // parse()-style factory guards its content, unlike CardCode above), so
+  // decoding a response containing a lone surrogate (a syntactically
+  // valid `\ud800` escape) produces a validly-constructed
+  // DeckOperationError whose toJson() must still reject re-encoding it,
+  // rather than silently inserting it into the QJsonObject directly as
+  // the previous non-fallible toJson() did.
+  QString lone = QStringLiteral("Could not sync deck ");
+  lone += QChar(0xD800);
+  const DeckOperationError err{.errorMsg = lone};
+  const auto encoded = err.toJson();
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
