@@ -295,6 +295,7 @@ include(cmake/PathManifest.cmake)
 arkham_append_encoder_hygiene_target(
     TARGET qt6keychain
     CLASSIFICATION EXTERNAL
+    EXEMPT_REASON "FetchContent dependency; source and object paths must remain under registered qtkeychain roots"
     OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
 )
 arkham_check_domain_header_inventory(
@@ -427,6 +428,17 @@ cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         TARGET arkham_domain_models
         OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_headers.txt"
 )
+
+if(ARKHAM_ENCODER_HYGIENE_CONFIGURE)
+    cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        CALL arkham_write_encoder_hygiene_target_universe
+            OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_universe.txt"
+            HEADER_INDEX_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_header_index.txt"
+            HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/target_headers"
+            SOURCE_INDEX_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_source_index.txt"
+            SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/target_sources"
+    )
+endif()
 cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     CALL arkham_write_target_source_manifest
         TARGET arkham_domain_models
@@ -522,6 +534,15 @@ arkham_append_encoder_hygiene_target(
     POLICY application
     OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
 )
+if(TARGET arkham-horror_tooling)
+    arkham_append_encoder_hygiene_target(
+        TARGET arkham-horror_tooling
+        CLASSIFICATION SCAN
+        POLICY application
+        CONTEXT_TARGET arkham-horror
+        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
+    )
+endif()
 cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     CALL arkham_append_target_autogen_manifest
         TARGET arkham-horror

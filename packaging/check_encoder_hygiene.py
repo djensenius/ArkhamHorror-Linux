@@ -556,10 +556,22 @@ _CXType_RValueReference = 104
 _CXType_FunctionNoProto = 110
 _CXType_FunctionProto = 111
 _CXType_MemberPointer = 117
+_CXType_ConstantArray = 112
+_CXType_IncompleteArray = 114
+_CXType_VariableArray = 115
+_CXType_DependentSizedArray = 116
 _REFERENCE_OR_POINTER_TYPE_KINDS = frozenset(
     {_CXType_Pointer, _CXType_LValueReference, _CXType_RValueReference}
 )
 _FUNCTION_TYPE_KINDS = frozenset({_CXType_FunctionNoProto, _CXType_FunctionProto})
+_ARRAY_TYPE_KINDS = frozenset(
+    {
+        _CXType_ConstantArray,
+        _CXType_IncompleteArray,
+        _CXType_VariableArray,
+        _CXType_DependentSizedArray,
+    }
+)
 
 # CXLinkageKind values (see clang-c/Index.h): only a declaration with
 # genuinely external linkage can be referenced (e.g. via an ad-hoc
@@ -760,6 +772,8 @@ class _LibClang:
         lib.clang_getArgType.argtypes = [_CXType, ctypes.c_uint]
         lib.clang_getResultType.restype = _CXType
         lib.clang_getResultType.argtypes = [_CXType]
+        lib.clang_getArrayElementType.restype = _CXType
+        lib.clang_getArrayElementType.argtypes = [_CXType]
 
         # clang_Cursor_getNumArguments()/clang_Cursor_getArgument(): work
         # directly on a function-like DECLARATION cursor (not merely a
@@ -1017,6 +1031,10 @@ def _json_payload_path(
             f"Callback JSON payload walk exceeded {_MAX_TYPE_DEPTH} levels"
         )
     canonical = clang.lib.clang_getCanonicalType(value_type)
+    if canonical.kind in _ARRAY_TYPE_KINDS:
+        return _json_payload_path(
+            clang, clang.lib.clang_getArrayElementType(canonical), depth + 1
+        )
     if canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS or canonical.kind == _CXType_MemberPointer:
         pointee = clang.lib.clang_getPointeeType(canonical)
         if pointee.kind != 0:
@@ -1033,6 +1051,154 @@ def _json_payload_path(
         )
         if found is not None:
             return found
+    return None
+
+
+def _substituted_payload_path(
+    clang: "_LibClang",
+    value_type: "_CXType",
+    substitutions: dict[str, _CXType],
+) -> str | None:
+    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(value_type))
+    for name, replacement in substitutions.items():
+        if _re.search(rf"\b{_re.escape(name)}\b", spelling):
+            return _json_payload_path(clang, replacement)
+    if _is_dependent_type(clang, value_type):
+        return "QJsonObject-capable unresolved callable parameter"
+    return _json_payload_path(clang, value_type)
+
+
+def _resolve_substituted_type(
+    clang: "_LibClang",
+    value_type: "_CXType",
+    substitutions: dict[str, _CXType],
+) -> "_CXType":
+    spellings = {
+        clang.to_str(clang.lib.clang_getTypeSpelling(value_type)),
+        clang.to_str(
+            clang.lib.clang_getTypeSpelling(
+                clang.lib.clang_getCanonicalType(value_type)
+            )
+        ),
+    }
+    for name, replacement in substitutions.items():
+        if name in spellings:
+            return replacement
+    replacements = list(substitutions.values())
+    for spelling in spellings:
+        match = _re.fullmatch(r"type-parameter-\d+-(\d+)", spelling)
+        if match and int(match.group(1)) < len(replacements):
+            return replacements[int(match.group(1))]
+    return value_type
+
+
+def _record_callable_json_path(
+    clang: "_LibClang",
+    value_type: "_CXType",
+    substitutions: dict[str, _CXType] | None = None,
+    visited: frozenset[tuple[str, tuple[str, ...]]] = frozenset(),
+    depth: int = 0,
+) -> str | None:
+    if depth > _MAX_TYPE_DEPTH:
+        raise EncoderHygieneError(
+            f"Callable record walk exceeded {_MAX_TYPE_DEPTH} levels"
+        )
+    substitutions = dict(substitutions or {})
+    canonical = clang.lib.clang_getCanonicalType(value_type)
+    declaration = clang.lib.clang_getTypeDeclaration(canonical)
+    if clang.lib.clang_getCursorKind(declaration) in (0, _CXCursor_NoDeclFound):
+        return None
+
+    primary = clang.lib.clang_getSpecializedCursorTemplate(declaration)
+    record = (
+        primary
+        if clang.lib.clang_getCursorKind(primary) == _CXCursor_ClassTemplate
+        else declaration
+    )
+    parameter_names: list[str] = []
+    if record is primary:
+        def collect_parameter(
+            cursor: "_CXCursor", _parent: "_CXCursor", _client_data
+        ) -> int:
+            if clang.lib.clang_getCursorKind(cursor) == _CXCursor_TemplateTypeParameter:
+                parameter_names.append(
+                    clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
+                )
+            return 1
+
+        parameter_callback = clang._visitor_func_type(collect_parameter)
+        clang.lib.clang_visitChildren(record, parameter_callback, None)
+        argument_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
+        for index, name in enumerate(parameter_names):
+            if index >= max(argument_count, 0):
+                break
+            argument = clang.lib.clang_Type_getTemplateArgumentAsType(
+                canonical, index
+            )
+            substitutions[name] = _resolve_substituted_type(
+                clang, argument, substitutions
+            )
+
+    record_usr = clang.to_str(clang.lib.clang_getCursorUSR(record))
+    substitution_key = tuple(
+        sorted(
+            clang.to_str(
+                clang.lib.clang_getTypeSpelling(
+                    clang.lib.clang_getCanonicalType(value)
+                )
+            )
+            for value in substitutions.values()
+        )
+    )
+    visit_key = (record_usr, substitution_key)
+    if record_usr and visit_key in visited:
+        return None
+    if record_usr:
+        visited = visited | {visit_key}
+
+    bases: list[_CXType] = []
+    result: str | None = None
+
+    def visit(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        nonlocal result
+        kind = clang.lib.clang_getCursorKind(cursor)
+        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        display = clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
+        if (
+            kind in _FUNCTION_LIKE_KINDS
+            and display.startswith("operator()")
+            and access in _INHERITABLE_ACCESS_SPECIFIERS
+        ):
+            for parameter in _parameter_cursors(clang, cursor):
+                result = _substituted_payload_path(
+                    clang, clang.lib.clang_getCursorType(parameter), substitutions
+                )
+                if result is not None:
+                    return 0
+        elif (
+            kind == _CXCursor_CXXBaseSpecifier
+            and access in _INHERITABLE_ACCESS_SPECIFIERS
+        ):
+            bases.append(clang.lib.clang_getCursorType(cursor))
+        return 1
+
+    callback = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(record, callback, None)
+    if result is not None:
+        return result
+    for base_type in bases:
+        resolved_base = _resolve_substituted_type(
+            clang, base_type, substitutions
+        )
+        result = _record_callable_json_path(
+            clang,
+            resolved_base,
+            substitutions,
+            visited,
+            depth + 1,
+        )
+        if result is not None:
+            return result
     return None
 
 
@@ -1075,6 +1241,12 @@ def _callback_json_path(
         if _is_dependent_type(clang, callable_type):
             return "QJsonObject-capable unresolved callable wrapper"
         return _callback_json_path(clang, callable_type, depth + 1)
+
+    record_payload = _record_callable_json_path(
+        clang, canonical, depth=depth + 1
+    )
+    if record_payload is not None:
+        return record_payload
 
     # Optional/container/alias wrappers around a callable retain the
     # callback's outward direction.
@@ -1158,6 +1330,16 @@ def _mutable_json_path(
     )
     canonical = clang.lib.clang_getCanonicalType(value_type)
     kind = canonical.kind
+    if kind in _ARRAY_TYPE_KINDS:
+        element = clang.lib.clang_getArrayElementType(canonical)
+        return _mutable_json_path(
+            clang,
+            element,
+            directly_mutable=directly_mutable
+            and not bool(clang.lib.clang_isConstQualifiedType(canonical))
+            and not bool(clang.lib.clang_isConstQualifiedType(element)),
+            depth=depth + 1,
+        )
     if kind in _REFERENCE_OR_POINTER_TYPE_KINDS:
         pointee = clang.lib.clang_getPointeeType(canonical)
         if kind == _CXType_Pointer:
@@ -1350,6 +1532,161 @@ def _record_member_candidates(
     return members
 
 
+def _cursor_is_system_header(clang: "_LibClang", cursor: "_CXCursor") -> bool:
+    location = clang.lib.clang_getCursorLocation(cursor)
+    return bool(clang.lib.clang_Location_isInSystemHeader(location))
+
+
+def _effective_template_base_exposures(
+    clang: "_LibClang",
+    value_type: "_CXType",
+    attribution_cursor: "_CXCursor",
+    substitutions: dict[str, _CXType],
+    visited: frozenset[tuple[str, tuple[str, ...]]] = frozenset(),
+    depth: int = 0,
+) -> list[_Exposure]:
+    if depth > _MAX_INHERITANCE_DEPTH:
+        raise EncoderHygieneError(
+            "Alias effective-base walk exceeded its recursion bound"
+        )
+    resolved_type = _resolve_substituted_type(clang, value_type, substitutions)
+    canonical = clang.lib.clang_getCanonicalType(resolved_type)
+    declaration = clang.lib.clang_getTypeDeclaration(canonical)
+    if clang.lib.clang_getCursorKind(declaration) in (0, _CXCursor_NoDeclFound):
+        return [
+            _Exposure(
+                None,
+                attribution_cursor,
+                "unresolved public/protected effective alias base",
+            )
+        ]
+
+    primary = clang.lib.clang_getSpecializedCursorTemplate(declaration)
+    record = (
+        primary
+        if clang.lib.clang_getCursorKind(primary) == _CXCursor_ClassTemplate
+        else declaration
+    )
+    local_substitutions = dict(substitutions)
+    parameter_names: list[str] = []
+    if record is primary:
+        def collect_parameter(
+            cursor: "_CXCursor", _parent: "_CXCursor", _client_data
+        ) -> int:
+            if clang.lib.clang_getCursorKind(cursor) == _CXCursor_TemplateTypeParameter:
+                parameter_names.append(
+                    clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
+                )
+            return 1
+
+        callback = clang._visitor_func_type(collect_parameter)
+        clang.lib.clang_visitChildren(record, callback, None)
+        argument_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
+        for index, name in enumerate(parameter_names):
+            if index >= max(argument_count, 0):
+                break
+            argument = clang.lib.clang_Type_getTemplateArgumentAsType(
+                canonical, index
+            )
+            local_substitutions[name] = _resolve_substituted_type(
+                clang, argument, substitutions
+            )
+
+    record_usr = clang.to_str(clang.lib.clang_getCursorUSR(record))
+    substitution_key = tuple(
+        sorted(
+            clang.to_str(
+                clang.lib.clang_getTypeSpelling(
+                    clang.lib.clang_getCanonicalType(value)
+                )
+            )
+            for value in local_substitutions.values()
+        )
+    )
+    key = (record_usr, substitution_key)
+    if record_usr and key in visited:
+        return []
+    if record_usr:
+        visited = visited | {key}
+
+    system_record = _cursor_is_system_header(clang, record)
+    exposed: list[_Exposure] = []
+    for member in _record_member_candidates(clang, record):
+        if system_record:
+            member_kind = clang.lib.clang_getCursorKind(member)
+            shaped, description = _is_encoder_shaped(
+                clang, member, member_kind
+            )
+            if not shaped or "unresolved" in description:
+                continue
+        exposed.append(
+            _Exposure(member, attribution_cursor, "effective concrete template base")
+        )
+
+    bases: list[_CXType] = []
+    unresolved_using = False
+
+    def visit(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        nonlocal unresolved_using
+        kind = clang.lib.clang_getCursorKind(cursor)
+        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        if (
+            kind == _CXCursor_CXXBaseSpecifier
+            and access in _INHERITABLE_ACCESS_SPECIFIERS
+        ):
+            bases.append(clang.lib.clang_getCursorType(cursor))
+        elif (
+            kind == _CXCursor_UsingDeclaration
+            and access in _INHERITABLE_ACCESS_SPECIFIERS
+        ):
+            targets = _resolve_using_declaration_targets(clang, cursor)
+            if targets:
+                exposed.extend(
+                    _Exposure(
+                        target,
+                        attribution_cursor,
+                        "effective template using-declaration",
+                    )
+                    for target in targets
+                )
+            else:
+                unresolved_using = True
+        return 1
+
+    callback = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(record, callback, None)
+    if unresolved_using and not system_record:
+        exposed.append(
+            _Exposure(
+                None,
+                attribution_cursor,
+                "unresolved public/protected effective template using-declaration",
+            )
+        )
+    for base in bases:
+        nested = _effective_template_base_exposures(
+            clang,
+            base,
+            attribution_cursor,
+            local_substitutions,
+            visited,
+            depth + 1,
+        )
+        if system_record:
+            nested = [
+                exposure
+                for exposure in nested
+                if exposure.source_cursor is not None
+                and _is_encoder_shaped(
+                    clang,
+                    exposure.source_cursor,
+                    clang.lib.clang_getCursorKind(exposure.source_cursor),
+                )[0]
+            ]
+        exposed.extend(nested)
+    return exposed
+
+
 def _alias_reexported_encoders(
     clang: "_LibClang", alias_cursor: "_CXCursor"
 ) -> list[_Exposure]:
@@ -1364,10 +1701,18 @@ def _alias_reexported_encoders(
     if clang.lib.clang_getCursorKind(target_decl) in (0, _CXCursor_NoDeclFound):
         return []
 
-    exposed = [
-        _Exposure(member, alias_cursor, "public/protected type alias")
-        for member in _record_member_candidates(clang, target_decl)
-    ]
+    exposed: list[_Exposure] = []
+    target_is_system = _cursor_is_system_header(clang, target_decl)
+    for member in _record_member_candidates(clang, target_decl):
+        if target_is_system:
+            shaped, description = _is_encoder_shaped(
+                clang, member, clang.lib.clang_getCursorKind(member)
+            )
+            if not shaped or "unresolved" in description:
+                continue
+        exposed.append(
+            _Exposure(member, alias_cursor, "public/protected type alias")
+        )
 
     primary = clang.lib.clang_getSpecializedCursorTemplate(target_decl)
     if clang.lib.clang_getCursorKind(primary) != _CXCursor_ClassTemplate:
@@ -1419,53 +1764,18 @@ def _alias_reexported_encoders(
         ):
             argument_records.append(declaration)
 
+    substitutions = {
+        name: argument
+        for name, argument in zip(parameter_names, arguments, strict=False)
+    }
     for base in bases:
-        base_spelling = clang.to_str(
-            clang.lib.clang_getTypeSpelling(
-                clang.lib.clang_getCursorType(base)
-            )
-        )
-        if base_spelling in parameter_names:
-            index = parameter_names.index(base_spelling)
-            if index >= len(arguments):
-                exposed.append(
-                    _Exposure(
-                        None,
-                        alias_cursor,
-                        "unresolved public/protected alias template base",
-                    )
-                )
-                continue
-            base_decl = clang.lib.clang_getTypeDeclaration(
-                clang.lib.clang_getCanonicalType(arguments[index])
-            )
-        else:
-            # Concrete implementation bases of a class-template
-            # specialization (e.g. libstdc++ shared_ptr internals) do not
-            # receive one of this alias's type arguments directly. Walking
-            # their unspecialized members would misattribute unrelated
-            # dependent APIs to the alias.
-            continue
-        if clang.lib.clang_getCursorKind(base_decl) in (0, _CXCursor_NoDeclFound):
-            exposed.append(
-                _Exposure(
-                    None,
-                    alias_cursor,
-                    "unresolved public/protected alias template base",
-                )
-            )
-            continue
         exposed.extend(
-            _Exposure(member, alias_cursor, "instantiated alias template base")
-            for member in _record_member_candidates(clang, base_decl)
-        )
-        exposed.extend(
-            _Exposure(
-                inherited.source_cursor,
+            _effective_template_base_exposures(
+                clang,
+                clang.lib.clang_getCursorType(base),
                 alias_cursor,
-                f"instantiated alias of {inherited.reason}",
+                substitutions,
             )
-            for inherited in _inherited_and_reexported_encoders(clang, base_decl)
         )
 
     for using_name in using_names:
@@ -2205,6 +2515,8 @@ class TargetPolicy:
     target_type: str
     source_dir: Path
     binary_dir: Path
+    context_target: str
+    exempt_reason: str
 
 
 def _load_target_policies(clang_build_dir: Path) -> dict[str, TargetPolicy]:
@@ -2218,12 +2530,22 @@ def _load_target_policies(clang_build_dir: Path) -> dict[str, TargetPolicy]:
         if not raw_line:
             continue
         fields = raw_line.split("\t")
-        if len(fields) != 6:
+        if len(fields) != 8:
             raise EncoderHygieneError(
                 f"{manifest}:{line_number}: expected "
-                "CLASSIFICATION<TAB>POLICY<TAB>TARGET<TAB>TYPE<TAB>SOURCE_DIR<TAB>BINARY_DIR"
+                "CLASSIFICATION<TAB>POLICY<TAB>TARGET<TAB>TYPE<TAB>SOURCE_DIR"
+                "<TAB>BINARY_DIR<TAB>CONTEXT_TARGET<TAB>EXEMPT_REASON"
             )
-        classification, policy, target, target_type, source_dir, binary_dir = fields
+        (
+            classification,
+            policy,
+            target,
+            target_type,
+            source_dir,
+            binary_dir,
+            context_target,
+            exempt_reason,
+        ) = fields
         if classification not in {"SCAN", "EXTERNAL", "TEST", "TRY_COMPILE"}:
             raise EncoderHygieneError(
                 f"{manifest}:{line_number}: invalid target classification {classification!r}"
@@ -2239,6 +2561,14 @@ def _load_target_policies(clang_build_dir: Path) -> dict[str, TargetPolicy]:
         if classification != "SCAN" and policy:
             raise EncoderHygieneError(
                 f"{manifest}:{line_number}: excluded target must not carry policy {policy!r}"
+            )
+        if classification == "SCAN" and (not context_target or exempt_reason):
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: SCAN target needs context and no exemption"
+            )
+        if classification != "SCAN" and (context_target or not exempt_reason):
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: exempt target needs a machine-readable reason"
             )
         if not target or target in policies or not target_type:
             raise EncoderHygieneError(
@@ -2257,10 +2587,197 @@ def _load_target_policies(clang_build_dir: Path) -> dict[str, TargetPolicy]:
             target_type=target_type,
             source_dir=source_path,
             binary_dir=binary_path,
+            context_target=context_target,
+            exempt_reason=exempt_reason,
         )
     if not policies:
         raise EncoderHygieneError(f"Target policy manifest is empty: {manifest}")
     return policies
+
+
+def _load_target_header_manifests(
+    repo_root: Path,
+    clang_build_dir: Path,
+    policies: dict[str, TargetPolicy],
+    contexts: Sequence[CompileContext],
+) -> dict[str, list[Path]]:
+    universe_path = clang_build_dir / "generated" / "target_universe.txt"
+    index_path = clang_build_dir / "generated" / "target_header_index.txt"
+    if not universe_path.is_file() or not index_path.is_file():
+        raise EncoderHygieneError(
+            "CMake target universe/header index metadata is missing"
+        )
+
+    universe: dict[str, tuple[str, str]] = {}
+    for line_number, line in enumerate(
+        universe_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3 or fields[0] in universe:
+            raise EncoderHygieneError(
+                f"{universe_path}:{line_number}: malformed/duplicate target"
+            )
+        universe[fields[0]] = (fields[1], fields[2])
+    if set(universe) != set(policies):
+        raise EncoderHygieneError(
+            "CMake target universe and explicit target policy records differ: "
+            f"universe-only={sorted(set(universe) - set(policies))}, "
+            f"policy-only={sorted(set(policies) - set(universe))}"
+        )
+    for target, policy in policies.items():
+        if universe[target] != (policy.target_type, policy.classification):
+            raise EncoderHygieneError(
+                f"Target universe metadata mismatch for {target}"
+            )
+
+    contexts_by_target: dict[str, list[CompileContext]] = {}
+    for context in contexts:
+        contexts_by_target.setdefault(context.target, []).append(context)
+
+    manifests: dict[str, list[Path]] = {}
+    for line_number, line in enumerate(
+        index_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 4:
+            raise EncoderHygieneError(
+                f"{index_path}:{line_number}: malformed header index record"
+            )
+        target, policy_name, context_target, manifest_text = fields
+        policy = policies.get(target)
+        if (
+            policy is None
+            or policy.classification != "SCAN"
+            or policy.policy != policy_name
+            or policy.context_target != context_target
+            or target in manifests
+        ):
+            raise EncoderHygieneError(
+                f"{index_path}:{line_number}: mismatched/duplicate header ownership"
+            )
+        if context_target not in contexts_by_target:
+            raise EncoderHygieneError(
+                f"Target {target} has no deterministic compiled header context "
+                f"from {context_target}"
+            )
+        context_policy = policies.get(context_target)
+        if context_policy is None or context_policy.classification != "SCAN":
+            raise EncoderHygieneError(
+                f"Target {target} header context {context_target} is not a "
+                "production SCAN target"
+            )
+        entries = _read_manifest(Path(manifest_text))
+        canonical: list[Path] = []
+        identities: set[tuple[int, int]] = set()
+        for entry in entries:
+            if not entry.is_file():
+                raise EncoderHygieneError(
+                    f"Target {target} header is missing/not regular: {entry}"
+                )
+            real = entry.resolve()
+            identity = _physical_identity(real)
+            if identity is None or identity in identities:
+                raise EncoderHygieneError(
+                    f"Target {target} has duplicate/aliased header identity: {entry}"
+                )
+            if not (
+                real.is_relative_to((repo_root / "src").resolve())
+                or real.is_relative_to(policy.binary_dir)
+                or real.is_relative_to(policy.source_dir)
+            ):
+                raise EncoderHygieneError(
+                    f"Target {target} header escapes CMake ownership: {real}"
+                )
+            identities.add(identity)
+            canonical.append(real)
+        manifests[target] = canonical
+
+    expected_scan = {
+        target
+        for target, policy in policies.items()
+        if policy.classification == "SCAN"
+    }
+    if set(manifests) != expected_scan:
+        raise EncoderHygieneError(
+            "Target header index is incomplete: "
+            f"missing={sorted(expected_scan - set(manifests))}, "
+            f"extra={sorted(set(manifests) - expected_scan)}"
+        )
+    return manifests
+
+
+def _load_target_source_manifests(
+    repo_root: Path,
+    clang_build_dir: Path,
+    policies: dict[str, TargetPolicy],
+) -> dict[str, list[Path]]:
+    index_path = clang_build_dir / "generated" / "target_source_index.txt"
+    if not index_path.is_file():
+        raise EncoderHygieneError(f"Target source index is missing: {index_path}")
+    manifests: dict[str, list[Path]] = {}
+    for line_number, line in enumerate(
+        index_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 4:
+            raise EncoderHygieneError(
+                f"{index_path}:{line_number}: malformed source index record"
+            )
+        target, policy_name, context_target, manifest_text = fields
+        policy = policies.get(target)
+        if (
+            policy is None
+            or policy.classification != "SCAN"
+            or policy.policy != policy_name
+            or policy.context_target != context_target
+            or target in manifests
+        ):
+            raise EncoderHygieneError(
+                f"{index_path}:{line_number}: mismatched/duplicate source ownership"
+            )
+        entries = _read_manifest(Path(manifest_text))
+        canonical: list[Path] = []
+        identities: set[tuple[int, int]] = set()
+        for entry in entries:
+            if not entry.is_file():
+                raise EncoderHygieneError(
+                    f"Target {target} source is missing/not regular: {entry}"
+                )
+            real = entry.resolve()
+            identity = _physical_identity(real)
+            if identity is None or identity in identities:
+                raise EncoderHygieneError(
+                    f"Target {target} has duplicate/aliased source identity: {entry}"
+                )
+            if not (
+                real.is_relative_to((repo_root / "src").resolve())
+                or real.is_relative_to(policy.binary_dir)
+                or real.is_relative_to(policy.source_dir)
+            ):
+                raise EncoderHygieneError(
+                    f"Target {target} source escapes CMake ownership: {real}"
+                )
+            identities.add(identity)
+            canonical.append(real)
+        manifests[target] = canonical
+    expected = {
+        target
+        for target, policy in policies.items()
+        if policy.classification == "SCAN"
+    }
+    if set(manifests) != expected:
+        raise EncoderHygieneError(
+            "Target source index is incomplete: "
+            f"missing={sorted(expected - set(manifests))}, "
+            f"extra={sorted(set(manifests) - expected)}"
+        )
+    return manifests
 
 
 def _parse_autogen_source_mocs(
@@ -3189,7 +3706,11 @@ def _validate_target_inventory(
         contexts_by_target.setdefault(context.target, []).append(context)
 
     unknown = sorted(set(contexts_by_target) - set(policies))
-    stale = sorted(set(policies) - set(contexts_by_target))
+    stale = sorted(
+        target
+        for target in set(policies) - set(contexts_by_target)
+        if policies[target].target_type != "INTERFACE_LIBRARY"
+    )
     if unknown or stale:
         details = [
             *(f"  unowned compile-command target: {target}" for target in unknown),
@@ -3201,7 +3722,9 @@ def _validate_target_inventory(
         )
 
     for target, policy in policies.items():
-        target_contexts = contexts_by_target[target]
+        target_contexts = contexts_by_target.get(target, [])
+        if not target_contexts:
+            continue
         if policy.classification == "EXTERNAL":
             for context in target_contexts:
                 if not (
@@ -3264,6 +3787,7 @@ def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
         f"-DCMAKE_CXX_COMPILER={clangxx}",
         "-DCMAKE_BUILD_TYPE=Debug",
         "-DBUILD_TESTING=OFF",
+        "-DARKHAM_ENCODER_HYGIENE_CONFIGURE=ON",
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     ]
     if qt_prefix:
@@ -3275,6 +3799,7 @@ def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
         target
         for target, policy in target_policies.items()
         if policy.classification == "SCAN"
+        and policy.target_type != "INTERFACE_LIBRARY"
     ]
     if not scan_targets:
         raise EncoderHygieneError(
@@ -3338,6 +3863,12 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     target_policies = _load_target_policies(clang_build_dir)
     external_roots = _external_roots(clang_build_dir.resolve())
     _validate_target_inventory(target_policies, all_contexts, external_roots)
+    target_headers = _load_target_header_manifests(
+        repo_root, clang_build_dir, target_policies, all_contexts
+    )
+    target_source_manifests = _load_target_source_manifests(
+        repo_root, clang_build_dir, target_policies
+    )
     contexts_by_target: dict[str, list[CompileContext]] = {}
     for context in all_contexts:
         contexts_by_target.setdefault(context.target, []).append(context)
@@ -3357,6 +3888,15 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         **{source: "foundation" for source in foundation_sources},
         **{source: "domain" for source in domain_sources},
     }
+    policy_rank = {"domain": 0, "foundation": 1, "application": 2}
+    for target, sources in target_source_manifests.items():
+        target_policy_name = target_policies[target].policy
+        for source in sources:
+            if source.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}:
+                continue
+            existing = source_owner_policy.get(source)
+            if existing is None or policy_rank[target_policy_name] < policy_rank[existing]:
+                source_owner_policy[source] = target_policy_name
 
     # Every manifest entry must physically live inside the root it claims
     # to belong to (see _validate_closure_rootedness()) *before* it is
@@ -3398,6 +3938,33 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
                     )
             autogen_by_target[closure.target] = closure
 
+    cxx_source_suffixes = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
+    for target, policy in target_policies.items():
+        if policy.classification != "SCAN":
+            continue
+        manifested_code = {
+            source
+            for source in target_source_manifests[target]
+            if source.suffix.lower() in cxx_source_suffixes
+        }
+        generated_code = (
+            autogen_by_target[target].code_files
+            if target in autogen_by_target
+            else frozenset()
+        )
+        unexplained_contexts = [
+            context.source
+            for context in contexts_by_target.get(target, [])
+            if context.source not in manifested_code
+            and context.source not in generated_code
+        ]
+        if unexplained_contexts:
+            raise EncoderHygieneError(
+                f"Target {target} compile commands contain sources absent from "
+                "its complete CMake SOURCES/INTERFACE_SOURCES/AUTOGEN metadata:\n"
+                + "\n".join(f"  {source}" for source in unexplained_contexts)
+            )
+
     domain_closure = domain_source_closure
     # foundation -> domain is the allowed dependency direction
     # (arkham_foundation legitimately links arkham_domain_models); the
@@ -3409,6 +3976,38 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         domain_source_closure
         | foundation_source_closure
     )
+    headers_by_policy = {
+        policy: frozenset(
+            header
+            for target, headers in target_headers.items()
+            if target_policies[target].policy == policy
+            for header in headers
+        )
+        for policy in ("domain", "foundation", "application")
+    }
+    if not domain_source_closure.issubset(headers_by_policy["domain"]) or not foundation_source_closure.issubset(
+        headers_by_policy["domain"] | headers_by_policy["foundation"]
+    ):
+        raise EncoderHygieneError(
+            "Legacy domain/foundation closure manifests are not fully owned by "
+            "the closed-world per-target header universe"
+        )
+    header_closures = {
+        "domain": headers_by_policy["domain"] | frozenset(domain_fragments),
+        "foundation": (
+            headers_by_policy["domain"]
+            | headers_by_policy["foundation"]
+            | frozenset(domain_fragments)
+            | frozenset(foundation_fragments)
+        ),
+        "application": (
+            headers_by_policy["domain"]
+            | headers_by_policy["foundation"]
+            | headers_by_policy["application"]
+            | frozenset(domain_fragments)
+            | frozenset(foundation_fragments)
+        ),
+    }
 
     libclang_path = _find_libclang()
     clang = _LibClang(libclang_path)
@@ -3422,7 +4021,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             context
             for target, target_policy in target_policies.items()
             if target_policy.classification == "SCAN"
-            for context in contexts_by_target[target]
+            for context in contexts_by_target.get(target, [])
             if (
                 target_policy.policy == policy
                 or source_owner_policy.get(context.source) == policy
@@ -3462,25 +4061,82 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         for closure in policy_closures
     )
     generated_compile_units = frozenset(
-        context.source
-        for context in all_contexts
-        if target_policies[context.target].classification == "SCAN"
-        and not context.source.is_relative_to((repo_root / "src").resolve())
+        [
+            context.source
+            for context in all_contexts
+            if target_policies[context.target].classification == "SCAN"
+            and not context.source.is_relative_to((repo_root / "src").resolve())
+        ]
+        + [
+            source
+            for target, sources in target_source_manifests.items()
+            for source in sources
+            if target_policies[target].classification == "SCAN"
+            and source.suffix.lower() in cxx_source_suffixes
+            and not source.is_relative_to((repo_root / "src").resolve())
+        ]
+    )
+    generated_target_headers = frozenset(
+        header
+        for headers in target_headers.values()
+        for header in headers
+        if not header.is_relative_to((repo_root / "src").resolve())
     )
     owned_paths = _owned_path_policy(
-        repo_root, generated_roots, generated_compile_units
+        repo_root,
+        generated_roots,
+        generated_compile_units | generated_target_headers,
     )
 
     try:
-        findings = _scan_headers(
+        findings: list[Finding] = []
+        for target, headers in target_headers.items():
+            target_policy = target_policies[target]
+            context_candidates = contexts_by_target[
+                target_policy.context_target
+            ]
+            unique_contexts: dict[tuple, CompileContext] = {}
+            for context in context_candidates:
+                unique_contexts.setdefault(
+                    (
+                        context.target,
+                        context.configuration,
+                        context.directory,
+                        context.arguments,
+                    ),
+                    context,
+                )
+            target_generated = autogen_by_target.get(target)
+            allowed_headers = (
+                header_closures[target_policy.policy]
+                | (
+                    target_generated.code_files
+                    if target_generated is not None
+                    else frozenset()
+                )
+            )
+            findings += _scan_headers(
+                clang,
+                idx,
+                headers,
+                list(unique_contexts.values()),
+                sysroot_args,
+                repo_root,
+                external_roots,
+                allowed_headers,
+                seen,
+                structural_violations,
+                owned_paths,
+            )
+        findings += _scan_headers(
             clang,
             idx,
-            domain_headers + domain_fragments,
+            domain_fragments,
             policy_contexts["domain"],
             sysroot_args,
             repo_root,
             external_roots,
-            domain_source_closure,
+            header_closures["domain"],
             seen,
             structural_violations,
             owned_paths,
@@ -3488,27 +4144,50 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         findings += _scan_headers(
             clang,
             idx,
-            foundation_headers + foundation_fragments,
+            foundation_fragments,
             policy_contexts["foundation"],
             sysroot_args,
             repo_root,
             external_roots,
-            foundation_closure,
+            header_closures["foundation"],
             seen,
             structural_violations,
             owned_paths,
         )
 
         base_closures = {
-            "domain": domain_source_closure,
-            "foundation": foundation_closure,
-            "application": foundation_closure,
+            "domain": header_closures["domain"],
+            "foundation": header_closures["foundation"],
+            "application": header_closures["application"],
         }
         for target, target_policy in target_policies.items():
             if target_policy.classification != "SCAN":
                 continue
-            target_contexts = contexts_by_target[target]
-            target_sources = sorted({context.source for context in target_contexts}, key=str)
+            target_contexts = contexts_by_target.get(target, [])
+            compiled_sources = {context.source for context in target_contexts}
+            manifested_code = {
+                source
+                for source in target_source_manifests[target]
+                if source.suffix.lower() in cxx_source_suffixes
+            }
+            uncompiled_sources = manifested_code - compiled_sources
+            scan_contexts = list(all_contexts)
+            if uncompiled_sources:
+                fallback = contexts_by_target[target_policy.context_target][0]
+                scan_contexts.extend(
+                    CompileContext(
+                        source=source,
+                        directory=fallback.directory,
+                        arguments=fallback.arguments,
+                        output=fallback.output,
+                        target=target,
+                        configuration=fallback.configuration,
+                    )
+                    for source in uncompiled_sources
+                )
+            target_sources = sorted(
+                compiled_sources | uncompiled_sources, key=str
+            )
             for context in target_contexts:
                 if not context.output.is_relative_to(target_policy.binary_dir):
                     raise EncoderHygieneError(
@@ -3552,7 +4231,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
                     seen,
                     owned_paths,
                     target=target,
-                    contexts=all_contexts,
+                    contexts=scan_contexts,
                 )
                 structural_violations.extend(target_violations)
                 findings += target_findings
