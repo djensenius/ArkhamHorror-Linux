@@ -1438,10 +1438,14 @@ bool mountPointHasTrustedLocalFilesystemType(
   }
   QFile mountinfo(QStringLiteral("/proc/self/mountinfo"));
   if (!mountinfo.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    qWarning() << "AssetCache: could not open /proc/self/mountinfo to "
+                  "authenticate mount point"
+               << canonicalMountPoint;
     return false;
   }
   bool found = false;
   bool trusted = false;
+  QString matchedFstype;
   while (!mountinfo.atEnd()) {
     const QString line = QString::fromUtf8(mountinfo.readLine());
     const int dashIndex = line.indexOf(QStringLiteral(" - "));
@@ -1465,7 +1469,20 @@ bool mountPointHasTrustedLocalFilesystemType(
       continue;
     }
     found = true;
-    trusted = trustedLocalMountFilesystemTypes().contains(afterDash.at(0));
+    matchedFstype = afterDash.at(0);
+    trusted = trustedLocalMountFilesystemTypes().contains(matchedFstype);
+  }
+  if (!found) {
+    qWarning()
+        << "AssetCache: no /proc/self/mountinfo entry's mount-point "
+           "field exactly matched"
+        << canonicalMountPoint
+        << "(diagnostic only -- see mountPointHasTrustedLocalFilesystemType())";
+  } else if (!trusted) {
+    qWarning() << "AssetCache: /proc/self/mountinfo reports mount point"
+               << canonicalMountPoint << "has filesystem type" << matchedFstype
+               << "which is not in the trusted-local allowlist (diagnostic "
+                  "only -- see mountPointHasTrustedLocalFilesystemType())";
   }
   return found && trusted;
 }
@@ -1492,6 +1509,9 @@ bool mountPointHasTrustedLocalFilesystemType(
 // deterministic answer via the override below.
 bool mountTransitionIsIndependentlyPolicyQualified(int fd) {
   if (!directoryDescriptorPassesOwnerAndModePolicy(fd)) {
+    qWarning() << "AssetCache: mount transition destination fails the "
+                  "ownership/mode policy (not owned by the current uid, or "
+                  "group/world-writable)";
     return false;
   }
 #if defined(__linux__)
@@ -1501,11 +1521,15 @@ bool mountTransitionIsIndependentlyPolicyQualified(int fd) {
   const ssize_t resolvedLen =
       ::readlink(procFdPath, resolved, sizeof(resolved) - 1);
   if (resolvedLen <= 0) {
+    qWarning() << "AssetCache: mount transition destination's canonical "
+                  "path could not be resolved via"
+               << procFdPath << "(errno" << errno
+               << QString::fromLocal8Bit(strerror(errno)) << ")";
     return false;
   }
   resolved[resolvedLen] = '\0';
-  return mountPointHasTrustedLocalFilesystemType(
-      QString::fromLocal8Bit(resolved));
+  const QString canonicalMountPoint = QString::fromLocal8Bit(resolved);
+  return mountPointHasTrustedLocalFilesystemType(canonicalMountPoint);
 #else
   if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
           std::memory_order_acquire)) {
