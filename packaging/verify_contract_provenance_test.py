@@ -11,10 +11,12 @@ Run directly: `python3 packaging/verify_contract_provenance_test.py`
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -309,6 +311,62 @@ class ClosureTests(unittest.TestCase):
         tree = FakeTree(blobs)
         with self.assertRaises(RuntimeError):
             vcp.compute_governed_paths(tree)
+
+
+class RunEnvTests(unittest.TestCase):
+    """_run() shells out to git for every RemoteGitTree operation
+    (init/fetch/cat-file); these tests prove it disables interactive
+    credential prompting deterministically rather than actually invoking
+    git, since the point under test is the environment _run() passes to
+    subprocess.run, not git's own behavior."""
+
+    def test_disables_git_terminal_prompt_and_askpass_by_default(self):
+        # Start from a clean environment (rather than this process's own,
+        # which may already happen to set these two variables in some
+        # sandboxes/CI images) so the assertion genuinely proves _run()
+        # injects them, not that they were merely already present.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(vcp.subprocess, "run") as run:
+                run.return_value = mock.Mock(stdout=b"", returncode=0)
+                vcp._run(["git", "status"])
+        _, kwargs = run.call_args
+        self.assertEqual(kwargs["env"].get("GIT_TERMINAL_PROMPT"), "0")
+        self.assertEqual(kwargs["env"].get("GIT_ASKPASS"), "echo")
+
+    def test_preserves_caller_provided_env_entries(self):
+        # The injected defaults must not clobber the rest of a caller-
+        # supplied environment (or, when none is given, the current
+        # process's own os.environ) -- only add the two prompt-disabling
+        # keys if genuinely absent.
+        with mock.patch.object(vcp.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout=b"", returncode=0)
+            vcp._run(["git", "status"], env={"SOME_OTHER_VAR": "kept"})
+        _, kwargs = run.call_args
+        self.assertEqual(kwargs["env"].get("SOME_OTHER_VAR"), "kept")
+        self.assertEqual(kwargs["env"].get("GIT_TERMINAL_PROMPT"), "0")
+        self.assertEqual(kwargs["env"].get("GIT_ASKPASS"), "echo")
+
+    def test_does_not_override_an_explicit_caller_choice(self):
+        # A caller that deliberately wants a real prompt (or a specific
+        # askpass helper) is respected rather than silently overridden.
+        with mock.patch.object(vcp.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout=b"", returncode=0)
+            vcp._run(
+                ["git", "status"],
+                env={"GIT_TERMINAL_PROMPT": "1", "GIT_ASKPASS": "my-helper"},
+            )
+        _, kwargs = run.call_args
+        self.assertEqual(kwargs["env"].get("GIT_TERMINAL_PROMPT"), "1")
+        self.assertEqual(kwargs["env"].get("GIT_ASKPASS"), "my-helper")
+
+    def test_defaults_from_process_environment_when_no_env_kwarg_given(self):
+        sentinel = "verify-contract-provenance-test-sentinel"
+        with mock.patch.dict(os.environ, {"VCP_TEST_SENTINEL": sentinel}):
+            with mock.patch.object(vcp.subprocess, "run") as run:
+                run.return_value = mock.Mock(stdout=b"", returncode=0)
+                vcp._run(["git", "status"])
+            _, kwargs = run.call_args
+            self.assertEqual(kwargs["env"].get("VCP_TEST_SENTINEL"), sentinel)
 
 
 class VerifyTests(unittest.TestCase):

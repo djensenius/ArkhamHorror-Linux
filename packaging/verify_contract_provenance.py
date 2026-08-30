@@ -116,7 +116,20 @@ def _repo_root() -> Path:
 
 
 def _run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(args, check=True, capture_output=True, **kwargs)
+    # This script runs unattended in CI; every call here is a git
+    # subprocess (init/fetch/cat-file) that could otherwise block
+    # waiting for interactive credential input -- e.g. a misconfigured
+    # remote requiring auth, or a developer's global git config pointing
+    # at a remote that needs a password -- turning a should-fail-fast
+    # provenance check into a silent hang. GIT_TERMINAL_PROMPT=0 makes
+    # git refuse to prompt on a terminal at all; GIT_ASKPASS=echo covers
+    # the askpass-helper path too (an empty "password" makes auth fail
+    # immediately instead of invoking a real prompt), so a credential
+    # requirement surfaces as a deterministic subprocess failure.
+    env = dict(kwargs.pop("env", None) or os.environ)
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_ASKPASS", "echo")
+    return subprocess.run(args, check=True, capture_output=True, env=env, **kwargs)
 
 
 class GitTree:
