@@ -592,6 +592,13 @@ class ProductionConfigurationMatrixTests(unittest.TestCase):
         )
         self.assertIn("Release", ceh.SUPPORTED_PRODUCTION_CONFIGS)
 
+    def test_standard_library_abi_namespaces_normalize_in_usrs(self) -> None:
+        libcxx = "c:@N@std@N@__1@S@function"
+        libstdcxx = "c:@N@std@N@__cxx11@S@function"
+        expected = "c:@N@std@S@function"
+        self.assertEqual(ceh._stable_usr(libcxx), expected)
+        self.assertEqual(ceh._stable_usr(libstdcxx), expected)
+
 
 class SanitizeCompileArgsTests(unittest.TestCase):
     def test_drops_compiler_executable_and_output_and_source(self) -> None:

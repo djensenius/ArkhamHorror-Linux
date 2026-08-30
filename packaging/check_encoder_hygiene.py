@@ -276,6 +276,12 @@ from typing import Iterator, Sequence
 # exactly for its (file, usr) pair's total observed count.
 
 
+def _stable_usr(usr: str) -> str:
+    return usr.replace("@N@std@N@__1", "@N@std").replace(
+        "@N@std@N@__cxx11", "@N@std"
+    )
+
+
 @dataclass(frozen=True)
 class AllowlistEntry:
     file: str  # repo-root-relative, forward-slash path, e.g. "src/domain/RawJson.h"
@@ -519,6 +525,7 @@ if len(_FULL_SIGNATURE_SHA256) != len(ALLOWLIST):
 ALLOWLIST = tuple(
     replace(
         entry,
+        usr=_stable_usr(entry.usr),
         access=(
             entry.access
             if entry.access is not None
@@ -1400,8 +1407,8 @@ def _forbidden_type_fingerprint(
             ) -> int:
                 nonlocal found
                 kind = clang.lib.clang_getCursorKind(cursor)
-                cursor_usr = clang.to_str(
-                    clang.lib.clang_getCursorUSR(cursor)
+                cursor_usr = _stable_usr(
+                    clang.to_str(clang.lib.clang_getCursorUSR(cursor))
                 )
                 if cursor_usr in ALLOWLIST_USRS:
                     return 1
@@ -1473,7 +1480,9 @@ def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tu
         clang.lib.clang_getCursorType(cursor)
     )
     semantic_parent = clang.lib.clang_getCursorSemanticParent(cursor)
-    owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(semantic_parent))
+    owner_usr = _stable_usr(
+        clang.to_str(clang.lib.clang_getCursorUSR(semantic_parent))
+    )
     full_signature = (
         f"kind={kind};owner={owner_usr};type={_stable_type_spelling(clang, cursor_type)};"
         f"result={result_spelling};params=[{'|'.join(parameter_spellings)}];"
@@ -3188,7 +3197,9 @@ def _scan_headers(
         is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
         if not is_shaped:
             return
-        usr = clang.to_str(clang.lib.clang_getCursorUSR(canonical_cursor))
+        usr = _stable_usr(
+            clang.to_str(clang.lib.clang_getCursorUSR(canonical_cursor))
+        )
         linkage = clang.lib.clang_getCursorLinkage(canonical_cursor)
         signature_type = clang.lib.clang_getCanonicalType(
             clang.lib.clang_getCursorType(canonical_cursor)
@@ -3240,12 +3251,18 @@ def _scan_headers(
         forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
         if forbidden_path is None:
             return
-        usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+        usr = _stable_usr(
+            clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+        )
         linkage = clang.lib.clang_getCursorLinkage(cursor)
         if not usr:
-            owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(parent))
+            owner_usr = _stable_usr(
+                clang.to_str(clang.lib.clang_getCursorUSR(parent))
+            )
             usr = f"{owner_usr}@type-surface@{kind}@{line}"
-        owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(parent))
+        owner_usr = _stable_usr(
+            clang.to_str(clang.lib.clang_getCursorUSR(parent))
+        )
         description = (
             f"kind={kind};owner={owner_usr};"
             f"type={_stable_type_spelling(clang, cursor_type)};"
@@ -3324,8 +3341,10 @@ def _scan_headers(
             )
             if not is_shaped:
                 continue
-            usr = clang.to_str(
-                clang.lib.clang_getCursorUSR(exposure.source_cursor)
+            usr = _stable_usr(
+                clang.to_str(
+                    clang.lib.clang_getCursorUSR(exposure.source_cursor)
+                )
             )
             source_signature = clang.to_str(
                 clang.lib.clang_getTypeSpelling(
@@ -3611,7 +3630,9 @@ def _scan_sources(
             is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
             if not is_shaped:
                 return
-            usr = clang.to_str(clang.lib.clang_getCursorUSR(canonical))
+            usr = _stable_usr(
+                clang.to_str(clang.lib.clang_getCursorUSR(canonical))
+            )
             signature = clang.to_str(
                 clang.lib.clang_getTypeSpelling(
                     clang.lib.clang_getCanonicalType(
@@ -3675,13 +3696,17 @@ def _scan_sources(
             forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
             if forbidden_path is None:
                 return
-            usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+            usr = _stable_usr(
+                clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+            )
             if not usr:
-                owner_usr = clang.to_str(
-                    clang.lib.clang_getCursorUSR(parent)
+                owner_usr = _stable_usr(
+                    clang.to_str(clang.lib.clang_getCursorUSR(parent))
                 )
                 usr = f"{owner_usr}@type-surface@{kind}@{line}"
-            owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(parent))
+            owner_usr = _stable_usr(
+                clang.to_str(clang.lib.clang_getCursorUSR(parent))
+            )
             description = (
                 f"kind={kind};owner={owner_usr};"
                 f"type={_stable_type_spelling(clang, cursor_type)};"
@@ -3758,8 +3783,12 @@ def _scan_sources(
                     )
                     if not is_shaped:
                         continue
-                    usr = clang.to_str(
-                        clang.lib.clang_getCursorUSR(exposure.source_cursor)
+                    usr = _stable_usr(
+                        clang.to_str(
+                            clang.lib.clang_getCursorUSR(
+                                exposure.source_cursor
+                            )
+                        )
                     )
                     display_name = (
                         clang.to_str(
