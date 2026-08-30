@@ -631,14 +631,26 @@ ValueOrError<QString> scientificShow(double value, QStringView path) {
   // scientific-notation representation fits comfortably within 64 bytes
   // (at most ~1 sign + 17 significant digits + '.' + 'e' + sign + 3
   // exponent digits), so this can never fail for the finite `absValue`
-  // guaranteed by the isfinite() check above.
-  Q_ASSERT(conv.ec == std::errc{});
+  // guaranteed by the isfinite() check above. Checked explicitly (rather
+  // than Q_ASSERT, which compiles out in release builds) so a
+  // standard-library-specific quirk this invariant did not anticipate can
+  // never silently proceed with an incomplete/garbage buffer and
+  // mis-encode a wire number with no indication anything went wrong.
+  if (conv.ec != std::errc{})
+    return failure(
+        QStringLiteral("%1: internal error formatting number").arg(path));
   const std::string_view text(buf, static_cast<size_t>(conv.ptr - buf));
 
   const size_t ePos = text.find('e');
   // Guaranteed present: std::to_chars(..., chars_format::scientific) always
-  // emits an 'e' exponent marker for a finite value.
-  Q_ASSERT(ePos != std::string_view::npos);
+  // emits an 'e' exponent marker for a finite value. Checked explicitly
+  // (rather than Q_ASSERT) for the same release-build-safety reason as
+  // above -- substr()-ing on an unexpected position must fail cleanly,
+  // not emit incorrect output.
+  if (ePos == std::string_view::npos)
+    return failure(
+        QStringLiteral("%1: internal error formatting number's mantissa")
+            .arg(path));
   const std::string_view mantissa = text.substr(0, ePos);
   std::string_view expText = text.substr(ePos + 1);
   if (!expText.empty() && expText.front() == '+')
@@ -650,14 +662,13 @@ ValueOrError<QString> scientificShow(double value, QStringView path) {
   // chars_format::scientific) itself just emitted a few lines above (with
   // only a leading '+' stripped), so this parse can never legitimately
   // fail for the finite `absValue` guaranteed by the isfinite() check
-  // above. Unlike the two Q_ASSERTs above (compiled out in release), a
-  // discarded from_chars failure here would silently leave
+  // above. Checked explicitly (like the two internal-error checks above),
+  // since a discarded from_chars failure here would silently leave
   // scientificExponent at its default-initialized 0 and let this
   // function emit an incorrect wire number with no indication anything
-  // went wrong -- check it explicitly and return a typed failure instead,
-  // matching this function's own ValueOrError<QString> contract, so a
-  // standard-library-specific quirk this invariant did not anticipate can
-  // never masquerade as a valid encoded value.
+  // went wrong -- matching this function's own ValueOrError<QString>
+  // contract, so a standard-library-specific quirk this invariant did not
+  // anticipate can never masquerade as a valid encoded value.
   if (expConv.ec != std::errc{} ||
       expConv.ptr != expText.data() + expText.size())
     return failure(
