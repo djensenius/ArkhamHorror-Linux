@@ -40,7 +40,17 @@ fail() {
 
 make_fake_lib() {
   # $1: directory, $2: filename
-  : > "$1/$2"
+  #
+  # Round-9+ review item 10: audit_codec_notices.py's
+  # find_bundled_libraries() now discovers bundled libraries by their
+  # real ELF magic bytes (\x7fELF), not merely by a "*.so*" filename
+  # glob, so a zero-byte fake library is no longer discovered at all.
+  # Write the four-byte ELF magic prefix (plus a little padding) so
+  # these synthetic fixtures are still recognized as bundled ELF
+  # objects; nothing here needs to be a real, loadable ELF file, since
+  # classify()/find_bundled_libraries() never parse dynamic-linking
+  # content, only the magic bytes and the path/basename.
+  printf '\x7fELF\0\0\0\0\0\0\0\0\0\0\0\0' > "$1/$2"
 }
 
 # --- Case 1: libavif only -----------------------------------------------
