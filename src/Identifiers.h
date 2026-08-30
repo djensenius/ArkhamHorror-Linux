@@ -52,16 +52,21 @@ public:
   }
 
   [[nodiscard]] const QString &value() const noexcept { return m_value; }
-  // Unlike NonEmptyString::toJson()/CardCode::toJson() below, this is
-  // deliberately non-fallible: parse()/fromJson() are this class's only
-  // construction paths, and both always store QUuid::toString(
-  // QUuid::WithoutBraces) -- canonical lowercase hex digits and hyphens
-  // only, a fixed 36-character ASCII length -- so m_value can never
-  // contain a lone/mismatched UTF-16 surrogate or exceed any length bound
-  // Value::toExactQJson()/toJsonBytes() enforce. This is intentionally
-  // the one remaining non-fallible identifier fragment encoder in this
-  // file; audited as provably safe rather than merely convenient.
-  [[nodiscard]] QJsonValue toJson() const { return m_value; }
+  // Canonical byte-level (AST) encode: m_value can never contain a lone/
+  // mismatched UTF-16 surrogate or exceed any length bound
+  // Value::toExactQJson()/toJsonBytes() enforce, since parse()/fromJson()
+  // are this class's only construction paths and both always store
+  // QUuid::toString(QUuid::WithoutBraces) -- canonical lowercase hex
+  // digits and hyphens only, a fixed 36-character ASCII length. No public
+  // toJson()/QJsonValue-returning encoder is exposed here: production and
+  // test callers alike compose this via toRawJson() and the single
+  // central Value::toExactQJson()/toExactQJsonObject()/toJsonBytes()
+  // adapter (see RawJson.h) that every other enclosing request/response
+  // in this domain also routes through, rather than each identifier
+  // fragment type exposing its own normal-looking QJson wrapper.
+  [[nodiscard]] Json::Value toRawJson() const {
+    return Json::Value::makeString(m_value);
+  }
 
   friend bool operator==(const TypedId &, const TypedId &) = default;
 
@@ -125,26 +130,23 @@ public:
   }
 
   [[nodiscard]] const QString &value() const noexcept { return m_value; }
-  // QJsonValue convenience conversion. parse()/fromJson() deliberately do
+  // Canonical byte-level (AST) encode. parse()/fromJson() deliberately do
   // not validate the payload beyond non-emptiness -- this type
   // intentionally stays as permissive as the backend itself for the
   // identifiers it backs (see this class's doc comment above), so an
   // over-length string or a lone/mismatched UTF-16 surrogate is a
   // validly-*constructed* NonEmptyString even though no production
   // serializer could ever transmit either as valid, bounded UTF-8. This
-  // encode boundary must therefore enforce every invariant
-  // Value::toExactQJson()/toJsonBytes() do -- not merely the
-  // lone-surrogate check this used to hand-duplicate here, which let this
-  // fragment encoder silently accept e.g. an over-
-  // ParseLimits::production().maxStringLength string a complete request
-  // toJson() (which composes this value via toRawJson()->
-  // toExactQJson()/toExactQJsonObject(), see e.g. Games.h's
-  // ClaimSeatRequest) would reject -- so this now builds the identical
-  // Json::Value and routes through that single canonical, bounded check
-  // itself, rather than duplicating (and risking drifting from) a subset
-  // of it by hand.
-  [[nodiscard]] ValueOrError<QJsonValue> toJson() const {
-    return Json::Value::makeString(m_value).toExactQJson();
+  // class exposes only the raw AST, not a public toJson()/QJsonValue-
+  // returning encoder: every caller (production or test) composes this
+  // via toRawJson() and the single central Value::toExactQJson()/
+  // toJsonBytes() adapter (see RawJson.h and e.g. Games.h's
+  // ClaimSeatRequest::toRawJson()) that already enforces every bounded/
+  // lone-surrogate invariant a wire-facing encode needs -- rather than
+  // this type hand-duplicating a subset of that check behind its own
+  // normal-looking wrapper.
+  [[nodiscard]] Json::Value toRawJson() const {
+    return Json::Value::makeString(m_value);
   }
 
   friend bool operator==(const NonEmptyString &,
@@ -207,19 +209,17 @@ public:
                                                        QStringView path);
 
   [[nodiscard]] const QString &value() const noexcept { return m_value; }
-  // QJsonValue convenience conversion. See NonEmptyString::toJson()'s doc
-  // comment just above for the identical rationale: parse() validates the
-  // "c" prefix/non-emptiness/no-line-terminator shape but not every
+  // Canonical byte-level (AST) encode. See NonEmptyString::toRawJson()'s
+  // doc comment just above for the identical rationale: parse() validates
+  // the "c" prefix/non-emptiness/no-line-terminator shape but not every
   // possible UTF-16 code unit or a bounded overall length, so an
   // over-length or lone/mismatched-surrogate string is a
-  // validly-constructed CardCode from this class's own perspective. This
-  // builds the identical Json::Value and routes through
-  // Value::toExactQJson()'s single canonical, bounded check -- the same
-  // one every enclosing request composing this value via toRawJson()
-  // already relies on -- rather than hand-duplicating just its
-  // lone-surrogate case here.
-  [[nodiscard]] ValueOrError<QJsonValue> toJson() const {
-    return Json::Value::makeString(m_value).toExactQJson();
+  // validly-constructed CardCode from this class's own perspective. No
+  // public toJson()/QJsonValue-returning encoder is exposed here; every
+  // caller composes this raw AST with the single central
+  // Value::toExactQJson() adapter (see RawJson.h) instead.
+  [[nodiscard]] Json::Value toRawJson() const {
+    return Json::Value::makeString(m_value);
   }
 
   [[nodiscard]] friend bool operator==(const CardCode &a,
@@ -263,20 +263,14 @@ struct CardName {
   // with no numeric-precision concern of their own.
   [[nodiscard]] static ValueOrError<CardName> fromJson(const Json::Value &v,
                                                        QStringView path);
-  // QJsonObject convenience conversion, now literally toRawJson()'s
-  // AST run through Value::toExactQJsonObject() -- the same bounded,
-  // canonical check (length, lone/mismatched UTF-16 surrogates) every
-  // enclosing request composing this value via toRawJson() already
-  // relies on -- rather than a hand-duplicated subset of it (title/
-  // subtitle are plain public QString fields with no validating factory
-  // of their own, unlike CardCode/NonEmptyString<Tag> above, so an
-  // over-length string or a lone/mismatched UTF-16 surrogate is directly
-  // constructible here).
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
-  // title/subtitle have no numeric-precision concern of their own, but
-  // exposing this alongside toJson() lets an enclosing aggregate (e.g.
-  // CardDef::toRawJson()) compose its own encode entirely in Json::Value
-  // without ever dropping to QJsonObject for this field specifically.
+  // Canonical byte-level (AST) encode: title/subtitle are plain public
+  // QString fields with no validating factory of their own (unlike
+  // CardCode/NonEmptyString<Tag> above), so an over-length string or a
+  // lone/mismatched UTF-16 surrogate is directly constructible here. No
+  // public toJson()/QJsonObject-returning encoder is exposed; every
+  // caller (including an enclosing aggregate's own toRawJson(), e.g.
+  // CardDef::toRawJson()) composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h) instead.
   [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const CardName &, const CardName &) = default;

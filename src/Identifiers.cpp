@@ -99,13 +99,6 @@ ValueOrError<CardName> CardName::fromJson(const Json::Value &v,
   return cardNameFromValueImpl(v, path);
 }
 
-ValueOrError<QJsonObject> CardName::toJson() const {
-  auto raw = toRawJson().toExactQJsonObject();
-  if (!raw)
-    return failure(raw.error());
-  return *raw;
-}
-
 Json::Value CardName::toRawJson() const {
   QList<std::pair<QString, Json::Value>> members;
   members.append({QStringLiteral("title"), Json::Value::makeString(title)});

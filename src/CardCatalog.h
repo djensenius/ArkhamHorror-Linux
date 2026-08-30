@@ -102,20 +102,20 @@ enum class SkillType {
 // `skillIcon`: a `SkillIcon` (with a nested SkillType) or a wild/wild-minus
 // icon (no contents). The private constructor makes an inconsistent state
 // (e.g. tag == SkillIcon with no skill type set, or a nullary tag carrying
-// a payload) unrepresentable, so toJson() never needs to guard against --
+// a payload) unrepresentable, so toRawJson() never needs to guard against --
 // or abort on -- a combination its own factories/fromJson could never
 // produce. An unrecognized tag decodes to Tag::Unknown, preserving the
 // complete raw decoded object verbatim (its "tag" and, if present,
 // "contents"); Unknown has no public factory, so production code composing
 // a skillIcon can never fabricate one -- only fromJson can produce it, and
-// toJson() re-encodes exactly what was decoded, never participating in any
-// known-tag behavior.
+// toRawJson() re-encodes exactly what was decoded, never participating in
+// any known-tag behavior.
 enum class SkillIconTag { SkillIcon, WildIcon, WildMinusIcon, Unknown };
 class SkillIcon {
 public:
   // Fails if `type` is not one of kSkillTypeTable's entries -- e.g. a
   // SkillType fabricated via static_cast from outside the enum's real
-  // range -- so toJson()/toRawJson()'s encodeClosedEnum() call below is
+  // range -- so toRawJson()'s encodeClosedEnum() call below is
   // provably safe once this succeeds (see CampaignOption::knownOption()'s
   // identical rationale in Games.h).
   [[nodiscard]] static ValueOrError<SkillIcon> skillType(SkillType type);
@@ -132,16 +132,17 @@ public:
   // QJsonValue's double-backed storage allows.
   [[nodiscard]] static ValueOrError<SkillIcon> fromRawJson(const Json::Value &v,
                                                            QStringView path);
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
-  // Canonical byte-level encode: composes the lossless AST directly (see
-  // RawJson.h) rather than through toJson()'s QJsonObject -- toJson()
-  // itself is now implemented in terms of this -- so an Unknown tag's
-  // unknownRaw() (or, once nested inside a CardDef/other aggregate, a
-  // numeric literal outside qint64 range anywhere within it) survives an
-  // encode-then-decode round trip byte-exact. Fails only if this
-  // instance's SkillType was fabricated via static_cast from an
-  // out-of-table value bypassing skillType()'s validation (impossible
-  // through any public API this class itself exposes).
+  // Canonical byte-level encode: no public toJson()/QJsonObject-returning
+  // encoder is exposed here -- every caller (including an enclosing
+  // aggregate's own toRawJson(), e.g. CardDef::toRawJson()) composes this
+  // raw AST with the single central Value::toExactQJsonObject() adapter
+  // (see RawJson.h) instead -- so an Unknown tag's unknownRaw() (or, once
+  // nested inside a CardDef/other aggregate, a numeric literal outside
+  // qint64 range anywhere within it) survives an encode-then-decode round
+  // trip byte-exact. Fails only if this instance's SkillType was
+  // fabricated via static_cast from an out-of-table value bypassing
+  // skillType()'s validation (impossible through any public API this
+  // class itself exposes).
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -253,21 +254,13 @@ public:
   // number no QJsonValue could represent.
   [[nodiscard]] static ValueOrError<CardCost> fromRawJson(const Json::Value &v,
                                                           QStringView path);
-  // QJsonObject convenience conversion, for display/log/debug or a
-  // QJsonObject-typed test assertion -- NEVER for building outbound
-  // request bytes; see toJsonBytes() below for the canonical, always-
-  // lossless equivalent. Composes toRawJson() below and its own bounded
-  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
-  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
-  // silently-rounding fallback, so a numeric literal beyond qint64's exact
-  // range or -- for the schema-unconstrained rawContents()/unknownRaw() payload
-  // tags -- a nested lone/mismatched UTF-16 surrogate/duplicate key/embedded
-  // Undefined is a typed failure here too, not merely at the byte
-  // encoder.
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: see SkillIcon::toRawJson()'s doc
   // comment -- identical rationale, since rawContents()/unknownRaw() may
-  // themselves hold a number outside qint64's exact range.
+  // themselves hold a number outside qint64's exact range. No public
+  // toJson()/QJsonObject-returning encoder is exposed here; every caller
+  // composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h), or uses
+  // toJsonBytes() below for outbound request bytes.
   [[nodiscard]] Json::Value toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -361,20 +354,11 @@ public:
   // comment.
   [[nodiscard]] static ValueOrError<GameValue> fromRawJson(const Json::Value &v,
                                                            QStringView path);
-  // QJsonObject convenience conversion, for display/log/debug or a
-  // QJsonObject-typed test assertion -- NEVER for building outbound
-  // request bytes; see toJsonBytes() below for the canonical, always-
-  // lossless equivalent. Composes toRawJson() below and its own bounded
-  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
-  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
-  // silently-rounding fallback, so an unrecognized tag's unknownRaw() (a
-  // schema- unconstrained payload this class itself never validates beyond
-  // capturing verbatim) is a typed failure here too if it holds a
-  // numeric literal beyond qint64's exact range or a nested lone/
-  // mismatched UTF-16 surrogate/duplicate key/embedded Undefined,
-  // rather than silently rounding/dropping it.
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: see SkillIcon::toRawJson()'s doc comment.
+  // No public toJson()/QJsonObject-returning encoder is exposed here;
+  // every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h), or uses
+  // toJsonBytes() below for outbound request bytes.
   [[nodiscard]] Json::Value toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -569,16 +553,6 @@ struct CardDef {
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<CardDef> fromRawBytes(QByteArrayView bytes,
                                                           QStringView path);
-  // QJsonObject convenience conversion, for display/log/debug or a
-  // QJsonObject-typed test assertion -- NEVER for building outbound
-  // request bytes; see toJsonBytes() below for the canonical, always-
-  // lossless equivalent. Composes toRawJson() below and its own bounded
-  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
-  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
-  // silently-rounding fallback, so every schema-unconstrained field's
-  // number/lone- surrogate/duplicate-key/embedded-Undefined invariant is
-  // enforced here too, not merely at the byte encoder.
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: composes the lossless AST directly (see
   // RawJson.h), recursing into every nested CardCost/GameValue/SkillIcon's
   // own toRawJson() and embedding every schema-unconstrained/outer-typed
@@ -587,13 +561,16 @@ struct CardDef {
   // round trip of e.g. a governed catalog.json entry is exact for every
   // numeric literal nested at any depth inside criteria/meta/
   // customizations/etc., not merely as exact as QJsonObject's
-  // double-backed storage allows. toJson() above is now implemented in
-  // terms of this. Fails only if a nested closed-enum field (cardType,
-  // cardSubType, revelation, whenDiscarded, classSymbols/slots/
-  // outOfPlayEffects, or a nested SkillIcon's skill) was fabricated via
-  // static_cast from an out-of-table value bypassing this codebase's own
-  // validating factories/decoders -- impossible through any public API
-  // this class itself exposes.
+  // double-backed storage allows. No public toJson()/QJsonObject-
+  // returning encoder is exposed here; every caller composes this raw AST
+  // with the single central Value::toExactQJsonObject() adapter (see
+  // RawJson.h), or uses toJsonBytes() below for outbound request bytes.
+  // Fails only if a nested closed-enum field (cardType, cardSubType,
+  // revelation, whenDiscarded, classSymbols/slots/outOfPlayEffects, or a
+  // nested SkillIcon's skill) was fabricated via static_cast from an
+  // out-of-table value bypassing this codebase's own validating
+  // factories/decoders -- impossible through any public API this class
+  // itself exposes.
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 

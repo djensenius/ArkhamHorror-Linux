@@ -484,13 +484,6 @@ ValueOrError<SkillIcon> SkillIcon::fromValueImpl(const V &v, QStringView path) {
   return result;
 }
 
-ValueOrError<QJsonObject> SkillIcon::toJson() const {
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
-}
-
 ValueOrError<Json::Value> SkillIcon::toRawJson() const {
   switch (m_tag) {
   case SkillIconTag::SkillIcon: {
@@ -693,10 +686,6 @@ ValueOrError<CardCost> CardCost::fromValueImpl(const V &v, QStringView path) {
   return result;
 }
 
-ValueOrError<QJsonObject> CardCost::toJson() const {
-  return toRawJson().toExactQJsonObject();
-}
-
 Json::Value CardCost::toRawJson() const {
   const auto tagged = [](QLatin1StringView tagName,
                          const Json::Value &contents) {
@@ -884,10 +873,6 @@ ValueOrError<GameValue> GameValue::fromValueImpl(const V &v, QStringView path) {
   result.m_tag = GameValueTag::Unknown;
   result.m_unknownRaw = *rawResult;
   return result;
-}
-
-ValueOrError<QJsonObject> GameValue::toJson() const {
-  return toRawJson().toExactQJsonObject();
 }
 
 Json::Value GameValue::toRawJson() const {
@@ -1543,13 +1528,6 @@ ValueOrError<QList<CardDef>> decodeCatalogFromRawBytes(QByteArrayView bytes,
     result.append(*item);
   }
   return result;
-}
-
-ValueOrError<QJsonObject> CardDef::toJson() const {
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> CardDef::toRawJson() const {

@@ -375,18 +375,19 @@ public:
   // outside qint64's range -- see RawNumber::toExactInt64()) is a typed
   // failure that propagates out of the whole conversion, rather than
   // that private test-only helper's silent fallback to a rounding
-  // IEEE-754 double. Intended
-  // for a request-bound "convenience QJsonValue" caller that has no other
-  // reason to reach for the raw AST/byte APIs directly but still must
-  // never submit a silently-rounded/altered request: unlike that
-  // private helper,
-  // this enforces the *same* invariants as toJsonBytes() (see its own doc
-  // comment) end-to-end -- a duplicate object key, a lone UTF-16 surrogate
-  // in any string or key, a nesting depth/array-or-object size/total-node
-  // count past ParseLimits::production(), and a Kind::Undefined value
-  // nested inside an array element or object member (as opposed to the
-  // whole top-level value itself, which legitimately stays Undefined --
-  // see e.g. DeckListInput::toJson()'s guarded sideSlots call) are every
+  // IEEE-754 double. This is the single centralized adapter every domain
+  // toRawJson() caller (production or test) composes explicitly --
+  // domain types in CardCatalog.h/Decks.h/Games.h/Identifiers.h expose no
+  // public QJson-returning encoder of their own; a caller instead writes
+  // `dto.toRawJson().toExactQJson()`/`toExactQJsonObject()`/
+  // `toExactQJsonArray()` here. This enforces the *same* invariants as
+  // toJsonBytes() (see its own doc comment) end-to-end -- a duplicate
+  // object key, a lone UTF-16 surrogate in any string or key, a nesting
+  // depth/array-or-object size/total-node count past
+  // ParseLimits::production(), and a Kind::Undefined value nested inside
+  // an array element or object member (as opposed to the whole
+  // top-level value itself, which legitimately stays Undefined -- see
+  // e.g. DeckListInput::toRawJson()'s guarded sideSlots call) are every
   // one a typed failure here, never a silently altered/truncated
   // QJsonValue tree. Still prefer toJsonBytes()/the raw AST directly
   // whenever the canonical wire representation is what actually matters.
@@ -394,17 +395,17 @@ public:
 
   // toExactQJson() above, narrowed to the (overwhelmingly common) case
   // where *this is already known to be an Object -- exactly the shape
-  // every outbound request's toJson() convenience composes via
-  // toRawJson(). A typed failure (never Q_ASSERT/Q_UNREACHABLE) if kind()
+  // every domain response/request's toRawJson() composes. A typed
+  // failure (never Q_ASSERT/Q_UNREACHABLE) if kind()
   // is not Kind::Object, so a future caller that accidentally calls this
   // on a non-object Value gets a clear error instead of undefined
   // behavior from an unchecked toObject() cast. This is the one encoder
-  // every request-facing toJson() should call after building its own
-  // toRawJson() AST, so a QJsonObject convenience view can never expose
-  // weaker validation (lone UTF-16 surrogates, duplicate keys, a nested
-  // Kind::Undefined, or a size/depth/node-count past
-  // ParseLimits::production()) than the canonical toJsonBytes() path --
-  // see e.g. FetchDeckRequest::toJson()'s doc comment in Decks.h.
+  // a caller should compose with any domain type's toRawJson() AST, so a
+  // QJsonObject-typed test assertion can never expose weaker validation
+  // (lone UTF-16 surrogates, duplicate keys, a nested Kind::Undefined, or
+  // a size/depth/node-count past ParseLimits::production()) than the
+  // canonical toJsonBytes() path -- see e.g. FetchDeckRequest::toJsonBytes()'s
+  // doc comment in Decks.h.
   [[nodiscard]] ValueOrError<QJsonObject> toExactQJsonObject() const;
 
   // toExactQJson() above, narrowed to the case where *this is already

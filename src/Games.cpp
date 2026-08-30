@@ -390,16 +390,7 @@ InvestigatorSummary::fromJson(const Json::Value &v, QStringView path) {
   return investigatorSummaryFromValueImpl(v, path);
 }
 
-ValueOrError<QJsonObject> InvestigatorSummary::toJson() const {
-  // Builds the complete response as a Json::Value AST and converts once
-  // via Value::toExactQJsonObject() (see RawJson.h) -- rather than
-  // returning a hand-built QJsonObject literal directly -- so this stays
-  // structurally identical to every other encoder in this file even
-  // though id/classSymbol are already individually validated; a future
-  // field added here with no validating factory of its own (e.g. a plain
-  // QString) would otherwise inherit this function's own bypass of the
-  // resource-limit/lone-surrogate checks the aggregate conversion below
-  // enforces.
+ValueOrError<Json::Value> InvestigatorSummary::toRawJson() const {
   auto classSymbolEncoded =
       Json::encodeClosedEnum(classSymbol, kClassSymbolTable);
   if (!classSymbolEncoded)
@@ -410,7 +401,7 @@ ValueOrError<QJsonObject> InvestigatorSummary::toJson() const {
       {QStringLiteral("classSymbol"),
        Json::Value::makeString(*classSymbolEncoded)},
   };
-  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
+  return Json::Value::makeObject(std::move(members));
 }
 
 ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const QJsonValue &v,
@@ -423,14 +414,7 @@ ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const Json::Value &v,
   return scenarioSummaryFromValueImpl(v, path);
 }
 
-ValueOrError<QJsonObject> ScenarioSummary::toJson() const {
-  // Builds the complete response as a Json::Value AST and converts once
-  // via Value::toExactQJsonObject() (see RawJson.h), rather than
-  // validating id/name individually and then inserting `variant` -- a
-  // plain public std::optional<QString> field with no validating
-  // factory of its own -- directly into the QJsonObject: a lone/
-  // mismatched UTF-16 surrogate or over-length string in `variant` would
-  // otherwise silently produce a normal-looking-but-invalid QJsonObject.
+ValueOrError<Json::Value> ScenarioSummary::toRawJson() const {
   auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
   if (!difficultyEncoded)
     return failure(
@@ -443,7 +427,7 @@ ValueOrError<QJsonObject> ScenarioSummary::toJson() const {
       {QStringLiteral("variant"),
        variant ? Json::Value::makeString(*variant) : Json::Value::makeNull()},
   };
-  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
+  return Json::Value::makeObject(std::move(members));
 }
 
 ValueOrError<CampaignSummary> CampaignSummary::fromJson(const QJsonValue &v,
@@ -456,11 +440,7 @@ ValueOrError<CampaignSummary> CampaignSummary::fromJson(const Json::Value &v,
   return campaignSummaryFromValueImpl(v, path);
 }
 
-ValueOrError<QJsonObject> CampaignSummary::toJson() const {
-  // See InvestigatorSummary::toJson() above: composes a complete
-  // Json::Value AST and converts once via toExactQJsonObject(), rather
-  // than returning a hand-built QJsonObject literal directly, for the
-  // same structural-consistency/defense-in-depth reason.
+ValueOrError<Json::Value> CampaignSummary::toRawJson() const {
   auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
   if (!difficultyEncoded)
     return failure(
@@ -481,7 +461,7 @@ ValueOrError<QJsonObject> CampaignSummary::toJson() const {
        Json::Value::makeString(*difficultyEncoded)},
       {QStringLiteral("currentCampaignMode"), currentCampaignModeValue},
   };
-  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
+  return Json::Value::makeObject(std::move(members));
 }
 
 ValueOrError<GameState> GameState::pending(QList<QUuid> playerIds) {
@@ -596,10 +576,6 @@ ValueOrError<GameState> GameState::fromValueImpl(const V &v, QStringView path) {
   result.m_unknownTag = tag;
   result.m_unknownRaw = *rawResult;
   return result;
-}
-
-ValueOrError<QJsonObject> GameState::toJson() const {
-  return toRawJson().toExactQJsonObject();
 }
 
 Json::Value GameState::toRawJson() const {
@@ -817,24 +793,18 @@ ValueOrError<Json::Value> GameListRow::toRawJson() const {
   // a Kind::Success instance, and it always populates id/gameState/
   // multiplayerVariant together, so they are guaranteed present by
   // construction -- there is no qFatal()/Q_ASSERT()-guarded fallback
-  // anywhere in this file; every tagged/sum-type toJson() in this
+  // anywhere in this file; every tagged/sum-type toRawJson() in this
   // codebase is unconditionally safe by construction instead.
   QList<std::pair<QString, Json::Value>> members;
   const auto insert = [&members](QLatin1StringView key, Json::Value value) {
     members.append({QString(key), std::move(value)});
   };
 
-  auto idRaw = Json::Value::fromQJson(m_id->toJson());
-  if (!idRaw)
-    return failure(QStringLiteral("id: %1").arg(idRaw.error()));
-  insert("id"_L1, *idRaw);
+  auto idRaw = m_id->toRawJson();
+  insert("id"_L1, idRaw);
 
   if (m_scenario) {
-    auto scenarioEncoded = m_scenario->toJson();
-    if (!scenarioEncoded)
-      return failure(
-          QStringLiteral("scenario: %1").arg(scenarioEncoded.error()));
-    auto scenarioRaw = Json::Value::fromQJson(*scenarioEncoded);
+    auto scenarioRaw = m_scenario->toRawJson();
     if (!scenarioRaw)
       return failure(QStringLiteral("scenario: %1").arg(scenarioRaw.error()));
     insert("scenario"_L1, *scenarioRaw);
@@ -842,33 +812,24 @@ ValueOrError<Json::Value> GameListRow::toRawJson() const {
     insert("scenario"_L1, Json::Value::makeNull());
   }
   if (m_campaign) {
-    auto campaignEncoded = m_campaign->toJson();
-    if (!campaignEncoded)
-      return failure(
-          QStringLiteral("campaign: %1").arg(campaignEncoded.error()));
-    auto campaignRaw = Json::Value::fromQJson(*campaignEncoded);
+    auto campaignRaw = m_campaign->toRawJson();
     if (!campaignRaw)
       return failure(QStringLiteral("campaign: %1").arg(campaignRaw.error()));
     insert("campaign"_L1, *campaignRaw);
   } else {
     insert("campaign"_L1, Json::Value::makeNull());
   }
-  // The reason this method exists distinct from toJson(): route gameState
-  // through GameState::toRawJson() (lossless Json::Value AST), not its
-  // QJsonObject-typed toJson() (double-backed) -- so an Unknown tag's
-  // numeric literal outside IEEE-754 double's exact-integer range
-  // survives an encode-then-reparse round trip through this row, not
-  // merely through GameState in isolation.
+  // The reason this method routes gameState through GameState::toRawJson()
+  // (lossless Json::Value AST) rather than any QJsonObject-typed
+  // intermediary: so an Unknown tag's numeric literal outside IEEE-754
+  // double's exact-integer range survives an encode-then-reparse round
+  // trip through this row, not merely through GameState in isolation.
   insert("gameState"_L1, m_gameState->toRawJson());
   insert("name"_L1, Json::Value::makeString(m_name));
 
   QList<Json::Value> investigatorsArr;
   for (qsizetype i = 0; i < m_investigators.size(); ++i) {
-    auto encoded = m_investigators.at(i).toJson();
-    if (!encoded)
-      return failure(
-          QStringLiteral("investigators[%1]: %2").arg(i).arg(encoded.error()));
-    auto raw = Json::Value::fromQJson(*encoded);
+    auto raw = m_investigators.at(i).toRawJson();
     if (!raw)
       return failure(
           QStringLiteral("investigators[%1]: %2").arg(i).arg(raw.error()));
@@ -878,12 +839,7 @@ ValueOrError<Json::Value> GameListRow::toRawJson() const {
 
   QList<Json::Value> otherArr;
   for (qsizetype i = 0; i < m_otherInvestigators.size(); ++i) {
-    auto encoded = m_otherInvestigators.at(i).toJson();
-    if (!encoded)
-      return failure(QStringLiteral("otherInvestigators[%1]: %2")
-                         .arg(i)
-                         .arg(encoded.error()));
-    auto raw = Json::Value::fromQJson(*encoded);
+    auto raw = m_otherInvestigators.at(i).toRawJson();
     if (!raw)
       return failure(
           QStringLiteral("otherInvestigators[%1]: %2").arg(i).arg(raw.error()));
@@ -901,13 +857,6 @@ ValueOrError<Json::Value> GameListRow::toRawJson() const {
   insert("hasOpenSeats"_L1, Json::Value::makeBool(m_hasOpenSeats));
 
   return Json::Value::makeObject(members);
-}
-
-ValueOrError<QJsonObject> GameListRow::toJson() const {
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
 }
 
 ValueOrError<QByteArray> GameListRow::toJsonBytes() const {
@@ -967,21 +916,6 @@ decodeGameListFromRawBytes(QByteArrayView bytes, QStringView path) {
   if (!parsed)
     return failure(parsed.error());
   return decodeGameListFromRawJson(*parsed, path);
-}
-
-ValueOrError<QJsonArray> encodeGameList(const QList<GameListRow> &rows) {
-  // Composes encodeGameListToRawJson() below (the lossless Json::Value
-  // AST this function's own toJsonBytes()-equivalent uses) and converts
-  // ONCE via Value::toExactQJsonArray() (see RawJson.h), rather than
-  // appending each row's individually-exact toJson() result into a
-  // QJsonArray by hand: the latter has no bound of its own on the total
-  // number of rows/nodes, letting an otherwise-valid list of
-  // individually-exact rows still bypass ParseLimits::production()'s
-  // overall array-length/total-node-count limit.
-  auto raw = encodeGameListToRawJson(rows);
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonArray();
 }
 
 ValueOrError<Json::Value>
@@ -1102,13 +1036,6 @@ ValueOrError<CampaignOption> CampaignOption::fromValueImpl(const V &v,
   result.m_text = tag;
   result.m_raw = *rawResult;
   return result;
-}
-
-ValueOrError<QJsonObject> CampaignOption::toJson() const {
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> CampaignOption::toRawJson() const {
@@ -1275,23 +1202,6 @@ CampaignOptionRequest::fromValueImpl(const V &v, QStringView path) {
   // fallback: an unrecognized tag is a hard decode failure here.
   return failure(QStringLiteral("%1: unrecognized campaign option tag \"%2\"")
                      .arg(path, tag));
-}
-
-ValueOrError<QJsonObject> CampaignOptionRequest::toJson() const {
-  // Composes toRawJson() below and its own bounded exact QJsonObject
-  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
-  // hand-building a QJsonObject: the previous implementation embedded
-  // Kind::Variant's `m_text` (an unconstrained caller-supplied string)
-  // via a raw QJsonValue(QString) construction with zero validation, so a
-  // lone/mismatched UTF-16 surrogate there would have silently produced a
-  // normal-looking-but-invalid QJsonObject even though toJsonBytes()
-  // correctly rejected the identical input. toRawJson()'s own error
-  // already identifies itself, so it is propagated verbatim rather than
-  // re-wrapped.
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> CampaignOptionRequest::toRawJson() const {
@@ -1554,25 +1464,6 @@ CreateGameRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*parsed, path);
 }
 
-ValueOrError<QJsonObject> CreateGameRequest::toJson() const {
-  // Composes toRawJson() below and its own bounded exact QJsonObject
-  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
-  // hand-building a QJsonObject: the previous implementation embedded
-  // campaignName via a raw QJsonValue(QString) construction with zero
-  // validation (and, transitively via a since-removed
-  // CampaignOrScenario::insertInto() test-only fragment method --
-  // round-16-cumulative-review item 1 -- campaignId/scenarioId the same
-  // way), so a lone/mismatched UTF-16 surrogate there would have
-  // silently produced a normal-looking-but-invalid QJsonObject even
-  // though toJsonBytes() correctly rejected the identical input.
-  // toRawJson() already validates deckIds' null-uuid invariant, so that
-  // check is not duplicated here.
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
-}
-
 ValueOrError<Json::Value> CreateGameRequest::toRawJson() const {
   QList<Json::Value> deckIdsArr;
   deckIdsArr.reserve(deckIds.size());
@@ -1749,20 +1640,6 @@ ValueOrError<Json::Value> ChooseDeckRequest::toRawJson() const {
   return Json::Value::makeObject(std::move(members));
 }
 
-ValueOrError<QJsonObject> ChooseDeckRequest::toJson() const {
-  // Composes toRawJson() above and its own bounded exact QJsonObject
-  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
-  // hand-building a QJsonObject: the previous implementation embedded
-  // investigatorId/deckUrl via raw, unvalidated QJsonValue construction
-  // with zero validation, so a lone/mismatched UTF-16 surrogate there
-  // would have silently produced a normal-looking-but-invalid QJsonObject
-  // even though toJsonBytes() correctly rejected the identical input.
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
-}
-
 ValueOrError<ChooseDeckRequest>
 ChooseDeckRequest::fromRawJson(const Json::Value &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
@@ -1811,18 +1688,6 @@ ValueOrError<ClaimSeatRequest> ClaimSeatRequest::fromJson(const QJsonValue &v,
   return decodeClaimSeatRequest(*objResult, path);
 }
 
-ValueOrError<QJsonObject> ClaimSeatRequest::toJson() const {
-  // Composes toRawJson() below and its own bounded exact QJsonObject
-  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
-  // embedding investigatorId via a raw, unvalidated QJsonValue(QString)
-  // construction, so a lone/mismatched UTF-16 surrogate is a typed
-  // failure here too, matching toJsonBytes().
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
-}
-
 ValueOrError<ClaimSeatRequest>
 ClaimSeatRequest::fromRawJson(const Json::Value &v, QStringView path) {
   auto objResult = Json::requireObject(v, path);
@@ -1866,21 +1731,6 @@ ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
     result.append(*item);
   }
   return result;
-}
-
-ValueOrError<QJsonArray> encodeOpenSeats(const QList<CardCode> &seats) {
-  // Builds the complete array as a Json::Value AST and converts ONCE via
-  // Value::toExactQJsonArray() (see RawJson.h), rather than appending
-  // each element's individually-exact CardCode::toJson() result into a
-  // QJsonArray by hand: the latter has no bound of its own on the total
-  // element/node count, letting an otherwise-valid list of individually-
-  // exact codes still bypass ParseLimits::production()'s overall
-  // array-length/total-node-count limit.
-  QList<Json::Value> raw;
-  raw.reserve(seats.size());
-  for (const auto &seat : seats)
-    raw.append(Json::Value::makeString(seat.value()));
-  return Json::Value::makeArray(raw).toExactQJsonArray();
 }
 
 } // namespace Arkham

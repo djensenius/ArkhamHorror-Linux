@@ -106,7 +106,11 @@ struct InvestigatorSummary {
   // nested investigators/otherInvestigators arrays.
   [[nodiscard]] static ValueOrError<InvestigatorSummary>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST for this response DTO (see RawJson.h).
+  // No public toJson()/QJsonObject-returning encoder is exposed here;
+  // every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h) instead.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
 
   friend bool operator==(const InvestigatorSummary &,
                          const InvestigatorSummary &) = default;
@@ -136,7 +140,11 @@ struct ScenarioSummary {
   // Json::Value overload doc comment above.
   [[nodiscard]] static ValueOrError<ScenarioSummary>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST for this response DTO (see RawJson.h).
+  // No public toJson()/QJsonObject-returning encoder is exposed here;
+  // every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h) instead.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
 
   friend bool operator==(const ScenarioSummary &,
                          const ScenarioSummary &) = default;
@@ -160,7 +168,11 @@ struct CampaignSummary {
   // Json::Value overload doc comment above.
   [[nodiscard]] static ValueOrError<CampaignSummary>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST for this response DTO (see RawJson.h).
+  // No public toJson()/QJsonObject-returning encoder is exposed here;
+  // every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h) instead.
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
 
   friend bool operator==(const CampaignSummary &,
                          const CampaignSummary &) = default;
@@ -203,23 +215,14 @@ public:
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<GameState>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  // QJsonObject convenience conversion, for display/log/debug or a
-  // QJsonObject-typed test assertion -- NEVER for building outbound
-  // request bytes; see toJsonBytes() below for the canonical, always-
-  // lossless equivalent. Composes toRawJson() below and its own bounded
-  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
-  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
-  // silently-rounding fallback, so an Unknown tag's unknownRaw() -- which may
-  // itself carry a numeric literal beyond qint64's exact range, a nested lone/
-  // mismatched UTF-16 surrogate, a duplicate key, or an embedded
-  // Undefined -- is a typed failure here too, not merely at the byte
-  // encoder.
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: composes the lossless AST directly (see
-  // RawJson.h) -- toJson() above is now implemented in terms of this --
-  // so unknownRaw()'s complete original object (including any numeric
-  // literal beyond double precision) survives an encode-then-decode round
-  // trip byte-exact via toJsonBytes(), not merely as closely as
+  // RawJson.h). No public toJson()/QJsonObject-returning encoder is
+  // exposed here; every caller composes this raw AST with the single
+  // central Value::toExactQJsonObject() adapter (see RawJson.h), or uses
+  // toJsonBytes() below for outbound request bytes -- so unknownRaw()'s
+  // complete original object (including any numeric literal beyond
+  // double precision) survives an encode-then-decode round trip
+  // byte-exact via toJsonBytes(), not merely as closely as
   // Json::Value::toLossyQJsonForTestingOnly() allows.
   [[nodiscard]] Json::Value toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
@@ -246,20 +249,18 @@ public:
   // exactness beyond a double's 2^53/int64 range matters. Note that a
   // duplicate object key anywhere in the payload is rejected by
   // Json::Value::parse() itself (see RawJson.cpp) and therefore never
-  // reaches this representation in the first place. toJson() below is a
-  // QJsonObject-typed convenience for the Unknown case that is now
-  // exactly as bounded/lossless as toJsonBytes() (see
-  // Value::toExactQJsonObject() in RawJson.h): a numeric literal beyond
-  // qint64's exact range, a lone/mismatched UTF-16 surrogate, a
-  // duplicate key, or an embedded Undefined anywhere inside it is a
-  // typed failure there too, rather than a silently-rounded/altered
-  // QJsonObject.
+  // reaches this representation in the first place. This is exactly as
+  // bounded/lossless as toJsonBytes() (see Value::toExactQJsonObject() in
+  // RawJson.h): a numeric literal beyond qint64's exact range, a
+  // lone/mismatched UTF-16 surrogate, a duplicate key, or an embedded
+  // Undefined anywhere inside it is a typed failure there too, rather
+  // than a silently-rounded/altered result.
   [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
   // Convenience view derived from unknownRaw(): the raw "contents" the
   // unrecognized tag object carried, if any (Undefined if it had none).
-  // Never the source of truth for encoding -- toJson()/unknownRaw() are.
+  // Never the source of truth for encoding -- toRawJson()/unknownRaw() are.
   [[nodiscard]] Json::Value unknownContents() const {
     return m_unknownRaw.isObject()
                ? m_unknownRaw.value(QLatin1StringView("contents"))
@@ -320,7 +321,7 @@ private:
 // success()/failure() are the only ways to build one (mirroring
 // CampaignOrScenario above): the private constructor makes a Success row
 // with a missing id/gameState/multiplayerVariant unrepresentable, so
-// toJson() never needs to guard against -- or fail on -- an invalid
+// toRawJson() never needs to guard against -- or fail on -- an invalid
 // instance that was never possible to construct in the first place.
 class GameListRow {
 public:
@@ -356,16 +357,16 @@ public:
   // runs, and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<GameListRow>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
-  // Canonical byte-level encode: composes the lossless AST directly (see
-  // RawJson.h), routing gameState through GameState::toRawJson() rather
-  // than its QJsonObject-typed toJson() -- so an Unknown gameState's
+  // The lossless Json::Value AST for this response DTO (see RawJson.h).
+  // No public toJson()/QJsonObject-returning encoder is exposed here;
+  // every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h), or uses
+  // toJsonBytes() below for outbound bytes. Canonical byte-level encode:
+  // composes the lossless AST directly (see RawJson.h), routing
+  // gameState through GameState::toRawJson() -- so an Unknown gameState's
   // numeric literal outside IEEE-754 double's exact-integer range
   // survives an encode-then-reparse round trip through this *aggregate*,
-  // not merely GameState in isolation. toJson() above remains a
-  // QJsonObject-typed convenience only as exact as
-  // Json::Value::toLossyQJsonForTestingOnly() allows (see its doc comment in
-  // RawJson.h) and is implemented in terms of this.
+  // not merely GameState in isolation.
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -463,13 +464,14 @@ decodeGameListFromRawJson(const Json::Value &v, QStringView path);
 // decodes via decodeGameListFromRawJson() above.
 [[nodiscard]] ValueOrError<QList<GameListRow>>
 decodeGameListFromRawBytes(QByteArrayView bytes, QStringView path);
-[[nodiscard]] ValueOrError<QJsonArray>
-encodeGameList(const QList<GameListRow> &rows);
 // Canonical byte-level encode: composes the lossless AST directly (see
-// RawJson.h), routing each row through GameListRow::toRawJson() rather
-// than its QJsonObject-typed toJson() -- so an unrecognized gameState's
-// exact numeric literal survives an encode-then-reparse round trip
-// through the *whole list*, not merely one row's GameState in isolation.
+// RawJson.h), routing each row through GameListRow::toRawJson() -- so an
+// unrecognized gameState's exact numeric literal survives an
+// encode-then-reparse round trip through the *whole list*, not merely one
+// row's GameState in isolation. No public toJson()/QJsonArray-returning
+// encoder is exposed for this collection; every caller composes this raw
+// AST with the single central Value::toExactQJsonArray() adapter (see
+// RawJson.h) instead.
 [[nodiscard]] ValueOrError<Json::Value>
 encodeGameListToRawJson(const QList<GameListRow> &rows);
 [[nodiscard]] ValueOrError<QByteArray>
@@ -536,7 +538,7 @@ public:
   // arbitrary caller-supplied KnownCampaignOption -- including one
   // fabricated via static_cast from a value outside the enum's real
   // range -- so it must validate rather than trust its argument. This is
-  // what makes toJson()/toRawJson()'s encodeClosedEnum() call below
+  // what makes toRawJson()'s encodeClosedEnum() call below
   // provably safe: a CampaignOption's m_known, once set, is always
   // table-valid.
   [[nodiscard]] static ValueOrError<CampaignOption>
@@ -557,13 +559,15 @@ public:
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<CampaignOption>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
-  // Canonical byte-level encode: composes the lossless AST directly (see
-  // RawJson.h) -- toJson() above is now implemented in terms of this --
-  // so rawJson()'s complete original object survives an encode-then-
-  // decode round trip byte-exact via toJsonBytes(), not merely as
-  // closely as Json::Value::toLossyQJsonForTestingOnly() allows. Fails only if
-  // this instance's KnownCampaignOption was fabricated via static_cast from an
+  // The lossless Json::Value AST for this response DTO (see RawJson.h).
+  // No public toJson()/QJsonObject-returning encoder is exposed here;
+  // every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h), or uses
+  // toJsonBytes() below for outbound bytes -- so rawJson()'s complete
+  // original object survives an encode-then-decode round trip byte-exact
+  // via toJsonBytes(), not merely as closely as
+  // Json::Value::toLossyQJsonForTestingOnly() allows. Fails only if this
+  // instance's KnownCampaignOption was fabricated via static_cast from an
   // out-of-table value bypassing knownOption()'s validation (impossible
   // through any public API this class itself exposes).
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
@@ -592,20 +596,17 @@ public:
   // exactness beyond a double's 2^53/int64 range matters. Note that a
   // duplicate object key anywhere in the payload is rejected by
   // Json::Value::parse() itself (see RawJson.cpp) and therefore never
-  // reaches this representation in the first place. toJson() below is a
-  // QJsonObject-typed convenience only as exact as
-  // Json::Value::toLossyQJsonForTestingOnly() itself is (see its doc comment in
-  // RawJson.h): an exact-int64 numeric literal survives, but anything requiring
-  // more precision than QJsonValue's double-backed storage allows does not.
+  // reaches this representation in the first place.
   [[nodiscard]] const Json::Value &rawJson() const noexcept { return m_raw; }
   // Convenience view derived from rawJson(): the raw "contents" the
   // decoded object carried, if any (Undefined if it had none or this
   // instance was not decoded from JSON). Never the source of truth for
-  // encoding -- toJson()/rawJson() are. Named for its original (and still
-  // primary) use identifying an unrecognized tag's payload; Kind::Known's
-  // KnownCampaignOption constructors are all nullary per the pinned
-  // backend (see kKnownCampaignOptionTable), so a Known instance's
-  // rawJson() ordinarily has no "contents" key at all -- one appearing
+  // encoding -- toRawJson()/rawJson() are. Named for its original (and
+  // still primary) use identifying an unrecognized tag's payload;
+  // Kind::Known's KnownCampaignOption constructors are all nullary per
+  // the pinned backend (see kKnownCampaignOptionTable), so a Known
+  // instance's rawJson() ordinarily has no "contents" key at all -- one
+  // appearing
   // there (even null) is itself the additive-field case toRequestOption()
   // below refuses to silently narrow past.
   [[nodiscard]] Json::Value unknownContents() const {
@@ -716,14 +717,15 @@ public:
   // without dropping to QJsonValue for this element type.
   [[nodiscard]] static ValueOrError<CampaignOptionRequest>
   fromJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode (round-10-cumulative-review item 2):
-  // composes the lossless AST directly (see RawJson.h) rather than
-  // toJson()'s QJsonObject, so a "CampaignVariant" `contents` string
-  // containing a lone/mismatched UTF-16 surrogate is a typed failure at
-  // Value::toJsonBytes() rather than ever silently embedded as invalid
-  // UTF-8. This is what CreateGameRequest::toRawJson() below composes its
-  // "options" array from -- toJson() remains display/log/test-only.
+  // composes the lossless AST directly (see RawJson.h) so a
+  // "CampaignVariant" `contents` string containing a lone/mismatched
+  // UTF-16 surrogate is a typed failure at Value::toJsonBytes() rather
+  // than ever silently embedded as invalid UTF-8. This is what
+  // CreateGameRequest::toRawJson() below composes its "options" array
+  // from. No public toJson()/QJsonObject-returning encoder is exposed
+  // here; every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h) instead.
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -848,8 +850,8 @@ private:
 // which -- like plain `.:?` -- folds an absent key and an explicit JSON
 // null to the exact same value, so there is nothing left for this client to
 // distinguish or preserve. `strictAsIfAt`/`asIfRuling` have no such default
-// and stay std::optional (absent-or-null collapse to unset; toJson omits
-// the key when unset).
+// and stay std::optional (absent-or-null collapse to unset; toRawJson
+// omits the key when unset).
 struct CreateGameRequest {
   QList<std::optional<QUuid>> deckIds;
   qint64 playerCount{};
@@ -888,18 +890,17 @@ struct CreateGameRequest {
   // constructing/mutating a CreateGameRequest by hand could otherwise
   // bypass that invariant and emit a wire value the backend -- and this
   // client's own decoder -- would reject.
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   // Canonical byte-level encode (round-10-cumulative-review item 2):
-  // composes the lossless AST directly (see RawJson.h) rather than
-  // toJson()'s QJsonObject -- `campaignName` is an unconstrained QString a
-  // caller can set to anything, and toJson() previously embedded it via a
-  // raw QJsonValue(QString) construction with zero validation -- so a
+  // composes the lossless AST directly (see RawJson.h) -- `campaignName`
+  // is an unconstrained QString a caller can set to anything -- so a
   // lone/mismatched UTF-16 surrogate anywhere in this request (including
   // nested inside campaignName or a CampaignOptionRequest's variant
-  // contents) is now a typed failure at Value::toJsonBytes() rather than
-  // ever silently emitted as invalid UTF-8. Shares the same
-  // deckIds-null-uuid validation as toJson() above.
-  [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
+  // contents) is a typed failure at Value::toJsonBytes() rather than ever
+  // silently emitted as invalid UTF-8. No public toJson()/QJsonObject-
+  // returning encoder is exposed here; every caller composes this raw
+  // AST with the single central Value::toExactQJsonObject() adapter (see
+  // RawJson.h) instead.
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   friend bool operator==(const CreateGameRequest &,
@@ -931,24 +932,15 @@ struct ChooseDeckRequest {
   // patch deckList back in from the raw tree" implementation.
   [[nodiscard]] static ValueOrError<ChooseDeckRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  // QJsonObject convenience conversion, for display/log/debug or a
-  // QJsonObject-typed test assertion -- NEVER for building outbound
-  // request bytes; see toJsonBytes() below for the canonical, always-
-  // lossless equivalent. Composes toRawJson() below and its own bounded
-  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
-  // RawJson.h) rather than embedding investigatorId/deckUrl via raw,
-  // unvalidated QJsonValue construction, so a lone/mismatched UTF-16
-  // surrogate anywhere in this request (including nested inside a
-  // present deckList) is a typed failure here too, and a present
-  // deckList's `id` being a Number literal that cannot be exactly
-  // represented is likewise rejected -- see DeckListInput::toJson()'s
-  // doc comment.
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // The lossless Json::Value AST fragment for this request body (see
-  // RawJson.h); used by toJson() and toJsonBytes() below so both share
-  // one encode.
+  // RawJson.h); used by toJsonBytes() below. No public toJson()/
+  // QJsonObject-returning encoder is exposed here; every caller composes
+  // this raw AST with the single central Value::toExactQJsonObject()
+  // adapter (see RawJson.h) instead -- a present deckList's `id` being a
+  // Number literal that cannot be exactly represented is rejected there
+  // too, matching DeckListInput::toRawJson()'s own invariant.
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
-  // Precision-preserving equivalent of toJson(); see
+  // Precision-preserving canonical encoder; see
   // DeckListInput::toJsonBytes().
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -971,23 +963,14 @@ struct ClaimSeatRequest {
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<ClaimSeatRequest>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  // QJsonObject convenience conversion, for display/log/debug or a
-  // QJsonObject-typed test assertion -- NEVER for building outbound
-  // request bytes; see toJsonBytes() below for the canonical, always-
-  // lossless equivalent. Composes toRawJson() below and its own bounded
-  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
-  // RawJson.h), rather than embedding investigatorId via a raw,
-  // unvalidated QJsonValue(QString) construction, so a lone/mismatched
-  // UTF-16 surrogate is a typed failure here too, matching toJsonBytes()
-  // instead of ever emitting a normal-looking-but-invalid QJsonObject.
-  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode (round-10-cumulative-review item 2):
   // composes the lossless AST directly (see RawJson.h) -- investigatorId
-  // is an unconstrained (non-empty) QString a caller can set to anything,
-  // and toJson() previously embedded it via a raw QJsonValue(QString)
-  // construction with zero validation -- so a lone/mismatched UTF-16
-  // surrogate is now a typed failure at Value::toJsonBytes() rather than
-  // ever silently emitted as invalid UTF-8.
+  // is an unconstrained (non-empty) QString a caller can set to anything
+  // -- so a lone/mismatched UTF-16 surrogate is a typed failure at
+  // Value::toJsonBytes() rather than ever silently emitted as invalid
+  // UTF-8. No public toJson()/QJsonObject-returning encoder is exposed
+  // here; every caller composes this raw AST with the single central
+  // Value::toExactQJsonObject() adapter (see RawJson.h) instead.
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -999,11 +982,5 @@ struct ClaimSeatRequest {
 // "c"-prefixed) card codes of investigators still owed a seat.
 [[nodiscard]] ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
                                                             QStringView path);
-// Test/round-trip-only reverse encoder (not used by any production
-// response/request path); propagates each CardCode::toJson()'s own typed
-// failure for a lone/mismatched UTF-16 surrogate rather than ever
-// silently producing an unencodable QJsonArray.
-[[nodiscard]] ValueOrError<QJsonArray>
-encodeOpenSeats(const QList<CardCode> &seats);
 
 } // namespace Arkham

@@ -164,11 +164,11 @@ Json::Value rawEncodeCardQuantityMapInput(const QMap<QString, qint64> &map) {
 // CardCode's own construction-time validation (see CardCode::parse() in
 // Identifiers.h) does not rule out an over-length or lone/mismatched
 // UTF-16 surrogate key, so -- unlike a value embedded via
-// CardCode::toJson() -- a key built via .value() directly bypasses that
-// type's own encode-time check entirely; DeckList::toJson() (the only
-// caller) validates the whole resulting AST in one pass via
-// Value::toExactQJsonObject() rather than this function duplicating just
-// the lone-surrogate case itself.
+// CardCode::toRawJson() -- a key built via .value() directly bypasses
+// that type's own encode-time check entirely; DeckList::toRawJson()'s
+// caller validates the whole resulting AST in one pass via the central
+// Value::toExactQJsonObject() adapter rather than this function
+// duplicating just the lone-surrogate case itself.
 Json::Value rawEncodeCardQuantityMap(const QMap<CardCode, qint64> &map) {
   QList<std::pair<QString, Json::Value>> members;
   members.reserve(map.size());
@@ -498,32 +498,11 @@ ExternalDeckId::fromRawObject(const Json::Value &obj, QStringView path) {
                      .arg(idPath, Json::typeName(v)));
 }
 
-ValueOrError<QJsonValue> ExternalDeckId::toJson() const {
-  // Builds the identical Json::Value toRawJson() already composes (see
-  // its own doc comment in Decks.h) and routes it through
-  // Value::toExactQJson()'s single canonical, bounded check, rather than
-  // hand-duplicating a subset of it here: the previous implementation
-  // checked Kind::Text for a lone surrogate but never against
-  // ParseLimits::production().maxStringLength, and called
-  // m_number.toExactInt64() directly for Kind::Number without first
-  // checking maxNumberDigits the way toExactQJson()'s own Number branch
-  // does -- so e.g. a "0." + 65 zero-digit fraction (all-zero, so
-  // toExactInt64() trivially returns 0) would have silently encoded as
-  // 0 here while toJsonBytes()/toExactQJson() reject the same literal
-  // for exceeding the digit budget. Kind::Absent/Kind::Null need no
-  // string/number validation of their own; toExactQJson() itself
-  // reproduces their exact QJsonValue::Undefined/Null results (see its
-  // own Kind::Undefined/Kind::Null cases), so this is a strict
-  // behavioral superset of the previous switch, not merely an equivalent
-  // rewrite.
-  return toRawJson().toExactQJson();
-}
-
 Json::Value ExternalDeckId::toRawJson() const {
   switch (m_kind) {
   case Kind::Absent:
-    // Mirrors toJson()'s QJsonValue::Undefined above: Undefined (not
-    // Null) so a caller composing this directly into an enclosing object
+    // Undefined (not Null), so a caller composing this directly into an
+    // enclosing object
     // omits the "id" key entirely, rather than silently emitting an
     // explicit JSON null for what is semantically an omitted id. Any
     // attempt to serialize this Undefined value on its own fails loudly
@@ -562,26 +541,6 @@ ValueOrError<DeckListInput> DeckListInput::fromRawBytes(QByteArrayView bytes,
   if (!raw)
     return failure(raw.error());
   return fromRawJson(*raw, path);
-}
-
-ValueOrError<QJsonObject> DeckListInput::toJson() const {
-  // Composes toRawJson() (below) and its own bounded exact QJsonObject
-  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
-  // hand-inserting fields into a QJsonObject: the previous implementation
-  // built cardSlots/id/sideSlots this way but embedded
-  // investigatorCode/investigatorName/meta/url/name via raw
-  // QJsonValue(QString) construction with zero validation, so a
-  // lone/mismatched UTF-16 surrogate in any of those fields would have
-  // silently produced a normal-looking-but-invalid QJsonObject here even
-  // though toJsonBytes() correctly rejected the identical input. Routing
-  // through the same toRawJson() AST toJsonBytes() itself serializes, and
-  // the same Value::toExactQJson() machinery toJsonBytes() effectively
-  // relies on for validation, means this convenience can never again
-  // diverge from the canonical encoder's invariants.
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> DeckListInput::toRawJson() const {
@@ -638,10 +597,6 @@ ValueOrError<DeckList> DeckList::fromRawBytes(QByteArrayView bytes,
   return fromRawJson(*parsed, path);
 }
 
-ValueOrError<QJsonObject> DeckList::toJson() const {
-  return toRawJson().toExactQJsonObject();
-}
-
 Json::Value DeckList::toRawJson() const {
   // Every ternary below uses Json::Value::makeNull() rather than leaving
   // the key absent for the unset case: decks.schema.json requires each of
@@ -682,10 +637,6 @@ ValueOrError<Deck> Deck::fromRawBytes(QByteArrayView bytes, QStringView path) {
   if (!parsed)
     return failure(parsed.error());
   return fromRawJson(*parsed, path);
-}
-
-ValueOrError<QJsonObject> Deck::toJson() const {
-  return toRawJson().toExactQJsonObject();
 }
 
 Json::Value Deck::toRawJson() const {
@@ -741,19 +692,6 @@ ValueOrError<Json::Value> CreateDeckRequest::toRawJson() const {
   return Json::Value::makeObject(std::move(members));
 }
 
-ValueOrError<QJsonObject> CreateDeckRequest::toJson() const {
-  // Composes toRawJson() above and its own bounded exact QJsonObject
-  // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
-  // embedding deckId/deckName/deckUrl via raw, unvalidated
-  // QJsonValue(QString) construction, so a lone/mismatched UTF-16
-  // surrogate anywhere in this request is a typed failure here too, not
-  // only at toJsonBytes().
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
-}
-
 ValueOrError<QByteArray> CreateDeckRequest::toJsonBytes() const {
   auto raw = toRawJson();
   if (!raw)
@@ -792,20 +730,6 @@ FetchDeckRequest::fromRawBytes(QByteArrayView bytes, QStringView path) {
   if (!raw)
     return failure(raw.error());
   return fromRawJson(*raw, path);
-}
-
-ValueOrError<QJsonObject> FetchDeckRequest::toJson() const {
-  // Composes toRawJson() below and its own bounded exact QJsonObject
-  // conversion (see Value::toExactQJsonObject() in RawJson.h), rather
-  // than embedding `url` via a raw, unvalidated QJsonValue(QString)
-  // construction: a lone/mismatched UTF-16 surrogate in `url` is now a
-  // typed failure here too, matching toJsonBytes() rather than silently
-  // emitting an invalid QJsonObject the byte encoder would separately
-  // reject.
-  auto raw = toRawJson();
-  if (!raw)
-    return failure(raw.error());
-  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> FetchDeckRequest::toRawJson() const {
@@ -866,10 +790,6 @@ DeckValidationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
   if (!raw)
     return failure(raw.error());
   return fromRawJson(*raw, path);
-}
-
-ValueOrError<QJsonObject> DeckValidationError::toJson() const {
-  return toRawJson().toExactQJsonObject();
 }
 
 Json::Value DeckValidationError::toRawJson() const {
@@ -951,15 +871,6 @@ DeckValidationResult::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*raw, path);
 }
 
-ValueOrError<QJsonArray> DeckValidationResult::toJson() const {
-  // Builds the complete array as a Json::Value AST (via toRawJson()
-  // below) and converts ONCE via Value::toExactQJsonArray() (see
-  // RawJson.h), rather than appending each element's individually-exact
-  // DeckValidationError::toJson() result into a QJsonArray by hand: the
-  // latter has no bound of its own on the total element/node count.
-  return toRawJson().toExactQJsonArray();
-}
-
 Json::Value DeckValidationResult::toRawJson() const {
   QList<Json::Value> items;
   items.reserve(m_errors.size());
@@ -1009,16 +920,11 @@ DeckOperationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*raw, path);
 }
 
-ValueOrError<QJsonObject> DeckOperationError::toJson() const {
-  // Composes a complete Json::Value AST and converts once via
-  // toExactQJsonObject() -- rather than validating errorMsg individually
-  // via toExactQJson() and then returning a hand-built QJsonObject
-  // literal directly -- for the same structural-consistency reason as
-  // every other encoder in this domain (see e.g. CardDef::toJson()).
+Json::Value DeckOperationError::toRawJson() const {
   QList<std::pair<QString, Json::Value>> members{
       {QStringLiteral("errorMsg"), Json::Value::makeString(errorMsg)},
   };
-  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
+  return Json::Value::makeObject(std::move(members));
 }
 
 } // namespace Arkham
