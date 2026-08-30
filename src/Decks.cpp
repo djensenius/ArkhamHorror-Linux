@@ -155,10 +155,27 @@ QJsonObject encodeCardQuantityMapInput(const QMap<QString, qint64> &map) {
   return obj;
 }
 
-QJsonObject encodeCardQuantityMap(const QMap<CardCode, qint64> &map) {
+// Builds the `slots`/`sideSlots` QJsonObject for DeckList::toJson() below.
+// A CardCode's own construction-time validation (see CardCode::parse() in
+// Identifiers.h) does not rule out a lone/mismatched UTF-16 surrogate, so
+// -- unlike a value embedded via CardCode::toJson() -- a key built via
+// .value() directly bypasses that type's own encode-time check entirely;
+// this validates each key against the same Json::hasLoneSurrogate() the
+// rest of this codebase's canonical encoders use, rather than silently
+// producing a QJsonObject with an unencodable key.
+ValueOrError<QJsonObject>
+encodeCardQuantityMap(const QMap<CardCode, qint64> &map) {
   QJsonObject obj;
-  for (auto it = map.constBegin(); it != map.constEnd(); ++it)
-    obj.insert(it.key().value(), it.value());
+  for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
+    const QString &key = it.key().value();
+    if (Json::hasLoneSurrogate(key))
+      return failure(
+          QStringLiteral(
+              "card code \"%1\" contains a lone UTF-16 surrogate code unit, "
+              "which cannot be encoded as valid UTF-8")
+              .arg(key));
+    obj.insert(key, it.value());
+  }
   return obj;
 }
 
@@ -505,6 +522,18 @@ ValueOrError<QJsonValue> ExternalDeckId::toJson() const {
     // Undefined which omits the key entirely.
     return QJsonValue(QJsonValue::Null);
   case Kind::Text:
+    // text()'s factory (see below) accepts any QString whatsoever --
+    // including an empty one or one holding a lone/mismatched UTF-16
+    // surrogate -- with no validation of its own, so a
+    // validly-constructed Kind::Text instance is not guaranteed
+    // wire-safe. Reject a lone surrogate here exactly like
+    // Value::toExactQJson()/toJsonBytes() would, via the same shared
+    // Json::hasLoneSurrogate() check, rather than ever returning a
+    // QJsonValue no downstream UTF-8 encoder could faithfully represent.
+    if (Json::hasLoneSurrogate(m_text))
+      return failure(QStringLiteral(
+          "ExternalDeckId::toJson: text id contains a lone UTF-16 "
+          "surrogate code unit, which cannot be encoded as valid UTF-8"));
     return QJsonValue(m_text);
   case Kind::Number:
     // Exact via QJsonValue(qint64) -- never a double -- whenever the
@@ -644,7 +673,7 @@ ValueOrError<DeckList> DeckList::fromRawBytes(QByteArrayView bytes,
   return fromRawJson(*parsed, path);
 }
 
-QJsonObject DeckList::toJson() const {
+ValueOrError<QJsonObject> DeckList::toJson() const {
   // Every ternary below uses QJsonValue(QJsonValue::Null) rather than the
   // bare default-constructed QJsonValue() for the unset case. Both
   // produce an identical Null-kind value (QJsonValue's default
@@ -653,10 +682,21 @@ QJsonObject DeckList::toJson() const {
   // avoids any ambiguity for a reader about which Qt JSON kind is
   // intended: decks.schema.json requires each of these keys to be
   // present, just nullable, so the key must never be omitted here.
+  auto slotsEncoded = encodeCardQuantityMap(cardSlots);
+  if (!slotsEncoded)
+    return failure(QStringLiteral("slots: %1").arg(slotsEncoded.error()));
+  auto sideSlotsEncoded = encodeCardQuantityMap(sideSlots);
+  if (!sideSlotsEncoded)
+    return failure(
+        QStringLiteral("sideSlots: %1").arg(sideSlotsEncoded.error()));
+  auto investigatorCodeEncoded = investigatorCode.toJson();
+  if (!investigatorCodeEncoded)
+    return failure(QStringLiteral("investigator_code: %1")
+                       .arg(investigatorCodeEncoded.error()));
   return QJsonObject{
-      {QStringLiteral("slots"), encodeCardQuantityMap(cardSlots)},
-      {QStringLiteral("sideSlots"), encodeCardQuantityMap(sideSlots)},
-      {QStringLiteral("investigator_code"), investigatorCode.toJson()},
+      {QStringLiteral("slots"), *slotsEncoded},
+      {QStringLiteral("sideSlots"), *sideSlotsEncoded},
+      {QStringLiteral("investigator_code"), *investigatorCodeEncoded},
       {QStringLiteral("investigator_name"), investigatorName},
       {QStringLiteral("meta"),
        meta ? QJsonValue(*meta) : QJsonValue(QJsonValue::Null)},
@@ -686,7 +726,10 @@ ValueOrError<Deck> Deck::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*parsed, path);
 }
 
-QJsonObject Deck::toJson() const {
+ValueOrError<QJsonObject> Deck::toJson() const {
+  auto listEncoded = list.toJson();
+  if (!listEncoded)
+    return failure(QStringLiteral("list: %1").arg(listEncoded.error()));
   return QJsonObject{
       {QStringLiteral("id"), id.toJson()},
       {QStringLiteral("userId"), userId},
@@ -698,7 +741,7 @@ QJsonObject Deck::toJson() const {
        url ? QJsonValue(*url) : QJsonValue(QJsonValue::Null)},
       {QStringLiteral("name"), name},
       {QStringLiteral("investigatorName"), investigatorName},
-      {QStringLiteral("list"), list.toJson()},
+      {QStringLiteral("list"), *listEncoded},
   };
 }
 
@@ -862,10 +905,13 @@ DeckValidationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*raw, path);
 }
 
-QJsonObject DeckValidationError::toJson() const {
+ValueOrError<QJsonObject> DeckValidationError::toJson() const {
+  auto cardCodeEncoded = cardCode.toJson();
+  if (!cardCodeEncoded)
+    return failure(QStringLiteral("contents: %1").arg(cardCodeEncoded.error()));
   return QJsonObject{
       {QStringLiteral("tag"), QStringLiteral("UnimplementedCard")},
-      {QStringLiteral("contents"), cardCode.toJson()},
+      {QStringLiteral("contents"), *cardCodeEncoded},
   };
 }
 
@@ -939,10 +985,14 @@ DeckValidationResult::fromRawBytes(QByteArrayView bytes, QStringView path) {
   return fromRawJson(*raw, path);
 }
 
-QJsonArray DeckValidationResult::toJson() const {
+ValueOrError<QJsonArray> DeckValidationResult::toJson() const {
   QJsonArray arr;
-  for (const DeckValidationError &error : m_errors)
-    arr.append(error.toJson());
+  for (qsizetype i = 0; i < m_errors.size(); ++i) {
+    auto encoded = m_errors.at(i).toJson();
+    if (!encoded)
+      return failure(QStringLiteral("[%1]: %2").arg(i).arg(encoded.error()));
+    arr.append(*encoded);
+  }
   return arr;
 }
 

@@ -415,8 +415,11 @@ ValueOrError<QJsonObject> InvestigatorSummary::toJson() const {
   if (!classSymbolEncoded)
     return failure(
         QStringLiteral("classSymbol: %1").arg(classSymbolEncoded.error()));
+  auto idEncoded = id.toJson();
+  if (!idEncoded)
+    return failure(QStringLiteral("id: %1").arg(idEncoded.error()));
   return QJsonObject{
-      {QStringLiteral("id"), id.toJson()},
+      {QStringLiteral("id"), *idEncoded},
       {QStringLiteral("classSymbol"), *classSymbolEncoded},
   };
 }
@@ -436,10 +439,16 @@ ValueOrError<QJsonObject> ScenarioSummary::toJson() const {
   if (!difficultyEncoded)
     return failure(
         QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
+  auto idEncoded = id.toJson();
+  if (!idEncoded)
+    return failure(QStringLiteral("id: %1").arg(idEncoded.error()));
+  auto nameEncoded = name.toJson();
+  if (!nameEncoded)
+    return failure(QStringLiteral("name: %1").arg(nameEncoded.error()));
   return QJsonObject{
-      {QStringLiteral("id"), id.toJson()},
+      {QStringLiteral("id"), *idEncoded},
       {QStringLiteral("difficulty"), *difficultyEncoded},
-      {QStringLiteral("name"), name.toJson()},
+      {QStringLiteral("name"), *nameEncoded},
       {QStringLiteral("variant"),
        variant ? QJsonValue(*variant) : QJsonValue(QJsonValue::Null)},
   };
@@ -469,8 +478,11 @@ ValueOrError<QJsonObject> CampaignSummary::toJson() const {
                          .arg(currentCampaignModeEncoded.error()));
     currentCampaignModeValue = QJsonValue(*currentCampaignModeEncoded);
   }
+  auto idEncoded = id.toJson();
+  if (!idEncoded)
+    return failure(QStringLiteral("id: %1").arg(idEncoded.error()));
   return QJsonObject{
-      {QStringLiteral("id"), id.toJson()},
+      {QStringLiteral("id"), *idEncoded},
       {QStringLiteral("difficulty"), *difficultyEncoded},
       {QStringLiteral("currentCampaignMode"), currentCampaignModeValue},
   };
@@ -1369,15 +1381,6 @@ CampaignOrScenario::fromValueImpl(const Obj &requestObj, QStringView path) {
   return result;
 }
 
-void CampaignOrScenario::insertInto(QJsonObject &obj) const {
-  obj.insert(QStringLiteral("campaignId"), m_campaignId
-                                               ? m_campaignId->toJson()
-                                               : QJsonValue(QJsonValue::Null));
-  obj.insert(QStringLiteral("scenarioId"), m_scenarioId
-                                               ? m_scenarioId->toJson()
-                                               : QJsonValue(QJsonValue::Null));
-}
-
 void CampaignOrScenario::insertRawInto(
     QList<std::pair<QString, Json::Value>> &members) const {
   members.append({QStringLiteral("campaignId"),
@@ -1543,12 +1546,14 @@ ValueOrError<QJsonObject> CreateGameRequest::toJson() const {
   // conversion (see Value::toExactQJsonObject() in RawJson.h) rather than
   // hand-building a QJsonObject: the previous implementation embedded
   // campaignName via a raw QJsonValue(QString) construction with zero
-  // validation (and, transitively via CampaignOrScenario::insertInto(),
-  // campaignId/scenarioId the same way), so a lone/mismatched UTF-16
-  // surrogate there would have silently produced a normal-looking-but-
-  // invalid QJsonObject even though toJsonBytes() correctly rejected the
-  // identical input. toRawJson() already validates deckIds' null-uuid
-  // invariant, so that check is not duplicated here.
+  // validation (and, transitively via a since-removed
+  // CampaignOrScenario::insertInto() test-only fragment method --
+  // round-16-cumulative-review item 1 -- campaignId/scenarioId the same
+  // way), so a lone/mismatched UTF-16 surrogate there would have
+  // silently produced a normal-looking-but-invalid QJsonObject even
+  // though toJsonBytes() correctly rejected the identical input.
+  // toRawJson() already validates deckIds' null-uuid invariant, so that
+  // check is not duplicated here.
   auto raw = toRawJson();
   if (!raw)
     return failure(raw.error());
@@ -1850,10 +1855,14 @@ ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
   return result;
 }
 
-QJsonArray encodeOpenSeats(const QList<CardCode> &seats) {
+ValueOrError<QJsonArray> encodeOpenSeats(const QList<CardCode> &seats) {
   QJsonArray result;
-  for (const auto &seat : seats)
-    result.append(seat.toJson());
+  for (qsizetype i = 0; i < seats.size(); ++i) {
+    auto encoded = seats.at(i).toJson();
+    if (!encoded)
+      return failure(QStringLiteral("[%1]: %2").arg(i).arg(encoded.error()));
+    result.append(*encoded);
+  }
   return result;
 }
 

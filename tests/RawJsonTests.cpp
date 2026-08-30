@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include <array>
 #include <limits>
 
 #include "RawJson.h"
@@ -170,6 +171,20 @@ private slots:
   void toExactQJsonObjectConvertsObjectSuccessfully();
   void toExactQJsonObjectRejectsNonObjectValue();
   void toExactQJsonObjectRejectsSameInvariantViolationsAsToExactQJson();
+
+  // Round-16-cumulative-review item 2: toExactQJsonInner()'s Number
+  // branch previously omitted the per-component digit-budget checks (int
+  // eger/fraction/exponent digit counts against limits.maxNumberDigits)
+  // that toJsonBytesInner()'s Number branch already enforced -- a
+  // RawNumber parsed under a wider custom ParseLimits (e.g. an all-zero
+  // coefficient with more digits than production's 64-digit budget)
+  // would silently succeed/normalize to 0 via toExactQJson() (whose
+  // all-zero toExactInt64() shortcut ran unconditionally) while
+  // toJsonBytes() correctly rejected the identical AST under production
+  // limits. Direct parity table plus an enclosing DeckList/sideSlots
+  // aggregate test below.
+  void toExactQJsonRejectsAllZeroCoefficientExceedingProductionDigitBudget();
+  void toExactQJsonParityTableMatchesToJsonBytesForEveryDigitBudgetCase();
 
   // Round-14 items 2/3: RawNumber's implicit move constructor/assignment
   // used to move (empty) its QString digit members, leaving a moved-from
@@ -1380,6 +1395,106 @@ void RawJsonTests::
   const Value objWithDeepArray =
       Value::makeObject({{QStringLiteral("nested"), deeplyNested}});
   QVERIFY(!objWithDeepArray.toExactQJsonObject().has_value());
+}
+
+void RawJsonTests::
+    toExactQJsonRejectsAllZeroCoefficientExceedingProductionDigitBudget() {
+  // Round-16-cumulative-review item 2: an all-zero coefficient short-
+  // circuits RawNumber::toExactInt64() to exact 0 regardless of digit
+  // count, so it is the only way to construct a RawNumber whose digit
+  // count exceeds ParseLimits::production().maxNumberDigits (64) while
+  // still being "exactly representable" by every other check -- any
+  // nonzero literal that long already fails toExactInt64()'s own
+  // magnitude-range check for unrelated reasons, so it could never have
+  // exposed this specific gap. The fraction part carries the excess
+  // zero digits (RFC 8259's `int` production forbids a redundant leading
+  // zero like "00", but `frac` places no such restriction on its digits),
+  // parsed here under a custom, deliberately widened ParseLimits (so
+  // parse() itself accepts the 70-zero-digit fraction), proving
+  // toExactQJson() -- which takes no limits parameter and always
+  // enforces production()'s budget internally -- now rejects it exactly
+  // like toJsonBytes(ParseLimits::production()) already did before this
+  // fix.
+  ParseLimits wide;
+  wide.maxNumberDigits = 128;
+  QVERIFY(70 > ParseLimits::production().maxNumberDigits);
+  const QByteArray literal = QByteArrayLiteral("0.") + QByteArray(70, '0');
+  auto parsed = Value::parse(literal, u"n", wide);
+  if (!parsed)
+    QFAIL(qPrintable(parsed.error()));
+  QVERIFY(parsed->isNumber());
+  QCOMPARE(parsed->toRawNumber().fractionDigits().size(), qsizetype(70));
+
+  // Before this fix: succeeded (toExactInt64()'s all-zero shortcut ran
+  // unconditionally, ignoring the 70 > 64 digit-budget violation).
+  const auto exactQJson = parsed->toExactQJson();
+  QVERIFY(!exactQJson.has_value());
+  QVERIFY2(exactQJson.error().contains(QStringLiteral("maximum digit count")),
+           qPrintable(exactQJson.error()));
+
+  // toJsonBytes() under the SAME production limits already rejected this
+  // (the pre-existing, correct behavior this fix brings toExactQJson()
+  // into parity with).
+  const auto bytesUnderProduction =
+      parsed->toJsonBytes(ParseLimits::production());
+  QVERIFY(!bytesUnderProduction.has_value());
+
+  // Under the original wide limits used to parse it, toJsonBytes() still
+  // succeeds -- proving the rejection above is specifically a production-
+  // budget mismatch, not a newly-broken all-zero/huge-digit-count case in
+  // general.
+  const auto bytesUnderWideLimits = parsed->toJsonBytes(wide);
+  if (!bytesUnderWideLimits)
+    QFAIL(qPrintable(bytesUnderWideLimits.error()));
+  QCOMPARE(*bytesUnderWideLimits, literal);
+}
+
+void RawJsonTests::
+    toExactQJsonParityTableMatchesToJsonBytesForEveryDigitBudgetCase() {
+  // Direct parity table (round-16-cumulative-review item 2's explicit
+  // ask): for each case, toExactQJson() (always production limits) and
+  // toJsonBytes(ParseLimits::production()) must agree on success/failure
+  // for the identical Value. Every all-zero case below places its excess
+  // digits in the fraction part (see the dedicated test above for why
+  // the integer part cannot syntactically carry them).
+  struct Case {
+    QByteArray literal;
+    qsizetype parseDigitBudget;
+    bool expectSuccess;
+  };
+  const std::array<Case, 4> cases{{
+      // At the production digit budget (64 zero fraction digits): both
+      // succeed.
+      {QByteArrayLiteral("0.") + QByteArray(64, '0'), 64, true},
+      // One over budget (65 zero fraction digits): both fail.
+      {QByteArrayLiteral("0.") + QByteArray(65, '0'), 65, false},
+      // Far over budget (100 zero fraction digits), parsed under a
+      // custom wide limit so parse() itself accepts it: both still fail.
+      {QByteArrayLiteral("0.") + QByteArray(100, '0'), 128, false},
+      // An ordinary short nonzero integer: both succeed. (A huge
+      // *nonzero* exponent is deliberately NOT included here: toJsonBytes()
+      // never evaluates magnitude at all -- it only re-emits
+      // RawNumber::literal() text once digit-count budgets pass -- while
+      // toExactQJson() additionally requires exact qint64
+      // representability via toExactInt64(). That asymmetry is expected
+      // and pre-existing, not a digit-budget parity gap, so it does not
+      // belong in this table.)
+      {QByteArrayLiteral("42"), 64, true},
+  }};
+  for (const auto &c : cases) {
+    ParseLimits limits = ParseLimits::production();
+    limits.maxNumberDigits = c.parseDigitBudget;
+    auto parsed = Value::parse(c.literal, u"n", limits);
+    if (!parsed)
+      QFAIL(qPrintable(QStringLiteral("fixture literal %1 must parse under "
+                                      "widened test limits: %2")
+                           .arg(QString::fromUtf8(c.literal), parsed.error())
+                           .toUtf8()));
+    const auto exactQJson = parsed->toExactQJson();
+    const auto bytes = parsed->toJsonBytes(ParseLimits::production());
+    QCOMPARE(exactQJson.has_value(), c.expectSuccess);
+    QCOMPARE(bytes.has_value(), c.expectSuccess);
+  }
 }
 
 void RawJsonTests::rawNumberMoveConstructLeavesSourceValidAndReusable() {

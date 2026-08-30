@@ -99,7 +99,15 @@ ValueOrError<CardName> CardName::fromJson(const Json::Value &v,
   return cardNameFromValueImpl(v, path);
 }
 
-QJsonObject CardName::toJson() const {
+ValueOrError<QJsonObject> CardName::toJson() const {
+  if (Json::hasLoneSurrogate(title))
+    return failure(QStringLiteral(
+        "title: contains a lone UTF-16 surrogate code unit, which cannot "
+        "be encoded as valid UTF-8"));
+  if (subtitle && Json::hasLoneSurrogate(*subtitle))
+    return failure(QStringLiteral(
+        "subtitle: contains a lone UTF-16 surrogate code unit, which "
+        "cannot be encoded as valid UTF-8"));
   return QJsonObject{
       {QStringLiteral("title"), title},
       // QJsonValue()'s default constructor is QJsonValue::Null, not

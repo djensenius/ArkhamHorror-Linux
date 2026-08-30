@@ -687,22 +687,13 @@ public:
   // AST (see RawJson.h) for CreateGameRequest::fromRawJson.
   [[nodiscard]] static ValueOrError<CampaignOrScenario>
   fromJson(const Json::Value &requestObj, QStringView path);
-  // QJsonObject convenience fragment-insertion, for display/log/debug or
-  // a QJsonObject-typed test assertion -- NEVER for building outbound
-  // request bytes. Inserts this request's resolved
-  // "campaignId"/"scenarioId" keys (each either the real id or explicit
-  // JSON null) into `obj`, matching the fixture's own encoding (both keys
-  // always present), but embeds each id via a raw, unvalidated
+  // Canonical byte-level equivalent of a prior insertInto() fragment
+  // (round-10-cumulative-review item 2, since removed -- see
+  // round-16-cumulative-review item 1: insertInto() had zero production
+  // callers, was test-only, and embedded each id via a raw, unvalidated
   // QJsonValue(QString) construction with no lone/mismatched UTF-16
-  // surrogate check -- see insertRawInto() below for the always-lossless,
-  // always-validated equivalent CreateGameRequest::toRawJson() actually
-  // composes through; CreateGameRequest::toJson() no longer calls this
-  // method (it derives its QJsonObject view from toRawJson() instead), so
-  // this remains solely a fragment-comparison convenience for tests.
-  void insertInto(QJsonObject &obj) const;
-  // Canonical byte-level equivalent of insertInto() (round-10-cumulative-
-  // review item 2): appends the same two keys, built directly as
-  // Json::Value strings/null rather than QJsonValue, so
+  // surrogate check, unlike this method): appends the same two keys,
+  // built directly as Json::Value strings/null rather than QJsonValue, so
   // CreateGameRequest::toJsonBytes() can reject a campaignId/scenarioId
   // containing a lone/mismatched UTF-16 surrogate instead of silently
   // embedding invalid UTF-8 -- neither id is currently UUID-backed (see
@@ -892,6 +883,11 @@ struct ClaimSeatRequest {
 // "c"-prefixed) card codes of investigators still owed a seat.
 [[nodiscard]] ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
                                                             QStringView path);
-[[nodiscard]] QJsonArray encodeOpenSeats(const QList<CardCode> &seats);
+// Test/round-trip-only reverse encoder (not used by any production
+// response/request path); propagates each CardCode::toJson()'s own typed
+// failure for a lone/mismatched UTF-16 surrogate rather than ever
+// silently producing an unencodable QJsonArray.
+[[nodiscard]] ValueOrError<QJsonArray>
+encodeOpenSeats(const QList<CardCode> &seats);
 
 } // namespace Arkham

@@ -95,7 +95,12 @@ public:
   // magnitude outside qint64's range) there is no way to represent it in
   // a QJsonValue without rounding through a double and silently losing
   // precision, so this returns a typed failure instead: this type never
-  // has a "safe fallback" that substitutes a rounded value.
+  // has a "safe fallback" that substitutes a rounded value. Kind::Text
+  // similarly fails for a lone/mismatched UTF-16 surrogate (text()'s
+  // factory does not itself validate for one), via the same
+  // Json::hasLoneSurrogate() check Value::toExactQJson()/toJsonBytes()
+  // use, rather than ever returning a QJsonValue no downstream UTF-8
+  // encoder could faithfully represent.
   [[nodiscard]] ValueOrError<QJsonValue> toJson() const;
   // The lossless Json::Value AST fragment for this id, for splicing into
   // a request built via Json::Value's builder statics (see RawJson.h).
@@ -248,7 +253,14 @@ struct DeckList {
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<DeckList> fromRawBytes(QByteArrayView bytes,
                                                            QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- this is a response-shape DTO
+  // (never composed into an outbound request), but investigatorCode
+  // (CardCode) and each cardSlots/sideSlots key are only validated at
+  // construction for non-emptiness/shape, not for every possible UTF-16
+  // code unit, so this is a typed failure rather than a silently
+  // unencodable QJsonObject for a lone/mismatched surrogate.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const DeckList &, const DeckList &) = default;
 };
@@ -274,7 +286,12 @@ struct Deck {
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<Deck> fromRawBytes(QByteArrayView bytes,
                                                        QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- this is a response-shape DTO
+  // (never composed into an outbound request); propagates list.toJson()'s
+  // own typed failure (see DeckList::toJson()'s doc comment) rather than
+  // ever silently producing an unencodable QJsonObject.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const Deck &, const Deck &) = default;
 };
@@ -383,7 +400,13 @@ struct DeckValidationError {
   // before any nested decode runs, and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<DeckValidationError>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- this is a response-shape DTO
+  // (never composed into an outbound request); propagates
+  // cardCode.toJson()'s own typed failure for a lone/mismatched
+  // surrogate rather than ever silently producing an unencodable
+  // QJsonObject.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
 
   friend bool operator==(const DeckValidationError &,
                          const DeckValidationError &) = default;
@@ -425,7 +448,12 @@ public:
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<DeckValidationResult>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonArray toJson() const;
+  // QJsonArray convenience conversion, for display/log/debug or a
+  // QJsonArray-typed test assertion -- this is a response-shape DTO
+  // (never composed into an outbound request); propagates each element's
+  // DeckValidationError::toJson() typed failure rather than ever
+  // silently producing an unencodable QJsonArray.
+  [[nodiscard]] ValueOrError<QJsonArray> toJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   [[nodiscard]] bool isSuccess() const noexcept {

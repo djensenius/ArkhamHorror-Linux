@@ -147,6 +147,12 @@ private slots:
   void deckListInputToJsonRejectsSideSlotsWithNestedUndefined();
   void deckListInputToJsonRejectsSideSlotsWithDuplicateKey();
   void createDeckRequestToJsonRejectsMaliciousSideSlots();
+  // Round-16-cumulative-review item 2 companion: a real enclosing
+  // request field (DeckListInput::sideSlots), not just Value::
+  // toExactQJson() in isolation, must reject an all-zero coefficient
+  // whose fraction digit count exceeds ParseLimits::production()'s
+  // digit budget.
+  void deckListInputToJsonRejectsSideSlotsWithExcessiveFractionDigitBudget();
   // Round-14 item 1: DeckListInput::toJson()/CreateDeckRequest::toJson()/
   // FetchDeckRequest::toJson() previously embedded
   // investigatorCode/deckName/url via raw, unvalidated QJsonValue(QString)
@@ -158,6 +164,23 @@ private slots:
   void deckListInputToJsonRejectsLoneSurrogateInInvestigatorCode();
   void createDeckRequestToJsonRejectsLoneSurrogateInDeckName();
   void fetchDeckRequestToJsonRejectsLoneSurrogateInUrl();
+  // Round-16-cumulative-review item 1: CampaignOrScenario::insertInto()
+  // (a QJsonObject-typed test-only fragment method with no
+  // lone-surrogate validation of its own) was removed as an unsafe,
+  // misleading public API (see Games.h/GamesTests.cpp); the reviewer
+  // also asked for a direct lone-surrogate parity test PER RETAINED
+  // fragment method, not merely through an enclosing request -- each of
+  // these five exercises exactly one fragment in isolation, proving it
+  // rejects a lone/mismatched UTF-16 surrogate exactly like
+  // Value::toExactQJson()/toJsonBytes() would, even though the enclosing
+  // request-level tests above already prove the same thing
+  // transitively.
+  void investigatorRefToJsonRejectsLoneSurrogateDirectly();
+  void cardCodeToJsonRejectsLoneSurrogateDirectly();
+  void cardNameToJsonRejectsLoneSurrogateInTitle();
+  void cardNameToJsonRejectsLoneSurrogateInSubtitle();
+  void externalDeckIdTextKindToJsonRejectsLoneSurrogate();
+  void deckListToJsonRejectsLoneSurrogateInCardSlotsKey();
 
   // Round-14 items 2/3: TypedId<Tag>/NonEmptyString<Tag>/CardCode used to
   // rely on an implicit move constructor/assignment that emptied the
@@ -310,7 +333,10 @@ void DecksTests::decodesNormalizedDeckListFromFixture() {
   QCOMPARE(*result->id, QStringLiteral("4242.0"));
   QCOMPARE(*result->name, QStringLiteral("Contract deck"));
 
-  QCOMPARE(result->toJson(), v.toObject());
+  auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, v.toObject());
 }
 
 void DecksTests::decodesDeckFromFixture() {
@@ -326,7 +352,10 @@ void DecksTests::decodesDeckFromFixture() {
   QCOMPARE(result->investigatorName, QStringLiteral("Roland Banks"));
   QCOMPARE(result->list.investigatorCode.value(), QStringLiteral("c01001"));
 
-  QCOMPARE(result->toJson(), v.toObject());
+  auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, v.toObject());
 }
 
 void DecksTests::deckListFromRawBytesMatchesFromJsonOnSameFixture() {
@@ -387,7 +416,10 @@ void DecksTests::decodesValidationErrorsFromFixture() {
   QCOMPARE(result->errorList().size(), 1);
   QCOMPARE(result->errorList().at(0).cardCode.value(),
            QStringLiteral("c99999"));
-  QCOMPARE(result->toJson(), v.toArray());
+  auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, v.toArray());
 }
 
 void DecksTests::decodesValidationSuccessFromFixture() {
@@ -399,7 +431,10 @@ void DecksTests::decodesValidationSuccessFromFixture() {
   QCOMPARE(result->kind(), DeckValidationResult::Kind::Success);
   QVERIFY(result->isSuccess());
   QVERIFY(result->errorList().isEmpty());
-  QCOMPARE(result->toJson(), v.toArray());
+  auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, v.toArray());
 }
 
 void DecksTests::decodesOperationErrorFromFixture() {
@@ -1159,7 +1194,10 @@ void DecksTests::nullableFieldsRoundTripAsExplicitNull() {
   QVERIFY(!result->url.has_value());
   QVERIFY(!result->id.has_value());
   QVERIFY(!result->name.has_value());
-  QCOMPARE(result->toJson(), obj);
+  auto reencoded = result->toJson();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, obj);
 }
 
 void DecksTests::normalizedDeckListMissingRequiredKeyRejected() {
@@ -1215,7 +1253,10 @@ void DecksTests::deckNullUrlRoundTripsAsExplicitNullNotOmitted() {
     QFAIL(qPrintable(result.error()));
   QVERIFY(!result->url.has_value());
 
-  const QJsonObject encoded = result->toJson();
+  auto encodedResult = result->toJson();
+  if (!encodedResult)
+    QFAIL(qPrintable(encodedResult.error()));
+  const QJsonObject encoded = *encodedResult;
   // A missing key's .value() is Undefined, whose isNull() is false (see
   // scratchDiagnosticCheck's empirical confirmation during review); so
   // this pair of assertions genuinely fails if the key were ever dropped,
@@ -1256,8 +1297,14 @@ void DecksTests::deckValidationResultSuccessAndErrorsAreDistinctKinds() {
   if (!errorsResult)
     QFAIL(qPrintable(errorsResult.error()));
   QVERIFY(success != *errorsResult);
-  QCOMPARE(success.toJson(), QJsonArray{});
-  QCOMPARE(errorsResult->toJson(),
+  auto successEncoded = success.toJson();
+  if (!successEncoded)
+    QFAIL(qPrintable(successEncoded.error()));
+  QCOMPARE(*successEncoded, QJsonArray{});
+  auto errorsEncoded = errorsResult->toJson();
+  if (!errorsEncoded)
+    QFAIL(qPrintable(errorsEncoded.error()));
+  QCOMPARE(*errorsEncoded,
            (QJsonArray{QJsonObject{
                {QStringLiteral("tag"), QStringLiteral("UnimplementedCard")},
                {QStringLiteral("contents"), QStringLiteral("c99999")}}}));
@@ -1417,6 +1464,58 @@ void DecksTests::deckListInputToJsonRejectsSideSlotsWithDuplicateKey() {
            qPrintable(encoded.error()));
 }
 
+void DecksTests::
+    deckListInputToJsonRejectsSideSlotsWithExcessiveFractionDigitBudget() {
+  // Companion to RawJsonTests::
+  // toExactQJsonRejectsAllZeroCoefficientExceedingProductionDigitBudget():
+  // proves the same digit-budget fix reaches through a real enclosing
+  // request field. An all-zero coefficient short-circuits
+  // RawNumber::toExactInt64() to exact 0 regardless of digit count, so
+  // it is the only way to build a number whose digit count exceeds
+  // ParseLimits::production().maxNumberDigits (64) while still being
+  // "exactly representable" by every other check; the excess zero
+  // digits live in the fraction part since RFC 8259's `int` production
+  // forbids a redundant leading zero like "00" but `frac` places no
+  // such restriction. Parsed here under a custom, deliberately widened
+  // ParseLimits so parse() itself accepts the 70-zero-digit fraction.
+  Json::ParseLimits wide;
+  wide.maxNumberDigits = 128;
+  const QByteArray excessiveFractionLiteral =
+      QByteArrayLiteral("0.") + QByteArray(70, '0');
+  auto parsedNumber = Json::Value::parse(excessiveFractionLiteral, u"n", wide);
+  if (!parsedNumber)
+    QFAIL(qPrintable(parsedNumber.error()));
+  QVERIFY(parsedNumber->isNumber());
+
+  DeckListInput input{
+      .sideSlots =
+          Json::Value::makeObject({{QStringLiteral("c01001"), *parsedNumber}}),
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+  };
+
+  // Before the digit-budget fix, DeckListInput::toJson()'s
+  // Value::toExactQJson() call would have silently accepted this via
+  // toExactInt64()'s all-zero shortcut, in spite of the encoded number
+  // exceeding production's digit budget.
+  const auto encoded = input.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("sideSlots")),
+           qPrintable(encoded.error()));
+
+  // toJsonBytes() (the lossless path, which already enforced this
+  // budget before this round's fix) rejects the identical AST too --
+  // proving both encoders agree, not merely that one happens to fail.
+  const auto bytes = input.toJsonBytes();
+  QVERIFY(!bytes.has_value());
+
+  // The enclosing CreateDeckRequest composes DeckListInput::toJson(),
+  // so the rejection must propagate all the way through the complete
+  // public request type as well.
+  const CreateDeckRequest request{.deckList = input};
+  const auto requestEncoded = request.toJsonBytes();
+  QVERIFY(!requestEncoded.has_value());
+}
+
 void DecksTests::createDeckRequestToJsonRejectsMaliciousSideSlots() {
   // Proves the rejection reaches the actual public outbound request type
   // this client sends over the wire, not merely DeckListInput in
@@ -1488,6 +1587,100 @@ void DecksTests::fetchDeckRequestToJsonRejectsLoneSurrogateInUrl() {
   QVERIFY(!encoded.has_value());
   const auto encodedBytes = request.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
+}
+
+void DecksTests::investigatorRefToJsonRejectsLoneSurrogateDirectly() {
+  // Direct fragment-level test (not merely through the enclosing
+  // DeckListInput -- see deckListInputToJsonRejectsLoneSurrogateInInvest
+  // igatorCode above) for NonEmptyString<Tag>::toJson(), the type behind
+  // InvestigatorRef/CampaignId/ScenarioId: parse() only requires
+  // non-empty text, so a lone surrogate is a validly-constructed value
+  // whose own toJson() must still reject it.
+  QString lone;
+  lone += QChar(0xD800);
+  const auto ref = InvestigatorRef::parse(lone);
+  if (!ref)
+    QFAIL(qPrintable(ref.error()));
+  const auto encoded = ref->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::cardCodeToJsonRejectsLoneSurrogateDirectly() {
+  // Direct fragment-level test for CardCode::toJson(): parse() validates
+  // the "c" prefix/non-emptiness/no-line-terminator shape but not every
+  // UTF-16 code unit, so "c" + a lone surrogate is a validly-constructed
+  // CardCode whose toJson() must still reject it.
+  QString lone = QStringLiteral("c");
+  lone += QChar(0xDC00);
+  const auto code = CardCode::parse(lone);
+  if (!code)
+    QFAIL(qPrintable(code.error()));
+  const auto encoded = code->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::cardNameToJsonRejectsLoneSurrogateInTitle() {
+  // Direct fragment-level test for CardName::toJson(): title/subtitle are
+  // plain public QString fields with no validating factory at all, so a
+  // lone surrogate is directly constructible.
+  QString lone;
+  lone += QChar(0xD800);
+  const CardName name{.title = lone, .subtitle = std::nullopt};
+  const auto encoded = name.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("title")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::cardNameToJsonRejectsLoneSurrogateInSubtitle() {
+  QString lone;
+  lone += QChar(0xDC00);
+  const CardName name{.title = QStringLiteral("Roland Banks"),
+                      .subtitle = lone};
+  const auto encoded = name.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("subtitle")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::externalDeckIdTextKindToJsonRejectsLoneSurrogate() {
+  // Direct fragment-level test for ExternalDeckId::toJson()'s Kind::Text
+  // branch: the text() factory does zero validation of its own (not even
+  // non-emptiness), so a lone surrogate is directly constructible and
+  // must be rejected at the encode boundary instead.
+  QString lone;
+  lone += QChar(0xD800);
+  const auto id = ExternalDeckId::text(lone);
+  QCOMPARE(id.kind(), ExternalDeckId::Kind::Text);
+  const auto encoded = id.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckListToJsonRejectsLoneSurrogateInCardSlotsKey() {
+  // Direct fragment-level test for encodeCardQuantityMap() (private to
+  // Decks.cpp, exercised here only through the public DeckList::toJson()
+  // it composes into): a CardCode key holding a lone surrogate must
+  // reject the whole map rather than silently producing a
+  // normal-looking-but-invalid QJsonObject key.
+  QString lone = QStringLiteral("c");
+  lone += QChar(0xD800);
+  const auto loneCode = CardCode::parse(lone);
+  if (!loneCode)
+    QFAIL(qPrintable(loneCode.error()));
+  const DeckList list{
+      .cardSlots = {{*loneCode, 1}},
+      .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
+  };
+  const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
 }
 
 void DecksTests::cardCodeMoveConstructLeavesSourceValidAndReusable() {

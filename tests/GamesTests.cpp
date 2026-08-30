@@ -23,6 +23,31 @@ Json::Value toRawJson(const QJsonValue &v) {
            qPrintable(result.error()));
   return *result;
 }
+
+// Round-16-cumulative-review item 1: CampaignOrScenario::insertInto() (a
+// QJsonObject-typed test-only fragment method with zero production
+// callers, and no lone/mismatched UTF-16 surrogate validation of its
+// own) has been removed as an unsafe, misleading public API -- see its
+// safe production counterpart insertRawInto()'s doc comment in Games.h.
+// This test helper reproduces the same "encode this CampaignOrScenario's
+// campaignId/scenarioId fragment as a QJsonObject" convenience the old
+// insertInto() provided, but exclusively through the canonical,
+// always-validated insertRawInto() + Value::toExactQJsonObject() path
+// production code itself uses -- so a test asserting against this can
+// never observe weaker validation than CreateGameRequest::toJsonBytes()
+// would apply to the same fragment. Fails via qFatal only for a
+// malformed *test fixture* (never production code), per this project's
+// qFatal convention (see toRawJson() above).
+QJsonObject
+encodeCampaignOrScenarioFragment(const CampaignOrScenario &campaignOrScenario) {
+  QList<std::pair<QString, Json::Value>> members;
+  campaignOrScenario.insertRawInto(members);
+  auto encoded = Json::Value::makeObject(members).toExactQJsonObject();
+  if (!encoded)
+    qFatal("test fixture construction must not fail: %s",
+           qPrintable(encoded.error()));
+  return *encoded;
+}
 } // namespace
 
 class GamesTests final : public QObject {
@@ -238,6 +263,22 @@ private slots:
   void investigatorRefMoveConstructLeavesSourceValidAndReusableInClaimSeat();
   void campaignIdMoveConstructLeavesSourceValidAndReusableInCreateGame();
   void scenarioIdMoveConstructLeavesSourceValidAndReusableInCreateGame();
+
+  // Round-16-cumulative-review item 1: CampaignOrScenario::insertInto()
+  // (unsafe, test-only, now removed -- see Games.h/encodeCampaignOrScenar
+  // ioFragment() above) is replaced by insertRawInto(), which was already
+  // safe/production-used but had no direct lone-surrogate parity test of
+  // its own; encodeOpenSeats()/InvestigatorSummary::toJson()/
+  // ScenarioSummary::toJson()/CampaignSummary::toJson() are the other
+  // retained fragment encoders this round makes fallible, each getting
+  // its own direct or minimally-enclosing parity test per the reviewer's
+  // "per retained fragment" ask.
+  void insertRawIntoFragmentRejectsLoneSurrogateInCampaignId();
+  void encodeOpenSeatsRejectsLoneSurrogateInCardCode();
+  void investigatorSummaryToJsonRejectsLoneSurrogateInId();
+  void scenarioSummaryToJsonRejectsLoneSurrogateInName();
+  void campaignSummaryToJsonRejectsLoneSurrogateInId();
+  void gameListRowToJsonRejectsLoneSurrogateThroughInvestigatorSummary();
 };
 
 namespace {
@@ -1149,7 +1190,10 @@ void GamesTests::decodesOpenSeatsFromFixture() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->size(), 2);
   QCOMPARE(result->at(0).value(), QStringLiteral("c01001"));
-  QCOMPARE(encodeOpenSeats(*result), v.toArray());
+  auto encoded = encodeOpenSeats(*result);
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, v.toArray());
 }
 
 void GamesTests::unknownCampaignOptionWithContentsPreservedAndRoundTrips() {
@@ -1423,17 +1467,13 @@ void GamesTests::campaignWithStartingScenarioAccepted() {
   QCOMPARE(result->campaignId()->value(), QStringLiteral("01"));
   QVERIFY(result->scenarioId().has_value());
   QCOMPARE(result->scenarioId()->value(), QStringLiteral("01104"));
-  QJsonObject encoded;
-  result->insertInto(encoded);
-  QCOMPARE(encoded, obj);
+  QCOMPARE(encodeCampaignOrScenarioFragment(*result), obj);
 
   // The factory-based construction path produces the same encoded shape.
   const CampaignOrScenario viaFactory =
       CampaignOrScenario::campaignWithStartingScenario(
           *CampaignId::parse(u"01"_s), *ScenarioId::parse(u"01104"_s));
-  QJsonObject encodedViaFactory;
-  viaFactory.insertInto(encodedViaFactory);
-  QCOMPARE(encodedViaFactory, obj);
+  QCOMPARE(encodeCampaignOrScenarioFragment(viaFactory), obj);
 }
 
 void GamesTests::neitherCampaignNorScenarioIdRejected() {
@@ -1465,9 +1505,7 @@ void GamesTests::campaignOnlyAccepted() {
     QFAIL(qPrintable(result.error()));
   QVERIFY(result->isCampaign());
   QCOMPARE(result->campaignId()->value(), QStringLiteral("01"));
-  QJsonObject encoded;
-  result->insertInto(encoded);
-  QCOMPARE(encoded, obj);
+  QCOMPARE(encodeCampaignOrScenarioFragment(*result), obj);
 }
 
 void GamesTests::scenarioOnlyAccepted() {
@@ -1479,17 +1517,13 @@ void GamesTests::scenarioOnlyAccepted() {
     QFAIL(qPrintable(result.error()));
   QVERIFY(!result->isCampaign());
   QCOMPARE(result->scenarioId()->value(), QStringLiteral("01104"));
-  QJsonObject encoded;
-  result->insertInto(encoded);
-  QCOMPARE(encoded, obj);
+  QCOMPARE(encodeCampaignOrScenarioFragment(*result), obj);
 
   // The factory-based construction path (not just fromJson) produces the
   // same encoded shape.
   const CampaignOrScenario viaFactory =
       CampaignOrScenario::scenario(*ScenarioId::parse(u"01104"_s));
-  QJsonObject encodedViaFactory;
-  viaFactory.insertInto(encodedViaFactory);
-  QCOMPARE(encodedViaFactory, obj);
+  QCOMPARE(encodeCampaignOrScenarioFragment(viaFactory), obj);
 }
 
 void GamesTests::strictAsIfAtOmittedWhenUnset() {
@@ -2227,6 +2261,143 @@ void GamesTests::
     QFAIL(qPrintable(movedBytes.error()));
   QCOMPARE(*sourceBytes, *movedBytes);
   QVERIFY(sourceBytes->contains("\"scenarioId\":\"01104\""));
+}
+
+void GamesTests::insertRawIntoFragmentRejectsLoneSurrogateInCampaignId() {
+  // Direct fragment-level parity test for insertRawInto() (the safe,
+  // production-used replacement for the removed insertInto(); see
+  // encodeCampaignOrScenarioFragment() above): CampaignId::parse() only
+  // requires non-empty text, so a lone surrogate is a validly-constructed
+  // CampaignId whose insertRawInto()+toExactQJsonObject() encode must
+  // still reject it exactly like CreateGameRequest::toJsonBytes() would
+  // for the same value embedded in a real request.
+  QString lone;
+  lone += QChar(0xD800);
+  const auto campaignId = CampaignId::parse(lone);
+  if (!campaignId)
+    QFAIL(qPrintable(campaignId.error()));
+  const auto campaignOrScenario = CampaignOrScenario::campaign(*campaignId);
+  QList<std::pair<QString, Json::Value>> members;
+  campaignOrScenario.insertRawInto(members);
+  const auto encoded = Json::Value::makeObject(members).toExactQJsonObject();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
+
+  // Parity: the same lone-surrogate campaignId embedded in a real
+  // CreateGameRequest is rejected identically by the enclosing request's
+  // own toJsonBytes().
+  auto request = minimalCreateGameRequest();
+  request.campaignOrScenario = campaignOrScenario;
+  const auto requestBytes = request.toJsonBytes();
+  QVERIFY(!requestBytes.has_value());
+}
+
+void GamesTests::encodeOpenSeatsRejectsLoneSurrogateInCardCode() {
+  // Direct fragment-level test for encodeOpenSeats() (test/round-trip
+  // only, no production caller -- see its doc comment in Games.h):
+  // CardCode::parse() validates the "c" prefix/non-emptiness/no-line-
+  // terminator shape but not every UTF-16 code unit, so "c" + a lone
+  // surrogate is a validly-constructed CardCode whose encode must still
+  // be rejected.
+  QString lone = QStringLiteral("c");
+  lone += QChar(0xD800);
+  const auto loneCode = CardCode::parse(lone);
+  if (!loneCode)
+    QFAIL(qPrintable(loneCode.error()));
+  const auto encoded = encodeOpenSeats({*loneCode});
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::investigatorSummaryToJsonRejectsLoneSurrogateInId() {
+  // Direct fragment-level test proving InvestigatorSummary::toJson() (now
+  // that CardCode::toJson() is itself fallible) checks-and-propagates its
+  // id field's failure rather than assuming CardCode::toJson() always
+  // succeeds.
+  QString lone = QStringLiteral("c");
+  lone += QChar(0xD800);
+  const auto loneCode = CardCode::parse(lone);
+  if (!loneCode)
+    QFAIL(qPrintable(loneCode.error()));
+  const InvestigatorSummary summary{.id = *loneCode,
+                                    .classSymbol = ClassSymbol::Guardian};
+  const auto encoded = summary.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("id")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::scenarioSummaryToJsonRejectsLoneSurrogateInName() {
+  // Direct fragment-level test proving ScenarioSummary::toJson()
+  // checks-and-propagates its name field's (CardName) failure.
+  QString lone;
+  lone += QChar(0xD800);
+  const ScenarioSummary summary{
+      .id = *CardCode::parse(QStringLiteral("c01104")),
+      .difficulty = Difficulty::Standard,
+      .name = CardName{.title = lone, .subtitle = std::nullopt},
+      .variant = std::nullopt,
+  };
+  const auto encoded = summary.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("name")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::campaignSummaryToJsonRejectsLoneSurrogateInId() {
+  // Direct fragment-level test proving CampaignSummary::toJson()
+  // checks-and-propagates its id field's (CampaignId, a
+  // NonEmptyString<Tag>) failure.
+  QString lone;
+  lone += QChar(0xDC00);
+  const auto campaignId = CampaignId::parse(lone);
+  if (!campaignId)
+    QFAIL(qPrintable(campaignId.error()));
+  const CampaignSummary summary{.id = *campaignId,
+                                .difficulty = Difficulty::Standard,
+                                .currentCampaignMode = std::nullopt};
+  const auto encoded = summary.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("id")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::
+    gameListRowToJsonRejectsLoneSurrogateThroughInvestigatorSummary() {
+  // End-to-end parity test: proves GameListRow::toJson() -- not merely
+  // InvestigatorSummary::toJson() in isolation -- correctly fails
+  // (rather than silently producing a normal-looking-but-invalid
+  // QJsonObject) when a nested InvestigatorSummary's CardCode id
+  // contains a lone surrogate. GameListRow::toJson()/toRawJson() already
+  // check-and-propagate InvestigatorSummary::toJson()'s own failure (see
+  // Games.cpp), so this proves that existing propagation still holds now
+  // that the failure can originate from CardCode::toJson() itself.
+  QString lone = QStringLiteral("c");
+  lone += QChar(0xD800);
+  const auto loneCode = CardCode::parse(lone);
+  if (!loneCode)
+    QFAIL(qPrintable(loneCode.error()));
+  const auto gameState = GameState::pending({QUuid::createUuid()});
+  if (!gameState)
+    QFAIL(qPrintable(gameState.error()));
+  const auto gameId =
+      GameId::parse(QUuid::createUuid().toString(QUuid::WithoutBraces));
+  if (!gameId)
+    QFAIL(qPrintable(gameId.error()));
+  const auto row = GameListRow::success(
+      *gameId, std::nullopt, std::nullopt, *gameState,
+      QStringLiteral("Test Game"),
+      QList<InvestigatorSummary>{InvestigatorSummary{
+          .id = *loneCode, .classSymbol = ClassSymbol::Guardian}},
+      QList<InvestigatorSummary>{}, MultiplayerVariant::Solo, false);
+  const auto encoded = row.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("investigators")),
+           qPrintable(encoded.error()));
+  const auto encodedBytes = row.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
 }
 
 QTEST_APPLESS_MAIN(GamesTests)

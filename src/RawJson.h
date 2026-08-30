@@ -230,6 +230,22 @@ private:
   QString m_expDigits;
 };
 
+// True iff `s` contains a high surrogate with no immediately-following low
+// surrogate, or a low surrogate with no immediately-preceding (already
+// consumed) high surrogate -- i.e. `s` could not be encoded as valid UTF-8
+// by Value::toJsonBytes()/toExactQJson() (see their own matching checks in
+// RawJson.cpp), even though a QString can be built to hold such an
+// ill-formed code unit programmatically (e.g. via QString::fromRawData()
+// or by slicing a valid string between a surrogate pair). Exposed as a
+// shared, single-source-of-truth primitive so any other public type built
+// from an otherwise-unconstrained QString (e.g. Identifiers.h's
+// NonEmptyString<Tag>/CardCode) can enforce the exact same wire-safety
+// invariant at its own construction boundary -- once, in one place --
+// rather than each duplicating (and risking drifting from) this logic, or
+// exposing a toJson()-style conversion whose success silently promises
+// more than it verifies.
+[[nodiscard]] bool hasLoneSurrogate(const QString &s);
+
 // A parsed-and-validated JSON value. Immutable once produced by
 // Value::parse(); mirrors QJsonValue/QJsonObject/QJsonArray's read API
 // closely enough that callers already familiar with those feel at home.

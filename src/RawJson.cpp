@@ -556,17 +556,17 @@ QJsonValue Value::toQJson() const {
   return QJsonValue(QJsonValue::Undefined);
 }
 
-namespace {
-// Shared with appendJsonEncodedString()'s own surrogate handling below:
-// true iff `s` contains a high surrogate with no immediately-following
-// low surrogate, or a low surrogate with no immediately-preceding
-// (already-consumed) high surrogate. A QString -- unlike Value::parse()'s
-// own input -- can be constructed programmatically to hold such an
-// ill-formed code unit (e.g. via QString::fromRawData() or by slicing a
-// valid string between a surrogate pair); toExactQJson() must reject one
-// exactly like toJsonBytes() does, rather than silently building a
-// QJsonValue no downstream UTF-8 serializer could faithfully encode.
-[[nodiscard]] bool hasLoneSurrogate(const QString &s) {
+// Declared publicly in RawJson.h (see its doc comment there for the
+// rationale for exposing this outside RawJson.cpp): also shared with
+// appendJsonEncodedString()'s own surrogate handling below, and with
+// toExactQJsonInner()'s String/object-key checks a few lines down. A
+// QString -- unlike Value::parse()'s own input -- can be constructed
+// programmatically to hold a lone/mismatched UTF-16 surrogate (e.g. via
+// QString::fromRawData() or by slicing a valid string between a surrogate
+// pair); toExactQJson() must reject one exactly like toJsonBytes() does,
+// rather than silently building a QJsonValue no downstream UTF-8
+// serializer could faithfully encode.
+bool hasLoneSurrogate(const QString &s) {
   for (qsizetype i = 0; i < s.size(); ++i) {
     const QChar ch = s[i];
     if (ch.isHighSurrogate()) {
@@ -581,7 +581,6 @@ namespace {
   }
   return false;
 }
-} // namespace
 
 ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
                                                   int depth,
@@ -636,6 +635,25 @@ ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
           "code unit, which cannot be encoded as valid UTF-8"));
     return QJsonValue(m_string);
   case Kind::Number:
+    // Mirrors toJsonBytesInner()'s own per-part digit-count check (and its
+    // empty-coefficient guard) *before* ever calling toExactInt64(): a
+    // RawNumber parsed under wider custom ParseLimits.maxNumberDigits (or
+    // built programmatically) could otherwise round-trip through this
+    // function -- and every public request toJson() layered on top of it
+    // -- while the exact same Value would be rejected by toJsonBytes()
+    // under `limits`. A canonical, bounded "exact QJson" conversion must
+    // never be *more* permissive than the byte encoder it exists
+    // alongside; without this check, `limits` was accepted as a parameter
+    // here but silently ignored for every Number.
+    if (m_number.integerDigits().isEmpty())
+      return failure(
+          QStringLiteral("Value::toExactQJson: number has no digits"));
+    if (m_number.integerDigits().size() > limits.maxNumberDigits ||
+        m_number.fractionDigits().size() > limits.maxNumberDigits ||
+        m_number.exponentDigits().size() > limits.maxNumberDigits)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: number literal exceeds the configured "
+          "maximum digit count"));
     // Preserve full int64 precision whenever the literal is mathematically
     // integral and in range (see RawNumber::toExactInt64()); every other
     // literal (a genuine decimal, or an integral value outside qint64's
