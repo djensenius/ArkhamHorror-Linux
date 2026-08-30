@@ -1956,6 +1956,251 @@ class PackageProvenanceTests(unittest.TestCase):
         )
 
 
+class QtSdkBundledProvenanceTests(unittest.TestCase):
+    """New review item ("ICU library package-provenance mismatch",
+    found only once the AppImage-smoke job's "Verify every bundled ELF
+    library ships its required license notice" step finally ran to
+    completion for the first time against the real produced AppImage on
+    the real pinned `ubuntu-22.04` CI runner): "icu" is bundled directly
+    from the Qt SDK's own `lib/` directory in this project's actual
+    pipeline, never from a dpkg-owned distro package (Ubuntu 22.04 ships
+    ICU 70, never the ICU 73 Qt 6.11.1 bundles) -- so its provenance is
+    authenticated against a real Qt SDK reference copy instead. These
+    tests cover bind_bundled_library_to_qt_sdk_provenance()/
+    validate_bundled_library_qt_sdk_provenance() directly (mirroring
+    PackageProvenanceTests' own dpkg-based coverage above), plus the
+    end-to-end `classify` CLI wiring that must route "icu" through this
+    mechanism instead of the dpkg one."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_icu_is_not_in_component_expected_source_packages(self) -> None:
+        # "icu" must never be validated via the dpkg cross-check
+        # mechanism at all -- see _COMPONENTS_WITH_QT_SDK_BUNDLED_
+        # PROVENANCE's own docstring for why that check can structurally
+        # never succeed for it on this project's real pinned CI runner.
+        self.assertNotIn("icu", audit.COMPONENT_EXPECTED_SOURCE_PACKAGES)
+        self.assertIn("icu", audit._COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE)
+
+    def test_bind_qt_sdk_returns_unavailable_when_no_reference_dir_supplied(
+        self,
+    ) -> None:
+        bundled = self.root / "libicudata.so.73"
+        bundled.write_bytes(_FAKE_ELF_BYTES)
+        self.assertEqual(
+            audit.bind_bundled_library_to_qt_sdk_provenance(bundled, None),
+            {"status": "qt_reference_dir_unavailable"},
+        )
+
+    def test_bind_qt_sdk_returns_not_found_when_reference_copy_absent(
+        self,
+    ) -> None:
+        qt_reference_dir = self.root / "qtsdk"
+        (qt_reference_dir / "lib").mkdir(parents=True)
+        bundled_dir = self.root / "bundled"
+        bundled_dir.mkdir()
+        bundled = bundled_dir / "libicudata.so.73"
+        bundled.write_bytes(_FAKE_ELF_BYTES)
+        binding = audit.bind_bundled_library_to_qt_sdk_provenance(
+            bundled, qt_reference_dir
+        )
+        self.assertEqual(binding["status"], "not_found")
+        self.assertIn("libicudata.so.73", str(binding["referencePath"]))
+
+    def test_bind_qt_sdk_returns_content_mismatch_for_a_substituted_library(
+        self,
+    ) -> None:
+        # The exact "unrelated/substituted file" scenario this check
+        # exists to catch: a reference copy exists at the expected path
+        # but is NOT the same compiled object as the bundled file.
+        qt_reference_dir = self.root / "qtsdk"
+        (qt_reference_dir / "lib").mkdir(parents=True)
+        (qt_reference_dir / "lib" / "libicudata.so.73").write_bytes(b"\x00reference")
+        bundled_dir = self.root / "bundled"
+        bundled_dir.mkdir()
+        bundled = bundled_dir / "libicudata.so.73"
+        bundled.write_bytes(b"\x00tampered-different-content")
+        with mock.patch.object(
+            audit, "_canonical_load_digest", return_value=None
+        ):
+            binding = audit.bind_bundled_library_to_qt_sdk_provenance(
+                bundled, qt_reference_dir
+            )
+        self.assertEqual(binding["status"], "content_mismatch")
+
+    def test_bind_qt_sdk_returns_matched_when_content_is_proven_identical(
+        self,
+    ) -> None:
+        qt_reference_dir = self.root / "qtsdk"
+        (qt_reference_dir / "lib").mkdir(parents=True)
+        (qt_reference_dir / "lib" / "libicudata.so.73").write_bytes(b"\x00identical")
+        bundled_dir = self.root / "bundled"
+        bundled_dir.mkdir()
+        bundled = bundled_dir / "libicudata.so.73"
+        bundled.write_bytes(b"\x00identical")
+        with mock.patch.object(
+            audit, "_canonical_load_digest", return_value="same-digest"
+        ):
+            binding = audit.bind_bundled_library_to_qt_sdk_provenance(
+                bundled, qt_reference_dir
+            )
+        self.assertEqual(binding["status"], "matched")
+
+    def test_validate_qt_sdk_provenance_no_op_when_reference_dir_unavailable(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            audit.validate_bundled_library_qt_sdk_provenance(
+                "icu", {"status": "qt_reference_dir_unavailable"}, True
+            )
+        )
+
+    def test_validate_qt_sdk_provenance_rejects_not_found_only_when_required(
+        self,
+    ) -> None:
+        binding = {"status": "not_found", "referencePath": "/qt/lib/libicudata.so.73"}
+        self.assertIsNone(
+            audit.validate_bundled_library_qt_sdk_provenance("icu", binding)
+        )
+        problem = audit.validate_bundled_library_qt_sdk_provenance(
+            "icu", binding, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("icu", problem)
+
+    def test_validate_qt_sdk_provenance_rejects_content_mismatch_unconditionally(
+        self,
+    ) -> None:
+        binding = {
+            "status": "content_mismatch",
+            "referencePath": "/qt/lib/libicudata.so.73",
+        }
+        problem = audit.validate_bundled_library_qt_sdk_provenance("icu", binding)
+        self.assertIsNotNone(problem)
+        self.assertIn("icu", problem)
+
+    def test_validate_qt_sdk_provenance_accepts_matched(self) -> None:
+        binding = {"status": "matched", "referencePath": "/qt/lib/libicudata.so.73"}
+        self.assertIsNone(
+            audit.validate_bundled_library_qt_sdk_provenance(
+                "icu", binding, require_provenance=True
+            )
+        )
+
+    def test_cmd_classify_uses_qt_sdk_provenance_for_icu_never_dpkg(self) -> None:
+        # End-to-end regression test for the actual CI failure: on a
+        # real dpkg-equipped host with --require-package-provenance
+        # passed (exactly this project's pinned `ubuntu-22.04`
+        # `appimage-smoke` job), the real system ICU package is a
+        # DIFFERENT version (70) than what Qt 6.11.1 bundles (73), so
+        # bind_bundled_library_to_system_provenance() would always
+        # report "not_found" for "libicudata.so.73" -- classify() must
+        # never even consult that dpkg-based path for "icu" at all, and
+        # must instead succeed via the Qt SDK reference copy.
+        lib_dir = self.root / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libicudata.so.73").write_bytes(_FAKE_ELF_BYTES)
+        (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
+
+        qt_reference_dir = self.root / "qtsdk"
+        (qt_reference_dir / "lib").mkdir(parents=True)
+        (qt_reference_dir / "lib" / "libicudata.so.73").write_bytes(_FAKE_ELF_BYTES)
+
+        def fail_if_called_for_icu(bundled_path: Path) -> dict[str, object]:
+            if bundled_path.name == "libicudata.so.73":
+                self.fail(
+                    "bind_bundled_library_to_system_provenance() must never "
+                    "be consulted for the 'icu' component at all -- see "
+                    "_COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE's own "
+                    "docstring"
+                )
+            return {"status": "dpkg_unavailable"}
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            audit,
+            "bind_bundled_library_to_system_provenance",
+            side_effect=fail_if_called_for_icu,
+        ), mock.patch.object(
+            audit, "_canonical_load_digest", return_value="same-digest"
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(
+                [
+                    "classify",
+                    str(lib_dir),
+                    "--qt-reference-dir",
+                    str(qt_reference_dir),
+                    "--require-package-provenance",
+                ]
+            )
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+
+    def test_cmd_classify_fails_when_icu_qt_sdk_reference_copy_not_found(
+        self,
+    ) -> None:
+        # The flip side of the above: with --require-package-provenance
+        # passed and a --qt-reference-dir supplied, an "icu" library
+        # with NO matching reference copy under the Qt SDK must still
+        # fail closed, never silently pass.
+        lib_dir = self.root / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libicudata.so.73").write_bytes(_FAKE_ELF_BYTES)
+        (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
+
+        qt_reference_dir = self.root / "qtsdk"
+        (qt_reference_dir / "lib").mkdir(parents=True)
+        # Deliberately no libicudata.so.73 placed under qt_reference_dir.
+
+        def fail_if_called_for_icu(bundled_path: Path) -> dict[str, object]:
+            if bundled_path.name == "libicudata.so.73":
+                self.fail(
+                    "bind_bundled_library_to_system_provenance() must never "
+                    "be consulted for the 'icu' component at all"
+                )
+            return {"status": "dpkg_unavailable"}
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            audit,
+            "bind_bundled_library_to_system_provenance",
+            side_effect=fail_if_called_for_icu,
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(
+                [
+                    "classify",
+                    str(lib_dir),
+                    "--qt-reference-dir",
+                    str(qt_reference_dir),
+                    "--require-package-provenance",
+                ]
+            )
+        self.assertNotEqual(exit_code, 0)
+        self.assertIn("icu", stderr.getvalue())
+
+    def test_sbom_inventory_records_qt_sdk_provenance_for_icu(self) -> None:
+        lib_dir = self.root / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libicudata.so.73").write_bytes(_FAKE_ELF_BYTES)
+
+        qt_reference_dir = self.root / "qtsdk"
+        (qt_reference_dir / "lib").mkdir(parents=True)
+        (qt_reference_dir / "lib" / "libicudata.so.73").write_bytes(_FAKE_ELF_BYTES)
+
+        with mock.patch.object(
+            audit, "_canonical_load_digest", return_value="same-digest"
+        ), mock.patch.object(
+            audit, "capture_package_provenance", return_value=None
+        ):
+            inventory = audit.build_sbom_inventory(lib_dir, qt_reference_dir)
+        entry = next(
+            e for e in inventory if e["basename"] == "libicudata.so.73"
+        )
+        self.assertEqual(entry["classification"], "icu")
+        self.assertIn("qtSdkProvenance", entry)
+        self.assertEqual(entry["qtSdkProvenance"]["status"], "matched")
 
 
 @unittest.skipUnless(

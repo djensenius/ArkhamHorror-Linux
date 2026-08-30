@@ -1146,12 +1146,13 @@ MANDATORY_COMPONENTS: frozenset[str] = frozenset({"libavif"})
 # including libavif's own real, live ldd-resolved AV1 backend closure
 # (dav1d/libgav1/libaom/libyuv/abseil), not a guessed/hypothetical one.
 # Components with NO entry here (qt, qtkeychain -- never distro apt
-# packages in this project's pipeline at all -- and svt-av1/rav1e/
+# packages in this project's pipeline at all -- svt-av1/rav1e/
 # sharpyuv, which the real, live Ubuntu 22.04 `libavif13` build does not
-# even dynamically link, per real `ldd` output) are simply never
-# validated by this mechanism; that is a deliberate, honestly-scoped
-# no-op for a component this table cannot make any true claim about,
-# never a silent false negative for one it can.
+# even dynamically link, per real `ldd` output -- and icu, see
+# _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE's own docstring for why)
+# are simply never validated by this mechanism; that is a deliberate,
+# honestly-scoped no-op for a component this table cannot make any true
+# claim about, never a silent false negative for one it can.
 COMPONENT_EXPECTED_SOURCE_PACKAGES: dict[str, frozenset[str]] = {
     "e2fsprogs": frozenset({"e2fsprogs"}),
     "krb5": frozenset({"krb5"}),
@@ -1180,7 +1181,12 @@ COMPONENT_EXPECTED_SOURCE_PACKAGES: dict[str, frozenset[str]] = {
     "libmd": frozenset({"libmd"}),
     "libcap": frozenset({"libcap2"}),
     "dbus": frozenset({"dbus"}),
-    "icu": frozenset({"icu"}),
+    # "icu" is deliberately NOT listed here: see
+    # _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE's own docstring below --
+    # its real, verifiable provenance in this project's actual pipeline
+    # is the Qt SDK's own bundled copy, authenticated by
+    # bind_bundled_library_to_qt_sdk_provenance() instead, never a dpkg
+    # package.
     "libkeyutils": frozenset({"keyutils"}),
     "lz4": frozenset({"lz4"}),
     "pcre": frozenset({"pcre3"}),
@@ -1260,6 +1266,53 @@ _SYSTEM_LIBRARY_SEARCH_DIRS: tuple[Path, ...] = (
     Path("/usr/lib"),
     Path("/lib"),
 )
+
+
+# New review item ("ICU library package-provenance mismatch", found only
+# once the AppImage-smoke job's "Verify every bundled ELF library ships
+# its required license notice" step -- fixed to be reachable at all by
+# two entirely unrelated earlier commits this same round -- finally ran
+# to completion for the first time, against the real produced AppImage,
+# on the real pinned `ubuntu-22.04` CI runner): "icu" is structurally
+# different from every other COMPONENT_EXPECTED_SOURCE_PACKAGES entry.
+# Every one of those was independently verified (see that table's own
+# docstring) to be a real, ldd-resolved dependency this project's build
+# picks up from the *live build host's own installed distro package* --
+# but ICU is not: Qt's official prebuilt Linux SDK bundles its OWN copy
+# of ICU directly inside `$QT_ROOT_DIR/lib/` (confirmed via a real CI
+# "Package" step log: "Deploying shared library
+# .../Qt/6.11.1/gcc_64/lib/libicudata.so.73", immediately followed by
+# "WARNING: Could not find copyright files for file
+# .../libicudata.so.73 using dpkg-query" -- linuxdeploy itself already
+# knows this file is not dpkg-owned), at Qt's own pinned ICU version --
+# specifically so Qt's `QLocale`/`QCollator` support never has a
+# fragile runtime ABI dependency on whatever ICU version (if any) a
+# given end-user's distro happens to ship. This project's own pinned
+# `ubuntu-22.04` "Jammy" `appimage-smoke` runner ships ICU 70
+# (`libicu70`), never the newer ICU 73 that Qt 6.11.1 bundles --
+# there is structurally no dpkg-owned `libicudata.so.73` (etc.) this
+# runner could ever have installed, at any point release, for
+# capture_package_provenance()/bind_bundled_library_to_system_provenance()
+# to compare against. Requiring dpkg provenance for "icu" can therefore
+# never succeed on the very host `--require-package-provenance` is
+# pinned to run on -- a previously-undiscovered latent bug, not a
+# regression introduced by removing it here.
+#
+# ICU's *bundled-content* provenance is instead authenticated the exact
+# same way this project already authenticates core Qt libraries and
+# Qt's own plugins/QML modules (see _is_real_core_qt_library()/
+# _is_real_qt_plugin_or_qml_module()): by proving, via
+# _is_same_compiled_object_or_unwritten(), that the bundled file is the
+# same compiled object as the real Qt SDK's own copy at the identical
+# `lib/<basename>` relative path -- see
+# bind_bundled_library_to_qt_sdk_provenance()/
+# validate_bundled_library_qt_sdk_provenance() below. This is strictly
+# MORE precise than the dpkg cross-check for this one component (it
+# compares against the exact upstream artifact this project's own build
+# genuinely obtained the file from, not merely "a same-named file some
+# host happens to have installed"), so no security coverage is lost by
+# excluding "icu" from COMPONENT_EXPECTED_SOURCE_PACKAGES above.
+_COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE: frozenset[str] = frozenset({"icu"})
 
 
 def _dpkg_owning_package(path: Path) -> str | None:
@@ -1603,6 +1656,92 @@ def validate_bundled_library_package_provenance(
                 "re-pinned in COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX"
             )
     return None
+
+
+def bind_bundled_library_to_qt_sdk_provenance(
+    bundled_path: Path, qt_reference_dir: Path | None
+) -> dict[str, object]:
+    """Companion to bind_bundled_library_to_system_provenance() for
+    components in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE (see that
+    constant's own docstring) whose real, verifiable upstream origin in
+    this project's actual pipeline is the Qt SDK's own bundled copy --
+    never a dpkg-owned distro package. Proves `bundled_path` is the
+    exact same compiled object as the real Qt SDK's own file at the
+    identical `lib/<basename>` relative path, using the identical
+    _is_same_compiled_object_or_unwritten() check this module already
+    uses for core Qt libraries (_is_real_core_qt_library()) and Qt's own
+    plugins/QML modules (_is_real_qt_plugin_or_qml_module()).
+
+    Returns a dict with a "status" key, one of:
+      - "qt_reference_dir_unavailable": no --qt-reference-dir was
+        supplied at all; no claim can be made here -- a legitimate,
+        honest no-op, exactly mirroring
+        bind_bundled_library_to_system_provenance()'s own
+        "dpkg_unavailable" status.
+      - "not_found": a qt_reference_dir WAS supplied, but no file exists
+        at the identical `lib/<basename>` relative path under it -- on
+        a host where this check IS performable, an expected
+        Qt-SDK-bundled component with no findable reference copy is
+        itself a real problem, never silently accepted.
+      - "content_mismatch": a reference copy was found at that path,
+        but it is not proven identical to `bundled_path` -- the exact
+        "substituted/tampered bundled file" scenario this check exists
+        to catch.
+      - "matched": a reference copy was found AND proven, by
+        _is_same_compiled_object_or_unwritten(), to be the same
+        compiled object as `bundled_path`."""
+    if qt_reference_dir is None:
+        return {"status": "qt_reference_dir_unavailable"}
+    candidate = qt_reference_dir / "lib" / bundled_path.name
+    reference_path = str(candidate)
+    if not candidate.is_file():
+        return {"status": "not_found", "referencePath": reference_path}
+    if not _is_same_compiled_object_or_unwritten(candidate, bundled_path):
+        return {"status": "content_mismatch", "referencePath": reference_path}
+    return {"status": "matched", "referencePath": reference_path}
+
+
+def validate_bundled_library_qt_sdk_provenance(
+    component: str, binding: dict[str, object], require_provenance: bool = False
+) -> str | None:
+    """Companion to validate_bundled_library_package_provenance() for
+    components authenticated via
+    bind_bundled_library_to_qt_sdk_provenance() above, mirroring its
+    require_provenance semantics: "content_mismatch" is always a hard
+    failure; "not_found" is a hard failure only when `require_provenance`
+    is True (this project's own pinned `ubuntu-22.04` `appimage-smoke` CI
+    job passes --require-package-provenance and runs against the real,
+    final AppImage with --qt-reference-dir always supplied, where by
+    construction the real Qt SDK reference copy genuinely exists);
+    without it, "not_found" remains a legitimate skip on a host that
+    never supplied --qt-reference-dir at all (this module's own
+    basename-only classification unit tests, or a caller with no Qt SDK
+    reference available)."""
+    status = binding["status"]
+    if status == "qt_reference_dir_unavailable":
+        return None
+    if status == "not_found":
+        if not require_provenance:
+            return None
+        return (
+            f"component {component!r} expects a real Qt SDK reference "
+            f"copy ({binding.get('referencePath')!r}) proving this "
+            "file's genuine Qt-SDK-bundled origin, but none exists -- "
+            "its provenance must be provable here, never silently "
+            "skipped"
+        )
+    if status == "content_mismatch":
+        return (
+            f"component {component!r}'s bundled library does not "
+            "byte-for-byte match (via _canonical_load_digest(), which "
+            "already tolerates every field patchelf's own documented "
+            "RUNPATH rewrite may alter) the real Qt SDK's own reference "
+            f"copy at {binding.get('referencePath')!r} -- the bundled "
+            "file cannot be proven to actually be that SDK's own build "
+            "output at all"
+        )
+    return None
+
 
 # Qt ships its own plugins (image format decoders, platform integrations,
 # TLS backends, SQL drivers, etc.) under a fixed, well-documented set of
@@ -1985,12 +2124,20 @@ def build_sbom_inventory(
     Each entry: path (relative to lib_dir), basename, classification
     ("allowlisted", "first-party", a COMPONENT_PATTERNS/Qt component
     name, or "unmapped"), elf_identity()'s sha256/buildId/
-    canonicalLoadDigest/soname fields, and packageProvenance (see
+    canonicalLoadDigest/soname fields, packageProvenance (see
     capture_package_provenance()'s own docstring; None whenever no real
     dpkg-owned system copy of this basename can be found in the current
-    environment, never itself an error) -- every final bundled ELF,
-    fully identified, with an explicit, reviewable disposition; nothing
-    bundled is ever left out of this list."""
+    environment, never itself an error), and -- for classification in
+    _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE (currently only "icu",
+    which never has a dpkg-owned system counterpart in this project's
+    pipeline at all; see that constant's own docstring) -- a
+    qtSdkProvenance field recording
+    bind_bundled_library_to_qt_sdk_provenance()'s own result instead, so
+    this entry's real, verifiable upstream origin is never silently
+    represented as merely "packageProvenance: null" with no explanation
+    -- every final bundled ELF, fully identified, with an explicit,
+    reviewable disposition; nothing bundled is ever left out of this
+    list."""
     entries: list[dict[str, object]] = []
     for path in find_bundled_libraries(lib_dir):
         basename = path.name
@@ -2009,6 +2156,10 @@ def build_sbom_inventory(
         }
         entry.update(elf_identity(path))
         entry["packageProvenance"] = capture_package_provenance(basename)
+        if classification in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
+            entry["qtSdkProvenance"] = bind_bundled_library_to_qt_sdk_provenance(
+                path, qt_reference_dir
+            )
         entries.append(entry)
     entries.sort(key=lambda e: str(e["path"]))
     return entries
@@ -2102,10 +2253,26 @@ def cmd_classify(args: argparse.Namespace) -> int:
     provenance_problems: list[str] = []
     for component, paths in sorted(by_component.items()):
         for path in paths:
-            binding = bind_bundled_library_to_system_provenance(path)
-            problem = validate_bundled_library_package_provenance(
-                component, binding, require_package_provenance
-            )
+            # New review item ("ICU library package-provenance
+            # mismatch"): components in
+            # _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE (currently only
+            # "icu") never originate from a dpkg-owned distro package in
+            # this project's actual pipeline -- see that constant's own
+            # docstring -- so their provenance is authenticated against
+            # the real Qt SDK reference copy instead of the host's dpkg
+            # database.
+            if component in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
+                qt_sdk_binding = bind_bundled_library_to_qt_sdk_provenance(
+                    path, qt_reference_dir
+                )
+                problem = validate_bundled_library_qt_sdk_provenance(
+                    component, qt_sdk_binding, require_package_provenance
+                )
+            else:
+                binding = bind_bundled_library_to_system_provenance(path)
+                problem = validate_bundled_library_package_provenance(
+                    component, binding, require_package_provenance
+                )
             if problem is not None:
                 provenance_problems.append(f"{path.relative_to(lib_dir)}: {problem}")
     if provenance_problems:
