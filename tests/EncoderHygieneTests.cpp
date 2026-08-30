@@ -80,9 +80,9 @@ QStringList hasHandBuiltJsonContainer(const QString &path,
   QStringList hits;
   const QStringList lines = text.split(u'\n');
   for (qsizetype i = 0; i < lines.size(); ++i) {
-    const QString code = lines[i].left(lines[i].indexOf(u"//"_s) < 0
-                                           ? lines[i].size()
-                                           : lines[i].indexOf(u"//"_s));
+    const qsizetype commentStart = lines[i].indexOf(u"//"_s);
+    const QString code =
+        lines[i].left(commentStart < 0 ? lines[i].size() : commentStart);
     if (handBuiltContainerPattern().match(code).hasMatch())
       hits.append(u"%1:%2: %3"_s.arg(path).arg(i + 1).arg(lines[i].trimmed()));
   }
