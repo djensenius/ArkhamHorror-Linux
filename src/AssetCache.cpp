@@ -1446,6 +1446,9 @@ bool mountPointHasTrustedLocalFilesystemType(
   bool found = false;
   bool trusted = false;
   QString matchedFstype;
+  QStringList nearMissCandidates;
+  const QString leafComponent =
+      canonicalMountPoint.section(QLatin1Char('/'), -1);
   while (!mountinfo.atEnd()) {
     const QString line = QString::fromUtf8(mountinfo.readLine());
     const int dashIndex = line.indexOf(QStringLiteral(" - "));
@@ -1461,6 +1464,17 @@ bool mountPointHasTrustedLocalFilesystemType(
       continue;
     }
     if (beforeDash.at(4) != canonicalMountPoint) {
+      // Diagnostic only (does not affect the actual verdict): a line
+      // whose mount-point field merely ENDS with this path's own final
+      // component, captured verbatim (bracketed, so any escaping/
+      // whitespace/prefix discrepancy is directly visible) to help
+      // root-cause a real "expected an exact match but found none" case
+      // without needing another CI round-trip per hypothesis.
+      if (!leafComponent.isEmpty() &&
+          beforeDash.at(4).endsWith(leafComponent) &&
+          nearMissCandidates.size() < 4) {
+        nearMissCandidates << beforeDash.at(4);
+      }
       continue;
     }
     const QStringList afterDash =
@@ -1476,7 +1490,9 @@ bool mountPointHasTrustedLocalFilesystemType(
     qWarning()
         << "AssetCache: no /proc/self/mountinfo entry's mount-point "
            "field exactly matched"
-        << canonicalMountPoint
+        << QStringLiteral("[%1]").arg(canonicalMountPoint)
+        << "-- near-miss candidates ending in the same final component:"
+        << nearMissCandidates
         << "(diagnostic only -- see mountPointHasTrustedLocalFilesystemType())";
   } else if (!trusted) {
     qWarning() << "AssetCache: /proc/self/mountinfo reports mount point"
