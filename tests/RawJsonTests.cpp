@@ -56,6 +56,8 @@ private slots:
   void objectFindDistinguishesAbsentFromPresentUndefinedFromPresentValue();
   void parseAcceptsEmptyArrayExactlyAtMaxDepthAndRejectsOneDeeper();
   void parseAcceptsEmptyObjectExactlyAtMaxDepthAndRejectsOneDeeper();
+  void arrayLimitFailsBeforeParsingDisallowedSubtree();
+  void objectLimitFailsBeforeParsingDisallowedSubtree();
   // Review round 5 (RawJson.cpp:476 HIGH finding): contains()/value() must
   // remain correct once backed by an index rather than a linear scan, at
   // a large member count built via the unbounded makeObject() constructor
@@ -1023,6 +1025,23 @@ void RawJsonTests::parseLimitsRejectsObjectExceedingMaxObjectMembers() {
   limits.maxObjectMembers = 1;
   QVERIFY(Value::parse(R"({"a":1})", u"test", limits).has_value());
   QVERIFY(!Value::parse(R"({"a":1,"b":2})", u"test", limits).has_value());
+}
+
+void RawJsonTests::arrayLimitFailsBeforeParsingDisallowedSubtree() {
+  ParseLimits limits;
+  limits.maxArrayElements = 1;
+  const auto result = Value::parse(R"([0,{"malformed":}])", u"test", limits);
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(u"maximum allowed element count"));
+}
+
+void RawJsonTests::objectLimitFailsBeforeParsingDisallowedSubtree() {
+  ParseLimits limits;
+  limits.maxObjectMembers = 1;
+  const auto result =
+      Value::parse(R"({"ok":0,"disallowed":{"malformed":}})", u"test", limits);
+  QVERIFY(!result.has_value());
+  QVERIFY(result.error().contains(u"maximum allowed member count"));
 }
 
 void RawJsonTests::parseLimitsRejectsTotalNodesExceedingMaxTotalNodes() {

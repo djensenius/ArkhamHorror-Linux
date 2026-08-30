@@ -429,11 +429,11 @@ private:
     }
     for (;;) {
       skipWhitespace();
+      if (v.m_array.size() >= m_limits.maxArrayElements)
+        return failAt("array exceeds the maximum allowed element count");
       auto element = parseValue(depth);
       if (!element)
         return Failure{element.error()};
-      if (v.m_array.size() >= m_limits.maxArrayElements)
-        return failAt("array exceeds the maximum allowed element count");
       v.m_array.append(std::move(*element));
       skipWhitespace();
       if (atEnd())
@@ -466,6 +466,8 @@ private:
     }
     for (;;) {
       skipWhitespace();
+      if (v.m_object.size() >= m_limits.maxObjectMembers)
+        return failAt("object exceeds the maximum allowed member count");
       if (atEnd() || peek() != '"')
         return failAt("expected a string key in object");
       auto key = parseStringText();
@@ -481,8 +483,6 @@ private:
       auto value = parseValue(depth);
       if (!value)
         return Failure{value.error()};
-      if (v.m_object.size() >= m_limits.maxObjectMembers)
-        return failAt("object exceeds the maximum allowed member count");
       v.m_objectIndex.insert(*key, v.m_object.size());
       v.m_object.append({std::move(*key), std::move(*value)});
       skipWhitespace();
