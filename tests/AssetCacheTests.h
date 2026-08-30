@@ -494,6 +494,24 @@ private slots:
   // -- clearing the marker here plays the role a real exec() would).
   void
   preForkLiveInstanceRejectsEveryInheritedOperationBeforeTouchingStateForTesting();
+  // Independent cumulative re-review (MEDIUM, "Pre-fork live AssetCache
+  // objects remain usable in child" -- "Real inherited object test
+  // while parent registry/mutex active"): unlike the simulated-flag
+  // test immediately above, this uses a REAL fork() while a real
+  // background thread genuinely holds this instance's m_mutex (via
+  // lockMutexForTesting(), synchronized deterministically -- no sleep-
+  // based timing race) at the exact moment of the fork(), so the
+  // forked child's copy of m_mutex is guaranteed captured in a locked
+  // state. The child touches ONLY the already-inherited, pre-existing
+  // AssetCache object (no further Qt/heap construction of its own --
+  // seeforkedChildProcessNeverJoinsParentsInheritedRootAuthority()'s
+  // comment for why that would be an unrelated, independent hazard on
+  // this platform) and must return the documented safe sentinel from
+  // every read-only accessor without ever deadlocking, proving
+  // hasForkedSinceConstruction()'s guard runs strictly before any
+  // m_mutex acquisition rather than merely usually finishing fast
+  // enough not to matter.
+  void realForkedChildAccessorsNeverDeadlockOnMutexHeldByParentAtForkTime();
   // Cumulative review (independent re-review, HIGH, "shared root
   // authority incomplete"): two SIMULTANEOUSLY LIVE same-process
   // instances over the same root -- one sibling's invalidate() must be

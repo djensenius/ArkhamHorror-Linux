@@ -16,8 +16,13 @@
 #include <QRegularExpression>
 #include <QTest>
 
+#include <atomic>
+#include <thread>
+
 #if defined(Q_OS_UNIX)
+#include <csignal>
 #include <cstring>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -4532,8 +4537,10 @@ void AssetCacheTests::
               preForkGeneration);
   QVERIFY(cache.lookupMemory(key).has_value());
   QVERIFY(cache.lookupDisk(key).has_value());
+  QVERIFY(cache.memoryCostBytes() > 0);
+  QVERIFY(cache.diskUsageBytes() > 0);
+  QVERIFY(cache.diskEntryCount() > 0);
 
-  // Now simulate exactly the state a real just-forked child's copy of
   // this exact, already-constructed object would observe.
   AssetCache::setPreForkLiveInstanceForcedStateForTesting(true);
 
@@ -4579,6 +4586,15 @@ void AssetCacheTests::
            AssetCache::InvalidateResult::PersistenceFailed);
   cache.reapAndEnforceQuota(); // must not crash/deadlock either.
 
+  // Independent cumulative re-review (MEDIUM, "Pre-fork live AssetCache
+  // objects remain usable in child"): the three read-only usage
+  // accessors must ALSO fail closed to their documented safe sentinel
+  // (0) rather than locking the inherited m_mutex, exactly like every
+  // other public method exercised above.
+  QCOMPARE(cache.memoryCostBytes(), 0);
+  QCOMPARE(cache.diskUsageBytes(), 0);
+  QCOMPARE(cache.diskEntryCount(), 0);
+
   // The pre-fork entry must remain COMPLETELY untouched by every one of
   // the rejected operations above -- neither evicted, invalidated, nor
   // silently mutated.
@@ -4597,6 +4613,130 @@ void AssetCacheTests::
               postClearGeneration);
   QVERIFY(cache.lookupMemory(otherKey).has_value());
   QVERIFY(cache.lookupDisk(otherKey).has_value());
+}
+
+void AssetCacheTests::
+    realForkedChildAccessorsNeverDeadlockOnMutexHeldByParentAtForkTime() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("fork() is a POSIX-specific mechanism; not applicable on this "
+        "platform");
+#else
+  AssetCache parentCache(configFor(m_tempDirPath));
+  QVERIFY(!parentCache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/real-fork-mutex-hold.png")));
+  parentCache.store(key, makeEntry(QByteArrayLiteral("real-fork-mutex-bytes")));
+  QVERIFY(parentCache.lookupMemory(key).has_value());
+  QVERIFY(parentCache.memoryCostBytes() > 0);
+
+  // A real background thread genuinely acquires this instance's real
+  // m_mutex and holds it -- synchronized deterministically via a
+  // spin-wait on an atomic flag (no sleep-based timing race) so the
+  // fork() below is GUARANTEED (not merely probabilistically likely)
+  // to happen while it is locked.
+  std::atomic<bool> holderLocked{false};
+  std::atomic<bool> releaseHolder{false};
+  std::thread holder([&]() {
+    parentCache.lockMutexForTesting();
+    holderLocked.store(true, std::memory_order_release);
+    while (!releaseHolder.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    parentCache.unlockMutexForTesting();
+  });
+  while (!holderLocked.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  int pipeFds[2] = {-1, -1};
+  QVERIFY(::pipe(pipeFds) == 0);
+
+  const pid_t child = ::fork();
+  QVERIFY(child >= 0);
+  if (child == 0) {
+    // CHILD: fork() only ever duplicates the CALLING thread (this
+    // test's own main thread) -- the holder thread above simply does
+    // not exist here, so this process's own copy of parentCache's
+    // m_mutex is frozen, permanently, in a locked state nothing in
+    // this process will ever unlock. Every accessor below MUST fail
+    // closed via hasForkedSinceConstruction() strictly BEFORE ever
+    // attempting to acquire that mutex -- if any one of them did not,
+    // this child would deadlock forever right here, and this test's
+    // own bounded poll()/waitpid() below would deterministically catch
+    // it (as a reported failure, never an indefinite hang) rather than
+    // silently pass. Deliberately does not construct any further Qt
+    // object of its own -- see
+    // forkedChildProcessNeverJoinsParentsInheritedRootAuthority()'s
+    // comment for why that is a separate, independent hazard on this
+    // platform, unrelated to the exact mechanism this test targets.
+    ::close(pipeFds[0]);
+    const qint64 mem = parentCache.memoryCostBytes();
+    const qint64 disk = parentCache.diskUsageBytes();
+    const int entries = parentCache.diskEntryCount();
+    const bool memoryHit = parentCache.lookupMemory(key).has_value();
+    const char verdict =
+        (mem == 0 && disk == 0 && entries == 0 && !memoryHit) ? '1' : '0';
+    ssize_t written = ::write(pipeFds[1], &verdict, 1);
+    (void)written;
+    ::close(pipeFds[1]);
+    ::_exit(0);
+  }
+
+  // PARENT: bounded wait (never an indefinite blocking read) -- if a
+  // regression reintroduces the deadlock this test targets, this must
+  // fail deterministically rather than hang the entire test run
+  // forever.
+  ::close(pipeFds[1]);
+  struct pollfd pfd {};
+  pfd.fd = pipeFds[0];
+  pfd.events = POLLIN;
+  const int pollResult = ::poll(&pfd, 1, /*timeoutMs=*/5000);
+  char verdict = '?';
+  ssize_t bytesRead = -1;
+  if (pollResult > 0 && (pfd.revents & POLLIN)) {
+    bytesRead = ::read(pipeFds[0], &verdict, 1);
+  }
+  ::close(pipeFds[0]);
+
+  if (pollResult <= 0) {
+    // The child never reported anything within the timeout -- almost
+    // certainly deadlocked on the inherited, permanently-locked mutex.
+    // Forcibly reap it so this process does not leak a zombie, but the
+    // test itself must still fail loudly rather than silently pass.
+    ::kill(child, SIGKILL);
+    int reapedStatus = 0;
+    ::waitpid(child, &reapedStatus, 0);
+    releaseHolder.store(true, std::memory_order_release);
+    holder.join();
+    QFAIL("forked child never reported a verdict within the timeout -- it "
+          "likely deadlocked on the inherited, permanently-locked mutex");
+  }
+
+  int status = 0;
+  const pid_t waited = ::waitpid(child, &status, 0);
+
+  releaseHolder.store(true, std::memory_order_release);
+  holder.join();
+
+  QVERIFY2(waited == child, "waitpid() never reaped the forked child");
+  QVERIFY2(WIFEXITED(status),
+           qPrintable(QStringLiteral(
+                          "forked child did not exit normally (raw status=%1, "
+                          "WIFSIGNALED=%2, WTERMSIG=%3)")
+                          .arg(status)
+                          .arg(WIFSIGNALED(status) ? 1 : 0)
+                          .arg(WIFSIGNALED(status) ? WTERMSIG(status) : -1)));
+  QVERIFY2(bytesRead == 1, "forked child never reported a verdict");
+  QCOMPARE(verdict, '1');
+
+  // The parent's own view of both the mutex and the cache entry remain
+  // completely unaffected: the holder thread released the real mutex
+  // normally in THIS process, and none of the child's rejected
+  // accessor calls ever touched this process's state at all.
+  QVERIFY(parentCache.lookupMemory(key).has_value());
+  QVERIFY(parentCache.memoryCostBytes() > 0);
+#endif
 }
 
 void AssetCacheTests::

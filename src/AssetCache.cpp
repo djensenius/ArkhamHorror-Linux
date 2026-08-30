@@ -64,6 +64,7 @@
 // the headers declare it (see mountIdViaStatx()'s stx_mask check).
 #include <linux/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h> // makedev() -- see mountIdHasTrustedLocalFilesystemType()
 // Round-9+ review (HIGH): openat2(2) (kernel 5.6+) lets every owned-
 // directory-chain component be opened via ONE atomic syscall that the
 // kernel itself refuses to complete (EXDEV/ELOOP) if the requested
@@ -1496,6 +1497,120 @@ std::optional<QByteArray> readEntireProcFileRaw(const char *path) {
   return content;
 }
 
+// Independent cumulative re-review (MEDIUM, "home trust still
+// pathname-only" -- "pathname mountinfo match not opened descriptor
+// mount ID... Match each opened descriptor statx mount ID to exact
+// mountinfo"): the STRONG, primary correlation path -- matches the
+// descriptor's OWN kernel-assigned STATX_MNT_ID (`identity.mountId`,
+// already recovered via mountIdentityForFd()/mountIdentityRelative() at
+// the exact moment this descriptor was opened, never re-derived from a
+// path string afterward) against mountinfo's own numeric mount-id field
+// (field 0), which is unambiguous by construction: the kernel assigns
+// each mount table entry exactly one, unique-at-any-given-moment id,
+// unlike a human-readable path string that could -- e.g. via unusual
+// mountinfo escaping, a differing per-process mount namespace view, or
+// simply this project's own path-normalization choices -- fail to
+// literally byte-for-byte match the kernel's own recorded mountPoint
+// field even for the exact same real mount. Additionally cross-checks
+// mountinfo's own major:minor device field (field 2) against this same
+// descriptor's st_dev (`identity.device`) as defense in depth: a
+// mismatch here would mean either a race (the mount table changed
+// between this descriptor's open() and this read of mountinfo) or an
+// inconsistency this project has no way to explain, so it fails closed
+// rather than trusting a partially-inconsistent record.
+bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
+                                          quint64 expectedDevice) {
+  if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
+          std::memory_order_acquire)) {
+    return g_forceMountTransitionPolicyOverrideValueForTesting.load(
+        std::memory_order_acquire);
+  }
+  const std::optional<QByteArray> mountinfoContent =
+      readEntireProcFileRaw("/proc/self/mountinfo");
+  if (!mountinfoContent.has_value()) {
+    qWarning() << "AssetCache: could not read /proc/self/mountinfo to "
+                  "authenticate mount id"
+               << mountId;
+    return false;
+  }
+  bool found = false;
+  bool trusted = false;
+  QString matchedFstype;
+  const QList<QByteArray> rawLines = mountinfoContent->split('\n');
+  for (const QByteArray &rawLine : rawLines) {
+    if (rawLine.isEmpty()) {
+      continue;
+    }
+    const QString line = QString::fromUtf8(rawLine);
+    const int dashIndex = line.indexOf(QStringLiteral(" - "));
+    if (dashIndex < 0) {
+      continue;
+    }
+    const QStringList beforeDash =
+        line.left(dashIndex).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    // Fields, in order: 0 mount-id, 1 parent-id, 2 major:minor, 3 root,
+    // 4 mount point, then options/optional tags.
+    if (beforeDash.size() < 5) {
+      continue;
+    }
+    bool mountIdOk = false;
+    const quint64 lineMountId = beforeDash.at(0).toULongLong(&mountIdOk);
+    if (!mountIdOk || lineMountId != mountId) {
+      continue;
+    }
+    const QStringList majorMinor =
+        beforeDash.at(2).split(QLatin1Char(':'), Qt::SkipEmptyParts);
+    if (majorMinor.size() != 2) {
+      continue;
+    }
+    bool majorOk = false;
+    bool minorOk = false;
+    const unsigned int major = majorMinor.at(0).toUInt(&majorOk);
+    const unsigned int minor = majorMinor.at(1).toUInt(&minorOk);
+    if (!majorOk || !minorOk) {
+      continue;
+    }
+#if defined(__linux__)
+    const quint64 lineDevice = static_cast<quint64>(::makedev(major, minor));
+    if (lineDevice != expectedDevice) {
+      qWarning() << "AssetCache: mountinfo mount id" << mountId << "device"
+                 << QStringLiteral("%1:%2").arg(major).arg(minor)
+                 << "does not match this descriptor's own st_dev -- refusing "
+                    "(possible mount-table race between open() and this "
+                    "read, or an unexplained inconsistency)";
+      return false;
+    }
+#endif
+    const QStringList afterDash =
+        line.mid(dashIndex + 3).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    if (afterDash.isEmpty()) {
+      continue;
+    }
+    found = true;
+    matchedFstype = afterDash.at(0);
+    trusted = trustedLocalMountFilesystemTypes().contains(matchedFstype);
+    // Mount ids are unique at any given moment -- exactly one line can
+    // ever match, so this loop could break here; kept scanning to the
+    // end anyway (mirrors mountPointHasTrustedLocalFilesystemTypeByPath()'s
+    // own "last matching line is authoritative" style) is unnecessary
+    // for a unique key, but harmless.
+    break;
+  }
+  if (!found) {
+    qWarning()
+        << "AssetCache: no /proc/self/mountinfo entry's mount-id "
+           "field exactly matched"
+        << mountId
+        << "(diagnostic only -- see mountIdHasTrustedLocalFilesystemType())";
+  } else if (!trusted) {
+    qWarning() << "AssetCache: /proc/self/mountinfo mount id" << mountId
+               << "has filesystem type" << matchedFstype
+               << "which is not in the trusted-local allowlist (diagnostic "
+                  "only -- see mountIdHasTrustedLocalFilesystemType())";
+  }
+  return found && trusted;
+}
+
 // True iff /proc/self/mountinfo records `canonicalMountPoint` (which
 // MUST already be an absolute, kernel-canonicalized path -- see this
 // function's own call site, which derives it from
@@ -1508,8 +1623,12 @@ std::optional<QByteArray> readEntireProcFileRaw(const char *path) {
 // once (a later mount stacked directly on top of an earlier one at the
 // identical path -- ordinary, valid mount-table behaviour), the LAST
 // matching line is authoritative, matching the kernel's own current
-// view exactly.
-bool mountPointHasTrustedLocalFilesystemType(
+// view exactly. FALLBACK ONLY: used exclusively when this descriptor's
+// own STATX_MNT_ID is unavailable (older kernel/glibc, or a non-Linux
+// platform) -- see mountIdHasTrustedLocalFilesystemType()'s own comment
+// for why the numeric mount-id correlation is strictly preferred
+// whenever it is available at all.
+bool mountPointHasTrustedLocalFilesystemTypeByPath(
     const QString &canonicalMountPoint) {
   if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
           std::memory_order_acquire)) {
@@ -1583,19 +1702,21 @@ bool mountPointHasTrustedLocalFilesystemType(
     trusted = trustedLocalMountFilesystemTypes().contains(matchedFstype);
   }
   if (!found) {
-    qWarning()
-        << "AssetCache: no /proc/self/mountinfo entry's mount-point "
-           "field exactly matched"
-        << QStringLiteral("[%1]").arg(canonicalMountPoint)
-        << "-- near-miss candidates ending in the same final component:"
-        << nearMissCandidates
-        << "-- most recent mountinfo entries overall:" << mostRecentMountPoints
-        << "(diagnostic only -- see mountPointHasTrustedLocalFilesystemType())";
+    qWarning() << "AssetCache: no /proc/self/mountinfo entry's mount-point "
+                  "field exactly matched"
+               << QStringLiteral("[%1]").arg(canonicalMountPoint)
+               << "-- near-miss candidates ending in the same final component:"
+               << nearMissCandidates
+               << "-- most recent mountinfo entries overall:"
+               << mostRecentMountPoints
+               << "(diagnostic only -- see "
+                  "mountPointHasTrustedLocalFilesystemTypeByPath())";
   } else if (!trusted) {
-    qWarning() << "AssetCache: /proc/self/mountinfo reports mount point"
-               << canonicalMountPoint << "has filesystem type" << matchedFstype
-               << "which is not in the trusted-local allowlist (diagnostic "
-                  "only -- see mountPointHasTrustedLocalFilesystemType())";
+    qWarning()
+        << "AssetCache: /proc/self/mountinfo reports mount point"
+        << canonicalMountPoint << "has filesystem type" << matchedFstype
+        << "which is not in the trusted-local allowlist (diagnostic "
+           "only -- see mountPointHasTrustedLocalFilesystemTypeByPath())";
   }
   return found && trusted;
 }
@@ -1631,8 +1752,15 @@ bool mountPointHasTrustedLocalFilesystemType(
 // root ownership (directoryDescriptorPassesAncestorOwnerAndModePolicy())
 // -- see that function's own comment for why conflating the two
 // checks was itself the defect.
+//
+// `identity` is the SAME MountIdentity already recovered for `fd` at
+// the exact moment this descriptor was opened (mountIdentityForFd()),
+// never re-derived afterward -- see mountIdHasTrustedLocalFilesystemType()'s
+// own comment for why correlating via its numeric STATX_MNT_ID is
+// strictly preferred over (and, whenever available, entirely replaces)
+// matching mountinfo by a re-resolved path string.
 bool mountTransitionIsIndependentlyPolicyQualified(
-    int fd, bool isFinalAccountHomeTransition) {
+    int fd, const MountIdentity &identity, bool isFinalAccountHomeTransition) {
   const bool ownershipOk =
       isFinalAccountHomeTransition
           ? directoryDescriptorPassesOwnerAndModePolicy(fd)
@@ -1647,6 +1775,14 @@ bool mountTransitionIsIndependentlyPolicyQualified(
     return false;
   }
 #if defined(__linux__)
+  if (identity.hasMountId) {
+    return mountIdHasTrustedLocalFilesystemType(identity.mountId,
+                                                identity.device);
+  }
+  // FALLBACK ONLY: this descriptor's own STATX_MNT_ID is unavailable
+  // (older kernel/glibc) -- degrade to the strictly weaker, pre-
+  // existing path-string correlation rather than refusing every
+  // transition outright.
   char procFdPath[64];
   std::snprintf(procFdPath, sizeof(procFdPath), "/proc/self/fd/%d", fd);
   char resolved[PATH_MAX];
@@ -1661,7 +1797,7 @@ bool mountTransitionIsIndependentlyPolicyQualified(
   }
   resolved[resolvedLen] = '\0';
   const QString canonicalMountPoint = QString::fromLocal8Bit(resolved);
-  return mountPointHasTrustedLocalFilesystemType(canonicalMountPoint);
+  return mountPointHasTrustedLocalFilesystemTypeByPath(canonicalMountPoint);
 #else
   if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
           std::memory_order_acquire)) {
@@ -1830,7 +1966,7 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
       // it is ever granted.
       if (!transitionMayBeAttemptedHere ||
           !mountTransitionIsIndependentlyPolicyQualified(
-              nextFd, isFinalAccountHomeComponent)) {
+              nextFd, nextMount, isFinalAccountHomeComponent)) {
         qWarning() << "AssetCache: refusing to treat" << home
                    << "as a trusted home directory anchor -- component"
                    << component
@@ -2722,6 +2858,42 @@ AssetCache::~AssetCache() {
   // once the LAST same-process sibling's m_rootAuthorityHandle share is
   // released, never by this destructor at all.
 #if defined(Q_OS_UNIX)
+  // Independent cumulative re-review (MEDIUM, "atfork child handler
+  // unsafe"/"destructor touches inherited FDs/shared_ptr/Qt heap"):
+  // every OTHER public method already fails closed via
+  // hasForkedSinceConstruction() BEFORE touching any inherited mutex/
+  // memory/disk state -- see lookupMemory()'s identical check -- but a
+  // destructor cannot simply return early: it must still leave every
+  // member in a destructible state. m_rootAuthorityHandle's ORDINARY
+  // destruction would decrement a std::shared_ptr refcount whose
+  // control block was itself duplicated (COW) by fork(), never
+  // genuinely shared across processes; if THIS process's own copy of
+  // that count happens to reach zero here, it would invoke
+  // ~RootAuthority(), which owns a QMutex/QHash that may have been
+  // captured mid-mutation by a PARENT-process thread that does not
+  // exist at all in this child (fork() only ever duplicates the single
+  // calling thread) -- destroying those is not safe to assume
+  // well-defined. The documented, safe policy in a forked child is
+  // instead to ABANDON this instance's own reference entirely, without
+  // ever invoking its deleter: leaking it into a heap block this
+  // process intentionally never frees (bounded by this process's own
+  // lifetime) rather than risking an unsafe inherited teardown --
+  // acquireExclusiveRootOwnershipOrFailClosed()'s own guard already
+  // requires exec() before any FRESH authority can ever be acquired by
+  // a forked-and-continuing process, so this leaked reference can never
+  // reappear as a real, usable authority either.
+  if (hasForkedSinceConstruction()) {
+    if (m_rootAuthorityHandle) {
+      new std::shared_ptr<void>(std::move(m_rootAuthorityHandle));
+    }
+    // A plain close() syscall is async-signal-safe and touches no Qt/
+    // heap state at all, unlike the shared_ptr teardown avoided above --
+    // safe to still run even for an inherited fd.
+    if (m_rootFd >= 0) {
+      ::close(m_rootFd);
+    }
+    return;
+  }
   // m_rootAuthorityHandle's own shared_ptr destruction (implicit,
   // default member-destruction order, happens automatically here)
   // releases this instance's share of the process-wide RootAuthority;
@@ -4833,11 +5005,25 @@ void AssetCache::reapAndEnforceQuota() {
 }
 
 qint64 AssetCache::memoryCostBytes() const {
+  // Independent cumulative re-review (MEDIUM, "Pre-fork live AssetCache
+  // objects remain usable in child"): checked BEFORE touching m_mutex --
+  // see lookupMemory()'s identical guard and
+  // hasForkedSinceConstruction()'s comment. A read-only accessor on a
+  // live, pre-fork instance now running in a forked child must never
+  // lock an inherited QMutex (which may have been captured mid-mutation
+  // by a parent-process thread that does not exist in this child), so
+  // it fails to a safe, documented sentinel of 0 instead.
+  if (hasForkedSinceConstruction()) {
+    return 0;
+  }
   QMutexLocker locker(m_mutex);
   return m_memory->totalCost();
 }
 
 qint64 AssetCache::diskUsageBytes() const {
+  if (hasForkedSinceConstruction()) {
+    return 0;
+  }
   QMutexLocker locker(m_mutex);
   // Recurses into subdirectories (see sumUsageRelative()), not a flat
   // listing -- this directory is exclusively owned by AssetCache, so a
@@ -4857,6 +5043,12 @@ qint64 AssetCache::diskUsageBytes() const {
 }
 
 int AssetCache::diskEntryCount() const {
+  // Independent cumulative re-review (MEDIUM, "Pre-fork live AssetCache
+  // objects remain usable in child"): see memoryCostBytes()'s identical
+  // guard immediately above.
+  if (hasForkedSinceConstruction()) {
+    return 0;
+  }
   QMutexLocker locker(m_mutex);
   if (!verifyRootAnchorLocked()) {
     return 0;
@@ -4985,8 +5177,9 @@ AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
   if (fd < 0) {
     return std::nullopt;
   }
+  const MountIdentity identity = mountIdentityForFd(fd);
   const bool qualified = mountTransitionIsIndependentlyPolicyQualified(
-      fd, isFinalAccountHomeTransition);
+      fd, identity, isFinalAccountHomeTransition);
   ::close(fd);
   return qualified;
 #else
@@ -5071,7 +5264,8 @@ void AssetCache::setAuthoritativeAccountHomeDirectoryOverrideForTesting(
 void AssetCache::setMountTransitionPolicyQualificationOverrideForTesting(
     bool active, bool qualified) {
   // Value is stored BEFORE the active flag (release ordering); every
-  // reader (mountPointHasTrustedLocalFilesystemType() on Linux,
+  // reader (mountIdHasTrustedLocalFilesystemType() and
+  // mountPointHasTrustedLocalFilesystemTypeByPath() on Linux,
   // mountTransitionIsIndependentlyPolicyQualified()'s non-Linux branch
   // otherwise) checks the flag first with acquire ordering, guaranteeing
   // it observes this exact value whenever it sees the override active.

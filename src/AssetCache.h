@@ -757,6 +757,20 @@ public:
   // used for.
   [[nodiscard]] bool rootLockRegistryHasLiveEntryForTesting() const;
 
+  // Independent cumulative re-review (MEDIUM, "Pre-fork live AssetCache
+  // objects remain usable in child" -- "Real inherited object test
+  // while parent registry/mutex active"): lets a test deterministically
+  // hold this instance's real m_mutex from one thread while a SEPARATE
+  // real fork() happens on another, so the forked child's copy of
+  // m_mutex is guaranteed (not merely probabilistically) captured in a
+  // locked state -- exactly the scenario hasForkedSinceConstruction()'s
+  // guards on every public accessor/mutator (checked BEFORE ever
+  // touching m_mutex) must survive without ever deadlocking. Test-only:
+  // a normal caller has no legitimate reason to manually lock/unlock
+  // this instance's own mutex from outside its own methods.
+  void lockMutexForTesting() { m_mutex->lock(); }
+  void unlockMutexForTesting() { m_mutex->unlock(); }
+
   // Round-7/8 item 7: the number of times invalidate() has actually run
   // since this instance was constructed. Lets a test assert a group of
   // coalesced cache-hit decode waiters sharing a single quarantine-worthy
