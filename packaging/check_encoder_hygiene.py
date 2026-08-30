@@ -98,6 +98,80 @@ project's tasks, loaded here directly via Python's built-in `ctypes`
 against libclang's stable C ABI (not the unrelated, separately
 pip-installed `clang`/`libclang` PyPI packages, which this script does
 not use or require).
+
+This script also independently, structurally proves the domain/
+foundation *dependency direction* boundary a review round demonstrated
+was not actually enforced by the compiler in the way an earlier
+CMakeLists.txt revision's comments (and a since-rewritten, now-removed
+compiled probe target) claimed: narrowing arkham_domain_models's public
+include path to only "src/domain" blocks a *bare*
+`#include "AuthModels.h"` (no `-I src` left to search), but it never
+blocked -- and cannot block, no matter how include paths are narrowed --
+a *relative-parent* `#include "../AuthModels.h"` written inside a file
+that itself lives in src/domain/, because quote-form #include always
+searches relative to the including file's own directory *before*
+consulting any `-I`/FILE_SET path at all. The same is true of an
+absolute-path #include, or a same-directory symlink whose target
+happens to resolve outside src/domain/. None of these are blockable by
+any compile-flag/include-path configuration; they can only be caught by
+inspecting what a header's #include actually, truly resolved to.
+
+So, for every header/fragment in BOTH manifests, this script also asks
+libclang for the *complete resolved inclusion graph* of that header's
+own wrapper translation unit (via `clang_getInclusions()` -- see
+https://clang.llvm.org/docs/LibClang.html -- which reports every file
+the compiler actually entered, transitively, no matter how the
+#include that reached it was spelled: bare, "../"-relative, absolute,
+via a symlink, or via a project-generated wrapper header) and requires
+every *project-owned* file that graph reaches (i.e. every included file
+whose own canonicalized, symlink-resolved real path lies inside this
+repository's tracked source tree -- anything outside it entirely, such
+as a Qt/system/toolchain header, is unconditionally external and
+exempt) to be a member of the closure this script was told is
+legitimate for the header currently being probed. "This repository's
+tracked source tree" deliberately excludes this script's own dedicated
+Clang-toolchain build directory (see _configure_clang_build_dir() and
+_audit_inclusion_graph()): that directory is, by default, physically
+nested inside the repository itself, and CMake's FetchContent (see
+CMakeLists.txt's QtKeychain declaration) downloads/builds genuinely
+external third-party source and generated build artifacts directly
+under it -- none of that is this repository's own tracked source,
+merely a byproduct of where this check happens to configure its
+scratch build, and must be classified exactly like any other external
+header:
+
+  - Scanning a DOMAIN header/fragment: the only permitted project-owned
+    included files are other members of the domain closure itself
+    (ARKHAM_DOMAIN_HEADERS + ARKHAM_DOMAIN_FRAGMENTS) -- reaching
+    *anything* foundation-owned (AuthModels.h or otherwise), by any
+    spelling whatsoever, is a hard structural violation. This is the
+    domain -> foundation direction the review round showed must be
+    forbidden.
+  - Scanning a FOUNDATION header/fragment: the domain closure is
+    additionally permitted (foundation -> domain is the allowed
+    direction; arkham_foundation legitimately links
+    arkham_domain_models), but nothing else project-owned/unregistered
+    is -- an unregistered fragment, a project-generated header outside
+    both closures, etc. is still a hard structural violation there too.
+
+Every declared entry in every manifest is also independently required
+to resolve (after following any symlink) to a real path *physically
+located inside its own claimed root* (src/domain/ for every domain
+entry, src/ for every foundation entry) before any of the above even
+runs -- this is what stops a same-named symlink smuggled directly into
+one of the manifests itself (rather than merely #include-d from
+elsewhere) from silently widening a closure to include a file it does
+not actually, physically contain.
+
+Since a header's own declarations may now legitimately be discovered
+while scanning a *different* header's wrapper TU (e.g. Decks.h's
+wrapper TU also enters ValueOrError.h, which Decks.h legitimately
+#includes), every declaration is attributed to its own true resolved
+source file (never to whichever header's wrapper TU happened to reach
+it) and recorded in one global, whole-run (file, line, USR) dedup set,
+so a legitimately shared/cross-included file's declarations are counted
+exactly once no matter how many other headers in its own closure
+#include it -- never once per including header.
 """
 
 from __future__ import annotations
@@ -415,6 +489,23 @@ class _LibClang:
         lib.clang_getFile.restype = ctypes.c_void_p
         lib.clang_getFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
+        # clang_getInclusions() is what makes the *resolved inclusion
+        # graph* of a wrapper TU (see _audit_inclusion_graph()) directly
+        # observable: it visits every file the compiler actually entered
+        # while parsing, transitively, regardless of how the #include
+        # that reached it was spelled (bare, "../"-relative, absolute,
+        # through a symlink, or via a project-generated wrapper) -- see
+        # the module docstring for why include-path/compile-flag
+        # configuration alone cannot block every one of those spellings,
+        # so only inspecting the compiler's own resolved graph can.
+        self._inclusion_visitor_func_type = ctypes.CFUNCTYPE(
+            None, ctypes.c_void_p, ctypes.POINTER(_CXSourceLocation), ctypes.c_uint, ctypes.c_void_p
+        )
+        lib.clang_getInclusions.restype = None
+        lib.clang_getInclusions.argtypes = [
+            ctypes.c_void_p, self._inclusion_visitor_func_type, ctypes.c_void_p
+        ]
+
         lib.clang_getNumDiagnostics.restype = ctypes.c_uint
         lib.clang_getNumDiagnostics.argtypes = [ctypes.c_void_p]
         lib.clang_getDiagnostic.restype = ctypes.c_void_p
@@ -563,7 +654,7 @@ def _parse_header_as_own_tu(
     header: Path,
     compile_args: list[str],
     sysroot_args: list[str],
-):
+) -> tuple[ctypes.c_void_p, str]:
     """Parse `header` as the sole content of its own synthetic translation
     unit: an in-memory ("unsaved") wrapper file containing exactly one
     line, `#include "<header, absolute path>"`, fed to libclang via
@@ -578,10 +669,13 @@ def _parse_header_as_own_tu(
     #includes -- the root fix for the coverage gap a review round
     demonstrated (see module docstring).
 
-    Returns the raw `CXTranslationUnit` pointer (caller must dispose it).
-    Raises EncoderHygieneError on any parse failure, fatal diagnostic, or
-    if clang_getFile() cannot confirm the wrapper's #include actually
-    resolved to this exact header file.
+    Returns `(tu, wrapper_filename)`: the raw `CXTranslationUnit` pointer
+    (caller must dispose it) and the synthetic wrapper's own filename
+    (the caller needs this to recognize and skip the wrapper's own
+    "main file" entry when auditing clang_getInclusions() -- see
+    _audit_inclusion_graph()). Raises EncoderHygieneError on any parse
+    failure, fatal diagnostic, or if clang_getFile() cannot confirm the
+    wrapper's #include actually resolved to this exact header file.
     """
 
     header_abs = str(header.resolve())
@@ -651,59 +745,196 @@ def _parse_header_as_own_tu(
             "script treats as a hard failure rather than silently skipping it."
         )
 
-    return tu
+    return tu, wrapper_filename
 
 
-def _collect_findings_for_headers(
+def _validate_closure_rootedness(
+    entries: Sequence[Path], expected_root: Path, kind_label: str
+) -> frozenset[Path]:
+    """Resolve every manifest entry (following any symlink) and hard-fail
+    if any of them physically lives outside `expected_root`.
+
+    This is what stops a same-named symlink smuggled directly into a
+    manifest itself (e.g. a bogus "src/domain/SneakyAlias.h" that is
+    really a symlink to "src/AuthModels.h", registered so it passes the
+    on-disk header-inventory check) from silently widening a closure to
+    include a file it does not actually, physically contain -- every
+    closure-membership/inclusion-graph check below is keyed on exactly
+    the resolved (realpath) set this function returns, never on the
+    original, possibly-symlinked lexical manifest path.
+
+    Raises EncoderHygieneError (never silently drops/renames an entry)
+    if any manifest entry's real path escapes `expected_root`."""
+
+    resolved: set[Path] = set()
+    violations: list[str] = []
+    for entry in entries:
+        real = entry.resolve()
+        if not real.is_relative_to(expected_root):
+            violations.append(f"  {entry} resolves to {real}, which is not inside {expected_root}")
+        resolved.add(real)
+    if violations:
+        raise EncoderHygieneError(
+            f"{kind_label} manifest entries must each physically reside inside "
+            f"{expected_root} once any symlink is followed -- found entries that "
+            "do not (a symlink whose real target lies elsewhere is exactly the "
+            "kind of same-named-but-different-file trick this check exists to "
+            "catch):\n" + "\n".join(sorted(violations))
+        )
+    return frozenset(resolved)
+
+
+def _audit_inclusion_graph(
+    clang: _LibClang,
+    tu: ctypes.c_void_p,
+    header: Path,
+    wrapper_filename: str,
+    allowed_closure: frozenset[Path],
+    repo_root: Path,
+    clang_build_dir: Path,
+) -> list[str]:
+    """Ask libclang for the complete resolved inclusion graph of
+    `header`'s own wrapper TU (via clang_getInclusions() -- see the
+    _LibClang binding above and the module docstring) and return one
+    violation description per project-owned file (i.e. one whose own
+    resolved, symlink-followed real path lies inside this repository's
+    tracked source tree -- anything outside it entirely is an external
+    Qt/system/toolchain header and always allowed unconditionally) it
+    reaches that is not a member of `allowed_closure`.
+
+    "Inside this repository's tracked source tree" deliberately excludes
+    anything resolving under `clang_build_dir` itself: this script
+    configures/builds its own dedicated CMake build directory (by
+    default `<repo_root>/build-encoder-hygiene`, i.e. physically NESTED
+    inside the repository), and CMake's FetchContent (see
+    CMakeLists.txt's QtKeychain declaration) downloads/builds genuinely
+    external third-party source and generates build artifacts (e.g.
+    qkeychain_export.h) directly under it -- none of that is part of
+    this repository's own tracked source, merely a byproduct of where
+    this particular check happens to configure its scratch build, and
+    must be classified exactly like any other external header, never as
+    an unregistered project file.
+
+    This is independent of however the #include that reached the
+    forbidden file was spelled: bare, "../"-relative, absolute, through
+    a symlink, or via a project-generated wrapper header all resolve to
+    the same real file identity here, which is exactly what a
+    compile-flag/include-path-based defense alone cannot guarantee (see
+    module docstring)."""
+
+    violations: list[str] = []
+    included: list[Path] = []
+
+    def visitor(included_file, _inclusion_stack, _include_len, _client_data) -> None:
+        if not included_file:
+            return
+        name = clang.to_str(clang.lib.clang_getFileName(included_file))
+        if name:
+            included.append(Path(name))
+
+    cb = clang._inclusion_visitor_func_type(visitor)
+    clang.lib.clang_getInclusions(tu, cb, None)
+
+    wrapper_basename = Path(wrapper_filename).name
+    for included_path in included:
+        # The wrapper's own synthetic "main file" is not a real
+        # #include at all -- clang_getInclusions() reports it anyway
+        # (with an empty inclusion stack), so it must be recognized and
+        # skipped by exact name before any closure-membership check
+        # (it would otherwise be misclassified as an unregistered
+        # project-owned file, since it lives right next to the real
+        # header on disk, lexically).
+        if included_path.name == wrapper_basename:
+            continue
+        real = included_path.resolve()
+        if not real.is_relative_to(repo_root) or real.is_relative_to(clang_build_dir):
+            continue  # External (Qt/system/toolchain/FetchContent/build-artifact) header: always allowed.
+        if real not in allowed_closure:
+            violations.append(
+                f"  {header} transitively #includes {included_path} "
+                f"(resolves to {real}), which is not part of the allowed "
+                "header/fragment closure for this scan -- a forbidden "
+                "cross-boundary dependency or an unregistered project file, "
+                "regardless of how the #include itself was spelled"
+            )
+
+    return violations
+
+
+def _scan_headers(
     clang: _LibClang,
     idx: ctypes.c_void_p,
     headers: Sequence[Path],
     compile_args: list[str],
     sysroot_args: list[str],
     repo_root: Path,
+    clang_build_dir: Path,
+    allowed_closure: frozenset[Path],
+    seen: set[tuple[str, int, str]],
+    structural_violations: list[str],
 ) -> list[Finding]:
-    """Independently parse every header in `headers` as its own
-    synthetic wrapper translation unit (see _parse_header_as_own_tu()),
-    recording a Finding for every public, QJson-family-returning,
-    function-like declaration whose OWN location resolves to exactly the
-    header currently being probed (never some other header transitively
-    pulled in by it -- that header gets its own separate iteration of
-    this same loop, so nothing here needs to deduplicate across
-    overlapping #include closures)."""
+    """Independently parse every header/fragment in `headers` as its own
+    synthetic wrapper translation unit (see _parse_header_as_own_tu()).
+
+    For each one:
+      - Audits its complete resolved inclusion graph against
+        `allowed_closure` (see _audit_inclusion_graph()), appending any
+        violation found to `structural_violations` -- a hard,
+        never-allowlist-able failure (see run_check()).
+      - Records a Finding for every public, QJson-family-returning,
+        function-like declaration whose OWN resolved location is a
+        member of `allowed_closure` -- not merely "== the header
+        currently being probed": a header may legitimately #include
+        another member of its own closure (e.g. Decks.h #include-ing
+        ValueOrError.h), and that included file's declarations must
+        still be attributed to their own true source file. `seen` is a
+        single (resolved file, line, USR) dedup set shared across the
+        *entire* run (both the domain and foundation passes), so a
+        legitimately shared/cross-included file's declarations are
+        recorded exactly once no matter how many headers in its own
+        closure #include it -- never once per including header."""
 
     findings: list[Finding] = []
-    current_header_abs: Path = headers[0].resolve() if headers else Path()
 
     def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
         kind = clang.lib.clang_getCursorKind(cursor)
         if kind in _FUNCTION_LIKE_KINDS:
             filename, line = clang.cursor_file_and_line(cursor)
-            if filename is not None and Path(filename).resolve() == current_header_abs:
-                access = clang.lib.clang_getCXXAccessSpecifier(cursor)
-                if access in _PUBLIC_ACCESS_SPECIFIERS:
-                    result_type = clang.lib.clang_getCursorResultType(cursor)
-                    canonical = clang.lib.clang_getCanonicalType(result_type)
-                    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
-                    if _is_qjson_family(spelling):
-                        usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
-                        display = clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
-                        findings.append(
-                            Finding(
-                                file=current_header_abs.relative_to(repo_root).as_posix(),
-                                line=line,
-                                display_name=display,
-                                canonical_return_type=spelling,
-                                usr=usr,
-                            )
-                        )
+            if filename is not None:
+                real = Path(filename).resolve()
+                if real in allowed_closure:
+                    access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+                    if access in _PUBLIC_ACCESS_SPECIFIERS:
+                        result_type = clang.lib.clang_getCursorResultType(cursor)
+                        canonical = clang.lib.clang_getCanonicalType(result_type)
+                        spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
+                        if _is_qjson_family(spelling):
+                            usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+                            dedup_key = (str(real), line, usr)
+                            if dedup_key not in seen:
+                                seen.add(dedup_key)
+                                display = clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
+                                findings.append(
+                                    Finding(
+                                        file=real.relative_to(repo_root).as_posix(),
+                                        line=line,
+                                        display_name=display,
+                                        canonical_return_type=spelling,
+                                        usr=usr,
+                                    )
+                                )
             return 1  # CXChildVisit_Continue: do not descend into the body.
         return 2  # CXChildVisit_Recurse: keep looking for nested declarations.
 
     visitor_cb = clang._visitor_func_type(visitor)
 
     for header in headers:
-        current_header_abs = header.resolve()
-        tu = _parse_header_as_own_tu(clang, idx, header, compile_args, sysroot_args)
+        tu, wrapper_filename = _parse_header_as_own_tu(clang, idx, header, compile_args, sysroot_args)
+        structural_violations.extend(
+            _audit_inclusion_graph(
+                clang, tu, header, wrapper_filename, allowed_closure, repo_root, clang_build_dir
+            )
+        )
         root = clang.lib.clang_getTranslationUnitCursor(tu)
         clang.lib.clang_visitChildren(root, visitor_cb, None)
         clang.lib.clang_disposeTranslationUnit(tu)
@@ -715,9 +946,14 @@ def _read_manifest(path: Path) -> list[Path]:
     if not path.is_file():
         raise EncoderHygieneError(
             f"Manifest {path} does not exist. Run `cmake` configure (see "
-            "CMakeLists.txt's ARKHAM_DOMAIN_HEADERS/ARKHAM_DOMAIN_SOURCES/"
-            "ARKHAM_FOUNDATION_HEADERS/ARKHAM_FOUNDATION_SOURCES, which generate "
-            "this file) before running this script."
+            "CMakeLists.txt's arkham_write_target_header_set_manifest() calls "
+            "for domain/foundation *_headers.txt -- generated from the real "
+            "arkham_domain_models/arkham_foundation targets' own live CMake "
+            "HEADER_SETS metadata, not a hand-authored variable -- and the "
+            "ARKHAM_DOMAIN_SOURCES/ARKHAM_FOUNDATION_SOURCES/"
+            "ARKHAM_DOMAIN_FRAGMENTS/ARKHAM_FOUNDATION_FRAGMENTS-driven "
+            "arkham_write_path_manifest() calls for *_sources.txt/*_fragments.txt) "
+            "before running this script."
         )
     lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
     return [Path(line) for line in lines if line]
@@ -790,11 +1026,48 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         raise EncoderHygieneError(f"{compile_commands_path} does not exist after configuring")
     compile_commands = json.loads(compile_commands_path.read_text(encoding="utf-8"))
 
+    # domain_headers.txt/foundation_headers.txt are generated by
+    # arkham_write_target_header_set_manifest() (see cmake/PathManifest.cmake)
+    # directly from the arkham_domain_models/arkham_foundation targets' own
+    # live CMake HEADER_SETS/HEADER_SET_<name> metadata -- never from a
+    # hand-authored CMake variable -- so a second/late FILE_SET call adding
+    # headers to either target is automatically captured here with no
+    # further change to this script. *_fragments.txt lists any registered
+    # non-header project source fragments (.inc/.inl/.ipp/.tpp) that
+    # contribute declarations via #include but are not headers in their own
+    # right; both are empty today (no such file exists in this codebase yet)
+    # but are read/validated/scanned identically to headers below, so a
+    # future fragment is covered by construction rather than by a suffix
+    # glob guess.
     generated_dir = clang_build_dir / "generated"
     domain_headers = _read_manifest(generated_dir / "domain_headers.txt")
     domain_sources = _read_manifest(generated_dir / "domain_sources.txt")
+    domain_fragments = _read_manifest(generated_dir / "domain_fragments.txt")
     foundation_headers = _read_manifest(generated_dir / "foundation_headers.txt")
     foundation_sources = _read_manifest(generated_dir / "foundation_sources.txt")
+    foundation_fragments = _read_manifest(generated_dir / "foundation_fragments.txt")
+
+    # Every manifest entry must physically live inside the root it claims
+    # to belong to (see _validate_closure_rootedness()) *before* it is
+    # trusted as a member of any allowed-inclusion closure below -- this
+    # is what stops a symlink smuggled directly into a manifest itself
+    # (rather than merely #include-d from elsewhere) from silently
+    # widening a closure.
+    domain_root = (repo_root / "src" / "domain").resolve()
+    foundation_root = (repo_root / "src").resolve()
+    domain_closure = _validate_closure_rootedness(
+        domain_headers + domain_fragments, domain_root, "Domain header/fragment"
+    )
+    foundation_only_closure = _validate_closure_rootedness(
+        foundation_headers + foundation_fragments, foundation_root, "Foundation header/fragment"
+    )
+    # foundation -> domain is the allowed dependency direction
+    # (arkham_foundation legitimately links arkham_domain_models); the
+    # reverse, domain -> foundation, is exactly the forbidden direction a
+    # review round demonstrated was not actually enforced (see module
+    # docstring) -- hence domain's own allowed closure below deliberately
+    # excludes foundation_only_closure entirely.
+    foundation_closure = domain_closure | foundation_only_closure
 
     libclang_path = _find_libclang()
     clang = _LibClang(libclang_path)
@@ -809,15 +1082,56 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     if not idx:
         raise EncoderHygieneError("clang_createIndex() failed")
 
+    # A single dedup set shared across BOTH passes below: once
+    # cross-closure #includes are permitted (a header may legitimately
+    # #include another member of its own closure), the same real
+    # declaration can be legitimately discovered while scanning more than
+    # one wrapper TU, and must only ever be recorded/counted once overall.
+    seen: set[tuple[str, int, str]] = set()
+    structural_violations: list[str] = []
+    clang_build_dir_resolved = clang_build_dir.resolve()
+
     try:
-        findings = _collect_findings_for_headers(
-            clang, idx, domain_headers, domain_args, sysroot_args, repo_root
+        findings = _scan_headers(
+            clang,
+            idx,
+            domain_headers + domain_fragments,
+            domain_args,
+            sysroot_args,
+            repo_root,
+            clang_build_dir_resolved,
+            domain_closure,
+            seen,
+            structural_violations,
         )
-        findings += _collect_findings_for_headers(
-            clang, idx, foundation_headers, foundation_args, sysroot_args, repo_root
+        findings += _scan_headers(
+            clang,
+            idx,
+            foundation_headers + foundation_fragments,
+            foundation_args,
+            sysroot_args,
+            repo_root,
+            clang_build_dir_resolved,
+            foundation_closure,
+            seen,
+            structural_violations,
         )
     finally:
         clang.lib.clang_disposeIndex(idx)
+
+    if structural_violations:
+        # A hard, never-allowlist-able failure: no AllowlistEntry can ever
+        # excuse a forbidden cross-boundary #include, unlike a QJson
+        # finding, which the ALLOWLIST mechanism exists specifically to
+        # cover for the tiny set of deliberately-approved adapters.
+        raise EncoderHygieneError(
+            "Domain/foundation dependency-direction boundary violated -- "
+            "these are hard structural failures and can never be allowlisted "
+            "(see this script's module docstring for why include-path/"
+            "compile-flag narrowing alone cannot block every #include "
+            "spelling, and why only inspecting the compiler's own resolved "
+            "inclusion graph can):\n" + "\n".join(structural_violations)
+        )
 
     return findings
 
@@ -925,9 +1239,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"Encoder hygiene: {len(findings)} public QJson-returning declaration(s) "
-        "found across the domain-model and foundation header sets, all "
+        "found across the domain-model and foundation header/fragment sets, all "
         f"{len(ALLOWLIST)} allowlist entries accounted for at their exact "
-        "expected occurrence count, zero violations."
+        "expected occurrence count, zero violations, and every header/"
+        "fragment's complete resolved inclusion graph stayed within its "
+        "allowed domain/foundation dependency-direction closure."
     )
     return 0
 

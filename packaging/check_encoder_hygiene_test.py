@@ -2,11 +2,17 @@
 """Unit tests for packaging/check_encoder_hygiene.py's pure decision logic
 (AllowlistEntry, classify(), the ALLOWLIST/ALLOWLIST_BY_KEY exact-count
 membership rule, compile-argument sanitization, representative-compile-
-args selection, and the "missing/miscounted allowlist entry" staleness
-check), using synthetic Finding/AllowlistEntry records and fake
-compile_commands.json-shaped data rather than a real compiler invocation
-(fast, deterministic, no Clang/libclang dependency for this file
-specifically -- the real, header-driven AST walk against the actual
+args selection, the "missing/miscounted allowlist entry" staleness
+check, and _validate_closure_rootedness()'s symlink-aware self-rootedness
+enforcement), using synthetic Finding/AllowlistEntry records, fake
+compile_commands.json-shaped data, and (for the rootedness tests, which
+genuinely need real filesystem entries/symlinks -- see
+ClosureRootednessTests) a scratch directory tree created under this
+repository's own gitignored build/ directory rather than the real
+project layout or the system temp directory, rather than a real compiler
+invocation (fast, deterministic, no Clang/libclang dependency for this
+file specifically -- the real, header-driven AST walk and
+clang_getInclusions()-based inclusion-graph audit against the actual
 project sources is exercised separately by
 `mise run contracts:check-encoder-hygiene`, which this test suite
 intentionally does not invoke).
@@ -17,6 +23,7 @@ Run directly: `python3 packaging/check_encoder_hygiene_test.py`
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -302,6 +309,67 @@ class FindingKeyTests(unittest.TestCase):
     def test_key_is_file_and_usr_pair(self) -> None:
         finding = _finding(file="src/domain/RawJson.h", usr="some-usr")
         self.assertEqual(finding.key(), ("src/domain/RawJson.h", "some-usr"))
+
+
+class ClosureRootednessTests(unittest.TestCase):
+    """Coverage for _validate_closure_rootedness(): every manifest entry
+    must, after following any symlink, physically reside inside its
+    claimed root -- the self-rootedness check that stops a same-named
+    symlink (whether smuggled directly into a manifest, or captured
+    automatically because a rogue second FILE_SET registered an
+    already-existing foundation header onto the domain target -- see
+    arkham_write_target_header_set_manifest() in
+    cmake/PathManifest.cmake) from silently widening a closure to
+    include a file it does not actually, physically contain.
+
+    Uses a real scratch directory tree (regular files and an actual
+    symlink -- Path.resolve() genuinely needs a real filesystem entry to
+    prove symlink-following, not merely lexical path manipulation) rooted
+    under this repository's own gitignored build/ directory, never the
+    system temp directory."""
+
+    def setUp(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        scratch_parent = repo_root / "build"
+        scratch_parent.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=str(scratch_parent))
+        self.scratch = Path(self._tmp.name)
+        self.expected_root = self.scratch / "src" / "domain"
+        self.other_root = self.scratch / "src"
+        self.expected_root.mkdir(parents=True)
+        (self.other_root / "AuthModels.h").write_text("// foundation-only\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_entries_physically_inside_expected_root_are_accepted(self) -> None:
+        real_header = self.expected_root / "RawJson.h"
+        real_header.write_text("// domain header\n", encoding="utf-8")
+        resolved = ceh._validate_closure_rootedness([real_header], self.expected_root, "Domain")
+        self.assertEqual(resolved, frozenset({real_header.resolve()}))
+
+    def test_entry_outside_expected_root_is_rejected(self) -> None:
+        outside_header = self.other_root / "AuthModels.h"
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._validate_closure_rootedness([outside_header], self.expected_root, "Domain")
+
+    def test_symlink_whose_real_target_escapes_expected_root_is_rejected(self) -> None:
+        # Reproduces the exact reviewer-reported attack: a same-named
+        # entry that lives lexically inside src/domain/ but is really a
+        # symlink pointing at a foundation-only file elsewhere.
+        alias = self.expected_root / "SneakyAlias.h"
+        alias.symlink_to(self.other_root / "AuthModels.h")
+        with self.assertRaises(ceh.EncoderHygieneError) as ctx:
+            ceh._validate_closure_rootedness([alias], self.expected_root, "Domain")
+        self.assertIn(str(self.other_root / "AuthModels.h"), str(ctx.exception))
+
+    def test_symlink_whose_real_target_stays_inside_expected_root_is_accepted(self) -> None:
+        real_header = self.expected_root / "RawJson.h"
+        real_header.write_text("// domain header\n", encoding="utf-8")
+        alias = self.expected_root / "AliasedHeader.h"
+        alias.symlink_to(real_header)
+        resolved = ceh._validate_closure_rootedness([alias], self.expected_root, "Domain")
+        self.assertEqual(resolved, frozenset({real_header.resolve()}))
 
 
 class RealLibclangBasenameTests(unittest.TestCase):
