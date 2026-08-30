@@ -350,7 +350,17 @@ def compute_governed_fixtures(tree: GitTree, schema_paths: set[str]) -> list[str
             f"{manifest_path}: manifest top level is "
             f"{type(manifest).__name__}, expected an object"
         )
-    fixtures_raw = manifest.get("fixtures", [])
+    if "fixtures" not in manifest:
+        # Distinct from a present-but-empty list: a missing key means the
+        # backend manifest regressed or was malformed in a way that would
+        # otherwise silently skip verifying every fixture this client's
+        # schemas govern -- this script's entire purpose is to prove
+        # fixture provenance as well as schema provenance, so treat this
+        # as a hard failure rather than defaulting to `[]`.
+        raise RuntimeError(
+            f'{manifest_path}: manifest is missing required "fixtures" key'
+        )
+    fixtures_raw = manifest["fixtures"]
     if not isinstance(fixtures_raw, list):
         raise RuntimeError(
             f"{manifest_path}: \"fixtures\" is {type(fixtures_raw).__name__}, "

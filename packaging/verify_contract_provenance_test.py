@@ -204,6 +204,29 @@ class ClosureTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             vcp.compute_governed_paths(tree)
 
+    def test_manifest_missing_fixtures_key_rejected(self):
+        # A manifest object entirely lacking the "fixtures" key must be a
+        # hard RuntimeError, distinct from a present-but-empty fixtures
+        # list: silently defaulting a missing key to [] would let a
+        # regressed/malformed backend manifest skip verifying every
+        # fixture this client's modeled schemas govern without any
+        # signal, defeating this script's fixture-provenance guarantee.
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = b"{}"
+        tree = FakeTree(blobs)
+        with self.assertRaises(RuntimeError):
+            vcp.compute_governed_paths(tree)
+
+    def test_manifest_present_but_empty_fixtures_list_accepted(self):
+        # By contrast, a present-and-empty "fixtures" list is a valid,
+        # distinct state (a backend manifest that genuinely governs no
+        # fixtures yet) and must not raise.
+        blobs = _baseline_blobs()
+        blobs["contracts/manifest.json"] = b'{"fixtures": []}'
+        tree = FakeTree(blobs)
+        governed = vcp.compute_governed_paths(tree)
+        self.assertNotIn("contracts/fixtures/catalog.json", governed)
+
     def test_manifest_fixtures_not_a_list_rejected(self):
         # "fixtures" present but bound to an object, not a list, must be a
         # clean RuntimeError, never an unhandled exception from iterating
