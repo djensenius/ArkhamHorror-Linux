@@ -1447,6 +1447,7 @@ bool mountPointHasTrustedLocalFilesystemType(
   bool trusted = false;
   QString matchedFstype;
   QStringList nearMissCandidates;
+  QStringList mostRecentMountPoints;
   const QString leafComponent =
       canonicalMountPoint.section(QLatin1Char('/'), -1);
   while (!mountinfo.atEnd()) {
@@ -1463,6 +1464,16 @@ bool mountPointHasTrustedLocalFilesystemType(
     if (beforeDash.size() < 5) {
       continue;
     }
+    // Diagnostic only (does not affect the actual verdict): mountinfo
+    // lines are emitted in mount-table order, which places the most
+    // recently created mounts last -- since the mount this policy check
+    // is trying to authenticate was (per the caller) JUST created, it
+    // should be among the LAST few lines if it is present under ANY
+    // path at all. Bracketed for exact whitespace/escaping visibility.
+    if (mostRecentMountPoints.size() >= 6) {
+      mostRecentMountPoints.removeFirst();
+    }
+    mostRecentMountPoints << QStringLiteral("[%1]").arg(beforeDash.at(4));
     if (beforeDash.at(4) != canonicalMountPoint) {
       // Diagnostic only (does not affect the actual verdict): a line
       // whose mount-point field merely ENDS with this path's own final
@@ -1493,6 +1504,7 @@ bool mountPointHasTrustedLocalFilesystemType(
         << QStringLiteral("[%1]").arg(canonicalMountPoint)
         << "-- near-miss candidates ending in the same final component:"
         << nearMissCandidates
+        << "-- most recent mountinfo entries overall:" << mostRecentMountPoints
         << "(diagnostic only -- see mountPointHasTrustedLocalFilesystemType())";
   } else if (!trusted) {
     qWarning() << "AssetCache: /proc/self/mountinfo reports mount point"
