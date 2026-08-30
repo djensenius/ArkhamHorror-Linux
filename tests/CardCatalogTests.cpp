@@ -165,6 +165,35 @@ private slots:
   void cardDefToJsonRejectsOutOfRangeCardSlotInArray();
   void cardDefToJsonRejectsOutOfRangeOutOfPlayEffectInArray();
   void cardDefToJsonRejectsOutOfRangeWhenDiscarded();
+
+  // Round-19-cumulative-review item 2: a stored Kind::Undefined member
+  // (constructible only via Json::Value::makeObject(), never a real
+  // parse -- see Value::find()'s doc comment) previously satisfied
+  // fieldPresence(obj, key) != Absent as if the key were genuinely
+  // present with a real value, so the reviewer's literal repro
+  // (makeObject({{"revealedName", Value{}}})) silently decoded as if
+  // "revealedName" were simply omitted. Each covers a different
+  // field-presence-sensitive helper family so none of them can silently
+  // regress to the old absent-vs-undefined conflation independently.
+  void cardDefRawDecodeRejectsOptionalRevealedNamePresentButStoredUndefined();
+  void cardDefRawDecodeRejectsRequiredCardCodePresentButStoredUndefined();
+  void cardDefRawDecodeRejectsNestedNullableSubtitlePresentButStoredUndefined();
+  void cardDefRawDecodeStillTreatsGenuinelyAbsentRevealedNameAsAbsent();
+
+  // Round-19-cumulative-review item 3: GameValue/SkillIcon/CardCost had
+  // no user-declared copy/move, so a compiler-generated move constructor/
+  // assignment would (for GameValue specifically) really move
+  // m_contents (QList<qint64>, leaving it empty) while the discriminating
+  // tag stayed ByPlayerCount on the moved-from source -- the exact
+  // element-count loss the reviewer flagged. All three now explicitly
+  // declare a copy constructor/assignment (see CardCatalog.h), so
+  // std::move() falls back to a full (cheap, implicit-sharing) copy
+  // instead, and this also transitively protects each type's Unknown-tag
+  // Json::Value raw payload (itself now copy-only, see RawJson.h).
+  void gameValueByPlayerCountMoveConstructLeavesSourceContentsIntact();
+  void gameValueByPlayerCountMoveAssignLeavesSourceContentsIntact();
+  void skillIconUnknownTagMoveConstructLeavesSourceRawIntact();
+  void cardCostUnknownTagMoveConstructLeavesSourceRawIntact();
 };
 
 namespace {
@@ -189,6 +218,33 @@ QJsonObject minimalCardObject() {
       {QStringLiteral("cardType"), QStringLiteral("AssetType")},
       {QStringLiteral("art"), QStringLiteral("1")},
   };
+}
+
+// Round-19-cumulative-review item 2: a directly-constructed Json::Value
+// object -- built via makeObject(), never Value::parse() -- can hold a
+// member whose value is a genuine Kind::Undefined (no valid JSON spelling
+// produces that; see Value::find()'s doc comment). replaceMember lets a
+// test overwrite (or newly insert) exactly one top-level member of the
+// otherwise-minimal raw card object with such a value, or with any other
+// Value, while every other member keeps decoding successfully, isolating
+// the field under test.
+Json::Value minimalCardRawObject(QLatin1StringView memberToReplace = {},
+                                 Json::Value replacement = {}) {
+  Json::Value base = toRawJson(minimalCardObject());
+  QList<std::pair<QString, Json::Value>> members = base.members();
+  if (memberToReplace.isEmpty())
+    return Json::Value::makeObject(members);
+  bool replaced = false;
+  for (auto &member : members) {
+    if (member.first == memberToReplace) {
+      member.second = replacement;
+      replaced = true;
+      break;
+    }
+  }
+  if (!replaced)
+    members.append({QString(memberToReplace), replacement});
+  return Json::Value::makeObject(members);
 }
 
 } // namespace
@@ -1761,6 +1817,186 @@ void CardCatalogTests::cardDefToJsonRejectsOutOfRangeWhenDiscarded() {
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("whenDiscarded")),
            qPrintable(encoded.error()));
+}
+
+void CardCatalogTests::
+    cardDefRawDecodeRejectsOptionalRevealedNamePresentButStoredUndefined() {
+  // The reviewer's literal repro: "revealedName" is an OPTIONAL field
+  // (see decodeCardDef's fieldPresence-gated decode in CardCatalog.cpp),
+  // decoded only when Json::fieldPresence() reports something other than
+  // Absent. Before this fix, a stored Kind::Undefined member satisfied
+  // that check exactly like a real value, so the field was then read via
+  // obj.value("revealedName") -- which also returns an indistinguishable
+  // Undefined -- and decodeCardNameValue() rejected it, but through
+  // fieldPresence()'s OLD behavior (reporting Absent) the field would
+  // instead have been silently skipped entirely, letting the whole
+  // CardDef decode SUCCEED as if "revealedName" were simply omitted. This
+  // must now fail instead.
+  const Json::Value obj = minimalCardRawObject(
+      "revealedName"_L1, Json::Value{} /* stored Undefined */);
+  const auto result = CardDef::fromRawJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("revealedName")),
+           qPrintable(result.error()));
+}
+
+void CardCatalogTests::
+    cardDefRawDecodeRejectsRequiredCardCodePresentButStoredUndefined() {
+  // "cardCode" is a REQUIRED field decoded via Json::requireField(), which
+  // now routes through the presence-distinguishing Json::detail::
+  // findField() rather than a plain value() lookup. A stored-Undefined
+  // member here was never a silent-success risk (requireField() always
+  // failed either way), but must keep failing with an honest message
+  // once find() forwards the found-but-Undefined value on to
+  // decodeCardCodeValue() for its own type check, rather than reporting
+  // "missing required field" for a key that is not actually missing.
+  const Json::Value obj =
+      minimalCardRawObject("cardCode"_L1, Json::Value{} /* stored Undefined */);
+  const auto result = CardDef::fromRawJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("cardCode")),
+           qPrintable(result.error()));
+}
+
+void CardCatalogTests::
+    cardDefRawDecodeRejectsNestedNullableSubtitlePresentButStoredUndefined() {
+  // "subtitle" is a REQUIRED-but-NULLABLE field (Json::requireNullableString,
+  // routed through findOptionalField() in JsonDecode.cpp) nested two
+  // levels deep inside CardDef's top-level "name" object -- covering both
+  // the "nullable" and "nested" categories in one repro. A stored
+  // Undefined here is distinct from both an absent "subtitle" key (which
+  // requireNullableString would reject as missing, since it is not itself
+  // optional -- CardName's exact-keys check demands exactly {title,
+  // subtitle}) and an explicit JSON null (a legitimate empty subtitle);
+  // it must fail with its own distinct message, not be silently treated
+  // as either.
+  const Json::Value base = minimalCardRawObject();
+  QList<std::pair<QString, Json::Value>> nameMembers =
+      base.value("name"_L1).members();
+  bool replaced = false;
+  for (auto &member : nameMembers) {
+    if (member.first == QStringLiteral("subtitle")) {
+      member.second = Json::Value{}; // stored Undefined, not Kind::Null
+      replaced = true;
+      break;
+    }
+  }
+  QVERIFY(replaced);
+  const Json::Value obj =
+      minimalCardRawObject("name"_L1, Json::Value::makeObject(nameMembers));
+
+  const auto result = CardDef::fromRawJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("subtitle")),
+           qPrintable(result.error()));
+}
+
+void CardCatalogTests::
+    cardDefRawDecodeStillTreatsGenuinelyAbsentRevealedNameAsAbsent() {
+  // Guards against an overcorrection: a genuinely absent "revealedName"
+  // key (never inserted at all, the ordinary/common case for this
+  // optional field) must still decode successfully with no revealedName
+  // populated -- fieldPresence()'s fix must distinguish stored-Undefined
+  // from absence in both directions, not merely start rejecting the
+  // field unconditionally.
+  const Json::Value obj = minimalCardRawObject();
+  QVERIFY(!obj.contains("revealedName"_L1));
+  const auto result = CardDef::fromRawJson(obj, u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(!result->revealedName.has_value());
+}
+
+void CardCatalogTests::
+    gameValueByPlayerCountMoveConstructLeavesSourceContentsIntact() {
+  GameValue source = GameValue::byPlayerCount(10, 20, 30, 40);
+  QCOMPARE(source.tag(), GameValueTag::ByPlayerCount);
+  QCOMPARE(source.contents(),
+           (QList<qint64>{qint64(10), qint64(20), qint64(30), qint64(40)}));
+
+  // std::move() on a GameValue now binds the explicitly-declared copy
+  // constructor (see CardCatalog.h) rather than an implicit move, so
+  // `source` below must remain fully intact -- still tag()==
+  // ByPlayerCount with all 4 entries, never silently collapsed to a
+  // 0-element contents() while the tag stays unchanged.
+  GameValue moved(std::move(source));
+  QCOMPARE(moved.tag(), GameValueTag::ByPlayerCount);
+  QCOMPARE(moved.contents(),
+           (QList<qint64>{qint64(10), qint64(20), qint64(30), qint64(40)}));
+
+  QCOMPARE(source.tag(), GameValueTag::ByPlayerCount);
+  QCOMPARE(source.contents(),
+           (QList<qint64>{qint64(10), qint64(20), qint64(30), qint64(40)}));
+
+  // Reuse the moved-from source end-to-end through its own encoder.
+  const QJsonObject expected{
+      {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
+      {QStringLiteral("contents"), QJsonArray{10, 20, 30, 40}}};
+  QCOMPARE(source.toJson(), expected);
+}
+
+void CardCatalogTests::
+    gameValueByPlayerCountMoveAssignLeavesSourceContentsIntact() {
+  GameValue source = GameValue::byPlayerCount(1, 2, 3, 4);
+  GameValue destination = GameValue::valueX();
+  destination = std::move(source);
+
+  QCOMPARE(destination.tag(), GameValueTag::ByPlayerCount);
+  QCOMPARE(destination.contents(),
+           (QList<qint64>{qint64(1), qint64(2), qint64(3), qint64(4)}));
+  // Move-assignment (falling back to copy-assignment) must leave
+  // `source` just as valid/reusable as move-construction does above.
+  QCOMPARE(source.tag(), GameValueTag::ByPlayerCount);
+  QCOMPARE(source.contents(),
+           (QList<qint64>{qint64(1), qint64(2), qint64(3), qint64(4)}));
+}
+
+void CardCatalogTests::skillIconUnknownTagMoveConstructLeavesSourceRawIntact() {
+  const QJsonObject obj{
+      {QStringLiteral("tag"), QStringLiteral("SomeFutureIcon")},
+      {QStringLiteral("contents"), QJsonObject{{QStringLiteral("x"), 1}}}};
+  auto decoded = SkillIcon::fromJson(obj, u"skill");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  SkillIcon source = *decoded;
+  QCOMPARE(source.tag(), SkillIconTag::Unknown);
+
+  // std::move() on a SkillIcon now binds the explicitly-declared copy
+  // constructor (see CardCatalog.h) rather than an implicit move, so
+  // `source` below must remain fully intact -- unknownRaw() must still
+  // be the complete original object, not emptied/defaulted to
+  // Kind::Undefined while tag() stays Unknown.
+  SkillIcon moved(std::move(source));
+  QCOMPARE(moved.tag(), SkillIconTag::Unknown);
+  QVERIFY(moved.unknownRaw() == toRawJson(obj));
+
+  QCOMPARE(source.tag(), SkillIconTag::Unknown);
+  QVERIFY(source.unknownRaw() == toRawJson(obj));
+  auto encoded = source.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
+}
+
+void CardCatalogTests::cardCostUnknownTagMoveConstructLeavesSourceRawIntact() {
+  const QJsonObject obj{
+      {QStringLiteral("tag"), QStringLiteral("SomeFutureCostTag")},
+      {QStringLiteral("contents"), QJsonObject{{QStringLiteral("y"), 2}}}};
+  auto decoded = CardCost::fromJson(obj, u"cost");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  CardCost source = *decoded;
+  QCOMPARE(source.tag(), CardCostTag::Unknown);
+
+  CardCost moved(std::move(source));
+  QCOMPARE(moved.tag(), CardCostTag::Unknown);
+  QVERIFY(moved.unknownRaw() == toRawJson(obj));
+
+  // The moved-from source must still independently report the complete
+  // original raw object.
+  QCOMPARE(source.tag(), CardCostTag::Unknown);
+  QVERIFY(source.unknownRaw() == toRawJson(obj));
+  QCOMPARE(source.toJson(), obj);
 }
 
 QTEST_APPLESS_MAIN(CardCatalogTests)

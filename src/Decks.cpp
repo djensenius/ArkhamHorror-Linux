@@ -157,26 +157,24 @@ QJsonObject encodeCardQuantityMapInput(const QMap<QString, qint64> &map) {
 
 // Builds the `slots`/`sideSlots` QJsonObject for DeckList::toJson() below.
 // A CardCode's own construction-time validation (see CardCode::parse() in
-// Identifiers.h) does not rule out a lone/mismatched UTF-16 surrogate, so
-// -- unlike a value embedded via CardCode::toJson() -- a key built via
-// .value() directly bypasses that type's own encode-time check entirely;
-// this validates each key against the same Json::hasLoneSurrogate() the
-// rest of this codebase's canonical encoders use, rather than silently
-// producing a QJsonObject with an unencodable key.
+// Identifiers.h) does not rule out an over-length or lone/mismatched
+// UTF-16 surrogate key, so -- unlike a value embedded via
+// CardCode::toJson() -- a key built via .value() directly bypasses that
+// type's own encode-time check entirely. Builds the equivalent Json::Value
+// object (mirroring rawEncodeCardQuantityMapInput() below) and routes it
+// through Value::toExactQJsonObject()'s single canonical, bounded check
+// (string length, lone/mismatched UTF-16 surrogates, duplicate keys)
+// rather than hand-duplicating just the lone-surrogate case, so this stays
+// in lockstep with every other encoder built the same way.
 ValueOrError<QJsonObject>
 encodeCardQuantityMap(const QMap<CardCode, qint64> &map) {
-  QJsonObject obj;
-  for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
-    const QString &key = it.key().value();
-    if (Json::hasLoneSurrogate(key))
-      return failure(
-          QStringLiteral(
-              "card code \"%1\" contains a lone UTF-16 surrogate code unit, "
-              "which cannot be encoded as valid UTF-8")
-              .arg(key));
-    obj.insert(key, it.value());
-  }
-  return obj;
+  QList<std::pair<QString, Json::Value>> members;
+  members.reserve(map.size());
+  for (auto it = map.constBegin(); it != map.constEnd(); ++it)
+    members.append(
+        {it.key().value(),
+         Json::Value::makeNumber(Json::RawNumber::fromInt64(it.value()))});
+  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
 }
 
 // Lossless equivalents of the two encoders above, for use by
@@ -510,53 +508,24 @@ ExternalDeckId::fromRawObject(const Json::Value &obj, QStringView path) {
 }
 
 ValueOrError<QJsonValue> ExternalDeckId::toJson() const {
-  switch (m_kind) {
-  case Kind::Absent:
-    return QJsonValue(QJsonValue::Undefined);
-  case Kind::Null:
-    // QJsonValue()'s default constructor is QJsonValue::Null, not
-    // Undefined -- spelled out explicitly here (rather than relying on
-    // the default constructor) to make the distinction from the Absent
-    // case above unambiguous: an explicit JSON null still emits an
-    // "id" key when composed into an enclosing object, unlike Absent's
-    // Undefined which omits the key entirely.
-    return QJsonValue(QJsonValue::Null);
-  case Kind::Text:
-    // text()'s factory (see below) accepts any QString whatsoever --
-    // including an empty one or one holding a lone/mismatched UTF-16
-    // surrogate -- with no validation of its own, so a
-    // validly-constructed Kind::Text instance is not guaranteed
-    // wire-safe. Reject a lone surrogate here exactly like
-    // Value::toExactQJson()/toJsonBytes() would, via the same shared
-    // Json::hasLoneSurrogate() check, rather than ever returning a
-    // QJsonValue no downstream UTF-8 encoder could faithfully represent.
-    if (Json::hasLoneSurrogate(m_text))
-      return failure(QStringLiteral(
-          "ExternalDeckId::toJson: text id contains a lone UTF-16 "
-          "surrogate code unit, which cannot be encoded as valid UTF-8"));
-    return QJsonValue(m_text);
-  case Kind::Number:
-    // Exact via QJsonValue(qint64) -- never a double -- whenever the
-    // literal is mathematically integral and fits qint64's range (see
-    // RawNumber::toExactInt64()): Qt's QJsonValue backing store
-    // preserves a qint64 exactly (see Value::toQJson()'s doc comment
-    // and toQJsonPreservesInt64ExactlyBeyondDoublePrecision in
-    // RawJsonTests.cpp), unlike constructing from a double. Any other
-    // Number literal -- a genuine fraction, or an exponent pushing the
-    // magnitude outside qint64's range -- cannot be represented in a
-    // QJsonValue without rounding, so this returns a typed failure
-    // rather than ever silently substituting a rounded value; use
-    // toRawJson() (always lossless) to encode such a value.
-    if (const auto exact = m_number.toExactInt64())
-      return QJsonValue(*exact);
-    return failure(
-        QStringLiteral("ExternalDeckId::toJson: numeric id \"%1\" cannot be "
-                       "represented exactly as a QJsonValue; use "
-                       "toRawJson()/toJsonBytes() instead")
-            .arg(m_number.literal()));
-  }
-  Q_UNREACHABLE_RETURN(
-      failure(QStringLiteral("ExternalDeckId::toJson: unreachable kind")));
+  // Builds the identical Json::Value toRawJson() already composes (see
+  // its own doc comment in Decks.h) and routes it through
+  // Value::toExactQJson()'s single canonical, bounded check, rather than
+  // hand-duplicating a subset of it here: the previous implementation
+  // checked Kind::Text for a lone surrogate but never against
+  // ParseLimits::production().maxStringLength, and called
+  // m_number.toExactInt64() directly for Kind::Number without first
+  // checking maxNumberDigits the way toExactQJson()'s own Number branch
+  // does -- so e.g. a "0." + 65 zero-digit fraction (all-zero, so
+  // toExactInt64() trivially returns 0) would have silently encoded as
+  // 0 here while toJsonBytes()/toExactQJson() reject the same literal
+  // for exceeding the digit budget. Kind::Absent/Kind::Null need no
+  // string/number validation of their own; toExactQJson() itself
+  // reproduces their exact QJsonValue::Undefined/Null results (see its
+  // own Kind::Undefined/Kind::Null cases), so this is a strict
+  // behavioral superset of the previous switch, not merely an equivalent
+  // rewrite.
+  return toRawJson().toExactQJson();
 }
 
 Json::Value ExternalDeckId::toRawJson() const {

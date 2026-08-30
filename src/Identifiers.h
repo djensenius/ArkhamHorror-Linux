@@ -128,20 +128,23 @@ public:
   // QJsonValue convenience conversion. parse()/fromJson() deliberately do
   // not validate the payload beyond non-emptiness -- this type
   // intentionally stays as permissive as the backend itself for the
-  // identifiers it backs (see this class's doc comment above), so a
-  // lone/mismatched UTF-16 surrogate is a validly-*constructed*
-  // NonEmptyString even though no serializer could ever transmit it as
-  // valid UTF-8. This encode boundary is therefore where that invariant
-  // is actually enforced, via the same Json::hasLoneSurrogate() check
-  // Value::toExactQJson()/toJsonBytes() use, so this typed failure stays
-  // in lockstep with them rather than silently handing back a QJsonValue
-  // no downstream encoder could faithfully represent.
+  // identifiers it backs (see this class's doc comment above), so an
+  // over-length string or a lone/mismatched UTF-16 surrogate is a
+  // validly-*constructed* NonEmptyString even though no production
+  // serializer could ever transmit either as valid, bounded UTF-8. This
+  // encode boundary must therefore enforce every invariant
+  // Value::toExactQJson()/toJsonBytes() do -- not merely the
+  // lone-surrogate check this used to hand-duplicate here, which let this
+  // fragment encoder silently accept e.g. an over-
+  // ParseLimits::production().maxStringLength string a complete request
+  // toJson() (which composes this value via toRawJson()->
+  // toExactQJson()/toExactQJsonObject(), see e.g. Games.h's
+  // ClaimSeatRequest) would reject -- so this now builds the identical
+  // Json::Value and routes through that single canonical, bounded check
+  // itself, rather than duplicating (and risking drifting from) a subset
+  // of it by hand.
   [[nodiscard]] ValueOrError<QJsonValue> toJson() const {
-    if (Json::hasLoneSurrogate(m_value))
-      return failure(QStringLiteral(
-          "contains a lone UTF-16 surrogate code unit, which cannot be "
-          "encoded as valid UTF-8"));
-    return QJsonValue(m_value);
+    return Json::Value::makeString(m_value).toExactQJson();
   }
 
   friend bool operator==(const NonEmptyString &,
@@ -207,17 +210,16 @@ public:
   // QJsonValue convenience conversion. See NonEmptyString::toJson()'s doc
   // comment just above for the identical rationale: parse() validates the
   // "c" prefix/non-emptiness/no-line-terminator shape but not every
-  // possible UTF-16 code unit, so a lone/mismatched surrogate is a
+  // possible UTF-16 code unit or a bounded overall length, so an
+  // over-length or lone/mismatched-surrogate string is a
   // validly-constructed CardCode from this class's own perspective. This
-  // typed failure keeps this encoder in lockstep with
-  // Value::toExactQJson()/toJsonBytes() via the same shared
-  // Json::hasLoneSurrogate() check.
+  // builds the identical Json::Value and routes through
+  // Value::toExactQJson()'s single canonical, bounded check -- the same
+  // one every enclosing request composing this value via toRawJson()
+  // already relies on -- rather than hand-duplicating just its
+  // lone-surrogate case here.
   [[nodiscard]] ValueOrError<QJsonValue> toJson() const {
-    if (Json::hasLoneSurrogate(m_value))
-      return failure(QStringLiteral(
-          "contains a lone UTF-16 surrogate code unit, which cannot be "
-          "encoded as valid UTF-8"));
-    return QJsonValue(m_value);
+    return Json::Value::makeString(m_value).toExactQJson();
   }
 
   [[nodiscard]] friend bool operator==(const CardCode &a,
@@ -261,15 +263,15 @@ struct CardName {
   // with no numeric-precision concern of their own.
   [[nodiscard]] static ValueOrError<CardName> fromJson(const Json::Value &v,
                                                        QStringView path);
-  // QJsonObject convenience conversion -- see toRawJson() below for the
-  // lossless alternative every enclosing aggregate composes through
-  // instead. title/subtitle are plain public QString fields with no
-  // validating factory of their own (unlike CardCode/NonEmptyString<Tag>
-  // above), so a lone/mismatched UTF-16 surrogate is directly
-  // constructible here; this typed failure keeps this encoder in
-  // lockstep with Value::toExactQJson()/toJsonBytes() via the same shared
-  // Json::hasLoneSurrogate() check rather than silently handing back a
-  // QJsonObject no downstream encoder could faithfully represent.
+  // QJsonObject convenience conversion, now literally toRawJson()'s
+  // AST run through Value::toExactQJsonObject() -- the same bounded,
+  // canonical check (length, lone/mismatched UTF-16 surrogates) every
+  // enclosing request composing this value via toRawJson() already
+  // relies on -- rather than a hand-duplicated subset of it (title/
+  // subtitle are plain public QString fields with no validating factory
+  // of their own, unlike CardCode/NonEmptyString<Tag> above, so an
+  // over-length string or a lone/mismatched UTF-16 surrogate is directly
+  // constructible here).
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // title/subtitle have no numeric-precision concern of their own, but
   // exposing this alongside toJson() lets an enclosing aggregate (e.g.

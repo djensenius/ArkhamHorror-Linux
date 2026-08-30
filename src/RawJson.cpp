@@ -508,6 +508,15 @@ Value Value::value(QLatin1StringView key) const {
   return m_object[*it].second;
 }
 
+std::optional<Value> Value::find(QLatin1StringView key) const {
+  if (m_kind != Kind::Object)
+    return std::nullopt;
+  const auto it = m_objectIndex.constFind(QString(key));
+  if (it == m_objectIndex.constEnd())
+    return std::nullopt;
+  return m_object[*it].second;
+}
+
 QStringList Value::keys() const {
   QStringList result;
   if (m_kind != Kind::Object)

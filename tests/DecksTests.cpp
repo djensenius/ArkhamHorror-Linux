@@ -181,6 +181,27 @@ private slots:
   void cardNameToJsonRejectsLoneSurrogateInSubtitle();
   void externalDeckIdTextKindToJsonRejectsLoneSurrogate();
   void deckListToJsonRejectsLoneSurrogateInCardSlotsKey();
+  // Round-18-cumulative-review item 1: every retained fragment toJson()
+  // above used to check *only* for a lone/mismatched UTF-16 surrogate,
+  // never against ParseLimits::production()'s string-length/number-
+  // digit-count budgets -- so e.g. an over-length InvestigatorRef, or an
+  // ExternalDeckId::Number literal whose digit count alone exceeded the
+  // budget, would succeed as a standalone fragment while an enclosing
+  // complete request encoder (which always composes through
+  // toRawJson()->toExactQJson()/toExactQJsonObject()) rejected the
+  // identical value. Each fragment now builds its Json::Value and routes
+  // through that same canonical, bounded conversion instead of
+  // hand-duplicating a subset of its checks; these tests prove both the
+  // direct fragment and its enclosing request now agree, not merely that
+  // one of them fails.
+  void investigatorRefToJsonRejectsStringExceedingProductionLengthBudget();
+  void
+  deckListInputToJsonRejectsInvestigatorCodeExceedingProductionLengthBudget();
+  void cardCodeToJsonRejectsStringExceedingProductionLengthBudget();
+  void deckListToJsonRejectsInvestigatorCodeExceedingProductionLengthBudget();
+  void cardNameToJsonRejectsTitleExceedingProductionLengthBudget();
+  void externalDeckIdNumberKindToJsonRejectsAllZeroExceedingDigitBudget();
+  void deckListInputToJsonRejectsIdExceedingDigitBudgetThroughFragmentParity();
 
   // Round-14 items 2/3: TypedId<Tag>/NonEmptyString<Tag>/CardCode used to
   // rely on an implicit move constructor/assignment that emptied the
@@ -198,6 +219,24 @@ private slots:
   void
   investigatorRefMoveConstructLeavesSourceValidAndReusableInDeckListInput();
   void deckIdMoveConstructLeavesSourceValidAndReusableInDeck();
+
+  // Round-19-cumulative-review item 3: DeckValidationResult/ExternalDeckId
+  // had no user-declared copy/move, so a compiler-generated move
+  // constructor/assignment really moved their QList<DeckValidationError>/
+  // QString payload members (leaving them empty) while the discriminating
+  // Kind enum stayed unchanged on the moved-from source -- for
+  // DeckValidationResult in particular, a moved-from Kind::Errors instance
+  // would then encode [] via toJson(), the exact "Errors -> Success"
+  // schema-shape collapse this class's own class-level doc comment
+  // documents as structurally impossible. Both now explicitly declare a
+  // copy constructor/assignment (see Decks.h), suppressing the implicit
+  // move so std::move() falls back to a full (cheap, implicit-sharing)
+  // copy instead.
+  void deckValidationResultMoveConstructLeavesSourceErrorsIntact();
+  void deckValidationResultMoveAssignLeavesSourceErrorsIntact();
+  void deckValidationResultSelfMoveAssignmentLeavesValueUnchanged();
+  void externalDeckIdMoveConstructLeavesSourceTextIntact();
+  void externalDeckIdMoveAssignLeavesSourceTextIntact();
 };
 
 namespace {
@@ -1554,6 +1593,29 @@ void DecksTests::deckListInputToJsonRejectsLoneSurrogateInInvestigatorCode() {
   QVERIFY(!encodedBytes.has_value());
 }
 
+void DecksTests::
+    deckListInputToJsonRejectsInvestigatorCodeExceedingProductionLengthBudget() {
+  // Round-18-cumulative-review item 1 parity companion: before this
+  // round's fix, InvestigatorRef::toJson() (the direct fragment, see
+  // investigatorRefToJsonRejectsStringExceedingProductionLengthBudget
+  // below) checked only for a lone surrogate and had no
+  // ParseLimits::production().maxStringLength check of its own, even
+  // though DeckListInput::toJson() (composing investigatorCode via
+  // toRawJson()->toExactQJsonObject()) already rejected the identical
+  // over-length string. Proves both now agree.
+  const QString overLong(Json::ParseLimits::production().maxStringLength + 1,
+                         u'a');
+  const DeckListInput input{
+      .investigatorCode = *InvestigatorRef::parse(overLong),
+  };
+  const auto encoded = input.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("length")),
+           qPrintable(encoded.error()));
+  const auto encodedBytes = input.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
+}
+
 void DecksTests::createDeckRequestToJsonRejectsLoneSurrogateInDeckName() {
   // deckName is a plain public QString field (no validated wrapper type),
   // so a lone surrogate there is exactly the "mutable request field
@@ -1607,6 +1669,25 @@ void DecksTests::investigatorRefToJsonRejectsLoneSurrogateDirectly() {
            qPrintable(encoded.error()));
 }
 
+void DecksTests::
+    investigatorRefToJsonRejectsStringExceedingProductionLengthBudget() {
+  // Round-18-cumulative-review item 1: before this round's fix, this
+  // fragment's toJson() checked only for a lone surrogate and had no
+  // ParseLimits::production().maxStringLength check of its own -- see
+  // deckListInputToJsonRejectsInvestigatorCodeExceedingProductionLength
+  // Budget above for the enclosing-request parity companion, which
+  // already rejected the identical over-length string before this fix.
+  const QString overLong(Json::ParseLimits::production().maxStringLength + 1,
+                         u'a');
+  const auto ref = InvestigatorRef::parse(overLong);
+  if (!ref)
+    QFAIL(qPrintable(ref.error()));
+  const auto encoded = ref->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("length")),
+           qPrintable(encoded.error()));
+}
+
 void DecksTests::cardCodeToJsonRejectsLoneSurrogateDirectly() {
   // Direct fragment-level test for CardCode::toJson(): parse() validates
   // the "c" prefix/non-emptiness/no-line-terminator shape but not every
@@ -1620,6 +1701,23 @@ void DecksTests::cardCodeToJsonRejectsLoneSurrogateDirectly() {
   const auto encoded = code->toJson();
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::cardCodeToJsonRejectsStringExceedingProductionLengthBudget() {
+  // Round-18-cumulative-review item 1: CardCode::parse() validates the
+  // "c" prefix/shape but not overall length, so an over-length code is
+  // validly-constructed. See deckListToJsonRejectsInvestigatorCodeExceed
+  // ingProductionLengthBudget below for the enclosing-request parity
+  // companion (DeckList::investigatorCode is also a CardCode).
+  QString overLong = QStringLiteral("c");
+  overLong += QString(Json::ParseLimits::production().maxStringLength, u'a');
+  const auto code = CardCode::parse(overLong);
+  if (!code)
+    QFAIL(qPrintable(code.error()));
+  const auto encoded = code->toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("length")),
            qPrintable(encoded.error()));
 }
 
@@ -1647,6 +1745,22 @@ void DecksTests::cardNameToJsonRejectsLoneSurrogateInSubtitle() {
            qPrintable(encoded.error()));
 }
 
+void DecksTests::cardNameToJsonRejectsTitleExceedingProductionLengthBudget() {
+  // Round-18-cumulative-review item 1: title/subtitle are plain public
+  // QString fields with no length-validating factory at all, so an
+  // over-length title is directly constructible. CardName has no
+  // production request consumer to pair against (see this class's own
+  // doc comment: it backs only response-shape CardDef.name/revealedName
+  // and game-list scenario name), so this is a standalone fragment test.
+  const QString overLong(Json::ParseLimits::production().maxStringLength + 1,
+                         u'a');
+  const CardName name{.title = overLong, .subtitle = std::nullopt};
+  const auto encoded = name.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("title")),
+           qPrintable(encoded.error()));
+}
+
 void DecksTests::externalDeckIdTextKindToJsonRejectsLoneSurrogate() {
   // Direct fragment-level test for ExternalDeckId::toJson()'s Kind::Text
   // branch: the text() factory does zero validation of its own (not even
@@ -1660,6 +1774,34 @@ void DecksTests::externalDeckIdTextKindToJsonRejectsLoneSurrogate() {
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
+}
+
+void DecksTests::
+    externalDeckIdNumberKindToJsonRejectsAllZeroExceedingDigitBudget() {
+  // Round-18-cumulative-review item 1: before this round's fix,
+  // ExternalDeckId::toJson()'s Kind::Number branch called
+  // RawNumber::toExactInt64() directly with no preceding
+  // ParseLimits::production().maxNumberDigits check of its own -- unlike
+  // Value::toExactQJson()'s own Number branch, which always checks the
+  // digit budget first. An all-zero coefficient short-circuits
+  // toExactInt64() to exact 0 regardless of digit count (see
+  // RawJsonTests::
+  // toExactQJsonRejectsAllZeroCoefficientExceedingProductionDigitBudget),
+  // so this fragment used to silently succeed as 0 for a literal
+  // toJsonBytes()/toExactQJson() would reject for exceeding the digit
+  // budget. See deckListInputToJsonRejectsIdExceedingDigitBudgetThrough
+  // FragmentParity below for the enclosing-request parity companion.
+  Json::ParseLimits wide;
+  wide.maxNumberDigits = 128;
+  const QByteArray excessiveFractionLiteral =
+      QByteArrayLiteral("0.") + QByteArray(70, '0');
+  auto parsedNumber = Json::Value::parse(excessiveFractionLiteral, u"n", wide);
+  if (!parsedNumber)
+    QFAIL(qPrintable(parsedNumber.error()));
+  QVERIFY(parsedNumber->isNumber());
+  const auto id = ExternalDeckId::number(parsedNumber->toRawNumber());
+  const auto encoded = id.toJson();
+  QVERIFY(!encoded.has_value());
 }
 
 void DecksTests::deckListToJsonRejectsLoneSurrogateInCardSlotsKey() {
@@ -1681,6 +1823,52 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInCardSlotsKey() {
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
+}
+
+void DecksTests::
+    deckListToJsonRejectsInvestigatorCodeExceedingProductionLengthBudget() {
+  // Enclosing-request parity companion to
+  // cardCodeToJsonRejectsStringExceedingProductionLengthBudget above:
+  // DeckList::investigatorCode is a CardCode field composed by
+  // encodeCardQuantityMap()'s sibling code in DeckList::toJson() via the
+  // same Value::toExactQJsonObject() path, so it must reject the
+  // identical over-length code the direct fragment test now also
+  // rejects.
+  QString overLong = QStringLiteral("c");
+  overLong += QString(Json::ParseLimits::production().maxStringLength, u'a');
+  const DeckList list{
+      .investigatorCode = *CardCode::parse(overLong),
+  };
+  const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("length")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::
+    deckListInputToJsonRejectsIdExceedingDigitBudgetThroughFragmentParity() {
+  // Enclosing-request parity companion to
+  // externalDeckIdNumberKindToJsonRejectsAllZeroExceedingDigitBudget
+  // above: DeckListInput::id is an ExternalDeckId field composed via
+  // toRawJson()->toExactQJson(), which already enforced the digit budget
+  // before this round's fix -- proving the direct fragment now agrees
+  // with the enclosing request rather than being a weaker standalone
+  // encoder.
+  Json::ParseLimits wide;
+  wide.maxNumberDigits = 128;
+  const QByteArray excessiveFractionLiteral =
+      QByteArrayLiteral("0.") + QByteArray(70, '0');
+  auto parsedNumber = Json::Value::parse(excessiveFractionLiteral, u"n", wide);
+  if (!parsedNumber)
+    QFAIL(qPrintable(parsedNumber.error()));
+  const DeckListInput input{
+      .investigatorCode = *InvestigatorRef::parse(QStringLiteral("01001")),
+      .id = ExternalDeckId::number(parsedNumber->toRawNumber()),
+  };
+  const auto encoded = input.toJson();
+  QVERIFY(!encoded.has_value());
+  const auto encodedBytes = input.toJsonBytes();
+  QVERIFY(!encodedBytes.has_value());
 }
 
 void DecksTests::cardCodeMoveConstructLeavesSourceValidAndReusable() {
@@ -1778,6 +1966,107 @@ void DecksTests::deckIdMoveConstructLeavesSourceValidAndReusableInDeck() {
 
   QCOMPARE(source.value(), moved.value());
   QVERIFY(!source.value().isEmpty());
+}
+
+void DecksTests::deckValidationResultMoveConstructLeavesSourceErrorsIntact() {
+  QList<DeckValidationError> errorList{
+      DeckValidationError{.cardCode = *CardCode::parse(u"c00001"_s)},
+      DeckValidationError{.cardCode = *CardCode::parse(u"c00002"_s)},
+  };
+  auto built = DeckValidationResult::errors(errorList);
+  if (!built)
+    QFAIL(qPrintable(built.error()));
+  DeckValidationResult source = *built;
+  QCOMPARE(source.kind(), DeckValidationResult::Kind::Errors);
+  QCOMPARE(source.errorList().size(), 2);
+
+  // std::move() on a DeckValidationResult now binds the explicitly-
+  // declared copy constructor (see Decks.h) rather than an implicit
+  // move, so `source` below must remain fully intact -- still
+  // Kind::Errors with both entries, never silently collapsed to
+  // Kind::Errors-but-empty (which toJson() would then encode as `[]`,
+  // indistinguishable from deckValidationSuccess).
+  DeckValidationResult moved(std::move(source));
+  QCOMPARE(moved.kind(), DeckValidationResult::Kind::Errors);
+  QCOMPARE(moved.errorList().size(), 2);
+
+  QCOMPARE(source.kind(), DeckValidationResult::Kind::Errors);
+  QCOMPARE(source.errorList().size(), 2);
+
+  // Reuse the moved-from source end-to-end through its own encoder: it
+  // must still encode as a 2-element array, never `[]`.
+  auto encoded = source.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->size(), 2);
+}
+
+void DecksTests::deckValidationResultMoveAssignLeavesSourceErrorsIntact() {
+  auto built = DeckValidationResult::errors(
+      {DeckValidationError{.cardCode = *CardCode::parse(u"c00003"_s)}});
+  if (!built)
+    QFAIL(qPrintable(built.error()));
+  DeckValidationResult source = *built;
+  DeckValidationResult destination = DeckValidationResult::success();
+  destination = std::move(source);
+
+  QCOMPARE(destination.kind(), DeckValidationResult::Kind::Errors);
+  QCOMPARE(destination.errorList().size(), 1);
+  // Move-assignment (falling back to copy-assignment) must leave
+  // `source` just as valid/reusable as move-construction does above.
+  QCOMPARE(source.kind(), DeckValidationResult::Kind::Errors);
+  QCOMPARE(source.errorList().size(), 1);
+  auto encoded = source.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->size(), 1);
+}
+
+void DecksTests::deckValidationResultSelfMoveAssignmentLeavesValueUnchanged() {
+  auto built = DeckValidationResult::errors(
+      {DeckValidationError{.cardCode = *CardCode::parse(u"c00004"_s)}});
+  if (!built)
+    QFAIL(qPrintable(built.error()));
+  DeckValidationResult result = *built;
+  DeckValidationResult &selfRef = result;
+  result = std::move(selfRef);
+  QCOMPARE(result.kind(), DeckValidationResult::Kind::Errors);
+  QCOMPARE(result.errorList().size(), 1);
+}
+
+void DecksTests::externalDeckIdMoveConstructLeavesSourceTextIntact() {
+  ExternalDeckId source = ExternalDeckId::text(QStringLiteral("legacy-42"));
+  QCOMPARE(source.kind(), ExternalDeckId::Kind::Text);
+  QCOMPARE(source.text(), QStringLiteral("legacy-42"));
+
+  // std::move() on an ExternalDeckId now binds the explicitly-declared
+  // copy constructor (see Decks.h) rather than an implicit move, so
+  // `source` below must remain fully intact -- still Kind::Text with
+  // its original text() -- not silently desynchronized to Kind::Text
+  // with an empty string.
+  ExternalDeckId moved(std::move(source));
+  QCOMPARE(moved.kind(), ExternalDeckId::Kind::Text);
+  QCOMPARE(moved.text(), QStringLiteral("legacy-42"));
+
+  QCOMPARE(source.kind(), ExternalDeckId::Kind::Text);
+  QCOMPARE(source.text(), QStringLiteral("legacy-42"));
+
+  // Reuse the moved-from source through its own fragment encoder.
+  auto encoded = source.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, QJsonValue(QStringLiteral("legacy-42")));
+}
+
+void DecksTests::externalDeckIdMoveAssignLeavesSourceTextIntact() {
+  ExternalDeckId source = ExternalDeckId::text(QStringLiteral("abc-99"));
+  ExternalDeckId destination = ExternalDeckId::absent();
+  destination = std::move(source);
+
+  QCOMPARE(destination.kind(), ExternalDeckId::Kind::Text);
+  QCOMPARE(destination.text(), QStringLiteral("abc-99"));
+  QCOMPARE(source.kind(), ExternalDeckId::Kind::Text);
+  QCOMPARE(source.text(), QStringLiteral("abc-99"));
 }
 
 QTEST_APPLESS_MAIN(DecksTests)

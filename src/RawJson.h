@@ -257,6 +257,41 @@ public:
   // missing object key.
   Value() = default;
 
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move:
+  // m_kind is a plain enum that a compiler-generated move leaves
+  // completely unchanged on the moved-from source (moving a trivial
+  // type is indistinguishable from copying it), while m_string/m_array/
+  // m_object/m_objectIndex are QString/QList/an index map whose real
+  // move constructors/assignments DO leave the moved-from source empty.
+  // Left implicit, this would silently desynchronize a moved-from
+  // Value's kind() from its actual storage -- e.g. a moved-from
+  // Kind::Object Value would still report kind() == Kind::Object but
+  // members() would be empty, an otherwise-unreachable state this AST is
+  // specifically designed to make impossible (see Kind's own invariant:
+  // every accessor above is documented as "only meaningful for" a
+  // specific kind, which a silently-emptied-but-still-tagged member
+  // would violate). This is also the root cause behind an equivalent
+  // bug in every type that embeds a Value as a tag-discriminated payload
+  // (e.g. SkillIcon::unknownRaw(), CardCost::rawContents()/unknownRaw(),
+  // GameValue::unknownRaw(), GameState::unknownRaw(),
+  // CampaignOption::rawJson()): fixing it here transitively fixes all of
+  // them, since their own compiler-generated moves fall back to copy-
+  // constructing this member once no move constructor is available to
+  // select. A user-declared copy constructor/assignment here means
+  // there is no user-declared move constructor/assignment for the
+  // compiler to implicitly generate, so std::move(value) instead binds
+  // to this copy constructor (an rvalue can bind to `const Value&`),
+  // leaving the moved-from source completely unchanged -- QString/
+  // QList's copy constructors are noexcept and O(1) (implicit sharing: a
+  // refcount increment, never a deep copy), so this costs nothing
+  // relative to a "real" move while making a moved-from Value
+  // structurally impossible to observe as internally inconsistent,
+  // including through a container (QList/QMap/std::optional) that
+  // relocates/moves its elements.
+  Value(const Value &) = default;
+  Value &operator=(const Value &) = default;
+
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   [[nodiscard]] bool isUndefined() const noexcept {
     return m_kind == Kind::Undefined;
@@ -297,7 +332,27 @@ public:
   // O(members) per lookup.
   [[nodiscard]] bool contains(QLatin1StringView key) const;
   // Undefined if the object has no such key, or *this is not an object.
+  // NOTE: this alone cannot distinguish "no such key" from "the key is
+  // present with a directly-constructed Kind::Undefined value" (a state
+  // this AST can programmatically model -- e.g. via makeObject() -- even
+  // though it has no valid JSON spelling of its own; see
+  // toExactQJsonInner()'s own rejection of a *nested* Undefined member).
+  // Use find() below when that distinction matters (i.e. any field-
+  // presence check), rather than re-deriving presence from an
+  // isUndefined() result on this function's return value.
   [[nodiscard]] Value value(QLatin1StringView key) const;
+  // Single-lookup presence query that DOES distinguish the two: returns
+  // std::nullopt only when the object genuinely has no such key (or
+  // *this is not an object at all), and an engaged optional -- whose
+  // Value may itself be Kind::Undefined -- whenever the key is present,
+  // no matter what it is present with. Every field-presence-sensitive
+  // decode helper in JsonDecode.h/.cpp (fieldPresence(), requireField(),
+  // requireRawField(), and the optional*/requireNullable* family) routes
+  // through this rather than contains()+value() or value() alone, so a
+  // key present with a stored Undefined value is always treated as
+  // "found" (and, where that state has no valid decode, reported as a
+  // distinct typed failure) -- never silently folded into "absent".
+  [[nodiscard]] std::optional<Value> find(QLatin1StringView key) const;
   [[nodiscard]] QStringList keys() const;
   [[nodiscard]] const QList<std::pair<QString, Value>> &members() const {
     return m_object;

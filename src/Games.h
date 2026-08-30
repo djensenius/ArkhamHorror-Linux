@@ -254,6 +254,30 @@ public:
 
   friend bool operator==(const GameState &, const GameState &) = default;
 
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_kind
+  // is a plain enum a compiler-generated move leaves completely
+  // unchanged on the moved-from source, but m_playerIds (QList<QUuid>)
+  // and m_unknownTag (QString) have real move constructors/assignments
+  // that DO leave the moved-from source empty, and m_unknownRaw is a
+  // Json::Value (now copy-only, see RawJson.h). Left implicit, a
+  // moved-from Kind::Pending/ChooseDecks instance would still report
+  // that kind() but playerIds() would be empty, and a moved-from
+  // Kind::Unknown instance would still report Kind::Unknown but
+  // unknownTag()/unknownRaw() would be empty/default -- both silently
+  // violating this class's own "only meaningful for"/"Unknown only"
+  // accessor invariants. A user-declared copy constructor/assignment
+  // here means there is no user-declared move constructor/assignment
+  // for the compiler to implicitly generate, so std::move(state)
+  // instead binds to this copy constructor (an rvalue can bind to
+  // `const GameState&`), leaving the moved-from source completely
+  // unchanged -- QList/QString's copy constructors are noexcept and
+  // O(1) (implicit sharing), so this costs nothing relative to a "real"
+  // move while making that loss structurally impossible to observe,
+  // including through a container that relocates/moves its elements.
+  GameState(const GameState &) = default;
+  GameState &operator=(const GameState &) = default;
+
 private:
   GameState() = default;
 
@@ -365,6 +389,33 @@ public:
   [[nodiscard]] const QString &error() const noexcept { return m_error; }
 
   friend bool operator==(const GameListRow &, const GameListRow &) = default;
+
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_kind
+  // is a plain enum a compiler-generated move leaves completely
+  // unchanged on the moved-from source, while m_name/m_error (QString)
+  // and m_investigators/m_otherInvestigators (QList<InvestigatorSummary>)
+  // have real move constructors/assignments that DO leave the moved-from
+  // source empty (the std::optional members' contained types are all
+  // themselves copy-only or trivial, so std::optional's own move never
+  // clears its engaged flag or empties them). Left implicit, a
+  // moved-from Kind::Success instance would still report kind() ==
+  // Success but name()/investigators() would be empty, and a
+  // moved-from Kind::Failure instance would still report Kind::Failure
+  // but error() would be empty -- exactly the Success/Failure-shape
+  // confusion the schema's own shape discrimination (see this class's
+  // own class-level doc comment) exists to prevent. A user-declared copy
+  // constructor/assignment here means there is no user-declared move
+  // constructor/assignment for the compiler to implicitly generate, so
+  // std::move(row) instead binds to this copy constructor (an rvalue
+  // can bind to `const GameListRow&`), leaving the moved-from source
+  // completely unchanged -- QString/QList's copy constructors are
+  // noexcept and O(1) (implicit sharing), so this costs nothing
+  // relative to a "real" move while making that confusion structurally
+  // impossible to observe, including through a container that
+  // relocates/moves its elements.
+  GameListRow(const GameListRow &) = default;
+  GameListRow &operator=(const GameListRow &) = default;
 
 private:
   GameListRow() = default;
@@ -576,6 +627,31 @@ public:
            lhs.m_text == rhs.m_text;
   }
 
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_kind
+  // is a plain enum a compiler-generated move leaves completely
+  // unchanged on the moved-from source, but m_text (QString, holding
+  // Kind::Variant's contents or Kind::Unknown's raw tag string) has a
+  // real move constructor/assignment that DOES leave the moved-from
+  // source empty, and m_raw is a Json::Value (now copy-only, see
+  // RawJson.h). Left implicit, a moved-from Kind::Variant/Unknown
+  // instance would still report that kind() but text() would be empty,
+  // and toRequestOption() would then narrow a moved-from source down to
+  // a request with silently-emptied contents/an incorrect additive-field
+  // refusal outcome rather than typed-failing or preserving the
+  // original text -- exactly the "bypasses narrowing refusal" risk this
+  // class exists to prevent. A user-declared copy constructor/
+  // assignment here means there is no user-declared move constructor/
+  // assignment for the compiler to implicitly generate, so
+  // std::move(option) instead binds to this copy constructor (an rvalue
+  // can bind to `const CampaignOption&`), leaving the moved-from source
+  // completely unchanged -- QString's copy constructor is noexcept and
+  // O(1) (implicit sharing), so this costs nothing relative to a "real"
+  // move while making that risk structurally impossible to observe,
+  // including through a container that relocates/moves its elements.
+  CampaignOption(const CampaignOption &) = default;
+  CampaignOption &operator=(const CampaignOption &) = default;
+
 private:
   CampaignOption() = default;
 
@@ -645,6 +721,32 @@ public:
 
   friend bool operator==(const CampaignOptionRequest &,
                          const CampaignOptionRequest &) = default;
+
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_kind
+  // is a plain enum a compiler-generated move leaves completely
+  // unchanged on the moved-from source, but m_text (QString, holding
+  // Kind::Variant's contents) has a real move constructor/assignment
+  // that DOES leave the moved-from source empty. Left implicit, a
+  // moved-from Kind::Variant instance would still report kind() ==
+  // Variant but text() would be empty, so reusing the moved-from source
+  // (e.g. after `auto moved = std::move(request);`) would silently
+  // encode an empty variant contents string rather than the original
+  // one -- a request this client itself composed no longer matching
+  // what the caller intended, even though this type otherwise makes
+  // "an unknown/malformed option cannot be submitted" a structural
+  // property (see this class's own class-level doc comment). A
+  // user-declared copy constructor/assignment here means there is no
+  // user-declared move constructor/assignment for the compiler to
+  // implicitly generate, so std::move(request) instead binds to this
+  // copy constructor (an rvalue can bind to
+  // `const CampaignOptionRequest&`), leaving the moved-from source
+  // completely unchanged -- QString's copy constructor is noexcept and
+  // O(1) (implicit sharing), so this costs nothing relative to a "real"
+  // move while making that loss structurally impossible to observe,
+  // including through a container that relocates/moves its elements.
+  CampaignOptionRequest(const CampaignOptionRequest &) = default;
+  CampaignOptionRequest &operator=(const CampaignOptionRequest &) = default;
 
 private:
   CampaignOptionRequest() = default;

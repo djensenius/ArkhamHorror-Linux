@@ -279,6 +279,21 @@ private slots:
   void scenarioSummaryToJsonRejectsLoneSurrogateInName();
   void campaignSummaryToJsonRejectsLoneSurrogateInId();
   void gameListRowToJsonRejectsLoneSurrogateThroughInvestigatorSummary();
+
+  // Round-19-cumulative-review item 3: GameState/GameListRow/
+  // CampaignOption/CampaignOptionRequest had no user-declared copy/move,
+  // so a compiler-generated move constructor/assignment would really
+  // move their QList<QUuid>/QList<InvestigatorSummary>/QString payload
+  // members (leaving them empty) while the discriminating Kind enum
+  // stayed unchanged on the moved-from source. All four now explicitly
+  // declare a copy constructor/assignment (see Games.h), so std::move()
+  // falls back to a full (cheap, implicit-sharing) copy instead.
+  void gameStatePendingMoveConstructLeavesSourcePlayerIdsIntact();
+  void gameStateUnknownTagMoveConstructLeavesSourceRawIntact();
+  void gameListRowSuccessMoveConstructLeavesSourceFieldsIntact();
+  void gameListRowFailureMoveConstructLeavesSourceErrorIntact();
+  void campaignOptionVariantMoveConstructLeavesSourceTextIntact();
+  void campaignOptionRequestVariantMoveConstructLeavesSourceTextIntact();
 };
 
 namespace {
@@ -2398,6 +2413,173 @@ void GamesTests::
            qPrintable(encoded.error()));
   const auto encodedBytes = row.toJsonBytes();
   QVERIFY(!encodedBytes.has_value());
+}
+
+void GamesTests::gameStatePendingMoveConstructLeavesSourcePlayerIdsIntact() {
+  const QUuid id1 = QUuid::createUuid();
+  const QUuid id2 = QUuid::createUuid();
+  auto built = GameState::pending({id1, id2});
+  if (!built)
+    QFAIL(qPrintable(built.error()));
+  GameState source = *built;
+  QCOMPARE(source.kind(), GameState::Kind::Pending);
+  QCOMPARE(source.playerIds(), (QList<QUuid>{id1, id2}));
+
+  // std::move() on a GameState now binds the explicitly-declared copy
+  // constructor (see Games.h) rather than an implicit move, so `source`
+  // below must remain fully intact -- still kind()==Pending with both
+  // player ids, never silently desynchronized to an empty playerIds()
+  // while kind() stays Pending.
+  GameState moved(std::move(source));
+  QCOMPARE(moved.kind(), GameState::Kind::Pending);
+  QCOMPARE(moved.playerIds(), (QList<QUuid>{id1, id2}));
+
+  QCOMPARE(source.kind(), GameState::Kind::Pending);
+  QCOMPARE(source.playerIds(), (QList<QUuid>{id1, id2}));
+
+  // Reuse the moved-from source end-to-end through its own encoder.
+  const auto encodedBytes = source.toJsonBytes();
+  if (!encodedBytes)
+    QFAIL(qPrintable(encodedBytes.error()));
+  QVERIFY(encodedBytes->contains(id1.toString(QUuid::WithoutBraces).toUtf8()));
+  QVERIFY(encodedBytes->contains(id2.toString(QUuid::WithoutBraces).toUtf8()));
+}
+
+void GamesTests::gameStateUnknownTagMoveConstructLeavesSourceRawIntact() {
+  const QJsonObject obj{
+      {QStringLiteral("tag"), QStringLiteral("IsSuspended")},
+      {QStringLiteral("contents"), QJsonObject{{QStringLiteral("since"), 5}}}};
+  auto decoded = GameState::fromJson(obj, u"gameState");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  GameState source = *decoded;
+  QCOMPARE(source.kind(), GameState::Kind::Unknown);
+
+  GameState moved(std::move(source));
+  QCOMPARE(moved.kind(), GameState::Kind::Unknown);
+  QCOMPARE(moved.unknownTag(), QStringLiteral("IsSuspended"));
+  QVERIFY(moved.unknownRaw() == toRawJson(obj));
+
+  // The moved-from source must still independently report the complete
+  // original tag string and raw object.
+  QCOMPARE(source.kind(), GameState::Kind::Unknown);
+  QCOMPARE(source.unknownTag(), QStringLiteral("IsSuspended"));
+  QVERIFY(source.unknownRaw() == toRawJson(obj));
+  QCOMPARE(source.toJson(), obj);
+}
+
+void GamesTests::gameListRowSuccessMoveConstructLeavesSourceFieldsIntact() {
+  auto gameState = GameState::pending({QUuid::createUuid()});
+  if (!gameState)
+    QFAIL(qPrintable(gameState.error()));
+  auto gameId =
+      GameId::parse(QUuid::createUuid().toString(QUuid::WithoutBraces));
+  if (!gameId)
+    QFAIL(qPrintable(gameId.error()));
+  GameListRow source = GameListRow::success(
+      *gameId, std::nullopt, std::nullopt, *gameState,
+      QStringLiteral("Test Game"),
+      QList<InvestigatorSummary>{
+          InvestigatorSummary{.id = *CardCode::parse(QStringLiteral("c01001")),
+                              .classSymbol = ClassSymbol::Guardian}},
+      QList<InvestigatorSummary>{}, MultiplayerVariant::Solo, true);
+  QCOMPARE(source.kind(), GameListRow::Kind::Success);
+  QCOMPARE(source.name(), QStringLiteral("Test Game"));
+  QCOMPARE(source.investigators().size(), 1);
+
+  // std::move() on a GameListRow now binds the explicitly-declared copy
+  // constructor (see Games.h) rather than an implicit move, so `source`
+  // below must remain fully intact -- still kind()==Success with its
+  // original name()/investigators(), never silently desynchronized to
+  // Success-shaped-but-empty (which would masquerade as a different,
+  // valid-looking row).
+  GameListRow moved(std::move(source));
+  QCOMPARE(moved.kind(), GameListRow::Kind::Success);
+  QCOMPARE(moved.name(), QStringLiteral("Test Game"));
+  QCOMPARE(moved.investigators().size(), 1);
+
+  QCOMPARE(source.kind(), GameListRow::Kind::Success);
+  QCOMPARE(source.name(), QStringLiteral("Test Game"));
+  QCOMPARE(source.investigators().size(), 1);
+
+  // Reuse the moved-from source end-to-end through its own encoder.
+  auto encoded = source.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->value("name"_L1).toString(), QStringLiteral("Test Game"));
+}
+
+void GamesTests::gameListRowFailureMoveConstructLeavesSourceErrorIntact() {
+  GameListRow source = GameListRow::failed(QStringLiteral("game not found"));
+  QCOMPARE(source.kind(), GameListRow::Kind::Failure);
+  QCOMPARE(source.error(), QStringLiteral("game not found"));
+
+  GameListRow moved(std::move(source));
+  QCOMPARE(moved.kind(), GameListRow::Kind::Failure);
+  QCOMPARE(moved.error(), QStringLiteral("game not found"));
+
+  // The moved-from source must still independently report the complete
+  // original error string -- never silently desynchronized to
+  // Failure-with-an-empty-error, which would round-trip as a
+  // different, misleading message.
+  QCOMPARE(source.kind(), GameListRow::Kind::Failure);
+  QCOMPARE(source.error(), QStringLiteral("game not found"));
+  auto encoded = source.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->value("error"_L1).toString(),
+           QStringLiteral("game not found"));
+}
+
+void GamesTests::campaignOptionVariantMoveConstructLeavesSourceTextIntact() {
+  CampaignOption source = CampaignOption::variantOption(
+      QStringLiteral("return-to-original-variant"));
+  QCOMPARE(source.kind(), CampaignOption::Kind::Variant);
+  QCOMPARE(source.text(), QStringLiteral("return-to-original-variant"));
+
+  // std::move() on a CampaignOption now binds the explicitly-declared
+  // copy constructor (see Games.h) rather than an implicit move, so
+  // `source` below must remain fully intact -- still kind()==Variant
+  // with its original text(), never silently emptied while narrowing
+  // via toRequestOption() would otherwise submit an empty contents
+  // string.
+  CampaignOption moved(std::move(source));
+  QCOMPARE(moved.kind(), CampaignOption::Kind::Variant);
+  QCOMPARE(moved.text(), QStringLiteral("return-to-original-variant"));
+
+  QCOMPARE(source.kind(), CampaignOption::Kind::Variant);
+  QCOMPARE(source.text(), QStringLiteral("return-to-original-variant"));
+
+  // Reuse the moved-from source end-to-end through narrowing +
+  // encoding, exactly the path createGameRequest.options actually uses.
+  auto narrowed = source.toRequestOption(u"option");
+  if (!narrowed)
+    QFAIL(qPrintable(narrowed.error()));
+  auto encoded = narrowed->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY(encoded->contains("return-to-original-variant"));
+}
+
+void GamesTests::
+    campaignOptionRequestVariantMoveConstructLeavesSourceTextIntact() {
+  CampaignOptionRequest source =
+      CampaignOptionRequest::variantOption(QStringLiteral("variant-x"));
+  QCOMPARE(source.kind(), CampaignOptionRequest::Kind::Variant);
+  QCOMPARE(source.text(), QStringLiteral("variant-x"));
+
+  CampaignOptionRequest moved(std::move(source));
+  QCOMPARE(moved.kind(), CampaignOptionRequest::Kind::Variant);
+  QCOMPARE(moved.text(), QStringLiteral("variant-x"));
+
+  // The moved-from source must still independently encode its original
+  // text -- never silently reduced to an empty variant contents string.
+  QCOMPARE(source.kind(), CampaignOptionRequest::Kind::Variant);
+  QCOMPARE(source.text(), QStringLiteral("variant-x"));
+  auto encoded = source.toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY(encoded->contains("variant-x"));
 }
 
 QTEST_APPLESS_MAIN(GamesTests)

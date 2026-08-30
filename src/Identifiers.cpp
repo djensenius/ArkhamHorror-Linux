@@ -100,26 +100,10 @@ ValueOrError<CardName> CardName::fromJson(const Json::Value &v,
 }
 
 ValueOrError<QJsonObject> CardName::toJson() const {
-  if (Json::hasLoneSurrogate(title))
-    return failure(QStringLiteral(
-        "title: contains a lone UTF-16 surrogate code unit, which cannot "
-        "be encoded as valid UTF-8"));
-  if (subtitle && Json::hasLoneSurrogate(*subtitle))
-    return failure(QStringLiteral(
-        "subtitle: contains a lone UTF-16 surrogate code unit, which "
-        "cannot be encoded as valid UTF-8"));
-  return QJsonObject{
-      {QStringLiteral("title"), title},
-      // QJsonValue()'s default constructor is QJsonValue::Null, not
-      // Undefined -- QJsonObject::insert() only drops a key for an
-      // explicit Undefined value, so this key is preserved with an
-      // explicit JSON null. Spelled out explicitly (rather than relying
-      // on the default constructor's less obvious Null default) since
-      // catalog.schema.json requires "subtitle" to be present, just
-      // nullable.
-      {QStringLiteral("subtitle"),
-       subtitle ? QJsonValue(*subtitle) : QJsonValue(QJsonValue::Null)},
-  };
+  auto raw = toRawJson().toExactQJsonObject();
+  if (!raw)
+    return failure(raw.error());
+  return *raw;
 }
 
 Json::Value CardName::toRawJson() const {

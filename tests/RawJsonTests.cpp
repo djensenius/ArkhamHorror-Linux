@@ -46,6 +46,13 @@ private slots:
   void rejectsExcessiveNestingDepth();
   void acceptsEmptyArrayAndObject();
   void objectAccessorsFindPresentKeysAndMissAbsentOnes();
+  // Round-19-cumulative-review item 2: value() alone cannot distinguish a
+  // key genuinely absent from one present with a directly-constructed
+  // Kind::Undefined value (both return an identical default-constructed
+  // Undefined Value) -- find() must, via a single lookup, since every
+  // field-presence-sensitive decode helper in JsonDecode.h/.cpp now
+  // routes through it instead.
+  void objectFindDistinguishesAbsentFromPresentUndefinedFromPresentValue();
   // Review round 5 (RawJson.cpp:476 HIGH finding): contains()/value() must
   // remain correct once backed by an index rather than a linear scan, at
   // a large member count built via the unbounded makeObject() constructor
@@ -199,6 +206,22 @@ private slots:
   void rawNumberSelfMoveAssignmentLeavesValueUnchanged();
   void rawNumberMovedFromRemainsValidForZeroNegativeAndHugeExponentCases();
   void rawNumberSurvivesQListRelocation();
+
+  // Round-19-cumulative-review item 3: Value itself (this class) had no
+  // user-declared copy/move, so a compiler-generated move constructor/
+  // assignment really moved m_string/m_array/m_object/m_objectIndex
+  // (leaving them empty) while m_kind -- a plain enum -- stayed
+  // unchanged, desynchronizing a moved-from Value's kind() from its
+  // actual storage (e.g. a moved-from Kind::Object Value would still
+  // report kind() == Kind::Object but members() would be empty). Value
+  // now explicitly declares a copy constructor/assignment (see
+  // RawJson.h), suppressing that implicit move so std::move() falls
+  // back to a full (cheap, QString/QList-implicit-sharing) copy instead.
+  void valueMoveConstructLeavesSourceValidAndReusableForObjectKind();
+  void valueMoveConstructLeavesSourceValidAndReusableForArrayKind();
+  void valueMoveAssignLeavesSourceValidAndReusable();
+  void valueSelfMoveAssignmentLeavesValueUnchanged();
+  void valueSurvivesQListRelocation();
 };
 
 namespace {
@@ -450,6 +473,54 @@ void RawJsonTests::objectAccessorsFindPresentKeysAndMissAbsentOnes() {
   QVERIFY(!value.contains("absent"_L1));
   QVERIFY(value.value("present"_L1).isNumber());
   QVERIFY(value.value("absent"_L1).isUndefined());
+}
+
+void RawJsonTests::
+    objectFindDistinguishesAbsentFromPresentUndefinedFromPresentValue() {
+  // A key present with a directly-constructed Kind::Undefined value is
+  // reachable only via makeObject() (never Value::parse(): a stored
+  // Undefined has no valid JSON spelling at all), but is nonetheless a
+  // real, distinct AST state from "no such key" -- exactly the state
+  // JsonDecode.h/.cpp's fieldPresence()/requireField()/requireRawField()/
+  // optional*/requireNullable* family must all now tell apart from
+  // genuine absence (see Value::find()'s own doc comment).
+  const Value obj = Value::makeObject({
+      {QStringLiteral("present"), Value::makeNumber(RawNumber::fromInt64(1))},
+      {QStringLiteral("presentNull"), Value::makeNull()},
+      {QStringLiteral("presentUndefined"), Value{}},
+  });
+
+  // Genuinely absent: find() disengaged.
+  QVERIFY(!obj.find("absent"_L1).has_value());
+
+  // Present with a real value: find() engaged, holding that value.
+  const auto present = obj.find("present"_L1);
+  QVERIFY(present.has_value());
+  QVERIFY(present->isNumber());
+  QCOMPARE(present->toRawNumber().literal(), QStringLiteral("1"));
+
+  // Present with an explicit JSON null: find() engaged, Kind::Null --
+  // still distinguishable from both absence and a stored Undefined.
+  const auto presentNull = obj.find("presentNull"_L1);
+  QVERIFY(presentNull.has_value());
+  QVERIFY(presentNull->isNull());
+
+  // The crux of this fix: present with a stored Kind::Undefined value.
+  // value() alone cannot tell this apart from "absent" (both return an
+  // identical default-constructed Undefined Value); find() must, since
+  // this key genuinely exists in the object.
+  const auto presentUndefined = obj.find("presentUndefined"_L1);
+  QVERIFY(presentUndefined.has_value());
+  QVERIFY(presentUndefined->isUndefined());
+  // Contrast: value() alone really is ambiguous here -- both this key and
+  // a genuinely-absent one return an Undefined Value from it.
+  QVERIFY(obj.value("presentUndefined"_L1).isUndefined());
+  QVERIFY(obj.value("absent"_L1).isUndefined());
+
+  // A non-object Value's find() is always disengaged, matching value()'s
+  // own "not an object" fallback.
+  const Value notAnObject = Value::makeNumber(RawNumber::fromInt64(1));
+  QVERIFY(!notAnObject.find("anything"_L1).has_value());
 }
 
 void RawJsonTests::objectAccessorLookupIsCorrectAcrossManyMembers() {
@@ -1582,6 +1653,100 @@ void RawJsonTests::rawNumberSurvivesQListRelocation() {
   for (int i = 0; i < 64; ++i) {
     QCOMPARE(numbers.at(i).literal(), QString::number(i));
     QCOMPARE(numbers.at(i).toExactInt64(), std::optional<qint64>(i));
+  }
+}
+
+void RawJsonTests::
+    valueMoveConstructLeavesSourceValidAndReusableForObjectKind() {
+  Value source = Value::makeObject(
+      {{QStringLiteral("a"), Value::makeNumber(RawNumber::fromInt64(1))},
+       {QStringLiteral("b"), Value::makeString(QStringLiteral("x"))}});
+  QCOMPARE(source.kind(), Value::Kind::Object);
+  QCOMPARE(source.members().size(), 2);
+
+  // std::move() on a Value now binds the explicitly-declared copy
+  // constructor (see RawJson.h) rather than an implicit move, so
+  // `source` below must remain fully intact -- not merely tagged
+  // Kind::Object with an emptied members() -- after this call.
+  Value moved(std::move(source));
+  QCOMPARE(moved.kind(), Value::Kind::Object);
+  QCOMPARE(moved.members().size(), 2);
+  QCOMPARE(moved.value("a"_L1).toRawNumber().literal(), QStringLiteral("1"));
+  QCOMPARE(moved.value("b"_L1).toString(), QStringLiteral("x"));
+
+  QCOMPARE(source.kind(), Value::Kind::Object);
+  QCOMPARE(source.members().size(), 2);
+  QCOMPARE(source.value("a"_L1).toRawNumber().literal(), QStringLiteral("1"));
+  QCOMPARE(source.value("b"_L1).toString(), QStringLiteral("x"));
+
+  // Reuse the moved-from source end-to-end through the canonical
+  // encoder, not merely via accessors.
+  auto bytes = source.toJsonBytes();
+  if (!bytes)
+    QFAIL(qPrintable(bytes.error()));
+  QCOMPARE(*bytes, QByteArray(R"({"a":1,"b":"x"})"));
+}
+
+void RawJsonTests::
+    valueMoveConstructLeavesSourceValidAndReusableForArrayKind() {
+  Value source = Value::makeArray({Value::makeString(QStringLiteral("p")),
+                                   Value::makeString(QStringLiteral("q")),
+                                   Value::makeString(QStringLiteral("r"))});
+  QCOMPARE(source.kind(), Value::Kind::Array);
+  QCOMPARE(source.toArray().size(), 3);
+
+  Value moved(std::move(source));
+  QCOMPARE(moved.kind(), Value::Kind::Array);
+  QCOMPARE(moved.toArray().size(), 3);
+
+  // The moved-from source must still independently report all 3
+  // elements -- an implicit move would have left this an empty array
+  // while kind() stayed Kind::Array.
+  QCOMPARE(source.kind(), Value::Kind::Array);
+  QCOMPARE(source.toArray().size(), 3);
+  auto bytes = source.toJsonBytes();
+  if (!bytes)
+    QFAIL(qPrintable(bytes.error()));
+  QCOMPARE(*bytes, QByteArray(R"(["p","q","r"])"));
+}
+
+void RawJsonTests::valueMoveAssignLeavesSourceValidAndReusable() {
+  Value source = Value::makeObject(
+      {{QStringLiteral("k"), Value::makeString(QStringLiteral("v"))}});
+  Value destination = Value::makeNull();
+  destination = std::move(source);
+
+  QCOMPARE(destination.kind(), Value::Kind::Object);
+  QCOMPARE(destination.value("k"_L1).toString(), QStringLiteral("v"));
+  // Move-assignment (falling back to copy-assignment) must leave
+  // `source` just as valid/reusable as move-construction does above.
+  QCOMPARE(source.kind(), Value::Kind::Object);
+  QCOMPARE(source.value("k"_L1).toString(), QStringLiteral("v"));
+}
+
+void RawJsonTests::valueSelfMoveAssignmentLeavesValueUnchanged() {
+  Value value = Value::makeObject(
+      {{QStringLiteral("k"), Value::makeNumber(RawNumber::fromInt64(9))}});
+  Value &selfRef = value;
+  value = std::move(selfRef);
+  QCOMPARE(value.kind(), Value::Kind::Object);
+  QCOMPARE(value.value("k"_L1).toRawNumber().literal(), QStringLiteral("9"));
+}
+
+void RawJsonTests::valueSurvivesQListRelocation() {
+  // Force at least one growth-triggered relocation; with no user-declared
+  // move constructor, QList relocates elements via copy rather than
+  // move, so every element -- old and new -- must retain its exact
+  // original kind/contents after growth.
+  QList<Value> values;
+  for (int i = 0; i < 64; ++i)
+    values.append(Value::makeObject(
+        {{QStringLiteral("i"), Value::makeNumber(RawNumber::fromInt64(i))}}));
+  QCOMPARE(values.size(), 64);
+  for (int i = 0; i < 64; ++i) {
+    QCOMPARE(values.at(i).kind(), Value::Kind::Object);
+    QCOMPARE(values.at(i).value("i"_L1).toRawNumber().literal(),
+             QString::number(i));
   }
 }
 

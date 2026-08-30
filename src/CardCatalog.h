@@ -164,6 +164,22 @@ public:
 
   friend bool operator==(const SkillIcon &, const SkillIcon &) = default;
 
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move. Every
+  // member here is either trivial (SkillIconTag, std::optional<SkillType>
+  // -- moving a trivial payload is indistinguishable from copying it, and
+  // std::optional's own move constructor never clears the source's
+  // engaged flag) or, after this fix, a Json::Value (m_unknownRaw),
+  // which is itself now copy-only for the identical reason (see its own
+  // doc comment in RawJson.h) -- so this class's implicit move was
+  // already behaviorally equivalent to a copy once Json::Value's move
+  // was suppressed. Declared explicitly anyway (rather than relying on
+  // that transitively) so the invariant is self-evident here and stays
+  // correct even if a future field with real move semantics is added
+  // without a reviewer re-deriving this reasoning from scratch.
+  SkillIcon(const SkillIcon &) = default;
+  SkillIcon &operator=(const SkillIcon &) = default;
+
 private:
   SkillIcon() = default;
 
@@ -263,6 +279,16 @@ public:
 
   friend bool operator==(const CardCost &, const CardCost &) = default;
 
+  // Explicitly declared for the identical reason as SkillIcon's own copy
+  // constructor/assignment above: every member is either trivial
+  // (CardCostTag, std::optional<qint64>) or a Json::Value (m_rawContents,
+  // m_unknownRaw), itself now copy-only (see RawJson.h), so this
+  // declaration is defense-in-depth/documentation rather than a
+  // behavior change, and stays correct if a future field with real move
+  // semantics is added.
+  CardCost(const CardCost &) = default;
+  CardCost &operator=(const CardCost &) = default;
+
 private:
   CardCost() = default;
 
@@ -348,6 +374,31 @@ public:
   }
 
   friend bool operator==(const GameValue &, const GameValue &) = default;
+
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_tag
+  // and m_singleAmount are trivial (an enum and std::optional<qint64>
+  // respectively -- moving a trivial payload never clears the source),
+  // but m_contents is a real QList<qint64> whose move constructor/
+  // assignment DOES leave the moved-from source empty, and m_unknownRaw
+  // is a Json::Value (now copy-only, see RawJson.h). Left implicit, a
+  // moved-from Kind::ByPlayerCount instance would still report tag() ==
+  // ByPlayerCount but contents() would be a 0-element list instead of
+  // the documented fixed 4 (onePlayer/twoPlayers/threePlayers/
+  // fourPlayers) -- exactly the element-count loss this class's own
+  // byPlayerCount() doc comment guards against at construction, silently
+  // reintroduced by an unguarded move. A user-declared copy constructor/
+  // assignment here means there is no user-declared move constructor/
+  // assignment for the compiler to implicitly generate, so
+  // std::move(value) instead binds to this copy constructor (an rvalue
+  // can bind to `const GameValue&`), leaving the moved-from source
+  // completely unchanged -- QList's copy constructor is noexcept and
+  // O(1) (implicit sharing), so this costs nothing relative to a "real"
+  // move while making that element-count loss structurally impossible
+  // to observe, including through a container that relocates/moves its
+  // elements.
+  GameValue(const GameValue &) = default;
+  GameValue &operator=(const GameValue &) = default;
 
 private:
   GameValue() = default;

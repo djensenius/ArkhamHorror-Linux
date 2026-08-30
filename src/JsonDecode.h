@@ -46,11 +46,51 @@ namespace Arkham::Json {
 // non-null value. Needed only where the two absent/null cases decode
 // differently (see DeckListInput's id field); everywhere else, both are
 // folded into std::nullopt by the optional* helpers below.
+//
+// A key present with a directly-constructed Kind::Undefined Json::Value
+// (only reachable via a programmatically-built AST, e.g.
+// makeObject({{"k", Value{}}}); never via Value::parse() -- see
+// Value::find()'s own doc comment in RawJson.h) classifies as Present,
+// not Absent: the key genuinely exists in the object, even though the
+// value it holds has no valid JSON spelling of its own. Callers branching
+// on `!= Absent` before decoding the field (see e.g. CardCatalog.cpp's
+// revealedName/cost/cardSubType handling) therefore still attempt to
+// decode such a value -- and correctly fail with a type-mismatch error
+// from that decode -- rather than this function silently misreporting
+// the key as missing and letting the field vanish without a trace.
 enum class FieldPresence { Absent, Null, Present };
 [[nodiscard]] FieldPresence fieldPresence(const QJsonObject &obj,
                                           QLatin1StringView key);
 [[nodiscard]] FieldPresence fieldPresence(const Json::Value &obj,
                                           QLatin1StringView key);
+
+// Internal single-lookup presence dispatch shared by requireField()/
+// requireRawField() below, so both the QJsonObject and Json::Value
+// overloads of each agree on exactly the same "is this key present"
+// classification fieldPresence() above uses -- rather than each
+// independently re-deriving it from a value()-returned Value/QJsonValue's
+// own isUndefined() (which, for Json::Value, cannot distinguish "absent"
+// from "present but Kind::Undefined"; see Value::find()'s doc comment).
+namespace detail {
+// QJsonObject can never store a literal Undefined value for a key --
+// QJsonObject::insert() with an Undefined QJsonValue removes the key
+// instead of storing it, since Qt's JSON object has no way to represent
+// "this key is present but has no value" at all -- so obj.constFind(key)
+// alone is already unambiguous here; this overload exists only so
+// requireField()/requireRawField()'s shared template/call sites can
+// treat both Obj types uniformly.
+[[nodiscard]] inline std::optional<QJsonValue>
+findField(const QJsonObject &obj, QLatin1StringView key) {
+  const auto it = obj.constFind(key);
+  if (it == obj.constEnd())
+    return std::nullopt;
+  return *it;
+}
+[[nodiscard]] inline std::optional<Json::Value>
+findField(const Json::Value &obj, QLatin1StringView key) {
+  return obj.find(key);
+}
+} // namespace detail
 
 // Bare-value required-type decoders: fail with a path-qualified, actionable
 // error if the value has the wrong JSON type. Useful directly for array
@@ -148,30 +188,35 @@ requireArrayField(const Json::Value &obj, QLatin1StringView key,
 // field" phrasing those wrappers use, rather than letting the raw
 // QJsonValue::Undefined/absent-key value fall through to the factory's
 // own type-check and surface as a less specific "expected <type>, got
-// missing". A present value (of any type, including the wrong one) is
-// still forwarded to `valueDecoder` unchanged, so type errors from
-// `valueDecoder` itself are untouched. Every requireString/requireInt/...
-// wrapper above is itself implemented in terms of this one helper (see
-// JsonDecode.cpp); it is exposed here as a template so it can also be
-// called directly wherever a call site's value decoder is some other
-// type's fromJson()-shaped factory instead of one of requireStringValue/
-// requireIntValue/requireBoolValue/requireObject/requireArray.
+// missing". A present value (of any type, including the wrong one, and
+// including -- for the Json::Value overload -- a directly-constructed
+// Kind::Undefined value, which is Present per fieldPresence()'s own
+// classification above) is still forwarded to `valueDecoder` unchanged,
+// so type errors from `valueDecoder` itself are untouched: `valueDecoder`
+// then reports its own actionable type mismatch (e.g. "expected object,
+// got missing") for that case, rather than this function pre-emptively
+// (and incorrectly) reporting the key as absent. Every requireString/
+// requireInt/... wrapper above is itself implemented in terms of this one
+// helper (see JsonDecode.cpp); it is exposed here as a template so it can
+// also be called directly wherever a call site's value decoder is some
+// other type's fromJson()-shaped factory instead of one of
+// requireStringValue/requireIntValue/requireBoolValue/requireObject/
+// requireArray.
 template <typename Obj, typename ValueDecoder>
 [[nodiscard]] auto requireField(const Obj &obj, QLatin1StringView key,
                                 QStringView path, ValueDecoder valueDecoder)
     -> decltype(valueDecoder(obj.value(key), path)) {
-  // A single obj.value(key) lookup -- rather than fieldPresence()'s own
-  // lookup followed by a second, separate obj.value(key) call here --
-  // since both QJsonObject::value() and Json::Value::value() already
-  // return an explicit Undefined value for an absent key (matching what
-  // fieldPresence() itself would report), and this is the workhorse most
-  // require*() field decoders funnel through for nearly every CardDef
-  // field during a catalog fixture decode.
-  auto value = obj.value(key);
-  if (value.isUndefined())
+  // A single detail::findField(obj, key) lookup -- never fieldPresence()'s
+  // own lookup followed by a second, separate value() call here -- shared
+  // with fieldPresence()'s own classification (see detail::findField's
+  // doc comment above) so both agree on exactly the same "is this key
+  // present" answer, including for a Json::Value obj holding a
+  // directly-constructed Kind::Undefined member.
+  auto found = detail::findField(obj, key);
+  if (!found)
     return failure(
         QStringLiteral("%1: missing required field \"%2\"").arg(path, key));
-  return valueDecoder(std::move(value), path);
+  return valueDecoder(std::move(*found), path);
 }
 
 // Required-but-unconstrained-value decoder: fails only if the key itself is
@@ -187,7 +232,12 @@ template <typename Obj, typename ValueDecoder>
 // Json::Value overload: the canonical form for a schema-unconstrained
 // field, since the returned Json::Value preserves arbitrary nested
 // numeric precision/duplicate-key rejection that requireRawField()'s
-// QJsonValue result cannot.
+// QJsonValue result cannot. A key present with a directly-constructed
+// Kind::Undefined value (see detail::findField's doc comment above) is
+// neither absent nor a value this function could honestly hand back
+// verbatim -- it has no valid JSON spelling at all -- so this fails with
+// a distinct, specific error rather than either silently succeeding with
+// an unrepresentable "raw value" or misreporting the key as missing.
 [[nodiscard]] ValueOrError<Json::Value> requireRawField(const Json::Value &obj,
                                                         QLatin1StringView key,
                                                         QStringView path);

@@ -85,22 +85,27 @@ public:
   // QJsonValue convenience conversion, for display/log/debug or a
   // QJsonObject-typed test assertion -- NEVER for building outbound
   // request bytes; see toRawJson() for the lossless equivalent
-  // DeckListInput::toJsonBytes() actually uses. Kind::Number succeeds
-  // exactly (via QJsonValue(qint64), never a double) whenever the
-  // literal is mathematically integral and fits qint64's range (see
+  // DeckListInput::toJsonBytes() actually uses. Implemented as
+  // toRawJson().toExactQJson() -- the same bounded, canonical check
+  // (string length, lone/mismatched UTF-16 surrogates, number-literal
+  // digit budget, then exact-int64 representability) every enclosing
+  // request already relies on when it composes this fragment via
+  // toRawJson(), rather than a hand-duplicated subset of it. Kind::Number
+  // succeeds exactly (via QJsonValue(qint64), never a double) whenever
+  // the literal is mathematically integral and fits qint64's range (see
   // RawNumber::toExactInt64()) -- exactly the same qint64 storage this
   // codebase already relies on elsewhere for lossless QJsonValue
   // round-tripping (see Json::Value::toQJson()'s doc comment). For every
-  // other Number literal (a genuine fraction, or an exponent pushing the
-  // magnitude outside qint64's range) there is no way to represent it in
-  // a QJsonValue without rounding through a double and silently losing
-  // precision, so this returns a typed failure instead: this type never
-  // has a "safe fallback" that substitutes a rounded value. Kind::Text
-  // similarly fails for a lone/mismatched UTF-16 surrogate (text()'s
-  // factory does not itself validate for one), via the same
-  // Json::hasLoneSurrogate() check Value::toExactQJson()/toJsonBytes()
-  // use, rather than ever returning a QJsonValue no downstream UTF-8
-  // encoder could faithfully represent.
+  // other Number literal (a genuine fraction, an exponent pushing the
+  // magnitude outside qint64's range, or one whose digit count alone
+  // exceeds ParseLimits::production().maxNumberDigits) there is no way to
+  // represent it in a QJsonValue without rounding through a double and
+  // silently losing precision, so this returns a typed failure instead:
+  // this type never has a "safe fallback" that substitutes a rounded
+  // value. Kind::Text similarly fails for an over-length string or a
+  // lone/mismatched UTF-16 surrogate (text()'s factory validates neither)
+  // rather than ever returning a QJsonValue no downstream UTF-8 encoder
+  // could faithfully represent.
   [[nodiscard]] ValueOrError<QJsonValue> toJson() const;
   // The lossless Json::Value AST fragment for this id, for splicing into
   // a request built via Json::Value's builder statics (see RawJson.h).
@@ -124,6 +129,29 @@ public:
 
   friend bool operator==(const ExternalDeckId &,
                          const ExternalDeckId &) = default;
+
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_kind
+  // is a plain enum a compiler-generated move leaves completely
+  // unchanged on the moved-from source, while m_text is a QString whose
+  // real move constructor/assignment DOES leave the moved-from source
+  // empty. Left implicit, a moved-from Kind::Text ExternalDeckId would
+  // still report kind() == Kind::Text but text() would be empty --
+  // exactly the "populated only when kind() == Kind::Text" invariant
+  // this class's accessors document, silently violated. A user-declared
+  // copy constructor/assignment here means there is no user-declared
+  // move constructor/assignment for the compiler to implicitly
+  // generate, so std::move(id) instead binds to this copy constructor
+  // (an rvalue can bind to `const ExternalDeckId&`), leaving the
+  // moved-from source completely unchanged -- QString's copy
+  // constructor is noexcept and O(1) (implicit sharing), and
+  // Json::RawNumber is already copy-only for the identical reason (see
+  // its own doc comment), so this costs nothing relative to a "real"
+  // move while making a moved-from ExternalDeckId structurally
+  // impossible to observe as invalid, including through a container
+  // that relocates/moves its elements.
+  ExternalDeckId(const ExternalDeckId &) = default;
+  ExternalDeckId &operator=(const ExternalDeckId &) = default;
 
 private:
   Kind m_kind{Kind::Absent};
@@ -466,6 +494,30 @@ public:
 
   friend bool operator==(const DeckValidationResult &,
                          const DeckValidationResult &) = default;
+
+  // Explicitly declared (rather than left to the compiler's implicit
+  // move constructor/assignment) specifically to suppress move: m_kind
+  // is a plain enum a compiler-generated move leaves completely
+  // unchanged on the moved-from source, while m_errors is a
+  // QList<DeckValidationError> whose real move constructor/assignment
+  // DOES leave the moved-from source empty. Left implicit, a moved-from
+  // Kind::Errors instance would still report kind() == Kind::Errors but
+  // errorList() would be empty -- silently masquerading as
+  // deckValidationSuccess (the empty array) to any caller that then
+  // calls toJson() on the moved-from source, exactly the "Errors ->
+  // Success" collapse this class's own class-level doc comment
+  // describes as structurally impossible. A user-declared copy
+  // constructor/assignment here means there is no user-declared move
+  // constructor/assignment for the compiler to implicitly generate, so
+  // std::move(result) instead binds to this copy constructor (an
+  // rvalue can bind to `const DeckValidationResult&`), leaving the
+  // moved-from source completely unchanged -- QList's copy constructor
+  // is noexcept and O(1) (implicit sharing), so this costs nothing
+  // relative to a "real" move while making that collapse structurally
+  // impossible to observe, including through a container that
+  // relocates/moves its elements.
+  DeckValidationResult(const DeckValidationResult &) = default;
+  DeckValidationResult &operator=(const DeckValidationResult &) = default;
 
 private:
   DeckValidationResult() = default;
