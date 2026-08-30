@@ -214,6 +214,8 @@ libcomerr_so="$(find_bundled_libcomerr)"
 #     dependencies actually come from once linuxdeploy-plugin-qt bundles
 #     them.
 distro_provenance_manifest="$repo_root/distro-provenance-manifest.json"
+distro_provenance_stage_dir="$repo_root/.distro-provenance-stage"
+rm -rf "$distro_provenance_stage_dir"
 mapfile -d '' -t qt_plugin_elf_files < <(
   find "$qt_reference_dir/plugins" -type f -print0 2>/dev/null
 )
@@ -222,7 +224,8 @@ python3 "$repo_root/packaging/audit_codec_notices.py" capture-distro-provenance 
   "$libsecret_so" "$libgpgerror_so" "$libgccs_so" "$libstdcxx_so" \
   "$libz_so" "$libcomerr_so" \
   "${qt_plugin_elf_files[@]}" \
-  --output "$distro_provenance_manifest"
+  --output "$distro_provenance_manifest" \
+  --staging-dir "$distro_provenance_stage_dir"
 echo "Wrote distro-package provenance manifest to $distro_provenance_manifest"
 
 # Package the third-party attribution files (QtKeychain's BSD-3-Clause

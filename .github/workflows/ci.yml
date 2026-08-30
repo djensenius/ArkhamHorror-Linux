@@ -29,6 +29,8 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
@@ -47,6 +49,8 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
@@ -65,6 +69,8 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
@@ -133,6 +139,8 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
@@ -151,6 +159,8 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
@@ -201,6 +211,8 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
