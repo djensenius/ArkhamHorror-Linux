@@ -1,0 +1,24 @@
+Copyright 1987 by the Student Information Processing Board
+of the Massachusetts Institute of Technology
+
+Permission to use, copy, modify, and distribute this software and
+its documentation for any purpose is hereby granted, provided that
+the names of M.I.T. and the M.I.T. S.I.P.B. not be used in
+advertising or publicity pertaining to distribution of the software
+without specific, written prior permission.  M.I.T. and the
+M.I.T. S.I.P.B. make no representations about the suitability of
+this software for any purpose.  It is provided "as is" without
+express or implied warranty.
+
+---
+
+This is the license used for e2fsprogs's lib/et and lib/ss libraries
+(which include lib/et/com_err.c, the source of the bundled
+libcom_err.so.2), reproduced verbatim from Ubuntu's debian/copyright
+for the e2fsprogs source package (packages.ubuntu.com/jammy/libcom-err2,
+git.launchpad.net/ubuntu/+source/e2fsprogs/tree/debian/copyright?h=ubuntu/jammy).
+It is deliberately reproduced here as its own, separate file rather than
+merged into ../krb5/NOTICE -- see ../e2fsprogs/NOTICE.md's "Why this is
+its own component" section for why the two are genuinely different
+licenses from genuinely different upstream projects, despite the
+superficial "MIT" similarity.

@@ -33,6 +33,16 @@ try:
 finally:
     sys.path.remove(_PACKAGING_DIR)
 
+# Round-9+ review item 10 ("rglob *.so* omits main executable, helper
+# ELFs, AppRun"): find_bundled_libraries() now discovers files by their
+# own ELF magic bytes rather than by a `*.so*` basename glob (see its
+# docstring in audit_codec_notices.py) -- every synthetic fake ".so" file
+# this test module creates must therefore actually carry the ELF magic
+# number to still be discovered at all, even though (as this module's
+# own top-of-file docstring notes) classify()/classify_path() never
+# themselves inspect any ELF content beyond that.
+_FAKE_ELF_BYTES = audit._ELF_MAGIC + b"\x00" * 12
+
 
 class ClassifyTests(unittest.TestCase):
     def test_mandatory_libavif_classifies(self) -> None:
@@ -182,15 +192,19 @@ class ClassifyTests(unittest.TestCase):
         # from Google's libyuv above, despite the similarly named
         # libraries). libcom_err (force-bundled the same way as
         # libgpg-error, since linuxdeploy's own default blacklist
-        # excludes it too) joins the existing "krb5" component rather
-        # than a new one, since it ships as part of the same MIT
-        # Kerberos 5 distribution. See third_party/bzip2/NOTICE.md and
-        # third_party/sharpyuv/NOTICE.md for exactly why each is
-        # bundled.
+        # excludes it too) is its OWN "e2fsprogs" component (round-9+
+        # review item 11 -- see third_party/e2fsprogs/NOTICE.md for why
+        # it is NOT part of the "krb5" component despite superficially
+        # looking like it belongs to the same MIT Kerberos 5
+        # distribution: the actual distribution package that builds and
+        # ships it, Ubuntu Jammy's libcom-err2, has an entirely separate
+        # e2fsprogs source package/version/license). See
+        # third_party/bzip2/NOTICE.md and third_party/sharpyuv/NOTICE.md
+        # for exactly why each of the other two is bundled.
         cases = {
             "libbz2.so.1.0": "bzip2",
             "libsharpyuv.so.0": "sharpyuv",
-            "libcom_err.so.2": "krb5",
+            "libcom_err.so.2": "e2fsprogs",
         }
         for basename, expected in cases.items():
             with self.subTest(basename=basename):
@@ -262,13 +276,13 @@ class ClassifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as qt_root_name:
             qt_root = Path(qt_root_name)
             (qt_root / "plugins" / "imageformats").mkdir(parents=True)
-            (qt_root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(b"")
+            (qt_root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(_FAKE_ELF_BYTES)
             (qt_root / "plugins" / "platforms").mkdir(parents=True)
-            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
             (qt_root / "plugins" / "generic").mkdir(parents=True)
-            (qt_root / "plugins" / "generic" / "libqoffscreen.so").write_bytes(b"")
+            (qt_root / "plugins" / "generic" / "libqoffscreen.so").write_bytes(_FAKE_ELF_BYTES)
             (qt_root / "plugins" / "tls").mkdir(parents=True)
-            (qt_root / "plugins" / "tls" / "libqopensslbackend.so").write_bytes(b"")
+            (qt_root / "plugins" / "tls" / "libqopensslbackend.so").write_bytes(_FAKE_ELF_BYTES)
 
             cases = {
                 Path("/AppDir/usr/plugins/imageformats/libqjpeg.so"): "qt",
@@ -298,7 +312,7 @@ class ClassifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as qt_root_name:
             qt_root = Path(qt_root_name)
             (qt_root / "plugins" / "platforms").mkdir(parents=True)
-            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
             # Note: no "libevil.so" exists anywhere under qt_root.
             self.assertIsNone(
                 audit.classify_path(
@@ -335,7 +349,7 @@ class ClassifyTests(unittest.TestCase):
             (qt_root / "qml" / "QtQml" / "Models").mkdir(parents=True)
             (
                 qt_root / "qml" / "QtQml" / "Models" / "libmodelsplugin.so"
-            ).write_bytes(b"")
+            ).write_bytes(_FAKE_ELF_BYTES)
             (
                 qt_root
                 / "qml"
@@ -352,13 +366,13 @@ class ClassifyTests(unittest.TestCase):
                 / "Basic"
                 / "impl"
                 / "libqtquickcontrols2basicstyleimplplugin.so"
-            ).write_bytes(b"")
+            ).write_bytes(_FAKE_ELF_BYTES)
             (qt_root / "qml" / "QtQuick" / "Effects").mkdir(parents=True)
             (
                 qt_root / "qml" / "QtQuick" / "Effects" / "libeffectsplugin.so"
-            ).write_bytes(b"")
+            ).write_bytes(_FAKE_ELF_BYTES)
             (qt_root / "qml" / "QtQuick").mkdir(parents=True, exist_ok=True)
-            (qt_root / "qml" / "QtQuick" / "libqtquick2plugin.so").write_bytes(b"")
+            (qt_root / "qml" / "QtQuick" / "libqtquick2plugin.so").write_bytes(_FAKE_ELF_BYTES)
 
             cases = {
                 Path("/AppDir/usr/qml/QtQml/Models/libmodelsplugin.so"): "qt",
@@ -388,7 +402,7 @@ class ClassifyTests(unittest.TestCase):
             (qt_root / "qml" / "QtQml" / "Models").mkdir(parents=True)
             (
                 qt_root / "qml" / "QtQml" / "Models" / "libmodelsplugin.so"
-            ).write_bytes(b"")
+            ).write_bytes(_FAKE_ELF_BYTES)
             self.assertIsNone(
                 audit.classify_path(
                     Path("/AppDir/usr/qml/QtQml/Models/libevilplugin.so"), qt_root
@@ -412,7 +426,7 @@ class ClassifyTests(unittest.TestCase):
             (qt_root / "qml" / "QtQml" / "Models").mkdir(parents=True)
             (
                 qt_root / "qml" / "QtQml" / "Models" / "libmodelsplugin.so"
-            ).write_bytes(b"")
+            ).write_bytes(_FAKE_ELF_BYTES)
             self.assertIsNone(
                 audit.classify_path(Path("/AppDir/usr/lib/libqmlfoo.so.1"), qt_root)
             )
@@ -436,7 +450,7 @@ class ClassifyAllAndCliTests(unittest.TestCase):
 
     def _touch(self, *names: str) -> None:
         for name in names:
-            (self.lib_dir / name).write_bytes(b"")
+            (self.lib_dir / name).write_bytes(_FAKE_ELF_BYTES)
 
     def test_classify_all_groups_by_component_and_excludes_allowlist(
         self,
@@ -471,7 +485,7 @@ class ClassifyAllAndCliTests(unittest.TestCase):
         # above.
         nested = self.lib_dir / "x86_64-linux-gnu" / "codecs"
         nested.mkdir(parents=True)
-        (nested / "libjpeg.so.8").write_bytes(b"")
+        (nested / "libjpeg.so.8").write_bytes(_FAKE_ELF_BYTES)
         by_component, unmapped = audit.classify_all(self.lib_dir)
         self.assertEqual(unmapped, [])
         self.assertIn("libjpeg", by_component)
@@ -488,19 +502,19 @@ class ClassifyAllAndCliTests(unittest.TestCase):
         # test_qt_plugin_directory_without_reference_dir_is_unmapped for
         # the fail-closed-by-default case).
         (self.lib_dir / "imageformats").mkdir()
-        (self.lib_dir / "imageformats" / "libqjpeg.so").write_bytes(b"")
+        (self.lib_dir / "imageformats" / "libqjpeg.so").write_bytes(_FAKE_ELF_BYTES)
         (self.lib_dir / "platforms").mkdir()
-        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
+        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
         (self.lib_dir / "generic").mkdir()
-        (self.lib_dir / "generic" / "libqoffscreen.so").write_bytes(b"")
+        (self.lib_dir / "generic" / "libqoffscreen.so").write_bytes(_FAKE_ELF_BYTES)
         with tempfile.TemporaryDirectory() as qt_root_name:
             qt_root = Path(qt_root_name)
             (qt_root / "plugins" / "imageformats").mkdir(parents=True)
-            (qt_root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(b"")
+            (qt_root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(_FAKE_ELF_BYTES)
             (qt_root / "plugins" / "platforms").mkdir(parents=True)
-            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
             (qt_root / "plugins" / "generic").mkdir(parents=True)
-            (qt_root / "plugins" / "generic" / "libqoffscreen.so").write_bytes(b"")
+            (qt_root / "plugins" / "generic" / "libqoffscreen.so").write_bytes(_FAKE_ELF_BYTES)
             by_component, unmapped = audit.classify_all(self.lib_dir, qt_root)
             self.assertEqual(unmapped, [])
             self.assertEqual(len(by_component.get("qt", [])), 3)
@@ -513,7 +527,7 @@ class ClassifyAllAndCliTests(unittest.TestCase):
         # pass a reference directory does not silently regress to the
         # old fail-open directory-name-only behavior.
         (self.lib_dir / "platforms").mkdir()
-        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
+        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
         by_component, unmapped = audit.classify_all(self.lib_dir)
         self.assertEqual(len(unmapped), 1)
         self.assertNotIn("qt", by_component)
@@ -526,11 +540,11 @@ class ClassifyAllAndCliTests(unittest.TestCase):
 
     def test_classify_cli_qt_reference_dir_resolves_real_qt_plugins(self) -> None:
         (self.lib_dir / "platforms").mkdir()
-        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
+        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
         with tempfile.TemporaryDirectory() as qt_root_name:
             qt_root = Path(qt_root_name)
             (qt_root / "plugins" / "platforms").mkdir(parents=True)
-            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(b"")
+            (qt_root / "plugins" / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
             exit_code, _stdout, stderr = self._run_classify_cli(
                 "--qt-reference-dir", str(qt_root)
             )
@@ -542,7 +556,7 @@ class ClassifyAllAndCliTests(unittest.TestCase):
     def test_classify_cli_without_qt_reference_dir_fails_on_qt_plugin(self) -> None:
         self._touch("libavif.so.16.0.0")
         (self.lib_dir / "platforms").mkdir()
-        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(b"")
+        (self.lib_dir / "platforms" / "libqxcb.so").write_bytes(_FAKE_ELF_BYTES)
         exit_code, _stdout, stderr = self._run_classify_cli()
         self.assertEqual(exit_code, 1)
         self.assertIn("libqxcb.so", stderr)
@@ -582,6 +596,194 @@ class ClassifyAllAndCliTests(unittest.TestCase):
         self.assertEqual(manifest["unmapped"], ["libunknownthing.so.1"])
 
 
+class FullElfDiscoveryAndFirstPartyExecutableTests(unittest.TestCase):
+    """Round-9+ review item 10 ("rglob *.so* omits main executable,
+    helper ELFs, AppRun; core Qt classified by basename only and
+    unauthenticated"): find_bundled_libraries() must discover EVERY real
+    ELF object under the audited root by its own magic bytes, regardless
+    of its basename -- and this project's own first-party executables
+    (the main application binary, AppRun) must be explicitly classified
+    (never silently invisible, never reported as an unmapped failure),
+    while a hostile file merely sharing one of those basenames at some
+    OTHER path is not."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / "squashfs-root"
+        self.root.mkdir()
+
+    def _write_fake_elf(self, relative_path: str, payload: bytes = b"") -> Path:
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_FAKE_ELF_BYTES + payload)
+        return path
+
+    def test_a_non_so_named_elf_helper_binary_is_discovered_and_classified(
+        self,
+    ) -> None:
+        # Round-8's own "usr/" widening already made a file like this
+        # theoretically reachable by directory, but the OLD `*.so*` glob
+        # inside find_bundled_libraries() still could never discover it,
+        # since its basename has no ".so" in it at all -- it was
+        # entirely invisible to classify_all()/build_sbom_inventory(),
+        # regardless of what directory it lived in.
+        self._write_fake_elf("usr/bin/some-helper-tool")
+        by_component, unmapped = audit.classify_all(self.root)
+        self.assertEqual(by_component, {})
+        self.assertEqual(
+            [str(p.relative_to(self.root)) for p in unmapped],
+            ["usr/bin/some-helper-tool"],
+        )
+        inventory = audit.build_sbom_inventory(self.root)
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["path"], "usr/bin/some-helper-tool")
+        self.assertEqual(inventory[0]["classification"], "unmapped")
+
+    def test_main_application_executable_is_classified_first_party(self) -> None:
+        self._write_fake_elf("usr/bin/arkham-horror")
+        by_component, unmapped = audit.classify_all(self.root)
+        self.assertEqual(by_component, {})
+        self.assertEqual(unmapped, [])
+        inventory = audit.build_sbom_inventory(self.root)
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["path"], "usr/bin/arkham-horror")
+        self.assertEqual(inventory[0]["classification"], "first-party")
+
+    def test_apprun_launcher_is_classified_first_party(self) -> None:
+        self._write_fake_elf("AppRun")
+        by_component, unmapped = audit.classify_all(self.root)
+        self.assertEqual(by_component, {})
+        self.assertEqual(unmapped, [])
+        inventory = audit.build_sbom_inventory(self.root)
+        self.assertEqual(inventory[0]["classification"], "first-party")
+
+    def test_arkham_horror_named_file_at_the_wrong_path_is_not_first_party(
+        self,
+    ) -> None:
+        # The first-party allowance is an exact relative-PATH match, never
+        # a basename-only heuristic: a hostile (or merely misplaced) file
+        # sharing the real executable's basename at some other location
+        # must still be classified normally (and reported unmapped here,
+        # since it matches no COMPONENT_PATTERNS entry either).
+        self._write_fake_elf("usr/lib/plugins/generic/arkham-horror")
+        by_component, unmapped = audit.classify_all(self.root)
+        self.assertEqual(by_component, {})
+        self.assertEqual(
+            [str(p.relative_to(self.root)) for p in unmapped],
+            ["usr/lib/plugins/generic/arkham-horror"],
+        )
+
+    def test_appimage_root_level_apprun_and_usr_bin_are_both_discovered_together(
+        self,
+    ) -> None:
+        # Confirms the fix also actually needs (and this test exercises)
+        # scanning from the FULL extracted AppImage root, not merely
+        # usr/ -- AppRun lives as a sibling of usr/, not beneath it.
+        self._write_fake_elf("AppRun")
+        self._write_fake_elf("usr/bin/arkham-horror")
+        self._write_fake_elf("usr/lib/libavif.so.16.0.0")
+        by_component, unmapped = audit.classify_all(self.root)
+        self.assertEqual(unmapped, [])
+        self.assertEqual(by_component, {"libavif": [self.root / "usr/lib/libavif.so.16.0.0"]})
+        inventory = audit.build_sbom_inventory(self.root)
+        classifications = {entry["path"]: entry["classification"] for entry in inventory}
+        self.assertEqual(
+            classifications,
+            {
+                "AppRun": "first-party",
+                "usr/bin/arkham-horror": "first-party",
+                "usr/lib/libavif.so.16.0.0": "libavif",
+            },
+        )
+
+
+class CoreQtLibraryAuthenticationTests(unittest.TestCase):
+    """Round-9+ review item 10's other half: core Qt shared libraries
+    (as opposed to plugins/QML modules, already covered by
+    QtPluginContentProvenanceTests) were previously classified purely by
+    an unauthenticated basename pattern. These tests use fake (non-real-
+    ELF-content) files -- unlike QtPluginContentProvenanceTests, which
+    needs genuine compiled objects specifically to exercise the
+    build-id-survives-patchelf case -- since the sha256-fallback
+    comparison path (exercised here because these fake files have no
+    real build-id note at all) needs no readelf/compiler and is
+    therefore fully portable."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.qt_root = self.root / "qt_sdk"
+        (self.qt_root / "lib").mkdir(parents=True)
+        self.appdir = self.root / "appdir" / "usr" / "lib"
+        self.appdir.mkdir(parents=True)
+
+    def test_genuine_core_qt_library_with_identical_bytes_classifies_as_qt(
+        self,
+    ) -> None:
+        reference = self.qt_root / "lib" / "libQt6Core.so.6"
+        reference.write_bytes(_FAKE_ELF_BYTES + b"genuine qt core payload")
+        bundled = self.appdir / "libQt6Core.so.6"
+        bundled.write_bytes(reference.read_bytes())
+        self.assertEqual(audit.classify_path(bundled, self.qt_root), "qt")
+
+    def test_substituted_core_qt_library_is_not_classified_as_qt(self) -> None:
+        # The exact HIGH-severity attack this finding describes: a
+        # different (substituted) libQt6Core.so.6 -- different bytes --
+        # placed at the identical bundled path. Previously accepted
+        # unconditionally by classify()'s bare `^libQt6.*\.so` basename
+        # pattern; must now be rejected once a qt_reference_dir is
+        # available.
+        reference = self.qt_root / "lib" / "libQt6Core.so.6"
+        reference.write_bytes(_FAKE_ELF_BYTES + b"genuine qt core payload")
+        substituted = self.appdir / "libQt6Core.so.6"
+        substituted.write_bytes(_FAKE_ELF_BYTES + b"a completely different payload")
+        self.assertNotEqual(
+            audit._sha256(reference), audit._sha256(substituted)
+        )
+        self.assertIsNone(audit.classify_path(substituted, self.qt_root))
+
+    def test_fake_qt_named_library_with_no_reference_counterpart_is_unmapped(
+        self,
+    ) -> None:
+        # A hostile "libQt6Backdoor.so.6" -- matching the core Qt naming
+        # convention by basename alone, but never actually present in the
+        # real Qt SDK at all.
+        backdoor = self.appdir / "libQt6Backdoor.so.6"
+        backdoor.write_bytes(_FAKE_ELF_BYTES + b"not really qt")
+        self.assertIsNone(audit.classify_path(backdoor, self.qt_root))
+
+    def test_without_a_reference_dir_core_qt_still_falls_back_to_basename(
+        self,
+    ) -> None:
+        # Preserves classify_path()'s own documented backward-compatible
+        # behavior for callers that never had a Qt SDK reference
+        # available at all (qt_reference_dir=None) -- only ever a
+        # degraded mode relative to the authenticated path above, never
+        # the production CI invocation (which always supplies
+        # --qt-reference-dir).
+        unverified = self.appdir / "libQt6Core.so.6"
+        unverified.write_bytes(_FAKE_ELF_BYTES)
+        self.assertEqual(audit.classify_path(unverified, None), "qt")
+
+    def test_classify_all_end_to_end_rejects_substituted_core_qt_library(
+        self,
+    ) -> None:
+        reference = self.qt_root / "lib" / "libQt6Core.so.6"
+        reference.write_bytes(_FAKE_ELF_BYTES + b"genuine qt core payload")
+        substituted = self.appdir / "libQt6Core.so.6"
+        substituted.write_bytes(_FAKE_ELF_BYTES + b"a completely different payload")
+        by_component, unmapped = audit.classify_all(
+            self.appdir, qt_reference_dir=self.qt_root
+        )
+        self.assertEqual(by_component, {})
+        self.assertEqual(
+            [str(p.relative_to(self.appdir)) for p in unmapped],
+            ["libQt6Core.so.6"],
+        )
+
+
 class VerifyNoticesTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -608,13 +810,13 @@ class VerifyNoticesTests(unittest.TestCase):
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
     def _seed_component(self, component: str, content: bytes = b"LICENSE TEXT") -> None:
-        (self.lib_dir / f"{component}-marker.so.1").write_bytes(b"")
+        (self.lib_dir / f"{component}-marker.so.1").write_bytes(_FAKE_ELF_BYTES)
         source_dir = self.third_party_root / component
         source_dir.mkdir(parents=True, exist_ok=True)
         (source_dir / "LICENSE").write_bytes(content)
 
     def test_matching_notice_content_passes(self) -> None:
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(_FAKE_ELF_BYTES)
         source_dir = self.third_party_root / "libavif"
         source_dir.mkdir()
         (source_dir / "LICENSE").write_bytes(b"BSD-2-Clause text")
@@ -625,7 +827,7 @@ class VerifyNoticesTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
 
     def test_missing_bundled_notice_file_fails(self) -> None:
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(_FAKE_ELF_BYTES)
         source_dir = self.third_party_root / "libavif"
         source_dir.mkdir()
         (source_dir / "LICENSE").write_bytes(b"BSD-2-Clause text")
@@ -636,7 +838,7 @@ class VerifyNoticesTests(unittest.TestCase):
         self.assertIn("missing its required non-empty", stderr)
 
     def test_content_drifted_bundled_notice_fails_checksum(self) -> None:
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(_FAKE_ELF_BYTES)
         source_dir = self.third_party_root / "libavif"
         source_dir.mkdir()
         (source_dir / "LICENSE").write_bytes(b"the real license text")
@@ -650,15 +852,15 @@ class VerifyNoticesTests(unittest.TestCase):
         self.assertIn("does not match the checked-in source", stderr)
 
     def test_missing_third_party_source_directory_fails(self) -> None:
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(_FAKE_ELF_BYTES)
         # third_party/libavif/ never created at all.
         exit_code, _stdout, stderr = self._run()
         self.assertEqual(exit_code, 1)
         self.assertIn("no checked-in notice source directory", stderr)
 
     def test_unmapped_bundled_library_fails_before_any_notice_check(self) -> None:
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"")
-        (self.lib_dir / "libunexpectedvendor.so.1").write_bytes(b"")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(_FAKE_ELF_BYTES)
+        (self.lib_dir / "libunexpectedvendor.so.1").write_bytes(_FAKE_ELF_BYTES)
         source_dir = self.third_party_root / "libavif"
         source_dir.mkdir()
         (source_dir / "LICENSE").write_bytes(b"BSD-2-Clause text")
@@ -673,7 +875,7 @@ class VerifyNoticesTests(unittest.TestCase):
         # Mirrors bundle_codec_notices.sh's own existing guarantee that
         # every file in a source directory (not just the first/LICENSE)
         # must be verified -- e.g. libaom's extra PATENTS file.
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(_FAKE_ELF_BYTES)
         source_dir = self.third_party_root / "libavif"
         source_dir.mkdir()
         (source_dir / "LICENSE").write_bytes(b"license text")
@@ -704,8 +906,10 @@ class SbomInventoryTests(unittest.TestCase):
         # "components"/"unmapped" keys silently excluded ABI_ALLOWLIST
         # members entirely -- an SBOM consumer had no way to even know
         # libc.so.6 was bundled at all, let alone its own identity.
-        (self.lib_dir / "libc.so.6").write_bytes(b"fake libc bytes")
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"fake libavif bytes")
+        (self.lib_dir / "libc.so.6").write_bytes(audit._ELF_MAGIC + b"fake libc bytes")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(
+            audit._ELF_MAGIC + b"fake libavif bytes"
+        )
         inventory = audit.build_sbom_inventory(self.lib_dir)
         by_path = {entry["path"]: entry for entry in inventory}
         self.assertIn("libc.so.6", by_path)
@@ -717,7 +921,7 @@ class SbomInventoryTests(unittest.TestCase):
         self.assertEqual(by_path["libavif.so.16.0.0"]["classification"], "libavif")
 
     def test_unmapped_library_still_appears_in_the_inventory(self) -> None:
-        (self.lib_dir / "libmysteryvendor.so.3").write_bytes(b"???")
+        (self.lib_dir / "libmysteryvendor.so.3").write_bytes(audit._ELF_MAGIC + b"???")
         inventory = audit.build_sbom_inventory(self.lib_dir)
         by_path = {entry["path"]: entry for entry in inventory}
         self.assertEqual(
@@ -725,9 +929,11 @@ class SbomInventoryTests(unittest.TestCase):
         )
 
     def test_json_manifest_inventory_includes_every_bundled_library(self) -> None:
-        (self.lib_dir / "libc.so.6").write_bytes(b"fake libc bytes")
-        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"fake libavif bytes")
-        (self.lib_dir / "libmysteryvendor.so.3").write_bytes(b"???")
+        (self.lib_dir / "libc.so.6").write_bytes(audit._ELF_MAGIC + b"fake libc bytes")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(
+            audit._ELF_MAGIC + b"fake libavif bytes"
+        )
+        (self.lib_dir / "libmysteryvendor.so.3").write_bytes(audit._ELF_MAGIC + b"???")
         json_path = Path(self._tmp.name) / "sbom.json"
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):

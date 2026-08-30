@@ -78,6 +78,32 @@ from pathlib import Path
 _SONAME_RE = re.compile(r"\(SONAME\)\s+Library soname:\s+\[(?P<name>[^\]]+)\]")
 _BUILD_ID_RE = re.compile(r"Build ID:\s*(?P<id>[0-9a-fA-F]+)")
 
+# Deliberately duplicated from (not imported from)
+# audit_dependency_closure.py's own _ELF_MAGIC/_is_elf_file -- each script
+# keeps its own tiny, independently-reviewable primitive so a change to
+# one script's definition can never silently affect the other's, exactly
+# matching the existing _SONAME_RE/_BUILD_ID_RE duplication rationale
+# above. Used by find_bundled_libraries() (round-9+ review item 10) to
+# discover every bundled ELF by its own magic bytes rather than by any
+# filename convention.
+_ELF_MAGIC = b"\x7fELF"
+
+
+def _is_elf_file(path: Path) -> bool:
+    """True if path's first bytes are the ELF magic number -- deliberately
+    never inspects the extension/basename at all, so it correctly
+    recognizes a real ELF object regardless of what it happens to be
+    named (see find_bundled_libraries()'s own docstring for why this
+    matters). Any I/O failure (permission, dangling symlink, deleted
+    mid-walk) is treated as "not an ELF file" rather than a hard error --
+    a file this script cannot even open is not a bundled ELF object this
+    script could meaningfully classify or SBOM-inventory either way."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(len(_ELF_MAGIC)) == _ELF_MAGIC
+    except OSError:
+        return False
+
 
 class ElfIdentityError(RuntimeError):
     """Raised when `readelf` itself cannot be run (not installed, or the
@@ -296,9 +322,25 @@ COMPONENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^libcap\.so"), "libcap"),
     (re.compile(r"^libdbus-1\.so"), "dbus"),
     (
-        re.compile(r"^lib(krb5support|gssapi_krb5|k5crypto|krb5|com_err)\.so"),
+        re.compile(r"^lib(krb5support|gssapi_krb5|k5crypto|krb5)\.so"),
         "krb5",
     ),
+    # Round-9+ review item 11: libcom_err.so.2 was previously folded into
+    # the "krb5" pattern/component above on the mistaken assumption that
+    # it is part of MIT Kerberos 5. On the actual distribution this
+    # project targets (Ubuntu 22.04 "Jammy"), libcom_err.so.2 is built
+    # and shipped by the libcom-err2 binary package, whose SOURCE package
+    # is e2fsprogs -- an entirely separate upstream project (the
+    # ext2/3/4 filesystem utilities) with its own distinct package
+    # name/version/copyright/license text, coincidentally also MIT-style
+    # and also traceable to an MIT entity, but never the same license
+    # text nor the same package as MIT Kerberos 5 itself. See
+    # third_party/e2fsprogs/NOTICE.md for the full explanation and exact
+    # package/version/license citation. Matched as its own, independent
+    # pattern -- deliberately never folded back into the krb5 pattern
+    # above -- so it always maps to its own correctly-attributed
+    # component.
+    (re.compile(r"^libcom_err\.so"), "e2fsprogs"),
     (re.compile(r"^libicu(data|i18n|uc)\.so"), "icu"),
     (re.compile(r"^libkeyutils\.so"), "libkeyutils"),
     (re.compile(r"^liblz4\.so"), "lz4"),
@@ -461,6 +503,20 @@ def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool
         candidate = qt_reference_dir / QT_QML_ROOT_DIRNAME / sub_path
     else:
         return False
+    return _is_same_compiled_object_or_unwritten(candidate, path)
+
+
+def _is_same_compiled_object_or_unwritten(candidate: Path, path: Path) -> bool:
+    """Shared same-compiled-object proof used by both
+    _is_real_qt_plugin_or_qml_module() (Qt plugins/QML modules) and
+    _is_real_core_qt_library() (core libQt6*.so* libraries): see the
+    former's own docstring for why a build-id match (falling back to a
+    full byte comparison only when either side has none) is the correct
+    signal, rather than a bare path/name match or a bare byte-identical
+    comparison alone. `path.is_file()` is checked first for exactly the
+    same reason documented there -- production callers always pass a
+    real, existing bundled file; this module's own pure-logic unit tests
+    (deliberately not needing a real ELF toolchain) may not."""
     if not candidate.is_file():
         return False
     if not path.is_file():
@@ -473,35 +529,120 @@ def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool
     return _sha256(candidate) == _sha256(path)
 
 
+# Round-9+ review item 10 ("core Qt classified by basename only and
+# unauthenticated"): the core Qt shared libraries themselves (e.g.
+# libQt6Core.so.6) -- as opposed to Qt's own plugins/QML modules, which
+# already require the _is_real_qt_plugin_or_qml_module() authentication
+# above -- were previously classified purely by classify()'s unauthenticated
+# `^libQt6.*\.so` basename pattern, with no verification against the real
+# Qt SDK at all. A hostile or substituted file merely NAMED e.g.
+# "libQt6Backdoor.so.6" or a byte-swapped "libQt6Core.so.6" would
+# previously be silently accepted as genuine, notice-covered Qt content.
+_CORE_QT_LIBRARY_RE = re.compile(r"^libQt6.*\.so")
+
+
+def _is_real_core_qt_library(path: Path, qt_reference_dir: Path) -> bool:
+    """True only if path's basename matches the core Qt library naming
+    convention AND a file at the identical relative path
+    (qt_reference_dir/lib/<basename>) genuinely exists and is proven, by
+    the same build-id-or-byte-content check used for Qt plugins/QML
+    modules, to be the SAME compiled object. See
+    _is_real_qt_plugin_or_qml_module()'s docstring for the full
+    build-id/patchelf rationale, which applies identically here."""
+    if not _CORE_QT_LIBRARY_RE.match(path.name):
+        return False
+    candidate = qt_reference_dir / "lib" / path.name
+    return _is_same_compiled_object_or_unwritten(candidate, path)
+
+
 def classify_path(path: Path, qt_reference_dir: Path | None = None) -> str | None:
     """Like classify(), but additionally resolves any library located
     directly inside one of Qt's own standardized plugin subdirectories
-    (QT_PLUGIN_DIRECTORIES), or anywhere beneath a literal "qml" path
-    component (QT_QML_ROOT_DIRNAME), to the "qt" component -- but, unlike
+    (QT_PLUGIN_DIRECTORIES), anywhere beneath a literal "qml" path
+    component (QT_QML_ROOT_DIRNAME), or matching the core Qt library
+    naming convention (libQt6*.so*), to the "qt" component -- but, unlike
     an earlier version of this function, ONLY if qt_reference_dir is
     supplied AND the bundled file is verified, by build-id (or, absent
     one, full byte content), to be the SAME compiled object as the file
     at the identical relative sub-path under it (see
     _is_real_qt_plugin_or_qml_module()'s docstring for why this
-    authoritative cross-check is required, not merely the directory name
-    or path existence alone). If qt_reference_dir is None, directory-based
-    Qt classification is refused entirely (returns None, i.e. unmapped,
-    rather than trusting the path) -- callers that omit it therefore
-    fail closed rather than silently reintroducing the fail-open
-    behavior a cumulative review found and required be fixed."""
-    if qt_reference_dir is not None and _is_real_qt_plugin_or_qml_module(path, qt_reference_dir):
-        return "qt"
+    authoritative cross-check is required, not merely the directory name,
+    basename pattern, or path existence alone). If qt_reference_dir is
+    None, directory/basename-based Qt classification is refused entirely
+    (returns None, i.e. unmapped, rather than trusting the path or name)
+    -- callers that omit it therefore fail closed rather than silently
+    reintroducing the fail-open behavior a cumulative review found and
+    required be fixed.
+
+    Round-9+ review item 10: a file whose basename merely happens to
+    match the libQt6*.so* naming convention (e.g. a hostile
+    "libQt6Backdoor.so.6", or a substituted "libQt6Core.so.6" with
+    different bytes/build-id) is deliberately NEVER classified as "qt"
+    via classify()'s own plain, unauthenticated COMPONENT_PATTERNS
+    lookup below whenever qt_reference_dir is available -- only a file
+    proven (by _is_real_core_qt_library()) to be the same compiled
+    object as the genuine file at the same relative path under the real
+    Qt SDK is accepted. classify()'s own libQt6 pattern remains reachable
+    only as an explicit, intentionally-lenient fallback for callers that
+    never had a Qt SDK reference available in the first place (e.g. this
+    module's own basename-only unit tests, or a caller auditing a lib
+    directory produced by a build this script has no Qt SDK access for)."""
+    if qt_reference_dir is not None:
+        if _is_real_qt_plugin_or_qml_module(path, qt_reference_dir):
+            return "qt"
+        if _CORE_QT_LIBRARY_RE.match(path.name):
+            return "qt" if _is_real_core_qt_library(path, qt_reference_dir) else None
     return classify(path.name)
 
 
+# Round-9+ review item 10 ("rglob *.so* omits main executable, helper
+# ELFs, AppRun; ... explicitly classify first-party executables"): this
+# project's own compiled artifacts that a real produced AppImage bundles
+# alongside its third-party dependencies -- the main application
+# executable and linuxdeploy's generated AppRun launcher -- are neither
+# a third-party COMPONENT_PATTERNS match nor covered by ABI_ALLOWLIST
+# (which is exclusively for host-provided system libraries). They need
+# no third-party notice (this project owns their copyright itself), but
+# must never be silently absent from the SBOM/audit, nor be reported as
+# an unmapped/unknown bundled binary (which would fail packaging).
+# Deliberately an explicit, closed set of exact relative paths (never a
+# basename-only or heuristic match): a hostile file placed at some OTHER
+# path merely sharing one of these basenames must still be classified
+# normally (and fail if unmapped), not be silently waved through by
+# name alone.
+FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS: frozenset[str] = frozenset(
+    {
+        "usr/bin/arkham-horror",
+        "AppRun",
+    }
+)
+
+
 def find_bundled_libraries(lib_dir: Path) -> list[Path]:
-    """Every `.so` or `.so.<version...>` regular file or symlink found
-    anywhere under lib_dir, recursively -- covers usr/lib, per-arch
-    subdirectories, and plugin directories (e.g. imageformats/) alike,
-    since linuxdeploy's exact placement is an implementation detail this
-    must not hard-code one particular layout for (mirroring
-    audit_dependency_closure.py's own doc-comment reasoning)."""
-    return sorted(p for p in lib_dir.rglob("*.so*") if p.is_file() or p.is_symlink())
+    """Every real ELF object (regular file, or symlink resolving to one)
+    found anywhere under lib_dir, recursively, discovered by inspecting
+    each candidate file's own leading magic bytes -- covers usr/lib,
+    per-arch subdirectories, and plugin directories (e.g.
+    imageformats/) alike, since linuxdeploy's exact placement is an
+    implementation detail this must not hard-code one particular layout
+    for (mirroring audit_dependency_closure.py's own doc-comment
+    reasoning).
+
+    Round-9+ review item 10 ("rglob *.so* omits main executable, helper
+    ELFs, AppRun"): this previously globbed only for `*.so*` basenames,
+    which structurally can never discover a bundled ELF whose own
+    basename simply does not happen to contain ".so" -- this project's
+    own main application executable (usr/bin/arkham-horror) and
+    linuxdeploy's generated AppRun launcher are exactly such files, and
+    were previously entirely invisible to this script: never classified,
+    never notice-checked, and never even listed in the SBOM inventory.
+    Every regular file (following symlinks) anywhere under lib_dir is
+    now inspected by its own actual magic bytes instead, so discovery no
+    longer depends on any filename convention a bundled ELF is not
+    actually obligated to follow -- this also naturally discovers any
+    other unanticipated "helper" ELF (a small bundled tool/launcher with
+    no ".so" in its name at all) the same way."""
+    return sorted(p for p in lib_dir.rglob("*") if p.is_file() and _is_elf_file(p))
 
 
 def classify_all(
@@ -509,15 +650,19 @@ def classify_all(
     qt_reference_dir: Path | None = None,
 ) -> tuple[dict[str, list[Path]], list[Path]]:
     """Returns (component -> [paths requiring that component's notice],
-    unmapped_paths). ABI_ALLOWLIST-covered libraries are excluded from
-    both (they need no notice and are not a failure). qt_reference_dir is
-    forwarded to classify_path() -- see its docstring; omitting it means
-    every directory-matched Qt plugin/QML module is reported unmapped."""
+    unmapped_paths). ABI_ALLOWLIST-covered libraries and this project's
+    own FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS are excluded from both
+    (neither needs a third-party notice, and neither is a failure).
+    qt_reference_dir is forwarded to classify_path() -- see its
+    docstring; omitting it means every directory/basename-matched Qt
+    plugin/QML module/core library is reported unmapped."""
     by_component: dict[str, list[Path]] = {}
     unmapped: list[Path] = []
     for path in find_bundled_libraries(lib_dir):
         basename = path.name
         if basename in ABI_ALLOWLIST:
+            continue
+        if str(path.relative_to(lib_dir)) in FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS:
             continue
         component = classify_path(path, qt_reference_dir)
         if component is None:
@@ -534,30 +679,35 @@ def build_sbom_inventory(
     """Every real bundled ELF found under lib_dir, with NO exclusions --
     unlike classify_all() above (whose whole purpose is deciding what
     needs a *notice*, and therefore deliberately excludes
-    ABI_ALLOWLIST-covered libraries as "needs nothing"), a review finding
-    specifically required that the SBOM/manifest inventory itself never
-    silently omit a bundled file merely because it happens to be
-    allowlisted: an allowlisted classification is itself a meaningful,
-    auditable fact ("this file is trusted to be host-provided, not
-    bundled for its own component notice") that a complete inventory
-    must still record, not a reason to leave the file invisible.
+    ABI_ALLOWLIST-covered and first-party-executable libraries as "needs
+    nothing"), a review finding specifically required that the
+    SBOM/manifest inventory itself never silently omit a bundled file
+    merely because it happens to be allowlisted or first-party: each
+    classification is itself a meaningful, auditable fact ("this file is
+    trusted to be host-provided, not bundled for its own component
+    notice", or "this file is this project's own compiled artifact, not
+    a third-party dependency at all") that a complete inventory must
+    still record, not a reason to leave the file invisible.
 
     Each entry: path (relative to lib_dir), basename, classification
-    ("allowlisted", a COMPONENT_PATTERNS/Qt component name, or
-    "unmapped"), and elf_identity()'s sha256/buildId/soname fields --
-    every final bundled ELF, fully identified, with an explicit,
-    reviewable disposition; nothing bundled is ever left out of this
-    list."""
+    ("allowlisted", "first-party", a COMPONENT_PATTERNS/Qt component
+    name, or "unmapped"), and elf_identity()'s sha256/buildId/soname
+    fields -- every final bundled ELF, fully identified, with an
+    explicit, reviewable disposition; nothing bundled is ever left out
+    of this list."""
     entries: list[dict[str, object]] = []
     for path in find_bundled_libraries(lib_dir):
         basename = path.name
+        relative_path = str(path.relative_to(lib_dir))
         if basename in ABI_ALLOWLIST:
             classification = "allowlisted"
+        elif relative_path in FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS:
+            classification = "first-party"
         else:
             component = classify_path(path, qt_reference_dir)
             classification = component if component is not None else "unmapped"
         entry: dict[str, object] = {
-            "path": str(path.relative_to(lib_dir)),
+            "path": relative_path,
             "basename": basename,
             "classification": classification,
         }

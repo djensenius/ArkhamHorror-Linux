@@ -224,6 +224,15 @@ jobs:
         # actually matching the checked-in third_party/ source. Hermetic
         # (no AppImage/network dependency).
         run: bash packaging/tests/test_bundle_codec_notices.sh
+      - name: Test full-AppDir codec/notice classifier auditor
+        # Portable (stdlib-only, no compiler/readelf/real ELF toolchain)
+        # unit tests for audit_codec_notices.py's classify()/verify-notices
+        # logic (review round-4 item 12 and round-9+ items 10-11):
+        # synthetic zero-byte fake ".so"/ELF files, since classify() only
+        # ever inspects a library's basename/path via COMPONENT_PATTERNS
+        # or (once discovered by ELF magic) its identity, never real
+        # dynamic-linking content.
+        run: python3 packaging/tests/test_audit_codec_notices.py -v
       - name: Test dependency-closure auditor against a synthetic ELF chain
         # Builds a small local three-library chain (root -> mid -> leaf)
         # with `cc`, then proves audit_dependency_closure.py: resolves a
@@ -487,8 +496,10 @@ jobs:
         # This step instead runs packaging/audit_codec_notices.py's
         # verify-notices mode against the REAL, final, already-extracted
         # AppImage (never the pre-packaging AppDir): it first recursively
-        # classifies EVERY bundled .so* file under the extracted usr/lib
-        # tree, hard-failing by exact path if even one cannot be resolved
+        # classifies EVERY bundled ELF object (discovered by magic bytes,
+        # not merely a `*.so*` name -- see round-9+ item 10) under the
+        # full extracted AppImage root, hard-failing by exact path if
+        # even one cannot be resolved
         # to either the small ABI allowlist (needs no notice) or a known
         # third_party/<component>/ notice source -- so a brand-new,
         # never-before-seen bundled library (the exact class of defect
@@ -502,14 +513,22 @@ jobs:
         run: |
           set -euo pipefail
           extracted="$(pwd)/squashfs-root"
-          # linuxdeploy's exact library placement (usr/lib vs. a per-arch
-          # subdirectory) is an implementation detail this must not
-          # hard-code -- matching every other closure-related step in
-          # this workflow, search the whole usr/ tree recursively rather
-          # than assuming one fixed lib subdirectory.
-          lib_search_root="$extracted/usr"
-          [[ -d "$lib_search_root" ]] || {
-            echo "Expected extracted AppImage usr/ directory not found: $lib_search_root" >&2
+          # Round-9+ review item 10 ("rglob *.so* omits main executable,
+          # helper ELFs, AppRun"): audit_codec_notices.py's
+          # find_bundled_libraries() now discovers every real ELF object
+          # by its own magic bytes, not merely files matching a `*.so*`
+          # basename glob, from wherever it is pointed -- so the scan
+          # root here is now the FULL extracted AppImage root
+          # ($extracted), not merely its usr/ subtree, since linuxdeploy's
+          # generated AppRun launcher and this project's own main
+          # application executable (usr/bin/arkham-horror, still inside
+          # usr/) must both be discovered, classified (first-party or a
+          # known component), and included in the SBOM -- AppRun in
+          # particular lives as a SIBLING of usr/, never reachable at
+          # all from a usr/-rooted scan.
+          lib_search_root="$extracted"
+          [[ -d "$lib_search_root/usr" ]] || {
+            echo "Expected extracted AppImage usr/ directory not found under: $lib_search_root" >&2
             exit 1
           }
           doc_root="$extracted/usr/share/doc/ArkhamHorror/third_party"
