@@ -494,6 +494,117 @@ python3 "$auditor" "$font_dir" --root libtestfontroot.so.1 --allow-font-renderin
   || fail "case 16 (--allow-font-rendering-stack): expected exit 0 once the flag is explicitly given"
 echo "PASS: --allow-font-rendering-stack explicitly permits libfontconfig.so.1 to resolve from the host"
 
+# --- Case 18: exact reachable-occurrence resolution (review item 4,
+# "index/root still one path per basename; reachability boolean then
+# recursion chooses index[name], not loader-selected duplicate"). Two
+# real, distinctly-compiled files sharing the exact same basename
+# ("libdup.so.1") exist in two different subdirectories: dir_good (the
+# ONLY one the root's own RUNPATH actually names) whose real dependency
+# is libgoodleaf.so.1 (genuinely bundled and reachable), and
+# dir_zzz_wrong (never named by anything's RUNPATH, sorts after dir_good
+# so a naive last-write-wins basename index would remember it instead)
+# whose own dependency is libphantom-never-bundled.so.1 (bundled
+# nowhere). A correct, loader-search-aware audit must resolve
+# "libdup.so.1" via dir_good specifically and therefore discover
+# libgoodleaf.so.1 as a real, satisfied dependency -- and must NEVER
+# explore dir_zzz_wrong's own DT_NEEDED entries at all, so the phantom
+# name must never appear anywhere in the output.
+dup_resolve_tree="$work_dir/appdir_dup_resolve"
+mkdir -p "$dup_resolve_tree/dir_good" "$dup_resolve_tree/dir_zzz_wrong"
+cat > goodleaf.c <<'EOF'
+int test_goodleaf(void) { return 1; }
+EOF
+cat > dupgood.c <<'EOF'
+int test_goodleaf(void);
+int test_dup(void) { return test_goodleaf(); }
+EOF
+cat > phantomstub.c <<'EOF'
+int test_phantom_dep(void) { return 1; }
+EOF
+cat > dupwrong.c <<'EOF'
+int test_phantom_dep(void);
+int test_dup(void) { return test_phantom_dep(); }
+EOF
+cat > duproot.c <<'EOF'
+int test_dup(void);
+int test_dup_root(void) { return test_dup(); }
+EOF
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libgoodleaf.so.1 \
+  -o "$dup_resolve_tree/dir_good/libgoodleaf.so.1" goodleaf.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 -Wl,-rpath,'$ORIGIN' \
+  -o "$dup_resolve_tree/dir_good/libdup.so.1" dupgood.c \
+  -L"$dup_resolve_tree/dir_good" -l:libgoodleaf.so.1
+# The "wrong" occurrence deliberately needs a phantom dependency that is
+# never actually bundled anywhere in the final tree -- link against a
+# throwaway stub providing the right SONAME, then delete the stub itself
+# (the same "NEEDED entry survives, target file does not" technique
+# already used by the X11/font-rendering cases above), so this file's
+# own DT_NEEDED names something that is never resolvable at all. If the
+# audit ever mistakenly resolves via this file instead of dir_good's,
+# this name must surface somewhere in the output (missing, at minimum).
+"$cc_bin" -shared -fPIC -Wl,-soname,libphantom-never-bundled.so.1 \
+  -o "$work_dir/libphantom-never-bundled.so.1.tmp" phantomstub.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 \
+  -o "$dup_resolve_tree/dir_zzz_wrong/libdup.so.1" dupwrong.c \
+  -L"$work_dir" -l:libphantom-never-bundled.so.1.tmp
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestduproot.so.1 -Wl,-rpath,'$ORIGIN/dir_good' \
+  -o "$dup_resolve_tree/libtestduproot.so.1" duproot.c \
+  -L"$dup_resolve_tree/dir_good" -l:libdup.so.1
+rm "$work_dir/libphantom-never-bundled.so.1.tmp"
+
+result_18="$(python3 "$auditor" "$dup_resolve_tree" --root libtestduproot.so.1 --list-only)" \
+  || fail "case 18: expected exit 0 resolving the reachable dir_good occurrence"
+echo "$result_18" | grep -q "^libgoodleaf.so.1$" \
+  || fail "case 18: expected the genuinely-reachable occurrence's own real dependency libgoodleaf.so.1 to be resolved, got: $result_18"
+echo "$result_18" | grep -q "phantom" \
+  && fail "case 18: the unreachable occurrence's own phantom dependency must never appear in the resolved closure: $result_18"
+output_18_full="$(python3 "$auditor" "$dup_resolve_tree" --root libtestduproot.so.1 2>&1)" \
+  || fail "case 18: expected exit 0 in human-readable mode too"
+echo "$output_18_full" | grep -q "phantom" \
+  && fail "case 18: the unreachable occurrence's own phantom dependency must never appear in the full report either: $output_18_full"
+echo "PASS: a duplicate basename is resolved via the exact reachable occurrence, never an arbitrary same-named copy elsewhere in the tree"
+
+# --- Case 19: PT_INTERP validation (review item 4, "validate PT_INTERP
+# for executables"). A genuine compiled executable's own recorded
+# program interpreter must be exactly the host-guaranteed dynamic loader
+# this project's own build (linuxdeploy, unpatched PT_INTERP) always
+# produces. Mutate a fresh copy's own .interp section via objcopy
+# (binutils; the same package already required by this whole test file
+# for readelf, so no new tooling dependency) to a bogus, non-allowlisted
+# path, proving the check is load-bearing, not vacuous.
+if command -v objcopy >/dev/null 2>&1; then
+  interp_dir="$work_dir/appdir_interp"
+  mkdir -p "$interp_dir"
+  cp "$auto_root_tree/bin/testapp" "$interp_dir/testapp"
+  printf '/nonexistent/bogus-ld.so\0' > "$work_dir/bogus-interp.bin"
+  if objcopy --update-section .interp="$work_dir/bogus-interp.bin" \
+      "$interp_dir/testapp" 2>/dev/null; then
+    chmod +x "$interp_dir/testapp"
+
+    set +e
+    output_19="$(python3 "$auditor" "$interp_dir" --auto-roots "$interp_dir" 2>&1)"
+    case19_status=$?
+    set -e
+    [[ $case19_status -ne 0 ]] \
+      || fail "case 19: expected non-zero exit for an executable with a rewritten, non-allowlisted PT_INTERP"
+    echo "$output_19" | grep -qi "interpreter" \
+      || fail "case 19: failure output did not mention the interpreter problem: $output_19"
+    echo "PASS: an executable's own PT_INTERP naming something other than the host-guaranteed loader is rejected"
+  else
+    echo "SKIP (case 19): objcopy could not update .interp on this system; cannot mutate PT_INTERP for this regression."
+  fi
+else
+  echo "SKIP (case 19): objcopy not available; cannot mutate PT_INTERP for this regression."
+fi
+
+# A genuine, unmutated executable's own PT_INTERP (the plain host
+# loader) must never itself be rejected -- proving case 19 above is
+# testing a real mutation, not a check that always fails.
+python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" --list-only >/dev/null \
+  || fail "case 19 (baseline): expected the genuine, unmutated testapp executable's own PT_INTERP to pass validation"
+echo "PASS: a genuine, unmutated executable's own PT_INTERP (the host-guaranteed loader) passes validation"
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the

@@ -252,6 +252,73 @@ def _parse_needed(dynamic_text: str) -> list[str]:
     return [m.group("name") for m in _NEEDED_RE.finditer(dynamic_text)]
 
 
+_INTERP_STRING_RE = re.compile(r"^\s*\[\s*\d+\]\s+(?P<value>\S.*\S|\S)\s*$", re.MULTILINE)
+
+
+def _read_interp(path: Path) -> str | None:
+    """Returns the ELF interpreter path recorded in `path`'s own .interp
+    section (e.g. "/lib64/ld-linux-x86-64.so.2"), or None if this ELF
+    file carries no .interp section at all.
+
+    Presence of .interp is itself the real, on-disk distinction between
+    "this file is directly exec()'d by the kernel, which will hand it to
+    exactly this recorded interpreter" (an actual executable) and "this
+    file is only ever dlopen()/dlsym()'d by a process that already has
+    its own interpreter" (an ordinary shared library) -- never a
+    name/extension guess, matching every other detection in this script.
+    """
+    result = subprocess.run(
+        ["readelf", "-p", ".interp", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    match = _INTERP_STRING_RE.search(result.stdout)
+    return match.group("value") if match is not None else None
+
+
+def validate_interp(path: Path, allowlist: frozenset[str]) -> str | None:
+    """Round-N+ review (HIGH, "validate PT_INTERP for executables"):
+    returns None if `path` is not a directly-executable ELF at all (no
+    .interp section), or if it is one whose own recorded interpreter is
+    genuinely one of the host-guaranteed dynamic-loader names in
+    `allowlist` -- otherwise returns a human-readable description of the
+    problem.
+
+    Deliberately a SEPARATE, narrower check from the DT_NEEDED closure
+    walk above, not folded into it: PT_INTERP resolution is an entirely
+    different mechanism (the kernel opens the exact absolute path
+    recorded in the ELF header at exec() time -- it never consults
+    DT_RUNPATH/DT_RPATH/LD_LIBRARY_PATH, which only govern how THAT
+    interpreter subsequently resolves this object's own DT_NEEDED
+    entries), so treating it as just another same-shaped dependency edge
+    would silently apply reachability semantics that do not actually
+    describe how a real kernel resolves it.
+
+    This project's own build (packaging/build-appimage.sh) relies
+    entirely on stock, unpatched linuxdeploy output: every bundled
+    executable's interpreter is always left as the plain host loader,
+    with LD_LIBRARY_PATH (not a rewritten PT_INTERP) doing the work of
+    finding bundled libraries. A bundled executable whose own interpreter
+    names anything else is therefore either packaging corruption or an
+    unreviewed build-tooling change -- either way, something this audit
+    must not silently pass, since a target host has no reason to have a
+    compatible loader at any OTHER path, and this project deliberately
+    never bundles a replacement loader of its own."""
+    interp = _read_interp(path)
+    if interp is None:
+        return None
+    if Path(interp).name in allowlist:
+        return None
+    return (
+        f"{path} records program interpreter '{interp}', which is neither "
+        "the host-guaranteed dynamic loader (ABI_ALLOWLIST) nor anything "
+        "this project's own build ever bundles -- refusing to assume it "
+        "will resolve on a target host."
+    )
+
+
 def _parse_search_path_kind_and_entries(
     dynamic_text: str,
 ) -> tuple[str | None, list[str]]:
@@ -371,18 +438,6 @@ def _effective_search_dirs(
     return ordered
 
 
-def _basename_reachable_in(dir_path: Path, name: str) -> bool:
-    """True if `name` names a real ELF file (or a symlink resolving to
-    one) found DIRECTLY inside dir_path -- deliberately never recursive:
-    a real ld.so directory search is never implicitly recursive into
-    subdirectories, so a dependency that only exists two levels below a
-    search directory (e.g. under a sibling Qt plugin's own subdirectory)
-    is exactly as unreachable to a real loader as one that is entirely
-    absent, regardless of how confidently a purely-recursive index might
-    otherwise "find" it somewhere else in the same AppDir tree."""
-    return _is_elf_file(dir_path / name)
-
-
 def _file_digest(path: Path) -> str | None:
     """Returns a content hash (sha256) of the file a path resolves to
     (following symlinks), or None if it cannot be read/does not exist
@@ -404,14 +459,14 @@ def _file_digest(path: Path) -> str | None:
         return None
 
 
-def _index_lib_dir(lib_dir: Path) -> dict[str, Path]:
+def _index_lib_dir(lib_dir: Path) -> dict[str, list[Path]]:
     """Maps every real ELF shared-object basename (or symlink resolving to
-    one) actually present anywhere under lib_dir (recursively) to its
-    path, so a NEEDED entry's exact SONAME string (e.g.
-    "libsecret-1.so.0") can be looked up directly -- AppImage bundling
-    copies both a library's real file and its SONAME symlink, so exact-name
-    lookup (rather than a version-stripping heuristic) is both correct and
-    simple here.
+    one) actually present anywhere under lib_dir (recursively) to EVERY
+    distinct path it is found at, so a NEEDED entry's exact SONAME string
+    (e.g. "libsecret-1.so.0") can be looked up directly -- AppImage
+    bundling copies both a library's real file and its SONAME symlink, so
+    exact-name lookup (rather than a version-stripping heuristic) is both
+    correct and simple here.
 
     Recursive (rglob) rather than the original flat iterdir() so a single
     invocation can be pointed at an entire AppDir usr/ tree (usr/bin, usr/lib,
@@ -432,32 +487,63 @@ def _index_lib_dir(lib_dir: Path) -> dict[str, Path]:
     at all: real AppDir trees legitimately contain many same-basename,
     genuinely-different non-library files (every bundled QML module ships
     its own "plugins.qmltypes", "qmldir", etc.), and indexing those too
-    would make this basename-uniqueness check fire on totally unrelated
+    would make an unrelated ambiguity check fire on totally unrelated
     files that a NEEDED lookup could never resolve to in the first place.
 
-    Raises ClosureAuditError if two indexed (ELF) entries anywhere in the
-    tree share an exact basename but resolve to genuinely different file
-    content (by sha256, not merely a different path -- an
-    independently-copied, byte-identical duplicate is harmless and common
-    in real bundling, so is not treated as ambiguous). A real content
-    difference could otherwise cause a NEEDED lookup to silently resolve
-    to the wrong one of two same-named files, masking a genuine
-    substitution risk.
+    Round-N+ review (HIGH, "index/root still one path per basename"):
+    deliberately returns EVERY distinct occurrence rather than collapsing
+    to a single "canonical" path -- a real AppDir can legitimately contain
+    two different, non-interchangeable files sharing the same basename in
+    different directories (e.g. a Qt plugin's own private copy of a
+    dependency versus the main lib directory's copy, each correctly
+    resolved only via ITS OWN requester's real RUNPATH/RPATH/search
+    context, per audit_closure()'s edge resolution). This function itself
+    never judges that ambiguous -- only a caller that must pick a SINGLE
+    occurrence without any real per-requester search context to
+    disambiguate (a bare root name, or a best-effort fallback
+    representative for an edge that resolved via no search directory at
+    all) needs -- and gets, via _select_unambiguous_occurrence() below --
+    that stricter guarantee.
     """
-    index: dict[str, Path] = {}
-    for entry in lib_dir.rglob("*"):
+    index: dict[str, list[Path]] = {}
+    for entry in sorted(lib_dir.rglob("*")):
         if not _is_elf_file(entry):
             continue
-        existing = index.get(entry.name)
-        if existing is not None and _file_digest(existing) != _file_digest(entry):
-            raise ClosureAuditError(
-                f"Ambiguous duplicate basename '{entry.name}' found at both "
-                f"{existing} and {entry} with different real content -- "
-                "refusing to guess which one a NEEDED lookup should resolve "
-                "to."
-            )
-        index[entry.name] = entry
+        index.setdefault(entry.name, []).append(entry)
     return index
+
+
+def _select_unambiguous_occurrence(
+    name: str, candidates: list[Path], lib_dir: Path
+) -> Path:
+    """Returns the single occurrence to use when no real per-requester
+    search context is available at all -- a root's own bare name (roots
+    are exempt from reachability entirely; see audit_closure()'s own
+    docstring), or the best-effort representative used to keep exploring
+    an edge that could not be resolved via ANY of its requester's real
+    search directories (already reported unreachable; this is purely to
+    surface further, unrelated problems in the same audit run).
+
+    Two or more occurrences are only genuinely ambiguous if their real
+    content actually differs (by sha256, not merely a different path --
+    an independently-copied, byte-identical duplicate is harmless and
+    common in real bundling, so is never treated as ambiguous). Raises
+    ClosureAuditError for a genuine content difference: silently picking
+    one could resolve to the wrong file entirely, masking a genuine
+    substitution risk exactly like the pre-existing symlink-escape check
+    above guards against."""
+    first = candidates[0]
+    for other in candidates[1:]:
+        if _file_digest(first) != _file_digest(other):
+            raise ClosureAuditError(
+                f"Ambiguous duplicate basename '{name}' found at both "
+                f"{first} and {other} with different real content, and no "
+                "real per-requester search context is available here to "
+                "disambiguate them (a root name, or an edge already "
+                "unresolved via any real search directory) -- refusing to "
+                "guess which one should be used."
+            )
+    return first
 
 
 def _is_elf_file(path: Path) -> bool:
@@ -595,6 +681,37 @@ def audit_closure(
             dynamic_text_cache[path] = cached
         return cached
 
+    def resolve_symlink_within_appdir(candidate: Path, name: str) -> Path:
+        """AppImage bundling always produces SONAME symlinks that point at
+        a sibling file inside the same directory (e.g. "libfoo.so.1 ->
+        libfoo.so.1.2.3"). A symlink resolving *outside* lib_dir --
+        whether via an absolute target or a "../" escape -- is never
+        something legitimate bundling would produce. Tolerating it would
+        let a library that merely happens to exist at that path on the
+        machine running the audit (not inside the AppDir at all) be
+        silently treated as "bundled", defeating this script's entire
+        host-independence guarantee. Fail closed instead of following the
+        symlink.
+
+        readlink() targets are resolved relative to the symlink's own
+        containing directory, not lib_dir itself -- with the recursive
+        index this may be a nested subdirectory (e.g. a Qt plugin
+        directory), so candidate.parent (not lib_dir) is the correct base
+        for a relative target."""
+        if not candidate.is_symlink():
+            return candidate
+        link_target = (candidate.parent / candidate.readlink()).resolve()
+        if not link_target.is_relative_to(lib_dir_resolved):
+            raise ClosureAuditError(
+                f"{name} in {lib_dir} is a symlink resolving outside "
+                f"the AppDir lib directory (to {link_target}) -- "
+                "refusing to follow it, since a library present at "
+                "that path on the machine running this audit (rather "
+                "than inside the AppDir) could otherwise be "
+                "misidentified as bundled and silently pass."
+            )
+        return link_target if link_target.exists() else candidate
+
     while queue:
         name, requester_path = queue.pop()
         edge_key = (name, str(requester_path) if requester_path is not None else None)
@@ -607,61 +724,64 @@ def audit_closure(
                 missing.setdefault(name, [])
             continue
 
-        resolved_path = index[name]
-        if resolved_path.is_symlink():
-            # AppImage bundling always produces SONAME symlinks that point
-            # at a sibling file inside the same directory (e.g.
-            # "libfoo.so.1 -> libfoo.so.1.2.3"). A symlink resolving
-            # *outside* lib_dir -- whether via an absolute target or a
-            # "../" escape -- is never something legitimate bundling would
-            # produce. Tolerating it would let a library that merely
-            # happens to exist at that path on the machine running the
-            # audit (not inside the AppDir at all) be silently treated as
-            # "bundled", defeating this script's entire host-independence
-            # guarantee. Fail closed instead of following the symlink.
-            #
-            # readlink() targets are resolved relative to the symlink's own
-            # containing directory, not lib_dir itself -- with the
-            # recursive index this may be a nested subdirectory (e.g. a Qt
-            # plugin directory), so resolved_path.parent (not lib_dir) is
-            # the correct base for a relative target.
-            link_target = (resolved_path.parent / resolved_path.readlink()).resolve()
-            if not link_target.is_relative_to(lib_dir_resolved):
-                raise ClosureAuditError(
-                    f"{name} in {lib_dir} is a symlink resolving outside "
-                    f"the AppDir lib directory (to {link_target}) -- "
-                    "refusing to follow it, since a library present at "
-                    "that path on the machine running this audit (rather "
-                    "than inside the AppDir) could otherwise be "
-                    "misidentified as bundled and silently pass."
-                )
-            if link_target.exists():
-                resolved_path = link_target
-            else:
-                resolved_path = index[name]
-
         if requester_path is not None:
             requester_dynamic_text = cached_dynamic_text(requester_path)
             effective_dirs = _effective_search_dirs(
                 requester_path, requester_dynamic_text, global_search_dirs,
                 lib_dir_resolved,
             )
-            if not any(
-                _basename_reachable_in(search_dir, name)
-                for search_dir in effective_dirs
-            ):
+            # Round-N+ review (HIGH, "index/root still one path per
+            # basename; reachability boolean then recursion chooses
+            # index[name], not loader-selected duplicate"): when the same
+            # basename exists at more than one path in the tree (e.g. two
+            # copies of a plugin's private dependency, one genuinely
+            # reachable via this requester's own RUNPATH, one that only
+            # happens to sit elsewhere), the file that gets explored for
+            # FURTHER dependencies must be the EXACT path a real loader
+            # would actually select for THIS requester -- never whichever
+            # single occurrence `index[name]` happens to remember (which
+            # reflects only rglob's own traversal order, not real loader
+            # precedence, and previously could silently substitute an
+            # entirely unrelated copy's own DT_NEEDED/RUNPATH into this
+            # requester's closure). Resolve the exact reachable file
+            # directly from `effective_dirs`, in real search-order
+            # precedence, rather than ever falling back to the flat index
+            # for a requester-specific edge.
+            resolved_path: Path | None = None
+            for search_dir in effective_dirs:
+                candidate = search_dir / name
+                if _is_elf_file(candidate):
+                    resolved_path = resolve_symlink_within_appdir(candidate, name)
+                    break
+            if resolved_path is None:
                 # Bundled somewhere in the tree, but not anywhere a real
                 # load of `requester_path` would actually search for it --
                 # exactly as fatal as a genuinely missing dependency (see
                 # this function's own docstring). Still recurse into its
-                # own further DT_NEEDED entries below so a single audit
-                # run reports every real problem, not just the first one;
-                # never add it to bundled_closure, since this edge was
-                # never validly resolved.
+                # own further DT_NEEDED entries below (using SOME
+                # occurrence, purely so a single audit run can still
+                # surface other real problems transitively below an
+                # already-broken edge) so a single audit run reports every
+                # real problem, not just the first one; never add it to
+                # bundled_closure, since this edge was never validly
+                # resolved.
                 unreachable.setdefault(name, []).append(requester_path.name)
-                for needed in _parse_needed(cached_dynamic_text(resolved_path)):
-                    queue.append((needed, resolved_path))
+                representative = resolve_symlink_within_appdir(
+                    _select_unambiguous_occurrence(name, index[name], lib_dir), name
+                )
+                for needed in _parse_needed(cached_dynamic_text(representative)):
+                    queue.append((needed, representative))
                 continue
+        else:
+            # A root, exempt from reachability (see this function's own
+            # docstring): resolved by the pre-existing --root convention
+            # of "the name as found anywhere in the indexed tree" (roots
+            # are either --auto-roots' own real discovered path, passed
+            # through unchanged below by main(), or a bare --root NAME
+            # expected to be found directly in lib_dir).
+            resolved_path = resolve_symlink_within_appdir(
+                _select_unambiguous_occurrence(name, index[name], lib_dir), name
+            )
 
         bundled_closure.add(name)
         for needed in _parse_needed(cached_dynamic_text(resolved_path)):
@@ -793,6 +913,22 @@ def main(argv: list[str]) -> int:
                     file=sys.stderr,
                 )
                 return 2
+
+        # Round-N+ review (HIGH, "validate PT_INTERP for executables"):
+        # only meaningful for files whose real, on-disk location is
+        # actually known -- --auto-roots' own discovered paths -- since a
+        # bare --root NAME is only ever a library name by this script's
+        # pre-existing convention, never a claim about which exact file
+        # in a possibly-ambiguous tree is "the" executable to inspect.
+        interp_problems = [
+            problem
+            for path in auto_roots.values()
+            if (problem := validate_interp(path, allowlist)) is not None
+        ]
+        if interp_problems:
+            for problem in interp_problems:
+                print(f"error: {problem}", file=sys.stderr)
+            return 2
 
         bundled_closure, missing, unreachable, _ = audit_closure(
             args.lib_dir,

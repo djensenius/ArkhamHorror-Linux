@@ -79,7 +79,7 @@ class EffectiveSearchDirsPrecedenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.lib_dir = Path(self.tmp.name)
+        self.lib_dir = Path(self.tmp.name).resolve()
         self.own_subdir = self.lib_dir / "own"
         self.own_subdir.mkdir()
         self.requester = self.lib_dir / "requester.so.1"
@@ -143,7 +143,7 @@ class PerEdgeReachabilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.lib_dir = Path(self.tmp.name)
+        self.lib_dir = Path(self.tmp.name).resolve()
 
         # libroot.so.1 (root) NEEDs libb.so.1 then liba.so.1 (in THIS
         # exact order -- see the queue-ordering comment below for why the
@@ -242,10 +242,10 @@ class ExternalPathLeakageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.lib_dir = Path(self.tmp.name)
+        self.lib_dir = Path(self.tmp.name).resolve()
         self.external_tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.external_tmp.cleanup)
-        self.external_dir = Path(self.external_tmp.name)
+        self.external_dir = Path(self.external_tmp.name).resolve()
 
         self.root = self.lib_dir / "libroot.so.1"
         _write_fake_elf(self.root)
@@ -287,6 +287,119 @@ class ExternalPathLeakageTests(unittest.TestCase):
         self.assertEqual(missing, {})
         self.assertIn("libshared.so.1", unreachable)
         self.assertNotIn("libshared.so.1", bundled_closure)
+
+
+class ExactReachablePathIsUsedForRecursionTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "index/root still one path per basename;
+    reachability boolean then recursion chooses index[name], not
+    loader-selected duplicate"): when the identical basename exists at
+    TWO different paths in the tree, the file actually explored for
+    FURTHER dependencies must be the exact one a real loader would select
+    for THIS requester (via its own effective RUNPATH/RPATH/global search
+    dirs) -- never whichever single occurrence the flat basename index
+    happens to remember (a pure artifact of directory-traversal order,
+    unrelated to real loader precedence).
+
+    Deliberately constructed so the two occurrences' own DT_NEEDED
+    entries genuinely differ (one leads to a real, present dependency;
+    the other names a dependency that exists nowhere at all), and so
+    the WRONG occurrence sorts LAST alphabetically/by rglob traversal
+    order (making it the one a naive last-write-wins `index[name]`
+    would remember) while the CORRECT, reachable one is only named by
+    the requester's own RUNPATH. Pre-fix, this made the audit either
+    silently miss the real dependency (never explored) or falsely
+    report a phantom dependency that was never actually going to be
+    loaded at all -- either way, a wrong answer produced with full
+    confidence."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lib_dir = Path(self.tmp.name).resolve()
+
+        self.root = self.lib_dir / "libroot.so.1"
+        _write_fake_elf(self.root)
+
+        # dir_good is the ONLY directory the root's own RUNPATH actually
+        # names -- this is the occurrence a real loader would select.
+        self.dir_good = self.lib_dir / "dir_good"
+        self.dir_good_dup = self.dir_good / "libdup.so.1"
+        _write_fake_elf(self.dir_good_dup)
+        self.good_leaf = self.dir_good / "libgoodleaf.so.1"
+        _write_fake_elf(self.good_leaf)
+
+        # dir_zzz_wrong sorts AFTER dir_good (both alphabetically and in
+        # rglob's own traversal order), so a last-write-wins flat index
+        # keyed only by basename would remember THIS occurrence instead
+        # -- despite the root's own RUNPATH never naming this directory
+        # at all.
+        self.dir_wrong = self.lib_dir / "dir_zzz_wrong"
+        self.dir_wrong_dup = self.dir_wrong / "libdup.so.1"
+        _write_fake_elf(self.dir_wrong_dup)
+
+        self.dynamic_text = {
+            self.root: _needed_and_runpath_text(
+                ["libdup.so.1"], "$ORIGIN/dir_good"
+            ),
+            self.dir_good_dup: _needed_and_runpath_text(
+                ["libgoodleaf.so.1"], "$ORIGIN"
+            ),
+            self.good_leaf: _needed_and_runpath_text([], None),
+            # The wrong occurrence's own dependency names something that
+            # is never bundled anywhere in the tree at all -- if the
+            # audit ever mistakenly explores THIS file instead of the
+            # genuinely-reachable one, this phantom name would appear
+            # somewhere in the result (missing or bundled_closure);
+            # since it is never actually loadable, it must never appear
+            # in either.
+            self.dir_wrong_dup: _needed_and_runpath_text(
+                ["libphantom-never-bundled.so.1"], "$ORIGIN"
+            ),
+        }
+
+    def test_recursion_uses_the_reachable_occurrence_not_the_indexed_one(
+        self,
+    ) -> None:
+        def fake_dynamic_text(path: Path) -> str:
+            return self.dynamic_text[path]
+
+        # Force the flat basename index to deliberately remember the
+        # WRONG occurrence for "libdup.so.1" -- regardless of this
+        # filesystem's own real (unspecified, non-deterministic) rglob
+        # traversal order -- so this regression reliably exercises
+        # exactly the bug being fixed on every platform/filesystem,
+        # rather than depending on incidental directory-iteration order
+        # to happen to produce the vulnerable index contents.
+        forced_index = {
+            "libroot.so.1": [self.root],
+            "libdup.so.1": [self.dir_wrong_dup],
+            "libgoodleaf.so.1": [self.good_leaf],
+        }
+
+        with mock.patch.object(
+            audit, "_readelf_dynamic_text", side_effect=fake_dynamic_text
+        ), mock.patch.object(
+            audit, "_index_lib_dir", return_value=forced_index
+        ):
+            bundled_closure, missing, unreachable, _ = audit.audit_closure(
+                self.lib_dir, ["libroot.so.1"]
+            )
+
+        # The genuinely-reachable copy's own real dependency must be
+        # discovered and marked bundled, EVEN THOUGH the (deliberately
+        # wrong) flat index above claims a completely different file for
+        # this exact same basename.
+        self.assertIn("libdup.so.1", bundled_closure)
+        self.assertIn("libgoodleaf.so.1", bundled_closure)
+        self.assertEqual(missing, {})
+        self.assertEqual(unreachable, {})
+        # The WRONG (unreachable-from-this-requester) occurrence's own
+        # phantom dependency must never leak into the result in any
+        # form -- proving the wrong file's own DT_NEEDED entries were
+        # never actually consulted at all.
+        self.assertNotIn("libphantom-never-bundled.so.1", bundled_closure)
+        self.assertNotIn("libphantom-never-bundled.so.1", missing)
+        self.assertNotIn("libphantom-never-bundled.so.1", unreachable)
 
 
 if __name__ == "__main__":
