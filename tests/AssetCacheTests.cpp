@@ -3048,6 +3048,47 @@ void AssetCacheTests::
   const QString bindSource = bindSourceDir.path();
   QVERIFY(QDir().mkpath(bindSource + QStringLiteral("/actual-home")));
 
+  // Cumulative review (independent re-review round-6, MEDIUM,
+  // "position-sensitive ownership"): this transition lands at an
+  // ANCESTOR position (fakeHome's own PARENT), which now requires
+  // root ownership -- see
+  // directoryDescriptorPassesAncestorOwnerAndModePolicy()'s own
+  // comment. QTemporaryDir's own directory is created with a
+  // restrictive 0700 mode; relaxed to 0755 BEFORE the chown so this
+  // (non-root) test process retains traversal access to the mounted
+  // view afterward, exactly like multipleIndependentlyQualified...'s
+  // own identical fix below.
+  QProcess bindSourceChmodProc;
+  bindSourceChmodProc.start(QStringLiteral("chmod"),
+                            {QStringLiteral("755"), bindSource});
+  QVERIFY(bindSourceChmodProc.waitForFinished(5000));
+  QCOMPARE(bindSourceChmodProc.exitCode(), 0);
+
+  QProcess bindSourceChownProc;
+  bindSourceChownProc.start(QStringLiteral("sudo"),
+                            {QStringLiteral("-n"), QStringLiteral("chown"),
+                             QStringLiteral("root:root"), bindSource});
+  const bool bindSourceChowned = bindSourceChownProc.waitForFinished(5000) &&
+                                 bindSourceChownProc.exitCode() == 0;
+  if (!bindSourceChowned) {
+    QSKIP("passwordless chown privilege unavailable in this environment; "
+          "see the finding's own fail-closed allowance");
+  }
+  // Restores ownership back to this test process's own uid before the
+  // QTemporaryDir destructor tries to remove it -- see
+  // multipleIndependentlyQualified...'s own identical guard for the
+  // full sticky-bit-cleanup rationale.
+  struct BindSourceChownBackGuard {
+    QString path;
+    ~BindSourceChownBackGuard() {
+      QProcess::execute(QStringLiteral("sudo"),
+                        {QStringLiteral("-n"), QStringLiteral("chown"),
+                         QString::number(::getuid()) + QLatin1Char(':') +
+                             QString::number(::getgid()),
+                         path});
+    }
+  } bindSourceChownBackGuard{bindSource};
+
   QProcess mountProc;
   mountProc.start(QStringLiteral("sudo"),
                   {QStringLiteral("-n"), QStringLiteral("mount"),
@@ -3388,6 +3429,22 @@ void AssetCacheTests::
   // umount calls below already require; skips (never fails) when
   // unavailable, exactly like every other privileged step in this
   // test.
+  // QTemporaryDir itself creates its directory with a restrictive
+  // 0700 mode (owner-only); once bind-mounted, the DESTINATION's
+  // effective traversal permissions become whatever the SOURCE's own
+  // mode is -- so without also relaxing it to a real dedicated
+  // partition's ordinary 0755, this test's own (non-root) process
+  // would lose all access to the mounted view the instant ownership
+  // moves to root. 0755 (root-owned, non-group/world-writable) is
+  // exactly the shape directoryDescriptorPassesAncestorOwnerAndModePolicy()
+  // requires and a genuine distro-provisioned "/home" mountpoint
+  // ordinarily has.
+  QProcess ancestorChmodProc;
+  ancestorChmodProc.start(QStringLiteral("chmod"),
+                          {QStringLiteral("755"), ancestorBindSource});
+  QVERIFY(ancestorChmodProc.waitForFinished(5000));
+  QCOMPARE(ancestorChmodProc.exitCode(), 0);
+
   QProcess ancestorChownProc;
   ancestorChownProc.start(QStringLiteral("sudo"),
                           {QStringLiteral("-n"), QStringLiteral("chown"),
