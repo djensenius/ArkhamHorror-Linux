@@ -185,22 +185,6 @@ ValueOrError<std::optional<Enum>> optionalClosedEnum(
   return std::optional<Enum>(*result);
 }
 
-template <typename Enum, std::size_t N>
-ValueOrError<QJsonArray> encodeEnumArray(
-    const QList<Enum> &values,
-    const std::array<std::pair<QLatin1StringView, Enum>, N> &table) {
-  QJsonArray result;
-  for (qsizetype i = 0; i < values.size(); ++i) {
-    auto encoded = Json::encodeClosedEnum(values.at(i), table);
-    if (!encoded)
-      return failure(QStringLiteral("encodeEnumArray[%1]: %2")
-                         .arg(i)
-                         .arg(encoded.error()));
-    result.append(*encoded);
-  }
-  return result;
-}
-
 // Arr is QJsonArray (from Json::requireArrayField(QJsonObject...)) or
 // QList<Json::Value> (from Json::requireArrayField(Json::Value...)): both
 // support .size()/operator[] identically, and Json::decodeUuid is itself
@@ -233,14 +217,12 @@ ValueOrError<GameState> decodeGameStateValue(const Json::Value &v,
   return GameState::fromRawJson(v, path);
 }
 
-QJsonArray encodeUuidArray(const QList<QUuid> &ids) {
-  QJsonArray result;
-  for (const QUuid &id : ids)
-    result.append(id.toString(QUuid::WithoutBraces));
-  return result;
-}
-
-// Raw-AST counterpart of encodeUuidArray() above, for GameState::toRawJson().
+// Raw-AST counterpart of the (removed) lossy encodeUuidArray(), for
+// GameState::toRawJson() below: every GameState encoder composes a
+// complete Json::Value AST and converts exactly once via
+// Value::toExactQJsonObject() (see RawJson.h and the "eliminate all
+// normal-looking lossy QJson encoders" audit), so no QJsonArray-returning
+// sibling is kept around unused/uncalled as a future bypass trap.
 Json::Value encodeUuidArrayRaw(const QList<QUuid> &ids) {
   QList<Json::Value> result;
   for (const QUuid &id : ids)
@@ -434,23 +416,26 @@ ValueOrError<ScenarioSummary> ScenarioSummary::fromJson(const Json::Value &v,
 }
 
 ValueOrError<QJsonObject> ScenarioSummary::toJson() const {
+  // Builds the complete response as a Json::Value AST and converts once
+  // via Value::toExactQJsonObject() (see RawJson.h), rather than
+  // validating id/name individually and then inserting `variant` -- a
+  // plain public std::optional<QString> field with no validating
+  // factory of its own -- directly into the QJsonObject: a lone/
+  // mismatched UTF-16 surrogate or over-length string in `variant` would
+  // otherwise silently produce a normal-looking-but-invalid QJsonObject.
   auto difficultyEncoded = Json::encodeClosedEnum(difficulty, kDifficultyTable);
   if (!difficultyEncoded)
     return failure(
         QStringLiteral("difficulty: %1").arg(difficultyEncoded.error()));
-  auto idEncoded = id.toJson();
-  if (!idEncoded)
-    return failure(QStringLiteral("id: %1").arg(idEncoded.error()));
-  auto nameEncoded = name.toJson();
-  if (!nameEncoded)
-    return failure(QStringLiteral("name: %1").arg(nameEncoded.error()));
-  return QJsonObject{
-      {QStringLiteral("id"), *idEncoded},
-      {QStringLiteral("difficulty"), *difficultyEncoded},
-      {QStringLiteral("name"), *nameEncoded},
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("id"), Json::Value::makeString(id.value())},
+      {QStringLiteral("difficulty"),
+       Json::Value::makeString(*difficultyEncoded)},
+      {QStringLiteral("name"), name.toRawJson()},
       {QStringLiteral("variant"),
-       variant ? QJsonValue(*variant) : QJsonValue(QJsonValue::Null)},
+       variant ? Json::Value::makeString(*variant) : Json::Value::makeNull()},
   };
+  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
 }
 
 ValueOrError<CampaignSummary> CampaignSummary::fromJson(const QJsonValue &v,
@@ -601,8 +586,8 @@ ValueOrError<GameState> GameState::fromValueImpl(const V &v, QStringView path) {
   return result;
 }
 
-QJsonObject GameState::toJson() const {
-  return toRawJson().toQJson().toObject();
+ValueOrError<QJsonObject> GameState::toJson() const {
+  return toRawJson().toExactQJsonObject();
 }
 
 Json::Value GameState::toRawJson() const {
@@ -910,7 +895,7 @@ ValueOrError<QJsonObject> GameListRow::toJson() const {
   auto raw = toRawJson();
   if (!raw)
     return failure(raw.error());
-  return raw->toQJson().toObject();
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<QByteArray> GameListRow::toJsonBytes() const {
@@ -973,15 +958,18 @@ decodeGameListFromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QJsonArray> encodeGameList(const QList<GameListRow> &rows) {
-  QJsonArray result;
-  for (qsizetype i = 0; i < rows.size(); ++i) {
-    auto encoded = rows.at(i).toJson();
-    if (!encoded)
-      return failure(
-          QStringLiteral("rows[%1]: %2").arg(i).arg(encoded.error()));
-    result.append(*encoded);
-  }
-  return result;
+  // Composes encodeGameListToRawJson() below (the lossless Json::Value
+  // AST this function's own toJsonBytes()-equivalent uses) and converts
+  // ONCE via Value::toExactQJsonArray() (see RawJson.h), rather than
+  // appending each row's individually-exact toJson() result into a
+  // QJsonArray by hand: the latter has no bound of its own on the total
+  // number of rows/nodes, letting an otherwise-valid list of
+  // individually-exact rows still bypass ParseLimits::production()'s
+  // overall array-length/total-node-count limit.
+  auto raw = encodeGameListToRawJson(rows);
+  if (!raw)
+    return failure(raw.error());
+  return raw->toExactQJsonArray();
 }
 
 ValueOrError<Json::Value>
@@ -1108,7 +1096,7 @@ ValueOrError<QJsonObject> CampaignOption::toJson() const {
   auto raw = toRawJson();
   if (!raw)
     return failure(raw.error());
-  return raw->toQJson().toObject();
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> CampaignOption::toRawJson() const {
@@ -1692,8 +1680,8 @@ ValueOrError<DeckListInput> decodeDeckListInputValue(const Json::Value &v,
 // decodeDeckListInputValue's Json::Value overload for the fromRawBytes()
 // path, so a numeric literal nested inside its sideSlots survives exactly
 // rather than only as closely as QJsonValue's double-backed storage
-// allows -- no toQJson()-then-reparse round trip is needed, unlike the
-// collapse-then-patch pattern this replaces.
+// allows -- no toLossyQJsonForTestingOnly()-then-reparse round trip is needed,
+// unlike the collapse-then-patch pattern this replaces.
 template <typename Obj>
 ValueOrError<ChooseDeckRequest> decodeChooseDeckRequest(const Obj &obj,
                                                         QStringView path) {
@@ -1869,14 +1857,18 @@ ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
 }
 
 ValueOrError<QJsonArray> encodeOpenSeats(const QList<CardCode> &seats) {
-  QJsonArray result;
-  for (qsizetype i = 0; i < seats.size(); ++i) {
-    auto encoded = seats.at(i).toJson();
-    if (!encoded)
-      return failure(QStringLiteral("[%1]: %2").arg(i).arg(encoded.error()));
-    result.append(*encoded);
-  }
-  return result;
+  // Builds the complete array as a Json::Value AST and converts ONCE via
+  // Value::toExactQJsonArray() (see RawJson.h), rather than appending
+  // each element's individually-exact CardCode::toJson() result into a
+  // QJsonArray by hand: the latter has no bound of its own on the total
+  // element/node count, letting an otherwise-valid list of individually-
+  // exact codes still bypass ParseLimits::production()'s overall
+  // array-length/total-node-count limit.
+  QList<Json::Value> raw;
+  raw.reserve(seats.size());
+  for (const auto &seat : seats)
+    raw.append(Json::Value::makeString(seat.value()));
+  return Json::Value::makeArray(raw).toExactQJsonArray();
 }
 
 } // namespace Arkham

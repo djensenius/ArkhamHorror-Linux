@@ -95,10 +95,10 @@ public:
   // the literal is mathematically integral and fits qint64's range (see
   // RawNumber::toExactInt64()) -- exactly the same qint64 storage this
   // codebase already relies on elsewhere for lossless QJsonValue
-  // round-tripping (see Json::Value::toQJson()'s doc comment). For every
-  // other Number literal (a genuine fraction, an exponent pushing the
-  // magnitude outside qint64's range, or one whose digit count alone
-  // exceeds ParseLimits::production().maxNumberDigits) there is no way to
+  // round-tripping (see Json::Value::toLossyQJsonForTestingOnly()'s doc
+  // comment). For every other Number literal (a genuine fraction, an exponent
+  // pushing the magnitude outside qint64's range, or one whose digit count
+  // alone exceeds ParseLimits::production().maxNumberDigits) there is no way to
   // represent it in a QJsonValue without rounding through a double and
   // silently losing precision, so this returns a typed failure instead:
   // this type never has a "safe fallback" that substitutes a rounded
@@ -122,8 +122,8 @@ public:
   // failure rather than silently dropping the key -- so forgetting this
   // precondition fails loudly at encode time, it does not silently omit
   // the field. (Only the separate, non-canonical, display/log-only
-  // Json::Value::toQJson() conversion would silently drop such a member,
-  // matching QJsonObject::insert()'s own documented behavior for
+  // Json::Value::toLossyQJsonForTestingOnly() conversion would silently drop
+  // such a member, matching QJsonObject::insert()'s own documented behavior for
   // QJsonValue::Undefined; no outbound request encoder uses that path.)
   [[nodiscard]] Json::Value toRawJson() const;
 
@@ -283,12 +283,25 @@ struct DeckList {
                                                            QStringView path);
   // QJsonObject convenience conversion, for display/log/debug or a
   // QJsonObject-typed test assertion -- this is a response-shape DTO
-  // (never composed into an outbound request), but investigatorCode
-  // (CardCode) and each cardSlots/sideSlots key are only validated at
-  // construction for non-emptiness/shape, not for every possible UTF-16
-  // code unit, so this is a typed failure rather than a silently
-  // unencodable QJsonObject for a lone/mismatched surrogate.
+  // (never composed into an outbound request). Composes toRawJson()
+  // below and its own bounded exact QJsonObject conversion (see
+  // Value::toExactQJsonObject() in RawJson.h) rather than hand-inserting
+  // fields into a QJsonObject: investigatorName/meta/url/id/name are
+  // plain public QString fields with no validating factory of their own
+  // (unlike investigatorCode/cardSlots/sideSlots keys, which are
+  // CardCode), so a lone/mismatched UTF-16 surrogate or over-length
+  // string in any of them would otherwise silently produce a normal-
+  // looking-but-invalid QJsonObject.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST for this response DTO (see RawJson.h);
+  // used by toJson() above and by Deck::toRawJson() below to compose a
+  // whole Deck's AST without a lossy encode-then-reparse round trip.
+  // Never fails: every field here is either already-validated
+  // (investigatorCode/cardSlots/sideSlots) or a plain optional/required
+  // QString/qint64 with no construction-time invariant of its own --
+  // toJson()'s own toExactQJsonObject() call is what actually enforces
+  // string length/lone-surrogate/duplicate-key bounds.
+  [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const DeckList &, const DeckList &) = default;
 };
@@ -316,10 +329,17 @@ struct Deck {
                                                        QStringView path);
   // QJsonObject convenience conversion, for display/log/debug or a
   // QJsonObject-typed test assertion -- this is a response-shape DTO
-  // (never composed into an outbound request); propagates list.toJson()'s
-  // own typed failure (see DeckList::toJson()'s doc comment) rather than
-  // ever silently producing an unencodable QJsonObject.
+  // (never composed into an outbound request). Composes toRawJson()
+  // below and its own bounded exact QJsonObject conversion (see
+  // Value::toExactQJsonObject() in RawJson.h) rather than hand-inserting
+  // name/investigatorName directly into a QJsonObject, matching
+  // DeckList::toJson()'s identical rationale above.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST for this response DTO (see RawJson.h);
+  // composes list.toRawJson() above rather than list.toJson() +
+  // Json::Value::fromQJson(), so this whole Deck can be converted to a
+  // QJsonObject exactly once by toJson() above.
+  [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const Deck &, const Deck &) = default;
 };
@@ -430,11 +450,18 @@ struct DeckValidationError {
   fromRawBytes(QByteArrayView bytes, QStringView path);
   // QJsonObject convenience conversion, for display/log/debug or a
   // QJsonObject-typed test assertion -- this is a response-shape DTO
-  // (never composed into an outbound request); propagates
-  // cardCode.toJson()'s own typed failure for a lone/mismatched
-  // surrogate rather than ever silently producing an unencodable
-  // QJsonObject.
+  // (never composed into an outbound request). Composes toRawJson()
+  // below and its own bounded exact QJsonObject conversion (see
+  // Value::toExactQJsonObject() in RawJson.h) rather than hand-inserting
+  // cardCode.toJson()'s already-exact QJsonValue directly into a
+  // QJsonObject literal.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
+  // The lossless Json::Value AST for this response DTO (see RawJson.h);
+  // used by toJson() above and by DeckValidationResult::toRawJson()
+  // below to compose the whole result array's AST without a lossy
+  // encode-then-reparse round trip. Never fails: cardCode is already
+  // validated at construction and "tag" is a fixed literal.
+  [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const DeckValidationError &,
                          const DeckValidationError &) = default;
@@ -478,10 +505,17 @@ public:
   fromRawBytes(QByteArrayView bytes, QStringView path);
   // QJsonArray convenience conversion, for display/log/debug or a
   // QJsonArray-typed test assertion -- this is a response-shape DTO
-  // (never composed into an outbound request); propagates each element's
-  // DeckValidationError::toJson() typed failure rather than ever
-  // silently producing an unencodable QJsonArray.
+  // (never composed into an outbound request). Composes toRawJson()
+  // below and its own bounded exact QJsonArray conversion (see
+  // Value::toExactQJsonArray() in RawJson.h), rather than appending each
+  // element's individually-exact DeckValidationError::toJson() result
+  // into a QJsonArray by hand, which cannot enforce the array's own
+  // overall element-count/total-node bound.
   [[nodiscard]] ValueOrError<QJsonArray> toJson() const;
+  // The lossless Json::Value AST for this response DTO (see RawJson.h);
+  // used by toJson() above. Never fails: each element's own toRawJson()
+  // is itself infallible.
+  [[nodiscard]] Json::Value toRawJson() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
   [[nodiscard]] bool isSuccess() const noexcept {

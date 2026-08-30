@@ -253,7 +253,18 @@ public:
   // number no QJsonValue could represent.
   [[nodiscard]] static ValueOrError<CardCost> fromRawJson(const Json::Value &v,
                                                           QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
+  // silently-rounding fallback, so a numeric literal beyond qint64's exact
+  // range or -- for the schema-unconstrained rawContents()/unknownRaw() payload
+  // tags -- a nested lone/mismatched UTF-16 surrogate/duplicate key/embedded
+  // Undefined is a typed failure here too, not merely at the byte
+  // encoder.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: see SkillIcon::toRawJson()'s doc
   // comment -- identical rationale, since rawContents()/unknownRaw() may
   // themselves hold a number outside qint64's exact range.
@@ -350,7 +361,19 @@ public:
   // comment.
   [[nodiscard]] static ValueOrError<GameValue> fromRawJson(const Json::Value &v,
                                                            QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
+  // silently-rounding fallback, so an unrecognized tag's unknownRaw() (a
+  // schema- unconstrained payload this class itself never validates beyond
+  // capturing verbatim) is a typed failure here too if it holds a
+  // numeric literal beyond qint64's exact range or a nested lone/
+  // mismatched UTF-16 surrogate/duplicate key/embedded Undefined,
+  // rather than silently rounding/dropping it.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: see SkillIcon::toRawJson()'s doc comment.
   [[nodiscard]] Json::Value toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
@@ -546,6 +569,15 @@ struct CardDef {
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<CardDef> fromRawBytes(QByteArrayView bytes,
                                                           QStringView path);
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
+  // silently-rounding fallback, so every schema-unconstrained field's
+  // number/lone- surrogate/duplicate-key/embedded-Undefined invariant is
+  // enforced here too, not merely at the byte encoder.
   [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: composes the lossless AST directly (see
   // RawJson.h), recursing into every nested CardCost/GameValue/SkillIcon's

@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QByteArrayView>
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QLatin1StringView>
@@ -36,12 +37,21 @@
 // rejects duplicate keys (comparing their *decoded* text, so "id" and
 // "\u0069d" are recognized as the same key), and validates string content
 // (UTF-8, escapes, surrogate pairs) and number syntax against the RFC 8259
-// grammar exactly. Value::toQJson() converts the validated tree to standard
-// Qt JSON types for this codebase's existing QJsonValue-based decoders --
-// which is lossless for every field except the one the issue calls out
-// explicitly (ExternalDeckId's numeric "id"; see Decks.h), since QJsonValue
-// itself cannot hold more precision than a double no matter how carefully
-// the bytes were parsed.
+// grammar exactly. Value::toExactQJson()/toExactQJsonObject()/
+// toExactQJsonArray() below convert the validated tree to standard Qt
+// JSON types for this codebase's existing QJsonValue-based decoders,
+// enforcing every one of parse()'s own invariants again on the way out
+// (duplicate keys, embedded Undefined, lone surrogates, ParseLimits
+// bounds) rather than ever silently rounding/collapsing -- see their own
+// doc comments below for the full list of production/domain code that
+// must route through them instead of hand-building a QJsonObject/
+// QJsonArray.
+
+// Forward-declared (global namespace, never Arkham::Json) solely so
+// Value's toLossyQJsonForTestingOnly() below can grant it -- and only
+// it -- friend access via an explicit ::RawJsonTests qualification; see
+// that method's own doc comment.
+class RawJsonTests;
 
 namespace Arkham::Json {
 
@@ -358,24 +368,18 @@ public:
     return m_object;
   }
 
-  // Recursively converts to a standard Qt JSON value. Lossless for every
-  // Kind except a Number whose literal is not RawNumber::toExactInt64()
-  // (i.e. a genuine decimal or an integral value outside qint64's range),
-  // which round-trips only as closely as IEEE-754 double allows; an
-  // exact-int64 literal is preserved exactly via Qt's own QCborValue-backed
-  // QJsonValue(qint64) storage (verified: QJsonValue::toInteger() on such
-  // a value returns the identical qint64, unlike a value constructed from
-  // a double).
-  [[nodiscard]] QJsonValue toQJson() const;
-  // Recursive, fallible counterpart of toQJson() above: identical
+  // Recursive, fallible counterpart of toLossyQJsonForTestingOnly()
+  // below: identical
   // conversion, except a Number node whose literal is not exactly
   // representable as a qint64 (a genuine fraction, or an integral value
   // outside qint64's range -- see RawNumber::toExactInt64()) is a typed
   // failure that propagates out of the whole conversion, rather than
-  // toQJson()'s silent fallback to a rounding IEEE-754 double. Intended
+  // that private test-only helper's silent fallback to a rounding
+  // IEEE-754 double. Intended
   // for a request-bound "convenience QJsonValue" caller that has no other
   // reason to reach for the raw AST/byte APIs directly but still must
-  // never submit a silently-rounded/altered request: unlike toQJson(),
+  // never submit a silently-rounded/altered request: unlike that
+  // private helper,
   // this enforces the *same* invariants as toJsonBytes() (see its own doc
   // comment) end-to-end -- a duplicate object key, a lone UTF-16 surrogate
   // in any string or key, a nesting depth/array-or-object size/total-node
@@ -402,6 +406,19 @@ public:
   // ParseLimits::production()) than the canonical toJsonBytes() path --
   // see e.g. FetchDeckRequest::toJson()'s doc comment in Decks.h.
   [[nodiscard]] ValueOrError<QJsonObject> toExactQJsonObject() const;
+
+  // toExactQJson() above, narrowed to the case where *this is already
+  // known to be an Array -- the shape a complete response/collection
+  // encoder (e.g. GameListRow list, DeckValidationResult, an open-seats
+  // list) should compose via toRawJson()/a raw Json::Value array literal
+  // and convert ONCE, rather than converting each element individually
+  // (via each element's own toJson()) and appending the results into a
+  // QJsonArray by hand: the latter loses toExactQJson()'s own top-level
+  // array-length/total-node-count bound (ParseLimits::production()),
+  // letting an otherwise-valid collection of individually-exact elements
+  // still bypass this codebase's overall resource limits. A typed
+  // failure (never Q_ASSERT/Q_UNREACHABLE) if kind() is not Kind::Array.
+  [[nodiscard]] ValueOrError<QJsonArray> toExactQJsonArray() const;
 
   friend bool operator==(const Value &, const Value &) = default;
 
@@ -468,7 +485,34 @@ private:
   [[nodiscard]] ValueOrError<QJsonValue>
   toExactQJsonInner(const ParseLimits &limits, int depth,
                     qsizetype &totalNodes) const;
+
+  // Recursively converts to a standard Qt JSON value WITHOUT any of
+  // toExactQJson()'s invariant checks: lossless for every Kind except a
+  // Number whose literal is not RawNumber::toExactInt64() (i.e. a genuine
+  // decimal or an integral value outside qint64's range), which
+  // round-trips only as closely as IEEE-754 double allows, and silently
+  // collapses a duplicate object key / drops a nested Kind::Undefined
+  // member rather than rejecting either. Deliberately private and named
+  // unmistakably: this is the exact lossy behavior every production
+  // encoder in this codebase must NOT exhibit (see the cumulative-review
+  // history in CardCatalog.cpp/Games.cpp/Decks.cpp -- every public
+  // toJson()/toQJson()-shaped response or request encoder was rewritten
+  // to build a complete Json::Value AST and convert it exactly once via
+  // toExactQJson()/toExactQJsonObject()/toExactQJsonArray() instead of
+  // ever calling this). Retained ONLY so RawJsonTests.cpp can assert this
+  // documented lossy fallback behavior still exists in the underlying
+  // AST type itself (i.e. that toExactQJson() is a deliberate, tested
+  // divergence from it, not an accidental one) -- no production
+  // domain/wire model may call it, enforced here by access control
+  // rather than convention alone.
+  [[nodiscard]] QJsonValue toLossyQJsonForTestingOnly() const;
+
   friend class Parser;
+  // Grants RawJsonTests (tests/RawJsonTests.cpp) -- and ONLY that test
+  // class -- access to toLossyQJsonForTestingOnly() above; see its own
+  // doc comment for why this must never be reachable from production
+  // code.
+  friend class ::RawJsonTests;
 
   Kind m_kind{Kind::Undefined};
   bool m_bool = false;

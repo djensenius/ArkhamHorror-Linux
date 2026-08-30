@@ -147,43 +147,35 @@ ValueOrError<DeckList> decodeDeckList(const V &v, QStringView path) {
   };
 }
 
-QJsonObject encodeCardQuantityMapInput(const QMap<QString, qint64> &map) {
-  QJsonObject obj;
-  for (auto it = map.constBegin(); it != map.constEnd(); ++it)
-    obj.insert(it.key(), it.value());
-  return obj;
-}
-
-// Builds the `slots`/`sideSlots` QJsonObject for DeckList::toJson() below.
-// A CardCode's own construction-time validation (see CardCode::parse() in
-// Identifiers.h) does not rule out an over-length or lone/mismatched
-// UTF-16 surrogate key, so -- unlike a value embedded via
-// CardCode::toJson() -- a key built via .value() directly bypasses that
-// type's own encode-time check entirely. Builds the equivalent Json::Value
-// object (mirroring rawEncodeCardQuantityMapInput() below) and routes it
-// through Value::toExactQJsonObject()'s single canonical, bounded check
-// (string length, lone/mismatched UTF-16 surrogates, duplicate keys)
-// rather than hand-duplicating just the lone-surrogate case, so this stays
-// in lockstep with every other encoder built the same way.
-ValueOrError<QJsonObject>
-encodeCardQuantityMap(const QMap<CardCode, qint64> &map) {
-  QList<std::pair<QString, Json::Value>> members;
-  members.reserve(map.size());
-  for (auto it = map.constBegin(); it != map.constEnd(); ++it)
-    members.append(
-        {it.key().value(),
-         Json::Value::makeNumber(Json::RawNumber::fromInt64(it.value()))});
-  return Json::Value::makeObject(std::move(members)).toExactQJsonObject();
-}
-
-// Lossless equivalents of the two encoders above, for use by
-// DeckListInput::toJsonBytes()'s Json::Value AST build (see RawJson.h).
+// Lossless Json::Value AST builders, used to compose a complete enclosing
+// Json::Value/DeckListInput AST (see toRawJson()/toJsonBytes() below)
+// rather than converting to QJsonObject per-map.
 Json::Value rawEncodeCardQuantityMapInput(const QMap<QString, qint64> &map) {
   QList<std::pair<QString, Json::Value>> members;
   members.reserve(map.size());
   for (auto it = map.constBegin(); it != map.constEnd(); ++it)
     members.append({it.key(), Json::Value::makeNumber(
                                   Json::RawNumber::fromInt64(it.value()))});
+  return Json::Value::makeObject(std::move(members));
+}
+
+// CardCode-keyed equivalent of rawEncodeCardQuantityMapInput() above, for
+// DeckList::toRawJson()'s complete Json::Value AST build below. A
+// CardCode's own construction-time validation (see CardCode::parse() in
+// Identifiers.h) does not rule out an over-length or lone/mismatched
+// UTF-16 surrogate key, so -- unlike a value embedded via
+// CardCode::toJson() -- a key built via .value() directly bypasses that
+// type's own encode-time check entirely; DeckList::toJson() (the only
+// caller) validates the whole resulting AST in one pass via
+// Value::toExactQJsonObject() rather than this function duplicating just
+// the lone-surrogate case itself.
+Json::Value rawEncodeCardQuantityMap(const QMap<CardCode, qint64> &map) {
+  QList<std::pair<QString, Json::Value>> members;
+  members.reserve(map.size());
+  for (auto it = map.constBegin(); it != map.constEnd(); ++it)
+    members.append(
+        {it.key().value(),
+         Json::Value::makeNumber(Json::RawNumber::fromInt64(it.value()))});
   return Json::Value::makeObject(std::move(members));
 }
 
@@ -647,41 +639,34 @@ ValueOrError<DeckList> DeckList::fromRawBytes(QByteArrayView bytes,
 }
 
 ValueOrError<QJsonObject> DeckList::toJson() const {
-  // Every ternary below uses QJsonValue(QJsonValue::Null) rather than the
-  // bare default-constructed QJsonValue() for the unset case. Both
-  // produce an identical Null-kind value (QJsonValue's default
-  // constructor is QJsonValue::Null, not Undefined -- QJsonObject only
-  // drops a key for an explicit Undefined value), but spelling it out
-  // avoids any ambiguity for a reader about which Qt JSON kind is
-  // intended: decks.schema.json requires each of these keys to be
-  // present, just nullable, so the key must never be omitted here.
-  auto slotsEncoded = encodeCardQuantityMap(cardSlots);
-  if (!slotsEncoded)
-    return failure(QStringLiteral("slots: %1").arg(slotsEncoded.error()));
-  auto sideSlotsEncoded = encodeCardQuantityMap(sideSlots);
-  if (!sideSlotsEncoded)
-    return failure(
-        QStringLiteral("sideSlots: %1").arg(sideSlotsEncoded.error()));
-  auto investigatorCodeEncoded = investigatorCode.toJson();
-  if (!investigatorCodeEncoded)
-    return failure(QStringLiteral("investigator_code: %1")
-                       .arg(investigatorCodeEncoded.error()));
-  return QJsonObject{
-      {QStringLiteral("slots"), *slotsEncoded},
-      {QStringLiteral("sideSlots"), *sideSlotsEncoded},
-      {QStringLiteral("investigator_code"), *investigatorCodeEncoded},
-      {QStringLiteral("investigator_name"), investigatorName},
+  return toRawJson().toExactQJsonObject();
+}
+
+Json::Value DeckList::toRawJson() const {
+  // Every ternary below uses Json::Value::makeNull() rather than leaving
+  // the key absent for the unset case: decks.schema.json requires each of
+  // these keys to be present, just nullable, so the key must never be
+  // omitted here.
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("slots"), rawEncodeCardQuantityMap(cardSlots)},
+      {QStringLiteral("sideSlots"), rawEncodeCardQuantityMap(sideSlots)},
+      {QStringLiteral("investigator_code"),
+       Json::Value::makeString(investigatorCode.value())},
+      {QStringLiteral("investigator_name"),
+       Json::Value::makeString(investigatorName)},
       {QStringLiteral("meta"),
-       meta ? QJsonValue(*meta) : QJsonValue(QJsonValue::Null)},
+       meta ? Json::Value::makeString(*meta) : Json::Value::makeNull()},
       {QStringLiteral("taboo_id"),
-       tabooId ? QJsonValue(*tabooId) : QJsonValue(QJsonValue::Null)},
+       tabooId ? Json::Value::makeNumber(Json::RawNumber::fromInt64(*tabooId))
+               : Json::Value::makeNull()},
       {QStringLiteral("url"),
-       url ? QJsonValue(*url) : QJsonValue(QJsonValue::Null)},
+       url ? Json::Value::makeString(*url) : Json::Value::makeNull()},
       {QStringLiteral("id"),
-       id ? QJsonValue(*id) : QJsonValue(QJsonValue::Null)},
+       id ? Json::Value::makeString(*id) : Json::Value::makeNull()},
       {QStringLiteral("name"),
-       name ? QJsonValue(*name) : QJsonValue(QJsonValue::Null)},
+       name ? Json::Value::makeString(*name) : Json::Value::makeNull()},
   };
+  return Json::Value::makeObject(std::move(members));
 }
 
 ValueOrError<Deck> Deck::fromJson(const QJsonValue &v, QStringView path) {
@@ -700,22 +685,27 @@ ValueOrError<Deck> Deck::fromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QJsonObject> Deck::toJson() const {
-  auto listEncoded = list.toJson();
-  if (!listEncoded)
-    return failure(QStringLiteral("list: %1").arg(listEncoded.error()));
-  return QJsonObject{
-      {QStringLiteral("id"), id.toJson()},
-      {QStringLiteral("userId"), userId},
-      // See DeckList::toJson()'s comment above: QJsonValue(Null) rather
-      // than the bare default constructor, to make explicit that this
-      // key must remain present (decks.schema.json requires "url",
-      // nullable) rather than being dropped like an Undefined value.
+  return toRawJson().toExactQJsonObject();
+}
+
+Json::Value Deck::toRawJson() const {
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("id"), Json::Value::makeString(id.value())},
+      {QStringLiteral("userId"),
+       Json::Value::makeNumber(Json::RawNumber::fromInt64(userId))},
+      // See DeckList::toRawJson()'s comment above: an explicit
+      // Json::Value::makeNull() rather than an omitted key, to make
+      // explicit that this key must remain present (decks.schema.json
+      // requires "url", nullable) rather than being dropped like an
+      // absent/Undefined value.
       {QStringLiteral("url"),
-       url ? QJsonValue(*url) : QJsonValue(QJsonValue::Null)},
-      {QStringLiteral("name"), name},
-      {QStringLiteral("investigatorName"), investigatorName},
-      {QStringLiteral("list"), *listEncoded},
+       url ? Json::Value::makeString(*url) : Json::Value::makeNull()},
+      {QStringLiteral("name"), Json::Value::makeString(name)},
+      {QStringLiteral("investigatorName"),
+       Json::Value::makeString(investigatorName)},
+      {QStringLiteral("list"), list.toRawJson()},
   };
+  return Json::Value::makeObject(std::move(members));
 }
 
 ValueOrError<CreateDeckRequest> CreateDeckRequest::fromJson(const QJsonValue &v,
@@ -879,13 +869,16 @@ DeckValidationError::fromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QJsonObject> DeckValidationError::toJson() const {
-  auto cardCodeEncoded = cardCode.toJson();
-  if (!cardCodeEncoded)
-    return failure(QStringLiteral("contents: %1").arg(cardCodeEncoded.error()));
-  return QJsonObject{
-      {QStringLiteral("tag"), QStringLiteral("UnimplementedCard")},
-      {QStringLiteral("contents"), *cardCodeEncoded},
+  return toRawJson().toExactQJsonObject();
+}
+
+Json::Value DeckValidationError::toRawJson() const {
+  QList<std::pair<QString, Json::Value>> members{
+      {QStringLiteral("tag"),
+       Json::Value::makeString(QStringLiteral("UnimplementedCard"))},
+      {QStringLiteral("contents"), Json::Value::makeString(cardCode.value())},
   };
+  return Json::Value::makeObject(std::move(members));
 }
 
 // Shared decode body for DeckValidationResult::fromJson()/fromRawJson():
@@ -959,14 +952,20 @@ DeckValidationResult::fromRawBytes(QByteArrayView bytes, QStringView path) {
 }
 
 ValueOrError<QJsonArray> DeckValidationResult::toJson() const {
-  QJsonArray arr;
-  for (qsizetype i = 0; i < m_errors.size(); ++i) {
-    auto encoded = m_errors.at(i).toJson();
-    if (!encoded)
-      return failure(QStringLiteral("[%1]: %2").arg(i).arg(encoded.error()));
-    arr.append(*encoded);
-  }
-  return arr;
+  // Builds the complete array as a Json::Value AST (via toRawJson()
+  // below) and converts ONCE via Value::toExactQJsonArray() (see
+  // RawJson.h), rather than appending each element's individually-exact
+  // DeckValidationError::toJson() result into a QJsonArray by hand: the
+  // latter has no bound of its own on the total element/node count.
+  return toRawJson().toExactQJsonArray();
+}
+
+Json::Value DeckValidationResult::toRawJson() const {
+  QList<Json::Value> items;
+  items.reserve(m_errors.size());
+  for (const auto &err : m_errors)
+    items.append(err.toRawJson());
+  return Json::Value::makeArray(std::move(items));
 }
 
 // Shared decode body for DeckOperationError::fromJson()/fromRawJson(): V

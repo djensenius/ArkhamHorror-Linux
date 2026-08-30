@@ -252,6 +252,17 @@ if(BUILD_TESTING)
     )
     add_test(NAME raw_json COMMAND arkham-raw-json-tests)
 
+    qt_add_executable(arkham-encoder-hygiene-tests
+        tests/EncoderHygieneTests.cpp
+    )
+    target_compile_definitions(arkham-encoder-hygiene-tests PRIVATE
+        ARKHAM_TEST_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_link_libraries(arkham-encoder-hygiene-tests PRIVATE
+        Qt6::Test
+    )
+    add_test(NAME encoder_hygiene COMMAND arkham-encoder-hygiene-tests)
+
     qt_add_executable(arkham-network-tests
         tests/NetworkTests.cpp
     )

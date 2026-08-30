@@ -63,7 +63,7 @@ private slots:
   // makeObject()) transient duplicate-key case toJsonBytes() rejects.
   void objectAccessorLookupIsCorrectAcrossManyMembers();
   void makeObjectDuplicateKeyResolvesToFirstOccurrence();
-  void toQJsonConvertsEveryKind();
+  void toLossyQJsonForTestingOnlyConvertsEveryKind();
   void skipsLeadingAndTrailingWhitespace();
 
   // toExactInt64()/fromInt64()/qint64-exactness (issue #19 review round 3,
@@ -88,7 +88,7 @@ private slots:
   // accept such exponents on both sides of zero's range boundary.
   void toExactInt64ZeroCoefficientAcceptsExponentBeyondQint64Range();
   void fromInt64RoundTripsFullRange();
-  void toQJsonPreservesInt64ExactlyBeyondDoublePrecision();
+  void toLossyQJsonForTestingOnlyPreservesInt64ExactlyBeyondDoublePrecision();
   void fromQJsonConvertsQJsonTreeRecursively();
   void fromQJsonPreservesInt64MaxExactlyAtBoundary();
   void fromQJsonPreservesInt64MinExactlyAtBoundary();
@@ -580,9 +580,9 @@ void RawJsonTests::makeObjectDuplicateKeyResolvesToFirstOccurrence() {
   QCOMPARE(obj.value("a"_L1).toString(), QStringLiteral("first"));
 }
 
-void RawJsonTests::toQJsonConvertsEveryKind() {
+void RawJsonTests::toLossyQJsonForTestingOnlyConvertsEveryKind() {
   auto value = mustParse(R"({"a":1,"b":"s","c":true,"d":null,"e":[1,2]})");
-  auto json = value.toQJson();
+  auto json = value.toLossyQJsonForTestingOnly();
   QVERIFY(json.isObject());
   auto object = json.toObject();
   QCOMPARE(object.value("a"_L1).toDouble(), 1.0);
@@ -719,12 +719,13 @@ void RawJsonTests::fromInt64RoundTripsFullRange() {
   }
 }
 
-void RawJsonTests::toQJsonPreservesInt64ExactlyBeyondDoublePrecision() {
+void RawJsonTests::
+    toLossyQJsonForTestingOnlyPreservesInt64ExactlyBeyondDoublePrecision() {
   auto value = mustParse(R"({"id":9007199254740993})");
-  auto json = value.toQJson();
+  auto json = value.toLossyQJsonForTestingOnly();
   // toInteger() recovers the exact qint64 even though .isDouble()/
-  // .toDouble() report the rounded double -- see Value::toQJson()'s doc
-  // comment.
+  // .toDouble() report the rounded double -- see
+  // Value::toLossyQJsonForTestingOnly()'s doc comment.
   QCOMPARE(json.toObject().value("id"_L1).toInteger(), 9007199254740993LL);
 }
 
@@ -1293,14 +1294,16 @@ void RawJsonTests::toExactQJsonAcceptsTopLevelUndefined() {
   // value legitimately stays Undefined -- e.g. DeckListInput::toJson()
   // only calls sideSlots.toExactQJson() after checking
   // !sideSlots.isUndefined(), but a direct top-level call must still
-  // succeed and report Undefined, matching toQJson()'s behavior.
+  // succeed and report Undefined, matching
+  // toLossyQJsonForTestingOnly()'s behavior.
   auto result = Value{}.toExactQJson();
   QVERIFY(result.has_value());
   QVERIFY(result->isUndefined());
 }
 
 void RawJsonTests::toExactQJsonRejectsLoneSurrogateInStringValue() {
-  // Round 12 item 1: toQJson()/the old toExactQJson() would happily embed
+  // Round 12 item 1: toLossyQJsonForTestingOnly()/the old toExactQJson()
+  // would happily embed
   // a lone surrogate straight into a QJsonValue with no error at all
   // (QJsonValue itself does not validate string content); the surrogate
   // would only surface as invalid UTF-8 later, whenever some other code

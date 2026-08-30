@@ -210,8 +210,8 @@ decodeEnumArray(const Obj &obj, QLatin1StringView key, QStringView path,
   return result;
 }
 
-// Raw-AST counterpart of encodeEnumArray() in Games.cpp, for
-// CardDef::toRawJson(). Fails (rather than crashing via
+// Builds a raw-AST array of closed-enum values, for CardDef::toRawJson().
+// Fails (rather than crashing via
 // Json::encodeClosedEnum()'s former Q_UNREACHABLE) if any element is a
 // closed-enum value fabricated via static_cast from outside its real
 // range -- see Json::encodeClosedEnum()'s doc comment in JsonDecode.h.
@@ -488,7 +488,7 @@ ValueOrError<QJsonObject> SkillIcon::toJson() const {
   auto raw = toRawJson();
   if (!raw)
     return failure(raw.error());
-  return raw->toQJson().toObject();
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> SkillIcon::toRawJson() const {
@@ -693,8 +693,8 @@ ValueOrError<CardCost> CardCost::fromValueImpl(const V &v, QStringView path) {
   return result;
 }
 
-QJsonObject CardCost::toJson() const {
-  return toRawJson().toQJson().toObject();
+ValueOrError<QJsonObject> CardCost::toJson() const {
+  return toRawJson().toExactQJsonObject();
 }
 
 Json::Value CardCost::toRawJson() const {
@@ -886,8 +886,8 @@ ValueOrError<GameValue> GameValue::fromValueImpl(const V &v, QStringView path) {
   return result;
 }
 
-QJsonObject GameValue::toJson() const {
-  return toRawJson().toQJson().toObject();
+ValueOrError<QJsonObject> GameValue::toJson() const {
+  return toRawJson().toExactQJsonObject();
 }
 
 Json::Value GameValue::toRawJson() const {
@@ -1549,7 +1549,7 @@ ValueOrError<QJsonObject> CardDef::toJson() const {
   auto raw = toRawJson();
   if (!raw)
     return failure(raw.error());
-  return raw->toQJson().toObject();
+  return raw->toExactQJsonObject();
 }
 
 ValueOrError<Json::Value> CardDef::toRawJson() const {

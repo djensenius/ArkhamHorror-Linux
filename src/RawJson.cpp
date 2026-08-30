@@ -553,7 +553,7 @@ QStringList Value::keys() const {
   return result;
 }
 
-QJsonValue Value::toQJson() const {
+QJsonValue Value::toLossyQJsonForTestingOnly() const {
   switch (m_kind) {
   case Kind::Undefined:
     return QJsonValue(QJsonValue::Undefined);
@@ -578,13 +578,13 @@ QJsonValue Value::toQJson() const {
   case Kind::Array: {
     QJsonArray array;
     for (const auto &element : m_array)
-      array.append(element.toQJson());
+      array.append(element.toLossyQJsonForTestingOnly());
     return array;
   }
   case Kind::Object: {
     QJsonObject object;
     for (const auto &[k, v] : m_object)
-      object.insert(k, v.toQJson());
+      object.insert(k, v.toLossyQJsonForTestingOnly());
     return object;
   }
   }
@@ -693,7 +693,8 @@ ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
     // integral and in range (see RawNumber::toExactInt64()); every other
     // literal (a genuine decimal, or an integral value outside qint64's
     // range) has no exact QJsonValue representation, so this is a typed
-    // failure rather than toQJson()'s silent double-rounding fallback.
+    // failure rather than toLossyQJsonForTestingOnly()'s silent
+    // double-rounding fallback.
     if (auto exact = m_number.toExactInt64())
       return QJsonValue(*exact);
     return failure(
@@ -803,6 +804,22 @@ ValueOrError<QJsonObject> Value::toExactQJsonObject() const {
   // never any other QJsonValue::Type -- so this is a lossless view, not a
   // narrowing/defensive fallback.
   return exact->toObject();
+}
+
+ValueOrError<QJsonArray> Value::toExactQJsonArray() const {
+  if (m_kind != Kind::Array)
+    return failure(
+        QStringLiteral("Value::toExactQJsonArray: expected an array, got %1")
+            .arg(typeName(*this)));
+  auto exact = toExactQJson();
+  if (!exact)
+    return failure(exact.error());
+  // Kind::Array above guarantees toExactQJsonInner's Array branch ran,
+  // which only ever returns QJsonValue(QJsonArray) or a typed failure --
+  // never any other QJsonValue::Type -- so this is a lossless view, not a
+  // narrowing/defensive fallback (see toExactQJsonObject()'s identical
+  // reasoning just above).
+  return exact->toArray();
 }
 
 Value Value::makeNull() {

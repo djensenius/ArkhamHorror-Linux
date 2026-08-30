@@ -203,13 +203,24 @@ public:
   // and decodes via fromRawJson() above.
   [[nodiscard]] static ValueOrError<GameState>
   fromRawBytes(QByteArrayView bytes, QStringView path);
-  [[nodiscard]] QJsonObject toJson() const;
+  // QJsonObject convenience conversion, for display/log/debug or a
+  // QJsonObject-typed test assertion -- NEVER for building outbound
+  // request bytes; see toJsonBytes() below for the canonical, always-
+  // lossless equivalent. Composes toRawJson() below and its own bounded
+  // exact QJsonObject conversion (see Value::toExactQJsonObject() in
+  // RawJson.h) rather than Value::toLossyQJsonForTestingOnly()'s
+  // silently-rounding fallback, so an Unknown tag's unknownRaw() -- which may
+  // itself carry a numeric literal beyond qint64's exact range, a nested lone/
+  // mismatched UTF-16 surrogate, a duplicate key, or an embedded
+  // Undefined -- is a typed failure here too, not merely at the byte
+  // encoder.
+  [[nodiscard]] ValueOrError<QJsonObject> toJson() const;
   // Canonical byte-level encode: composes the lossless AST directly (see
   // RawJson.h) -- toJson() above is now implemented in terms of this --
   // so unknownRaw()'s complete original object (including any numeric
   // literal beyond double precision) survives an encode-then-decode round
   // trip byte-exact via toJsonBytes(), not merely as closely as
-  // Json::Value::toQJson() allows.
+  // Json::Value::toLossyQJsonForTestingOnly() allows.
   [[nodiscard]] Json::Value toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -236,10 +247,13 @@ public:
   // duplicate object key anywhere in the payload is rejected by
   // Json::Value::parse() itself (see RawJson.cpp) and therefore never
   // reaches this representation in the first place. toJson() below is a
-  // QJsonObject-typed convenience for the Unknown case only as exact as
-  // Json::Value::toQJson() itself is (see its doc comment in RawJson.h):
-  // an exact-int64 numeric literal survives, but anything requiring more
-  // precision than QJsonValue's double-backed storage allows does not.
+  // QJsonObject-typed convenience for the Unknown case that is now
+  // exactly as bounded/lossless as toJsonBytes() (see
+  // Value::toExactQJsonObject() in RawJson.h): a numeric literal beyond
+  // qint64's exact range, a lone/mismatched UTF-16 surrogate, a
+  // duplicate key, or an embedded Undefined anywhere inside it is a
+  // typed failure there too, rather than a silently-rounded/altered
+  // QJsonObject.
   [[nodiscard]] const Json::Value &unknownRaw() const noexcept {
     return m_unknownRaw;
   }
@@ -349,9 +363,9 @@ public:
   // numeric literal outside IEEE-754 double's exact-integer range
   // survives an encode-then-reparse round trip through this *aggregate*,
   // not merely GameState in isolation. toJson() above remains a
-  // QJsonObject-typed convenience only as exact as Json::Value::toQJson()
-  // allows (see its doc comment in RawJson.h) and is implemented in terms
-  // of this.
+  // QJsonObject-typed convenience only as exact as
+  // Json::Value::toLossyQJsonForTestingOnly() allows (see its doc comment in
+  // RawJson.h) and is implemented in terms of this.
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
@@ -548,8 +562,8 @@ public:
   // RawJson.h) -- toJson() above is now implemented in terms of this --
   // so rawJson()'s complete original object survives an encode-then-
   // decode round trip byte-exact via toJsonBytes(), not merely as
-  // closely as Json::Value::toQJson() allows. Fails only if this
-  // instance's KnownCampaignOption was fabricated via static_cast from an
+  // closely as Json::Value::toLossyQJsonForTestingOnly() allows. Fails only if
+  // this instance's KnownCampaignOption was fabricated via static_cast from an
   // out-of-table value bypassing knownOption()'s validation (impossible
   // through any public API this class itself exposes).
   [[nodiscard]] ValueOrError<Json::Value> toRawJson() const;
@@ -579,10 +593,10 @@ public:
   // duplicate object key anywhere in the payload is rejected by
   // Json::Value::parse() itself (see RawJson.cpp) and therefore never
   // reaches this representation in the first place. toJson() below is a
-  // QJsonObject-typed convenience only as exact as Json::Value::toQJson()
-  // itself is (see its doc comment in RawJson.h): an exact-int64 numeric
-  // literal survives, but anything requiring more precision than
-  // QJsonValue's double-backed storage allows does not.
+  // QJsonObject-typed convenience only as exact as
+  // Json::Value::toLossyQJsonForTestingOnly() itself is (see its doc comment in
+  // RawJson.h): an exact-int64 numeric literal survives, but anything requiring
+  // more precision than QJsonValue's double-backed storage allows does not.
   [[nodiscard]] const Json::Value &rawJson() const noexcept { return m_raw; }
   // Convenience view derived from rawJson(): the raw "contents" the
   // decoded object carried, if any (Undefined if it had none or this

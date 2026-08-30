@@ -129,11 +129,11 @@ requireArray(const Json::Value &v, QStringView path);
 // check even though the original JSON text was not itself an integer.
 // Reads the value via QJsonValue::toInteger() rather than
 // toDouble()+static_cast, so a value that reached this QJsonValue via
-// RawJson.h's Value::toQJson() int64-exact path (see that function's doc
-// comment) decodes to the identical qint64 -- including magnitudes no
-// double can represent exactly, e.g. 9223372036854775807. A QJsonValue
-// built directly from a double (as every contract-domain integer this
-// codebase's non-byte fromJson() entry points still decode, when not
+// RawJson.h's Value::toLossyQJsonForTestingOnly() int64-exact path (see that
+// function's doc comment) decodes to the identical qint64 -- including
+// magnitudes no double can represent exactly, e.g. 9223372036854775807. A
+// QJsonValue built directly from a double (as every contract-domain integer
+// this codebase's non-byte fromJson() entry points still decode, when not
 // reached via a fromRawBytes()-style raw-parse-first path) is exact only
 // within IEEE-754 double's integer-exact range (+-2^53); this is the most
 // fidelity obtainable from that representation, not a shortcut this
