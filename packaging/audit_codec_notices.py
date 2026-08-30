@@ -201,6 +201,55 @@ _CANONICAL_DIGEST_EXCLUDED_SECTIONS: frozenset[str] = frozenset(
     {".dynstr", ".dynamic", ".interp", ".dynsym", ".symtab", ".strtab"}
 )
 
+# Real cumulative-review regression, found only against this project's
+# own actual bundled test fixtures once one grew large enough (a
+# non-empty `.bss`) to push patchelf's rpath rewrite past the same
+# relocation threshold already described above: `.gnu.hash` and every
+# `.note.*` section are documented (see
+# _CANONICAL_DIGEST_EXCLUDED_SECTIONS' own docstring) to be swept,
+# alongside `.dynstr`, into a brand-new PT_LOAD segment whenever that
+# rewrite needs more room than the original slack allows -- and this
+# project's own empirical testing found that the brand-new segment can
+# legitimately have a DIFFERENT permission set than the ORIGINAL one,
+# in EITHER direction: not only gaining a WRITE bit the section never
+# had (already anticipated and tolerated by
+# _canonical_load_digest()'s own inline comment), but also LOSING the
+# EXECUTE bit it previously had (observed: `.gnu.hash`/`.note.*`
+# moving from a "R E" segment to a "RW " one). Because a single
+# standalone digest has no way to encode "only a GAIN is suspicious,
+# a LOSS is fine" (there is no earlier/later ordering available to a
+# hash function over one file in isolation -- doing so would require
+# comparing two files' flags directly, which is not this function's
+# job), the runtime-executable-bit check itself is excluded entirely
+# for these two specific, already-established-as-relocatable
+# categories of section, exactly mirroring how `.dynstr`/`.dynamic`/
+# `.dynsym`/`.symtab`/`.strtab`'s own raw CONTENT is excluded above for
+# the identical underlying "known to legitimately migrate during a
+# real patchelf repack" reason. This does not weaken tamper detection
+# for either section's own actual CONTENT (still fully hashed via the
+# normal per-section pass) or for any OTHER section's executable-bit
+# (a genuinely security-relevant section such as `.text`/`.plt`/
+# `.init`/`.fini`/`.got`/`.data`/`.rodata` gaining or losing its
+# executable status is still always caught) -- `.gnu.hash`/`.note.*`
+# are pure, non-executed metadata that nothing ever jumps into by
+# design, so which segment (and its incidental permission bits) they
+# happen to be swept into carries no actual security meaning.
+_SECTIONS_WITH_VOLATILE_SEGMENT_EXECUTABLE_BIT_NAMES: frozenset[str] = frozenset(
+    {".gnu.hash"}
+)
+_SECTIONS_WITH_VOLATILE_SEGMENT_EXECUTABLE_BIT_PREFIXES: tuple[str, ...] = (".note.",)
+
+
+def _has_volatile_segment_executable_bit(name: str) -> bool:
+    """True for `.gnu.hash` and every `.note.*` section -- see
+    _SECTIONS_WITH_VOLATILE_SEGMENT_EXECUTABLE_BIT_NAMES' own docstring
+    for why these specific, already-documented-as-relocatable sections'
+    runtime executable-bit is excluded from _canonical_load_digest()'s
+    hash entirely, while their own content remains fully authenticated."""
+    return name in _SECTIONS_WITH_VOLATILE_SEGMENT_EXECUTABLE_BIT_NAMES or name.startswith(
+        _SECTIONS_WITH_VOLATILE_SEGMENT_EXECUTABLE_BIT_PREFIXES
+    )
+
 # `.dynamic`'s raw bytes are excluded wholesale above (its physical
 # layout/ordering can legitimately shift alongside `.dynstr`'s own
 # rewrite -- see _CANONICAL_DIGEST_EXCLUDED_SECTIONS' own docstring),
@@ -347,12 +396,18 @@ def _resolve_symbol_address(value: str, sections: list[dict[str, str]]) -> str:
     return "-> <unmapped address>"
 
 
-# `_DYNAMIC` and `_GLOBAL_OFFSET_TABLE_` are linker-synthesized, ABS-
-# indexed (per the ELF spec, "not associated with any section")
+# `_DYNAMIC` and `_GLOBAL_OFFSET_TABLE_` are linker-synthesized
 # absolute-address aliases the link editor computes to equal
 # `.dynamic`'s and `.got`'s own respective base addresses at LINK time.
-# This project's own empirical testing against a real patchelf 0.14.3
-# rpath rewrite that physically relocates `.dynamic` (see
+# Depending on the exact binutils/ld/patchelf version involved, readelf
+# may report either symbol's own Ndx column as the literal "ABS"
+# keyword OR as a bare section-header-table index resolving to the
+# very section it aliases (both forms observed empirically across
+# different toolchain versions during this project's own testing) --
+# the exclusion below therefore matches by NAME alone, regardless of
+# which Ndx representation a given toolchain happens to produce. This
+# project's own empirical testing against a real patchelf rpath
+# rewrite that physically relocates `.dynamic` (see
 # _CANONICAL_DIGEST_EXCLUDED_SECTIONS' own docstring) found that
 # patchelf updates every REAL runtime consumer of that address (the
 # ELF program header's own PT_DYNAMIC entry, and every DT_* dynamic
@@ -402,7 +457,7 @@ def _decode_symbol_table_entries(
                     if 0 <= index < len(sections)
                     else f"<unmapped section index {index}>"
                 )
-        if ndx == "ABS" and name in _LINKER_SYNTHESIZED_ABS_ALIAS_SYMBOL_NAMES:
+        if name in _LINKER_SYNTHESIZED_ABS_ALIAS_SYMBOL_NAMES:
             value = "<linker-synthesized ABS alias, address excluded>"
         else:
             value = _resolve_symbol_address(match.group("value"), sections)
@@ -784,7 +839,18 @@ def _canonical_load_digest(path: Path) -> str | None:
                 # section becoming newly EXECUTABLE that never was is
                 # the one direction of program-header tampering that is
                 # always a genuine, always-detectable privilege change.
-                runtime_executable = "E" in segment_flags.get(name, "")
+                # `.gnu.hash`/`.note.*` are excluded from even this
+                # single-bit check -- see
+                # _has_volatile_segment_executable_bit()'s own
+                # docstring: the SAME relocation can legitimately swing
+                # their executable bit in EITHER direction (including
+                # LOSING it, not just gaining a write bit), which a
+                # standalone per-file digest cannot distinguish from
+                # genuine tampering.
+                if _has_volatile_segment_executable_bit(name):
+                    runtime_executable = "<volatile, excluded>"
+                else:
+                    runtime_executable = "E" in segment_flags.get(name, "")
                 header = (
                     f"{name}\0{section['type']}\0{section['flags']}\0"
                     f"{runtime_executable}\0{size}\0"
