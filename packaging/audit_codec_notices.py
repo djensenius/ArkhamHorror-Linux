@@ -3154,7 +3154,42 @@ def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
     real system file on a given host anyway), captures full provenance
     for the merged set via capture_distro_source_provenance(), and
     writes the result as JSON to args.output -- the manifest later
-    consumed by `classify --distro-provenance-manifest`."""
+    consumed by `classify --distro-provenance-manifest`.
+
+    `appimage-smoke` regression ("component 'libsecret' expects a real,
+    dpkg-owned system library ... but none exists"): resolve_ldd_
+    dependencies(elf_path) only ever reports elf_path's OWN
+    dependencies -- the sonames elf_path itself DT_NEEDED-links against
+    -- never elf_path itself. build-appimage.sh's own "Capture distro
+    provenance" step passes several force-bundled libraries (libsecret,
+    libgpg-error, libgcc_s, libstdc++, zlib, libcom_err -- see that
+    script's own comments on why linuxdeploy's automatic ldd-based
+    bundling cannot discover them itself) as direct `elf_paths`
+    specifically so THEIR OWN provenance gets captured; but unless some
+    OTHER scanned ELF file also happens to independently DT_NEEDED-link
+    the exact same soname (which the reviewed Qt-plugin/executable
+    closure does for some of these but not reliably all -- libsecret-
+    1.so.0 in particular is only ever dlopen()'d, never DT_NEEDED-
+    linked, by anything this project bundles), that library's own
+    soname never appears as a *value* in resolve_ldd_dependencies()'s
+    output at all, so it was silently absent from the manifest entirely
+    -- a real gap the older, pre-manifest basename-directory-search
+    fallback (bind_bundled_library_to_system_provenance()) never had,
+    since it searched the system for the bundled basename directly
+    rather than depending on some other file happening to reference it.
+    Every explicitly given `elf_path` is therefore ALSO captured as its
+    own {soname: path} entry (soname = elf_path.name, the exact real
+    file linuxdeploy's own --library flag copies verbatim into the
+    AppImage under that same basename) in addition to its resolved
+    dependencies -- applied last so it authoritatively wins over any
+    same-soname dependency-derived entry (both describe the identical
+    real system file in practice, but the explicit, directly-selected
+    input is definitionally the exact file that is actually bundled).
+    This is a pure superset: first-party inputs with no real dpkg
+    owner (arkham-horror itself, Qt's own plugin ELF files) simply
+    fail capture_distro_source_provenance()'s own dpkg-ownership check
+    and are omitted from the result exactly as before, so this cannot
+    spuriously "prove" ownership of anything that truly has none."""
     merged_dependencies: dict[str, Path] = {}
     missing_inputs: list[Path] = []
     for elf_path in args.elf_paths:
@@ -3178,6 +3213,13 @@ def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # Applied AFTER (and deliberately not counted towards) the "resolved
+    # zero dependencies" `ldd`-sanity check above -- that check exists to
+    # catch a broken/missing `ldd` or non-dynamic inputs, which self-
+    # entries (always present for any real, existing elf_path) would
+    # otherwise permanently mask.
+    for elf_path in args.elf_paths:
+        merged_dependencies[elf_path.name] = elf_path
     captured = capture_distro_source_provenance(merged_dependencies)
     args.output.write_text(json.dumps(captured, indent=2, sort_keys=True) + "\n")
     print(

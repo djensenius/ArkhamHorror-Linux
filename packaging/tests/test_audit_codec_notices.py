@@ -3209,6 +3209,149 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             )
         self.assertEqual(exit_code, 0, stderr.getvalue())
 
+    def test_cmd_capture_distro_provenance_captures_a_dlopen_only_force_bundled_input_itself(
+        self,
+    ) -> None:
+        # Real `appimage-smoke` CI regression: libsecret-1.so.0 (and
+        # every other force-bundled library build-appimage.sh passes
+        # directly as an `elf_paths` argument specifically BECAUSE
+        # linuxdeploy's automatic ldd-based bundling cannot discover it
+        # on its own -- see that script's own comments) is never
+        # DT_NEEDED-linked by anything this project bundles (QtKeychain
+        # only ever dlopen()s it at runtime), so it never appears as a
+        # *value* in resolve_ldd_dependencies()'s output for ANY input,
+        # including its own. Before this fix, cmd_capture_distro_
+        # provenance() only ever captured the *dependencies* of each
+        # given ELF path, never the path itself, so a manifest built
+        # from build-appimage.sh's own real, multi-input invocation
+        # (main executable + several force-bundled libraries) silently
+        # omitted libsecret-1.so.0 entirely -- reproduced here exactly:
+        # the executable resolves one real dependency (as `ldd
+        # arkham-horror` genuinely would), while the dlopen-only
+        # libsecret input resolves to zero dependencies OF ITS OWN (as
+        # `ldd libsecret-1.so.0` reporting only libsecret's own
+        # dependencies, never "libsecret-1.so.0" itself, would).
+        executable = self.tmp_path / "arkham-horror"
+        executable.write_bytes(_FAKE_ELF_BYTES)
+        libsecret_input = self.tmp_path / "libsecret-1.so.0"
+        libsecret_input.write_bytes(_FAKE_ELF_BYTES)
+        libc_path = self.tmp_path / "libc.so.6"
+        libc_path.write_bytes(_FAKE_ELF_BYTES)
+        output_path = self.tmp_path / "manifest.json"
+
+        def fake_resolve_ldd_dependencies(elf_path: Path) -> dict[str, Path]:
+            if elf_path == executable:
+                return {"libc.so.6": libc_path}
+            return {}
+
+        def fake_dpkg_owning_package(path: Path) -> str | None:
+            return {libc_path: "libc6", libsecret_input: "libsecret-1-0"}.get(path)
+
+        def fake_dpkg_package_metadata(package: str) -> tuple[str, str]:
+            return {
+                "libc6": ("2.35-0ubuntu3.8", "glibc"),
+                "libsecret-1-0": ("0.20.5-2", "libsecret"),
+            }[package]
+
+        with mock.patch.object(
+            audit, "resolve_ldd_dependencies", side_effect=fake_resolve_ldd_dependencies
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", side_effect=fake_dpkg_owning_package
+        ), mock.patch.object(
+            audit, "_dpkg_package_metadata", side_effect=fake_dpkg_package_metadata
+        ):
+            exit_code = audit.main(
+                [
+                    "capture-distro-provenance",
+                    str(executable),
+                    str(libsecret_input),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        manifest = json.loads(output_path.read_text())
+        self.assertIn(
+            "libsecret-1.so.0",
+            manifest,
+            "the force-bundled input's own soname must be captured even "
+            "when resolve_ldd_dependencies() reports zero dependencies "
+            "referencing it (dlopen-only, never DT_NEEDED-linked)",
+        )
+        self.assertEqual(manifest["libsecret-1.so.0"]["path"], str(libsecret_input))
+        self.assertEqual(manifest["libsecret-1.so.0"]["package"], "libsecret-1-0")
+        self.assertEqual(manifest["libsecret-1.so.0"]["sourcePackage"], "libsecret")
+        # The real dependency captured from the executable's own real
+        # ldd resolution must still be present too -- the fix is purely
+        # additive.
+        self.assertIn("libc.so.6", manifest)
+
+    def test_cmd_capture_distro_provenance_self_entry_does_not_fabricate_ownership(
+        self,
+    ) -> None:
+        # The flip side of the fix above: a first-party input with no
+        # real dpkg owner at all (this project's own executable, or a
+        # Qt plugin ELF file) must still be honestly OMITTED from the
+        # manifest -- capturing every input's own basename as a
+        # candidate entry must never bypass the real dpkg-ownership
+        # check itself.
+        first_party_input = self.tmp_path / "arkham-horror"
+        first_party_input.write_bytes(_FAKE_ELF_BYTES)
+        output_path = self.tmp_path / "manifest.json"
+        with mock.patch.object(
+            audit, "resolve_ldd_dependencies", return_value={}
+        ), mock.patch.object(audit, "_dpkg_owning_package", return_value=None):
+            exit_code = audit.main(
+                [
+                    "capture-distro-provenance",
+                    str(first_party_input),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+        # Zero real dependencies resolved and the self-entry itself is
+        # unowned -- cmd_capture_distro_provenance() reports this as
+        # its own honest "resolved zero dependencies" failure exit
+        # code 1, exactly as it already does when given a dependency-
+        # free input with no real distro ownership at all.
+        self.assertEqual(exit_code, 1)
+
+    def test_cmd_capture_distro_provenance_self_entry_does_not_override_real_dependency_resolution(
+        self,
+    ) -> None:
+        # A self-entry must not silently discard a real, already-
+        # resolved dependency captured for the SAME soname from
+        # scanning a different ELF file -- it may only ever coincide
+        # with (never contradict) the identical real system file.
+        qt_plugin = self.tmp_path / "libqxcb.so"
+        qt_plugin.write_bytes(_FAKE_ELF_BYTES)
+        libz_input = self.tmp_path / "libz.so.1"
+        libz_input.write_bytes(_FAKE_ELF_BYTES)
+        output_path = self.tmp_path / "manifest.json"
+        with mock.patch.object(
+            audit,
+            "resolve_ldd_dependencies",
+            side_effect=lambda elf_path: (
+                {"libz.so.1": libz_input} if elf_path == qt_plugin else {}
+            ),
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="zlib1g"
+        ), mock.patch.object(
+            audit, "_dpkg_package_metadata", return_value=("1:1.2.11.dfsg-2ubuntu9", "zlib")
+        ):
+            exit_code = audit.main(
+                [
+                    "capture-distro-provenance",
+                    str(qt_plugin),
+                    str(libz_input),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        manifest = json.loads(output_path.read_text())
+        self.assertEqual(manifest["libz.so.1"]["path"], str(libz_input))
+
 
 class QtSdkBundledProvenanceTests(unittest.TestCase):
     """New review item ("ICU library package-provenance mismatch",
