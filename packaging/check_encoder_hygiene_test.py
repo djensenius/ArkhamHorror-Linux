@@ -177,5 +177,37 @@ class FindingKeyTests(unittest.TestCase):
         self.assertEqual(finding.key(), ("RawJson.h", "some-usr"))
 
 
+class RealLibclangBasenameTests(unittest.TestCase):
+    """Regression coverage for the CI failure where the Ubuntu
+    libclang-dev glob matched libclang-cpp.so (Clang's internal,
+    unstable C++ API library -- loads fine via ctypes.CDLL but is
+    missing every clang_* C ABI symbol this script calls) instead of the
+    real libclang.so/libclang-<N>.so."""
+
+    def test_accepts_unversioned_and_dev_symlink_names(self) -> None:
+        for name in ("libclang.so", "libclang.so.1", "libclang-18.so", "libclang-18.so.1"):
+            with self.subTest(name=name):
+                self.assertTrue(ceh._is_real_libclang_basename(name))
+
+    def test_rejects_libclang_cpp_variants(self) -> None:
+        for name in ("libclang-cpp.so", "libclang-cpp.so.18", "libclang-cpp.so.18.1"):
+            with self.subTest(name=name):
+                self.assertFalse(ceh._is_real_libclang_basename(name))
+
+    def test_filter_drops_only_cpp_variant_from_a_mixed_glob_result(self) -> None:
+        paths = [
+            "/usr/lib/llvm-18/lib/libclang-cpp.so.18.1",
+            "/usr/lib/llvm-18/lib/libclang.so.1",
+            "/usr/lib/llvm-18/lib/libclang-18.so",
+        ]
+        self.assertEqual(
+            ceh._real_libclang_only(paths),
+            [
+                "/usr/lib/llvm-18/lib/libclang.so.1",
+                "/usr/lib/llvm-18/lib/libclang-18.so",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

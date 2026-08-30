@@ -77,6 +77,7 @@ import glob as globmod
 import json
 import os
 import platform
+import re as _re
 import shlex
 import shutil
 import subprocess
@@ -188,11 +189,37 @@ _CX_CXXPublic = 1
 _PUBLIC_ACCESS_SPECIFIERS = frozenset({_CX_CXXInvalidAccessSpecifier, _CX_CXXPublic})
 
 
+_REAL_LIBCLANG_BASENAME_RE = _re.compile(r"^libclang(-\d+)?\.so(\.\d+)*$")
+
+
+def _is_real_libclang_basename(basename: str) -> bool:
+    """True for libclang.so, libclang.so.1, libclang-18.so,
+    libclang-18.so.1, etc.; False for libclang-cpp.so* (Clang's internal,
+    unstable C++ AST/frontend API library, which does not export the
+    stable C ABI this script's ctypes bindings require -- see
+    _find_libclang()'s doc comment)."""
+
+    return bool(_REAL_LIBCLANG_BASENAME_RE.match(basename))
+
+
+def _real_libclang_only(paths: list[str]) -> list[str]:
+    return [p for p in paths if _is_real_libclang_basename(os.path.basename(p))]
+
+
 def _find_libclang() -> Path:
     """Locate an already-installed libclang shared library. Never installs
     or downloads one -- if none of the well-known locations (or an
     explicit ARKHAM_LIBCLANG_PATH override) has it, this raises rather
-    than silently skipping the whole check."""
+    than silently skipping the whole check.
+
+    Deliberately excludes `libclang-cpp.so*`: that library exposes
+    Clang's internal, unstable C++ AST/frontend APIs, not the stable C
+    ABI (`clang_getCString`, `clang_parseTranslationUnit2`, etc.) this
+    script's ctypes bindings target -- loading it succeeds (ctypes.CDLL
+    does not validate exported symbols at load time) but every
+    `clang_*` C API call then fails with `undefined symbol`, since
+    those C-ABI entry points are not exported by libclang-cpp at all.
+    """
 
     override = os.environ.get("ARKHAM_LIBCLANG_PATH")
     if override:
@@ -220,29 +247,33 @@ def _find_libclang() -> Path:
         if llvm_config:
             try:
                 libdir = subprocess.check_output([llvm_config, "--libdir"], text=True).strip()
-                candidates += sorted(globmod.glob(os.path.join(libdir, "libclang.so*")), reverse=True)
-                candidates += sorted(globmod.glob(os.path.join(libdir, "libclang-*.so*")), reverse=True)
+                candidates += _real_libclang_only(
+                    sorted(globmod.glob(os.path.join(libdir, "libclang*.so*")), reverse=True)
+                )
             except (subprocess.CalledProcessError, OSError):
                 pass
-        candidates += sorted(globmod.glob("/usr/lib/llvm-*/lib/libclang-*.so*"), reverse=True)
-        candidates += sorted(globmod.glob("/usr/lib/llvm-*/lib/libclang.so*"), reverse=True)
-        candidates += sorted(globmod.glob("/usr/lib/*-linux-gnu/libclang-*.so*"), reverse=True)
-        candidates += sorted(globmod.glob("/usr/lib/*-linux-gnu/libclang.so*"), reverse=True)
+        candidates += _real_libclang_only(
+            sorted(globmod.glob("/usr/lib/llvm-*/lib/libclang*.so*"), reverse=True)
+        )
+        candidates += _real_libclang_only(
+            sorted(globmod.glob("/usr/lib/*-linux-gnu/libclang*.so*"), reverse=True)
+        )
 
     for candidate in candidates:
         if Path(candidate).is_file():
             return Path(candidate)
 
     found_by_ctypes = ctypes.util.find_library("clang")
-    if found_by_ctypes:
+    if found_by_ctypes and "cpp" not in Path(found_by_ctypes).name:
         return Path(found_by_ctypes)
 
     raise EncoderHygieneError(
-        "Could not locate a libclang shared library anywhere. This check "
-        "requires an installed Clang toolchain exposing libclang (already "
-        "used elsewhere in this project for clang-format); set "
-        "ARKHAM_LIBCLANG_PATH to an explicit path if it is installed "
-        "somewhere non-standard. Refusing to silently skip this check."
+        "Could not locate a real libclang (C ABI, not libclang-cpp) shared "
+        "library anywhere. This check requires an installed Clang toolchain "
+        "exposing libclang (already used elsewhere in this project for "
+        "clang-format); set ARKHAM_LIBCLANG_PATH to an explicit path if it "
+        "is installed somewhere non-standard. Refusing to silently skip "
+        "this check."
     )
 
 
