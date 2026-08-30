@@ -20,6 +20,7 @@ import io
 import json
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -967,10 +968,10 @@ class SbomInventoryTests(unittest.TestCase):
             audit._sha256(self.lib_dir / "libc.so.6"),
         )
         self.assertEqual(by_path["libavif.so.16.0.0"]["classification"], "libavif")
-        # The new executableSegmentDigest field must be present (even
+        # The new canonicalLoadDigest field must be present (even
         # if None for a fake, non-parseable ELF fixture) on every entry
         # -- never a silently-missing key.
-        self.assertIn("executableSegmentDigest", by_path["libc.so.6"])
+        self.assertIn("canonicalLoadDigest", by_path["libc.so.6"])
 
     def test_unmapped_library_still_appears_in_the_inventory(self) -> None:
         (self.lib_dir / "libmysteryvendor.so.3").write_bytes(audit._ELF_MAGIC + b"???")
@@ -1017,7 +1018,7 @@ def _compile_shared_object(cc_bin: str, source: str, output: Path) -> None:
 
 # Deliberately its own tiny, independently-reviewable `readelf -lW`
 # parser -- NOT a reuse/import of audit_codec_notices.py's own
-# _PROGRAM_HEADER_RE/_read_executable_load_segments() -- so this
+# _PROGRAM_HEADER_RE/_canonical_load_digest() -- so this
 # regression test's own understanding of "where is a real executable
 # segment" can never coincidentally share, and therefore never mask, a
 # bug in the production parser it exists to exercise.
@@ -1042,6 +1043,56 @@ def _first_executable_load_segment(path: Path) -> tuple[int, int]:
         if match.group("flags")[2] == "E":
             return int(match.group("offset"), 16), int(match.group("filesz"), 16)
     raise AssertionError(f"{path} has no executable PT_LOAD segment")
+
+
+def _test_section_file_range(path: Path, section_name: str) -> tuple[int, int]:
+    """Returns (file_offset, file_size) of the named section, parsed via
+    `readelf -SW` independently of production code (see the module
+    comment above `_TEST_LOAD_HEADER_RE`)."""
+    output = subprocess.run(
+        ["readelf", "-SW", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    pattern = re.compile(
+        r"\[\s*\d+\]\s+"
+        + re.escape(section_name)
+        + r"[ \t]+\S+[ \t]+[0-9a-fA-F]+[ \t]+"
+        r"(?P<offset>[0-9a-fA-F]+)[ \t]+(?P<size>[0-9a-fA-F]+)[ \t]"
+    )
+    match = pattern.search(output)
+    if not match:
+        raise AssertionError(f"section {section_name!r} not found in {path}")
+    return int(match.group("offset"), 16), int(match.group("size"), 16)
+
+
+def _test_flip_first_non_executable_load_segment(path: Path) -> None:
+    """Directly patches the raw ELF64 program header table (bypassing
+    any tool, including patchelf) to flip on the PF_X bit of the first
+    PT_LOAD segment that does not already have it set -- this simulates
+    a "segment header mutation" attack that never touches any section's
+    own content or declared sh_flags at all, which only a check of the
+    section's actual runtime LOAD-segment mapping can catch."""
+    data = bytearray(path.read_bytes())
+    e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+    PT_LOAD = 1
+    PF_X = 1
+    for index in range(e_phnum):
+        entry_off = e_phoff + index * e_phentsize
+        p_type = struct.unpack_from("<I", data, entry_off)[0]
+        if p_type != PT_LOAD:
+            continue
+        flags_off = entry_off + 4
+        p_flags = struct.unpack_from("<I", data, flags_off)[0]
+        if p_flags & PF_X:
+            continue
+        struct.pack_into("<I", data, flags_off, p_flags | PF_X)
+        path.write_bytes(bytes(data))
+        return
+    raise AssertionError(f"{path} has no non-executable PT_LOAD segment to mutate")
 
 
 @unittest.skipUnless(
@@ -1201,12 +1252,12 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
             audit._read_build_id(reference), audit._read_build_id(mutated)
         )
         self.assertNotEqual(
-            audit._executable_segment_digest(reference),
-            audit._executable_segment_digest(mutated),
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
         )
         self.assertIsNone(audit.classify_path(mutated, qt_root))
 
-    def test_executable_segment_digest_is_stable_across_patchelf_rpath_edit(
+    def test_canonical_load_digest_is_stable_across_patchelf_rpath_edit(
         self,
     ) -> None:
         # The flip side of the mutation test above: a real patchelf
@@ -1230,19 +1281,191 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
         )
         self.assertNotEqual(audit._sha256(reference), audit._sha256(patched))
         self.assertEqual(
-            audit._executable_segment_digest(reference),
-            audit._executable_segment_digest(patched),
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(patched),
         )
 
-    def test_executable_segment_digest_none_when_no_executable_segment(
+    def test_canonical_load_digest_none_when_no_loaded_section(
         self,
     ) -> None:
         # A plain, non-ELF file (or one whose readelf output has no
-        # executable PT_LOAD entry at all) must return None, not raise
+        # loaded (SHF_ALLOC) section at all) must return None, not raise
         # or silently produce a hash over unrelated bytes.
         not_elf = self.root / "not-a-real-elf.so"
         not_elf.write_bytes(b"\x00" * 64)
-        self.assertIsNone(audit._executable_segment_digest(not_elf))
+        self.assertIsNone(audit._canonical_load_digest(not_elf))
+
+    def _build_rich_shared_object(self, output: Path) -> None:
+        """A single small `.so` deliberately exercising every ELF
+        feature this round's findings are concerned with: a real
+        `DT_NEEDED` (libc), an `.init_array` constructor entry, real
+        `.got`/`.got.plt` relocations (via malloc/free calls), and
+        `.rodata` content -- so every mutation test below exercises a
+        genuine, realistic binary rather than a degenerate fixture."""
+        source = (
+            "#include <stdlib.h>\n"
+            'static const char message[] = "canonical-load-digest-fixture";\n'
+            "__attribute__((constructor)) static void init(void) {\n"
+            "    void *p = malloc(16);\n"
+            "    free(p);\n"
+            "}\n"
+            "const char *test_plugin_entry(void) { return message; }\n"
+        )
+        _compile_shared_object(self.cc_bin, source, output)
+
+    def test_canonical_load_digest_is_stable_across_patchelf_rpath_relocation(
+        self,
+    ) -> None:
+        # Harder than the existing short-rpath stability test above:
+        # this project's own empirical testing found that patchelf
+        # (0.14.3) must PHYSICALLY RELOCATE `.dynstr` (and whatever
+        # else was co-resident with it, e.g. `.gnu.hash`/`.note.*`)
+        # into a brand-new, appended PT_LOAD segment when the new
+        # RPATH string no longer fits in the original slack -- a
+        # materially different code path than an in-place rewrite, and
+        # the one that actually exercises _resolve_dynamic_tag_value(),
+        # _read_dynamic_symbols()' index-renumbering tolerance, and the
+        # execute-bit-only (not full R/W/E) segment-flag comparison.
+        if not shutil.which("patchelf"):
+            self.skipTest("requires patchelf to simulate a real RUNPATH rewrite")
+        reference = self.root / "reference_reloc.so"
+        self._build_rich_shared_object(reference)
+        patched = self.root / "patched_reloc.so"
+        patched.write_bytes(reference.read_bytes())
+        patched.chmod(0o755)
+        long_rpath = "/".join(["deliberately-very-long-rpath-component"] * 40)
+        subprocess.run(
+            ["patchelf", "--set-rpath", long_rpath, str(patched)],
+            check=True,
+            capture_output=True,
+        )
+        # Sanity: the RPATH rewrite really did force new segments to
+        # appear (proving the relocation path, not just an in-place
+        # rewrite, was actually exercised).
+        load_count_before = len(
+            _TEST_LOAD_HEADER_RE.findall(
+                subprocess.run(
+                    ["readelf", "-lW", str(reference)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            )
+        )
+        load_count_after = len(
+            _TEST_LOAD_HEADER_RE.findall(
+                subprocess.run(
+                    ["readelf", "-lW", str(patched)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            )
+        )
+        self.assertGreater(load_count_after, load_count_before)
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(patched))
+        self.assertEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(patched),
+        )
+
+    def test_canonical_load_digest_detects_rodata_mutation(self) -> None:
+        reference = self.root / "rodata_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "rodata_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        offset, size = _test_section_file_range(reference, ".rodata")
+        self.assertGreater(size, 0)
+        data = bytearray(mutated.read_bytes())
+        data[offset] ^= 0xFF
+        mutated.write_bytes(bytes(data))
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_init_array_mutation(self) -> None:
+        reference = self.root / "initarray_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "initarray_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        offset, size = _test_section_file_range(reference, ".init_array")
+        self.assertGreater(size, 0)
+        data = bytearray(mutated.read_bytes())
+        data[offset] ^= 0xFF
+        mutated.write_bytes(bytes(data))
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_got_mutation(self) -> None:
+        reference = self.root / "got_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "got_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        section_name = ".got.plt" if b".got.plt" in reference.read_bytes() else ".got"
+        offset, size = _test_section_file_range(reference, section_name)
+        self.assertGreater(size, 0)
+        data = bytearray(mutated.read_bytes())
+        data[offset] ^= 0xFF
+        mutated.write_bytes(bytes(data))
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_dynamic_metadata_mutation(
+        self,
+    ) -> None:
+        # A redirected DT_NEEDED SONAME is exactly the kind of dynamic
+        # -linking directive tampering that a wholesale-excluded
+        # `.dynamic` byte-range hash would miss entirely (since
+        # `.dynamic`'s raw bytes are excluded due to legitimate
+        # relocation); only the decoded-tag folding catches it.
+        if not shutil.which("patchelf"):
+            self.skipTest("requires patchelf to rewrite DT_NEEDED")
+        reference = self.root / "needed_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "needed_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        mutated.chmod(0o755)
+        subprocess.run(
+            ["patchelf", "--replace-needed", "libc.so.6", "libc.so.99", str(mutated)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_segment_header_mutation(
+        self,
+    ) -> None:
+        # An attacker flips a PT_LOAD program header's own PF_X bit to
+        # make a previously non-executable segment (e.g. one holding
+        # `.rodata`) executable, without touching any section's content
+        # or its own, independent sh_flags field at all. Only a check
+        # of the section's actual runtime LOAD-segment mapping (not
+        # merely its content bytes or declared sh_flags) can catch
+        # this -- exactly what _canonical_load_digest()'s
+        # execute-bit-only segment check exists for.
+        reference = self.root / "segflip_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "segflip_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        _test_flip_first_non_executable_load_segment(mutated)
+        # Sanity: no section's own content or declared sh_flags moved
+        # at all; only the program-header table changed.
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
 
 
 
@@ -1361,18 +1584,19 @@ class PackageProvenanceTests(unittest.TestCase):
         (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
         (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
 
-        def fake_capture(basename: str) -> dict[str, str] | None:
-            if basename == "libcom_err.so.2":
+        def fake_bind(bundled_path: Path) -> dict[str, object]:
+            if bundled_path.name == "libcom_err.so.2":
                 return {
+                    "status": "matched",
                     "package": "libkrb5-3",
                     "version": "1.19.2-2ubuntu0.8",
                     "sourcePackage": "krb5",
                 }
-            return None
+            return {"status": "dpkg_unavailable"}
 
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(
-            audit, "capture_package_provenance", side_effect=fake_capture
+            audit, "bind_bundled_library_to_system_provenance", side_effect=fake_bind
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = audit.main(["classify", str(lib_dir)])
         self.assertNotEqual(exit_code, 0)
@@ -1387,21 +1611,270 @@ class PackageProvenanceTests(unittest.TestCase):
         (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
         (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
 
-        def fake_capture(basename: str) -> dict[str, str] | None:
-            if basename == "libcom_err.so.2":
+        def fake_bind(bundled_path: Path) -> dict[str, object]:
+            if bundled_path.name == "libcom_err.so.2":
                 return {
+                    "status": "matched",
                     "package": "libcom-err2",
                     "version": "1.46.5-2ubuntu1.2",
                     "sourcePackage": "e2fsprogs",
                 }
-            return None
+            return {"status": "dpkg_unavailable"}
 
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(
-            audit, "capture_package_provenance", side_effect=fake_capture
+            audit, "bind_bundled_library_to_system_provenance", side_effect=fake_bind
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = audit.main(["classify", str(lib_dir)])
         self.assertEqual(exit_code, 0, stderr.getvalue())
+
+    def test_cmd_classify_fails_when_expected_distro_component_provenance_not_found(
+        self,
+    ) -> None:
+        # Round-7 review (HIGH, "missing provenance passes"): with
+        # --require-package-provenance passed (this project's own
+        # governed-expectations opt-in for a host/CI-job where every
+        # expected distro component's system counterpart genuinely IS
+        # installed -- see validate_bundled_library_package_provenance()'s
+        # own docstring), an expected distro component whose provenance
+        # simply cannot be found at all must fail closed -- the OLD
+        # behavior (capture_package_provenance() returning None) was
+        # always silently skipped, never reported, even here.
+        lib_dir = Path(self._tmp.name) / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
+        (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
+
+        def fake_bind(bundled_path: Path) -> dict[str, object]:
+            if bundled_path.name == "libcom_err.so.2":
+                return {"status": "not_found"}
+            return {"status": "dpkg_unavailable"}
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            audit, "bind_bundled_library_to_system_provenance", side_effect=fake_bind
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(
+                ["classify", str(lib_dir), "--require-package-provenance"]
+            )
+        self.assertNotEqual(exit_code, 0)
+        self.assertIn("e2fsprogs", stderr.getvalue())
+
+    def test_cmd_classify_succeeds_when_provenance_not_found_and_not_required(
+        self,
+    ) -> None:
+        # The flip side: without --require-package-provenance, the same
+        # "not_found" outcome must remain a legitimate, harmless skip
+        # (preserving this project's existing, portable basename-only
+        # classification test fixtures' behavior on any host, dpkg
+        # -equipped or not).
+        lib_dir = Path(self._tmp.name) / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
+        (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
+
+        def fake_bind(bundled_path: Path) -> dict[str, object]:
+            return {"status": "not_found"}
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            audit, "bind_bundled_library_to_system_provenance", side_effect=fake_bind
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(["classify", str(lib_dir)])
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+
+    def test_bind_returns_dpkg_unavailable_when_dpkg_tools_missing(self) -> None:
+        with mock.patch.object(shutil, "which", return_value=None):
+            binding = audit.bind_bundled_library_to_system_provenance(
+                self.search_dir / "libfoo.so.1"
+            )
+        self.assertEqual(binding, {"status": "dpkg_unavailable"})
+
+    def test_bind_returns_not_found_when_no_system_copy_exists(self) -> None:
+        bundled = self.search_dir / "bundled"
+        bundled.mkdir()
+        bundled_lib = bundled / "libfoo.so.1"
+        bundled_lib.write_bytes(b"\x00")
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (self.search_dir / "system",)
+        ), mock.patch.object(shutil, "which", return_value="/usr/bin/dpkg"):
+            binding = audit.bind_bundled_library_to_system_provenance(bundled_lib)
+        self.assertEqual(binding, {"status": "not_found"})
+
+    def test_bind_returns_not_dpkg_owned_when_system_copy_is_unowned(self) -> None:
+        system_dir = self.search_dir / "system"
+        system_dir.mkdir()
+        (system_dir / "libfoo.so.1").write_bytes(b"\x00")
+        bundled_dir = self.search_dir / "bundled"
+        bundled_dir.mkdir()
+        bundled_lib = bundled_dir / "libfoo.so.1"
+        bundled_lib.write_bytes(b"\x00")
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (system_dir,)
+        ), mock.patch.object(
+            shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(audit, "_dpkg_owning_package", return_value=None):
+            binding = audit.bind_bundled_library_to_system_provenance(bundled_lib)
+        self.assertEqual(binding["status"], "not_dpkg_owned")
+
+    def test_bind_returns_content_mismatch_for_a_substituted_same_basename_library(
+        self,
+    ) -> None:
+        # The exact "unrelated host file" attack this finding is about:
+        # a same-basename system file exists and IS dpkg-owned, but its
+        # actual compiled content differs from the bundled file -- a
+        # bare basename-only lookup would wrongly "match" this.
+        system_dir = self.search_dir / "system"
+        system_dir.mkdir()
+        (system_dir / "libfoo.so.1").write_bytes(b"\x00")
+        bundled_dir = self.search_dir / "bundled"
+        bundled_dir.mkdir()
+        bundled_lib = bundled_dir / "libfoo.so.1"
+        bundled_lib.write_bytes(b"\x00")
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (system_dir,)
+        ), mock.patch.object(
+            shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="libfoo1"
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("1.2.3-1ubuntu1", "foosource"),
+        ), mock.patch.object(
+            audit,
+            "_canonical_load_digest",
+            side_effect=lambda p: "digest-a" if p == bundled_lib else "digest-b",
+        ):
+            binding = audit.bind_bundled_library_to_system_provenance(bundled_lib)
+        self.assertEqual(binding["status"], "content_mismatch")
+        self.assertEqual(binding["sourcePackage"], "foosource")
+
+    def test_bind_returns_matched_when_content_digests_agree(self) -> None:
+        system_dir = self.search_dir / "system"
+        system_dir.mkdir()
+        (system_dir / "libfoo.so.1").write_bytes(b"\x00")
+        bundled_dir = self.search_dir / "bundled"
+        bundled_dir.mkdir()
+        bundled_lib = bundled_dir / "libfoo.so.1"
+        bundled_lib.write_bytes(b"\x00")
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (system_dir,)
+        ), mock.patch.object(
+            shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="libfoo1"
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("1.2.3-1ubuntu1", "foosource"),
+        ), mock.patch.object(
+            audit, "_canonical_load_digest", return_value="same-digest"
+        ):
+            binding = audit.bind_bundled_library_to_system_provenance(bundled_lib)
+        self.assertEqual(
+            binding,
+            {
+                "status": "matched",
+                "package": "libfoo1",
+                "version": "1.2.3-1ubuntu1",
+                "sourcePackage": "foosource",
+            },
+        )
+
+    def test_validate_bundled_provenance_accepts_dpkg_unavailable_as_no_op(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "e2fsprogs", {"status": "dpkg_unavailable"}
+            )
+        )
+
+    def test_validate_bundled_provenance_no_op_for_unmapped_component(self) -> None:
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "not-a-real-component", {"status": "not_found"}
+            )
+        )
+
+    def test_validate_bundled_provenance_rejects_not_found(self) -> None:
+        # "not_found" is only a hard failure when require_provenance=True
+        # (governed expectations -- see this function's own docstring);
+        # a merely dpkg-equipped but incomplete host must not spuriously
+        # fail here without that explicit opt-in.
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "e2fsprogs", {"status": "not_found"}
+            )
+        )
+        problem = audit.validate_bundled_library_package_provenance(
+            "e2fsprogs", {"status": "not_found"}, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("e2fsprogs", problem)
+
+    def test_validate_bundled_provenance_rejects_not_dpkg_owned(self) -> None:
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "e2fsprogs", {"status": "not_dpkg_owned"}
+            )
+        )
+        problem = audit.validate_bundled_library_package_provenance(
+            "e2fsprogs", {"status": "not_dpkg_owned"}, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+
+    def test_validate_bundled_provenance_rejects_content_mismatch(self) -> None:
+        problem = audit.validate_bundled_library_package_provenance(
+            "e2fsprogs",
+            {
+                "status": "content_mismatch",
+                "package": "libcom-err2",
+                "version": "1.46.5-2ubuntu1.2",
+                "sourcePackage": "e2fsprogs",
+            },
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("e2fsprogs", problem)
+
+    def test_validate_bundled_provenance_rejects_version_revision_drift(
+        self,
+    ) -> None:
+        # Round-7 review ("pin package revision/snapshot"): even a
+        # matched, content-proven, correctly-source-packaged provenance
+        # must still fail if its real installed version has drifted
+        # away from the pinned COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX
+        # major/minor baseline -- a genuine upstream revision change,
+        # not a routine Debian point-release bump.
+        problem = audit.validate_bundled_library_package_provenance(
+            "e2fsprogs",
+            {
+                "status": "matched",
+                "package": "libcom-err2",
+                "version": "1.47.0-1ubuntu1",
+                "sourcePackage": "e2fsprogs",
+            },
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("e2fsprogs", problem)
+
+    def test_validate_bundled_provenance_tolerates_routine_point_release(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "e2fsprogs",
+                {
+                    "status": "matched",
+                    "package": "libcom-err2",
+                    "version": "1.46.5-2ubuntu1.9",
+                    "sourcePackage": "e2fsprogs",
+                },
+            )
+        )
+
+
 
 
 @unittest.skipUnless(

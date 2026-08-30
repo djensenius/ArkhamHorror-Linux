@@ -548,8 +548,17 @@ jobs:
           }
 
           sbom_path="$(pwd)/codec-notice-sbom.json"
+          # --require-package-provenance (round-7 review, "missing
+          # provenance passes"/"governed expectations"): this step runs
+          # against the real, final, ldd-closure-resolved AppImage on
+          # this exact pinned ubuntu-22.04 runner, where every expected
+          # distro component's real system counterpart is genuinely
+          # guaranteed installed -- so a distro component whose
+          # provenance cannot be found/dpkg-owned here is a real
+          # problem, not a silently-tolerated gap.
           python3 packaging/audit_codec_notices.py classify "$lib_search_root" \
-            --json-out "$sbom_path" --qt-reference-dir "$QT_ROOT_DIR"
+            --json-out "$sbom_path" --qt-reference-dir "$QT_ROOT_DIR" \
+            --require-package-provenance
           echo "Wrote machine-readable bundled-library SBOM to $sbom_path"
 
           python3 packaging/audit_codec_notices.py verify-notices \
