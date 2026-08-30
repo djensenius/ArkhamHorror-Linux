@@ -16,9 +16,9 @@ explicitly enumerated allowlist of legitimate symbols:
   - The foundation header set (every other public header this build
     compiles -- networking, auth, session, keychain, input/controller UI
     glue, app composition -- see ARKHAM_FOUNDATION_HEADERS / the
-    arkham_foundation target). Its only permitted QJson-returning symbols
-    are AuthModels.h's two legitimate request-body encoders
-    (AuthenticateRequest::toJson, RegisterRequest::toJson).
+    arkham_foundation target). Its outbound exceptions remain exactly
+    AuthModels.h's two request-body encoders; its inbound decoder
+    signatures are separately pinned by exact identity/signature/access.
   - Every compile command owned by the application target, including
     src/main.cpp, AUTOMOC, QML type-registration/cache, and RCC-generated
     units, under the foundation/application closure. No app-local encoder
@@ -95,29 +95,18 @@ and categorically cannot be referenced from another translation unit at
 all, so it is correctly never flagged, no matter its own nominal access
 specifier.
 
-A further review round also demonstrated that this script's shape check
-inspected only a declaration's own RESULT type, never (a) a non-const
-QJson-family reference/pointer OUTPUT or INOUT parameter (e.g. a public/
-friend `void encode(QJsonObject &out)`, or an equivalent constructor),
-which is exactly as capable of smuggling a lossy value out of an
-otherwise return-type-clean signature as a lossy return type is, nor (b)
-encoder-shaped members made newly accessible purely through public/
-protected inheritance or a using-declaration, with no new textual
-declaration of their own at all (e.g. a new struct publicly deriving
-from an already-allowlisted AuthenticateRequest, or privately deriving
-it and using-declaring its toJson() back to public). This script now
-also inspects every function-like/constructor declaration's own
-parameters for a non-const QJson-family reference/pointer (see
-_is_encoder_shaped()), and separately walks every class/struct/
-class-template definition's own base-specifiers and using-declarations
-(see _inherited_and_reexported_encoders()) to discover exactly this kind
-of newly-exposed-without-a-new-declaration member, recursively through a
-multi-level inheritance chain, attributing any resulting Finding to the
-EXPOSING class's own file/line (which, keyed against ALLOWLIST_BY_KEY,
-can never match the original declaring class's own allowlist entry, so
-it fails closed as a violation with zero change to the allowlist
-mechanism itself).
-
+A later series of reviews demonstrated that output-channel inference is
+itself an open-ended category error: pointer wrappers, arrays, callbacks,
+functors, and dependent bases can all expose the same wire type through
+different language machinery. The policy is therefore a closed positive
+boundary, not an output classifier. Every public/protected production
+function, constructor, conversion, alias, field, variable, and base is
+recursively searched for any semantic reference to QJsonObject,
+QJsonArray, QJsonValue, QJsonDocument, or QVariant JSON containers.
+Constness and presumed direction do not exempt it. The only accepted
+references are exact path + USR + canonical semantic signature + access +
+occurrence-count entries below, covering the intentional inbound decoders
+and the bounded RawJson/Auth adapters.
 
 An even earlier version of this check (see git history:
 tests/EncoderHygieneTests.cpp) was a purely source-text regex/parser,
@@ -143,10 +132,8 @@ an ever-growing fragment of C++ parsing by hand:
     every typedef/using-alias/decltype/auto/template parameter already
     resolved to its underlying real type by the compiler itself) AND
     inspects every parameter recursively through canonical references,
-    pointers, aliases, and template wrappers down to the ultimate
-    QJson-family object's actual cv-qualification -- an output/inout parameter is
-    exactly as capable of smuggling a lossy value out as a lossy return
-    type is (see _is_encoder_shaped()) -- together with its USR (Unified
+    arrays, functions, aliases, records, bases, and template
+    instantiations, together with its USR (Unified
     Symbol Resolution -- a stable, fully qualified,
     signature-and-overload-aware identity Clang computes for every
     declaration; see https://clang.llvm.org/docs/USRs.html), access
@@ -155,25 +142,23 @@ an ever-growing fragment of C++ parsing by hand:
     type alias whose own location
     is likewise exactly the header currently being probed, this script
     additionally walks its base-specifiers and using-declarations (see
-    _inherited_and_reexported_encoders()) to discover any encoder-shaped
+    _inherited_and_reexported_encoders()) to discover any forbidden-type
     member function made newly, transitively accessible through public/
     protected/dependent inheritance, an alias, or a using-declaration alone, with no new
     textual declaration of its own -- attributing the resulting Finding
     to the EXPOSING class's own file/line rather than the original
     declaring class's file, so it cannot masquerade as an
     already-audited, already-allowlisted symbol.
-  - A declaration is a *violation* if its canonical return type (or, for
-    an output/inout parameter, that parameter's own canonical pointee
-    type) is in the QJson family (QJsonObject/QJsonArray/QJsonValue,
-    with or without a reference/pointer/const qualifier) and its (file,
-    USR) pair, counted by *exact occurrence count*, is not one of the
-    ALLOWLIST entries below. There is no general "looks like a decode
+  - A declaration is a *violation* if any semantic type component is in
+    the forbidden family and its exact file, USR, canonical semantic
+    signature, access, and occurrence count are not one ALLOWLIST entry
+    below. There is no general "looks like a decode
     helper" heuristic
     (e.g. "takes a QJson parameter, so it must be inbound-only") -- that
     itself would be a new textual/structural loophole (e.g. a lossy
     per-DTO `toJson(QJsonObject seed)` padded with an unused QJson-typed
     parameter purely to slip past such a rule). Every legitimate
-    exception is named explicitly, by exact qualified USR, exact expected
+    exception is named explicitly, by exact qualified USR/signature/access, exact expected
     source file (a full, repo-root-relative path -- never a bare
     basename, which would incorrectly collide two different files that
     happen to share a name), and exact expected occurrence count, so
@@ -299,6 +284,8 @@ class AllowlistEntry:
     file: str  # repo-root-relative, forward-slash path, e.g. "src/domain/RawJson.h"
     usr: str
     expected_count: int = 1
+    semantic_signature: str | None = None
+    access: int | None = None
 
     def key(self) -> tuple[str, str]:
         return (self.file, self.usr)
@@ -308,9 +295,9 @@ class AllowlistEntry:
 # adapters. These are the *only* encoding-direction (domain data -> QJson)
 # public conversions permitted anywhere in the domain-model header set.
 _CANONICAL_ADAPTERS = (
-    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@toExactQJson#1"),
-    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@toExactQJsonObject#1"),
-    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@toExactQJsonArray#1"),
+    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@toExactQJson#1", semantic_signature="result=Arkham::ValueOrError<QJsonValue>", access=1),
+    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@toExactQJsonObject#1", semantic_signature="result=Arkham::ValueOrError<QJsonObject>", access=1),
+    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@toExactQJsonArray#1", semantic_signature="result=Arkham::ValueOrError<QJsonArray>", access=1),
 )
 
 # src/domain/JsonDecode.h: decode-direction (inbound QJson -> narrower/
@@ -322,18 +309,75 @@ _CANONICAL_ADAPTERS = (
 # Undefined/surrogate fidelity loss the exact adapters above exist to
 # prevent.
 _DECODE_HELPERS = (
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@N@detail@F@findField#&1$@S@QJsonObject#$@S@QLatin1String#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireObject#&1$@S@QJsonValue#$@S@QStringView#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireArray#&1$@S@QJsonValue#$@S@QStringView#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireObjectField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireArrayField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireRawField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalRawArrayField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalRawObjectField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#"),
-    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@objectMembers#&1$@S@QJsonObject#"),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@N@detail@F@findField#&1$@S@QJsonObject#$@S@QLatin1String#", semantic_signature="result=std::optional<QJsonValue>;param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireObject#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="result=Arkham::ValueOrError<QJsonObject>;param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireArray#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="result=Arkham::ValueOrError<QJsonArray>;param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireObjectField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="result=Arkham::ValueOrError<QJsonObject>;param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireArrayField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="result=Arkham::ValueOrError<QJsonArray>;param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireRawField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="result=Arkham::ValueOrError<QJsonValue>;param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalRawArrayField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="result=Arkham::ValueOrError<QJsonValue>;param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalRawObjectField#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="result=Arkham::ValueOrError<QJsonValue>;param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@objectMembers#&1$@S@QJsonObject#", semantic_signature="result=QList<std::pair<QString, QJsonValue>>;param[0]=const QJsonObject &", access=0),
 )
 
-DOMAIN_ALLOWLIST: tuple[AllowlistEntry, ...] = _CANONICAL_ADAPTERS + _DECODE_HELPERS
+_INBOUND_DOMAIN_SURFACES = (
+    AllowlistEntry("src/domain/CardCatalog.h", "c:@N@Arkham@S@SkillIcon@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/CardCatalog.h", "c:@N@Arkham@S@CardCost@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/CardCatalog.h", "c:@N@Arkham@S@GameValue@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/CardCatalog.h", "c:@N@Arkham@S@CardDef@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@ExternalDeckId@F@fromObject#&1$@S@QJsonObject#$@S@QStringView#S", semantic_signature="param[0]=const QJsonObject &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@DeckListInput@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@DeckList@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@Deck@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@CreateDeckRequest@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@FetchDeckRequest@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@DeckValidationError@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@DeckValidationResult@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Decks.h", "c:@N@Arkham@S@DeckOperationError@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.cpp", "c:@N@Arkham@F@decodeInvestigatorRefValue#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/Games.cpp", "c:@N@Arkham@F@decodeDeckListInputValue#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@InvestigatorSummary@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@ScenarioSummary@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@CampaignSummary@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@GameState@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@GameListRow@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@F@decodeGameList#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@CampaignOption@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@CampaignOptionRequest@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@CampaignOrScenario@F@fromJson#&1$@S@QJsonObject#$@S@QStringView#S", semantic_signature="param[0]=const QJsonObject &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@CreateGameRequest@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@ChooseDeckRequest@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@S@ClaimSeatRequest@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Games.h", "c:@N@Arkham@F@decodeOpenSeats#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/Identifiers.h", "c:@N@Arkham@ST>1#T@TypedId@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Identifiers.h", "c:@N@Arkham@ST>1#T@NonEmptyString@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Identifiers.h", "c:@N@Arkham@S@CardCode@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/Identifiers.h", "c:@N@Arkham@S@CardName@F@fromJson#&1$@S@QJsonValue#$@S@QStringView#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@typeName#&1$@S@QJsonValue#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@fieldPresence#&1$@S@QJsonObject#$@S@QLatin1String#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireStringValue#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireIntValue#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireBoolValue#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireString#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireInt#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireBool#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalString#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalInt#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalBool#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalNonNullString#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalNonNullInt#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@optionalNonNullBool#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireNullableString#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@requireNullableInt#&1$@S@QJsonObject#$@S@QLatin1String#$@S@QStringView#", semantic_signature="param[0]=const QJsonObject &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@decodeUuid#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@decodeNullableUuid#&1$@S@QJsonValue#$@S@QStringView#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/JsonDecode.h", "c:@N@Arkham@N@Json@F@toLosslessRaw#&1$@S@QJsonValue#", semantic_signature="param[0]=const QJsonValue &", access=0),
+    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@fromQJson#&1$@S@QJsonValue#S", semantic_signature="param[0]=const QJsonValue &", access=1),
+)
+
+DOMAIN_ALLOWLIST: tuple[AllowlistEntry, ...] = (
+    _CANONICAL_ADAPTERS + _DECODE_HELPERS + _INBOUND_DOMAIN_SURFACES
+)
 
 # src/AuthModels.h: the two legitimate foundation-layer request-body
 # encoders. These deliberately live outside the domain-model header set
@@ -341,8 +385,11 @@ DOMAIN_ALLOWLIST: tuple[AllowlistEntry, ...] = _CANONICAL_ADAPTERS + _DECODE_HEL
 # they have no QDebug/toString either) and are the *only* QJson-returning
 # public declarations permitted anywhere in the foundation header set.
 FOUNDATION_ALLOWLIST: tuple[AllowlistEntry, ...] = (
-    AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@AuthenticateRequest@F@toJson#1"),
-    AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@RegisterRequest@F@toJson#1"),
+    AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@AuthenticateRequest@F@toJson#1", semantic_signature="result=QJsonObject", access=1),
+    AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@RegisterRequest@F@toJson#1", semantic_signature="result=QJsonObject", access=1),
+    AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@AuthToken@F@fromJson#&1$@S@QJsonObject#S", semantic_signature="param[0]=const QJsonObject &", access=1),
+    AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@CurrentUser@F@fromJson#&1$@S@QJsonObject#S", semantic_signature="param[0]=const QJsonObject &", access=1),
+    AllowlistEntry("src/ServerCapabilities.h", "c:@N@Arkham@S@ServerCapabilities@F@fromJson#&1$@S@QJsonObject#S", semantic_signature="param[0]=const QJsonObject &", access=1),
 )
 
 ALLOWLIST: tuple[AllowlistEntry, ...] = DOMAIN_ALLOWLIST + FOUNDATION_ALLOWLIST
@@ -480,6 +527,8 @@ class _CXUnsavedFile(ctypes.Structure):
 # exposure walk added below started doing so.
 _CXCursor_StructDecl = 2
 _CXCursor_ClassDecl = 4
+_CXCursor_FieldDecl = 6
+_CXCursor_VarDecl = 9
 _CXCursor_ClassTemplate = 31
 _CXCursor_FunctionDecl = 8
 _CXCursor_ParmDecl = 10
@@ -494,7 +543,6 @@ _CXCursor_UsingDeclaration = 35
 _CXCursor_TypeAliasDecl = 36
 _CXCursor_OverloadedDeclRef = 49
 _CXCursor_NoDeclFound = 71
-_CXCursor_AnnotateAttr = 406
 _CXCursor_FriendDecl = 603
 _CXCursor_TemplateTypeParameter = 27
 
@@ -503,13 +551,7 @@ _CXCursor_TemplateTypeParameter = 27
 # _inherited_and_reexported_encoders()).
 _RECORD_LIKE_KINDS = frozenset({_CXCursor_StructDecl, _CXCursor_ClassDecl, _CXCursor_ClassTemplate})
 
-# Function-like declaration kinds whose own RESULT type is inspected for
-# QJson-family shape (see _is_encoder_shaped()). Constructors are
-# deliberately excluded here -- clang_getCursorResultType() has no
-# meaningful "return type" concept for a constructor -- but ARE included
-# in _OUTPARAM_CHECKED_KINDS below, since a constructor can still take a
-# non-const QJson-family output/inout reference or pointer parameter
-# exactly like an ordinary function can.
+# Function-like declaration kinds with a meaningful result type.
 _FUNCTION_LIKE_KINDS = frozenset(
     {
         _CXCursor_FunctionDecl,
@@ -519,12 +561,9 @@ _FUNCTION_LIKE_KINDS = frozenset(
     }
 )
 
-# Every declaration kind whose PARAMETERS are inspected for a non-const
-# QJson-family output/inout reference or pointer (see
-# _is_encoder_shaped()) -- a review round demonstrated a public/friend
-# `void encode(QJsonObject &out)` (or an equivalent constructor) was a
-# real, undetected bypass of the return-type-only check.
-_OUTPARAM_CHECKED_KINDS = _FUNCTION_LIKE_KINDS | {_CXCursor_Constructor}
+# Every function/constructor signature subject to the closed forbidden-
+# wire-type boundary. Constructors have parameters but no result.
+_SIGNATURE_DECL_KINDS = _FUNCTION_LIKE_KINDS | {_CXCursor_Constructor}
 
 # CX_CXXAccessSpecifier (see clang-c/Index.h): 0 is "invalid" -- reported
 # for cursors that are not class members at all (ordinary namespace-scope
@@ -537,6 +576,18 @@ _CX_CXXPublic = 1
 _CX_CXXProtected = 2
 _CX_CXXPrivate = 3
 _PUBLIC_ACCESS_SPECIFIERS = frozenset({_CX_CXXInvalidAccessSpecifier, _CX_CXXPublic})
+_SURFACE_ACCESS_SPECIFIERS = frozenset(
+    {_CX_CXXInvalidAccessSpecifier, _CX_CXXPublic, _CX_CXXProtected}
+)
+_TYPE_SURFACE_KINDS = frozenset(
+    {
+        _CXCursor_TypeAliasDecl,
+        _CXCursor_TypedefDecl,
+        _CXCursor_CXXBaseSpecifier,
+        _CXCursor_FieldDecl,
+        _CXCursor_VarDecl,
+    }
+)
 
 # A public OR protected base class/using-declaration still exposes its
 # encoder-shaped members to the outside world (directly for a public
@@ -547,9 +598,7 @@ _PUBLIC_ACCESS_SPECIFIERS = frozenset({_CX_CXXInvalidAccessSpecifier, _CX_CXXPub
 # _inherited_and_reexported_encoders().
 _INHERITABLE_ACCESS_SPECIFIERS = frozenset({_CX_CXXPublic, _CX_CXXProtected})
 
-# CXTypeKind values (see clang-c/Index.h) this script's output/inout
-# parameter check needs to recognize a non-const reference/pointer,
-# empirically re-confirmed the same way as the cursor kinds above.
+# CXTypeKind values used by the closed recursive semantic type graph.
 _CXType_Pointer = 101
 _CXType_LValueReference = 103
 _CXType_RValueReference = 104
@@ -787,19 +836,11 @@ class _LibClang:
         lib.clang_Cursor_getArgument.restype = _CXCursor
         lib.clang_Cursor_getArgument.argtypes = [_CXCursor, ctypes.c_uint]
 
-        # clang_getPointeeType()/clang_isConstQualifiedType(): given a
-        # reference or pointer CXType, resolve the type it refers to and
-        # ask whether that pointee is const-qualified -- a const pointee
-        # (`const QJsonObject &`/`const QJsonObject *`) is an ordinary
-        # input parameter; a non-const one (`QJsonObject &`/
-        # `QJsonObject *`) is a genuine output/inout parameter capable of
-        # smuggling a lossy QJson-family value out of an otherwise
-        # return-type-clean function, exactly like a lossy return type
-        # would.
+        # Resolve pointees while recursively inventorying semantic type
+        # references. Constness does not exempt a declaration; legitimate
+        # inbound signatures are exact allowlist entries.
         lib.clang_getPointeeType.restype = _CXType
         lib.clang_getPointeeType.argtypes = [_CXType]
-        lib.clang_isConstQualifiedType.restype = ctypes.c_uint
-        lib.clang_isConstQualifiedType.argtypes = [_CXType]
 
         # clang_isCursorDefinition(): distinguishes a declaration-only
         # cursor from one that also carries a body/definition -- used
@@ -955,14 +996,11 @@ class Finding:
     file: str  # repo-root-relative, forward-slash path, e.g. "src/domain/RawJson.h"
     line: int
     display_name: str
-    # Normally the plain canonical return-type spelling; for an
-    # output/inout-parameter violation (see _is_encoder_shaped()) this is
-    # instead a human-readable description of the offending parameter
-    # (still containing the actual QJson-family type name, so
-    # classify()'s substring-based _is_qjson_family() check keeps working
-    # unmodified either way).
+    # Stable semantic fingerprint of every forbidden result/parameter or
+    # type-surface reference on this declaration.
     canonical_return_type: str
     usr: str
+    access: int = 0
 
     def key(self) -> tuple[str, str]:
         return (self.file, self.usr)
@@ -975,98 +1013,6 @@ def _is_qjson_family(canonical_type_spelling: str) -> bool:
 
 
 _MAX_TYPE_DEPTH = 32
-
-_OUTPUT_CAPABLE_TEMPLATE_PREFIXES = (
-    "std::shared_ptr<",
-    "std::unique_ptr<",
-    "std::weak_ptr<",
-    "std::reference_wrapper<",
-    "std::span<",
-    "QSharedPointer<",
-    "QWeakPointer<",
-    "QPointer<",
-    "QScopedPointer<",
-    "QSharedDataPointer<",
-    "QExplicitlySharedDataPointer<",
-)
-_CALLABLE_TEMPLATE_PREFIXES = (
-    "std::function<",
-    "std::move_only_function<",
-)
-
-
-def _normalized_type_spelling(spelling: str) -> str:
-    return "".join(spelling.split()).removeprefix("const")
-
-
-def _has_template_prefix(spelling: str, prefixes: Sequence[str]) -> bool:
-    normalized = _normalized_type_spelling(spelling)
-    return any(
-        normalized.startswith(prefix)
-        or normalized.startswith(prefix.rsplit("::", 1)[-1])
-        for prefix in prefixes
-    )
-
-
-def _is_dependent_type(clang: "_LibClang", value_type: "_CXType") -> bool:
-    canonical = clang.lib.clang_getCanonicalType(value_type)
-    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
-    declaration = clang.lib.clang_getTypeDeclaration(canonical)
-    return (
-        "type-parameter-" in spelling
-        or spelling in ("", "<dependent type>")
-        or clang.lib.clang_getCursorKind(declaration)
-        == _CXCursor_TemplateTypeParameter
-    )
-
-
-def _json_payload_path(
-    clang: "_LibClang", value_type: "_CXType", depth: int = 0
-) -> str | None:
-    """Find JSON anywhere in a value graph, intentionally ignoring cv.
-    Used only for callback/signal arguments whose direction is outward."""
-
-    if depth > _MAX_TYPE_DEPTH:
-        raise EncoderHygieneError(
-            f"Callback JSON payload walk exceeded {_MAX_TYPE_DEPTH} levels"
-        )
-    canonical = clang.lib.clang_getCanonicalType(value_type)
-    if canonical.kind in _ARRAY_TYPE_KINDS:
-        return _json_payload_path(
-            clang, clang.lib.clang_getArrayElementType(canonical), depth + 1
-        )
-    if canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS or canonical.kind == _CXType_MemberPointer:
-        pointee = clang.lib.clang_getPointeeType(canonical)
-        if pointee.kind != 0:
-            return _json_payload_path(clang, pointee, depth + 1)
-    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
-    if _is_qjson_family(spelling):
-        return spelling
-    argument_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
-    for index in range(max(argument_count, 0)):
-        found = _json_payload_path(
-            clang,
-            clang.lib.clang_Type_getTemplateArgumentAsType(canonical, index),
-            depth + 1,
-        )
-        if found is not None:
-            return found
-    return None
-
-
-def _substituted_payload_path(
-    clang: "_LibClang",
-    value_type: "_CXType",
-    substitutions: dict[str, _CXType],
-) -> str | None:
-    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(value_type))
-    for name, replacement in substitutions.items():
-        if _re.search(rf"\b{_re.escape(name)}\b", spelling):
-            return _json_payload_path(clang, replacement)
-    if _is_dependent_type(clang, value_type):
-        return "QJsonObject-capable unresolved callable parameter"
-    return _json_payload_path(clang, value_type)
-
 
 def _resolve_substituted_type(
     clang: "_LibClang",
@@ -1092,195 +1038,6 @@ def _resolve_substituted_type(
     return value_type
 
 
-def _record_callable_json_path(
-    clang: "_LibClang",
-    value_type: "_CXType",
-    substitutions: dict[str, _CXType] | None = None,
-    visited: frozenset[tuple[str, tuple[str, ...]]] = frozenset(),
-    depth: int = 0,
-) -> str | None:
-    if depth > _MAX_TYPE_DEPTH:
-        raise EncoderHygieneError(
-            f"Callable record walk exceeded {_MAX_TYPE_DEPTH} levels"
-        )
-    substitutions = dict(substitutions or {})
-    canonical = clang.lib.clang_getCanonicalType(value_type)
-    declaration = clang.lib.clang_getTypeDeclaration(canonical)
-    if clang.lib.clang_getCursorKind(declaration) in (0, _CXCursor_NoDeclFound):
-        return None
-
-    primary = clang.lib.clang_getSpecializedCursorTemplate(declaration)
-    record = (
-        primary
-        if clang.lib.clang_getCursorKind(primary) == _CXCursor_ClassTemplate
-        else declaration
-    )
-    parameter_names: list[str] = []
-    if record is primary:
-        def collect_parameter(
-            cursor: "_CXCursor", _parent: "_CXCursor", _client_data
-        ) -> int:
-            if clang.lib.clang_getCursorKind(cursor) == _CXCursor_TemplateTypeParameter:
-                parameter_names.append(
-                    clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
-                )
-            return 1
-
-        parameter_callback = clang._visitor_func_type(collect_parameter)
-        clang.lib.clang_visitChildren(record, parameter_callback, None)
-        argument_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
-        for index, name in enumerate(parameter_names):
-            if index >= max(argument_count, 0):
-                break
-            argument = clang.lib.clang_Type_getTemplateArgumentAsType(
-                canonical, index
-            )
-            substitutions[name] = _resolve_substituted_type(
-                clang, argument, substitutions
-            )
-
-    record_usr = clang.to_str(clang.lib.clang_getCursorUSR(record))
-    substitution_key = tuple(
-        sorted(
-            clang.to_str(
-                clang.lib.clang_getTypeSpelling(
-                    clang.lib.clang_getCanonicalType(value)
-                )
-            )
-            for value in substitutions.values()
-        )
-    )
-    visit_key = (record_usr, substitution_key)
-    if record_usr and visit_key in visited:
-        return None
-    if record_usr:
-        visited = visited | {visit_key}
-
-    bases: list[_CXType] = []
-    result: str | None = None
-
-    def visit(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
-        nonlocal result
-        kind = clang.lib.clang_getCursorKind(cursor)
-        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
-        display = clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
-        if (
-            kind in _FUNCTION_LIKE_KINDS
-            and display.startswith("operator()")
-            and access in _INHERITABLE_ACCESS_SPECIFIERS
-        ):
-            for parameter in _parameter_cursors(clang, cursor):
-                result = _substituted_payload_path(
-                    clang, clang.lib.clang_getCursorType(parameter), substitutions
-                )
-                if result is not None:
-                    return 0
-        elif (
-            kind == _CXCursor_CXXBaseSpecifier
-            and access in _INHERITABLE_ACCESS_SPECIFIERS
-        ):
-            bases.append(clang.lib.clang_getCursorType(cursor))
-        return 1
-
-    callback = clang._visitor_func_type(visit)
-    clang.lib.clang_visitChildren(record, callback, None)
-    if result is not None:
-        return result
-    for base_type in bases:
-        resolved_base = _resolve_substituted_type(
-            clang, base_type, substitutions
-        )
-        result = _record_callable_json_path(
-            clang,
-            resolved_base,
-            substitutions,
-            visited,
-            depth + 1,
-        )
-        if result is not None:
-            return result
-    return None
-
-
-def _callback_json_path(
-    clang: "_LibClang", value_type: "_CXType", depth: int = 0
-) -> str | None:
-    if depth > _MAX_TYPE_DEPTH:
-        raise EncoderHygieneError(
-            f"Callback type walk exceeded {_MAX_TYPE_DEPTH} levels"
-        )
-    original_spelling = clang.to_str(
-        clang.lib.clang_getTypeSpelling(value_type)
-    )
-    canonical = clang.lib.clang_getCanonicalType(value_type)
-    if canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS or canonical.kind == _CXType_MemberPointer:
-        pointee = clang.lib.clang_getPointeeType(canonical)
-        if pointee.kind != 0:
-            return _callback_json_path(clang, pointee, depth + 1)
-        return None
-    if canonical.kind in _FUNCTION_TYPE_KINDS:
-        argument_count = clang.lib.clang_getNumArgTypes(canonical)
-        for index in range(max(argument_count, 0)):
-            found = _json_payload_path(
-                clang, clang.lib.clang_getArgType(canonical, index), depth + 1
-            )
-            if found is not None:
-                return found
-        return None
-
-    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
-    template_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
-    if _has_template_prefix(
-        spelling, _CALLABLE_TEMPLATE_PREFIXES
-    ) or _has_template_prefix(
-        original_spelling, _CALLABLE_TEMPLATE_PREFIXES
-    ):
-        if template_count < 1:
-            return "QJsonObject-capable unresolved callable wrapper"
-        callable_type = clang.lib.clang_Type_getTemplateArgumentAsType(canonical, 0)
-        if _is_dependent_type(clang, callable_type):
-            return "QJsonObject-capable unresolved callable wrapper"
-        return _callback_json_path(clang, callable_type, depth + 1)
-
-    record_payload = _record_callable_json_path(
-        clang, canonical, depth=depth + 1
-    )
-    if record_payload is not None:
-        return record_payload
-
-    # Optional/container/alias wrappers around a callable retain the
-    # callback's outward direction.
-    for index in range(max(template_count, 0)):
-        found = _callback_json_path(
-            clang,
-            clang.lib.clang_Type_getTemplateArgumentAsType(canonical, index),
-            depth + 1,
-        )
-        if found is not None:
-            return found
-    return None
-
-
-def _cursor_has_annotation(
-    clang: "_LibClang", cursor: "_CXCursor", annotation: str
-) -> bool:
-    found = False
-
-    def visit(child: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
-        nonlocal found
-        if (
-            clang.lib.clang_getCursorKind(child) == _CXCursor_AnnotateAttr
-            and clang.to_str(clang.lib.clang_getCursorDisplayName(child))
-            == annotation
-        ):
-            found = True
-        return 1
-
-    callback = clang._visitor_func_type(visit)
-    clang.lib.clang_visitChildren(cursor, callback, None)
-    return found
-
-
 def _parameter_cursors(
     clang: "_LibClang", cursor: "_CXCursor"
 ) -> list[_CXCursor]:
@@ -1302,183 +1059,91 @@ def _parameter_cursors(
     return parameters
 
 
-def _mutable_json_path(
+def _stable_type_spelling(clang: "_LibClang", value_type: "_CXType") -> str:
+    spelling = clang.to_str(
+        clang.lib.clang_getTypeSpelling(
+            clang.lib.clang_getCanonicalType(value_type)
+        )
+    )
+    spelling = spelling.replace("std::__1::", "std::").replace(
+        "std::__cxx11::", "std::"
+    )
+    return " ".join(spelling.split())
+
+
+def _forbidden_type_fingerprint(
     clang: "_LibClang",
     value_type: "_CXType",
-    *,
-    directly_mutable: bool,
     depth: int = 0,
+    visited_records: frozenset[str] = frozenset(),
 ) -> str | None:
-    """Return the ultimate mutable JSON-family type reachable through
-    references, pointers, aliases, and template wrappers.
-
-    Constness on a pointer object is intentionally not treated as
-    constness on the object it points at. Thus ``QJsonObject * const &``
-    is mutable output, while ``const QJsonObject * const &`` is input.
-    For a template wrapper reached through a mutable reference/pointer,
-    direct JSON-valued template arguments are mutable; pointer-valued
-    arguments are followed even through a const wrapper because their
-    pointee has independent cv-qualification."""
+    """Return the canonical outer type whenever any recursively reachable
+    semantic component references a forbidden Qt wire container."""
 
     if depth > _MAX_TYPE_DEPTH:
-        raise EncoderHygieneError(
-            f"JSON output-parameter type walk exceeded {_MAX_TYPE_DEPTH} levels"
-        )
-
-    original_spelling = clang.to_str(
-        clang.lib.clang_getTypeSpelling(value_type)
-    )
-    canonical = clang.lib.clang_getCanonicalType(value_type)
-    kind = canonical.kind
-    if kind in _ARRAY_TYPE_KINDS:
-        element = clang.lib.clang_getArrayElementType(canonical)
-        return _mutable_json_path(
-            clang,
-            element,
-            directly_mutable=directly_mutable
-            and not bool(clang.lib.clang_isConstQualifiedType(canonical))
-            and not bool(clang.lib.clang_isConstQualifiedType(element)),
-            depth=depth + 1,
-        )
-    if kind in _REFERENCE_OR_POINTER_TYPE_KINDS:
-        pointee = clang.lib.clang_getPointeeType(canonical)
-        if kind == _CXType_Pointer:
-            # Top-level cv applies to the pointer, never its pointee.
-            return _mutable_json_path(
-                clang, pointee, directly_mutable=True, depth=depth + 1
-            )
-        return _mutable_json_path(
-            clang,
-            pointee,
-            directly_mutable=not bool(clang.lib.clang_isConstQualifiedType(pointee)),
-            depth=depth + 1,
-        )
-
-    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
-    template_arg_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
-
-    # QVariantMap/List/Hash are themselves prohibited JSON containers
-    # despite having template arguments in canonical form.
-    if _is_qvariant_json_container(spelling):
-        return spelling if directly_mutable and not clang.lib.clang_isConstQualifiedType(canonical) else None
-
-    if template_arg_count < 0:
-        if any(
-            _re.fullmatch(rf"(?:const\s+)?{family}(?:\s+const)?", spelling.strip())
-            for family in _QJSON_FAMILY
-        ):
-            if directly_mutable and not clang.lib.clang_isConstQualifiedType(canonical):
-                return spelling
         return None
-
-    if _has_template_prefix(
-        spelling, _OUTPUT_CAPABLE_TEMPLATE_PREFIXES
-    ) or _has_template_prefix(
-        original_spelling, _OUTPUT_CAPABLE_TEMPLATE_PREFIXES
-    ):
-        if template_arg_count < 1:
-            return "QJsonObject-capable unresolved output wrapper"
-        pointee_argument = clang.lib.clang_Type_getTemplateArgumentAsType(
-            canonical, 0
-        )
-        if _is_dependent_type(clang, pointee_argument):
-            return "QJsonObject-capable unresolved output wrapper"
-        return _mutable_json_path(
-            clang, pointee_argument, directly_mutable=True, depth=depth + 1
-        )
-
-    wrapper_mutable = directly_mutable and not bool(
-        clang.lib.clang_isConstQualifiedType(canonical)
-    )
-    for index in range(template_arg_count):
-        argument = clang.lib.clang_Type_getTemplateArgumentAsType(canonical, index)
-        if argument.kind == 0:
-            continue
-        argument_canonical = clang.lib.clang_getCanonicalType(argument)
-        argument_is_indirect = argument_canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS
-        found = _mutable_json_path(
+    canonical = clang.lib.clang_getCanonicalType(value_type)
+    spelling = _stable_type_spelling(clang, canonical)
+    if _is_qjson_family(spelling):
+        return spelling
+    if canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS or canonical.kind == _CXType_MemberPointer:
+        pointee = clang.lib.clang_getPointeeType(canonical)
+        if pointee.kind != 0 and _forbidden_type_fingerprint(
+            clang, pointee, depth + 1, visited_records
+        ):
+            return spelling
+    if canonical.kind in _ARRAY_TYPE_KINDS:
+        if _forbidden_type_fingerprint(
             clang,
-            argument,
-            directly_mutable=wrapper_mutable or argument_is_indirect,
-            depth=depth + 1,
+            clang.lib.clang_getArrayElementType(canonical),
+            depth + 1,
+            visited_records,
+        ):
+            return spelling
+    if canonical.kind in _FUNCTION_TYPE_KINDS:
+        result = clang.lib.clang_getResultType(canonical)
+        if result.kind != 0 and _forbidden_type_fingerprint(
+            clang, result, depth + 1, visited_records
+        ):
+            return spelling
+        for index in range(max(clang.lib.clang_getNumArgTypes(canonical), 0)):
+            if _forbidden_type_fingerprint(
+                clang,
+                clang.lib.clang_getArgType(canonical, index),
+                depth + 1,
+                visited_records,
+            ):
+                return spelling
+    template_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
+    for index in range(max(template_count, 0)):
+        argument = clang.lib.clang_Type_getTemplateArgumentAsType(
+            canonical, index
         )
-        if found is not None:
-            return found
+        if argument.kind != 0 and _forbidden_type_fingerprint(
+            clang, argument, depth + 1, visited_records
+        ):
+            return spelling
     return None
 
 
 def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tuple[bool, str]:
-    """True if this function-like/constructor declaration is
-    "encoder-shaped": either its own canonical RESULT type (checked only
-    for kinds in _FUNCTION_LIKE_KINDS -- a constructor has no meaningful
-    return type) or any of its non-const-qualified reference/pointer
-    PARAMETER types (checked for every kind in _OUTPARAM_CHECKED_KINDS)
-    is in the QJson/QVariant-JSON-container family (see
-    _is_qjson_family()).
+    """Closed positive boundary: report every forbidden Qt wire type
+    referenced by a production function signature, without inferring
+    direction, mutability, ownership, or callback behavior."""
 
-    Returns (True, a human-readable description of the offending return
-    type or parameter) when encoder-shaped, else (False, the plain
-    canonical return-type spelling).
-
-    A review round demonstrated the original return-type-only check
-    missed a public/friend `void encode(QJsonObject &out)` (or an
-    equivalent constructor writing through a non-const reference/pointer
-    parameter) entirely: passing a non-const reference/pointer to a
-    QJson-family type is exactly as capable of smuggling a lossy value
-    out of an otherwise clean-looking signature as a lossy return type
-    is. A CONST-qualified reference/pointer parameter (an ordinary INPUT
-    parameter -- e.g. every JsonDecode.h decode helper takes one) must
-    never be flagged, and is not: only a non-const pointee triggers this
-    check."""
-
-    result_type = clang.lib.clang_getCursorResultType(cursor)
-    canonical_result = clang.lib.clang_getCanonicalType(result_type)
-    result_spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical_result))
-    if kind in _FUNCTION_LIKE_KINDS and _is_qjson_family(result_spelling):
-        return True, result_spelling
-
-    if kind in _OUTPARAM_CHECKED_KINDS:
-        is_qt_signal = kind == _CXCursor_CXXMethod and _cursor_has_annotation(
-            clang, cursor, "qt_signal"
+    references: list[str] = []
+    if kind in _FUNCTION_LIKE_KINDS:
+        result = clang.lib.clang_getCursorResultType(cursor)
+        forbidden = _forbidden_type_fingerprint(clang, result)
+        if forbidden is not None:
+            references.append(f"result={forbidden}")
+    for index, parameter in enumerate(_parameter_cursors(clang, cursor)):
+        forbidden = _forbidden_type_fingerprint(
+            clang, clang.lib.clang_getCursorType(parameter)
         )
-        for arg_index, parm_cursor in enumerate(_parameter_cursors(clang, cursor)):
-            parm_type = clang.lib.clang_getCursorType(parm_cursor)
-            canonical_parm = clang.lib.clang_getCanonicalType(parm_type)
-            parm_spelling = clang.to_str(
-                clang.lib.clang_getTypeSpelling(canonical_parm)
-            )
-
-            if is_qt_signal:
-                signal_payload = _json_payload_path(clang, canonical_parm)
-                if signal_payload is not None:
-                    return (
-                        True,
-                        f"Qt signal output parameter #{arg_index}: "
-                        f"{parm_spelling} (outbound {signal_payload})",
-                    )
-
-            callback_payload = _callback_json_path(clang, canonical_parm)
-            if callback_payload is not None:
-                return (
-                    True,
-                    f"callback output parameter #{arg_index}: "
-                    f"{parm_spelling} (outbound {callback_payload})",
-                )
-
-            mutable_json = _mutable_json_path(
-                clang,
-                canonical_parm,
-                directly_mutable=canonical_parm.kind
-                in _REFERENCE_OR_POINTER_TYPE_KINDS,
-            )
-            if mutable_json is not None:
-                return (
-                    True,
-                    "non-const output/inout parameter "
-                    f"#{arg_index}: {parm_spelling} (mutable {mutable_json})",
-                )
-
-    return False, result_spelling
+        if forbidden is not None:
+            references.append(f"param[{index}]={forbidden}")
+    return bool(references), ";".join(references) if references else "no forbidden Qt wire type"
 
 
 def _resolve_using_declaration_targets(clang: "_LibClang", using_cursor: "_CXCursor") -> list:
@@ -1917,7 +1582,7 @@ def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -
     its (file, USR) key is not in ALLOWLIST_BY_KEY at all, or `counts`
     (when supplied) shows its total observed occurrence count does not
     exactly match that entry's expected_count; 'allowed' otherwise
-    (including every non-QJson-returning declaration, which this script
+    (including every declaration with no forbidden type reference, which this script
     never even constructs a Finding for -- see `_collect_findings()` --
     but classify() stays total/defensive regardless).
 
@@ -1930,6 +1595,13 @@ def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -
         return "allowed"
     entry = ALLOWLIST_BY_KEY.get(finding.key())
     if entry is None:
+        return "violation"
+    if (
+        entry.semantic_signature is None
+        or entry.semantic_signature != finding.canonical_return_type
+        or entry.access is None
+        or entry.access != finding.access
+    ):
         return "violation"
     if counts is not None and counts[finding.key()] != entry.expected_count:
         return "violation"
@@ -2600,7 +2272,7 @@ def _load_target_header_manifests(
     clang_build_dir: Path,
     policies: dict[str, TargetPolicy],
     contexts: Sequence[CompileContext],
-) -> dict[str, list[Path]]:
+) -> tuple[dict[str, list[Path]], dict[str, tuple[str, ...]]]:
     universe_path = clang_build_dir / "generated" / "target_universe.txt"
     index_path = clang_build_dir / "generated" / "target_header_index.txt"
     if not universe_path.is_file() or not index_path.is_file():
@@ -2637,6 +2309,7 @@ def _load_target_header_manifests(
         contexts_by_target.setdefault(context.target, []).append(context)
 
     manifests: dict[str, list[Path]] = {}
+    manifest_contexts: dict[str, tuple[str, ...]] = {}
     for line_number, line in enumerate(
         index_path.read_text(encoding="utf-8").splitlines(), start=1
     ):
@@ -2648,28 +2321,32 @@ def _load_target_header_manifests(
                 f"{index_path}:{line_number}: malformed header index record"
             )
         target, policy_name, context_target, manifest_text = fields
+        context_targets = tuple(
+            context for context in context_target.split(",") if context
+        )
         policy = policies.get(target)
         if (
             policy is None
             or policy.classification != "SCAN"
             or policy.policy != policy_name
-            or policy.context_target != context_target
+            or policy.context_target not in context_targets
             or target in manifests
         ):
             raise EncoderHygieneError(
                 f"{index_path}:{line_number}: mismatched/duplicate header ownership"
             )
-        if context_target not in contexts_by_target:
-            raise EncoderHygieneError(
-                f"Target {target} has no deterministic compiled header context "
-                f"from {context_target}"
-            )
-        context_policy = policies.get(context_target)
-        if context_policy is None or context_policy.classification != "SCAN":
-            raise EncoderHygieneError(
-                f"Target {target} header context {context_target} is not a "
-                "production SCAN target"
-            )
+        for actual_context in context_targets:
+            if actual_context not in contexts_by_target:
+                raise EncoderHygieneError(
+                    f"Target {target} has no deterministic compiled header context "
+                    f"from {actual_context}"
+                )
+            context_policy = policies.get(actual_context)
+            if context_policy is None or context_policy.classification != "SCAN":
+                raise EncoderHygieneError(
+                    f"Target {target} header context {actual_context} is not a "
+                    "production SCAN target"
+                )
         entries = _read_manifest(Path(manifest_text))
         canonical: list[Path] = []
         identities: set[tuple[int, int]] = set()
@@ -2695,6 +2372,7 @@ def _load_target_header_manifests(
             identities.add(identity)
             canonical.append(real)
         manifests[target] = canonical
+        manifest_contexts[target] = context_targets
 
     expected_scan = {
         target
@@ -2707,7 +2385,7 @@ def _load_target_header_manifests(
             f"missing={sorted(expected_scan - set(manifests))}, "
             f"extra={sorted(set(manifests) - expected_scan)}"
         )
-    return manifests
+    return manifests, manifest_contexts
 
 
 def _load_target_source_manifests(
@@ -2730,12 +2408,15 @@ def _load_target_source_manifests(
                 f"{index_path}:{line_number}: malformed source index record"
             )
         target, policy_name, context_target, manifest_text = fields
+        context_targets = tuple(
+            context for context in context_target.split(",") if context
+        )
         policy = policies.get(target)
         if (
             policy is None
             or policy.classification != "SCAN"
             or policy.policy != policy_name
-            or policy.context_target != context_target
+            or policy.context_target not in context_targets
             or target in manifests
         ):
             raise EncoderHygieneError(
@@ -3045,9 +2726,9 @@ def _scan_headers(
         `allowed_closure` (see _audit_inclusion_graph()), appending any
         violation found to `structural_violations` -- a hard,
         never-allowlist-able failure (see run_check()).
-      - Records a Finding for every public, encoder-shaped (see
-        _is_encoder_shaped(): QJson-family return type OR non-const
-        QJson-family output/inout parameter), function-like/constructor
+      - Records a Finding for every public/protected function-like or
+        constructor signature that semantically references a forbidden
+        Qt wire container anywhere in its recursive type graph
         declaration whose OWN resolved location is a member of
         `allowed_closure` -- not merely "== the header currently being
         probed": a header may legitimately #include another member of
@@ -3087,6 +2768,7 @@ def _scan_headers(
         display_name: str,
         shape_description: str,
         usr: str,
+        access: int,
     ) -> None:
         if dedup_key in seen:
             return
@@ -3098,6 +2780,7 @@ def _scan_headers(
                 display_name=display_name,
                 canonical_return_type=shape_description,
                 usr=usr,
+                access=access,
             )
         )
 
@@ -3110,7 +2793,7 @@ def _scan_headers(
         if real not in allowed_closure:
             return
         access = clang.lib.clang_getCXXAccessSpecifier(canonical_cursor)
-        if access not in _PUBLIC_ACCESS_SPECIFIERS:
+        if access not in _SURFACE_ACCESS_SPECIFIERS:
             return
         is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
         if not is_shaped:
@@ -3135,6 +2818,41 @@ def _scan_headers(
             display_name=clang.to_str(clang.lib.clang_getCursorDisplayName(cursor)),
             shape_description=shape_description,
             usr=usr,
+            access=access,
+        )
+
+    def handle_type_surface(
+        cursor: _CXCursor, kind: int, parent: _CXCursor
+    ) -> None:
+        filename, line = clang.cursor_file_and_line(cursor)
+        if filename is None:
+            return
+        real = Path(filename).resolve()
+        if real not in allowed_closure:
+            return
+        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        if access not in _SURFACE_ACCESS_SPECIFIERS:
+            return
+        type_spelling = _forbidden_type_fingerprint(
+            clang, clang.lib.clang_getCursorType(cursor)
+        )
+        if type_spelling is None:
+            return
+        usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+        if not usr:
+            owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(parent))
+            usr = f"{owner_usr}@type-surface@{kind}@{line}"
+        description = f"type={type_spelling}"
+        record_if_new(
+            dedup_key=(str(real), line, usr, kind, description, access),
+            real=real,
+            line=line,
+            display_name=clang.to_str(
+                clang.lib.clang_getCursorDisplayName(cursor)
+            ),
+            shape_description=description,
+            usr=usr,
+            access=access,
         )
 
     def handle_inheritance_exposure(
@@ -3183,6 +2901,7 @@ def _scan_headers(
                         "unresolved exposure capable of returning/mutating QJsonObject"
                     ),
                     usr=usr,
+                    access=class_access,
                 )
                 continue
             source_kind = clang.lib.clang_getCursorKind(exposure.source_cursor)
@@ -3219,11 +2938,13 @@ def _scan_headers(
                 ),
                 shape_description=shape_description,
                 usr=usr,
+                access=class_access,
             )
 
-    def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
+    def visitor(cursor: _CXCursor, parent: _CXCursor, _client_data) -> int:
         kind = clang.lib.clang_getCursorKind(cursor)
         if kind in (_CXCursor_TypeAliasDecl, _CXCursor_TypedefDecl):
+            handle_type_surface(cursor, kind, parent)
             handle_inheritance_exposure(
                 cursor, _alias_reexported_encoders(clang, cursor)
             )
@@ -3231,9 +2952,12 @@ def _scan_headers(
         if kind in _RECORD_LIKE_KINDS and clang.lib.clang_isCursorDefinition(cursor):
             handle_inheritance_exposure(cursor)
             return 2  # CXChildVisit_Recurse: still walk this class's own direct members normally.
-        if kind in _OUTPARAM_CHECKED_KINDS:  # Superset of _FUNCTION_LIKE_KINDS, includes constructors.
+        if kind in _SIGNATURE_DECL_KINDS:
             handle_own_declaration(cursor, kind)
             return 1  # CXChildVisit_Continue: do not descend into the body.
+        if kind in _TYPE_SURFACE_KINDS:
+            handle_type_surface(cursor, kind, parent)
+            return 1
         return 2  # CXChildVisit_Recurse: keep looking for nested declarations.
 
     visitor_cb = clang._visitor_func_type(visitor)
@@ -3436,7 +3160,7 @@ def _scan_sources(
                 return
 
             access = clang.lib.clang_getCXXAccessSpecifier(canonical)
-            if access not in _PUBLIC_ACCESS_SPECIFIERS:
+            if access not in _SURFACE_ACCESS_SPECIFIERS:
                 return
             if canonical_real == source_real:
                 linkage = clang.lib.clang_getCursorLinkage(cursor)
@@ -3475,6 +3199,48 @@ def _scan_sources(
                     ),
                     canonical_return_type=shape_description,
                     usr=usr,
+                    access=access,
+                )
+            )
+
+        def record_type_surface(
+            cursor: _CXCursor, kind: int, parent: _CXCursor
+        ) -> None:
+            filename, line = clang.cursor_file_and_line(cursor)
+            if filename is None:
+                return
+            real = Path(filename).resolve()
+            if real not in allowed_closure and real != source_real:
+                return
+            access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+            if access not in _SURFACE_ACCESS_SPECIFIERS:
+                return
+            forbidden = _forbidden_type_fingerprint(
+                clang, clang.lib.clang_getCursorType(cursor)
+            )
+            if forbidden is None:
+                return
+            usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+            if not usr:
+                owner_usr = clang.to_str(
+                    clang.lib.clang_getCursorUSR(parent)
+                )
+                usr = f"{owner_usr}@type-surface@{kind}@{line}"
+            description = f"type={forbidden}"
+            dedup_key = (str(real), line, usr, kind, description, access)
+            if dedup_key in seen:
+                return
+            seen.add(dedup_key)
+            findings.append(
+                Finding(
+                    file=finding_path(real),
+                    line=line,
+                    display_name=clang.to_str(
+                        clang.lib.clang_getCursorDisplayName(cursor)
+                    ),
+                    canonical_return_type=description,
+                    usr=usr,
+                    access=access,
                 )
             )
 
@@ -3567,10 +3333,11 @@ def _scan_sources(
                         display_name=display_name,
                         canonical_return_type=shape_description,
                         usr=usr,
+                        access=class_access,
                     )
                 )
 
-        def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
+        def visitor(cursor: _CXCursor, parent: _CXCursor, _client_data) -> int:
             kind = clang.lib.clang_getCursorKind(cursor)
             filename, _line = clang.cursor_file_and_line(cursor)
             if filename is not None:
@@ -3583,6 +3350,7 @@ def _scan_sources(
                     return 1
 
             if kind in (_CXCursor_TypeAliasDecl, _CXCursor_TypedefDecl):
+                record_type_surface(cursor, kind, parent)
                 record_inheritance(
                     cursor, _alias_reexported_encoders(clang, cursor)
                 )
@@ -3590,7 +3358,10 @@ def _scan_sources(
             if kind in _RECORD_LIKE_KINDS and clang.lib.clang_isCursorDefinition(cursor):
                 record_inheritance(cursor)
                 return 2
-            if kind not in _OUTPARAM_CHECKED_KINDS:
+            if kind not in _SIGNATURE_DECL_KINDS:
+                if kind in _TYPE_SURFACE_KINDS:
+                    record_type_surface(cursor, kind, parent)
+                    return 1
                 return 2
 
             canonical = clang.lib.clang_getCanonicalCursor(cursor)
@@ -3863,7 +3634,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     target_policies = _load_target_policies(clang_build_dir)
     external_roots = _external_roots(clang_build_dir.resolve())
     _validate_target_inventory(target_policies, all_contexts, external_roots)
-    target_headers = _load_target_header_manifests(
+    target_headers, target_header_contexts = _load_target_header_manifests(
         repo_root, clang_build_dir, target_policies, all_contexts
     )
     target_source_manifests = _load_target_source_manifests(
@@ -3939,6 +3710,12 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             autogen_by_target[closure.target] = closure
 
     cxx_source_suffixes = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
+    all_manifested_code = {
+        source
+        for sources in target_source_manifests.values()
+        for source in sources
+        if source.suffix.lower() in cxx_source_suffixes
+    }
     for target, policy in target_policies.items():
         if policy.classification != "SCAN":
             continue
@@ -3955,7 +3732,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         unexplained_contexts = [
             context.source
             for context in contexts_by_target.get(target, [])
-            if context.source not in manifested_code
+            if context.source not in all_manifested_code
             and context.source not in generated_code
         ]
         if unexplained_contexts:
@@ -4092,8 +3869,10 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         findings: list[Finding] = []
         for target, headers in target_headers.items():
             target_policy = target_policies[target]
-            context_candidates = contexts_by_target[
-                target_policy.context_target
+            context_candidates = [
+                context
+                for context_target in target_header_contexts[target]
+                for context in contexts_by_target[context_target]
             ]
             unique_contexts: dict[tuple, CompileContext] = {}
             for context in context_candidates:
@@ -4173,18 +3952,19 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             uncompiled_sources = manifested_code - compiled_sources
             scan_contexts = list(all_contexts)
             if uncompiled_sources:
-                fallback = contexts_by_target[target_policy.context_target][0]
-                scan_contexts.extend(
-                    CompileContext(
-                        source=source,
-                        directory=fallback.directory,
-                        arguments=fallback.arguments,
-                        output=fallback.output,
-                        target=target,
-                        configuration=fallback.configuration,
-                    )
-                    for source in uncompiled_sources
-                )
+                for context_target in target_header_contexts[target]:
+                    for fallback in contexts_by_target[context_target]:
+                        scan_contexts.extend(
+                            CompileContext(
+                                source=source,
+                                directory=fallback.directory,
+                                arguments=fallback.arguments,
+                                output=fallback.output,
+                                target=target,
+                                configuration=fallback.configuration,
+                            )
+                            for source in uncompiled_sources
+                        )
             target_sources = sorted(
                 compiled_sources | uncompiled_sources, key=str
             )
@@ -4280,11 +4060,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--list",
         action="store_true",
-        help="Print every QJson-family-returning declaration found (with its "
+        help="Print every forbidden Qt wire-type surface found (with its "
         "exact USR and classification) and exit, without applying pass/fail "
         "policy. Intended for maintainers updating ALLOWLIST after a "
-        "deliberate, reviewed change to one of the 14 legitimate adapters/"
-        "helpers/foundation encoders -- never as a way to silence a real "
+        "deliberate, reviewed change to the exact positive surface allowlist "
+        "-- never as a way to silence a real "
         "violation.",
     )
     args = parser.parse_args(argv)
@@ -4341,9 +4121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # correct but noisy for a single root-cause fix).
         seen: set[tuple[str, int, str]] = set()
         print(
-            f"error: {len(violations)} public QJson-returning declaration(s) are "
-            "not in the tiny explicit allowlist (by exact file + USR + "
-            "occurrence count):",
+            f"error: {len(violations)} forbidden Qt wire-type surface(s) are "
+            "not in the exact positive allowlist (file + USR + canonical "
+            "semantic signature + access + occurrence count):",
             file=sys.stderr,
         )
         for v in sorted(violations, key=lambda f: (f.file, f.line)):
@@ -4357,8 +4137,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     print(
-        f"Encoder hygiene: {len(findings)} public QJson-returning declaration(s) "
-        "found across all explicitly-owned production targets, all "
+        f"Encoder hygiene: {len(findings)} exact forbidden-type surface(s) "
+        "accounted for across all explicitly-owned production targets, all "
         f"{len(ALLOWLIST)} allowlist entries accounted for at their exact "
         "expected occurrence count, zero violations, and every header, fragment, "
         "source target/configuration, and owned AUTOGEN unit stayed within its "

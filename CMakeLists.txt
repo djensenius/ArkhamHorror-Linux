@@ -527,6 +527,11 @@ qt_add_qml_module(arkham-horror
     QML_FILES
         qml/Main.qml
 )
+# Qt's command injects internal QT_* target-property generator expressions
+# for QML metadata/resources. These are the only accepted SCAN-target
+# expressions; project-authored configuration expressions remain forbidden.
+set_property(TARGET arkham-horror PROPERTY
+    ARKHAM_ENCODER_HYGIENE_ALLOW_QT_GENERATED_EXPRESSIONS ON)
 
 arkham_append_encoder_hygiene_target(
     TARGET arkham-horror
@@ -539,7 +544,6 @@ if(TARGET arkham-horror_tooling)
         TARGET arkham-horror_tooling
         CLASSIFICATION SCAN
         POLICY application
-        CONTEXT_TARGET arkham-horror
         OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
     )
 endif()

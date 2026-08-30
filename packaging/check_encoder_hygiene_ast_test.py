@@ -444,7 +444,7 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
         findings, violations = self._scan_header_fixture(header, frozenset({header.resolve()}))
         self.assertEqual(violations, [])
         self.assertEqual(len(findings), 1)
-        self.assertIn("output/inout parameter", findings[0].canonical_return_type)
+        self.assertIn("param[0]=QJsonObject &", findings[0].canonical_return_type)
 
     def test_public_non_const_pointer_output_parameter_is_flagged(self) -> None:
         header = self._write(
@@ -457,9 +457,9 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
         findings, violations = self._scan_header_fixture(header, frozenset({header.resolve()}))
         self.assertEqual(violations, [])
         self.assertEqual(len(findings), 1)
-        self.assertIn("output/inout parameter", findings[0].canonical_return_type)
+        self.assertIn("param[0]=QJsonObject *", findings[0].canonical_return_type)
 
-    def test_public_const_reference_input_parameter_is_not_flagged(self) -> None:
+    def test_unallowlisted_const_input_is_structurally_rejected(self) -> None:
         header = self._write(
             "InParam.h",
             "struct QJsonObject {};\n"
@@ -469,7 +469,8 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
         )
         findings, violations = self._scan_header_fixture(header, frozenset({header.resolve()}))
         self.assertEqual(violations, [])
-        self.assertEqual(findings, [])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("const QJsonObject &", findings[0].canonical_return_type)
 
     def test_public_base_class_encoder_is_exposed_through_derived_class(self) -> None:
         header = self._write(
@@ -595,15 +596,20 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
                     header, frozenset({header.resolve()})
                 )
                 self.assertEqual(violations, [])
-                self.assertEqual(len(findings), 1)
+                self.assertTrue(
+                    any(
+                        finding.display_name.startswith("encode(")
+                        for finding in findings
+                    )
+                )
 
-        accepted = {
+        structurally_forbidden_even_when_const = {
             "pointer to const": "const QJsonObject * const &",
             "const direct wrapper": "const Box<QJsonObject> &",
             "const alias pointee": "ConstAlias &",
         }
         accepted_prelude = prelude + "using ConstAlias = const QJsonObject * const;\n"
-        for label, parameter in accepted.items():
+        for label, parameter in structurally_forbidden_even_when_const.items():
             with self.subTest(label=label):
                 header = self._write(
                     f"input-{label.replace(' ', '-')}.h",
@@ -613,7 +619,12 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
                     header, frozenset({header.resolve()})
                 )
                 self.assertEqual(violations, [])
-                self.assertEqual(findings, [])
+                self.assertTrue(
+                    any(
+                        finding.display_name.startswith("decode(")
+                        for finding in findings
+                    )
+                )
 
     def test_smart_pointer_output_channels_and_const_pointee_controls(self) -> None:
         prelude = (
@@ -646,14 +657,19 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
                     header, frozenset({header.resolve()})
                 )
                 self.assertEqual(violations, [])
-                self.assertEqual(len(findings), 1)
+                self.assertTrue(
+                    any(
+                        finding.display_name.startswith("mutate(")
+                        for finding in findings
+                    )
+                )
 
-        accepted = {
+        immutable_or_value_forms_still_require_exact_allowlisting = {
             "shared const pointee": "std::shared_ptr<const QJsonObject>",
             "shared const pointee ref": "const std::shared_ptr<const QJsonObject> &",
             "direct optional value": "std::optional<QJsonObject>",
         }
-        for label, parameter in accepted.items():
+        for label, parameter in immutable_or_value_forms_still_require_exact_allowlisting.items():
             with self.subTest(label=label):
                 header = self._write(
                     f"smart-safe-{label.replace(' ', '-')}.h",
@@ -663,7 +679,12 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
                     header, frozenset({header.resolve()})
                 )
                 self.assertEqual(violations, [])
-                self.assertEqual(findings, [])
+                self.assertTrue(
+                    any(
+                        finding.display_name.startswith("consume(")
+                        for finding in findings
+                    )
+                )
 
     def test_callback_parameters_reverse_json_direction(self) -> None:
         prelude = (
@@ -694,9 +715,11 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
                     header, frozenset({header.resolve()})
                 )
                 self.assertEqual(violations, [])
-                self.assertEqual(len(findings), 1)
-                self.assertIn(
-                    "callback output", findings[0].canonical_return_type
+                self.assertTrue(
+                    any(
+                        finding.display_name.startswith("publish(")
+                        for finding in findings
+                    )
                 )
 
         header = self._write(
@@ -709,7 +732,9 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             header, frozenset({header.resolve()})
         )
         self.assertEqual(violations, [])
-        self.assertEqual(findings, [])
+        names = {finding.display_name.split("(", 1)[0] for finding in findings}
+        self.assertIn("decodeWith", names)
+        self.assertNotIn("notifyWith", names)
 
     def test_qt_signal_json_payload_is_outbound_but_normal_input_is_not(self) -> None:
         header = self._write(
@@ -725,8 +750,10 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             header, frozenset({header.resolve()})
         )
         self.assertEqual(violations, [])
-        self.assertEqual(len(findings), 1)
-        self.assertIn("Qt signal output", findings[0].canonical_return_type)
+        self.assertEqual(
+            {finding.display_name.split("(", 1)[0] for finding in findings},
+            {"emitted", "decode"},
+        )
 
     def test_record_functor_callback_graph_is_reverse_directed(self) -> None:
         header = self._write(
@@ -759,15 +786,12 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             for finding in findings
             if finding.display_name.startswith("publish")
         }
-        self.assertEqual(
-            published,
-            {
-                "publishTemplate",
-                "publishAlias",
-                "publishInherited",
-                "publishOverloaded",
-                "publishGeneric",
-            },
+        self.assertEqual(published, {"publishTemplate", "publishAlias"})
+        self.assertTrue(
+            any(
+                finding.display_name.startswith("operator()")
+                for finding in findings
+            )
         )
 
     def test_private_functor_and_noncallable_wrapper_are_safe_controls(self) -> None:
@@ -786,7 +810,9 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             header, frozenset({header.resolve()})
         )
         self.assertEqual(violations, [])
-        self.assertEqual(findings, [])
+        names = {finding.display_name.split("(", 1)[0] for finding in findings}
+        self.assertIn("valueControl", names)
+        self.assertNotIn("privateControl", names)
 
     def test_arrays_and_smart_pointer_arrays_follow_element_types(self) -> None:
         prelude = (
@@ -812,7 +838,12 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
                     header, frozenset({header.resolve()})
                 )
                 self.assertEqual(violations, [])
-                self.assertEqual(len(findings), 1)
+                self.assertTrue(
+                    any(
+                        finding.display_name.startswith("emitArray(")
+                        for finding in findings
+                    )
+                )
 
         header = self._write(
             "array-const-controls.h",
@@ -824,7 +855,14 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             header, frozenset({header.resolve()})
         )
         self.assertEqual(violations, [])
-        self.assertEqual(findings, [])
+        self.assertEqual(
+            {
+                finding.display_name.split("(", 1)[0]
+                for finding in findings
+                if finding.display_name.startswith("consume")
+            },
+            {"consumeConst", "consumeShared"},
+        )
 
         dependent = self._write(
             "array-dependent-and-variable.h",
@@ -844,7 +882,7 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             {"emitDependent", "emitVariable"},
         )
 
-    def test_unresolved_smart_pointer_template_fails_closed(self) -> None:
+    def test_unresolved_wrapper_without_forbidden_argument_is_not_invented(self) -> None:
         header = self._write(
             "UnresolvedSmartPointer.h",
             "#include <memory>\n"
@@ -854,8 +892,80 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             header, frozenset({header.resolve()})
         )
         self.assertEqual(violations, [])
-        self.assertEqual(len(findings), 1)
-        self.assertIn("unresolved output wrapper", findings[0].canonical_return_type)
+        self.assertEqual(findings, [])
+
+    def test_custom_pointer_wrapper_is_rejected_by_outer_type_reference(self) -> None:
+        header = self._write(
+            "CustomHandleMatrix.h",
+            "struct QJsonObject {};\n"
+            "template<class T> struct Handle {\n"
+            "  T &operator*() const;\n"
+            "  T *operator->() const;\n"
+            "  T *get() const;\n"
+            "  operator T *() const;\n"
+            "};\n"
+            "template<class T> struct Outer { T value; };\n"
+            "using JsonHandle = Handle<QJsonObject>;\n"
+            "void byValue(Handle<QJsonObject> value);\n"
+            "void byConstRef(const Handle<QJsonObject> &value);\n"
+            "void nested(Outer<Handle<QJsonObject>> value);\n"
+            "void alias(JsonHandle value);\n"
+            "void safe(Handle<int> value);\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        names = {finding.display_name.split("(", 1)[0] for finding in findings}
+        self.assertTrue({"JsonHandle", "byValue", "byConstRef", "nested", "alias"}.issubset(names))
+        self.assertNotIn("safe", names)
+
+    def test_multi_parameter_template_matrix_checks_every_argument(self) -> None:
+        header = self._write(
+            "MultiParameterMatrix.h",
+            "struct QJsonObject {};\n"
+            "template<class A, class B> struct Pair { A first; B second; };\n"
+            "template<class A, class B> struct Sink {\n"
+            "  void operator()(const A &, const B &) const;\n"
+            "};\n"
+            "void second(Pair<int, QJsonObject> value);\n"
+            "void first(Pair<QJsonObject, int> value);\n"
+            "void sinkSecond(Sink<int, QJsonObject> value);\n"
+            "void sinkFirst(Sink<QJsonObject, int> value);\n"
+            "void safe(Pair<int, long> value);\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        names = {finding.display_name.split("(", 1)[0] for finding in findings}
+        self.assertTrue(
+            {"second", "first", "sinkSecond", "sinkFirst"}.issubset(names)
+        )
+        self.assertNotIn("safe", names)
+
+    def test_dependent_encoder_alias_fails_at_forbidden_instantiation(self) -> None:
+        header = self._write(
+            "DependentSignatureMatrix.h",
+            "struct QJsonObject {};\n"
+            "template<class T> struct Base {\n"
+            "  T toJson() const;\n"
+            "  void write(T &out) const;\n"
+            "};\n"
+            "template<class T> struct Adapter : public Base<T> {};\n"
+            "template<class T> struct Layer : public Adapter<T> {};\n"
+            "using Lossy = Adapter<QJsonObject>;\n"
+            "using DeepLossy = Layer<QJsonObject>;\n"
+            "using Safe = Layer<int>;\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        names = {finding.display_name for finding in findings}
+        self.assertIn("Lossy", names)
+        self.assertIn("DeepLossy", names)
+        self.assertNotIn("Safe", names)
 
     def test_dependent_public_and_protected_inheritance_fail_closed(self) -> None:
         header = self._write(
@@ -961,8 +1071,12 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
         )
         self.assertEqual(violations, [])
         self.assertEqual(len(findings), 1)
-        self.assertIn("toJson", findings[0].display_name)
-        self.assertEqual(findings[0].file, "domain/Alias.h")
+        self.assertTrue(
+            all(finding.file == "domain/Alias.h" for finding in findings)
+        )
+        self.assertTrue(
+            any("toJson" in finding.display_name for finding in findings)
+        )
 
     def test_concrete_and_composed_template_bases_are_not_skipped(self) -> None:
         external = self._write(
@@ -1414,12 +1528,24 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         )
         self._write(
             "src/InterfaceWire.h",
-            "struct QJsonObject {}; QJsonObject interfaceOnlyEncoder();\n",
+            "struct QJsonObject {};\n"
+            "QJsonObject interfaceOnlyEncoder();\n"
+            "#ifdef INTERFACE_OWN_ENCODER\n"
+            "QJsonObject interfaceDefinitionEncoder();\n"
+            "#endif\n"
+            "#ifdef CONSUMER_ONE_ENCODER\n"
+            "QJsonObject consumerOneEncoder();\n"
+            "#endif\n"
+            "#ifdef CONSUMER_TWO_ENCODER\n"
+            "QJsonObject consumerTwoEncoder();\n"
+            "#endif\n",
         )
         self._write(
             "src/InterfaceSource.cpp",
             "struct QJsonObject {}; QJsonObject interfaceSourceEncoder() { return {}; }\n",
         )
+        self._write("src/ConsumerOne.cpp", "int main() { return 0; }\n")
+        self._write("src/ConsumerTwo.cpp", "int main() { return 0; }\n")
         cmake = (
             "cmake_minimum_required(VERSION 3.25)\n"
             "project(ClosedHeaderUniverse CXX)\n"
@@ -1433,15 +1559,26 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_library(wire_interface INTERFACE)\n"
             + 'target_sources(wire_interface INTERFACE FILE_SET wire_headers TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/InterfaceWire.h")\n'
             + 'target_sources(wire_interface INTERFACE "${CMAKE_SOURCE_DIR}/src/InterfaceSource.cpp")\n'
+            + "target_compile_definitions(wire_interface INTERFACE INTERFACE_OWN_ENCODER)\n"
+            + "add_executable(consumer_one src/ConsumerOne.cpp)\n"
+            + "target_link_libraries(consumer_one PRIVATE wire_interface)\n"
+            + "target_compile_definitions(consumer_one PRIVATE CONSUMER_ONE_ENCODER)\n"
+            + "add_executable(consumer_two src/ConsumerTwo.cpp)\n"
+            + "target_link_libraries(consumer_two PRIVATE wire_interface)\n"
+            + "target_compile_definitions(consumer_two PRIVATE CONSUMER_TWO_ENCODER)\n"
             + 'file(WRITE "${CMAKE_BINARY_DIR}/GeneratedWire.h" "struct QJsonObject {}; QJsonObject generatedHeaderEncoder();\\n")\n'
             + 'target_sources(app PUBLIC FILE_SET app_late_generated TYPE HEADERS BASE_DIRS "${CMAKE_BINARY_DIR}" FILES "${CMAKE_BINARY_DIR}/GeneratedWire.h")\n'
             + "add_library(Imported::Legitimate INTERFACE IMPORTED)\n"
             + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
-            + 'arkham_append_encoder_hygiene_target(TARGET wire_interface CLASSIFICATION SCAN POLICY application CONTEXT_TARGET app OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET consumer_one CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET consumer_two CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET wire_interface CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + self._register_manifests("domain", "foundation")
         )
         self._write("CMakeLists.txt", cmake)
-        self._configure_and_build(["domain", "foundation", "app"])
+        self._configure_and_build(
+            ["domain", "foundation", "app", "consumer_one", "consumer_two"]
+        )
         findings = ceh.run_check(self.root, self.build, skip_configure=True)
         self.assertEqual(
             {
@@ -1451,6 +1588,9 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             {
                 "unusedAppEncoder",
                 "interfaceOnlyEncoder",
+                "interfaceDefinitionEncoder",
+                "consumerOneEncoder",
+                "consumerTwoEncoder",
                 "interfaceSourceEncoder",
                 "generatedHeaderEncoder",
             },
@@ -1459,9 +1599,14 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             self.build / "generated/target_header_index.txt"
         ).read_text(encoding="utf-8")
         self.assertIn("app\tapplication\tapp\t", index)
-        self.assertIn(
-            "wire_interface\tapplication\tapp\t", index
+        wire_line = next(
+            line
+            for line in index.splitlines()
+            if line.startswith("wire_interface\t")
         )
+        self.assertIn("__arkham_encoder_context_", wire_line)
+        self.assertIn("consumer_one", wire_line)
+        self.assertIn("consumer_two", wire_line)
 
     def test_unknown_compile_target_fails_reverse_inventory(self) -> None:
         self._write("src/domain/Domain.h", "#pragma once\n")
@@ -1506,6 +1651,118 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         self.assertIn(
             "has no explicit SCAN/EXEMPT classification",
             configure.stdout + configure.stderr,
+        )
+
+    def test_scan_target_generator_expressions_fail_cmake_finalization(self) -> None:
+        expressions = {
+            "current-config-header-source": (
+                'target_sources(app PRIVATE "$<$<CONFIG:Debug>:${CMAKE_SOURCE_DIR}/Lossy.h>")\n'
+            ),
+            "release-only-source": (
+                'target_sources(app PRIVATE "$<$<CONFIG:Release>:${CMAKE_SOURCE_DIR}/Lossy.cpp>")\n'
+            ),
+            "nested-expression": (
+                'target_sources(app PRIVATE "$<$<AND:$<CONFIG:Debug>,$<BOOL:1>>:${CMAKE_SOURCE_DIR}/Lossy.h>")\n'
+            ),
+            "conditional-file-set": (
+                'target_sources(app PUBLIC FILE_SET conditional TYPE HEADERS '
+                'BASE_DIRS "${CMAKE_SOURCE_DIR}" '
+                'FILES "$<$<CONFIG:Release>:${CMAKE_SOURCE_DIR}/Lossy.h>")\n'
+            ),
+        }
+        ninja = shutil.which("ninja") or subprocess.check_output(
+            ["mise", "which", "ninja"], text=True
+        ).strip()
+        for label, mutation in expressions.items():
+            with self.subTest(label=label):
+                case_root = self.root / label
+                case_root.mkdir()
+                (case_root / "Main.cpp").write_text(
+                    "int main() { return 0; }\n", encoding="utf-8"
+                )
+                (case_root / "Lossy.cpp").write_text(
+                    "struct QJsonObject {}; QJsonObject encode();\n",
+                    encoding="utf-8",
+                )
+                (case_root / "Lossy.h").write_text(
+                    "struct QJsonObject {}; QJsonObject encode();\n",
+                    encoding="utf-8",
+                )
+                cmake = (
+                    "cmake_minimum_required(VERSION 3.25)\n"
+                    "project(GenexInventory CXX)\n"
+                    f'include("{self.module}")\n'
+                    'file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")\n'
+                    'file(WRITE "${CMAKE_BINARY_DIR}/generated/target_policy.txt" "")\n'
+                    "add_executable(app Main.cpp)\n"
+                    + mutation
+                    + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+                    + 'cmake_language(DEFER CALL arkham_write_encoder_hygiene_target_universe '
+                    'OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_universe.txt" '
+                    'HEADER_INDEX_FILE "${CMAKE_BINARY_DIR}/generated/target_header_index.txt" '
+                    'HEADER_DIR "${CMAKE_BINARY_DIR}/generated/target_headers" '
+                    'SOURCE_INDEX_FILE "${CMAKE_BINARY_DIR}/generated/target_source_index.txt" '
+                    'SOURCE_DIR "${CMAKE_BINARY_DIR}/generated/target_sources")\n'
+                )
+                (case_root / "CMakeLists.txt").write_text(
+                    cmake, encoding="utf-8"
+                )
+                configured = subprocess.run(
+                    [
+                        "cmake",
+                        "-S",
+                        str(case_root),
+                        "-B",
+                        str(case_root / "build"),
+                        "-G",
+                        "Ninja",
+                        f"-DCMAKE_MAKE_PROGRAM={ninja}",
+                        "-DCMAKE_BUILD_TYPE=Debug",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(configured.returncode, 0)
+                self.assertRegex(
+                    configured.stdout + configured.stderr,
+                    "generator expression|configuration-closed",
+                )
+
+    def test_interface_manual_context_must_be_a_real_consumer(self) -> None:
+        self._write("Main.cpp", "int main() { return 0; }\n")
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(InvalidInterfaceContext CXX)\n"
+            f'include("{self.module}")\n'
+            'file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/generated/target_policy.txt" "")\n'
+            "add_executable(app Main.cpp)\n"
+            "add_library(wire INTERFACE)\n"
+            + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET wire CLASSIFICATION SCAN POLICY application CONTEXT_TARGET app OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+        )
+        self._write("CMakeLists.txt", cmake)
+        ninja = shutil.which("ninja") or subprocess.check_output(
+            ["mise", "which", "ninja"], text=True
+        ).strip()
+        configured = subprocess.run(
+            [
+                "cmake",
+                "-S",
+                str(self.root),
+                "-B",
+                str(self.build),
+                "-G",
+                "Ninja",
+                f"-DCMAKE_MAKE_PROGRAM={ninja}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(configured.returncode, 0)
+        self.assertRegex(
+            configured.stdout + configured.stderr,
+            r"does\s+not consume INTERFACE target",
         )
 
     def test_test_trycompile_and_external_targets_need_explicit_metadata(self) -> None:

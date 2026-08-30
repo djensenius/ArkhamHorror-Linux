@@ -498,30 +498,69 @@ function(arkham_append_encoder_hygiene_target)
     if(NOT ARG_CLASSIFICATION MATCHES "^(SCAN|EXTERNAL|TEST|TRY_COMPILE)$")
         message(FATAL_ERROR "arkham_append_encoder_hygiene_target: invalid CLASSIFICATION '${ARG_CLASSIFICATION}'")
     endif()
+    if(NOT ARG_OUTPUT_FILE)
+        message(FATAL_ERROR "arkham_append_encoder_hygiene_target: OUTPUT_FILE is required")
+    endif()
+    get_target_property(_arkham_eht_existing ${ARG_TARGET} ARKHAM_ENCODER_HYGIENE_CLASSIFICATION)
+    if(_arkham_eht_existing)
+        message(FATAL_ERROR "arkham_append_encoder_hygiene_target: target '${ARG_TARGET}' is already classified")
+    endif()
+    get_target_property(_arkham_eht_type ${ARG_TARGET} TYPE)
     if(ARG_CLASSIFICATION STREQUAL "SCAN")
         if(NOT ARG_POLICY MATCHES "^(domain|foundation|application)$")
             message(FATAL_ERROR "arkham_append_encoder_hygiene_target: SCAN requires domain, foundation, or application POLICY")
         endif()
-        if(NOT ARG_CONTEXT_TARGET)
+        if(_arkham_eht_type STREQUAL "INTERFACE_LIBRARY")
+            if(ARG_CONTEXT_TARGET)
+                if(NOT TARGET ${ARG_CONTEXT_TARGET})
+                    message(FATAL_ERROR "arkham_append_encoder_hygiene_target: CONTEXT_TARGET must exist")
+                endif()
+                get_target_property(_arkham_eht_links ${ARG_CONTEXT_TARGET} LINK_LIBRARIES)
+                if(NOT _arkham_eht_links)
+                    set(_arkham_eht_links "")
+                endif()
+                list(FIND _arkham_eht_links "${ARG_TARGET}" _arkham_eht_consumer_index)
+                if(_arkham_eht_consumer_index EQUAL -1)
+                    message(FATAL_ERROR
+                        "arkham_append_encoder_hygiene_target: nominated CONTEXT_TARGET "
+                        "'${ARG_CONTEXT_TARGET}' does not consume INTERFACE target '${ARG_TARGET}'")
+                endif()
+            endif()
+            string(SHA256 _arkham_eht_hash "${ARG_TARGET}")
+            string(SUBSTRING "${_arkham_eht_hash}" 0 16 _arkham_eht_short_hash)
+            set(_arkham_eht_context_target
+                "__arkham_encoder_context_${_arkham_eht_short_hash}")
+            get_filename_component(_arkham_eht_output_dir "${ARG_OUTPUT_FILE}" DIRECTORY)
+            set(_arkham_eht_context_dir "${_arkham_eht_output_dir}/interface_context")
+            file(MAKE_DIRECTORY "${_arkham_eht_context_dir}")
+            set(_arkham_eht_context_source
+                "${_arkham_eht_context_dir}/${_arkham_eht_short_hash}.cpp")
+            file(WRITE "${_arkham_eht_context_source}"
+                "int arkham_encoder_context_${_arkham_eht_short_hash}() { return 0; }\n")
+            add_library(${_arkham_eht_context_target} OBJECT
+                "${_arkham_eht_context_source}")
+            set_target_properties(${_arkham_eht_context_target} PROPERTIES
+                AUTOMOC OFF
+                AUTOUIC OFF
+                AUTORCC OFF)
+            target_link_libraries(${_arkham_eht_context_target} PRIVATE
+                ${ARG_TARGET})
+            arkham_append_encoder_hygiene_target(
+                TARGET ${_arkham_eht_context_target}
+                CLASSIFICATION SCAN
+                POLICY ${ARG_POLICY}
+                OUTPUT_FILE "${ARG_OUTPUT_FILE}")
+            set(ARG_CONTEXT_TARGET "${_arkham_eht_context_target}")
+        elseif(NOT ARG_CONTEXT_TARGET)
             set(ARG_CONTEXT_TARGET "${ARG_TARGET}")
-        endif()
-        if(NOT TARGET ${ARG_CONTEXT_TARGET})
+        elseif(NOT TARGET ${ARG_CONTEXT_TARGET})
             message(FATAL_ERROR "arkham_append_encoder_hygiene_target: CONTEXT_TARGET must exist")
-        endif()
-        get_target_property(_arkham_eht_type ${ARG_TARGET} TYPE)
-        if(_arkham_eht_type STREQUAL "INTERFACE_LIBRARY" AND ARG_CONTEXT_TARGET STREQUAL ARG_TARGET)
-            message(FATAL_ERROR "arkham_append_encoder_hygiene_target: INTERFACE target requires an explicit compiled CONTEXT_TARGET")
         endif()
     elseif(ARG_POLICY OR ARG_CONTEXT_TARGET)
         message(FATAL_ERROR "arkham_append_encoder_hygiene_target: exempt targets must not specify POLICY/CONTEXT_TARGET")
     elseif(NOT ARG_EXEMPT_REASON)
         message(FATAL_ERROR "arkham_append_encoder_hygiene_target: exempt target requires EXEMPT_REASON")
     endif()
-    if(NOT ARG_OUTPUT_FILE)
-        message(FATAL_ERROR "arkham_append_encoder_hygiene_target: OUTPUT_FILE is required")
-    endif()
-
-    get_target_property(_arkham_eht_type ${ARG_TARGET} TYPE)
     get_target_property(_arkham_eht_source_dir ${ARG_TARGET} SOURCE_DIR)
     get_target_property(_arkham_eht_binary_dir ${ARG_TARGET} BINARY_DIR)
     file(APPEND "${ARG_OUTPUT_FILE}"
@@ -533,6 +572,7 @@ function(arkham_append_encoder_hygiene_target)
     unset(_arkham_eht_type)
     unset(_arkham_eht_source_dir)
     unset(_arkham_eht_binary_dir)
+    unset(_arkham_eht_existing)
 endfunction()
 
 function(_arkham_collect_buildsystem_targets directory out_var)
@@ -593,6 +633,29 @@ function(arkham_write_encoder_hygiene_target_universe)
             "${ARG_SOURCE_DIR}/${_arkham_ehu_short_hash}.txt")
         get_target_property(_arkham_ehu_context ${_arkham_ehu_target} ARKHAM_ENCODER_HYGIENE_CONTEXT_TARGET)
         get_target_property(_arkham_ehu_policy ${_arkham_ehu_target} ARKHAM_ENCODER_HYGIENE_POLICY)
+        set(_arkham_ehu_contexts "${_arkham_ehu_context}")
+        if(_arkham_ehu_type STREQUAL "INTERFACE_LIBRARY")
+            foreach(_arkham_ehu_candidate IN LISTS _arkham_ehu_targets)
+                get_target_property(_arkham_ehu_candidate_class
+                    ${_arkham_ehu_candidate} ARKHAM_ENCODER_HYGIENE_CLASSIFICATION)
+                if(NOT _arkham_ehu_candidate_class STREQUAL "SCAN")
+                    continue()
+                endif()
+                get_target_property(_arkham_ehu_candidate_links
+                    ${_arkham_ehu_candidate} LINK_LIBRARIES)
+                if(NOT _arkham_ehu_candidate_links)
+                    set(_arkham_ehu_candidate_links "")
+                endif()
+                list(FIND _arkham_ehu_candidate_links
+                    "${_arkham_ehu_target}" _arkham_ehu_link_index)
+                if(NOT _arkham_ehu_link_index EQUAL -1)
+                    list(APPEND _arkham_ehu_contexts "${_arkham_ehu_candidate}")
+                endif()
+            endforeach()
+        endif()
+        list(REMOVE_DUPLICATES _arkham_ehu_contexts)
+        string(REPLACE ";" "," _arkham_ehu_contexts_serialized
+            "${_arkham_ehu_contexts}")
 
         get_target_property(_arkham_ehu_names ${_arkham_ehu_target} HEADER_SETS)
         get_target_property(_arkham_ehu_interface_names ${_arkham_ehu_target} INTERFACE_HEADER_SETS)
@@ -605,6 +668,16 @@ function(arkham_write_encoder_hygiene_target_universe)
         list(REMOVE_DUPLICATES _arkham_ehu_names)
         set(_arkham_ehu_header_pieces "")
         foreach(_arkham_ehu_name IN LISTS _arkham_ehu_names)
+            get_target_property(_arkham_ehu_header_files
+                ${_arkham_ehu_target} HEADER_SET_${_arkham_ehu_name})
+            foreach(_arkham_ehu_header IN LISTS _arkham_ehu_header_files)
+                if(_arkham_ehu_header MATCHES "\\$<")
+                    message(FATAL_ERROR
+                        "Encoder-hygiene target '${_arkham_ehu_target}' header set "
+                        "'${_arkham_ehu_name}' contains a generator expression. "
+                        "SCAN target header/source inventories must be configuration-closed.")
+                endif()
+            endforeach()
             list(APPEND _arkham_ehu_header_pieces
                 "$<TARGET_PROPERTY:${_arkham_ehu_target},HEADER_SET_${_arkham_ehu_name}>")
         endforeach()
@@ -618,6 +691,23 @@ function(arkham_write_encoder_hygiene_target_universe)
         if(_arkham_ehu_interface_sources)
             list(APPEND _arkham_ehu_sources ${_arkham_ehu_interface_sources})
         endif()
+        get_target_property(_arkham_ehu_allow_qt_genex
+            ${_arkham_ehu_target} ARKHAM_ENCODER_HYGIENE_ALLOW_QT_GENERATED_EXPRESSIONS)
+        get_target_property(_arkham_ehu_binary_dir
+            ${_arkham_ehu_target} BINARY_DIR)
+        set(_arkham_ehu_expected_qt_genex
+            "$<BUILD_INTERFACE:$<$<BOOL:$<TARGET_PROPERTY:QT_CONSUMES_METATYPES>>:${_arkham_ehu_binary_dir}/meta_types/qt6${_arkham_ehu_target}_metatypes.json>>")
+        foreach(_arkham_ehu_source IN LISTS _arkham_ehu_sources)
+            if(_arkham_ehu_source MATCHES "\\$<" AND NOT
+                    (_arkham_ehu_allow_qt_genex
+                        AND _arkham_ehu_source STREQUAL _arkham_ehu_expected_qt_genex))
+                message(FATAL_ERROR
+                    "Encoder-hygiene target '${_arkham_ehu_target}' SOURCES/"
+                    "INTERFACE_SOURCES contains an unclassified generator expression "
+                    "'${_arkham_ehu_source}'. Project-authored SCAN target inventories "
+                    "must be configuration-closed.")
+            endif()
+        endforeach()
         foreach(_arkham_ehu_source IN LISTS _arkham_ehu_sources)
             if(_arkham_ehu_source MATCHES "\\.(h|hh|hpp|hxx|inc|inl|ipp|tpp)$")
                 cmake_path(IS_RELATIVE _arkham_ehu_source _arkham_ehu_relative)
@@ -652,9 +742,9 @@ function(arkham_write_encoder_hygiene_target_universe)
             CONTENT "$<JOIN:${_arkham_ehu_source_pieces},\n>\n"
             TARGET ${_arkham_ehu_target})
         string(APPEND _arkham_ehu_index
-            "${_arkham_ehu_target}\t${_arkham_ehu_policy}\t${_arkham_ehu_context}\t${_arkham_ehu_header_file}\n")
+            "${_arkham_ehu_target}\t${_arkham_ehu_policy}\t${_arkham_ehu_contexts_serialized}\t${_arkham_ehu_header_file}\n")
         string(APPEND _arkham_ehu_source_index
-            "${_arkham_ehu_target}\t${_arkham_ehu_policy}\t${_arkham_ehu_context}\t${_arkham_ehu_source_file}\n")
+            "${_arkham_ehu_target}\t${_arkham_ehu_policy}\t${_arkham_ehu_contexts_serialized}\t${_arkham_ehu_source_file}\n")
     endforeach()
     file(WRITE "${ARG_OUTPUT_FILE}" "${_arkham_ehu_universe}")
     file(WRITE "${ARG_HEADER_INDEX_FILE}" "${_arkham_ehu_index}")

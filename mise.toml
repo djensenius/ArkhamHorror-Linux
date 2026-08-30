@@ -67,7 +67,7 @@ description = "Unit-test verify_contract_provenance.py's closure discovery/verif
 run = "python3 packaging/verify_contract_provenance_test.py"
 
 [tasks."contracts:check-encoder-hygiene"]
-description = "Prove via real compiler-AST inspection (libclang) that every explicitly inventoried production target command (domain, foundation, application, AUTOMOC/QML/RCC generated units) obeys its exact closure and exposes no QJson/QVariant output channel except the 14 canonical allowlist entries. Unknown target commands fail closed."
+description = "Prove via real compiler-AST inspection (libclang) that every closed-world production target/header/source context obeys its exact closure and references no forbidden QJson/QVariant wire type except exact path+USR+semantic-signature+access+count positive allowances for intentional inbound decoders and bounded RawJson/Auth adapters."
 run = "python3 packaging/check_encoder_hygiene.py"
 
 [tasks."contracts:test-encoder-hygiene-script"]
@@ -75,5 +75,5 @@ description = "Unit-test check_encoder_hygiene.py's classify()/allowlist/sanitiz
 run = "python3 packaging/check_encoder_hygiene_test.py"
 
 [tasks."contracts:test-encoder-hygiene-ast-mutations"]
-description = "Real libclang/CMake fail-before/pass-after mutations for production target inventory, source contexts, smart-pointer/callback outputs, inheritance/aliases, owned AUTOGEN/source-local MOC, and inclusion ownership. Requires real libclang and CMake."
+description = "Real libclang/CMake fail-before/pass-after matrix for the closed forbidden-wire-type boundary across targets/configs, generator expressions, interface consumers, aliases/templates/arrays/callables/bases, and owned generated/AUTOGEN sources."
 run = "python3 packaging/check_encoder_hygiene_ast_test.py"

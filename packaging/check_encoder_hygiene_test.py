@@ -40,6 +40,7 @@ def _finding(
     display_name: str = "someMethod()",
     canonical_return_type: str = "QJsonObject",
     usr: str = "c:@N@Arkham@F@someMethod#1",
+    access: int = 0,
 ) -> ceh.Finding:
     return ceh.Finding(
         file=file,
@@ -47,6 +48,7 @@ def _finding(
         display_name=display_name,
         canonical_return_type=canonical_return_type,
         usr=usr,
+        access=access,
     )
 
 
@@ -58,7 +60,10 @@ class ClassifyTests(unittest.TestCase):
     def test_exact_allowlisted_entry_is_allowed_with_matching_count(self) -> None:
         entry = ceh.ALLOWLIST[0]
         finding = _finding(
-            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+            file=entry.file,
+            usr=entry.usr,
+            canonical_return_type=entry.semantic_signature,
+            access=entry.access,
         )
         counts = Counter({entry.key(): entry.expected_count})
         self.assertEqual(ceh.classify(finding, counts), "allowed")
@@ -69,14 +74,40 @@ class ClassifyTests(unittest.TestCase):
         # when no occurrence-count context is supplied.
         entry = ceh.ALLOWLIST[0]
         finding = _finding(
-            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+            file=entry.file,
+            usr=entry.usr,
+            canonical_return_type=entry.semantic_signature,
+            access=entry.access,
         )
         self.assertEqual(ceh.classify(finding), "allowed")
+
+    def test_allowlisted_usr_with_changed_semantic_signature_is_rejected(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = _finding(
+            file=entry.file,
+            usr=entry.usr,
+            canonical_return_type="result=const QJsonObject &",
+            access=entry.access,
+        )
+        self.assertEqual(ceh.classify(finding), "violation")
+
+    def test_allowlisted_usr_with_changed_access_is_rejected(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = _finding(
+            file=entry.file,
+            usr=entry.usr,
+            canonical_return_type=entry.semantic_signature,
+            access=2,
+        )
+        self.assertEqual(ceh.classify(finding), "violation")
 
     def test_allowlisted_entry_with_too_few_occurrences_is_a_violation(self) -> None:
         entry = ceh.ALLOWLIST[0]
         finding = _finding(
-            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+            file=entry.file,
+            usr=entry.usr,
+            canonical_return_type=entry.semantic_signature,
+            access=entry.access,
         )
         counts = Counter({entry.key(): 0})
         self.assertEqual(ceh.classify(finding, counts), "violation")
@@ -87,7 +118,10 @@ class ClassifyTests(unittest.TestCase):
         # EXACT expected occurrence count must match too.
         entry = ceh.ALLOWLIST[0]
         finding = _finding(
-            file=entry.file, usr=entry.usr, canonical_return_type="Arkham::ValueOrError<QJsonObject>"
+            file=entry.file,
+            usr=entry.usr,
+            canonical_return_type=entry.semantic_signature,
+            access=entry.access,
         )
         counts = Counter({entry.key(): entry.expected_count + 1})
         self.assertEqual(ceh.classify(finding, counts), "violation")
@@ -419,14 +453,14 @@ class AllowlistEntryTests(unittest.TestCase):
 
 
 class AllowlistShapeTests(unittest.TestCase):
-    def test_domain_allowlist_has_exactly_twelve_entries(self) -> None:
-        self.assertEqual(len(ceh.DOMAIN_ALLOWLIST), 12)
+    def test_domain_allowlist_has_exactly_sixty_four_entries(self) -> None:
+        self.assertEqual(len(ceh.DOMAIN_ALLOWLIST), 64)
 
-    def test_foundation_allowlist_has_exactly_two_entries(self) -> None:
-        self.assertEqual(len(ceh.FOUNDATION_ALLOWLIST), 2)
+    def test_foundation_allowlist_has_exactly_five_entries(self) -> None:
+        self.assertEqual(len(ceh.FOUNDATION_ALLOWLIST), 5)
 
-    def test_combined_allowlist_has_fourteen_entries(self) -> None:
-        self.assertEqual(len(ceh.ALLOWLIST), 14)
+    def test_combined_allowlist_has_sixty_nine_entries(self) -> None:
+        self.assertEqual(len(ceh.ALLOWLIST), 69)
 
     def test_allowlist_entries_are_unique(self) -> None:
         # Guards against an accidental duplicate entry silently shrinking
@@ -439,13 +473,18 @@ class AllowlistShapeTests(unittest.TestCase):
     def test_allowlist_by_key_has_one_entry_per_allowlist_member(self) -> None:
         self.assertEqual(len(ceh.ALLOWLIST_BY_KEY), len(ceh.ALLOWLIST))
 
-    def test_domain_allowlist_only_names_domain_rawjson_and_jsondecode_headers(self) -> None:
+    def test_domain_allowlist_only_names_domain_sources(self) -> None:
         for entry in ceh.DOMAIN_ALLOWLIST:
-            self.assertIn(entry.file, ("src/domain/RawJson.h", "src/domain/JsonDecode.h"))
+            self.assertTrue(entry.file.startswith("src/domain/"))
 
-    def test_foundation_allowlist_only_names_authmodels_header(self) -> None:
+    def test_foundation_allowlist_names_only_exact_foundation_decoder_files(self) -> None:
         for entry in ceh.FOUNDATION_ALLOWLIST:
-            self.assertEqual(entry.file, "src/AuthModels.h")
+            self.assertIn(entry.file, ("src/AuthModels.h", "src/ServerCapabilities.h"))
+
+    def test_every_allowlist_entry_pins_signature_and_access(self) -> None:
+        for entry in ceh.ALLOWLIST:
+            self.assertIsNotNone(entry.semantic_signature)
+            self.assertIsNotNone(entry.access)
 
     def test_domain_and_foundation_allowlists_share_no_files(self) -> None:
         # Structural proof the two audited header sets are disjoint by
