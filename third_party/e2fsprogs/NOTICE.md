@@ -6,10 +6,26 @@ dependency of the ArkhamHorror-Linux client's AppImage packaging:
 - **Name:** e2fsprogs's `lib/et` "common error" library (`libcom_err.so.2`)
 - **Upstream:** https://e2fsprogs.sourceforge.net/ (source repository:
   https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git)
-- **Distribution package:** Ubuntu 22.04 "Jammy" `libcom-err2`, version
-  `1.46.5-2ubuntu1.1`, built from the `e2fsprogs` source package (see
+- **Distribution package:** Ubuntu 22.04 "Jammy" `libcom-err2`, built from
+  the `e2fsprogs` source package (see
   `https://packages.ubuntu.com/jammy/libcom-err2` and
-  `https://git.launchpad.net/ubuntu/+source/e2fsprogs/tree/debian/copyright?h=ubuntu/jammy`)
+  `https://git.launchpad.net/ubuntu/+source/e2fsprogs/tree/debian/copyright?h=ubuntu/jammy`).
+  The exact point-release *version* (last independently confirmed:
+  `1.46.5-2ubuntu1.2`) is deliberately **not** pinned as a hardcoded fact
+  in this file -- a routine Ubuntu security update to this project's own
+  pinned `ubuntu-22.04` CI runner (see `.github/workflows/ci.yml`'s
+  `appimage-smoke` job) legitimately bumps it from time to time, and a
+  frozen version string here would silently go stale the moment that
+  happens, with nothing to ever catch the drift. Instead,
+  `packaging/audit_codec_notices.py`'s `capture_package_provenance()` /
+  `COMPONENT_EXPECTED_SOURCE_PACKAGES` re-derive and authenticate the
+  REAL, currently-installed `libcom-err2` version/source-package identity
+  directly from the live `dpkg` database at real build/audit time (see
+  "Provenance is verified dynamically, not hardcoded" below), and the
+  final produced AppImage's own SBOM (`--json-out`'s `inventory[].
+  packageProvenance`) always records the exact version that was actually
+  used for that specific build -- the durable, always-current source of
+  truth for "which exact version shipped", rather than this document.
 - **License:** MIT-style (the e2fsprogs `lib/et`/`lib/ss` license -- see
   `NOTICE`, reproduced verbatim from Ubuntu's `debian/copyright` for the
   e2fsprogs source package). This is a genuinely DIFFERENT license text,
@@ -26,6 +42,47 @@ dependency of the ArkhamHorror-Linux client's AppImage packaging:
 from linuxdeploy's own default bundling blacklist and is instead
 force-bundled explicitly by `find_bundled_libcomerr` in
 `packaging/build-appimage.sh`.
+
+## Provenance is verified dynamically, not hardcoded
+
+A cumulative review (round-N+, MEDIUM) correctly found that hardcoding one
+exact Ubuntu package *version* string in this document (as an earlier
+revision of this file did) is itself a latent defect: this project's real
+CI `apt-get install` steps are deliberately left unpinned to a specific
+package version (only the Ubuntu *release* -- "22.04" -- is pinned, via
+`runs-on: ubuntu-22.04` in `.github/workflows/ci.yml`), so the actual
+installed `libcom-err2` version can legitimately advance via routine Ubuntu
+security updates between CI runs, silently making a frozen version string
+here stale/wrong with nothing to ever notice.
+
+Rather than hardcode a version doomed to eventually drift, `packaging/
+audit_codec_notices.py` authenticates this component's real provenance
+DYNAMICALLY at build/audit time instead:
+
+- `capture_package_provenance("libcom_err.so.2")` finds the real,
+  currently-installed system copy of this library on the CI runner (or any
+  other Debian/Ubuntu host running the audit) and queries the live `dpkg`
+  database for its exact installed binary package name, version, and
+  source package.
+- `COMPONENT_EXPECTED_SOURCE_PACKAGES["e2fsprogs"]` records only the
+  STABLE fact that this component's real Debian *source package* name is
+  `e2fsprogs` -- something that does not change across ordinary point
+  releases -- and `validate_component_package_provenance()` fails
+  `packaging/audit_codec_notices.py classify` outright if the real,
+  installed system copy's own source package ever disagrees (e.g. a
+  future regression re-introducing the "libcom_err is part of krb5"
+  mistake this same review round's own history already once made -- see
+  "Why this is its own component" below).
+- The full captured `{package, version, sourcePackage}` record for every
+  bundled distro library this mechanism can verify is emitted into the
+  final SBOM/manifest (`packaging/audit_codec_notices.py classify
+  --json-out`'s `inventory[].packageProvenance` field), giving any
+  consumer of a specific, real, produced AppImage the exact version that
+  build actually shipped -- accurate by construction, unlike a hand
+  maintained prose string in this document ever could be.
+
+This deliberately never requires editing this file merely because Ubuntu
+shipped a routine point-release security update.
 
 ## Why this is its own component, separate from `../krb5/`
 

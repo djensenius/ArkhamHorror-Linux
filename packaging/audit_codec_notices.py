@@ -66,6 +66,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +78,28 @@ from pathlib import Path
 # change to one script's regex can never silently affect the other's.
 _SONAME_RE = re.compile(r"\(SONAME\)\s+Library soname:\s+\[(?P<name>[^\]]+)\]")
 _BUILD_ID_RE = re.compile(r"Build ID:\s*(?P<id>[0-9a-fA-F]+)")
+
+# Round-N+ review (HIGH, "Qt authenticity accepts matching build ID
+# only; modified bytes can retain note. Build ID not signature."):
+# parses `readelf -lW`'s one-line-per-entry program header format (see
+# _executable_segment_digest()'s own docstring for the full rationale).
+# The FLAGS column is a FIXED three-character field -- 'R' or ' ',
+# then 'W' or ' ', then 'E' or ' ' -- never whitespace-collapsed by
+# readelf itself, which is why this is matched as a literal
+# three-character class rather than a naive whitespace-split (which
+# would misalign every column after an entry with a missing permission
+# bit, e.g. "R E" for read+execute-but-not-write).
+_PROGRAM_HEADER_RE = re.compile(
+    r"^\s*(?P<type>\S+)\s+"
+    r"(?P<offset>0x[0-9a-fA-F]+)\s+"
+    r"(?P<vaddr>0x[0-9a-fA-F]+)\s+"
+    r"(?P<paddr>0x[0-9a-fA-F]+)\s+"
+    r"(?P<filesz>0x[0-9a-fA-F]+)\s+"
+    r"(?P<memsz>0x[0-9a-fA-F]+)\s+"
+    r"(?P<flags>[R ][W ][E ])\s+"
+    r"(?P<align>0x[0-9a-fA-F]+)\s*$",
+    re.MULTILINE,
+)
 
 # Deliberately duplicated from (not imported from)
 # audit_dependency_closure.py's own _ELF_MAGIC/_is_elf_file -- each script
@@ -148,16 +171,100 @@ def _read_build_id(path: Path) -> str | None:
     digest the linker embeds and which normal post-link binary-editing
     tools (patchelf's RUNPATH/interpreter rewriting, strip's debug-info
     removal, cp) do not alter, because it identifies the *compiled code*
-    itself rather than any mutable container metadata -- this is
-    precisely why it, not a whole-file byte hash, is the correct
-    signal for "is this final, patchelf-rewritten bundled file the same
-    underlying compiled object as this other (e.g. pre-patchelf SDK
-    reference) copy", which a plain sha256 comparison could never answer
-    correctly for a legitimately-patched file. Returns None, not a
-    failure, if the object was linked without `--build-id` (rare on a
-    modern distro toolchain, but not an error in itself)."""
+    itself rather than any mutable container metadata.
+
+    Round-N+ review (HIGH, "Build ID not signature"): a build-id match
+    alone is deliberately NOT treated anywhere in this module any more as
+    sufficient proof of authenticity (see
+    _is_same_compiled_object_or_unwritten()'s own docstring, which now
+    uses _executable_segment_digest() instead) -- it is merely a stored
+    identifier the linker writes once at build time, never re-verified
+    or invalidated by anything if the underlying bytes are edited
+    afterward. A tool capable of patching PT_LOAD segment bytes in place
+    can trivially leave an old, now-stale build-id note untouched, and
+    nothing in the ELF format itself would ever notice or object. Still
+    retained/exposed here for elf_identity()'s SBOM inventory, where it
+    remains useful, honestly-labeled provenance metadata (alongside the
+    real executableSegmentDigest field), just never the basis for an
+    authenticity decision by itself. Returns None, not a failure, if the
+    object was linked without `--build-id` (rare on a modern distro
+    toolchain, but not an error in itself)."""
     match = _BUILD_ID_RE.search(_readelf(path, "-n"))
     return match.group("id").lower() if match else None
+
+
+def _read_executable_load_segments(path: Path) -> list[tuple[int, int]]:
+    """Returns (file_offset, file_size) for every PT_LOAD program header
+    segment in `path` whose PF_X (executable) permission bit is set, in
+    program-header order -- i.e. exactly the file ranges that will ever
+    actually be mapped as *executable* code at runtime. Raises
+    ElfIdentityError (via _readelf()) if readelf itself cannot parse
+    `path`'s program headers at all."""
+    segments: list[tuple[int, int]] = []
+    for match in _PROGRAM_HEADER_RE.finditer(_readelf(path, "-l", "-W")):
+        if match.group("type") != "LOAD":
+            continue
+        if match.group("flags")[2] != "E":
+            continue
+        segments.append(
+            (int(match.group("offset"), 16), int(match.group("filesz"), 16))
+        )
+    return segments
+
+
+def _executable_segment_digest(path: Path) -> str | None:
+    """Round-N+ review (HIGH, "Qt authenticity accepts matching build ID
+    only; modified bytes can retain note. Build ID not signature."):
+    returns a SHA-256 digest computed directly over the exact on-disk
+    bytes of every executable (PF_X) PT_LOAD segment in `path`, in
+    program-header order -- i.e. a real cryptographic proof over the
+    actual compiled CODE this object will ever execute -- or None if
+    `path` cannot be parsed as an ELF object at all, or has no
+    executable PT_LOAD segment (a pure-data object, vanishingly rare for
+    a real bundled library/plugin/executable but not itself an error).
+
+    This is deliberately NOT the same thing as a bare `.note.gnu.
+    build-id` comparison (see _read_build_id()'s own updated docstring
+    for why a build-id match alone proves nothing) and deliberately NOT
+    a whole-file byte comparison either (patchelf legitimately rewrites
+    RUNPATH/RPATH/INTERP string content and the .dynamic section that
+    references it -- and, whenever the new string is longer than the
+    placeholder it replaces, may need to grow/relocate the dynamic
+    string table, shifting the file offsets of everything stored after
+    it -- while strip legitimately removes .symtab/.debug* sections
+    entirely; neither of those ever lives inside, or shifts the
+    in-segment content of, an *executable* PT_LOAD segment, since
+    a linker never places mutable/rewritable metadata -- relocatable
+    string tables, symbol tables, or debug info -- in a segment mapped
+    with execute permission). Hashing only the bytes that are provably
+    stable across both of this project's own real packaging
+    transformations (patchelf, strip) is therefore the correct middle
+    ground: broad enough to genuinely prove "the actual code is
+    unmodified", narrow enough to still match a legitimately repackaged
+    file, and immune to a mutation that patches code while leaving a
+    now-stale build-id note untouched (exactly the attack a bare
+    build-id comparison could not detect at all)."""
+    try:
+        segments = _read_executable_load_segments(path)
+    except ElfIdentityError:
+        return None
+    if not segments:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for offset, size in segments:
+                handle.seek(offset)
+                remaining = size
+                while remaining > 0:
+                    chunk = handle.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def _sha256(path: Path) -> str:
@@ -169,14 +276,21 @@ def elf_identity(path: Path) -> dict[str, str | None]:
     object, for SBOM inventory purposes: its whole-file sha256 (detects
     ANY byte-level substitution of the final shipped artifact, however
     produced; always computable via pure Python, never fails), its own
-    build-id (detects/proves *compiled-code* identity across a
-    legitimate post-link edit -- see _read_build_id()), and its own
-    DT_SONAME (its own declared logical library name/version, which for
-    a versioned shared object may differ from its basename on disk).
+    build-id (honestly-labeled provenance metadata only -- see
+    _read_build_id()'s updated docstring for why this is NOT a proof of
+    authenticity by itself), its own executableSegmentDigest (the real
+    cryptographic proof over its actual compiled/executable code -- see
+    _executable_segment_digest()'s own docstring for exactly what this
+    covers and why it is stable across this project's own legitimate
+    patchelf/strip repackaging while still detecting any real code
+    substitution, unlike a bare build-id), and its own DT_SONAME (its own
+    declared logical library name/version, which for a versioned shared
+    object may differ from its basename on disk).
 
-    buildId/soname are None whenever readelf cannot supply them --
-    whether because the object legitimately has none (both are optional
-    per-object; not every plugin declares a SONAME, and a toolchain not
+    buildId/executableSegmentDigest/soname are each independently None
+    whenever they cannot be supplied -- whether because the object
+    legitimately has none (not every object has an executable PT_LOAD
+    segment, not every plugin declares a SONAME, and a toolchain not
     passing `--build-id` produces no build-id note), because readelf
     itself is not installed, or because `path` is not parseable as an
     ELF object at all. This is deliberately never a hard failure: an
@@ -185,8 +299,8 @@ def elf_identity(path: Path) -> dict[str, str | None]:
     unproduced merely because one detail about one entry could not be
     determined in the current environment -- the sha256 field alone
     already gives every entry a verifiable, always-present identity, and
-    a None buildId/soname is visible, honestly-reported information in
-    the manifest, not a silently dropped entry."""
+    a None field is visible, honestly-reported information in the
+    manifest, not a silently dropped entry."""
     try:
         build_id = _read_build_id(path)
     except ElfIdentityError:
@@ -198,6 +312,7 @@ def elf_identity(path: Path) -> dict[str, str | None]:
     return {
         "sha256": _sha256(path),
         "buildId": build_id,
+        "executableSegmentDigest": _executable_segment_digest(path),
         "soname": soname,
     }
 
@@ -353,6 +468,245 @@ COMPONENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 MANDATORY_COMPONENTS: frozenset[str] = frozenset({"libavif"})
 
+# Round-N+ review (MEDIUM, "libcom_err provenance/version inferred
+# basename; CI apt unpinned, notice hardcodes Jammy 1.46.5-2ubuntu1.1
+# while updates may .2"): rather than hardcoding one exact package
+# VERSION string in a NOTICE.md file (which a routine, entirely
+# legitimate Ubuntu security update to this project's own pinned
+# `ubuntu-22.04` CI runner -- see .github/workflows/ci.yml's
+# `appimage-smoke` job -- would silently make stale the moment a point
+# release ships, with nothing to ever catch the drift), this maps each
+# distro-packaged COMPONENT_PATTERNS component to the set of Debian
+# SOURCE package name(s) it is expected to actually originate from on
+# this project's real, pinned Ubuntu 22.04 build/audit environment.
+# capture_package_provenance()/validate_component_package_provenance()
+# below use this to authenticate, at real build/CI time, the ACTUAL
+# `dpkg-query`-derived source package of the real system copy of each
+# bundled distro library -- catching a wrong owner/version/component
+# mapping outright -- while never needing this table itself edited
+# merely because Ubuntu shipped a routine point-release version bump
+# (source package NAMES are stable across such updates; only the
+# version, which this table deliberately does not pin, changes).
+#
+# Every entry below was independently verified against a real,
+# unmodified `ubuntu:22.04` container (matching the exact `ubuntu-22.04`
+# CI runner image this project's own `appimage-smoke` job is pinned to)
+# via `dpkg -S <realpath>` (falling back to the merged-/usr-stripped
+# path when dpkg's own database predates the merge -- see
+# _dpkg_owning_package()'s own docstring) followed by
+# `dpkg-query -W -f='${source:Package}'`, for every actual bundled
+# library this project's own real dependency closure pulls in --
+# including libavif's own real, live ldd-resolved AV1 backend closure
+# (dav1d/libgav1/libaom/libyuv/abseil), not a guessed/hypothetical one.
+# Components with NO entry here (qt, qtkeychain -- never distro apt
+# packages in this project's pipeline at all -- and svt-av1/rav1e/
+# sharpyuv, which the real, live Ubuntu 22.04 `libavif13` build does not
+# even dynamically link, per real `ldd` output) are simply never
+# validated by this mechanism; that is a deliberate, honestly-scoped
+# no-op for a component this table cannot make any true claim about,
+# never a silent false negative for one it can.
+COMPONENT_EXPECTED_SOURCE_PACKAGES: dict[str, frozenset[str]] = {
+    "e2fsprogs": frozenset({"e2fsprogs"}),
+    "krb5": frozenset({"krb5"}),
+    "libsecret": frozenset({"libsecret"}),
+    "libgpg-error": frozenset({"libgpg-error"}),
+    "libgcrypt": frozenset({"libgcrypt20"}),
+    "libffi": frozenset({"libffi"}),
+    "glib": frozenset({"glib2.0"}),
+    "zlib": frozenset({"zlib"}),
+    "pcre2": frozenset({"pcre2"}),
+    "util-linux": frozenset({"util-linux"}),
+    "libselinux": frozenset({"libselinux"}),
+    "liblzma": frozenset({"xz-utils"}),
+    "libxau": frozenset({"libxau"}),
+    "libxdmcp": frozenset({"libxdmcp"}),
+    "xcb": frozenset({"libxcb"}),
+    "xcb-util": frozenset({"xcb-util"}),
+    "xcb-util-image": frozenset({"xcb-util-image"}),
+    "xcb-util-keysyms": frozenset({"xcb-util-keysyms"}),
+    "xcb-util-renderutil": frozenset({"xcb-util-renderutil"}),
+    "xcb-util-wm": frozenset({"xcb-util-wm"}),
+    "xcb-util-cursor": frozenset({"xcb-util-cursor"}),
+    "xkbcommon": frozenset({"libxkbcommon"}),
+    "brotli": frozenset({"brotli"}),
+    "libbsd": frozenset({"libbsd"}),
+    "libmd": frozenset({"libmd"}),
+    "libcap": frozenset({"libcap2"}),
+    "dbus": frozenset({"dbus"}),
+    "icu": frozenset({"icu"}),
+    "libkeyutils": frozenset({"keyutils"}),
+    "lz4": frozenset({"lz4"}),
+    "pcre": frozenset({"pcre3"}),
+    "libpng": frozenset({"libpng1.6"}),
+    "systemd": frozenset({"systemd"}),
+    "zstd": frozenset({"zstd"}),
+    "libjpeg": frozenset({"libjpeg-turbo"}),
+    "bzip2": frozenset({"bzip2"}),
+    "libavif": frozenset({"libavif"}),
+    "libaom": frozenset({"aom"}),
+    "libyuv": frozenset({"libyuv"}),
+    "dav1d": frozenset({"dav1d"}),
+    "libgav1": frozenset({"libgav1"}),
+    "abseil": frozenset({"abseil"}),
+    # gcc-12 is Ubuntu 22.04 "Jammy"'s own current default GCC source
+    # package name; kept as its own frozenset (rather than a bare
+    # literal) so a deliberate future addition (e.g. if this project's
+    # pinned CI image is ever intentionally moved to a newer Ubuntu with
+    # a renamed gcc-NN source package) is a clearly-reviewable one-line
+    # diff here, not a silent behavior change.
+    "gcc-runtime": frozenset({"gcc-12"}),
+}
+
+# Deliberately x86_64-only (this project's whole AppImage target ABI --
+# see ABI_ALLOWLIST/audit_dependency_closure.py's own X86_64 assumption)
+# and deliberately NOT including any bundled AppDir path -- these are
+# the standard locations a real Debian/Ubuntu system installs its own
+# unmodified system libraries, searched here specifically to find the
+# ORIGINAL, dpkg-owned system copy of a library this project's build
+# process separately *bundles a copy of* into the AppDir, so that copy's
+# real upstream package/version/source provenance can be authenticated
+# against the live system dpkg database -- the bundled AppDir copy
+# itself is never dpkg-owned (it is linuxdeploy's own plain file copy,
+# possibly patchelf-rewritten) and therefore could never itself be
+# looked up this way.
+_SYSTEM_LIBRARY_SEARCH_DIRS: tuple[Path, ...] = (
+    Path("/usr/lib/x86_64-linux-gnu"),
+    Path("/lib/x86_64-linux-gnu"),
+    Path("/usr/lib"),
+    Path("/lib"),
+)
+
+
+def _dpkg_owning_package(path: Path) -> str | None:
+    """The name (with any `:architecture` qualifier stripped) of the
+    dpkg-installed binary package that owns the real, existing file at
+    `path` -- or None if `dpkg` itself is not installed (this function
+    is only ever meaningfully exercised on a real Debian/Ubuntu system;
+    a macOS/non-Debian development machine or a component that
+    genuinely is not distro-packaged both fall through to this same,
+    deliberately non-fatal None), or if no installed package owns this
+    exact path.
+
+    Tries `path` exactly first; if that reports no owner, retries with
+    any leading `/usr` prefix stripped. This handles a real, empirically
+    confirmed wrinkle on a modern merged-/usr Ubuntu system: dpkg's own
+    package-contents database still records many system libraries'
+    paths in their pre-usr-merge form (e.g. `/lib/x86_64-linux-gnu/...`)
+    even though `/lib` is now purely a symlink to `/usr/lib` on disk --
+    a literal `dpkg -S /usr/lib/x86_64-linux-gnu/libz.so.1.2.11` was
+    directly observed to report no owner at all on a genuine, unmodified
+    `ubuntu:22.04` system for exactly this reason, while `dpkg -S
+    /lib/x86_64-linux-gnu/libz.so.1.2.11` (the path dpkg's own database
+    actually recorded) correctly resolves it."""
+    if shutil.which("dpkg") is None:
+        return None
+    for candidate in (path, Path(str(path).removeprefix("/usr"))):
+        try:
+            result = subprocess.run(
+                ["dpkg", "-S", str(candidate)],
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return None
+        if result.returncode != 0 or not result.stdout.strip():
+            continue
+        owner = result.stdout.strip().splitlines()[0].split(":", 1)[0]
+        return owner.split(":")[0]
+    return None
+
+
+def _dpkg_package_metadata(package: str) -> tuple[str, str] | None:
+    """(installed version, source package name) for an installed dpkg
+    binary `package` name, or None if `dpkg-query` is unavailable or the
+    package is not actually installed (a defensive case that should
+    never occur given this is only ever called with a package name
+    `_dpkg_owning_package()` itself just reported as installed, but
+    handled explicitly rather than assumed)."""
+    if shutil.which("dpkg-query") is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "dpkg-query",
+                "--showformat=${Version}\t${source:Package}",
+                "--show",
+                package,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or "\t" not in result.stdout:
+        return None
+    version, source_package = result.stdout.split("\t", 1)
+    if not version or not source_package:
+        return None
+    return version, source_package
+
+
+def capture_package_provenance(basename: str) -> dict[str, str] | None:
+    """Round-N+ review (MEDIUM, package provenance): finds the real,
+    currently-installed system copy of a library sharing `basename`
+    (searched across _SYSTEM_LIBRARY_SEARCH_DIRS, symlinks resolved) and
+    returns its dpkg-derived {"package", "version", "sourcePackage"}
+    identity, or None the moment any step of that is unavailable --
+    dpkg not installed, no real system library of this basename exists
+    on the current host at all (a genuinely project-vendored/
+    self-built codec library, or simply a non-Debian development
+    machine), or the found file is not actually dpkg-owned. None is
+    never itself an error here: it is the correct, honest answer
+    whenever this specific, real-system cross-check cannot meaningfully
+    be performed in the current environment, and every caller (both the
+    CLI's provenance validation and the SBOM inventory below) treats it
+    as such -- only a REAL, resolved provenance record that disagrees
+    with COMPONENT_EXPECTED_SOURCE_PACKAGES is ever treated as a
+    failure."""
+    for search_dir in _SYSTEM_LIBRARY_SEARCH_DIRS:
+        candidate = search_dir / basename
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve()
+        package = _dpkg_owning_package(resolved)
+        if package is None:
+            continue
+        metadata = _dpkg_package_metadata(package)
+        if metadata is None:
+            continue
+        version, source_package = metadata
+        return {
+            "package": package,
+            "version": version,
+            "sourcePackage": source_package,
+        }
+    return None
+
+
+def validate_component_package_provenance(
+    component: str, provenance: dict[str, str]
+) -> str | None:
+    """Returns a descriptive problem string if `provenance` (as returned
+    by capture_package_provenance()) actually disagrees with
+    COMPONENT_EXPECTED_SOURCE_PACKAGES' expectation for `component`, or
+    None if it agrees, or None if `component` simply has no entry in
+    that table at all (nothing this project can currently verify -- see
+    COMPONENT_EXPECTED_SOURCE_PACKAGES' own docstring for exactly which
+    components that is and why, deliberately never conflated with an
+    actual, checkable mismatch)."""
+    expected = COMPONENT_EXPECTED_SOURCE_PACKAGES.get(component)
+    if expected is None:
+        return None
+    actual = provenance["sourcePackage"]
+    if actual in expected:
+        return None
+    return (
+        f"component {component!r} claims Debian source package "
+        f"{sorted(expected)!r}, but the real installed system library's "
+        f"own dpkg-derived source package is {actual!r} (binary package "
+        f"{provenance['package']!r} version {provenance['version']!r})"
+    )
+
 # Qt ships its own plugins (image format decoders, platform integrations,
 # TLS backends, SQL drivers, etc.) under a fixed, well-documented set of
 # subdirectory names -- see Qt's own "Deploying Qt Plugins" documentation
@@ -437,21 +791,6 @@ def classify(basename: str) -> str | None:
     return None
 
 
-def _build_id_or_none(path: Path) -> str | None:
-    """`_read_build_id(path)`, but treats readelf itself being entirely
-    unavailable, or `path` not being a real ELF object at all, the same
-    as a genuinely absent build-id note (None) rather than a hard
-    ElfIdentityError -- appropriate ONLY for this best-effort provenance
-    comparison (which always has the sha256 fallback below to fall back
-    on), unlike elf_identity()'s own SBOM-inventory use of
-    _read_build_id(), where an unparseable bundled ELF is a real,
-    reportable tooling problem that must not be silently swallowed."""
-    try:
-        return _read_build_id(path)
-    except ElfIdentityError:
-        return None
-
-
 def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool:
     """Returns True only if a file with the SAME relative sub-path (plugin
     subdirectory + basename, or the full path beneath the "qml" root)
@@ -468,20 +807,28 @@ def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool
     replace the genuine Qt plugin at that exact path with an arbitrary
     binary and this check would previously still accept it, since it
     never actually inspected the bundled file's own content. Bytes alone
-    cannot be the proof either, in the other direction: linuxdeploy's
-    patchelf step legitimately rewrites the bundled copy's RUNPATH/
-    interpreter after copying it out of the SDK, so a genuine, entirely
-    unmodified-in-substance Qt plugin will NOT be byte-identical to the
-    pre-patchelf reference copy. The correct, precise signal is each
-    object's own `.note.gnu.build-id` (see _read_build_id()'s docstring):
-    it identifies the *compiled code* itself and survives patchelf's
-    purely-metadata rewriting untouched, so requiring it to match proves
-    "same compiled object, merely repackaged" without being fooled by
-    the repackaging step itself. If either copy has no build-id at all
-    (a toolchain not passing `--build-id`, a stripped binary, or readelf
-    itself unavailable), this falls back to requiring the two files be
-    fully byte-identical -- deliberately the strict, fail-closed choice
-    for that rarer case, rather than silently trusting the path alone.
+    cannot be the sole proof either, in the other direction:
+    linuxdeploy's patchelf step legitimately rewrites the bundled copy's
+    RUNPATH/interpreter after copying it out of the SDK, so a genuine,
+    entirely unmodified-in-substance Qt plugin will NOT be byte-identical
+    to the pre-patchelf reference copy.
+
+    Round-N+ review (HIGH, "Qt authenticity accepts matching build ID
+    only; modified bytes can retain note. Build ID not signature."): the
+    correct, precise signal is each object's own executable PT_LOAD
+    segment bytes (see _executable_segment_digest()'s own docstring) --
+    a real cryptographic digest over the actual compiled CODE, which
+    patchelf/strip provably never modify -- NOT a bare `.note.gnu.
+    build-id` match, which is merely a stored identifier nothing ever
+    re-verifies against the file's current bytes: a tool capable of
+    patching executable code in place could trivially leave an old,
+    correct-looking build-id note untouched, and a build-id-only check
+    would have silently accepted the substitution. If either copy has no
+    executable PT_LOAD segment at all (vanishingly rare for a real
+    bundled library/plugin, but not itself an error), this falls back to
+    requiring the two files be fully byte-identical -- deliberately the
+    strict, fail-closed choice for that rarer case, rather than silently
+    trusting the path alone.
 
     `path.is_file()` is checked before performing this content
     verification at all: production callers (classify_all(), via
@@ -510,22 +857,25 @@ def _is_same_compiled_object_or_unwritten(candidate: Path, path: Path) -> bool:
     """Shared same-compiled-object proof used by both
     _is_real_qt_plugin_or_qml_module() (Qt plugins/QML modules) and
     _is_real_core_qt_library() (core libQt6*.so* libraries): see the
-    former's own docstring for why a build-id match (falling back to a
-    full byte comparison only when either side has none) is the correct
-    signal, rather than a bare path/name match or a bare byte-identical
-    comparison alone. `path.is_file()` is checked first for exactly the
-    same reason documented there -- production callers always pass a
-    real, existing bundled file; this module's own pure-logic unit tests
-    (deliberately not needing a real ELF toolchain) may not."""
+    former's own docstring for why a genuine cryptographic digest over
+    each object's own executable PT_LOAD segment bytes (falling back to a
+    full byte comparison only when neither has one) is the correct
+    signal, rather than a bare path/name match, a bare `.note.gnu.
+    build-id` match (not a signature -- see _read_build_id()'s updated
+    docstring), or a bare byte-identical comparison alone. `path.is_file()`
+    is checked first for exactly the same reason documented there --
+    production callers always pass a real, existing bundled file; this
+    module's own pure-logic unit tests (deliberately not needing a real
+    ELF toolchain) may not."""
     if not candidate.is_file():
         return False
     if not path.is_file():
         return True
 
-    reference_build_id = _build_id_or_none(candidate)
-    bundled_build_id = _build_id_or_none(path)
-    if reference_build_id is not None and bundled_build_id is not None:
-        return reference_build_id == bundled_build_id
+    reference_digest = _executable_segment_digest(candidate)
+    bundled_digest = _executable_segment_digest(path)
+    if reference_digest is not None and bundled_digest is not None:
+        return reference_digest == bundled_digest
     return _sha256(candidate) == _sha256(path)
 
 
@@ -733,10 +1083,13 @@ def build_sbom_inventory(
 
     Each entry: path (relative to lib_dir), basename, classification
     ("allowlisted", "first-party", a COMPONENT_PATTERNS/Qt component
-    name, or "unmapped"), and elf_identity()'s sha256/buildId/soname
-    fields -- every final bundled ELF, fully identified, with an
-    explicit, reviewable disposition; nothing bundled is ever left out
-    of this list."""
+    name, or "unmapped"), elf_identity()'s sha256/buildId/
+    executableSegmentDigest/soname fields, and packageProvenance (see
+    capture_package_provenance()'s own docstring; None whenever no real
+    dpkg-owned system copy of this basename can be found in the current
+    environment, never itself an error) -- every final bundled ELF,
+    fully identified, with an explicit, reviewable disposition; nothing
+    bundled is ever left out of this list."""
     entries: list[dict[str, object]] = []
     for path in find_bundled_libraries(lib_dir):
         basename = path.name
@@ -754,6 +1107,7 @@ def build_sbom_inventory(
             "classification": classification,
         }
         entry.update(elf_identity(path))
+        entry["packageProvenance"] = capture_package_provenance(basename)
         entries.append(entry)
     entries.sort(key=lambda e: str(e["path"]))
     return entries
@@ -812,6 +1166,40 @@ def cmd_classify(args: argparse.Namespace) -> int:
         )
         for path in unmapped:
             print(f"  {path}", file=sys.stderr)
+        return 1
+
+    # Round-N+ review (MEDIUM, package provenance): cross-check every
+    # classified distro-packaged component against the REAL, live
+    # dpkg-derived source package of a same-basename system library, if
+    # one can actually be found on the current host (see
+    # capture_package_provenance()'s own docstring for exactly when this
+    # is None -- always harmless -- versus a real, checkable mismatch).
+    # This is the load-bearing check in the real, pinned `ubuntu-22.04`
+    # `appimage-smoke` CI job (see .github/workflows/ci.yml), where a
+    # genuine system copy of e.g. libcom_err.so.2/libkrb5.so.3 is always
+    # actually installed and dpkg-owned; it is a harmless, entirely
+    # skipped no-op in any other environment (a non-Debian development
+    # machine, or a component this project genuinely vendors/builds from
+    # source rather than installing via apt).
+    provenance_problems: list[str] = []
+    for component, paths in sorted(by_component.items()):
+        for path in paths:
+            provenance = capture_package_provenance(path.name)
+            if provenance is None:
+                continue
+            problem = validate_component_package_provenance(component, provenance)
+            if problem is not None:
+                provenance_problems.append(f"{path.relative_to(lib_dir)}: {problem}")
+    if provenance_problems:
+        print(
+            "audit_codec_notices: bundled component/real-system "
+            "package-provenance mismatch (see "
+            "COMPONENT_EXPECTED_SOURCE_PACKAGES in "
+            "packaging/audit_codec_notices.py):",
+            file=sys.stderr,
+        )
+        for problem in provenance_problems:
+            print(f"  {problem}", file=sys.stderr)
         return 1
 
     for component, paths in sorted(by_component.items()):

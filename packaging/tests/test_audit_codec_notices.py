@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 _PACKAGING_DIR = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _PACKAGING_DIR)
@@ -965,6 +967,10 @@ class SbomInventoryTests(unittest.TestCase):
             audit._sha256(self.lib_dir / "libc.so.6"),
         )
         self.assertEqual(by_path["libavif.so.16.0.0"]["classification"], "libavif")
+        # The new executableSegmentDigest field must be present (even
+        # if None for a fake, non-parseable ELF fixture) on every entry
+        # -- never a silently-missing key.
+        self.assertIn("executableSegmentDigest", by_path["libc.so.6"])
 
     def test_unmapped_library_still_appears_in_the_inventory(self) -> None:
         (self.lib_dir / "libmysteryvendor.so.3").write_bytes(audit._ELF_MAGIC + b"???")
@@ -1007,6 +1013,35 @@ def _compile_shared_object(cc_bin: str, source: str, output: Path) -> None:
         check=True,
         capture_output=True,
     )
+
+
+# Deliberately its own tiny, independently-reviewable `readelf -lW`
+# parser -- NOT a reuse/import of audit_codec_notices.py's own
+# _PROGRAM_HEADER_RE/_read_executable_load_segments() -- so this
+# regression test's own understanding of "where is a real executable
+# segment" can never coincidentally share, and therefore never mask, a
+# bug in the production parser it exists to exercise.
+_TEST_LOAD_HEADER_RE = re.compile(
+    r"^\s*LOAD\s+(?P<offset>0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+\s+"
+    r"(?P<filesz>0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s+(?P<flags>[R ][W ][E ])\s+",
+    re.MULTILINE,
+)
+
+
+def _first_executable_load_segment(path: Path) -> tuple[int, int]:
+    """Returns (file_offset, file_size) of the first PT_LOAD segment in
+    `path` with the executable (E) permission bit set, parsed
+    independently of production code (see the module comment above)."""
+    output = subprocess.run(
+        ["readelf", "-lW", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    for match in _TEST_LOAD_HEADER_RE.finditer(output):
+        if match.group("flags")[2] == "E":
+            return int(match.group("offset"), 16), int(match.group("filesz"), 16)
+    raise AssertionError(f"{path} has no executable PT_LOAD segment")
 
 
 @unittest.skipUnless(
@@ -1120,6 +1155,292 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
             audit._read_build_id(reference), audit._read_build_id(bundled)
         )
         self.assertEqual(audit.classify_path(bundled, qt_root), "qt")
+
+    def test_code_mutation_preserving_build_id_note_is_rejected(self) -> None:
+        # Round-N+ review (HIGH, "Build ID not signature"): this is the
+        # exact attack a bare build-id comparison cannot detect -- a
+        # single byte inside a real, mapped EXECUTABLE PT_LOAD segment
+        # is flipped in place (a stand-in for any tool/attacker capable
+        # of patching compiled code after linking) while the
+        # `.note.gnu.build-id` section itself is never touched at all,
+        # so it stays byte-identical to the reference. The OLD
+        # build-id-only check would have wrongly classified this as
+        # "qt" (same compiled object); the fixed executable-segment
+        # digest must reject it.
+        qt_root = self.root / "qt_sdk"
+        (qt_root / "plugins" / "imageformats").mkdir(parents=True)
+        reference = qt_root / "plugins" / "imageformats" / "libqjpeg.so"
+        _compile_shared_object(
+            self.cc_bin,
+            "int test_plugin_entry(void) { return 1; }\n"
+            "int another_function(int x) { return x * 2 + 1; }\n",
+            reference,
+        )
+
+        bundled_dir = self.root / "appdir" / "plugins" / "imageformats"
+        bundled_dir.mkdir(parents=True)
+        mutated = bundled_dir / "libqjpeg.so"
+        mutated.write_bytes(reference.read_bytes())
+
+        offset, size = _first_executable_load_segment(reference)
+        self.assertGreater(size, 0)
+        data = bytearray(mutated.read_bytes())
+        # Flip one bit near the middle of the mapped executable range --
+        # anywhere inside [offset, offset + size) is real, mapped,
+        # executable code, never section-table/relocation metadata.
+        mutate_at = offset + size // 2
+        data[mutate_at] ^= 0xFF
+        mutated.write_bytes(bytes(data))
+
+        # Sanity: the mutation really did change the bytes...
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(mutated))
+        # ...while leaving the stored build-id note completely
+        # untouched -- exactly the scenario a build-id-only check could
+        # never catch.
+        self.assertEqual(
+            audit._read_build_id(reference), audit._read_build_id(mutated)
+        )
+        self.assertNotEqual(
+            audit._executable_segment_digest(reference),
+            audit._executable_segment_digest(mutated),
+        )
+        self.assertIsNone(audit.classify_path(mutated, qt_root))
+
+    def test_executable_segment_digest_is_stable_across_patchelf_rpath_edit(
+        self,
+    ) -> None:
+        # The flip side of the mutation test above: a real patchelf
+        # RUNPATH rewrite (which only ever touches .dynamic/.dynstr,
+        # never a mapped executable segment) must NOT change the
+        # executable-segment digest, or every genuinely-repackaged Qt
+        # plugin would start failing this check.
+        if not shutil.which("patchelf"):
+            self.skipTest("requires patchelf to simulate a real RUNPATH rewrite")
+        reference = self.root / "reference.so"
+        _compile_shared_object(
+            self.cc_bin, "int test_plugin_entry(void) { return 1; }\n", reference
+        )
+        patched = self.root / "patched.so"
+        patched.write_bytes(reference.read_bytes())
+        patched.chmod(0o755)
+        subprocess.run(
+            ["patchelf", "--set-rpath", "$ORIGIN/../..", str(patched)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(patched))
+        self.assertEqual(
+            audit._executable_segment_digest(reference),
+            audit._executable_segment_digest(patched),
+        )
+
+    def test_executable_segment_digest_none_when_no_executable_segment(
+        self,
+    ) -> None:
+        # A plain, non-ELF file (or one whose readelf output has no
+        # executable PT_LOAD entry at all) must return None, not raise
+        # or silently produce a hash over unrelated bytes.
+        not_elf = self.root / "not-a-real-elf.so"
+        not_elf.write_bytes(b"\x00" * 64)
+        self.assertIsNone(audit._executable_segment_digest(not_elf))
+
+
+
+class PackageProvenanceTests(unittest.TestCase):
+    """Round-N+ review (MEDIUM, "libcom_err provenance/version inferred
+    basename; CI apt unpinned, notice hardcodes Jammy 1.46.5-2ubuntu1.1
+    while updates may .2"): portable (no real dpkg needed --
+    _dpkg_owning_package()/_dpkg_package_metadata() are mocked directly)
+    tests of capture_package_provenance()/
+    validate_component_package_provenance()'s own logic."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.search_dir = Path(self._tmp.name)
+
+    def test_capture_returns_none_when_no_system_copy_exists_anywhere(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (self.search_dir,)
+        ):
+            self.assertIsNone(
+                audit.capture_package_provenance("libnothing-like-this.so.1")
+            )
+
+    def test_capture_returns_none_when_dpkg_does_not_own_the_found_file(
+        self,
+    ) -> None:
+        (self.search_dir / "libfoo.so.1").write_bytes(b"\x00")
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (self.search_dir,)
+        ), mock.patch.object(audit, "_dpkg_owning_package", return_value=None):
+            self.assertIsNone(audit.capture_package_provenance("libfoo.so.1"))
+
+    def test_capture_returns_full_identity_when_a_real_system_copy_is_dpkg_owned(
+        self,
+    ) -> None:
+        (self.search_dir / "libfoo.so.1").write_bytes(b"\x00")
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (self.search_dir,)
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="libfoo1"
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("1.2.3-1ubuntu1", "foosource"),
+        ):
+            self.assertEqual(
+                audit.capture_package_provenance("libfoo.so.1"),
+                {
+                    "package": "libfoo1",
+                    "version": "1.2.3-1ubuntu1",
+                    "sourcePackage": "foosource",
+                },
+            )
+
+    def test_validate_accepts_matching_expected_source_package(self) -> None:
+        self.assertIsNone(
+            audit.validate_component_package_provenance(
+                "e2fsprogs",
+                {
+                    "package": "libcom-err2",
+                    "version": "1.46.5-2ubuntu1.2",
+                    "sourcePackage": "e2fsprogs",
+                },
+            )
+        )
+
+    def test_validate_rejects_wrong_source_package(self) -> None:
+        # The exact regression this finding is about: a captured
+        # provenance record whose real source package does not match
+        # what the component claims (e.g. a future conflation bug
+        # re-introducing "libcom_err is part of krb5") must fail
+        # outright, not silently pass.
+        problem = audit.validate_component_package_provenance(
+            "e2fsprogs",
+            {
+                "package": "libkrb5-3",
+                "version": "1.19.2-2ubuntu0.8",
+                "sourcePackage": "krb5",
+            },
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("e2fsprogs", problem)
+        self.assertIn("krb5", problem)
+
+    def test_validate_is_a_silent_no_op_for_a_component_with_no_mapping(
+        self,
+    ) -> None:
+        # qt/qtkeychain (and any future component this project cannot
+        # currently make a real claim about) must never be
+        # spuriously flagged merely for lacking a mapping entry.
+        self.assertIsNone(
+            audit.validate_component_package_provenance(
+                "not-a-real-component",
+                {
+                    "package": "anything",
+                    "version": "0",
+                    "sourcePackage": "anything-at-all",
+                },
+            )
+        )
+
+    def test_cmd_classify_fails_when_real_provenance_disagrees_with_component(
+        self,
+    ) -> None:
+        # End-to-end wiring test: classify() itself must fail closed
+        # when a bundled library's real captured provenance disagrees
+        # with its COMPONENT_PATTERNS mapping, even though the fixture
+        # file here is only a fake-magic-bytes stand-in (matching this
+        # module's own established pure-basename-classification testing
+        # convention -- see the top-of-file docstring).
+        lib_dir = Path(self._tmp.name) / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
+        (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
+
+        def fake_capture(basename: str) -> dict[str, str] | None:
+            if basename == "libcom_err.so.2":
+                return {
+                    "package": "libkrb5-3",
+                    "version": "1.19.2-2ubuntu0.8",
+                    "sourcePackage": "krb5",
+                }
+            return None
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            audit, "capture_package_provenance", side_effect=fake_capture
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(["classify", str(lib_dir)])
+        self.assertNotEqual(exit_code, 0)
+        self.assertIn("e2fsprogs", stderr.getvalue())
+        self.assertIn("krb5", stderr.getvalue())
+
+    def test_cmd_classify_succeeds_when_provenance_agrees_or_is_unavailable(
+        self,
+    ) -> None:
+        lib_dir = Path(self._tmp.name) / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
+        (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
+
+        def fake_capture(basename: str) -> dict[str, str] | None:
+            if basename == "libcom_err.so.2":
+                return {
+                    "package": "libcom-err2",
+                    "version": "1.46.5-2ubuntu1.2",
+                    "sourcePackage": "e2fsprogs",
+                }
+            return None
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            audit, "capture_package_provenance", side_effect=fake_capture
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(["classify", str(lib_dir)])
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+
+
+@unittest.skipUnless(
+    shutil.which("dpkg") and shutil.which("dpkg-query"),
+    "requires a real Debian/Ubuntu dpkg database to authenticate a genuine "
+    "system library",
+)
+class RealSystemPackageProvenanceTests(unittest.TestCase):
+    """Round-N+ review (MEDIUM, package provenance): the same mechanism
+    tested with fully mocked dpkg above, proven here against a REAL
+    dpkg database. libz.so.1 (from zlib1g) is used because it is one of
+    the small set of packages every Debian/Ubuntu system -- including a
+    bare, freshly-created container -- always already has installed (it
+    is a transitive dependency of dpkg/apt/bash themselves), so this
+    test needs no network access or `apt-get install` of its own to be
+    hermetic; it is still skipped outright (never silently vacuous) on
+    any non-Debian host via the class-level skip above."""
+
+    def test_real_system_library_matches_its_expected_component(self) -> None:
+        provenance = audit.capture_package_provenance("libz.so.1")
+        if provenance is None:
+            self.skipTest(
+                "no real libz.so.1 system copy found under "
+                "_SYSTEM_LIBRARY_SEARCH_DIRS on this host"
+            )
+        self.assertIsNone(
+            audit.validate_component_package_provenance("zlib", provenance)
+        )
+
+    def test_real_system_library_rejects_a_wrong_expected_component(self) -> None:
+        provenance = audit.capture_package_provenance("libz.so.1")
+        if provenance is None:
+            self.skipTest(
+                "no real libz.so.1 system copy found under "
+                "_SYSTEM_LIBRARY_SEARCH_DIRS on this host"
+            )
+        problem = audit.validate_component_package_provenance("krb5", provenance)
+        self.assertIsNotNone(problem)
+        self.assertIn("krb5", problem)
 
 
 if __name__ == "__main__":
