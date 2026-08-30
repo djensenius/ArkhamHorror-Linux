@@ -36,12 +36,11 @@ header to the domain manifest, without changing any real source file,
 produced zero findings. This script now parses every header in BOTH
 manifests directly and independently: for each header path, it builds a
 synthetic in-memory ("unsaved") translation unit containing nothing but
-`#include "<that exact header, by absolute path>"`, using compile flags
-borrowed from a real source file belonging to that header's own CMake
-target (every source in one of this project's two library targets shares
-identical target-level -I/-D/-std flags, verified directly against
-CMakeLists.txt: neither target uses set_source_files_properties() or
-per-file target_compile_definitions() to vary flags source-by-source).
+`#include "<that exact header, by absolute path>"`, once for every
+distinct target/configuration compile context associated with its
+manifested source set. Context identity comes from each command's CMake
+object output, and its exact working directory plus command/arguments
+representation is preserved.
 This guarantees every registered header is independently, exhaustively
 parsed regardless of what any .cpp currently #includes, and
 clang_getFile() is used afterwards to hard-fail if the wrapper's
@@ -70,14 +69,15 @@ symbol and call it, whether or not that symbol also happens to have a
 declaration in some header. Source scanning therefore now ALSO collects
 QJson-family Findings for genuinely NEW, source-only declarations (see
 _scan_sources()): for every function-like/constructor declaration found
-directly in a real .cpp, this script asks libclang for that
+in the source or a project header visible in that exact TU, this script asks libclang for that
 declaration's *canonical* cursor (clang_getCanonicalCursor(), which
 always resolves to the FIRST declaration of that entity anywhere in the
-TU). If the canonical cursor's own file is a header already covered by
-the header scan, the .cpp cursor is merely that header declaration's
-out-of-line *definition* and is silently skipped here (it was already
-counted, correctly, while scanning its header). If the canonical
-cursor's own file is the .cpp itself (no earlier declaration anywhere),
+TU). An out-of-line definition is skipped only when the exact canonical
+identity (resolved file, line, USR, signature, access, and shape) was
+actually observed in unified seen data. A macro-conditional declaration
+visible only under this source's preprocessor state is therefore
+classified rather than skipped merely because its path is registered.
+If the canonical cursor's own file is the .cpp itself,
 this is a genuinely new declaration -- and it is recorded as a Finding
 (which can never match any ALLOWLIST entry, since every entry is keyed
 to a header path) if, and only if, it also has genuinely external
@@ -134,21 +134,22 @@ an ever-growing fragment of C++ parsing by hand:
     script asks libclang for the *canonical* result type (i.e. with
     every typedef/using-alias/decltype/auto/template parameter already
     resolved to its underlying real type by the compiler itself) AND
-    inspects every one of its parameters (constructors included) for a
-    non-const-qualified reference/pointer whose own canonical pointee
-    type is likewise QJson-family -- an output/inout parameter is
+    inspects every parameter recursively through canonical references,
+    pointers, aliases, and template wrappers down to the ultimate
+    QJson-family object's actual cv-qualification -- an output/inout parameter is
     exactly as capable of smuggling a lossy value out as a lossy return
     type is (see _is_encoder_shaped()) -- together with its USR (Unified
     Symbol Resolution -- a stable, fully qualified,
     signature-and-overload-aware identity Clang computes for every
     declaration; see https://clang.llvm.org/docs/USRs.html), access
     specifier, and exact source file.
-  - For every class/struct/class-template DEFINITION whose own location
+  - For every class/struct/class-template definition and public/protected
+    type alias whose own location
     is likewise exactly the header currently being probed, this script
     additionally walks its base-specifiers and using-declarations (see
     _inherited_and_reexported_encoders()) to discover any encoder-shaped
     member function made newly, transitively accessible through public/
-    protected inheritance or a using-declaration alone, with no new
+    protected/dependent inheritance, an alias, or a using-declaration alone, with no new
     textual declaration of its own -- attributing the resulting Finding
     to the EXPOSING class's own file/line rather than the original
     declaring class's file, so it cannot masquerade as an
@@ -269,9 +270,10 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 
 # --- The tiny, explicit allowlists ------------------------------------------
@@ -477,10 +479,14 @@ _CXCursor_Namespace = 22
 _CXCursor_ConversionFunction = 26
 _CXCursor_FunctionTemplate = 30
 _CXCursor_Constructor = 24
+_CXCursor_TypedefDecl = 20
 _CXCursor_CXXBaseSpecifier = 44
 _CXCursor_UsingDeclaration = 35
+_CXCursor_TypeAliasDecl = 36
 _CXCursor_OverloadedDeclRef = 49
+_CXCursor_NoDeclFound = 71
 _CXCursor_FriendDecl = 603
+_CXCursor_TemplateTypeParameter = 27
 
 # The "shape-eligible" record/class-template kinds this script walks for
 # base-specifier/using-declaration inheritance exposure (see
@@ -730,6 +736,11 @@ class _LibClang:
         lib.clang_getCursorType.restype = _CXType
         lib.clang_getCursorType.argtypes = [_CXCursor]
 
+        lib.clang_Type_getNumTemplateArguments.restype = ctypes.c_int
+        lib.clang_Type_getNumTemplateArguments.argtypes = [_CXType]
+        lib.clang_Type_getTemplateArgumentAsType.restype = _CXType
+        lib.clang_Type_getTemplateArgumentAsType.argtypes = [_CXType, ctypes.c_uint]
+
         # clang_Cursor_getNumArguments()/clang_Cursor_getArgument(): work
         # directly on a function-like DECLARATION cursor (not merely a
         # call-expression, which is the more commonly documented use),
@@ -774,6 +785,8 @@ class _LibClang:
         # accessible to the derived class.
         lib.clang_getTypeDeclaration.restype = _CXCursor
         lib.clang_getTypeDeclaration.argtypes = [_CXType]
+        lib.clang_getSpecializedCursorTemplate.restype = _CXCursor
+        lib.clang_getSpecializedCursorTemplate.argtypes = [_CXCursor]
 
         # clang_getNumOverloadedDecls()/clang_getOverloadedDecl(): a
         # using-declaration's own OverloadedDeclRef child cursor (kind
@@ -927,6 +940,85 @@ def _is_qjson_family(canonical_type_spelling: str) -> bool:
     )
 
 
+_MAX_TYPE_DEPTH = 32
+
+
+def _mutable_json_path(
+    clang: "_LibClang",
+    value_type: "_CXType",
+    *,
+    directly_mutable: bool,
+    depth: int = 0,
+) -> str | None:
+    """Return the ultimate mutable JSON-family type reachable through
+    references, pointers, aliases, and template wrappers.
+
+    Constness on a pointer object is intentionally not treated as
+    constness on the object it points at. Thus ``QJsonObject * const &``
+    is mutable output, while ``const QJsonObject * const &`` is input.
+    For a template wrapper reached through a mutable reference/pointer,
+    direct JSON-valued template arguments are mutable; pointer-valued
+    arguments are followed even through a const wrapper because their
+    pointee has independent cv-qualification."""
+
+    if depth > _MAX_TYPE_DEPTH:
+        raise EncoderHygieneError(
+            f"JSON output-parameter type walk exceeded {_MAX_TYPE_DEPTH} levels"
+        )
+
+    canonical = clang.lib.clang_getCanonicalType(value_type)
+    kind = canonical.kind
+    if kind in _REFERENCE_OR_POINTER_TYPE_KINDS:
+        pointee = clang.lib.clang_getPointeeType(canonical)
+        if kind == _CXType_Pointer:
+            # Top-level cv applies to the pointer, never its pointee.
+            return _mutable_json_path(
+                clang, pointee, directly_mutable=True, depth=depth + 1
+            )
+        return _mutable_json_path(
+            clang,
+            pointee,
+            directly_mutable=not bool(clang.lib.clang_isConstQualifiedType(pointee)),
+            depth=depth + 1,
+        )
+
+    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
+    template_arg_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
+
+    # QVariantMap/List/Hash are themselves prohibited JSON containers
+    # despite having template arguments in canonical form.
+    if _is_qvariant_json_container(spelling):
+        return spelling if directly_mutable and not clang.lib.clang_isConstQualifiedType(canonical) else None
+
+    if template_arg_count < 0:
+        if any(
+            _re.fullmatch(rf"(?:const\s+)?{family}(?:\s+const)?", spelling.strip())
+            for family in _QJSON_FAMILY
+        ):
+            if directly_mutable and not clang.lib.clang_isConstQualifiedType(canonical):
+                return spelling
+        return None
+
+    wrapper_mutable = directly_mutable and not bool(
+        clang.lib.clang_isConstQualifiedType(canonical)
+    )
+    for index in range(template_arg_count):
+        argument = clang.lib.clang_Type_getTemplateArgumentAsType(canonical, index)
+        if argument.kind == 0:
+            continue
+        argument_canonical = clang.lib.clang_getCanonicalType(argument)
+        argument_is_indirect = argument_canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS
+        found = _mutable_json_path(
+            clang,
+            argument,
+            directly_mutable=wrapper_mutable or argument_is_indirect,
+            depth=depth + 1,
+        )
+        if found is not None:
+            return found
+    return None
+
+
 def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tuple[bool, str]:
     """True if this function-like/constructor declaration is
     "encoder-shaped": either its own canonical RESULT type (checked only
@@ -963,19 +1055,19 @@ def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tu
             parm_cursor = clang.lib.clang_Cursor_getArgument(cursor, arg_index)
             parm_type = clang.lib.clang_getCursorType(parm_cursor)
             canonical_parm = clang.lib.clang_getCanonicalType(parm_type)
-            if canonical_parm.kind not in _REFERENCE_OR_POINTER_TYPE_KINDS:
-                continue
-            pointee = clang.lib.clang_getPointeeType(canonical_parm)
-            if clang.lib.clang_isConstQualifiedType(pointee):
-                continue  # A const reference/pointer is an ordinary input parameter, never flagged.
-            canonical_pointee = clang.lib.clang_getCanonicalType(pointee)
-            pointee_spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical_pointee))
-            if _is_qjson_family(pointee_spelling):
-                qualifier = "&" if canonical_parm.kind != _CXType_Pointer else "*"
-                return (
-                    True,
-                    f"non-const output/inout parameter #{arg_index}: {pointee_spelling} {qualifier}",
+            if canonical_parm.kind in _REFERENCE_OR_POINTER_TYPE_KINDS:
+                mutable_json = _mutable_json_path(
+                    clang, canonical_parm, directly_mutable=True
                 )
+                if mutable_json is not None:
+                    parm_spelling = clang.to_str(
+                        clang.lib.clang_getTypeSpelling(canonical_parm)
+                    )
+                    return (
+                        True,
+                        "non-const output/inout parameter "
+                        f"#{arg_index}: {parm_spelling} (mutable {mutable_json})",
+                    )
 
     return False, result_spelling
 
@@ -1007,9 +1099,169 @@ def _resolve_using_declaration_targets(clang: "_LibClang", using_cursor: "_CXCur
 _MAX_INHERITANCE_DEPTH = 16
 
 
+@dataclass(frozen=True)
+class _Exposure:
+    source_cursor: _CXCursor | None
+    attribution_cursor: _CXCursor
+    reason: str
+
+
+def _record_member_candidates(
+    clang: "_LibClang", record_cursor: "_CXCursor"
+) -> list[_CXCursor]:
+    members: list[_CXCursor] = []
+
+    def visit(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        kind = clang.lib.clang_getCursorKind(cursor)
+        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        if kind in _FUNCTION_LIKE_KINDS and access in _INHERITABLE_ACCESS_SPECIFIERS:
+            members.append(cursor)
+        return 1
+
+    callback = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(record_cursor, callback, None)
+    return members
+
+
+def _alias_reexported_encoders(
+    clang: "_LibClang", alias_cursor: "_CXCursor"
+) -> list[_Exposure]:
+    """Resolve public/protected aliases, including specializations of
+    dependent wrapper templates, and attribute any exposed member back
+    to the alias declaration."""
+
+    alias_type = clang.lib.clang_getCanonicalType(
+        clang.lib.clang_getCursorType(alias_cursor)
+    )
+    target_decl = clang.lib.clang_getTypeDeclaration(alias_type)
+    if clang.lib.clang_getCursorKind(target_decl) in (0, _CXCursor_NoDeclFound):
+        return []
+
+    exposed = [
+        _Exposure(member, alias_cursor, "public/protected type alias")
+        for member in _record_member_candidates(clang, target_decl)
+    ]
+    for inherited in _inherited_and_reexported_encoders(clang, target_decl):
+        exposed.append(
+            _Exposure(
+                inherited.source_cursor,
+                alias_cursor,
+                f"type alias of {inherited.reason}",
+            )
+        )
+
+    primary = clang.lib.clang_getSpecializedCursorTemplate(target_decl)
+    if clang.lib.clang_getCursorKind(primary) != _CXCursor_ClassTemplate:
+        return exposed
+
+    argument_count = clang.lib.clang_Type_getNumTemplateArguments(alias_type)
+    arguments = [
+        clang.lib.clang_Type_getTemplateArgumentAsType(alias_type, index)
+        for index in range(max(argument_count, 0))
+    ]
+    parameter_names: list[str] = []
+    bases: list[_CXCursor] = []
+    using_names: list[str] = []
+
+    def visit_primary(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        kind = clang.lib.clang_getCursorKind(cursor)
+        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        if kind == _CXCursor_TemplateTypeParameter:
+            parameter_names.append(
+                clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
+            )
+        elif kind == _CXCursor_CXXBaseSpecifier and access in _INHERITABLE_ACCESS_SPECIFIERS:
+            bases.append(cursor)
+        elif kind == _CXCursor_UsingDeclaration and access in _INHERITABLE_ACCESS_SPECIFIERS:
+            using_names.append(
+                clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
+            )
+        return 1
+
+    callback = clang._visitor_func_type(visit_primary)
+    clang.lib.clang_visitChildren(primary, callback, None)
+
+    argument_records: list[_CXCursor] = []
+    for argument in arguments:
+        declaration = clang.lib.clang_getTypeDeclaration(
+            clang.lib.clang_getCanonicalType(argument)
+        )
+        if clang.lib.clang_getCursorKind(declaration) not in (
+            0,
+            _CXCursor_NoDeclFound,
+        ):
+            argument_records.append(declaration)
+
+    for base in bases:
+        base_spelling = clang.to_str(
+            clang.lib.clang_getTypeSpelling(
+                clang.lib.clang_getCursorType(base)
+            )
+        )
+        if base_spelling in parameter_names:
+            index = parameter_names.index(base_spelling)
+            if index >= len(arguments):
+                exposed.append(
+                    _Exposure(
+                        None,
+                        alias_cursor,
+                        "unresolved public/protected alias template base",
+                    )
+                )
+                continue
+            base_decl = clang.lib.clang_getTypeDeclaration(
+                clang.lib.clang_getCanonicalType(arguments[index])
+            )
+        else:
+            base_decl = clang.lib.clang_getTypeDeclaration(
+                clang.lib.clang_getCursorType(base)
+            )
+        if clang.lib.clang_getCursorKind(base_decl) in (0, _CXCursor_NoDeclFound):
+            exposed.append(
+                _Exposure(
+                    None,
+                    alias_cursor,
+                    "unresolved public/protected alias template base",
+                )
+            )
+            continue
+        exposed.extend(
+            _Exposure(member, alias_cursor, "instantiated alias template base")
+            for member in _record_member_candidates(clang, base_decl)
+        )
+        exposed.extend(
+            _Exposure(
+                inherited.source_cursor,
+                alias_cursor,
+                f"instantiated alias of {inherited.reason}",
+            )
+            for inherited in _inherited_and_reexported_encoders(clang, base_decl)
+        )
+
+    for using_name in using_names:
+        simple_name = using_name.rsplit("::", 1)[-1]
+        for argument_record in argument_records:
+            for member in _record_member_candidates(clang, argument_record):
+                member_name = clang.to_str(
+                    clang.lib.clang_getCursorDisplayName(member)
+                ).split("(", 1)[0]
+                if member_name == simple_name:
+                    exposed.append(
+                        _Exposure(
+                            member,
+                            alias_cursor,
+                            "instantiated dependent using-declaration alias",
+                        )
+                    )
+    return exposed
+
+
 def _inherited_and_reexported_encoders(
-    clang: "_LibClang", class_cursor: "_CXCursor", depth: int = 0
-) -> list:
+    clang: "_LibClang",
+    class_cursor: "_CXCursor",
+    depth: int = 0,
+    visited: frozenset[str] = frozenset(),
+) -> list[_Exposure]:
     """Walk `class_cursor`'s own direct children for:
 
       - a PUBLIC or PROTECTED base-specifier (see
@@ -1050,8 +1302,14 @@ def _inherited_and_reexported_encoders(
             "pathological/cyclic class hierarchy, not real production code."
         )
 
-    exposed: list = []
-    bases: list = []
+    class_usr = clang.to_str(clang.lib.clang_getCursorUSR(class_cursor))
+    if class_usr and class_usr in visited:
+        return []
+    if class_usr:
+        visited = visited | {class_usr}
+
+    exposed: list[_Exposure] = []
+    bases: list[_CXCursor] = []
 
     def visit(cursor: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
         kind = clang.lib.clang_getCursorKind(cursor)
@@ -1059,8 +1317,21 @@ def _inherited_and_reexported_encoders(
         if kind == _CXCursor_CXXBaseSpecifier and access in _INHERITABLE_ACCESS_SPECIFIERS:
             bases.append(cursor)
         elif kind == _CXCursor_UsingDeclaration and access in _INHERITABLE_ACCESS_SPECIFIERS:
-            for target in _resolve_using_declaration_targets(clang, cursor):
-                exposed.append((target, cursor))
+            targets = _resolve_using_declaration_targets(clang, cursor)
+            if targets:
+                for target in targets:
+                    exposed.append(
+                        _Exposure(target, cursor, "using-declaration")
+                    )
+            else:
+                exposed.append(
+                    _Exposure(
+                        None,
+                        cursor,
+                        "unresolved public/protected dependent using-declaration "
+                        "capable of forwarding an encoder",
+                    )
+                )
         return 1  # CXChildVisit_Continue: never descend into member function bodies here.
 
     cb = clang._visitor_func_type(visit)
@@ -1069,18 +1340,33 @@ def _inherited_and_reexported_encoders(
     for base_specifier in bases:
         base_type = clang.lib.clang_getCursorType(base_specifier)
         base_decl = clang.lib.clang_getTypeDeclaration(base_type)
+        base_kind = clang.lib.clang_getCursorKind(base_decl)
+        if base_kind in (0, _CXCursor_TemplateTypeParameter, _CXCursor_NoDeclFound):
+            exposed.append(
+                _Exposure(
+                    None,
+                    base_specifier,
+                    "unresolved public/protected dependent base capable of "
+                    "inheriting an encoder",
+                )
+            )
+            continue
 
         def visit_base_member(cursor: "_CXCursor", _parent: "_CXCursor", _client_data, _base=base_specifier) -> int:
             member_kind = clang.lib.clang_getCursorKind(cursor)
             member_access = clang.lib.clang_getCXXAccessSpecifier(cursor)
             if member_kind in _FUNCTION_LIKE_KINDS and member_access in _INHERITABLE_ACCESS_SPECIFIERS:
-                exposed.append((cursor, _base))
+                exposed.append(_Exposure(cursor, _base, "base-class inheritance"))
             return 1  # CXChildVisit_Continue
 
         member_cb = clang._visitor_func_type(visit_base_member)
         clang.lib.clang_visitChildren(base_decl, member_cb, None)
 
-        exposed.extend(_inherited_and_reexported_encoders(clang, base_decl, depth + 1))
+        exposed.extend(
+            _inherited_and_reexported_encoders(
+                clang, base_decl, depth + 1, visited
+            )
+        )
 
     return exposed
 
@@ -1110,16 +1396,18 @@ def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -
     return "allowed"
 
 
-def _sanitize_compile_args(command: str, source_file: str) -> list[str]:
+def _sanitize_compile_args(command: str | Sequence[str], source_file: str) -> list[str]:
     """Turn one compile_commands.json entry's shell command string into the
     argv libclang's clang_parseTranslationUnit2() expects: drop the
     compiler executable itself (argv[0]), -o/-c/-arch <value>/-g (all
     irrelevant to AST-only parsing; some, like a stray -arch on a
     cross-compile entry, could even cause a spurious parse failure), and
-    the trailing source file (passed to clang_parseTranslationUnit2()
-    separately, as its own file argument, not duplicated in argv)."""
+    source-file token wherever it appears (passed to
+    clang_parseTranslationUnit2() separately, not duplicated in argv)."""
 
-    tokens = shlex.split(command)
+    tokens = shlex.split(command) if isinstance(command, str) else list(command)
+    if not tokens:
+        raise EncoderHygieneError("compile_commands.json entry has an empty command/arguments array")
     args = tokens[1:]  # drop argv[0] (the compiler executable)
     cleaned: list[str] = []
     skip_next = False
@@ -1133,9 +1421,150 @@ def _sanitize_compile_args(command: str, source_file: str) -> list[str]:
         if token in ("-c", "-g"):
             continue
         cleaned.append(token)
-    if cleaned and cleaned[-1] == source_file:
-        cleaned = cleaned[:-1]
+    cleaned = [token for token in cleaned if token != source_file]
     return cleaned
+
+
+@dataclass(frozen=True)
+class CompileContext:
+    source: Path
+    directory: Path
+    arguments: tuple[str, ...]
+    output: Path
+    target: str
+    configuration: str
+
+    def identity(self) -> tuple[str, str, str, str, tuple[str, ...]]:
+        return (
+            str(self.source),
+            str(self.output),
+            self.target,
+            self.configuration,
+            self.arguments,
+        )
+
+
+def _entry_path(entry: dict, key: str, directory: Path) -> Path:
+    value = entry.get(key)
+    if not isinstance(value, str) or not value:
+        raise EncoderHygieneError(
+            f"compile_commands.json entry is missing non-empty {key!r}: {entry!r}"
+        )
+    path = Path(value)
+    return (directory / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def _compile_entry_tokens(entry: dict) -> list[str]:
+    has_arguments = "arguments" in entry
+    has_command = "command" in entry
+    if has_arguments == has_command:
+        raise EncoderHygieneError(
+            "Each compile_commands.json entry must contain exactly one of "
+            f"'arguments' or 'command', not both/neither: {entry!r}"
+        )
+    if has_arguments:
+        arguments = entry["arguments"]
+        if not isinstance(arguments, list) or not all(
+            isinstance(argument, str) for argument in arguments
+        ):
+            raise EncoderHygieneError(
+                f"compile command 'arguments' must be an array of strings: {entry!r}"
+            )
+        return list(arguments)
+    command = entry["command"]
+    if not isinstance(command, str):
+        raise EncoderHygieneError(
+            f"compile command 'command' must be a string: {entry!r}"
+        )
+    return shlex.split(command)
+
+
+def _target_and_configuration_from_output(output: Path) -> tuple[str, str]:
+    parts = output.parts
+    candidates = [
+        index
+        for index, part in enumerate(parts[:-1])
+        if part == "CMakeFiles"
+        and index + 1 < len(parts)
+        and parts[index + 1].endswith(".dir")
+    ]
+    if len(candidates) != 1:
+        raise EncoderHygieneError(
+            f"Compile-command output {output} does not carry one unambiguous "
+            "CMake target object identity (expected exactly one "
+            "CMakeFiles/<target>.dir component)"
+        )
+    index = candidates[0]
+    target = parts[index + 1][: -len(".dir")]
+    if not target:
+        raise EncoderHygieneError(f"Compile-command output {output} has an empty target identity")
+    relative_output = parts[index + 2 :]
+    configurations = {
+        "Debug",
+        "Release",
+        "RelWithDebInfo",
+        "MinSizeRel",
+    }
+    configuration = relative_output[0] if relative_output and relative_output[0] in configurations else ""
+    return target, configuration
+
+
+def _compile_contexts_for_source(
+    compile_commands: Sequence[dict], source: Path
+) -> list[CompileContext]:
+    resolved = source.resolve()
+    contexts: list[CompileContext] = []
+    for entry in compile_commands:
+        directory_value = entry.get("directory")
+        if not isinstance(directory_value, str) or not directory_value:
+            raise EncoderHygieneError(
+                f"compile_commands.json entry has no exact working directory: {entry!r}"
+            )
+        directory = Path(directory_value).resolve()
+        entry_source = _entry_path(entry, "file", directory)
+        if entry_source != resolved:
+            continue
+        output = _entry_path(entry, "output", directory)
+        target, configuration = _target_and_configuration_from_output(output)
+        raw_tokens = _compile_entry_tokens(entry)
+        arguments = tuple(_sanitize_compile_args(raw_tokens, entry["file"]))
+        contexts.append(
+            CompileContext(
+                source=resolved,
+                directory=directory,
+                arguments=arguments,
+                output=output,
+                target=target,
+                configuration=configuration,
+            )
+        )
+
+    if not contexts:
+        raise EncoderHygieneError(
+            f"No compile_commands.json entry found for source {source}; every "
+            "manifested source must have at least one target-owned object command"
+        )
+
+    identities = [context.identity() for context in contexts]
+    if len(identities) != len(set(identities)):
+        raise EncoderHygieneError(
+            f"Duplicate indistinguishable compile commands found for {source}; "
+            "each target/configuration/object context must be unique"
+        )
+    outputs = [context.output for context in contexts]
+    if len(outputs) != len(set(outputs)):
+        raise EncoderHygieneError(
+            f"Multiple compile commands claim the same object output for {source}: {outputs}"
+        )
+    target_configurations = [
+        (context.target, context.configuration) for context in contexts
+    ]
+    if len(target_configurations) != len(set(target_configurations)):
+        raise EncoderHygieneError(
+            f"Multiple unexplained object commands compile {source} for the same "
+            "target/configuration; ownership is ambiguous"
+        )
+    return contexts
 
 
 def _macos_sdk_sysroot() -> str:
@@ -1144,39 +1573,46 @@ def _macos_sdk_sysroot() -> str:
     ).strip()
 
 
-def _representative_compile_args(
+def _header_compile_contexts(
     compile_commands: list[dict], sources: Sequence[Path], target_label: str
-) -> list[str]:
-    """Borrow one representative, sanitized compile-args list for a whole
-    CMake target, taken from any one of its real source files' actual
-    compile_commands.json entry.
-
-    Every source belonging to one of this project's two library targets
-    (arkham_domain_models, arkham_foundation) shares identical
-    target-level -I/-D/-std flags -- verified directly against
-    CMakeLists.txt: neither target uses set_source_files_properties() or
-    per-file target_compile_definitions() to vary flags source-by-source
-    -- so any single one of them is representative for the purpose of
-    parsing a *header* belonging to that same target as its own
-    standalone translation unit. This is what lets every header be
-    scanned on its own, independent of whether any particular .cpp
-    currently #includes it (see the module docstring)."""
+) -> list[CompileContext]:
+    """Return every distinct target/configuration argument context for
+    the manifested sources. Headers are independently parsed in all of
+    them, so a consumer-specific define/include path or multi-config
+    object command cannot be hidden by a first-path match."""
 
     if not sources:
         raise EncoderHygieneError(
             f"No {target_label} sources were listed in its manifest -- cannot "
-            "borrow representative compile flags for its headers."
+            "derive target/configuration compile contexts for its headers."
         )
-    commands_by_file = {Path(entry["file"]).resolve(): entry for entry in compile_commands}
-    first = sources[0]
-    entry = commands_by_file.get(first.resolve())
-    if entry is None:
+    contexts: list[CompileContext] = []
+    for source in sources:
+        contexts.extend(_compile_contexts_for_source(compile_commands, source))
+    unique: dict[tuple, CompileContext] = {}
+    for context in contexts:
+        key = (
+            context.target,
+            context.configuration,
+            context.directory,
+            context.arguments,
+        )
+        unique.setdefault(key, context)
+    if not unique:
         raise EncoderHygieneError(
-            f"No compile_commands.json entry found for {target_label} source {first} "
-            "-- the dedicated Clang build directory may not have configured/built "
-            "this target; see _configure_clang_build_dir()."
+            f"No target/configuration compile contexts found for {target_label} headers"
         )
-    return _sanitize_compile_args(entry["command"], entry["file"])
+    return list(unique.values())
+
+
+@contextmanager
+def _working_directory(directory: Path) -> Iterator[None]:
+    previous = Path.cwd()
+    try:
+        os.chdir(directory)
+        yield
+    finally:
+        os.chdir(previous)
 
 
 def _parse_header_as_own_tu(
@@ -1185,6 +1621,7 @@ def _parse_header_as_own_tu(
     header: Path,
     compile_args: list[str],
     sysroot_args: list[str],
+    working_directory: Path | None = None,
 ) -> tuple[ctypes.c_void_p, str]:
     """Parse `header` as the sole content of its own synthetic translation
     unit: an in-memory ("unsaved") wrapper file containing exactly one
@@ -1228,16 +1665,17 @@ def _parse_header_as_own_tu(
     argv = (ctypes.c_char_p * len(args_bytes))(*args_bytes)
 
     tu_ptr = ctypes.c_void_p()
-    err = clang.lib.clang_parseTranslationUnit2(
-        idx,
-        wrapper_filename.encode("utf-8"),
-        argv,
-        len(args_bytes),
-        unsaved_array,
-        1,
-        0x0,
-        ctypes.byref(tu_ptr),
-    )
+    with _working_directory(working_directory or Path.cwd()):
+        err = clang.lib.clang_parseTranslationUnit2(
+            idx,
+            wrapper_filename.encode("utf-8"),
+            argv,
+            len(args_bytes),
+            unsaved_array,
+            1,
+            0x0,
+            ctypes.byref(tu_ptr),
+        )
     if err != 0 or not tu_ptr.value:
         raise EncoderHygieneError(
             f"libclang failed to parse a synthetic wrapper #include-ing {header} "
@@ -1300,6 +1738,9 @@ def _validate_closure_rootedness(
     resolved: set[Path] = set()
     violations: list[str] = []
     for entry in entries:
+        if not entry.is_file():
+            violations.append(f"  {entry} is missing or is not a regular file")
+            continue
         real = entry.resolve()
         if not real.is_relative_to(expected_root):
             violations.append(f"  {entry} resolves to {real}, which is not inside {expected_root}")
@@ -1315,6 +1756,43 @@ def _validate_closure_rootedness(
     return frozenset(resolved)
 
 
+def _physical_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+@dataclass(frozen=True)
+class OwnedPathPolicy:
+    roots: frozenset[Path]
+    physical_identities: frozenset[tuple[int, int]]
+
+    def owns(self, lexical: Path, real: Path) -> bool:
+        if any(
+            lexical.is_relative_to(root) or real.is_relative_to(root)
+            for root in self.roots
+        ):
+            return True
+        identity = _physical_identity(real)
+        return identity is not None and identity in self.physical_identities
+
+
+def _owned_path_policy(repo_root: Path, generated_roots: frozenset[Path]) -> OwnedPathPolicy:
+    roots = frozenset({(repo_root / "src").resolve()}) | generated_roots
+    identities: set[tuple[int, int]] = set()
+    for root in roots:
+        if not root.is_dir():
+            raise EncoderHygieneError(f"Owned project/generated root does not exist: {root}")
+        for path in root.rglob("*"):
+            if path.is_file():
+                identity = _physical_identity(path)
+                if identity is not None:
+                    identities.add(identity)
+    return OwnedPathPolicy(roots=roots, physical_identities=frozenset(identities))
+
+
 def _audit_inclusion_graph(
     clang: _LibClang,
     tu: ctypes.c_void_p,
@@ -1322,6 +1800,8 @@ def _audit_inclusion_graph(
     wrapper_filename: str,
     allowed_closure: frozenset[Path],
     external_roots: frozenset[Path],
+    owned_paths: OwnedPathPolicy | None = None,
+    working_directory: Path | None = None,
 ) -> list[str]:
     """Ask libclang for the complete resolved inclusion graph of
     `header`'s own wrapper TU (via clang_getInclusions() -- see the
@@ -1386,7 +1866,12 @@ def _audit_inclusion_graph(
 
     wrapper_real = Path(wrapper_filename).resolve()
     for included_path, included_file in included:
-        real = included_path.resolve()
+        lexical = (
+            (working_directory / included_path).absolute()
+            if working_directory is not None and not included_path.is_absolute()
+            else included_path.absolute()
+        )
+        real = lexical.resolve()
         # The wrapper's own synthetic "main file" is not a real
         # #include at all -- clang_getInclusions() reports it anyway
         # (with an empty inclusion stack), so it must be recognized and
@@ -1397,26 +1882,38 @@ def _audit_inclusion_graph(
         # happens to share the same basename.
         if real == wrapper_real:
             continue
+        if real in allowed_closure:
+            continue
+        # Project source and registered generated ownership always wins
+        # over compiler/system and external-root markings. The physical
+        # identity set also catches hardlink aliases placed under an
+        # otherwise external/system include directory.
+        if owned_paths is not None and owned_paths.owns(lexical, real):
+            violations.append(
+                f"  {header} transitively #includes {included_path} "
+                f"(resolves to owned file {real}), which is not part of the "
+                "allowed project/generated closure for this scan"
+            )
+            continue
         location = clang.lib.clang_getLocation(tu, included_file, 1, 1)
         if clang.lib.clang_Location_isInSystemHeader(location):
             continue  # A genuine compiler/system/toolchain header (see this function's own doc comment).
         if any(real.is_relative_to(root) for root in external_roots):
             continue  # Explicitly-registered external subtree (e.g. FetchContent-vendored source/build).
-        if real not in allowed_closure:
-            violations.append(
-                f"  {header} transitively #includes {included_path} "
-                f"(resolves to {real}), which is not part of the allowed "
-                "header/fragment closure for this scan -- a forbidden "
-                "cross-boundary dependency or an unregistered project file, "
-                "regardless of how the #include itself was spelled"
-            )
+        violations.append(
+            f"  {header} transitively #includes {included_path} "
+            f"(resolves to {real}), which is not part of the allowed "
+            "header/fragment closure for this scan -- a forbidden "
+            "cross-boundary dependency or an unregistered project file, "
+            "regardless of how the #include itself was spelled"
+        )
 
     return violations
 
 
 def _external_roots(clang_build_dir: Path) -> frozenset[Path]:
-    """The small, EXPLICIT set of subtrees this script treats as
-    genuinely external/trusted-generated (never subject to the domain/
+    """The small, EXPLICIT set of dependency subtrees this script treats as
+    genuinely external (never subject to the domain/
     foundation dependency-direction closure check), independent of the
     blanket "anything under the build directory" (or, later, "anything
     outside repo_root") exemption two separate review rounds
@@ -1424,51 +1921,160 @@ def _external_roots(clang_build_dir: Path) -> frozenset[Path]:
     comment for the exact bypasses this replaces).
 
     Read from `<clang-build-dir>/generated/external_roots.txt`, which
-    CMakeLists.txt/cmake/PathManifest.cmake populate from two distinct,
-    always CMake-metadata-derived (never hand-authored/lexically
-    guessed) sources:
-
-      - The REAL, FetchContent-populated `qtkeychain_SOURCE_DIR`/
-        `qtkeychain_BINARY_DIR` variables (written eagerly, right after
-        `FetchContent_MakeAvailable(qtkeychain)`) -- genuine third-party
-        dependency package metadata, replacing a previous
-        `<clang-build-dir>/_deps` lexical guess that happened to work
-        only because this project currently has exactly one FetchContent
-        dependency at exactly that conventional location.
-      - Each production target's own AUTOMOC `AUTOGEN_BUILD_DIR` (see
-        arkham_append_target_autogen_root() in cmake/PathManifest.cmake,
-        appended once both targets are fully configured) -- needed
-        because a real build showed that AUTOMOC's own generated
-        `mocs_compilation.cpp` (already independently scanned as a
-        SOURCE) transitively `#include`s per-class `moc_*.cpp`
-        fragments physically written under that directory, which are
-        mechanically generated in full by Qt's `moc` tool directly from
-        an already-audited Q_OBJECT/Q_GADGET header and can never
-        introduce a public API surface of their own, so requiring them
-        to have their own manifest entry would be auditing generated
-        boilerplate that cannot possibly differ from what its source
-        header already declares.
-
-    Either way, this stays correct automatically if qtkeychain's own
-    FetchContent declaration changes, a new dependency is added, or
-    AUTOGEN_BUILD_DIR's own CMake default ever changes, with no change
-    needed to this script."""
+    CMakeLists.txt populates from the real FetchContent
+    `qtkeychain_SOURCE_DIR`/`qtkeychain_BINARY_DIR` metadata. AUTOGEN is
+    deliberately absent: it is project-owned, enumerated against each
+    target's AutogenInfo.json by _load_autogen_closures(), and audited."""
 
     manifest = clang_build_dir / "generated" / "external_roots.txt"
     return frozenset(root.resolve() for root in _read_manifest(manifest))
+
+
+_CXX_GENERATED_SUFFIXES = frozenset(
+    {".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp", ".c", ".cc", ".cpp", ".cxx", ".moc"}
+)
+
+
+@dataclass(frozen=True)
+class AutogenClosure:
+    target: str
+    policy: str
+    root: Path
+    code_files: frozenset[Path]
+
+
+def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosure]]:
+    manifest = clang_build_dir / "generated" / "autogen_targets.txt"
+    if not manifest.is_file():
+        raise EncoderHygieneError(
+            f"Owned AUTOGEN target manifest is missing: {manifest}"
+        )
+
+    closures: dict[str, list[AutogenClosure]] = {"domain": [], "foundation": []}
+    seen_targets: set[str] = set()
+    for line_number, raw_line in enumerate(
+        manifest.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not raw_line.strip():
+            continue
+        fields = raw_line.split("\t")
+        if len(fields) != 3:
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: expected POLICY<TAB>TARGET<TAB>ROOT"
+            )
+        policy, target, root_text = fields
+        if policy not in closures or not target or target in seen_targets:
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: invalid/duplicate AUTOGEN ownership "
+                f"record {raw_line!r}"
+            )
+        seen_targets.add(target)
+        root = Path(root_text).resolve()
+        metadata_path = (
+            clang_build_dir
+            / "CMakeFiles"
+            / f"{target}_autogen.dir"
+            / "AutogenInfo.json"
+        )
+        if not metadata_path.is_file():
+            raise EncoderHygieneError(
+                f"CMake AUTOGEN metadata for target {target!r} is missing: {metadata_path}"
+            )
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise EncoderHygieneError(
+                f"Could not read CMake AUTOGEN metadata {metadata_path}: {exc}"
+            ) from exc
+        metadata_root = Path(metadata.get("BUILD_DIR", "")).resolve()
+        if metadata_root != root:
+            raise EncoderHygieneError(
+                f"AUTOGEN root mismatch for {target}: manifest={root}, "
+                f"AutogenInfo.json={metadata_root}"
+            )
+
+        compilation = Path(metadata.get("MOC_COMPILATION_FILE", "")).resolve()
+        if compilation.parent != root or not compilation.is_file():
+            raise EncoderHygieneError(
+                f"AUTOGEN compilation unit for {target} is missing/outside its "
+                f"owned root: {compilation}"
+            )
+        expected_code = {compilation}
+        for header_record in metadata.get("HEADERS", []):
+            if not isinstance(header_record, list) or len(header_record) < 3:
+                raise EncoderHygieneError(
+                    f"Malformed HEADERS entry in {metadata_path}: {header_record!r}"
+                )
+            output = header_record[2]
+            if isinstance(output, str) and output:
+                generated = (root / output).resolve()
+                if generated.is_file():
+                    expected_code.add(generated)
+
+        actual_code = {
+            path.resolve()
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in _CXX_GENERATED_SUFFIXES
+            and path.name != "moc_predefs.h"
+        }
+        unexplained = actual_code - expected_code
+        missing = expected_code - actual_code
+        if unexplained or missing:
+            details = [
+                *(f"  unexplained generated C/C++ file: {path}" for path in sorted(unexplained)),
+                *(f"  missing generated C/C++ file: {path}" for path in sorted(missing)),
+            ]
+            raise EncoderHygieneError(
+                f"AUTOGEN closure for {target} does not exactly match CMake's "
+                "AutogenInfo.json; arbitrary writable files under AUTOGEN are "
+                "project-owned and never trusted as external:\n" + "\n".join(details)
+            )
+
+        for generated in expected_code - {compilation}:
+            prefix = generated.read_text(encoding="utf-8", errors="replace")[:512]
+            if "Meta object code from reading C++ file" not in prefix or "Qt Meta Object Compiler" not in prefix:
+                raise EncoderHygieneError(
+                    f"Expected CMake-declared MOC artifact lacks the genuine Qt "
+                    f"moc provenance banner: {generated}"
+                )
+        compilation_text = compilation.read_text(encoding="utf-8", errors="replace")
+        if "This file is autogenerated. Changes will be overwritten." not in compilation_text[:256]:
+            raise EncoderHygieneError(
+                f"AUTOGEN aggregation unit lacks CMake's generated provenance banner: "
+                f"{compilation}"
+            )
+        for generated in expected_code - {compilation}:
+            relative = generated.relative_to(root).as_posix()
+            if f'#include "{relative}"' not in compilation_text:
+                raise EncoderHygieneError(
+                    f"CMake-declared MOC artifact is not enumerated by the target's "
+                    f"audited aggregation unit: {generated}"
+                )
+
+        closures[policy].append(
+            AutogenClosure(
+                target=target,
+                policy=policy,
+                root=root,
+                code_files=frozenset(expected_code),
+            )
+        )
+    return closures
 
 
 def _scan_headers(
     clang: _LibClang,
     idx: ctypes.c_void_p,
     headers: Sequence[Path],
-    compile_args: list[str],
+    compile_contexts: Sequence[CompileContext],
     sysroot_args: list[str],
     repo_root: Path,
     external_roots: frozenset[Path],
     allowed_closure: frozenset[Path],
     seen: set[tuple],
     structural_violations: list[str],
+    owned_paths: OwnedPathPolicy | None = None,
 ) -> list[Finding]:
     """Independently parse every header/fragment in `headers` as its own
     synthetic wrapper translation unit (see _parse_header_as_own_tu()).
@@ -1500,12 +2106,10 @@ def _scan_headers(
         an already-allowlisted encoder type" bypass without any change
         to the allowlist mechanism itself.
 
-    `seen` is a single dedup set shared across the *entire* run (both
-    the domain and foundation passes, and both header and source scans):
-    each entry is either a 3-tuple `(resolved file, line, USR)` for an
-    own-declaration Finding, or a 4-tuple
-    `(resolved file, line, USR, "inherited")` for an inheritance/using-
-    declaration-exposure Finding -- the differing tuple shapes guarantee
+    `seen` is a single exact canonical-identity set shared across the
+    entire run. Own declarations include resolved file, line, USR, kind,
+    signature, access, and shape; inherited/alias exposures additionally
+    include their exposing declaration and reason. The differing keys guarantee
     the two kinds can never collide with each other even at the exact
     same nominal (file, line, usr), while still deduplicating repeats of
     the *same* kind (e.g. a legitimately shared/cross-included file's
@@ -1537,21 +2141,34 @@ def _scan_headers(
         )
 
     def handle_own_declaration(cursor: _CXCursor, kind: int) -> None:
-        filename, line = clang.cursor_file_and_line(cursor)
+        canonical_cursor = clang.lib.clang_getCanonicalCursor(cursor)
+        filename, line = clang.cursor_file_and_line(canonical_cursor)
         if filename is None:
             return
         real = Path(filename).resolve()
         if real not in allowed_closure:
             return
-        access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+        access = clang.lib.clang_getCXXAccessSpecifier(canonical_cursor)
         if access not in _PUBLIC_ACCESS_SPECIFIERS:
             return
         is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
         if not is_shaped:
             return
-        usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+        usr = clang.to_str(clang.lib.clang_getCursorUSR(canonical_cursor))
+        signature_type = clang.lib.clang_getCanonicalType(
+            clang.lib.clang_getCursorType(canonical_cursor)
+        )
+        signature = clang.to_str(clang.lib.clang_getTypeSpelling(signature_type))
         record_if_new(
-            dedup_key=(str(real), line, usr),
+            dedup_key=(
+                str(real),
+                line,
+                usr,
+                kind,
+                signature,
+                access,
+                shape_description,
+            ),
             real=real,
             line=line,
             display_name=clang.to_str(clang.lib.clang_getCursorDisplayName(cursor)),
@@ -1559,30 +2176,84 @@ def _scan_headers(
             usr=usr,
         )
 
-    def handle_inheritance_exposure(class_cursor: _CXCursor) -> None:
+    def handle_inheritance_exposure(
+        class_cursor: _CXCursor, exposures: Sequence[_Exposure] | None = None
+    ) -> None:
         filename, _def_line = clang.cursor_file_and_line(class_cursor)
         if filename is None:
             return
         if Path(filename).resolve() not in allowed_closure:
             return
-        for source_cursor, attribution_cursor in _inherited_and_reexported_encoders(clang, class_cursor):
-            source_kind = clang.lib.clang_getCursorKind(source_cursor)
-            is_shaped, shape_description = _is_encoder_shaped(clang, source_cursor, source_kind)
-            if not is_shaped:
-                continue
-            attribution_filename, attribution_line = clang.cursor_file_and_line(attribution_cursor)
+        class_access = clang.lib.clang_getCXXAccessSpecifier(class_cursor)
+        if class_access not in (
+            _CX_CXXInvalidAccessSpecifier,
+            _CX_CXXPublic,
+            _CX_CXXProtected,
+        ):
+            return
+        class_usr = clang.to_str(clang.lib.clang_getCursorUSR(class_cursor))
+        for exposure in (
+            exposures
+            if exposures is not None
+            else _inherited_and_reexported_encoders(clang, class_cursor)
+        ):
+            attribution_filename, attribution_line = clang.cursor_file_and_line(
+                exposure.attribution_cursor
+            )
             if attribution_filename is None:
                 continue
             attribution_real = Path(attribution_filename).resolve()
             if attribution_real not in allowed_closure:
                 continue
-            usr = clang.to_str(clang.lib.clang_getCursorUSR(source_cursor))
+            if exposure.source_cursor is None:
+                usr = f"{class_usr}@dependent-exposure@{attribution_line}@{exposure.reason}"
+                record_if_new(
+                    dedup_key=(
+                        str(attribution_real),
+                        attribution_line,
+                        usr,
+                        "dependent-inheritance",
+                        class_usr,
+                    ),
+                    real=attribution_real,
+                    line=attribution_line,
+                    display_name=exposure.reason,
+                    shape_description=(
+                        "unresolved exposure capable of returning/mutating QJsonObject"
+                    ),
+                    usr=usr,
+                )
+                continue
+            source_kind = clang.lib.clang_getCursorKind(exposure.source_cursor)
+            is_shaped, shape_description = _is_encoder_shaped(
+                clang, exposure.source_cursor, source_kind
+            )
+            if not is_shaped:
+                continue
+            usr = clang.to_str(
+                clang.lib.clang_getCursorUSR(exposure.source_cursor)
+            )
+            source_signature = clang.to_str(
+                clang.lib.clang_getTypeSpelling(
+                    clang.lib.clang_getCanonicalType(
+                        clang.lib.clang_getCursorType(exposure.source_cursor)
+                    )
+                )
+            )
             record_if_new(
-                dedup_key=(str(attribution_real), attribution_line, usr, "inherited"),
+                dedup_key=(
+                    str(attribution_real),
+                    attribution_line,
+                    usr,
+                    "inherited",
+                    class_usr,
+                    source_signature,
+                    exposure.reason,
+                ),
                 real=attribution_real,
                 line=attribution_line,
                 display_name=(
-                    f"{clang.to_str(clang.lib.clang_getCursorDisplayName(source_cursor))} "
+                    f"{clang.to_str(clang.lib.clang_getCursorDisplayName(exposure.source_cursor))} "
                     "(exposed via inheritance/using-declaration)"
                 ),
                 shape_description=shape_description,
@@ -1591,6 +2262,11 @@ def _scan_headers(
 
     def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
         kind = clang.lib.clang_getCursorKind(cursor)
+        if kind in (_CXCursor_TypeAliasDecl, _CXCursor_TypedefDecl):
+            handle_inheritance_exposure(
+                cursor, _alias_reexported_encoders(clang, cursor)
+            )
+            return 1
         if kind in _RECORD_LIKE_KINDS and clang.lib.clang_isCursorDefinition(cursor):
             handle_inheritance_exposure(cursor)
             return 2  # CXChildVisit_Recurse: still walk this class's own direct members normally.
@@ -1601,58 +2277,50 @@ def _scan_headers(
 
     visitor_cb = clang._visitor_func_type(visitor)
 
+    if not compile_contexts:
+        raise EncoderHygieneError("Header scan received no target/configuration compile contexts")
     for header in headers:
-        tu, wrapper_filename = _parse_header_as_own_tu(clang, idx, header, compile_args, sysroot_args)
-        structural_violations.extend(
-            _audit_inclusion_graph(clang, tu, header, wrapper_filename, allowed_closure, external_roots)
-        )
-        root = clang.lib.clang_getTranslationUnitCursor(tu)
-        clang.lib.clang_visitChildren(root, visitor_cb, None)
-        clang.lib.clang_disposeTranslationUnit(tu)
+        for context in compile_contexts:
+            tu, wrapper_filename = _parse_header_as_own_tu(
+                clang,
+                idx,
+                header,
+                list(context.arguments),
+                sysroot_args,
+                context.directory,
+            )
+            try:
+                structural_violations.extend(
+                    _audit_inclusion_graph(
+                        clang,
+                        tu,
+                        header,
+                        wrapper_filename,
+                        allowed_closure,
+                        external_roots,
+                        owned_paths,
+                        context.directory,
+                    )
+                )
+                root = clang.lib.clang_getTranslationUnitCursor(tu)
+                clang.lib.clang_visitChildren(root, visitor_cb, None)
+            finally:
+                clang.lib.clang_disposeTranslationUnit(tu)
 
 
     return findings
 
 
-def _find_compile_command_for_source(compile_commands: list[dict], source: Path) -> dict:
-    """Look up `source`'s own EXACT compile_commands.json entry, matched
-    by its resolved absolute path -- never a "representative" entry
-    borrowed from some other file in the same target (see
-    _representative_compile_args(), which remains correct for
-    *headers*: a header has no compile_commands.json entry of its own at
-    all, since it is never itself compiled as a translation unit by the
-    real build). A review round demonstrated that never independently
-    parsing each real .cpp with its own exact compile command left every
-    production source file completely unaudited by this script's
-    dependency-direction policy -- this is the lookup that closes that
-    gap: a manifest-registered source with no matching compile command
-    is a hard failure, never a silent skip."""
-
-    resolved = source.resolve()
-    for entry in compile_commands:
-        if Path(entry["file"]).resolve() == resolved:
-            return entry
-    raise EncoderHygieneError(
-        f"No compile_commands.json entry found for source {source} -- every "
-        "manifest-registered source must have actually been compiled by the "
-        "dedicated Clang build directory (see _configure_clang_build_dir()); "
-        "a source manifest entry with no matching compile command is a hard "
-        "failure, since it means either the manifest and the real build have "
-        "silently drifted apart, or this source was never really built at all."
-    )
-
-
 def _parse_source_as_own_tu(
     clang: _LibClang,
     idx: ctypes.c_void_p,
-    source: Path,
-    compile_commands: list[dict],
+    context: CompileContext,
     sysroot_args: list[str],
 ) -> ctypes.c_void_p:
     """Parse a REAL production .cpp `source` directly, on disk, as its own
-    translation unit -- using its OWN exact compile_commands.json entry
-    (see _find_compile_command_for_source()), never flags borrowed from
-    any other file. Unlike _parse_header_as_own_tu(), no synthetic
+    translation unit using one exact target/configuration object context
+    returned by _compile_contexts_for_source(), never flags borrowed
+    from any other file. Unlike _parse_header_as_own_tu(), no synthetic
     wrapper/unsaved-file trick is needed here: a real source file already
     exists on disk and already has its own exact compile command, so it
     is handed to libclang exactly as the real build itself compiles it.
@@ -1675,28 +2343,31 @@ def _parse_source_as_own_tu(
     correct AST, so this refuses to silently scan a partial/
     error-recovery one."""
 
-    entry = _find_compile_command_for_source(compile_commands, source)
-    compile_args = _sanitize_compile_args(entry["command"], entry["file"])
-    source_abs = str(source.resolve())
+    source = context.source
+    compile_args = list(context.arguments)
+    source_abs = str(source)
 
     args_bytes = [a.encode("utf-8") for a in (compile_args + sysroot_args)]
     argv = (ctypes.c_char_p * len(args_bytes))(*args_bytes)
 
     tu_ptr = ctypes.c_void_p()
-    err = clang.lib.clang_parseTranslationUnit2(
-        idx,
-        source_abs.encode("utf-8"),
-        argv,
-        len(args_bytes),
-        None,
-        0,
-        0x0,
-        ctypes.byref(tu_ptr),
-    )
+    with _working_directory(context.directory):
+        err = clang.lib.clang_parseTranslationUnit2(
+            idx,
+            source_abs.encode("utf-8"),
+            argv,
+            len(args_bytes),
+            None,
+            0,
+            0x0,
+            ctypes.byref(tu_ptr),
+        )
     if err != 0 or not tu_ptr.value:
         raise EncoderHygieneError(
             f"libclang failed to parse production source {source} directly, "
-            f"using its own exact compile_commands.json entry (CXErrorCode="
+            f"using exact target/config context {context.target}/"
+            f"{context.configuration or '<single-config>'} from {context.directory} "
+            f"(CXErrorCode="
             f"{err}); this must never be silently skipped, since a "
             "manifest-registered source this script cannot parse is a source "
             "it cannot prove anything about."
@@ -1733,11 +2404,12 @@ def _scan_sources(
     external_roots: frozenset[Path],
     allowed_closure: frozenset[Path],
     seen: set[tuple],
+    owned_paths: OwnedPathPolicy | None = None,
 ) -> tuple[list[str], list[Finding]]:
     """Independently parse every REAL production .cpp in `sources` as its
-    own translation unit (see _parse_source_as_own_tu()) -- each with its
-    own exact compile_commands.json entry, never a borrowed/
-    "representative" one -- and:
+    own translation unit (see _parse_source_as_own_tu()) in every exact
+    target/configuration object command matching its physical path --
+    never a first-match or borrowed context -- and:
 
       - audit its complete resolved inclusion graph against
         `allowed_closure`, exactly like _scan_headers() already does for
@@ -1746,9 +2418,9 @@ def _scan_sources(
         the identical way a header's own wrapper "main file" entry is,
         by passing the source's own path as the self-filtering
         `wrapper_filename` argument);
-      - collect a Finding for every genuinely NEW, source-only,
-        externally-linked, encoder-shaped declaration this source
-        introduces -- i.e. one with no earlier declaration anywhere,
+      - collect Findings for source-only external declarations and for
+        project-header declarations visible only in this TU's exact
+        preprocessor context,
         such as a namespace-scope `QJsonObject encodeDeck(const
         DeckList&)` written directly in a .cpp with no header
         declaration at all, which a review round demonstrated compiles
@@ -1756,16 +2428,13 @@ def _scan_sources(
         ad-hoc `extern` forward declaration despite this script
         previously collecting zero findings from source scanning.
 
-    An out-of-line DEFINITION of an already header-declared symbol (e.g.
+    An out-of-line definition of an already observed header declaration (e.g.
     src/domain/RawJson.cpp's `Value::toExactQJson()`, or
     src/AuthModels.cpp's `AuthenticateRequest::toJson()`) is correctly
-    NOT re-flagged here: for each function-like/constructor cursor found
-    in this source, clang_getCanonicalCursor() is used to resolve it to
-    its own FIRST declaration anywhere in the TU. When that canonical
-    cursor's own file is a header already covered by _scan_headers()
-    (i.e. a member of `allowed_closure`), this cursor is merely that
-    header declaration's out-of-line definition, already correctly
-    counted while scanning its header, and is silently skipped. Only
+    not re-flagged: it is skipped only when its exact canonical identity
+    (resolved path, line, USR, signature, access, and shape) is already
+    in unified `seen` data. Header-path membership alone never suppresses
+    a macro-conditional declaration absent from standalone wrappers. Only
     when the canonical cursor's own file is the .cpp itself (no earlier
     declaration anywhere) -- and that declaration has genuinely EXTERNAL
     linkage (clang_getCursorLinkage() == CXLinkage_External; a `static`-
@@ -1776,9 +2445,9 @@ def _scan_sources(
     never match any ALLOWLIST entry, since every entry is keyed to a
     header path), so it always, correctly, classifies as a violation.
 
-    `seen` is the SAME whole-run dedup set _scan_headers() uses (3-tuple
-    `(resolved file, line, USR)` entries): a source-only declaration's
-    dedup key uses the source's own resolved path, so it can never
+    `seen` is the same whole-run canonical-identity set _scan_headers()
+    uses (resolved file, line, USR, kind, signature, access, and shape):
+    a source-only declaration's key uses the source's own path, so it cannot
     collide with a header-scan entry, but a source scanned more than
     once (impossible in this script's normal flow, since each manifest
     entry is scanned exactly once, but kept for defensive consistency
@@ -1787,84 +2456,212 @@ def _scan_sources(
     violations: list[str] = []
     findings: list[Finding] = []
 
+    def finding_path(real: Path) -> str:
+        try:
+            return real.relative_to(repo_root).as_posix()
+        except ValueError:
+            return real.as_posix()
+
     def make_visitor(source_real: Path):
-        def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
-            kind = clang.lib.clang_getCursorKind(cursor)
-            filename, _line = clang.cursor_file_and_line(cursor)
-            if filename is not None and Path(filename).resolve() != source_real:
-                # This cursor (and everything beneath it) belongs entirely to a
-                # different, transitively-#include-d file -- e.g. a project header
-                # already independently covered by _scan_headers(), or a Qt/system
-                # header entirely out of scope here. Declarations reached only by
-                # recursing into another file's own AST must never be attributed to
-                # THIS source, so this subtree is not descended into at all.
-                return 1  # CXChildVisit_Continue
-
-            if kind in _RECORD_LIKE_KINDS:
-                return 2  # CXChildVisit_Recurse: a source-defined class/struct is not itself
-                # flagged here (constructing new *types* in a .cpp is not how this bypass
-                # works; only a source-only *function*/constructor declaration is), but its
-                # own members, physically written in this same source, must still be
-                # visited normally.
-            if kind not in _OUTPARAM_CHECKED_KINDS:  # Superset of _FUNCTION_LIKE_KINDS, includes constructors.
-                return 2  # CXChildVisit_Recurse: keep looking for nested declarations.
-
+        def record_own(cursor: _CXCursor, kind: int) -> None:
             canonical = clang.lib.clang_getCanonicalCursor(cursor)
             canonical_filename, canonical_line = clang.cursor_file_and_line(canonical)
             if canonical_filename is None:
-                return 1  # CXChildVisit_Continue: no location at all (e.g. built-in); nothing to check.
+                return
             canonical_real = Path(canonical_filename).resolve()
-            if canonical_real in allowed_closure:
-                return 1  # Already declared (and already counted) in a scanned header; this source
-                # cursor is merely that declaration's out-of-line definition.
-            if not canonical_real.is_relative_to(repo_root):
-                return 1  # The canonical declaration belongs to an entirely external (e.g. Qt/
-                # system) header -- this is a specialization/instantiation of pre-existing
-                # external API, not a new source-only project declaration.
+            if canonical_real not in allowed_closure and canonical_real != source_real:
+                return
 
-            linkage = clang.lib.clang_getCursorLinkage(cursor)
-            if linkage != _CXLinkage_External:
-                return 1  # `static`/anonymous-namespace-scoped: cannot be referenced from another TU.
-
-            access = clang.lib.clang_getCXXAccessSpecifier(cursor)
+            access = clang.lib.clang_getCXXAccessSpecifier(canonical)
             if access not in _PUBLIC_ACCESS_SPECIFIERS:
-                return 1  # A private/protected member of a class defined only in this source is not
-                # reachable from outside that class regardless of its own linkage.
+                return
+            if canonical_real == source_real:
+                linkage = clang.lib.clang_getCursorLinkage(cursor)
+                if linkage != _CXLinkage_External:
+                    return
 
             is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
             if not is_shaped:
-                return 1
+                return
+            usr = clang.to_str(clang.lib.clang_getCursorUSR(canonical))
+            signature = clang.to_str(
+                clang.lib.clang_getTypeSpelling(
+                    clang.lib.clang_getCanonicalType(
+                        clang.lib.clang_getCursorType(canonical)
+                    )
+                )
+            )
+            dedup_key = (
+                str(canonical_real),
+                canonical_line,
+                usr,
+                kind,
+                signature,
+                access,
+                shape_description,
+            )
+            if dedup_key in seen:
+                return
+            seen.add(dedup_key)
+            findings.append(
+                Finding(
+                    file=finding_path(canonical_real),
+                    line=canonical_line,
+                    display_name=clang.to_str(
+                        clang.lib.clang_getCursorDisplayName(cursor)
+                    ),
+                    canonical_return_type=shape_description,
+                    usr=usr,
+                )
+            )
 
-            usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
-            dedup_key = (str(canonical_real), canonical_line, usr)
-            if dedup_key not in seen:
+        def record_inheritance(
+            class_cursor: _CXCursor,
+            exposures: Sequence[_Exposure] | None = None,
+        ) -> None:
+            class_filename, _class_line = clang.cursor_file_and_line(class_cursor)
+            if class_filename is None:
+                return
+            class_real = Path(class_filename).resolve()
+            if class_real not in allowed_closure and class_real != source_real:
+                return
+            class_access = clang.lib.clang_getCXXAccessSpecifier(class_cursor)
+            if class_access not in (
+                _CX_CXXInvalidAccessSpecifier,
+                _CX_CXXPublic,
+                _CX_CXXProtected,
+            ):
+                return
+            class_usr = clang.to_str(clang.lib.clang_getCursorUSR(class_cursor))
+            for exposure in (
+                exposures
+                if exposures is not None
+                else _inherited_and_reexported_encoders(clang, class_cursor)
+            ):
+                attribution_filename, attribution_line = clang.cursor_file_and_line(
+                    exposure.attribution_cursor
+                )
+                if attribution_filename is None:
+                    continue
+                attribution_real = Path(attribution_filename).resolve()
+                if attribution_real not in allowed_closure and attribution_real != source_real:
+                    continue
+                if exposure.source_cursor is None:
+                    usr = (
+                        f"{class_usr}@dependent-exposure@{attribution_line}@"
+                        f"{exposure.reason}"
+                    )
+                    shape_description = (
+                        "unresolved exposure capable of returning/mutating QJsonObject"
+                    )
+                    display_name = exposure.reason
+                    source_signature = ""
+                else:
+                    source_kind = clang.lib.clang_getCursorKind(
+                        exposure.source_cursor
+                    )
+                    is_shaped, shape_description = _is_encoder_shaped(
+                        clang, exposure.source_cursor, source_kind
+                    )
+                    if not is_shaped:
+                        continue
+                    usr = clang.to_str(
+                        clang.lib.clang_getCursorUSR(exposure.source_cursor)
+                    )
+                    display_name = (
+                        clang.to_str(
+                            clang.lib.clang_getCursorDisplayName(
+                                exposure.source_cursor
+                            )
+                        )
+                        + " (exposed via inheritance/using-declaration)"
+                    )
+                    source_signature = clang.to_str(
+                        clang.lib.clang_getTypeSpelling(
+                            clang.lib.clang_getCanonicalType(
+                                clang.lib.clang_getCursorType(
+                                    exposure.source_cursor
+                                )
+                            )
+                        )
+                    )
+                dedup_key = (
+                    str(attribution_real),
+                    attribution_line,
+                    usr,
+                    "inherited",
+                    class_usr,
+                    source_signature,
+                    exposure.reason,
+                )
+                if dedup_key in seen:
+                    continue
                 seen.add(dedup_key)
                 findings.append(
                     Finding(
-                        file=canonical_real.relative_to(repo_root).as_posix(),
-                        line=canonical_line,
-                        display_name=clang.to_str(clang.lib.clang_getCursorDisplayName(cursor)),
+                        file=finding_path(attribution_real),
+                        line=attribution_line,
+                        display_name=display_name,
                         canonical_return_type=shape_description,
                         usr=usr,
                     )
                 )
+
+        def visitor(cursor: _CXCursor, _parent: _CXCursor, _client_data) -> int:
+            kind = clang.lib.clang_getCursorKind(cursor)
+            filename, _line = clang.cursor_file_and_line(cursor)
+            if filename is not None:
+                cursor_real = Path(filename).resolve()
+                if cursor_real != source_real and cursor_real not in allowed_closure:
+                    # System/external declarations are not policy-owned. In
+                    # contrast, project headers in allowed_closure MUST be
+                    # traversed in this exact source TU: source-local defines
+                    # can reveal declarations absent from standalone wrappers.
+                    return 1
+
+            if kind in (_CXCursor_TypeAliasDecl, _CXCursor_TypedefDecl):
+                record_inheritance(
+                    cursor, _alias_reexported_encoders(clang, cursor)
+                )
+                return 1
+            if kind in _RECORD_LIKE_KINDS and clang.lib.clang_isCursorDefinition(cursor):
+                record_inheritance(cursor)
+                return 2
+            if kind not in _OUTPARAM_CHECKED_KINDS:
+                return 2
+
+            canonical = clang.lib.clang_getCanonicalCursor(cursor)
+            canonical_filename, _canonical_line = clang.cursor_file_and_line(canonical)
+            if canonical_filename is None:
+                return 1  # CXChildVisit_Continue
+            canonical_real = Path(canonical_filename).resolve()
+            if canonical_real == source_real or canonical_real in allowed_closure:
+                record_own(cursor, kind)
             return 1
 
         return visitor
 
     for source in sources:
-        tu = _parse_source_as_own_tu(clang, idx, source, compile_commands, sysroot_args)
-        try:
-            violations.extend(
-                _audit_inclusion_graph(
-                    clang, tu, source, str(source.resolve()), allowed_closure, external_roots
+        for context in _compile_contexts_for_source(compile_commands, source):
+            tu = _parse_source_as_own_tu(clang, idx, context, sysroot_args)
+            try:
+                violations.extend(
+                    _audit_inclusion_graph(
+                        clang,
+                        tu,
+                        source,
+                        str(source.resolve()),
+                        allowed_closure,
+                        external_roots,
+                        owned_paths,
+                        context.directory,
+                    )
                 )
-            )
-            root = clang.lib.clang_getTranslationUnitCursor(tu)
-            visitor_cb = clang._visitor_func_type(make_visitor(source.resolve()))
-            clang.lib.clang_visitChildren(root, visitor_cb, None)
-        finally:
-            clang.lib.clang_disposeTranslationUnit(tu)
+                root = clang.lib.clang_getTranslationUnitCursor(tu)
+                visitor_cb = clang._visitor_func_type(make_visitor(source.resolve()))
+                clang.lib.clang_visitChildren(root, visitor_cb, None)
+            finally:
+                clang.lib.clang_disposeTranslationUnit(tu)
     return violations, findings
 
 
@@ -1882,7 +2679,13 @@ def _read_manifest(path: Path) -> list[Path]:
             "before running this script."
         )
     lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
-    return [Path(line) for line in lines if line]
+    entries = [Path(line) for line in lines if line]
+    if len(entries) != len(set(entries)):
+        raise EncoderHygieneError(
+            f"Manifest {path} contains duplicate path entries; ownership must be "
+            "unambiguous rather than silently deduplicated"
+        )
+    return entries
 
 
 def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
@@ -1950,7 +2753,20 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     compile_commands_path = clang_build_dir / "compile_commands.json"
     if not compile_commands_path.is_file():
         raise EncoderHygieneError(f"{compile_commands_path} does not exist after configuring")
-    compile_commands = json.loads(compile_commands_path.read_text(encoding="utf-8"))
+    try:
+        compile_commands = json.loads(
+            compile_commands_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EncoderHygieneError(
+            f"Could not read {compile_commands_path}: {exc}"
+        ) from exc
+    if not isinstance(compile_commands, list) or not all(
+        isinstance(entry, dict) for entry in compile_commands
+    ):
+        raise EncoderHygieneError(
+            f"{compile_commands_path} must contain an array of compile-command objects"
+        )
 
     # domain_headers.txt/foundation_headers.txt are generated by
     # arkham_write_target_header_set_manifest() (see cmake/PathManifest.cmake)
@@ -1981,19 +2797,35 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     # widening a closure.
     domain_root = (repo_root / "src" / "domain").resolve()
     foundation_root = (repo_root / "src").resolve()
-    domain_closure = _validate_closure_rootedness(
+    domain_source_closure = _validate_closure_rootedness(
         domain_headers + domain_fragments, domain_root, "Domain header/fragment"
     )
-    foundation_only_closure = _validate_closure_rootedness(
+    foundation_source_closure = _validate_closure_rootedness(
         foundation_headers + foundation_fragments, foundation_root, "Foundation header/fragment"
     )
+    autogen_closures = _load_autogen_closures(clang_build_dir)
+    domain_generated_closure = frozenset(
+        path
+        for closure in autogen_closures["domain"]
+        for path in closure.code_files
+    )
+    foundation_generated_closure = frozenset(
+        path
+        for closure in autogen_closures["foundation"]
+        for path in closure.code_files
+    )
+    domain_closure = domain_source_closure | domain_generated_closure
     # foundation -> domain is the allowed dependency direction
     # (arkham_foundation legitimately links arkham_domain_models); the
     # reverse, domain -> foundation, is exactly the forbidden direction a
     # review round demonstrated was not actually enforced (see module
     # docstring) -- hence domain's own allowed closure below deliberately
     # excludes foundation_only_closure entirely.
-    foundation_closure = domain_closure | foundation_only_closure
+    foundation_closure = (
+        domain_source_closure
+        | foundation_source_closure
+        | foundation_generated_closure
+    )
 
     libclang_path = _find_libclang()
     clang = _LibClang(libclang_path)
@@ -2001,8 +2833,12 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     is_macos = platform.system() == "Darwin"
     sysroot_args = ["-isysroot", _macos_sdk_sysroot()] if is_macos else []
 
-    domain_args = _representative_compile_args(compile_commands, domain_sources, "domain")
-    foundation_args = _representative_compile_args(compile_commands, foundation_sources, "foundation")
+    domain_contexts = _header_compile_contexts(
+        compile_commands, domain_sources, "domain"
+    )
+    foundation_contexts = _header_compile_contexts(
+        compile_commands, foundation_sources, "foundation"
+    )
 
     idx = clang.lib.clang_createIndex(0, 0)
     if not idx:
@@ -2013,35 +2849,43 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     # #include another member of its own closure), the same real
     # declaration can be legitimately discovered while scanning more than
     # one wrapper TU, and must only ever be recorded/counted once overall.
-    seen: set[tuple[str, int, str]] = set()
+    seen: set[tuple] = set()
     structural_violations: list[str] = []
     clang_build_dir_resolved = clang_build_dir.resolve()
     external_roots = _external_roots(clang_build_dir_resolved)
+    generated_roots = frozenset(
+        closure.root
+        for policy_closures in autogen_closures.values()
+        for closure in policy_closures
+    )
+    owned_paths = _owned_path_policy(repo_root, generated_roots)
 
     try:
         findings = _scan_headers(
             clang,
             idx,
             domain_headers + domain_fragments,
-            domain_args,
+            domain_contexts,
             sysroot_args,
             repo_root,
             external_roots,
             domain_closure,
             seen,
             structural_violations,
+            owned_paths,
         )
         findings += _scan_headers(
             clang,
             idx,
             foundation_headers + foundation_fragments,
-            foundation_args,
+            foundation_contexts,
             sysroot_args,
             repo_root,
             external_roots,
             foundation_closure,
             seen,
             structural_violations,
+            owned_paths,
         )
 
         # A review round demonstrated this script previously never
@@ -2080,6 +2924,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             external_roots,
             domain_closure,
             seen,
+            owned_paths,
         )
         structural_violations.extend(domain_source_violations)
         findings += domain_source_findings
@@ -2094,6 +2939,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             external_roots,
             foundation_closure,
             seen,
+            owned_paths,
         )
         structural_violations.extend(foundation_source_violations)
         findings += foundation_source_findings
@@ -2222,8 +3068,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"Encoder hygiene: {len(findings)} public QJson-returning declaration(s) "
         "found across the domain-model and foundation header/fragment sets, all "
         f"{len(ALLOWLIST)} allowlist entries accounted for at their exact "
-        "expected occurrence count, zero violations, and every header/"
-        "fragment's complete resolved inclusion graph stayed within its "
+        "expected occurrence count, zero violations, and every header, fragment, "
+        "source target/configuration, and owned AUTOGEN unit stayed within its "
         "allowed domain/foundation dependency-direction closure."
     )
     return 0

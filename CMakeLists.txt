@@ -86,6 +86,7 @@ file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
     "${qtkeychain_SOURCE_DIR}\n${qtkeychain_BINARY_DIR}\n"
 )
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/autogen_targets.txt" "")
 
 # FetchContent builds qtkeychain via add_subdirectory(), so the namespaced
 # alias normally created by the installed QtKeychainConfig.cmake does not
@@ -419,17 +420,16 @@ cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         TARGET arkham_domain_models
         OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_sources.txt"
 )
-# See arkham_append_target_autogen_root()'s own doc comment in
-# cmake/PathManifest.cmake for why this target's own AUTOMOC-generated
-# per-class moc_*.cpp fragments (transitively #include-d from the
-# mocs_compilation.cpp registered above) must be registered as a
-# trusted, generated root rather than requiring their own manifest
-# entry -- deferred for the identical reason (AUTOGEN_BUILD_DIR is not
-# guaranteed to be finalized until end-of-directory processing).
+# Register this target's AUTOGEN directory as owned generated metadata,
+# never as an external/trusted root. The policy checker cross-checks its
+# concrete C/C++ files against CMake's AutogenInfo.json and audits them
+# through the generated compilation unit. Deferred because
+# AUTOGEN_BUILD_DIR is finalized at end-of-directory processing.
 cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    CALL arkham_append_target_autogen_root
+    CALL arkham_append_target_autogen_manifest
         TARGET arkham_domain_models
-        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
+        POLICY domain
+        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/autogen_targets.txt"
 )
 arkham_write_path_manifest(
     OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/domain_fragments.txt"
@@ -468,9 +468,10 @@ cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 # See the matching arkham_domain_models call above.
 cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    CALL arkham_append_target_autogen_root
+    CALL arkham_append_target_autogen_manifest
         TARGET arkham_foundation
-        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
+        POLICY foundation
+        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/autogen_targets.txt"
 )
 arkham_write_path_manifest(
     OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/foundation_fragments.txt"

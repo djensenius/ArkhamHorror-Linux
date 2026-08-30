@@ -8,10 +8,9 @@
 # FILE_SET/source registrations (reading every named header set's files
 # via the single real `HEADER_SET_<name>` property regardless of which
 # visibility it came from, since no separate `INTERFACE_HEADER_SET_<name>`
-# property actually exists), and that arkham_append_target_autogen_root()
-# (also in cmake/PathManifest.cmake) correctly registers an AUTOMOC-
-# enabled target's own AUTOGEN_BUILD_DIR while leaving an AUTOMOC-
-# disabled target's manifest untouched.
+# property actually exists), and that
+# arkham_append_target_autogen_manifest() correctly registers owned
+# target/policy/AUTOGEN_BUILD_DIR metadata only for AUTOMOC targets.
 #
 # cmake_language(DEFER DIRECTORY <dir> CALL ...) requires <dir> to be a
 # directory CMake is actually (or has already finished) processing as
@@ -52,10 +51,10 @@
 #     explicitly enabled (AutomocGeneratedCompilationUnitIsIncludedInManifestTest),
 #     proving arkham_write_target_source_manifest() appends that
 #     target's own AUTOMOC-generated mocs_compilation.cpp, and that
-#     arkham_append_target_autogen_root() registers its AUTOGEN_BUILD_DIR
-#     into a shared external-roots manifest -- alongside the same kind of
+#     arkham_append_target_autogen_manifest() registers its AUTOGEN_BUILD_DIR
+#     into an owned-target manifest -- alongside the same kind of
 #     regressed pre-fix reproduction, and a negative control proving
-#     arkham_append_target_autogen_root() appends NOTHING at all for
+#     arkham_append_target_autogen_manifest() appends NOTHING at all for
 #     probe_target (AUTOMOC left OFF, the default).
 #
 # Expected, asserted outcomes:
@@ -264,22 +263,20 @@ cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
     OUTPUT_FILE "${CMAKE_BINARY_DIR}/sources_automoc_regressed.txt"
 )
 
-# arkham_append_target_autogen_root(): the shared external-roots
-# manifest starts empty; probe_target_automoc (AUTOMOC ON) must append
-# its own AUTOGEN_BUILD_DIR, while probe_target (AUTOMOC left at its
-# CMake default of OFF) must append NOTHING at all -- a negative
-# control proving the function's own AUTOMOC guard is real, not a
-# no-op that always appends regardless.
-file(WRITE "${CMAKE_BINARY_DIR}/external_roots_probe.txt" "")
+# Owned AUTOGEN metadata starts empty; the AUTOMOC target contributes
+# exactly one policy/target/root record and the non-AUTOMOC target none.
+file(WRITE "${CMAKE_BINARY_DIR}/autogen_targets_probe.txt" "")
 cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
-    arkham_append_target_autogen_root
+    arkham_append_target_autogen_manifest
     TARGET probe_target_automoc
-    OUTPUT_FILE "${CMAKE_BINARY_DIR}/external_roots_probe.txt"
+    POLICY domain
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/autogen_targets_probe.txt"
 )
 cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
-    arkham_append_target_autogen_root
+    arkham_append_target_autogen_manifest
     TARGET probe_target
-    OUTPUT_FILE "${CMAKE_BINARY_DIR}/external_roots_probe.txt"
+    POLICY domain
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/autogen_targets_probe.txt"
 )
 ]=])
 
@@ -413,24 +410,24 @@ if(NOT "${_sources_automoc_regressed}" STREQUAL "")
 endif()
 message(STATUS "Case 8 (AutomocGeneratedCompilationUnitIsIncludedInManifestTest, fail-before: regressed pre-fix source manifest correctly omits mocs_compilation.cpp) passed.")
 
-# --- Case 9: arkham_append_target_autogen_root() must append EXACTLY
-# ONE line overall to the shared external-roots manifest -- proving
+# --- Case 9: arkham_append_target_autogen_manifest() must append EXACTLY
+# ONE line overall to the owned AUTOGEN manifest -- proving
 # both that probe_target_automoc's (AUTOMOC ON) own AUTOGEN_BUILD_DIR IS
 # registered, and that probe_target's (AUTOMOC left OFF, the default)
 # call correctly appended NOTHING at all, i.e. the function's own
 # AUTOMOC guard is real and not a no-op that always appends regardless
 # of whether AUTOMOC is actually enabled. ---
-_arkham_dtm_read_manifest_lines("${ARKHAM_SCRATCH_DIR}/build/external_roots_probe.txt" _external_roots_probe)
-list(LENGTH _external_roots_probe _external_roots_probe_count)
-if(NOT _external_roots_probe_count EQUAL 1)
+_arkham_dtm_read_manifest_lines("${ARKHAM_SCRATCH_DIR}/build/autogen_targets_probe.txt" _autogen_targets_probe)
+list(LENGTH _autogen_targets_probe _autogen_targets_probe_count)
+if(NOT _autogen_targets_probe_count EQUAL 1)
     message(FATAL_ERROR
-        "Case 9 (arkham_append_target_autogen_root) expected exactly one line in external_roots_probe.txt (probe_target_automoc's own AUTOGEN_BUILD_DIR, with probe_target's AUTOMOC-disabled call contributing nothing) but found ${_external_roots_probe_count}: ${_external_roots_probe}")
+        "Case 9 expected exactly one owned AUTOGEN record but found ${_autogen_targets_probe_count}: ${_autogen_targets_probe}")
 endif()
-list(GET _external_roots_probe 0 _external_roots_probe_only_line)
-if(NOT _external_roots_probe_only_line MATCHES "probe_target_automoc_autogen$")
+list(GET _autogen_targets_probe 0 _autogen_targets_probe_only_line)
+if(NOT _autogen_targets_probe_only_line MATCHES "^domain[\t]probe_target_automoc[\t].*probe_target_automoc_autogen$")
     message(FATAL_ERROR
-        "Case 9 (arkham_append_target_autogen_root) expected the one registered root to be probe_target_automoc's own AUTOGEN_BUILD_DIR, but found: ${_external_roots_probe_only_line}")
+        "Case 9 expected domain/target/root AUTOGEN metadata, found: ${_autogen_targets_probe_only_line}")
 endif()
-message(STATUS "Case 9 (arkham_append_target_autogen_root correctly registers only the AUTOMOC-enabled target's own AUTOGEN_BUILD_DIR, and appends nothing for the AUTOMOC-disabled target) passed.")
+message(STATUS "Case 9 (owned AUTOGEN metadata registers only the AUTOMOC-enabled target) passed.")
 
 message(STATUS "DeferredTargetManifestPolicyTest: all 9 cases passed.")

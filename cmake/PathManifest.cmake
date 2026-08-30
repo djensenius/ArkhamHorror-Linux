@@ -318,22 +318,16 @@ endfunction()
 #     property is enabled for it, so a future Q_OBJECT/Q_GADGET type
 #     added to either target's generated moc output is audited exactly
 #     like any other compiled translation unit, never silently skipped.
-#     packaging/check_encoder_hygiene.py's own
-#     _find_compile_command_for_source() independently enforces the
-#     other half of this: every source this manifest lists (including
-#     this appended mocs_compilation.cpp entry) MUST have its own exact
-#     compile_commands.json entry, or the scan hard-fails outright --
-#     this manifest can never silently list a source Ninja/Make itself
-#     never actually compiled. (compile_commands.json entries carry no
-#     per-target attribution field a generator-agnostic reverse check
-#     could key on -- e.g. the Ninja generator this project's own
-#     packaging/check_encoder_hygiene.py build uses gives every entry the
-#     SAME top-level build "directory" regardless of which target owns
-#     it -- so the manifest-to-target-SOURCES direction covered by
-#     arkham_write_target_source_manifest() itself, plus this function's
-#     analogous AUTOGEN_BUILD_DIR/trusted-root registration for the one
-#     concrete generated-TU gap a real build actually exposed, is what
-#     this project actually enforces; see tests/cmake/
+#     packaging/check_encoder_hygiene.py independently requires every
+#     target/configuration object command for each manifested physical
+#     source, keyed by compile_commands.json's CMakeFiles/<target>.dir
+#     output identity. Missing, ambiguous, duplicate, or targetless
+#     entries fail closed, and each entry's own working directory plus
+#     command/arguments representation is used verbatim after dropping
+#     compile-only flags. AUTOGEN_BUILD_DIR is separately registered as
+#     owned generated metadata and cross-checked against the target's
+#     AutogenInfo.json; it is never an external/trusted subtree. See
+#     tests/cmake/
 #     DeferredTargetManifestPolicyTest.cmake's
 #     AutomocGeneratedCompilationUnitIsIncludedInManifestTest for the
 #     real, fail-before/pass-after CMake mutation test proving this
@@ -433,63 +427,40 @@ function(arkham_write_target_source_manifest)
     unset(_arkham_tsm_lines)
 endfunction()
 
-# A real, running build subsequently showed that once
-# arkham_write_target_source_manifest() (above) started registering each
-# target's own AUTOMOC-generated `mocs_compilation.cpp` as a genuine,
-# independently-scanned SOURCE, that translation unit's OWN transitive
-# `#include`s of the individual per-Q_OBJECT-class `moc_*.cpp` fragments
-# AUTOMOC generates (e.g. `moc_FocusController.cpp`, physically written
-# under that same target's AUTOGEN_BUILD_DIR) were then, correctly,
-# reached by packaging/check_encoder_hygiene.py's inclusion-graph audit
-# for the first time -- and, having no manifest entry of their own,
-# failed as unregistered project files. These fragments are not
-# hand-authored project code at all: each one is mechanically generated,
-# in full, by Qt's `moc` tool directly from an already
-# FILE_SET-registered, already independently AST-scanned Q_OBJECT/
-# Q_GADGET header, and can only ever reference members that header
-# itself already declares -- moc cannot invent a new public API surface
-# of its own. This function registers a target's own AUTOGEN_BUILD_DIR
-# (computed identically to arkham_write_target_source_manifest()'s own
-# mocs_compilation.cpp path logic above) as a trusted, GENERATED root in
-# the same manifest packaging/check_encoder_hygiene.py's
-# `_external_roots()` reads for genuinely-external FetchContent
-# dependencies (see the `generated/external_roots.txt` writer in
-# CMakeLists.txt) -- appended via file(APPEND ...), never overwriting
-# the FetchContent-derived lines already written there. This is real,
-# CMake-derived target metadata (AUTOMOC/AUTOGEN_BUILD_DIR properties),
-# never a lexical "build directory" guess, so it stays correct
-# automatically if CMake's own AUTOGEN_BUILD_DIR default ever changes or
-# is explicitly overridden for either target.
-#
-# Arguments:
-#   TARGET       The target whose AUTOGEN_BUILD_DIR (if AUTOMOC-enabled)
-#                is registered.
-#   OUTPUT_FILE  Absolute path of the (already-existing) external-roots
-#                manifest file to append to.
-function(arkham_append_target_autogen_root)
-    set(oneValueArgs TARGET OUTPUT_FILE)
+# Register an AUTOMOC target's generated directory as project-owned
+# metadata. It is deliberately not an external/trusted root:
+# check_encoder_hygiene.py cross-checks every C/C++ artifact beneath it
+# against CMake's target-specific AutogenInfo.json, audits the generated
+# compilation unit with its exact object compile command, and allows
+# only the concrete moc outputs CMake enumerates there.
+function(arkham_append_target_autogen_manifest)
+    set(oneValueArgs TARGET POLICY OUTPUT_FILE)
     cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
 
     if(NOT ARG_TARGET)
-        message(FATAL_ERROR "arkham_append_target_autogen_root: TARGET is required")
+        message(FATAL_ERROR "arkham_append_target_autogen_manifest: TARGET is required")
+    endif()
+    if(NOT ARG_POLICY MATCHES "^(domain|foundation)$")
+        message(FATAL_ERROR "arkham_append_target_autogen_manifest: POLICY must be domain or foundation")
     endif()
     if(NOT ARG_OUTPUT_FILE)
-        message(FATAL_ERROR "arkham_append_target_autogen_root: OUTPUT_FILE is required")
+        message(FATAL_ERROR "arkham_append_target_autogen_manifest: OUTPUT_FILE is required")
     endif()
     if(NOT TARGET ${ARG_TARGET})
-        message(FATAL_ERROR "arkham_append_target_autogen_root: no such target '${ARG_TARGET}'")
+        message(FATAL_ERROR "arkham_append_target_autogen_manifest: no such target '${ARG_TARGET}'")
     endif()
 
-    get_target_property(_arkham_tar_automoc ${ARG_TARGET} AUTOMOC)
-    if(_arkham_tar_automoc)
-        get_target_property(_arkham_tar_autogen_dir ${ARG_TARGET} AUTOGEN_BUILD_DIR)
-        if(NOT _arkham_tar_autogen_dir)
-            get_target_property(_arkham_tar_binary_dir ${ARG_TARGET} BINARY_DIR)
-            set(_arkham_tar_autogen_dir "${_arkham_tar_binary_dir}/${ARG_TARGET}_autogen")
-            unset(_arkham_tar_binary_dir)
+    get_target_property(_arkham_tam_automoc ${ARG_TARGET} AUTOMOC)
+    if(_arkham_tam_automoc)
+        get_target_property(_arkham_tam_autogen_dir ${ARG_TARGET} AUTOGEN_BUILD_DIR)
+        if(NOT _arkham_tam_autogen_dir)
+            get_target_property(_arkham_tam_binary_dir ${ARG_TARGET} BINARY_DIR)
+            set(_arkham_tam_autogen_dir "${_arkham_tam_binary_dir}/${ARG_TARGET}_autogen")
+            unset(_arkham_tam_binary_dir)
         endif()
-        file(APPEND "${ARG_OUTPUT_FILE}" "${_arkham_tar_autogen_dir}\n")
-        unset(_arkham_tar_autogen_dir)
+        file(APPEND "${ARG_OUTPUT_FILE}"
+            "${ARG_POLICY}\t${ARG_TARGET}\t${_arkham_tam_autogen_dir}\n")
+        unset(_arkham_tam_autogen_dir)
     endif()
-    unset(_arkham_tar_automoc)
+    unset(_arkham_tam_automoc)
 endfunction()

@@ -38,8 +38,11 @@ Run directly: `python3 packaging/check_encoder_hygiene_ast_test.py`
 from __future__ import annotations
 
 import ctypes
+import json
+import os
 import platform
 import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -94,21 +97,35 @@ class _RealLibclangTestCase(unittest.TestCase):
         return path
 
     def _scan_header_fixture(
-        self, header: Path, allowed_closure: frozenset[Path], external_roots: frozenset[Path] = frozenset()
+        self,
+        header: Path,
+        allowed_closure: frozenset[Path],
+        external_roots: frozenset[Path] = frozenset(),
+        arguments: tuple[str, ...] = ("-std=c++23",),
+        owned_paths: ceh.OwnedPathPolicy | None = None,
     ) -> tuple[list[ceh.Finding], list[str]]:
         seen: set[tuple] = set()
         structural_violations: list[str] = []
+        context = ceh.CompileContext(
+            source=header.resolve(),
+            directory=self.scratch.resolve(),
+            arguments=arguments,
+            output=(self.scratch / "CMakeFiles/fixture.dir/header.o").resolve(),
+            target="fixture",
+            configuration="",
+        )
         findings = ceh._scan_headers(
             self.clang,
             self.idx,
             [header],
-            ["-std=c++23"],
+            [context],
             self.sysroot_args,
             self.repo_root,
             external_roots,
             allowed_closure,
             seen,
             structural_violations,
+            owned_paths,
         )
         return findings, structural_violations
 
@@ -118,8 +135,12 @@ class _RealLibclangTestCase(unittest.TestCase):
         source_abs = str(source.resolve())
         compile_commands = [
             {
+                "directory": str(self.scratch.resolve()),
                 "file": source_abs,
                 "command": f"c++ -std=c++23 -c {source_abs} -o {source_abs}.o",
+                "output": str(
+                    (self.scratch / f"CMakeFiles/fixture.dir/{source.name}.o").resolve()
+                ),
             }
         ]
         return ceh._scan_sources(
@@ -237,7 +258,16 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             self.clang,
             self.idx,
             [header],
-            ["-std=c++23"],
+            [
+                ceh.CompileContext(
+                    source=header.resolve(),
+                    directory=self.scratch.resolve(),
+                    arguments=("-std=c++23",),
+                    output=(self.scratch / "CMakeFiles/fixture.dir/header.o").resolve(),
+                    target="fixture",
+                    configuration="",
+                )
+            ],
             self.sysroot_args,
             self.repo_root,
             frozenset(),
@@ -256,6 +286,145 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "the out-of-line .cpp definition of an already header-declared/counted "
             "function must never be re-flagged as a NEW source-only declaration",
         )
+
+    def test_source_tu_macro_context_discovers_conditional_header_declarations(self) -> None:
+        header = self._write(
+            "Conditional.h",
+            "struct QJsonObject {};\n"
+            "#ifdef SOURCE_LOCAL_ENCODER\n"
+            "namespace Arkham {\n"
+            "QJsonObject conditionalNamespace();\n"
+            "struct ConditionalMember {\n"
+            "  QJsonObject member();\n"
+            "  friend QJsonObject friendEncoder(const ConditionalMember &);\n"
+            "  template<class T> QJsonObject templated(T) { return {}; }\n"
+            "};\n"
+            "#define DECLARE_ENCODER(name) QJsonObject name();\n"
+            "DECLARE_ENCODER(macroEncoder)\n"
+            "}\n"
+            "#endif\n",
+        )
+        source = self._write(
+            "Conditional.cpp",
+            "#define SOURCE_LOCAL_ENCODER\n"
+            '#include "Conditional.h"\n'
+            "namespace Arkham {\n"
+            "QJsonObject conditionalNamespace() { return {}; }\n"
+            "QJsonObject ConditionalMember::member() { return {}; }\n"
+            "QJsonObject friendEncoder(const ConditionalMember &) { return {}; }\n"
+            "QJsonObject macroEncoder() { return {}; }\n"
+            "}\n",
+        )
+        closure = frozenset({header.resolve()})
+        standalone, violations = self._scan_header_fixture(header, closure)
+        self.assertEqual(violations, [])
+        self.assertEqual(standalone, [])
+
+        source_violations, findings = self._scan_source_fixture(source, closure)
+        self.assertEqual(source_violations, [])
+        names = {finding.display_name.split("(", 1)[0] for finding in findings}
+        self.assertEqual(
+            names,
+            {
+                "conditionalNamespace",
+                "member",
+                "friendEncoder",
+                "templated",
+                "macroEncoder",
+            },
+        )
+
+    def test_distinct_target_macro_contexts_do_not_suppress_overloads(self) -> None:
+        header = self._write(
+            "ContextOverload.h",
+            "struct QJsonObject {};\n"
+            "#if MODE == 1\n"
+            "QJsonObject contextual(int);\n"
+            "#elif MODE == 2\n"
+            "QJsonObject contextual(double);\n"
+            "#endif\n",
+        )
+        source = self._write(
+            "ContextOverload.cpp",
+            '#include "ContextOverload.h"\n'
+            "#if MODE == 1\n"
+            "QJsonObject contextual(int) { return {}; }\n"
+            "#elif MODE == 2\n"
+            "QJsonObject contextual(double) { return {}; }\n"
+            "#endif\n",
+        )
+        source_abs = str(source.resolve())
+        commands = []
+        for mode, target in ((1, "domain"), (2, "consumer")):
+            output = self.scratch / f"CMakeFiles/{target}.dir/context.o"
+            commands.append(
+                {
+                    "directory": str(self.scratch.resolve()),
+                    "file": source_abs,
+                    "arguments": [
+                        "clang++",
+                        "-std=c++23",
+                        f"-DMODE={mode}",
+                        "-c",
+                        source_abs,
+                    ],
+                    "output": str(output.resolve()),
+                }
+            )
+        violations, findings = ceh._scan_sources(
+            self.clang,
+            self.idx,
+            [source],
+            commands,
+            self.sysroot_args,
+            self.repo_root,
+            frozenset(),
+            frozenset({header.resolve()}),
+            set(),
+        )
+        self.assertEqual(violations, [])
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(len({finding.usr for finding in findings}), 2)
+
+    def test_compile_entry_working_directory_and_arguments_array_are_exact(self) -> None:
+        work = self.scratch / "target-build"
+        include = work / "relative-include"
+        include.mkdir(parents=True)
+        header = include / "Context.h"
+        header.write_text("struct QJsonObject {};\n", encoding="utf-8")
+        source = work / "Source.cpp"
+        source.write_text(
+            '#include "Context.h"\nQJsonObject exactDirectoryEncoder() { return {}; }\n',
+            encoding="utf-8",
+        )
+        commands = [
+            {
+                "directory": str(work),
+                "file": "Source.cpp",
+                "arguments": [
+                    "clang++",
+                    "-std=c++23",
+                    "-Irelative-include",
+                    "-c",
+                    "Source.cpp",
+                ],
+                "output": "CMakeFiles/exact-context.dir/Source.cpp.o",
+            }
+        ]
+        violations, findings = ceh._scan_sources(
+            self.clang,
+            self.idx,
+            [source],
+            commands,
+            self.sysroot_args,
+            self.repo_root,
+            frozenset(),
+            frozenset({header.resolve()}),
+            set(),
+        )
+        self.assertEqual(violations, [])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("exactDirectoryEncoder", findings[0].display_name)
 
 
 class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
@@ -353,6 +522,27 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
         self.assertEqual(len(findings), 1)
         self.assertNotIn("exposed via inheritance", findings[0].display_name)
 
+    def test_protected_inheritance_remains_exposable_to_subclasses(self) -> None:
+        header = self._write(
+            "ProtectedInherit.h",
+            "struct QJsonObject {};\n"
+            "class BaseProtected {\n"
+            "public:\n"
+            "  QJsonObject toJsonProtected() const;\n"
+            "};\n"
+            "class DerivedProtected : protected BaseProtected {};\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        inherited = [
+            finding
+            for finding in findings
+            if "exposed via inheritance" in finding.display_name
+        ]
+        self.assertEqual(len(inherited), 1)
+
     def test_using_declaration_reexports_an_otherwise_private_base_encoder(self) -> None:
         header = self._write(
             "UsingReexport.h",
@@ -379,6 +569,158 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
         inherited = [f for f in findings if "exposed via inheritance" in f.display_name]
         self.assertEqual(len(inherited), 1)
         self.assertIn("toJson4", inherited[0].display_name)
+
+    def test_nested_cv_pointer_alias_and_template_output_mutability(self) -> None:
+        rejected = {
+            "const pointer to mutable": "QJsonObject * const &",
+            "double pointer": "QJsonObject **",
+            "typedef pointer": "MutableAlias &",
+            "alias-template pointer": "PointerAlias<QJsonObject> const &",
+            "mutable wrapper": "Box<QJsonObject> &",
+            "const wrapper containing mutable pointer": "const Box<QJsonObject *> &",
+        }
+        prelude = (
+            "struct QJsonObject {};\n"
+            "using MutableAlias = QJsonObject * const;\n"
+            "template<class T> using PointerAlias = T *;\n"
+            "template<class T> struct Box { T value; };\n"
+        )
+        for label, parameter in rejected.items():
+            with self.subTest(label=label):
+                header = self._write(
+                    f"output-{label.replace(' ', '-')}.h",
+                    prelude + f"void encode({parameter} out);\n",
+                )
+                findings, violations = self._scan_header_fixture(
+                    header, frozenset({header.resolve()})
+                )
+                self.assertEqual(violations, [])
+                self.assertEqual(len(findings), 1)
+
+        accepted = {
+            "pointer to const": "const QJsonObject * const &",
+            "const direct wrapper": "const Box<QJsonObject> &",
+            "const alias pointee": "ConstAlias &",
+        }
+        accepted_prelude = prelude + "using ConstAlias = const QJsonObject * const;\n"
+        for label, parameter in accepted.items():
+            with self.subTest(label=label):
+                header = self._write(
+                    f"input-{label.replace(' ', '-')}.h",
+                    accepted_prelude + f"void decode({parameter} in);\n",
+                )
+                findings, violations = self._scan_header_fixture(
+                    header, frozenset({header.resolve()})
+                )
+                self.assertEqual(violations, [])
+                self.assertEqual(findings, [])
+
+    def test_dependent_public_and_protected_inheritance_fail_closed(self) -> None:
+        header = self._write(
+            "DependentInheritance.h",
+            "struct QJsonObject {};\n"
+            "struct AuthenticateRequest { QJsonObject toJson() const; };\n"
+            "template<class T> struct PublicWrapper : public T {};\n"
+            "using WrappedAuth = PublicWrapper<AuthenticateRequest>;\n"
+            "template<class T> struct ProtectedWrapper : protected T {};\n"
+            "template<class T> struct PrivateWrapper : private T {};\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        dependent = [
+            finding
+            for finding in findings
+            if "dependent base" in finding.display_name
+        ]
+        self.assertEqual(len(dependent), 2)
+        self.assertFalse(
+            any("PrivateWrapper" in finding.usr for finding in dependent)
+        )
+
+    def test_public_dependent_using_reexport_from_private_base_fails_closed(self) -> None:
+        header = self._write(
+            "DependentUsing.h",
+            "struct QJsonObject {};\n"
+            "struct AuthenticateRequest { QJsonObject toJson() const; };\n"
+            "template<class T> struct Forwarder : private T {\n"
+            "public:\n"
+            "  using T::toJson;\n"
+            "};\n"
+            "using ForwardAuth = Forwarder<AuthenticateRequest>;\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        dependent_using = [
+            finding
+            for finding in findings
+            if "dependent using-declaration" in finding.display_name
+        ]
+        self.assertEqual(len(dependent_using), 1)
+
+    def test_private_nested_dependent_wrapper_is_not_exposed(self) -> None:
+        header = self._write(
+            "PrivateNestedWrapper.h",
+            "struct QJsonObject {};\n"
+            "class Holder {\n"
+            "private:\n"
+            "  template<class T> struct Hidden : public T {};\n"
+            "};\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        self.assertEqual(findings, [])
+
+    def test_public_and_protected_aliases_reexport_encoder_type(self) -> None:
+        header = self._write(
+            "AliasExposure.h",
+            "struct QJsonObject {};\n"
+            "struct AuthenticateRequest { QJsonObject toJson() const; };\n"
+            "using PublicAlias = AuthenticateRequest;\n"
+            "class AliasHolder {\n"
+            "protected:\n"
+            "  using ProtectedAlias = AuthenticateRequest;\n"
+            "private:\n"
+            "  using PrivateAlias = AuthenticateRequest;\n"
+            "};\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        alias_findings = [
+            finding
+            for finding in findings
+            if "exposed via inheritance" in finding.display_name
+        ]
+        self.assertEqual(len(alias_findings), 2)
+
+    def test_external_dependent_wrapper_alias_is_audited_at_project_alias(self) -> None:
+        external = self._write(
+            "external/Wrapper.h",
+            "struct QJsonObject {};\n"
+            "struct AuthenticateRequest { QJsonObject toJson() const; };\n"
+            "template<class T> struct Wrapper : public T {};\n",
+        )
+        header = self._write(
+            "domain/Alias.h",
+            '#include "../external/Wrapper.h"\n'
+            "using WrappedAuth = Wrapper<AuthenticateRequest>;\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header,
+            frozenset({header.resolve()}),
+            external_roots=frozenset({external.parent.resolve()}),
+        )
+        self.assertEqual(violations, [])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("toJson", findings[0].display_name)
+        self.assertEqual(findings[0].file, "domain/Alias.h")
 
 
 class InclusionGraphDirectionAndClassificationTests(_RealLibclangTestCase):
@@ -481,6 +823,58 @@ class InclusionGraphDirectionAndClassificationTests(_RealLibclangTestCase):
             "project file",
         )
 
+    def test_project_source_marked_system_remains_owned_and_rejected(self) -> None:
+        forbidden = self._write("src/forbidden/Lossy.h", "struct QJsonObject {};\n")
+        allowed = self._write("src/domain/Allowed.h", '#include "Lossy.h"\n')
+        owned = ceh._owned_path_policy(self.repo_root, frozenset())
+        tu, wrapper_filename = ceh._parse_header_as_own_tu(
+            self.clang,
+            self.idx,
+            allowed,
+            ["-std=c++23", "-isystem", str(forbidden.parent)],
+            self.sysroot_args,
+        )
+        try:
+            violations = ceh._audit_inclusion_graph(
+                self.clang,
+                tu,
+                allowed,
+                wrapper_filename,
+                frozenset({allowed.resolve()}),
+                frozenset(),
+                owned,
+            )
+        finally:
+            self.clang.lib.clang_disposeTranslationUnit(tu)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("owned file", violations[0])
+
+    def test_hardlink_under_external_root_cannot_declassify_owned_source(self) -> None:
+        owned_header = self._write("src/forbidden/Owned.h", "struct Owned {};\n")
+        external_root = self.scratch / "external"
+        external_root.mkdir()
+        alias = external_root / "Alias.h"
+        os.link(owned_header, alias)
+        allowed = self._write("src/domain/Allowed.h", f'#include "{alias}"\n')
+        owned = ceh._owned_path_policy(self.repo_root, frozenset())
+        tu, wrapper_filename = ceh._parse_header_as_own_tu(
+            self.clang, self.idx, allowed, ["-std=c++23"], self.sysroot_args
+        )
+        try:
+            violations = ceh._audit_inclusion_graph(
+                self.clang,
+                tu,
+                allowed,
+                wrapper_filename,
+                frozenset({allowed.resolve()}),
+                frozenset({external_root.resolve()}),
+                owned,
+            )
+        finally:
+            self.clang.lib.clang_disposeTranslationUnit(tu)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("owned file", violations[0])
+
     def test_wrappers_own_synthetic_main_file_is_never_misclassified_as_a_violation(self) -> None:
         # A header with no #includes of its own at all: the ONLY file
         # clang_getInclusions() reports is the wrapper's own synthetic
@@ -489,6 +883,218 @@ class InclusionGraphDirectionAndClassificationTests(_RealLibclangTestCase):
         allowed = self._write("domain/Standalone.h", "struct QJsonObject {};\n")
         violations = self._audit_inclusion_graph_fixture(allowed, frozenset({allowed.resolve()}))
         self.assertEqual(violations, [])
+
+
+class ProductionCMakeSeamTests(unittest.TestCase):
+    def setUp(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        self.module = (repo / "cmake" / "PathManifest.cmake").resolve()
+        self.root = repo / "build" / "encoder-hygiene-production-seam" / self._testMethodName
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        self.root.mkdir(parents=True)
+        self.build = self.root / "build"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _write(self, relative: str, content: str) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _configure_and_build(self, targets: list[str], *, qt: bool = False) -> None:
+        clangxx = os.environ.get("ARKHAM_CLANGXX", "clang++")
+        command = [
+            "cmake",
+            "-S",
+            str(self.root),
+            "-B",
+            str(self.build),
+            "-G",
+            "Ninja",
+            f"-DCMAKE_CXX_COMPILER={clangxx}",
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ]
+        ninja = shutil.which("ninja")
+        if ninja is None and shutil.which("mise"):
+            ninja = subprocess.check_output(
+                ["mise", "which", "ninja"], text=True
+            ).strip()
+        if ninja:
+            command.append(f"-DCMAKE_MAKE_PROGRAM={ninja}")
+        if qt:
+            qt_prefix = os.environ.get("QT_PREFIX") or os.environ.get("QTDIR")
+            if not qt_prefix and shutil.which("brew"):
+                qt_prefix = subprocess.check_output(
+                    ["brew", "--prefix"], text=True
+                ).strip()
+            if qt_prefix:
+                command.append(f"-DCMAKE_PREFIX_PATH={qt_prefix}")
+        try:
+            subprocess.run(
+                command, check=True, cwd=self.root, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["cmake", "--build", str(self.build), "--target", *targets],
+                check=True,
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            self.fail(
+                f"CMake production-seam command failed: {exc.cmd}\n"
+                f"stdout:\n{exc.stdout}\nstderr:\n{exc.stderr}"
+            )
+
+    def _manifest_prelude(self) -> str:
+        return (
+            f'include("{self.module}")\n'
+            'file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/generated/external_roots.txt" "")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/generated/autogen_targets.txt" "")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/generated/domain_fragments.txt" "")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/generated/foundation_fragments.txt" "")\n'
+        )
+
+    def _register_manifests(self, domain: str, foundation: str, *, automoc: bool = False) -> str:
+        text = (
+            f'cmake_language(DEFER CALL arkham_write_target_header_set_manifest TARGET {domain} OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/domain_headers.txt")\n'
+            f'cmake_language(DEFER CALL arkham_write_target_source_manifest TARGET {domain} OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/domain_sources.txt")\n'
+            f'cmake_language(DEFER CALL arkham_write_target_header_set_manifest TARGET {foundation} OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/foundation_headers.txt")\n'
+            f'cmake_language(DEFER CALL arkham_write_target_source_manifest TARGET {foundation} OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/foundation_sources.txt")\n'
+        )
+        if automoc:
+            text += (
+                f'cmake_language(DEFER CALL arkham_append_target_autogen_manifest TARGET {domain} POLICY domain OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/autogen_targets.txt")\n'
+                f'cmake_language(DEFER CALL arkham_append_target_autogen_manifest TARGET {foundation} POLICY foundation OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/autogen_targets.txt")\n'
+            )
+        return text
+
+    def test_scans_every_target_object_context_for_shared_source(self) -> None:
+        self._write("src/domain/Domain.h", "#pragma once\n")
+        self._write(
+            "src/domain/Conditional.h",
+            "#pragma once\n"
+            "#ifdef CONSUMER_ENCODER\n"
+            "struct QJsonObject {};\n"
+            "inline QJsonObject consumerContextEncoder() { return {}; }\n"
+            "#endif\n",
+        )
+        self._write("src/Foundation.h", "#pragma once\n")
+        self._write(
+            "src/domain/Shared.cpp",
+            "#ifdef CONSUMER_ENCODER\n"
+            '#include "Conditional.h"\n'
+            "#endif\n",
+        )
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(TargetContexts CXX)\n"
+            + self._manifest_prelude()
+            + "add_library(domain STATIC src/domain/Shared.cpp)\n"
+            'target_include_directories(domain PRIVATE "${CMAKE_SOURCE_DIR}/src/domain")\n'
+            'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h" "${CMAKE_SOURCE_DIR}/src/domain/Conditional.h")\n'
+            + "add_library(foundation STATIC src/domain/Shared.cpp)\n"
+            'target_include_directories(foundation PRIVATE "${CMAKE_SOURCE_DIR}/src/domain")\n'
+            'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
+            + "add_library(consumer STATIC src/domain/Shared.cpp)\n"
+            'target_include_directories(consumer PRIVATE "${CMAKE_SOURCE_DIR}/src/domain")\n'
+            "target_compile_definitions(consumer PRIVATE CONSUMER_ENCODER)\n"
+            + self._register_manifests("domain", "foundation")
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(["domain", "foundation", "consumer"])
+
+        commands = json.loads(
+            (self.build / "compile_commands.json").read_text(encoding="utf-8")
+        )
+        contexts = ceh._compile_contexts_for_source(
+            commands, self.root / "src/domain/Shared.cpp"
+        )
+        self.assertEqual(
+            {context.target for context in contexts},
+            {"domain", "foundation", "consumer"},
+        )
+        findings = ceh.run_check(self.root, self.build, skip_configure=True)
+        self.assertEqual(
+            [finding.display_name for finding in findings],
+            ["consumerContextEncoder()"],
+        )
+
+    def test_system_include_marking_cannot_declassify_project_source(self) -> None:
+        self._write("src/domain/Domain.h", "#pragma once\n")
+        self._write("src/Foundation.h", "#pragma once\n")
+        self._write("src/hidden/Lossy.h", "struct Lossy {};\n")
+        self._write("src/domain/Domain.cpp", '#include "Lossy.h"\n')
+        self._write("src/Foundation.cpp", "int foundationSource = 0;\n")
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(SystemOwned CXX)\n"
+            + self._manifest_prelude()
+            + "add_library(domain STATIC src/domain/Domain.cpp)\n"
+            'target_include_directories(domain SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/hidden")\n'
+            'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h")\n'
+            + "add_library(foundation STATIC src/Foundation.cpp)\n"
+            'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
+            + self._register_manifests("domain", "foundation")
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(["domain", "foundation"])
+        with self.assertRaisesRegex(ceh.EncoderHygieneError, "owned file"):
+            ceh.run_check(self.root, self.build, skip_configure=True)
+
+    def test_owned_autogen_is_exact_and_genuine_moc_still_passes(self) -> None:
+        self._write(
+            "src/domain/Domain.h",
+            "#pragma once\n"
+            "#include <QObject>\n"
+            "class DomainObject : public QObject {\n"
+            "  Q_OBJECT\n"
+            "};\n",
+        )
+        self._write("src/domain/Domain.cpp", '#include "Domain.h"\n')
+        self._write("src/Foundation.h", "#pragma once\n")
+        self._write("src/Foundation.cpp", '#include "Foundation.h"\n')
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(OwnedAutogen CXX)\n"
+            "find_package(Qt6 REQUIRED COMPONENTS Core)\n"
+            "set(CMAKE_AUTOMOC ON)\n"
+            + self._manifest_prelude()
+            + "add_library(domain STATIC src/domain/Domain.cpp)\n"
+            "target_link_libraries(domain PUBLIC Qt6::Core)\n"
+            'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h")\n'
+            + "add_library(foundation STATIC src/Foundation.cpp)\n"
+            "target_link_libraries(foundation PUBLIC Qt6::Core)\n"
+            'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
+            + self._register_manifests("domain", "foundation", automoc=True)
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(["domain", "foundation"], qt=True)
+        self.assertEqual(ceh.run_check(self.root, self.build, skip_configure=True), [])
+
+        autogen = self.build / "domain_autogen"
+        moc = next(path for path in autogen.rglob("moc_Domain.cpp"))
+        with moc.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n#include <QJsonObject>\n"
+                "QJsonObject generatedWrapperEncoder() { return {}; }\n"
+            )
+        findings = ceh.run_check(self.root, self.build, skip_configure=True)
+        self.assertTrue(
+            any("generatedWrapperEncoder" in finding.display_name for finding in findings)
+        )
+
+        (autogen / "Lossy.h").write_text(
+            "struct QJsonObject {}; QJsonObject hiddenEncoder();\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ceh.EncoderHygieneError, "unexplained generated"):
+            ceh.run_check(self.root, self.build, skip_configure=True)
 
 
 if __name__ == "__main__":

@@ -249,8 +249,7 @@ class ExternalRootsTests(unittest.TestCase):
     subtrees exempted from the domain/foundation dependency-direction
     closure check -- sourced from a REAL, CMake-generated
     `<clang-build-dir>/generated/external_roots.txt` manifest (see
-    cmake/PathManifest.cmake's eager FetchContent-derived writer and
-    arkham_append_target_autogen_root()), never a hand-authored/
+    CMakeLists.txt's FetchContent-derived writer), never a hand-authored/
     hardcoded `_deps` guess -- replacing the earlier, unsound blanket
     "anything under the build directory" exemption a review round
     demonstrated let a genuinely project-generated header/fragment
@@ -320,37 +319,88 @@ class ExternalRootsTests(unittest.TestCase):
             ceh._external_roots(self.build_dir)
 
 
-class FindCompileCommandForSourceTests(unittest.TestCase):
-    """Coverage for _find_compile_command_for_source(): every
-    manifest-registered production .cpp must be matched to its OWN exact
-    compile_commands.json entry by resolved absolute path, never a
-    representative entry borrowed from another file in the same target
-    (that remains _representative_compile_args()'s separate, header-only
-    job) -- and a manifest entry with no matching compile command is a
-    hard failure, never a silent skip (see the reviewer-reported gap
-    this closes: a real .cpp previously compiled completely unaudited by
-    this script's dependency-direction policy)."""
+class CompileContextsForSourceTests(unittest.TestCase):
+    def _entry(
+        self,
+        source: str,
+        target: str,
+        *,
+        define: str = "",
+        output_suffix: str = "",
+    ) -> dict:
+        return {
+            "directory": "/repo/build",
+            "file": source,
+            "command": (
+                f"clang++ -std=c++23 {define} -c {source} "
+                f"-o CMakeFiles/{target}.dir/{output_suffix}source.o"
+            ),
+            "output": f"CMakeFiles/{target}.dir/{output_suffix}source.o",
+        }
 
-    def test_finds_entry_by_resolved_absolute_path(self) -> None:
+    def test_returns_every_target_context_for_same_physical_source(self) -> None:
         compile_commands = [
-            {
-                "file": "/repo/src/domain/RawJson.cpp",
-                "command": "clang++ -std=c++23 -Isrc/domain -c /repo/src/domain/RawJson.cpp",
-            },
-            {
-                "file": "/repo/src/domain/Decks.cpp",
-                "command": "clang++ -std=c++23 -DOTHER -c /repo/src/domain/Decks.cpp",
-            },
+            self._entry("/repo/src/domain/Decks.cpp", "domain", define="-DDOMAIN"),
+            self._entry("/repo/src/domain/Decks.cpp", "foundation", define="-DFOUNDATION"),
+            self._entry(
+                "/repo/src/domain/Decks.cpp",
+                "consumer",
+                define="-DCONSUMER",
+                output_suffix="Debug/",
+            ),
+            self._entry(
+                "/repo/src/domain/Decks.cpp",
+                "consumer",
+                define="-DCONSUMER_RELEASE",
+                output_suffix="Release/",
+            ),
         ]
-        entry = ceh._find_compile_command_for_source(compile_commands, Path("/repo/src/domain/Decks.cpp"))
-        self.assertEqual(entry["file"], "/repo/src/domain/Decks.cpp")
+        contexts = ceh._compile_contexts_for_source(
+            compile_commands, Path("/repo/src/domain/Decks.cpp")
+        )
+        self.assertEqual(
+            [context.target for context in contexts],
+            ["domain", "foundation", "consumer", "consumer"],
+        )
+        self.assertEqual(
+            [context.configuration for context in contexts[-2:]],
+            ["Debug", "Release"],
+        )
+        self.assertIn("-DCONSUMER_RELEASE", contexts[-1].arguments)
 
     def test_raises_when_no_matching_entry_exists(self) -> None:
         compile_commands = [
-            {"file": "/repo/src/domain/RawJson.cpp", "command": "clang++ -c /repo/src/domain/RawJson.cpp"},
+            self._entry("/repo/src/domain/RawJson.cpp", "domain"),
         ]
         with self.assertRaises(ceh.EncoderHygieneError):
-            ceh._find_compile_command_for_source(compile_commands, Path("/repo/src/domain/Decks.cpp"))
+            ceh._compile_contexts_for_source(
+                compile_commands, Path("/repo/src/domain/Decks.cpp")
+            )
+
+    def test_rejects_entry_without_object_target_identity(self) -> None:
+        entry = self._entry("/repo/src/domain/Decks.cpp", "domain")
+        entry["output"] = "/repo/build/unowned.o"
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._compile_contexts_for_source(
+                [entry], Path("/repo/src/domain/Decks.cpp")
+            )
+
+    def test_honors_arguments_array_without_shell_reparsing(self) -> None:
+        source = "/repo/src/domain/Decks.cpp"
+        entry = self._entry(source, "domain")
+        del entry["command"]
+        entry["arguments"] = ["clang++", "-DVALUE=a b", "-c", source]
+        contexts = ceh._compile_contexts_for_source([entry], Path(source))
+        self.assertIn("-DVALUE=a b", contexts[0].arguments)
+
+    def test_rejects_duplicate_object_output(self) -> None:
+        entry = self._entry("/repo/src/domain/Decks.cpp", "domain")
+        duplicate = dict(entry)
+        duplicate["command"] = duplicate["command"].replace("-std=c++23", "-std=c++23 -DOTHER")
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._compile_contexts_for_source(
+                [entry, duplicate], Path("/repo/src/domain/Decks.cpp")
+            )
 
 
 class AllowlistEntryTests(unittest.TestCase):
@@ -431,33 +481,47 @@ class MissingOrMiscountedAllowlistEntryDetectionTests(unittest.TestCase):
         self.assertEqual(missing, [target])
 
 
-class RepresentativeCompileArgsTests(unittest.TestCase):
-    def test_selects_and_sanitizes_first_source_entry(self) -> None:
+class HeaderCompileContextsTests(unittest.TestCase):
+    def test_preserves_distinct_target_contexts(self) -> None:
         compile_commands = [
             {
+                "directory": "/repo/build",
                 "file": "/repo/src/domain/RawJson.cpp",
                 "command": "/usr/bin/clang++ -std=c++23 -Isrc/domain -o x.o -c /repo/src/domain/RawJson.cpp",
+                "output": "CMakeFiles/domain.dir/x.o",
             },
             {
+                "directory": "/repo/build",
                 "file": "/repo/src/domain/Decks.cpp",
                 "command": "/usr/bin/clang++ -std=c++23 -Isrc/domain -DOTHER -o y.o -c /repo/src/domain/Decks.cpp",
+                "output": "CMakeFiles/consumer.dir/y.o",
             },
         ]
-        sources = [Path("/repo/src/domain/RawJson.cpp")]
-        result = ceh._representative_compile_args(compile_commands, sources, "domain")
-        self.assertEqual(result, ["-std=c++23", "-Isrc/domain"])
+        sources = [
+            Path("/repo/src/domain/RawJson.cpp"),
+            Path("/repo/src/domain/Decks.cpp"),
+        ]
+        result = ceh._header_compile_contexts(
+            compile_commands, sources, "domain"
+        )
+        self.assertEqual([context.target for context in result], ["domain", "consumer"])
 
     def test_raises_when_no_sources_given(self) -> None:
         with self.assertRaises(ceh.EncoderHygieneError):
-            ceh._representative_compile_args([], [], "domain")
+            ceh._header_compile_contexts([], [], "domain")
 
     def test_raises_when_representative_source_missing_from_compile_commands(self) -> None:
         compile_commands = [
-            {"file": "/repo/src/domain/Decks.cpp", "command": "clang++ -DFOO /repo/src/domain/Decks.cpp"},
+            {
+                "directory": "/repo/build",
+                "file": "/repo/src/domain/Decks.cpp",
+                "command": "clang++ -DFOO /repo/src/domain/Decks.cpp",
+                "output": "CMakeFiles/domain.dir/Decks.o",
+            },
         ]
         sources = [Path("/repo/src/domain/RawJson.cpp")]
         with self.assertRaises(ceh.EncoderHygieneError):
-            ceh._representative_compile_args(compile_commands, sources, "domain")
+            ceh._header_compile_contexts(compile_commands, sources, "domain")
 
 
 class SanitizeCompileArgsTests(unittest.TestCase):
@@ -476,14 +540,10 @@ class SanitizeCompileArgsTests(unittest.TestCase):
         result = ceh._sanitize_compile_args(command, "src/domain/Games.cpp")
         self.assertEqual(result, ["-DA", "-DB", "-Ifoo", "-Ibar"])
 
-    def test_source_file_not_trailing_is_left_untouched(self) -> None:
-        # Defensive: if a compile_commands.json entry's command string
-        # does not end with the exact source file (e.g. a quoting
-        # difference), this must not accidentally eat an unrelated
-        # trailing flag.
+    def test_source_file_is_removed_even_when_not_trailing(self) -> None:
         command = "clang++ -DFOO src/domain/Games.cpp -Wall"
         result = ceh._sanitize_compile_args(command, "src/domain/Games.cpp")
-        self.assertEqual(result, ["-DFOO", "src/domain/Games.cpp", "-Wall"])
+        self.assertEqual(result, ["-DFOO", "-Wall"])
 
 
 class FindingKeyTests(unittest.TestCase):
