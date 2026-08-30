@@ -243,6 +243,18 @@ jobs:
         # resolves once the flag is explicitly given), and the recursive
         # index's ambiguous-duplicate-basename rejection.
         run: bash packaging/tests/test_audit_dependency_closure.sh
+      - name: Test dependency-closure auditor's per-edge/RUNPATH logic
+        # Portable (stdlib-only, no compiler/readelf/real ELF toolchain)
+        # unit tests for audit_dependency_closure.py's internal
+        # _effective_search_dirs()/audit_closure() logic (review round-9+
+        # item 4): monkeypatches _readelf_dynamic_text() with fabricated
+        # `readelf -d -W`-shaped text so the exact per-(name, requester)
+        # edge reachability BFS, the external-RUNPATH-path rejection, and
+        # the DT_RUNPATH-vs-DT_RPATH-vs-LD_LIBRARY_PATH precedence
+        # ordering are all exercised deterministically -- runs on any
+        # platform, complementing (never replacing) the Linux-only
+        # synthetic-ELF-chain test above.
+        run: python3 packaging/tests/test_audit_dependency_closure.py -v
       - name: Test the AVIF bundled round-trip smoke program in isolation
         # Hermetic (no AppImage/container/network dependency) proof that
         # packaging/tests/avif_bundled_roundtrip_smoke.c -- used later in

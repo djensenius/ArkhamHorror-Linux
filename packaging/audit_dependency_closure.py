@@ -252,20 +252,27 @@ def _parse_needed(dynamic_text: str) -> list[str]:
     return [m.group("name") for m in _NEEDED_RE.finditer(dynamic_text)]
 
 
-def _parse_search_path_entries(dynamic_text: str) -> list[str]:
-    """Returns this object's own DT_RUNPATH entries if present, else its
-    DT_RPATH entries (colon-separated, empty entries dropped) -- never
-    both. This mirrors glibc's ld.so precisely: DT_RUNPATH, when present,
-    entirely REPLACES DT_RPATH for resolving this object's own direct
-    DT_NEEDED entries (DT_RPATH is only ever consulted when DT_RUNPATH is
-    completely absent), so merging the two would search directories a
-    real load of this exact file would never actually search."""
+def _parse_search_path_kind_and_entries(
+    dynamic_text: str,
+) -> tuple[str | None, list[str]]:
+    """Returns (kind, entries): `kind` is "runpath" if this object carries
+    a DT_RUNPATH tag, "rpath" if it carries a DT_RPATH tag instead (never
+    both -- DT_RUNPATH, when present, entirely REPLACES DT_RPATH for
+    resolving this object's own direct DT_NEEDED entries; DT_RPATH is
+    only ever consulted when DT_RUNPATH is completely absent), or None if
+    neither tag is present at all. `entries` is the colon-separated list
+    from whichever tag was found (empty entries dropped), or an empty
+    list if `kind` is None. Round-9+ review (HIGH): the distinction
+    between the two kinds matters beyond merely "which one wins" -- see
+    _effective_search_dirs()'s own comment on why DT_RUNPATH and DT_RPATH
+    each have a DIFFERENT real precedence relative to LD_LIBRARY_PATH."""
     match = _RUNPATH_RE.search(dynamic_text)
-    if match is None:
-        match = _RPATH_RE.search(dynamic_text)
-    if match is None:
-        return []
-    return [entry for entry in match.group("value").split(":") if entry]
+    if match is not None:
+        return "runpath", [entry for entry in match.group("value").split(":") if entry]
+    match = _RPATH_RE.search(dynamic_text)
+    if match is not None:
+        return "rpath", [entry for entry in match.group("value").split(":") if entry]
+    return None, []
 
 
 def _expand_origin(entry: str, origin_dir: Path) -> Path:
@@ -287,29 +294,81 @@ def _expand_origin(entry: str, origin_dir: Path) -> Path:
 
 
 def _effective_search_dirs(
-    requester_path: Path, dynamic_text: str, global_search_dirs: list[Path]
+    requester_path: Path,
+    dynamic_text: str,
+    global_search_dirs: list[Path],
+    lib_dir_resolved: Path,
 ) -> list[Path]:
     """The ordered list of real directories a load of `requester_path`'s
     own DT_NEEDED entries would actually search, per real ld.so
-    precedence: this object's own DT_RUNPATH (or DT_RPATH if no RUNPATH
-    is present) with $ORIGIN expanded relative to its OWN containing
-    directory, first; then the caller-supplied global default search
-    directories (representing this project's AppRun-exported
-    LD_LIBRARY_PATH, which applies uniformly to every bundled object
-    regardless of its own individual RUNPATH -- see main()'s
+    precedence -- which, contrary to a naive "RUNPATH/RPATH always wins"
+    assumption, genuinely DIFFERS depending on which of the two tags this
+    object carries:
+
+      - DT_RPATH (only consulted when DT_RUNPATH is absent): searched
+        BEFORE LD_LIBRARY_PATH -- this is the legacy behavior glibc
+        preserves for backwards compatibility.
+      - DT_RUNPATH: searched AFTER LD_LIBRARY_PATH -- the modern tag is
+        deliberately overridable by the environment, exactly the
+        opposite precedence from DT_RPATH.
+
+    `global_search_dirs` represents this project's AppRun-exported
+    LD_LIBRARY_PATH, applying uniformly to every bundled object
+    regardless of its own individual RUNPATH/RPATH (see main()'s
     --global-search-dir). A directory named by more than one of these
     sources is only ever searched once, at its EARLIEST (highest-
-    precedence) position."""
+    precedence) position for the kind of tag actually present.
+
+    Round-9+ review (HIGH, "boolean resolver permits external path"): a
+    RUNPATH/RPATH entry (after $ORIGIN expansion) that resolves OUTSIDE
+    `lib_dir_resolved` -- the AppDir actually being audited -- is never
+    included at all, regardless of what may or may not happen to exist
+    at that absolute path on the specific machine running this audit.
+    Trusting such a path would let a dependency be misreported as
+    "reachable" purely because the AUDIT HOST happens to have a
+    same-named library sitting there -- exactly the host-dependent
+    leakage this script's docstring and every other check in it
+    (_index_lib_dir's ambiguous-duplicate guard, the symlink-escape
+    check in audit_closure()) are designed to prevent. A real target
+    machine (e.g. a SteamOS Deck) has no reason to have anything at that
+    same absolute path at all; only directories genuinely inside the
+    AppDir itself can ever make a dependency truly self-contained.
+    global_search_dirs is not filtered the same way here: it is always
+    supplied by this script's own caller (main()'s --global-search-dir),
+    which is expected to only ever pass real AppDir-relative directories
+    (e.g. the AppDir's own usr/lib) -- see main()'s own argument help
+    text -- so it is trusted as given, exactly as before.
+    """
     origin_dir = requester_path.parent.resolve()
-    dirs: list[Path] = []
-    for entry in _parse_search_path_entries(dynamic_text):
+    kind, entries = _parse_search_path_kind_and_entries(dynamic_text)
+    own_dirs: list[Path] = []
+    for entry in entries:
         expanded = _expand_origin(entry, origin_dir)
-        if expanded not in dirs:
-            dirs.append(expanded)
-    for candidate in global_search_dirs:
-        if candidate not in dirs:
-            dirs.append(candidate)
-    return dirs
+        if not expanded.is_relative_to(lib_dir_resolved):
+            continue
+        if expanded not in own_dirs:
+            own_dirs.append(expanded)
+
+    ordered: list[Path] = []
+    if kind == "rpath":
+        # Legacy DT_RPATH: searched BEFORE LD_LIBRARY_PATH.
+        for d in own_dirs:
+            if d not in ordered:
+                ordered.append(d)
+        for candidate in global_search_dirs:
+            if candidate not in ordered:
+                ordered.append(candidate)
+    else:
+        # DT_RUNPATH (or neither tag present, in which case own_dirs is
+        # empty and this ordering is moot): LD_LIBRARY_PATH is searched
+        # BEFORE the object's own RUNPATH.
+        for candidate in global_search_dirs:
+            if candidate not in ordered:
+                ordered.append(candidate)
+        for d in own_dirs:
+            if d not in ordered:
+                ordered.append(d)
+    return ordered
 
 
 def _basename_reachable_in(dir_path: Path, name: str) -> bool:
@@ -508,13 +567,40 @@ def audit_closure(
     # Each queue entry is (name, requester_path); requester_path is None
     # only for an initial root (see the reachability-exemption note above).
     queue: list[tuple[str, Path | None]] = [(name, None) for name in roots]
-    seen: set[str] = set()
+    # Round-9+ review (HIGH, "seen keyed only SONAME skips same dependency
+    # from different requester/RPATH contexts" / "roots collapsed
+    # basename"): deduplication is keyed by the EDGE -- (name, requester)
+    # -- never by `name` alone. Two DIFFERENT requesters naming the same
+    # dependency name each have their OWN real search context and must be
+    # independently reachability-checked: one requester's RUNPATH/RPATH
+    # reaching a bundled library says nothing about whether a SECOND,
+    # differently-located requester's own RUNPATH/RPATH also reaches it.
+    # Keying by name alone previously let the FIRST requester's outcome
+    # silently stand in for every later requester of the identical name --
+    # including a root (requester=None, exempt from reachability entirely)
+    # incorrectly "vouching" for an unrelated later dependency edge that
+    # happens to share its bare basename, and a genuinely unreachable edge
+    # from one requester being masked by an earlier, differently-located,
+    # successful edge for the same name. A per-resolved-file readelf-
+    # output cache (below) keeps this from being a real performance
+    # regression: only the (cheap, in-memory) reachability check repeats
+    # per distinct requester, never a redundant subprocess invocation.
+    seen_edges: set[tuple[str, str | None]] = set()
+    dynamic_text_cache: dict[Path, str] = {}
+
+    def cached_dynamic_text(path: Path) -> str:
+        cached = dynamic_text_cache.get(path)
+        if cached is None:
+            cached = _readelf_dynamic_text(path)
+            dynamic_text_cache[path] = cached
+        return cached
 
     while queue:
         name, requester_path = queue.pop()
-        if name in seen:
+        edge_key = (name, str(requester_path) if requester_path is not None else None)
+        if edge_key in seen_edges:
             continue
-        seen.add(name)
+        seen_edges.add(edge_key)
 
         if name not in index:
             if name not in allowlist:
@@ -555,9 +641,10 @@ def audit_closure(
                 resolved_path = index[name]
 
         if requester_path is not None:
-            requester_dynamic_text = _readelf_dynamic_text(requester_path)
+            requester_dynamic_text = cached_dynamic_text(requester_path)
             effective_dirs = _effective_search_dirs(
-                requester_path, requester_dynamic_text, global_search_dirs
+                requester_path, requester_dynamic_text, global_search_dirs,
+                lib_dir_resolved,
             )
             if not any(
                 _basename_reachable_in(search_dir, name)
@@ -572,17 +659,17 @@ def audit_closure(
                 # never add it to bundled_closure, since this edge was
                 # never validly resolved.
                 unreachable.setdefault(name, []).append(requester_path.name)
-                for needed in _parse_needed(_readelf_dynamic_text(resolved_path)):
+                for needed in _parse_needed(cached_dynamic_text(resolved_path)):
                     queue.append((needed, resolved_path))
                 continue
 
         bundled_closure.add(name)
-        for needed in _parse_needed(_readelf_dynamic_text(resolved_path)):
+        for needed in _parse_needed(cached_dynamic_text(resolved_path)):
             queue.append((needed, resolved_path))
             if needed not in index and needed not in allowlist:
                 missing.setdefault(needed, []).append(name)
 
-    return bundled_closure, missing, unreachable, seen
+    return bundled_closure, missing, unreachable, {name for name, _ in seen_edges}
 
 
 
