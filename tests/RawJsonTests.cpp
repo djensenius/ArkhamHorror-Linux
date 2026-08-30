@@ -53,6 +53,8 @@ private slots:
   // field-presence-sensitive decode helper in JsonDecode.h/.cpp now
   // routes through it instead.
   void objectFindDistinguishesAbsentFromPresentUndefinedFromPresentValue();
+  void parseAcceptsEmptyArrayExactlyAtMaxDepthAndRejectsOneDeeper();
+  void parseAcceptsEmptyObjectExactlyAtMaxDepthAndRejectsOneDeeper();
   // Review round 5 (RawJson.cpp:476 HIGH finding): contains()/value() must
   // remain correct once backed by an index rather than a linear scan, at
   // a large member count built via the unbounded makeObject() constructor
@@ -1361,6 +1363,76 @@ void RawJsonTests::toExactQJsonAcceptsValidNestedAstAndPreservesExactInt64() {
            QStringLiteral("hello"));
   QVERIFY(array.at(1).isNull());
   QCOMPARE(array.at(2).toBool(), false);
+}
+
+void RawJsonTests::
+    parseAcceptsEmptyArrayExactlyAtMaxDepthAndRejectsOneDeeper() {
+  // Exact-head cumulative review (commit 1e4824d) flagged parseArray() as
+  // not enforcing ParseLimits::maxDepth "for the array node itself",
+  // reasoning that since the depth check textually lives only inside
+  // parseValue(), an empty array's own early "peek() == ']'" return path
+  // has no depth comparison of its own and could therefore accept an
+  // empty array one level past maxDepth. Tracing the actual control flow
+  // shows this is not the case: parseValue(depth) unconditionally checks
+  // `depth > maxDepth` for *whatever value it is about to parse*
+  // (scalar, array, or object) before ever inspecting the next
+  // character, so an array/object literal's own nesting level is always
+  // validated by the very call that decided to dispatch into
+  // parseArray(depth + 1)/parseObject(depth + 1) -- parseArray/
+  // parseObject's own `depth` parameter is *already* the (validated)
+  // depth at which their *children* live, exactly mirroring
+  // toExactQJsonInner()'s identical check-before-dispatch pattern (see
+  // its own doc comment). This test proves that empirically rather than
+  // by inspection alone: an empty array nested exactly maxDepth levels
+  // deep must still parse successfully (matching what
+  // toExactQJsonAcceptsEmptyArrayExactlyAtMaxDepth() already proves for
+  // the in-memory AST), while the identical shape nested one level
+  // deeper must be rejected -- through Value::parse() itself, the one
+  // entry point the reviewer's finding was specifically about.
+  ParseLimits limits = ParseLimits::production();
+  limits.maxDepth = 3;
+
+  const QByteArray atLimit = QByteArray(limits.maxDepth, '[') + "[]" +
+                             QByteArray(limits.maxDepth, ']');
+  auto resultAtLimit = Value::parse(atLimit, u"test", limits);
+  if (!resultAtLimit)
+    QFAIL(qPrintable(resultAtLimit.error()));
+
+  const QByteArray oneDeeper = QByteArray(limits.maxDepth + 1, '[') + "[]" +
+                               QByteArray(limits.maxDepth + 1, ']');
+  auto resultOneDeeper = Value::parse(oneDeeper, u"test", limits);
+  QVERIFY(!resultOneDeeper.has_value());
+}
+
+void RawJsonTests::
+    parseAcceptsEmptyObjectExactlyAtMaxDepthAndRejectsOneDeeper() {
+  // Object counterpart of the array test immediately above -- see its
+  // doc comment for the full analysis of why the reviewer's concern
+  // (parseObject() supposedly missing its own maxDepth check) does not
+  // reproduce: parseObject(depth)'s `depth` parameter is already the
+  // depth its own members live at, validated by the parseValue() call
+  // that dispatched into it.
+  ParseLimits limits = ParseLimits::production();
+  limits.maxDepth = 3;
+
+  QByteArray atLimit;
+  for (int i = 0; i < limits.maxDepth; ++i)
+    atLimit += "{\"a\":";
+  atLimit += "{}";
+  for (int i = 0; i < limits.maxDepth; ++i)
+    atLimit += "}";
+  auto resultAtLimit = Value::parse(atLimit, u"test", limits);
+  if (!resultAtLimit)
+    QFAIL(qPrintable(resultAtLimit.error()));
+
+  QByteArray oneDeeper;
+  for (int i = 0; i < limits.maxDepth + 1; ++i)
+    oneDeeper += "{\"a\":";
+  oneDeeper += "{}";
+  for (int i = 0; i < limits.maxDepth + 1; ++i)
+    oneDeeper += "}";
+  auto resultOneDeeper = Value::parse(oneDeeper, u"test", limits);
+  QVERIFY(!resultOneDeeper.has_value());
 }
 
 void RawJsonTests::toExactQJsonAcceptsEmptyArrayExactlyAtMaxDepth() {

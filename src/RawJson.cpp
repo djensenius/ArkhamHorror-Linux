@@ -396,6 +396,27 @@ private:
     return codepoint;
   }
 
+  // `depth` here is already the depth at which *this container's own
+  // members/elements* live -- i.e. one deeper than the array/object
+  // literal itself -- because the only caller, parseValue(parentDepth),
+  // unconditionally checks `parentDepth > m_limits.maxDepth` for
+  // *whatever value it is about to parse* (scalar, array, or object)
+  // before ever inspecting the next character, and only then dispatches
+  // here via parseArray(parentDepth + 1)/parseObject(parentDepth + 1).
+  // That means this array/object literal's own nesting level is always
+  // validated by its caller before this function is ever entered, so an
+  // empty container (the early "peek() == ']'"/"peek() == '}'" return
+  // below, with no elements/members left to check at `depth`) needs no
+  // depth check of its own here -- it would be redundant with the check
+  // parseValue() already performed for this exact node. Every genuine
+  // element/member IS still checked at `depth` via each parseValue(depth)
+  // call in the loop below, exactly mirroring toExactQJsonInner()'s
+  // identical check-before-dispatch-then-recurse-at-depth+1 pattern (see
+  // its own doc comment) -- see
+  // parseAcceptsEmptyArrayExactlyAtMaxDepthAndRejectsOneDeeper()/
+  // parseAcceptsEmptyObjectExactlyAtMaxDepthAndRejectsOneDeeper() in
+  // RawJsonTests.cpp for a direct empirical proof through Value::parse()
+  // itself.
   [[nodiscard]] ValueOrError<Value> parseArray(int depth) {
     ++m_pos; // '['
     Value v;
@@ -428,6 +449,11 @@ private:
     }
   }
 
+  // See parseArray()'s doc comment immediately above: the identical
+  // reasoning applies here (`depth` is already this object's own
+  // members' depth, validated for this object literal itself by the
+  // parseValue() call that dispatched into parseObject(depth) in the
+  // first place).
   [[nodiscard]] ValueOrError<Value> parseObject(int depth) {
     ++m_pos; // '{'
     Value v;
