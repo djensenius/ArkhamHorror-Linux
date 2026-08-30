@@ -519,7 +519,12 @@ ValueOrError<Json::Value> SkillIcon::toRawJson() const {
   case SkillIconTag::Unknown:
     return m_unknownRaw;
   }
-  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
+  // No case above can actually be missed for any m_tag this type's
+  // private constructor/factories can produce, but a typed failure --
+  // rather than Q_UNREACHABLE_RETURN -- means an out-of-range m_tag
+  // fails cleanly instead of aborting/UB.
+  return failure(
+      QStringLiteral("SkillIcon::toRawJson: unhandled SkillIcon tag value"));
 }
 
 ValueOrError<QByteArray> SkillIcon::toJsonBytes() const {
@@ -731,7 +736,14 @@ Json::Value CardCost::toRawJson() const {
   case CardCostTag::Unknown:
     return m_unknownRaw;
   }
-  Q_UNREACHABLE_RETURN(Json::Value{});
+  // No case above can actually be missed for any m_tag this type's
+  // private constructor/factories can produce (see the class invariant
+  // comments above), but this trailing return -- rather than
+  // Q_UNREACHABLE_RETURN -- means an out-of-range m_tag (e.g. future enum
+  // extension not handled here) fails to encode as Undefined instead of
+  // aborting/UB; Value::toJsonBytes() already rejects an Undefined value
+  // outright, so misuse still fails loudly, just not catastrophically.
+  return Json::Value{};
 }
 
 ValueOrError<QByteArray> CardCost::toJsonBytes() const {
@@ -928,7 +940,11 @@ Json::Value GameValue::toRawJson() const {
   case GameValueTag::Unknown:
     return m_unknownRaw;
   }
-  Q_UNREACHABLE_RETURN(Json::Value{});
+  // See CardCost::toRawJson() above for why a plain trailing return
+  // (rather than Q_UNREACHABLE_RETURN) is used here: an out-of-range
+  // m_tag encodes as Undefined -- which Value::toJsonBytes() already
+  // rejects -- instead of aborting/UB.
+  return Json::Value{};
 }
 
 ValueOrError<QByteArray> GameValue::toJsonBytes() const {

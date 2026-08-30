@@ -547,7 +547,12 @@ Json::Value ExternalDeckId::toRawJson() const {
   case Kind::Number:
     return Json::Value::makeNumber(m_number);
   }
-  Q_UNREACHABLE_RETURN(Json::Value::makeNull());
+  // An out-of-range m_kind falls back to Undefined (Value::toJsonBytes()
+  // rejects it outright) rather than Q_UNREACHABLE_RETURN(makeNull()):
+  // the prior fallback risked silently emitting a meaningful JSON null
+  // for what would actually be an invalid/unrepresented state, which is
+  // a worse failure mode than failing loudly to serialize at all.
+  return Json::Value{};
 }
 
 ValueOrError<DeckListInput> DeckListInput::fromJson(const QJsonValue &v,

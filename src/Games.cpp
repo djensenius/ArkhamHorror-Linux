@@ -629,7 +629,11 @@ Json::Value GameState::toRawJson() const {
   case Kind::Unknown:
     return m_unknownRaw;
   }
-  Q_UNREACHABLE_RETURN(Json::Value{});
+  // See CardCost::toRawJson()/GameValue::toRawJson() in CardCatalog.cpp
+  // for why a plain trailing return -- rather than Q_UNREACHABLE_RETURN
+  // -- is used here: an out-of-range m_kind encodes as Undefined (which
+  // Value::toJsonBytes() already rejects) instead of aborting/UB.
+  return Json::Value{};
 }
 
 ValueOrError<QByteArray> GameState::toJsonBytes() const {
@@ -1142,7 +1146,10 @@ ValueOrError<Json::Value> CampaignOption::toRawJson() const {
         QStringLiteral("CampaignOption::toRawJson: unknown option with no "
                        "raw object to encode"));
   }
-  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
+  // A typed failure -- rather than Q_UNREACHABLE_RETURN -- for an
+  // out-of-range m_kind, matching every other case in this switch.
+  return failure(
+      QStringLiteral("CampaignOption::toRawJson: unhandled tag value"));
 }
 
 ValueOrError<QByteArray> CampaignOption::toJsonBytes() const {
@@ -1192,7 +1199,11 @@ CampaignOption::toRequestOption(QStringView path) const {
                                   "option \"%2\" in a request")
                        .arg(path, m_text));
   }
-  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
+  // A typed failure -- rather than Q_UNREACHABLE_RETURN -- for an
+  // out-of-range m_kind, matching every other case in this switch.
+  return failure(
+      QStringLiteral("%1: CampaignOption::toRequestOption: unhandled tag value")
+          .arg(path));
 }
 
 ValueOrError<CampaignOptionRequest>
@@ -1300,7 +1311,10 @@ ValueOrError<Json::Value> CampaignOptionRequest::toRawJson() const {
           Json::Value::makeString(QStringLiteral("CampaignVariant"))},
          {QStringLiteral("contents"), Json::Value::makeString(m_text)}});
   }
-  Q_UNREACHABLE_RETURN(failure(QStringLiteral("unreachable")));
+  // A typed failure -- rather than Q_UNREACHABLE_RETURN -- for an
+  // out-of-range m_kind, matching every other case in this switch.
+  return failure(
+      QStringLiteral("CampaignOptionRequest::toRawJson: unhandled tag value"));
 }
 
 ValueOrError<QByteArray> CampaignOptionRequest::toJsonBytes() const {

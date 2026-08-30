@@ -28,7 +28,13 @@ QString typeName(const QJsonValue &v) {
   case QJsonValue::Undefined:
     return QStringLiteral("missing");
   }
-  Q_UNREACHABLE_RETURN(QStringLiteral("unknown"));
+  // No default/fallback case above: a genuinely new QJsonValue::Type
+  // enumerator added by a future Qt version would still trip this
+  // switch's own exhaustiveness warning at compile time. Returning a
+  // plain descriptive fallback (rather than Q_UNREACHABLE_RETURN) avoids
+  // an abort/UB in that scenario -- this is a diagnostic-only helper, so
+  // "unknown" costs nothing but a slightly less specific error message.
+  return QStringLiteral("unknown");
 }
 
 QString joinPath(QStringView parent, QStringView field) {
@@ -135,7 +141,11 @@ QString typeName(const Json::Value &v) {
   case Json::Value::Kind::Undefined:
     return QStringLiteral("missing");
   }
-  Q_UNREACHABLE_RETURN(QStringLiteral("unknown"));
+  // See the QJsonValue overload above: a safe descriptive fallback
+  // rather than Q_UNREACHABLE_RETURN, for the same reason (this switch
+  // still warns at compile time if Json::Value::Kind gains a case this
+  // function doesn't handle; only the runtime fallback differs).
+  return QStringLiteral("unknown");
 }
 
 FieldPresence fieldPresence(const Json::Value &obj, QLatin1StringView key) {
