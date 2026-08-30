@@ -650,6 +650,32 @@ class FullElfDiscoveryAndFirstPartyExecutableTests(unittest.TestCase):
         self.assertEqual(inventory[0]["path"], "usr/bin/arkham-horror")
         self.assertEqual(inventory[0]["classification"], "first-party")
 
+    def test_main_application_executable_is_classified_first_party_when_scanned_from_usr_root(
+        self,
+    ) -> None:
+        # packaging/lib/bundle_codec_notices.sh's real pre-packaging
+        # build-time call site (bundle_codec_notices(), invoked from
+        # packaging/build-appimage.sh) passes "$app_dir/usr" as lib_dir,
+        # NOT the full AppDir root that the later CI verify-notices step
+        # scans -- so the main executable's path relative to THIS
+        # lib_dir is "bin/arkham-horror", one path segment shorter than
+        # the "usr/bin/arkham-horror" the sibling test above exercises.
+        # Both conventions must independently classify it as first-party
+        # (this exact mismatch was a real regression caught only by
+        # actually running the produced CI workflow, not by this test
+        # suite alone, since it previously only exercised the full-root
+        # convention).
+        usr_root = self.root / "usr"
+        usr_root.mkdir()
+        self._write_fake_elf("usr/bin/arkham-horror")
+        by_component, unmapped = audit.classify_all(usr_root)
+        self.assertEqual(by_component, {})
+        self.assertEqual(unmapped, [])
+        inventory = audit.build_sbom_inventory(usr_root)
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["path"], "bin/arkham-horror")
+        self.assertEqual(inventory[0]["classification"], "first-party")
+
     def test_apprun_launcher_is_classified_first_party(self) -> None:
         self._write_fake_elf("AppRun")
         by_component, unmapped = audit.classify_all(self.root)

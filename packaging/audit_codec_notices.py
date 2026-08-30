@@ -605,17 +605,40 @@ def classify_path(path: Path, qt_reference_dir: Path | None = None) -> str | Non
 # no third-party notice (this project owns their copyright itself), but
 # must never be silently absent from the SBOM/audit, nor be reported as
 # an unmapped/unknown bundled binary (which would fail packaging).
-# Deliberately an explicit, closed set of exact relative paths (never a
-# basename-only or heuristic match): a hostile file placed at some OTHER
-# path merely sharing one of these basenames must still be classified
-# normally (and fail if unmapped), not be silently waved through by
-# name alone.
-FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS: frozenset[str] = frozenset(
+#
+# This module is invoked with two different, both legitimate, values of
+# `lib_dir`: packaging/lib/bundle_codec_notices.sh (the pre-packaging
+# AppDir build step) scans only "$app_dir/usr", while the final CI
+# verify-notices step scans the FULL extracted AppImage root (so it can
+# also discover AppRun, which lives as a sibling of usr/, not beneath
+# it). The main executable's relative path is therefore either
+# "usr/bin/arkham-horror" or "bin/arkham-horror" depending on which root
+# was scanned -- expressed below as a closed set of exact relative-path
+# SUFFIXES (matched against the tail of path.relative_to(lib_dir).parts,
+# never a basename-only match): a hostile file placed at some OTHER
+# path merely sharing one of these basenames -- e.g.
+# "usr/lib/plugins/generic/arkham-horror" -- still does not match either
+# suffix and must still be classified normally (and fail if unmapped).
+FIRST_PARTY_EXECUTABLE_RELATIVE_PATH_SUFFIXES: frozenset[tuple[str, ...]] = frozenset(
     {
-        "usr/bin/arkham-horror",
-        "AppRun",
+        ("usr", "bin", "arkham-horror"),
+        ("bin", "arkham-horror"),
+        ("AppRun",),
     }
 )
+
+
+def _is_first_party_executable(path: Path, lib_dir: Path) -> bool:
+    """True only if path's relative-to-lib_dir path components end with
+    one of FIRST_PARTY_EXECUTABLE_RELATIVE_PATH_SUFFIXES exactly -- see
+    that constant's docstring for why a suffix match (rather than a
+    single fixed full relative path) is required here, and why it is
+    still not a basename-only match."""
+    relative_parts = path.relative_to(lib_dir).parts
+    for suffix in FIRST_PARTY_EXECUTABLE_RELATIVE_PATH_SUFFIXES:
+        if len(relative_parts) >= len(suffix) and relative_parts[-len(suffix) :] == suffix:
+            return True
+    return False
 
 
 def find_bundled_libraries(lib_dir: Path) -> list[Path]:
@@ -651,7 +674,8 @@ def classify_all(
 ) -> tuple[dict[str, list[Path]], list[Path]]:
     """Returns (component -> [paths requiring that component's notice],
     unmapped_paths). ABI_ALLOWLIST-covered libraries and this project's
-    own FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS are excluded from both
+    own first-party executables (see
+    FIRST_PARTY_EXECUTABLE_RELATIVE_PATH_SUFFIXES) are excluded from both
     (neither needs a third-party notice, and neither is a failure).
     qt_reference_dir is forwarded to classify_path() -- see its
     docstring; omitting it means every directory/basename-matched Qt
@@ -662,7 +686,7 @@ def classify_all(
         basename = path.name
         if basename in ABI_ALLOWLIST:
             continue
-        if str(path.relative_to(lib_dir)) in FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS:
+        if _is_first_party_executable(path, lib_dir):
             continue
         component = classify_path(path, qt_reference_dir)
         if component is None:
@@ -701,7 +725,7 @@ def build_sbom_inventory(
         relative_path = str(path.relative_to(lib_dir))
         if basename in ABI_ALLOWLIST:
             classification = "allowlisted"
-        elif relative_path in FIRST_PARTY_EXECUTABLE_RELATIVE_PATHS:
+        elif _is_first_party_executable(path, lib_dir):
             classification = "first-party"
         else:
             component = classify_path(path, qt_reference_dir)
