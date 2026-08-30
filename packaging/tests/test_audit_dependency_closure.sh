@@ -243,12 +243,15 @@ echo "PASS: an in-tree waypoint symlink chain that ultimately escapes the AppDir
 # --- Case 11/12: --auto-roots. Builds a small synthetic AppDir/usr-style
 # tree with a "plugin" ELF nested two directories deep (mirroring a real
 # usr/lib/plugins/imageformats/libqjpeg.so-style layout) that NEEDs a
-# library which is bundled elsewhere in the tree (usr/lib), and which is
-# NOT transitively reachable from any of the existing --root chain above
-# at all. This is exactly the class of gap the review item this flag
-# addresses identified: a hand-picked --root list can prove the libsecret
-# closure complete while never noticing a *different* bundled ELF (a Qt
-# plugin, or the app's own executable) requires something never bundled.
+# library which is bundled elsewhere in the tree (usr/lib), reachable only
+# via the plugin's own RUNPATH ($ORIGIN/../.. -- mirroring how real
+# linuxdeploy/patchelf actually sets a bundled Qt plugin's RUNPATH to
+# point back at the main lib directory), and which is NOT transitively
+# reachable from any of the existing --root chain above at all. This is
+# exactly the class of gap the review item this flag addresses
+# identified: a hand-picked --root list can prove the libsecret closure
+# complete while never noticing a *different* bundled ELF (a Qt plugin,
+# or the app's own executable) requires something never bundled.
 auto_root_tree="$work_dir/usr_auto_roots"
 mkdir -p "$auto_root_tree/lib" "$auto_root_tree/lib/plugins/imageformats" "$auto_root_tree/bin"
 
@@ -268,6 +271,7 @@ EOF
 ln -s libpluginleaf.so.1 "$auto_root_tree/lib/libpluginleaf.so"
 
 "$cc_bin" -shared -fPIC -Wl,-soname,libqtestplugin.so \
+  -Wl,-rpath,'$ORIGIN/../..' \
   -o "$auto_root_tree/lib/plugins/imageformats/libqtestplugin.so" plugin.c \
   -L"$auto_root_tree/lib" -l:libpluginleaf.so.1
 
@@ -288,7 +292,8 @@ echo "PASS: without --auto-roots, a plugin's own dependency outside any --root c
 # With --auto-roots pointed at the whole tree, every real ELF (the app
 # executable, the nested plugin, and the library it needs) is discovered
 # and rooted, so the plugin's dependency on libpluginleaf.so.1 is now
-# actually walked and resolved.
+# actually walked and resolved -- genuinely, via the plugin's own real
+# RUNPATH, not merely "found somewhere in the recursive tree".
 result_11="$(python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" --list-only)"
 echo "$result_11" | grep -q "^libpluginleaf.so.1$" \
   || fail "case 11: expected --auto-roots to discover and resolve the nested plugin's own dependency, got: $result_11"
@@ -310,6 +315,43 @@ set -e
 echo "$output_12" | grep -q "libpluginleaf.so.1" \
   || fail "case 12: failure output did not name the missing plugin dependency: $output_12"
 echo "PASS: --auto-roots catches a missing dependency of a plugin/executable no hand-picked --root list named"
+
+# --- Case 17: loader-search-awareness (review item 8, "global basename
+# index treats library anywhere in usr as resolving DT_NEEDED, ignoring
+# requester RUNPATH/RPATH/$ORIGIN/AppRun LD_LIBRARY_PATH/search order").
+# Relocate the SAME dependency the plugin genuinely needs into a THIRD
+# directory that is on neither the plugin's own RUNPATH
+# ($ORIGIN/../.. -> lib/) nor the default global search directory
+# (lib_dir itself, here the whole auto_root_tree) -- a real dynamic
+# loader resolving libqtestplugin.so's own DT_NEEDED entries would never
+# find it there, exactly as surely as if it were entirely absent. The
+# audit must fail and name the dependency, proving this is a genuine
+# loader-search-context check, not merely "present somewhere in the
+# tree", which a purely recursive index (the pre-fix behavior) would
+# have silently accepted.
+mkdir -p "$auto_root_tree/lib/plugins/other"
+"$cc_bin" -shared -fPIC -Wl,-soname,libpluginleaf.so.1 \
+  -o "$auto_root_tree/lib/plugins/other/libpluginleaf.so.1" pluginleaf.c
+ln -s libpluginleaf.so.1 "$auto_root_tree/lib/plugins/other/libpluginleaf.so"
+set +e
+output_17="$(python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" 2>&1)"
+case17_status=$?
+set -e
+[[ $case17_status -ne 0 ]] \
+  || fail "case 17: expected non-zero exit for a dependency relocated to a directory unreachable from the plugin's own RUNPATH/global search dirs"
+echo "$output_17" | grep -q "libpluginleaf.so.1" \
+  || fail "case 17: failure output did not name the unreachable dependency: $output_17"
+echo "PASS: a dependency present only in an unsearched directory is correctly treated as unreachable, never silently resolved from elsewhere in the tree"
+rm -rf "$auto_root_tree/lib/plugins/other"
+
+# Restore the plugin's genuinely-reachable dependency (deleted by case 12
+# above) so any later case relying on this same auto_root_tree (none
+# currently do, but kept for robustness against future additions) sees a
+# consistent, intact tree.
+"$cc_bin" -shared -fPIC -Wl,-soname,libpluginleaf.so.1 \
+  -o "$auto_root_tree/lib/libpluginleaf.so.1" pluginleaf.c
+ln -sf libpluginleaf.so.1 "$auto_root_tree/lib/libpluginleaf.so"
+
 
 # --- Case 13: --allow-x11-desktop-stack. Builds a root that NEEDs a
 # stub library sharing an exact X11_DESKTOP_ABI_ALLOWLIST SONAME

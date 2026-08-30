@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -683,6 +685,189 @@ class VerifyNoticesTests(unittest.TestCase):
         exit_code, _stdout, stderr = self._run()
         self.assertEqual(exit_code, 1)
         self.assertIn("NOTICE.md", stderr)
+
+
+class SbomInventoryTests(unittest.TestCase):
+    """Review round (2 HIGH + 8 MEDIUM) item 9: the SBOM/manifest must
+    never omit an allowlisted bundled library, and must carry a
+    cryptographic identity (sha256 at minimum, always computable without
+    any ELF toolchain) for every single entry."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.lib_dir = Path(self._tmp.name) / "lib"
+        self.lib_dir.mkdir()
+
+    def test_allowlisted_library_is_never_omitted_from_the_inventory(self) -> None:
+        # Prior to this fix, classify_all()/the JSON manifest's
+        # "components"/"unmapped" keys silently excluded ABI_ALLOWLIST
+        # members entirely -- an SBOM consumer had no way to even know
+        # libc.so.6 was bundled at all, let alone its own identity.
+        (self.lib_dir / "libc.so.6").write_bytes(b"fake libc bytes")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"fake libavif bytes")
+        inventory = audit.build_sbom_inventory(self.lib_dir)
+        by_path = {entry["path"]: entry for entry in inventory}
+        self.assertIn("libc.so.6", by_path)
+        self.assertEqual(by_path["libc.so.6"]["classification"], "allowlisted")
+        self.assertEqual(
+            by_path["libc.so.6"]["sha256"],
+            audit._sha256(self.lib_dir / "libc.so.6"),
+        )
+        self.assertEqual(by_path["libavif.so.16.0.0"]["classification"], "libavif")
+
+    def test_unmapped_library_still_appears_in_the_inventory(self) -> None:
+        (self.lib_dir / "libmysteryvendor.so.3").write_bytes(b"???")
+        inventory = audit.build_sbom_inventory(self.lib_dir)
+        by_path = {entry["path"]: entry for entry in inventory}
+        self.assertEqual(
+            by_path["libmysteryvendor.so.3"]["classification"], "unmapped"
+        )
+
+    def test_json_manifest_inventory_includes_every_bundled_library(self) -> None:
+        (self.lib_dir / "libc.so.6").write_bytes(b"fake libc bytes")
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(b"fake libavif bytes")
+        (self.lib_dir / "libmysteryvendor.so.3").write_bytes(b"???")
+        json_path = Path(self._tmp.name) / "sbom.json"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            audit.main(
+                ["classify", str(self.lib_dir), "--json-out", str(json_path)]
+            )
+        manifest = json.loads(json_path.read_text())
+        inventory_paths = {entry["path"] for entry in manifest["inventory"]}
+        self.assertEqual(
+            inventory_paths,
+            {"libc.so.6", "libavif.so.16.0.0", "libmysteryvendor.so.3"},
+        )
+        # Every entry must carry (at minimum) a sha256 -- never entirely
+        # bare identity, even in an environment where readelf could not
+        # determine a build-id/SONAME for a non-ELF test fixture.
+        for entry in manifest["inventory"]:
+            self.assertIsNotNone(entry["sha256"])
+
+
+def _compile_shared_object(cc_bin: str, source: str, output: Path) -> None:
+    source_path = output.with_suffix(".c")
+    source_path.write_text(source)
+    subprocess.run(
+        [cc_bin, "-shared", "-fPIC", "-o", str(output), str(source_path)],
+        check=True,
+        capture_output=True,
+    )
+
+
+@unittest.skipUnless(
+    shutil.which("cc") or shutil.which("gcc"),
+    "requires a real C compiler to build genuine ELF fixtures",
+)
+@unittest.skipUnless(
+    shutil.which("readelf"), "requires readelf (binutils) to read build-id/SONAME"
+)
+class QtPluginContentProvenanceTests(unittest.TestCase):
+    """Review round (2 HIGH + 8 MEDIUM) item 9's core regression: a Qt
+    plugin classification that only ever checked relative-path existence
+    against the reference Qt SDK, never the bundled file's own content,
+    would wrongly accept an attacker-substituted binary placed at the
+    exact same path with the exact same name. These tests use genuine,
+    compiled ELF shared objects (unlike the rest of this module's
+    basename-only fake-file tests) since a real build-id/content
+    comparison is precisely the behavior under test."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.cc_bin = shutil.which("cc") or shutil.which("gcc")
+
+    def test_genuine_unmodified_qt_plugin_still_classifies_as_qt(self) -> None:
+        qt_root = self.root / "qt_sdk"
+        (qt_root / "plugins" / "imageformats").mkdir(parents=True)
+        reference = qt_root / "plugins" / "imageformats" / "libqjpeg.so"
+        _compile_shared_object(
+            self.cc_bin, "int test_plugin_entry(void) { return 1; }\n", reference
+        )
+
+        bundled_dir = self.root / "appdir" / "plugins" / "imageformats"
+        bundled_dir.mkdir(parents=True)
+        bundled = bundled_dir / "libqjpeg.so"
+        # An exact copy models the common case of an unmodified bundled
+        # plugin (or one only rewritten in ways that happen to preserve
+        # every byte, e.g. a no-op patchelf pass); the build-id-based
+        # comparison and the sha256 fallback both agree here.
+        bundled.write_bytes(reference.read_bytes())
+
+        self.assertEqual(
+            audit.classify_path(bundled, qt_root),
+            "qt",
+        )
+
+    def test_substituted_qt_plugin_at_the_same_path_is_not_classified_as_qt(
+        self,
+    ) -> None:
+        # The exact attack this finding is about: a different compiled
+        # object (different source, different build-id, different
+        # bytes) is placed at the identical relative sub-path and
+        # basename a genuine Qt plugin would occupy.
+        qt_root = self.root / "qt_sdk"
+        (qt_root / "plugins" / "imageformats").mkdir(parents=True)
+        reference = qt_root / "plugins" / "imageformats" / "libqjpeg.so"
+        _compile_shared_object(
+            self.cc_bin, "int test_plugin_entry(void) { return 1; }\n", reference
+        )
+
+        bundled_dir = self.root / "appdir" / "plugins" / "imageformats"
+        bundled_dir.mkdir(parents=True)
+        substituted = bundled_dir / "libqjpeg.so"
+        _compile_shared_object(
+            self.cc_bin,
+            "int test_plugin_entry(void) { return 0xDEAD; }\n"
+            "int extra_unexpected_symbol(void) { return 2; }\n",
+            substituted,
+        )
+        # Sanity: really is different content, not an accidental copy.
+        self.assertNotEqual(
+            audit._sha256(reference), audit._sha256(substituted)
+        )
+
+        self.assertIsNone(
+            audit.classify_path(substituted, qt_root),
+        )
+
+    def test_build_id_survives_a_patchelf_style_rpath_edit(self) -> None:
+        # Approximates linuxdeploy's own patchelf RUNPATH-rewriting step
+        # (which this classifier's provenance check must tolerate,
+        # per this finding's own design constraint) by compiling the
+        # SAME source twice with different RPATH values -- an
+        # RPATH/RUNPATH difference alone must never make a genuinely
+        # unmodified plugin look "substituted".
+        if not shutil.which("patchelf"):
+            self.skipTest("requires patchelf to simulate a real RUNPATH rewrite")
+        qt_root = self.root / "qt_sdk"
+        (qt_root / "plugins" / "imageformats").mkdir(parents=True)
+        reference = qt_root / "plugins" / "imageformats" / "libqjpeg.so"
+        _compile_shared_object(
+            self.cc_bin, "int test_plugin_entry(void) { return 1; }\n", reference
+        )
+
+        bundled_dir = self.root / "appdir" / "plugins" / "imageformats"
+        bundled_dir.mkdir(parents=True)
+        bundled = bundled_dir / "libqjpeg.so"
+        bundled.write_bytes(reference.read_bytes())
+        bundled.chmod(0o755)
+        subprocess.run(
+            ["patchelf", "--set-rpath", "$ORIGIN/../..", str(bundled)],
+            check=True,
+            capture_output=True,
+        )
+        # The patchelf rewrite legitimately changed the bytes...
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(bundled))
+        # ...but the build-id (and therefore this classifier's own
+        # verdict) must be unaffected by it.
+        self.assertEqual(
+            audit._read_build_id(reference), audit._read_build_id(bundled)
+        )
+        self.assertEqual(audit.classify_path(bundled, qt_root), "qt")
 
 
 if __name__ == "__main__":

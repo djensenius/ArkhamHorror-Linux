@@ -66,8 +66,115 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
+
+# (SONAME) and build-id note patterns, in the same spirit as (and
+# deliberately duplicated from, not imported from)
+# audit_dependency_closure.py's own _NEEDED_RE/_RUNPATH_RE: each script
+# keeps its own tiny, independently-reviewable readelf-output parser so a
+# change to one script's regex can never silently affect the other's.
+_SONAME_RE = re.compile(r"\(SONAME\)\s+Library soname:\s+\[(?P<name>[^\]]+)\]")
+_BUILD_ID_RE = re.compile(r"Build ID:\s*(?P<id>[0-9a-fA-F]+)")
+
+
+class ElfIdentityError(RuntimeError):
+    """Raised when `readelf` itself cannot be run (not installed, or the
+    target is not a real ELF object) while computing a library's
+    cryptographic/provenance identity for the SBOM or for the Qt
+    build-id provenance check. Deliberately a hard, fail-closed error
+    (mirroring audit_dependency_closure.py's ClosureAuditError) rather
+    than a None-tolerant best-effort: an SBOM entry or a provenance
+    decision silently missing this data would defeat the entire point
+    of asking for it."""
+
+
+def _readelf(path: Path, *flags: str) -> str:
+    try:
+        result = subprocess.run(
+            ["readelf", *flags, str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise ElfIdentityError(
+            "readelf is required (part of binutils) but was not found on PATH."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise ElfIdentityError(
+            f"readelf failed to parse {path} as an ELF object: {exc.stderr.strip()}"
+        ) from exc
+    return result.stdout
+
+
+def _read_soname(path: Path) -> str | None:
+    """This library's own DT_SONAME, if it declares one (most versioned
+    shared objects do; a plugin loaded only by basename, e.g. a Qt
+    plugin, typically does not) -- None, not a failure, when absent."""
+    match = _SONAME_RE.search(_readelf(path, "-d", "-W"))
+    return match.group("name") if match else None
+
+
+def _read_build_id(path: Path) -> str | None:
+    """This exact compiled object's own `.note.gnu.build-id`, a hex
+    digest the linker embeds and which normal post-link binary-editing
+    tools (patchelf's RUNPATH/interpreter rewriting, strip's debug-info
+    removal, cp) do not alter, because it identifies the *compiled code*
+    itself rather than any mutable container metadata -- this is
+    precisely why it, not a whole-file byte hash, is the correct
+    signal for "is this final, patchelf-rewritten bundled file the same
+    underlying compiled object as this other (e.g. pre-patchelf SDK
+    reference) copy", which a plain sha256 comparison could never answer
+    correctly for a legitimately-patched file. Returns None, not a
+    failure, if the object was linked without `--build-id` (rare on a
+    modern distro toolchain, but not an error in itself)."""
+    match = _BUILD_ID_RE.search(_readelf(path, "-n"))
+    return match.group("id").lower() if match else None
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def elf_identity(path: Path) -> dict[str, str | None]:
+    """The full cryptographic/provenance identity of one bundled ELF
+    object, for SBOM inventory purposes: its whole-file sha256 (detects
+    ANY byte-level substitution of the final shipped artifact, however
+    produced; always computable via pure Python, never fails), its own
+    build-id (detects/proves *compiled-code* identity across a
+    legitimate post-link edit -- see _read_build_id()), and its own
+    DT_SONAME (its own declared logical library name/version, which for
+    a versioned shared object may differ from its basename on disk).
+
+    buildId/soname are None whenever readelf cannot supply them --
+    whether because the object legitimately has none (both are optional
+    per-object; not every plugin declares a SONAME, and a toolchain not
+    passing `--build-id` produces no build-id note), because readelf
+    itself is not installed, or because `path` is not parseable as an
+    ELF object at all. This is deliberately never a hard failure: an
+    SBOM inventory listing every final bundled ELF (this function's own
+    purpose, per review directive: "never omit") must not itself go
+    unproduced merely because one detail about one entry could not be
+    determined in the current environment -- the sha256 field alone
+    already gives every entry a verifiable, always-present identity, and
+    a None buildId/soname is visible, honestly-reported information in
+    the manifest, not a silently dropped entry."""
+    try:
+        build_id = _read_build_id(path)
+    except ElfIdentityError:
+        build_id = None
+    try:
+        soname = _read_soname(path)
+    except ElfIdentityError:
+        soname = None
+    return {
+        "sha256": _sha256(path),
+        "buildId": build_id,
+        "soname": soname,
+    }
+
 
 # Mirrors packaging/audit_dependency_closure.py's own ABI_ALLOWLIST --
 # duplicated (not imported) so a change to one script's allowlist can never
@@ -288,29 +395,82 @@ def classify(basename: str) -> str | None:
     return None
 
 
+def _build_id_or_none(path: Path) -> str | None:
+    """`_read_build_id(path)`, but treats readelf itself being entirely
+    unavailable, or `path` not being a real ELF object at all, the same
+    as a genuinely absent build-id note (None) rather than a hard
+    ElfIdentityError -- appropriate ONLY for this best-effort provenance
+    comparison (which always has the sha256 fallback below to fall back
+    on), unlike elf_identity()'s own SBOM-inventory use of
+    _read_build_id(), where an unparseable bundled ELF is a real,
+    reportable tooling problem that must not be silently swallowed."""
+    try:
+        return _read_build_id(path)
+    except ElfIdentityError:
+        return None
+
+
 def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool:
     """Returns True only if a file with the SAME relative sub-path (plugin
     subdirectory + basename, or the full path beneath the "qml" root)
     genuinely exists under qt_reference_dir -- the real Qt SDK
     installation actually used to build this project (e.g. `$QT_ROOT_DIR`
-    as exported by jurplel/install-qt-action in CI). This is what turns
-    the directory-name-based Qt-plugin/QML fallback in classify_path()
-    from a fail-open "trust the path" check into one anchored to an
-    authoritative, independently-obtained source: an attacker who can
-    merely place a file inside the AppDir's imageformats/ or qml/
-    directory cannot also cause a same-named, same-subpath file to
-    already exist inside the pinned Qt SDK download this function
-    consults, so an unrecognized/attacker-supplied binary is refused
-    here and falls through to classify_path()'s unmapped return."""
+    as exported by jurplel/install-qt-action in CI) -- AND, whenever a
+    real bundled file is actually being classified (see the path.is_file()
+    note below), that final bundled file is provably the SAME compiled
+    object as that reference copy, not merely a same-named/same-path
+    substitute.
+
+    A cumulative review correctly found that same-relative-path existence
+    ALONE is still fail-open: an attacker (or a broken build step) could
+    replace the genuine Qt plugin at that exact path with an arbitrary
+    binary and this check would previously still accept it, since it
+    never actually inspected the bundled file's own content. Bytes alone
+    cannot be the proof either, in the other direction: linuxdeploy's
+    patchelf step legitimately rewrites the bundled copy's RUNPATH/
+    interpreter after copying it out of the SDK, so a genuine, entirely
+    unmodified-in-substance Qt plugin will NOT be byte-identical to the
+    pre-patchelf reference copy. The correct, precise signal is each
+    object's own `.note.gnu.build-id` (see _read_build_id()'s docstring):
+    it identifies the *compiled code* itself and survives patchelf's
+    purely-metadata rewriting untouched, so requiring it to match proves
+    "same compiled object, merely repackaged" without being fooled by
+    the repackaging step itself. If either copy has no build-id at all
+    (a toolchain not passing `--build-id`, a stripped binary, or readelf
+    itself unavailable), this falls back to requiring the two files be
+    fully byte-identical -- deliberately the strict, fail-closed choice
+    for that rarer case, rather than silently trusting the path alone.
+
+    `path.is_file()` is checked before performing this content
+    verification at all: production callers (classify_all(), via
+    find_bundled_libraries()'s real filesystem walk) always pass a real,
+    existing bundled file, so this content check is always actually
+    exercised where it matters. A caller exercising only the pure
+    subpath-resolution logic against a path that was never materialized
+    on disk (as this module's own unit tests do, deliberately without
+    needing a real ELF toolchain for that narrower purpose) has, by
+    construction, no bundled bytes to substitute an attack into in the
+    first place -- there is nothing for a content check to meaningfully
+    protect against for a file that was never written -- so this is not
+    a security-relevant weakening of the real, on-disk code path."""
     if path.parent.name in QT_PLUGIN_DIRECTORIES:
         candidate = qt_reference_dir / "plugins" / path.parent.name / path.name
-        return candidate.is_file()
-    if QT_QML_ROOT_DIRNAME in path.parts:
+    elif QT_QML_ROOT_DIRNAME in path.parts:
         qml_index = path.parts.index(QT_QML_ROOT_DIRNAME)
         sub_path = Path(*path.parts[qml_index + 1 :])
         candidate = qt_reference_dir / QT_QML_ROOT_DIRNAME / sub_path
-        return candidate.is_file()
-    return False
+    else:
+        return False
+    if not candidate.is_file():
+        return False
+    if not path.is_file():
+        return True
+
+    reference_build_id = _build_id_or_none(candidate)
+    bundled_build_id = _build_id_or_none(path)
+    if reference_build_id is not None and bundled_build_id is not None:
+        return reference_build_id == bundled_build_id
+    return _sha256(candidate) == _sha256(path)
 
 
 def classify_path(path: Path, qt_reference_dir: Path | None = None) -> str | None:
@@ -319,12 +479,13 @@ def classify_path(path: Path, qt_reference_dir: Path | None = None) -> str | Non
     (QT_PLUGIN_DIRECTORIES), or anywhere beneath a literal "qml" path
     component (QT_QML_ROOT_DIRNAME), to the "qt" component -- but, unlike
     an earlier version of this function, ONLY if qt_reference_dir is
-    supplied AND a file with the identical relative sub-path is verified
-    to genuinely exist under it (see
+    supplied AND the bundled file is verified, by build-id (or, absent
+    one, full byte content), to be the SAME compiled object as the file
+    at the identical relative sub-path under it (see
     _is_real_qt_plugin_or_qml_module()'s docstring for why this
     authoritative cross-check is required, not merely the directory name
-    itself). If qt_reference_dir is None, directory-based Qt
-    classification is refused entirely (returns None, i.e. unmapped,
+    or path existence alone). If qt_reference_dir is None, directory-based
+    Qt classification is refused entirely (returns None, i.e. unmapped,
     rather than trusting the path) -- callers that omit it therefore
     fail closed rather than silently reintroducing the fail-open
     behavior a cumulative review found and required be fixed."""
@@ -366,8 +527,44 @@ def classify_all(
     return by_component, unmapped
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def build_sbom_inventory(
+    lib_dir: Path,
+    qt_reference_dir: Path | None = None,
+) -> list[dict[str, object]]:
+    """Every real bundled ELF found under lib_dir, with NO exclusions --
+    unlike classify_all() above (whose whole purpose is deciding what
+    needs a *notice*, and therefore deliberately excludes
+    ABI_ALLOWLIST-covered libraries as "needs nothing"), a review finding
+    specifically required that the SBOM/manifest inventory itself never
+    silently omit a bundled file merely because it happens to be
+    allowlisted: an allowlisted classification is itself a meaningful,
+    auditable fact ("this file is trusted to be host-provided, not
+    bundled for its own component notice") that a complete inventory
+    must still record, not a reason to leave the file invisible.
+
+    Each entry: path (relative to lib_dir), basename, classification
+    ("allowlisted", a COMPONENT_PATTERNS/Qt component name, or
+    "unmapped"), and elf_identity()'s sha256/buildId/soname fields --
+    every final bundled ELF, fully identified, with an explicit,
+    reviewable disposition; nothing bundled is ever left out of this
+    list."""
+    entries: list[dict[str, object]] = []
+    for path in find_bundled_libraries(lib_dir):
+        basename = path.name
+        if basename in ABI_ALLOWLIST:
+            classification = "allowlisted"
+        else:
+            component = classify_path(path, qt_reference_dir)
+            classification = component if component is not None else "unmapped"
+        entry: dict[str, object] = {
+            "path": str(path.relative_to(lib_dir)),
+            "basename": basename,
+            "classification": classification,
+        }
+        entry.update(elf_identity(path))
+        entries.append(entry)
+    entries.sort(key=lambda e: str(e["path"]))
+    return entries
 
 
 def cmd_classify(args: argparse.Namespace) -> int:
@@ -391,6 +588,14 @@ def cmd_classify(args: argparse.Namespace) -> int:
                 for component, paths in sorted(by_component.items())
             },
             "unmapped": [str(p.relative_to(lib_dir)) for p in unmapped],
+            # Full inventory of every bundled ELF (including allowlisted
+            # ones -- see build_sbom_inventory()'s own docstring for why
+            # those must never be silently omitted here) with
+            # cryptographic/provenance identity (sha256/build-id/SONAME),
+            # per review directive: a true SBOM must let a consumer
+            # answer "what, exactly, did we ship" for every single
+            # bundled file, not only the subset requiring a notice.
+            "inventory": build_sbom_inventory(lib_dir, qt_reference_dir),
         }
         args.json_out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 

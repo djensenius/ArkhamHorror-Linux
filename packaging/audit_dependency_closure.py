@@ -211,6 +211,8 @@ FONT_RENDERING_ABI_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 _NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[(?P<name>[^\]]+)\]")
+_RUNPATH_RE = re.compile(r"\(RUNPATH\)\s+Library runpath:\s+\[(?P<value>[^\]]*)\]")
+_RPATH_RE = re.compile(r"\(RPATH\)\s+Library rpath:\s+\[(?P<value>[^\]]*)\]")
 _ELF_MAGIC = b"\x7fELF"
 
 
@@ -222,7 +224,12 @@ class ClosureAuditError(RuntimeError):
     tooling/integrity error."""
 
 
-def _readelf_needed(path: Path) -> list[str]:
+def _readelf_dynamic_text(path: Path) -> str:
+    """Runs `readelf -d -W` on `path` exactly once and returns its raw
+    stdout -- both _parse_needed() and _parse_search_path_entries() below
+    parse this same text, so each bundled ELF is only ever actually
+    invoked through readelf a single time per audit, regardless of how
+    many distinct DT_* tags are read from it."""
     try:
         result = subprocess.run(
             ["readelf", "-d", "-W", str(path)],
@@ -238,8 +245,83 @@ def _readelf_needed(path: Path) -> list[str]:
         raise ClosureAuditError(
             f"readelf failed to parse {path} as an ELF shared object: {exc.stderr.strip()}"
         ) from exc
+    return result.stdout
 
-    return [m.group("name") for m in _NEEDED_RE.finditer(result.stdout)]
+
+def _parse_needed(dynamic_text: str) -> list[str]:
+    return [m.group("name") for m in _NEEDED_RE.finditer(dynamic_text)]
+
+
+def _parse_search_path_entries(dynamic_text: str) -> list[str]:
+    """Returns this object's own DT_RUNPATH entries if present, else its
+    DT_RPATH entries (colon-separated, empty entries dropped) -- never
+    both. This mirrors glibc's ld.so precisely: DT_RUNPATH, when present,
+    entirely REPLACES DT_RPATH for resolving this object's own direct
+    DT_NEEDED entries (DT_RPATH is only ever consulted when DT_RUNPATH is
+    completely absent), so merging the two would search directories a
+    real load of this exact file would never actually search."""
+    match = _RUNPATH_RE.search(dynamic_text)
+    if match is None:
+        match = _RPATH_RE.search(dynamic_text)
+    if match is None:
+        return []
+    return [entry for entry in match.group("value").split(":") if entry]
+
+
+def _expand_origin(entry: str, origin_dir: Path) -> Path:
+    """Expands a single RUNPATH/RPATH entry's $ORIGIN (or ${ORIGIN})
+    token(s) to `origin_dir` -- the requesting object's OWN containing
+    directory, exactly as ld.so defines $ORIGIN -- then resolves the
+    result (following any further symlinked ancestor directories, exactly
+    like the real loader would) to an absolute, canonical directory path.
+    A non-$ORIGIN relative entry (rare, but permitted by the format) is
+    resolved relative to origin_dir too, matching ld.so's own documented
+    behavior for a relative RUNPATH/RPATH entry."""
+    expanded = entry.replace("$ORIGIN", str(origin_dir)).replace(
+        "${ORIGIN}", str(origin_dir)
+    )
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
+        candidate = origin_dir / candidate
+    return candidate.resolve()
+
+
+def _effective_search_dirs(
+    requester_path: Path, dynamic_text: str, global_search_dirs: list[Path]
+) -> list[Path]:
+    """The ordered list of real directories a load of `requester_path`'s
+    own DT_NEEDED entries would actually search, per real ld.so
+    precedence: this object's own DT_RUNPATH (or DT_RPATH if no RUNPATH
+    is present) with $ORIGIN expanded relative to its OWN containing
+    directory, first; then the caller-supplied global default search
+    directories (representing this project's AppRun-exported
+    LD_LIBRARY_PATH, which applies uniformly to every bundled object
+    regardless of its own individual RUNPATH -- see main()'s
+    --global-search-dir). A directory named by more than one of these
+    sources is only ever searched once, at its EARLIEST (highest-
+    precedence) position."""
+    origin_dir = requester_path.parent.resolve()
+    dirs: list[Path] = []
+    for entry in _parse_search_path_entries(dynamic_text):
+        expanded = _expand_origin(entry, origin_dir)
+        if expanded not in dirs:
+            dirs.append(expanded)
+    for candidate in global_search_dirs:
+        if candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
+
+
+def _basename_reachable_in(dir_path: Path, name: str) -> bool:
+    """True if `name` names a real ELF file (or a symlink resolving to
+    one) found DIRECTLY inside dir_path -- deliberately never recursive:
+    a real ld.so directory search is never implicitly recursive into
+    subdirectories, so a dependency that only exists two levels below a
+    search directory (e.g. under a sibling Qt plugin's own subdirectory)
+    is exactly as unreachable to a real loader as one that is entirely
+    absent, regardless of how confidently a purely-recursive index might
+    otherwise "find" it somewhere else in the same AppDir tree."""
+    return _is_elf_file(dir_path / name)
 
 
 def _file_digest(path: Path) -> str | None:
@@ -334,50 +416,102 @@ def _is_elf_file(path: Path) -> bool:
         return False
 
 
-def _discover_elf_roots(search_dir: Path) -> list[str]:
+def _discover_elf_roots(search_dir: Path) -> dict[str, Path]:
     """Recursively finds every real ELF file under search_dir (the app's own
     executable, every Qt plugin, every QML module's native library, and
-    every already-bundled library alike) and returns their basenames,
-    de-duplicated and sorted for deterministic output. This is what lets
-    --auto-roots prove closure completeness against literally everything
-    the packaged AppImage might ever try to load, not only a hand-picked
-    subset some prior incident happened to name."""
-    names: set[str] = set()
-    for entry in search_dir.rglob("*"):
-        if _is_elf_file(entry):
-            names.add(entry.name)
-    return sorted(names)
+    every already-bundled library alike) and returns a mapping of each
+    one's basename to its real discovered path (first match wins,
+    deterministically, for a rare same-basename duplicate -- rglob's own
+    traversal order -- exactly as the pre-existing bundled-library index
+    already tolerates harmless byte-identical duplicates elsewhere in this
+    script). This is what lets --auto-roots prove closure completeness
+    against literally everything the packaged AppImage might ever try to
+    load, not only a hand-picked subset some prior incident happened to
+    name -- and, crucially, what lets each auto-discovered root's OWN
+    real location be used to compute ITS OWN effective RUNPATH/RPATH
+    search context for its own dependency edges (see
+    _effective_search_dirs()), rather than only ever knowing it by a bare
+    name divorced from where it actually lives in the tree."""
+    discovered: dict[str, Path] = {}
+    for entry in sorted(search_dir.rglob("*")):
+        if _is_elf_file(entry) and entry.name not in discovered:
+            discovered[entry.name] = entry
+    return discovered
 
 
 def audit_closure(
     lib_dir: Path,
     roots: list[str],
     extra_allowlist: frozenset[str] = frozenset(),
-) -> tuple[set[str], dict[str, list[str]], set[str]]:
-    """Returns (bundled_closure, missing -> [requested-by...], visited_all).
+    global_search_dirs: list[Path] | None = None,
+) -> tuple[set[str], dict[str, list[str]], dict[str, list[str]], set[str]]:
+    """Returns (bundled_closure, missing -> [requested-by...],
+    unreachable -> [requested-by...], visited_all).
 
-    bundled_closure: every bundled library name found reachable from roots.
-    missing: every NEEDED name that was neither bundled nor allowlisted,
-      mapped to the list of bundled libraries that required it (for a
-      useful error message pinpointing which dependency edge is broken).
+    bundled_closure: every bundled library name found reachable from roots
+      -- both actually present in the AppDir AND actually resolvable via
+      its specific requester's own real loader search context (see
+      unreachable below); a name that is merely present somewhere in the
+      tree but never actually reachable is NOT included here.
+    missing: every NEEDED name that was neither bundled anywhere in the
+      tree nor allowlisted, mapped to the list of bundled libraries that
+      required it (for a useful error message pinpointing which
+      dependency edge is broken).
+    unreachable: every NEEDED name that IS bundled somewhere in the tree
+      (and is not allowlisted) but is NOT reachable from the specific
+      requester(s) that named it -- i.e. neither that requester's own
+      $ORIGIN-expanded DT_RUNPATH/DT_RPATH nor any global_search_dirs
+      entry actually contains it directly. A real ld.so load of that
+      requester would fail to resolve this exact dependency exactly as
+      surely as if it were entirely absent from the AppDir, regardless of
+      which unrelated, unsearched directory elsewhere in the tree happens
+      to also contain a same-named file -- see the module docstring's
+      RUNPATH/RPATH/$ORIGIN/LD_LIBRARY_PATH loader-search-awareness
+      rationale. Mapped to the same "requested by" list shape as missing.
+    global_search_dirs: directories searched for EVERY requester,
+      regardless of its own RUNPATH/RPATH -- representing this project's
+      AppRun-exported LD_LIBRARY_PATH (see main()'s --global-search-dir).
+      Defaults to [lib_dir] alone, preserving this function's original,
+      pre-loader-search-aware behavior for every existing single-flat-
+      directory caller that never passes this parameter.
     extra_allowlist: an additional, separately-documented allowlist unioned
       with ABI_ALLOWLIST for this call only (e.g. X11_DESKTOP_ABI_ALLOWLIST,
       opted into explicitly via --allow-x11-desktop-stack) -- kept as an
       explicit parameter rather than silently merged into ABI_ALLOWLIST
       itself so a caller auditing e.g. the narrow libsecret closure never
       unintentionally also trusts the X11/GL desktop-stack assumption.
+
+    Every entry in `roots` itself (requester is None below) is never
+    subjected to the reachability check: it is presumed to be loaded by
+    its own real, already-known path (execve()'d directly for the app's
+    own executable/plugins discovered by --auto-roots, or --root's
+    documented convention of naming something expected to live directly
+    in lib_dir), never resolved BY NAME through some other object's own
+    search path in the first place -- only an actual DT_NEEDED dependency
+    EDGE (which always has a concrete, known requester: the object whose
+    own dynamic section named it) is ever reachability-checked. Once a
+    root's own resolved path is known (from the bundled-library index),
+    that path becomes the requester for ITS OWN dependency edges exactly
+    like any other object's.
     """
     allowlist = ABI_ALLOWLIST | extra_allowlist
     index = _index_lib_dir(lib_dir)
     lib_dir_resolved = lib_dir.resolve()
+    if global_search_dirs is None:
+        global_search_dirs = [lib_dir_resolved]
+    else:
+        global_search_dirs = [d.resolve() for d in global_search_dirs]
 
     bundled_closure: set[str] = set()
     missing: dict[str, list[str]] = {}
-    queue: list[str] = list(roots)
+    unreachable: dict[str, list[str]] = {}
+    # Each queue entry is (name, requester_path); requester_path is None
+    # only for an initial root (see the reachability-exemption note above).
+    queue: list[tuple[str, Path | None]] = [(name, None) for name in roots]
     seen: set[str] = set()
 
     while queue:
-        name = queue.pop()
+        name, requester_path = queue.pop()
         if name in seen:
             continue
         seen.add(name)
@@ -387,7 +521,6 @@ def audit_closure(
                 missing.setdefault(name, [])
             continue
 
-        bundled_closure.add(name)
         resolved_path = index[name]
         if resolved_path.is_symlink():
             # AppImage bundling always produces SONAME symlinks that point
@@ -421,12 +554,36 @@ def audit_closure(
             else:
                 resolved_path = index[name]
 
-        for needed in _readelf_needed(resolved_path):
-            queue.append(needed)
+        if requester_path is not None:
+            requester_dynamic_text = _readelf_dynamic_text(requester_path)
+            effective_dirs = _effective_search_dirs(
+                requester_path, requester_dynamic_text, global_search_dirs
+            )
+            if not any(
+                _basename_reachable_in(search_dir, name)
+                for search_dir in effective_dirs
+            ):
+                # Bundled somewhere in the tree, but not anywhere a real
+                # load of `requester_path` would actually search for it --
+                # exactly as fatal as a genuinely missing dependency (see
+                # this function's own docstring). Still recurse into its
+                # own further DT_NEEDED entries below so a single audit
+                # run reports every real problem, not just the first one;
+                # never add it to bundled_closure, since this edge was
+                # never validly resolved.
+                unreachable.setdefault(name, []).append(requester_path.name)
+                for needed in _parse_needed(_readelf_dynamic_text(resolved_path)):
+                    queue.append((needed, resolved_path))
+                continue
+
+        bundled_closure.add(name)
+        for needed in _parse_needed(_readelf_dynamic_text(resolved_path)):
+            queue.append((needed, resolved_path))
             if needed not in index and needed not in allowlist:
                 missing.setdefault(needed, []).append(name)
 
-    return bundled_closure, missing, seen
+    return bundled_closure, missing, unreachable, seen
+
 
 
 def main(argv: list[str]) -> int:
@@ -488,13 +645,29 @@ def main(argv: list[str]) -> int:
         "need to enumerate closure members programmatically. Failure output "
         "is unchanged.",
     )
+    parser.add_argument(
+        "--global-search-dir",
+        action="append",
+        dest="global_search_dirs",
+        default=None,
+        type=Path,
+        help="A directory searched for every bundled dependency edge, "
+        "regardless of the requesting object's own RUNPATH/RPATH "
+        "(repeatable) -- representing this project's own AppRun-exported "
+        "LD_LIBRARY_PATH. Defaults to [lib_dir] alone if never given, "
+        "matching every existing single-flat-directory invocation. Pass "
+        "the real 'usr/lib' directory explicitly when lib_dir is a wider "
+        "tree (e.g. the whole 'usr/' root, as --auto-roots typically "
+        "audits), since lib_dir itself is otherwise not a real load-time "
+        "search directory in that case.",
+    )
     args = parser.parse_args(argv)
 
     if not args.lib_dir.is_dir():
         print(f"Not a directory: {args.lib_dir}", file=sys.stderr)
         return 2
 
-    auto_roots: list[str] = []
+    auto_roots: dict[str, Path] = {}
     if args.auto_roots is not None:
         if not args.auto_roots.is_dir():
             print(f"Not a directory: {args.auto_roots}", file=sys.stderr)
@@ -513,7 +686,7 @@ def main(argv: list[str]) -> int:
     # are already sorted; explicit roots are appended after, then the whole
     # list is de-duplicated by insertion order).
     roots: list[str] = []
-    for root in [*auto_roots, *explicit_roots]:
+    for root in [*sorted(auto_roots), *explicit_roots]:
         if root not in roots:
             roots.append(root)
 
@@ -534,7 +707,12 @@ def main(argv: list[str]) -> int:
                 )
                 return 2
 
-        bundled_closure, missing, _ = audit_closure(args.lib_dir, roots, extra_allowlist)
+        bundled_closure, missing, unreachable, _ = audit_closure(
+            args.lib_dir,
+            roots,
+            extra_allowlist,
+            global_search_dirs=args.global_search_dirs,
+        )
     except ClosureAuditError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -553,6 +731,20 @@ def main(argv: list[str]) -> int:
         for name in sorted(required_bundled):
             print(f"  {name}")
 
+    if unreachable:
+        print(
+            "\nBundled elsewhere in the AppDir, but NOT reachable via the "
+            "requesting object's own RUNPATH/RPATH ($ORIGIN-expanded) or "
+            "any --global-search-dir -- a real dynamic loader would fail "
+            "to resolve this dependency exactly as if it were entirely "
+            "absent (see the module docstring's loader-search-awareness "
+            "rationale):",
+            file=sys.stderr,
+        )
+        for name, requested_by in sorted(unreachable.items()):
+            requesters = ", ".join(sorted(set(requested_by))) or "(root)"
+            print(f"  {name}  (required by: {requesters})", file=sys.stderr)
+
     if missing:
         print(
             "\nMissing non-ABI transitive dependencies (present in neither "
@@ -562,6 +754,9 @@ def main(argv: list[str]) -> int:
         for name, requested_by in sorted(missing.items()):
             requesters = ", ".join(sorted(set(requested_by))) or "(root)"
             print(f"  {name}  (required by: {requesters})", file=sys.stderr)
+        return 1
+
+    if unreachable:
         return 1
 
     if args.list_only:

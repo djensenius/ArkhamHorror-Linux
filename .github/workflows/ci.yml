@@ -53,7 +53,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain, libavif and libjpeg build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev # libavif-dev/libjpeg-turbo8-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...) need these even for the configure-only lint job.
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev # libavif-dev/libjpeg-turbo8-dev/zlib1g-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)/find_package(ZLIB REQUIRED) need these even for the configure-only lint job.
       - run: mise run lint
 
   test:
@@ -73,7 +73,7 @@ jobs:
       - name: Install QtKeychain, D-Bus, libavif, libjpeg and clang-format build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev libjpeg-turbo8-dev clang-format # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev/libjpeg-turbo8-dev provide the mandatory AVIF/JPEG decode dependencies (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)); clang-format is required by generate_asset_locale_digest.py --check below (review round-6/7 item 10 -- --check fails closed without it, see that script's _clang_format()).
+          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev libjpeg-turbo8-dev zlib1g-dev clang-format # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev/libjpeg-turbo8-dev/zlib1g-dev provide the mandatory AVIF/JPEG decode and PNG IDAT-zlib-validation dependencies (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)/find_package(ZLIB REQUIRED)); clang-format is required by generate_asset_locale_digest.py --check below (review round-6/7 item 10 -- --check fails closed without it, see that script's _clang_format()).
       - name: Test asset locale digest generator's --check fail-closed behavior
         # tools/generate_asset_locale_digest.py's --check mode (review
         # round-3 item 16) is a standalone local dev tool no CMake/ctest
@@ -139,8 +139,49 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain and libavif build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - run: mise run build
+
+  ubsan:
+    name: UBSan (asset codecs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.14
+          cache: true
+      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtwebsockets
+          cache: true
+      - name: Install QtKeychain, libavif, libjpeg and zlib build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
+      - name: Configure with ARKHAM_ENABLE_UBSAN in an optimized build
+        # Cumulative-review finding (PR #18, exact head 4a47ea34): proves
+        # AssetJpegDecoder.cpp's setjmp/longjmp-adjacent state handling
+        # (and the rest of the asset codec/cache/coordinator paths this
+        # binary exercises) under Clang's UndefinedBehaviorSanitizer in an
+        # OPTIMIZED (RelWithDebInfo) build specifically -- see
+        # CMakeLists.txt's ARKHAM_ENABLE_UBSAN option doc comment for why
+        # an optimized build is the configuration most likely to actually
+        # miscompile around setjmp()'s limited guarantees, versus the
+        # normal -O0 Debug build every other CI job uses.
+        run: |
+          QT_PREFIX="${QT_PREFIX:-${QT_ROOT_DIR:-}}"
+          cmake -S . -B build-ubsan -G Ninja \
+            ${QT_PREFIX:+-DCMAKE_PREFIX_PATH="$QT_PREFIX"} \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=ON \
+            -DARKHAM_ENABLE_UBSAN=ON
+      - name: Build asset test binary under UBSan
+        run: cmake --build build-ubsan --target arkham-asset-tests --parallel
+      - name: Run asset tests under UBSan
+        env:
+          QT_QPA_PLATFORM: offscreen
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build-ubsan/arkham-asset-tests
 
   appimage-smoke:
     name: AppImage smoke artifact
@@ -162,7 +203,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; AVIF is decoded directly against a bundled libavif (see src/AssetAvifDecoder.cpp) rather than through any Qt image-format plugin, so no Qt AVIF module is needed here either.
           cache: true
       - name: Install QtKeychain and libavif build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - name: Test libsecret discovery fallback logic
         # Exercises find_bundled_libsecret() (used by build-appimage.sh
         # below) against ldconfig-absent, ldconfig-failing,
@@ -734,8 +775,18 @@ jobs:
             exit 1
           }
           echo "Auditing the exhaustive closure of every real bundled ELF under $usr_root ..."
+          # --global-search-dir "$usr_root/lib" mirrors this project's real
+          # AppRun-exported LD_LIBRARY_PATH: it is searched for every
+          # bundled object's dependency edges regardless of that object's
+          # own RUNPATH/RPATH. Without it, only $ORIGIN-relative entries
+          # patchelf/linuxdeploy actually wrote onto each individual
+          # bundled ELF (not usr_root itself, which is never a real
+          # load-time search directory) would be honored -- see
+          # audit_dependency_closure.py's loader-search-awareness design.
           python3 packaging/audit_dependency_closure.py "$usr_root" \
-            --auto-roots "$usr_root" --allow-x11-desktop-stack \
+            --auto-roots "$usr_root" \
+            --global-search-dir "$usr_root/lib" \
+            --allow-x11-desktop-stack \
             --allow-font-rendering-stack
       - name: Verify bundled libsecret dependency closure has no host fallback
         # The static recursive closure audit above is the primary,
