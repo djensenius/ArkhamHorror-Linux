@@ -117,13 +117,13 @@ void EncoderHygieneTests::domainFilesContainNoHandBuiltJsonContainers() {
     allHits += hasHandBuiltJsonContainer(path, readFileOrFail(path));
   }
   QVERIFY2(allHits.isEmpty(),
-           qPrintable(u"found hand-built QJsonObject/QJsonArray "
-                      "declaration(s) in a pinned-contract domain encoder "
-                      "file -- every response/request encoder in this "
-                      "domain must instead compose a complete Json::Value "
-                      "AST and convert it exactly once via "
-                      "toExactQJson()/toExactQJsonObject()/"
-                      "toExactQJsonArray() (see RawJson.h):\n"_s +
+           qPrintable(u"found hand-built QJsonObject/QJsonArray "_s
+                      u"declaration(s) in a pinned-contract domain encoder "_s
+                      u"file -- every response/request encoder in this "_s
+                      u"domain must instead compose a complete Json::Value "_s
+                      u"AST and convert it exactly once via "_s
+                      u"toExactQJson()/toExactQJsonObject()/"_s
+                      u"toExactQJsonArray() (see RawJson.h):\n"_s +
                       allHits.join(u'\n')));
 }
 
@@ -135,7 +135,7 @@ void EncoderHygieneTests::checkerIgnoresLegitimateDecodeSideByRefParameters() {
   // round depend on.
   const QStringList hits = hasHandBuiltJsonContainer(
       u"synthetic"_s,
-      u"ValueOrError<CardDef> CardDef::fromJson(const QJsonObject &obj,\n"
+      u"ValueOrError<CardDef> CardDef::fromJson(const QJsonObject &obj,\n"_s
       u"                                        QStringView path) {\n"_s);
   QVERIFY(hits.isEmpty());
 }
@@ -146,8 +146,8 @@ void EncoderHygieneTests::checkerIgnoresExactConverterReturnTypeDeclarations() {
   // must never be flagged either -- only an actual local hand-built
   // container declaration should be.
   const QStringList hits = hasHandBuiltJsonContainer(
-      u"synthetic"_s, u"ValueOrError<QJsonObject> CardDef::toJson() const {\n"
-                      u"  return toRawJson().toExactQJsonObject();\n"
+      u"synthetic"_s, u"ValueOrError<QJsonObject> CardDef::toJson() const {\n"_s
+                      u"  return toRawJson().toExactQJsonObject();\n"_s
                       u"}\n"_s);
   QVERIFY(hits.isEmpty());
 }
@@ -163,10 +163,10 @@ void EncoderHygieneTests::checkerDetectsARealHandBuiltObjectViolation() {
   // (also real, also desirable) "bare non-fallible QJsonObject return
   // type" shape.
   const QStringList hits = hasHandBuiltJsonContainer(
-      u"synthetic"_s, u"ValueOrError<QJsonObject> Foo::toJson() const {\n"
-                      u"  QJsonObject object;\n"
-                      u"  object.insert(\"name\"_L1, m_name);\n"
-                      u"  return object;\n"
+      u"synthetic"_s, u"ValueOrError<QJsonObject> Foo::toJson() const {\n"_s
+                      u"  QJsonObject object;\n"_s
+                      u"  object.insert(\"name\"_L1, m_name);\n"_s
+                      u"  return object;\n"_s
                       u"}\n"_s);
   QCOMPARE(hits.size(), 1);
   QVERIFY(hits.first().contains(u"QJsonObject object;"_s));
@@ -174,11 +174,11 @@ void EncoderHygieneTests::checkerDetectsARealHandBuiltObjectViolation() {
 
 void EncoderHygieneTests::checkerDetectsARealHandBuiltArrayViolation() {
   const QStringList hits = hasHandBuiltJsonContainer(
-      u"synthetic"_s, u"ValueOrError<QJsonArray> Foo::toJson() const {\n"
-                      u"  QJsonArray array;\n"
-                      u"  for (const auto &row : m_rows)\n"
-                      u"    array.append(row);\n"
-                      u"  return array;\n"
+      u"synthetic"_s, u"ValueOrError<QJsonArray> Foo::toJson() const {\n"_s
+                      u"  QJsonArray array;\n"_s
+                      u"  for (const auto &row : m_rows)\n"_s
+                      u"    array.append(row);\n"_s
+                      u"  return array;\n"_s
                       u"}\n"_s);
   QCOMPARE(hits.size(), 1);
   QVERIFY(hits.first().contains(u"QJsonArray array;"_s));
