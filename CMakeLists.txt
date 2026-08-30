@@ -87,6 +87,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
     "${qtkeychain_SOURCE_DIR}\n${qtkeychain_BINARY_DIR}\n"
 )
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/autogen_targets.txt" "")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt" "")
 
 # FetchContent builds qtkeychain via add_subdirectory(), so the namespaced
 # alias normally created by the installed QtKeychainConfig.cmake does not
@@ -291,6 +292,11 @@ unset(_arkham_dup_check_index)
 # anywhere under src/ is recognized under -- not just "*.h".
 include(cmake/DomainHeaderInventory.cmake)
 include(cmake/PathManifest.cmake)
+arkham_append_encoder_hygiene_target(
+    TARGET qt6keychain
+    CLASSIFICATION EXTERNAL
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
+)
 arkham_check_domain_header_inventory(
     BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
     HEADER_GLOB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -367,6 +373,12 @@ unset(_arkham_domain_headers_absolute)
 target_include_directories(arkham_domain_models PUBLIC src/domain)
 target_link_libraries(arkham_domain_models PUBLIC
     Qt6::Core
+)
+arkham_append_encoder_hygiene_target(
+    TARGET arkham_domain_models
+    CLASSIFICATION SCAN
+    POLICY domain
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
 )
 
 # See packaging/check_encoder_hygiene.py: plain, one-path-per-line
@@ -486,6 +498,12 @@ target_link_libraries(arkham_foundation PUBLIC
     Qt6::Network
     Qt6Keychain::Qt6Keychain
 )
+arkham_append_encoder_hygiene_target(
+    TARGET arkham_foundation
+    CLASSIFICATION SCAN
+    POLICY foundation
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
+)
 
 qt_add_executable(arkham-horror
     src/main.cpp
@@ -496,6 +514,19 @@ qt_add_qml_module(arkham-horror
     VERSION 1.0
     QML_FILES
         qml/Main.qml
+)
+
+arkham_append_encoder_hygiene_target(
+    TARGET arkham-horror
+    CLASSIFICATION SCAN
+    POLICY application
+    OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt"
+)
+cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    CALL arkham_append_target_autogen_manifest
+        TARGET arkham-horror
+        POLICY application
+        OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/autogen_targets.txt"
 )
 
 target_link_libraries(arkham-horror PRIVATE

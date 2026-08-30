@@ -22,6 +22,7 @@ Run directly: `python3 packaging/check_encoder_hygiene_test.py`
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -550,6 +551,42 @@ class FindingKeyTests(unittest.TestCase):
     def test_key_is_file_and_usr_pair(self) -> None:
         finding = _finding(file="src/domain/RawJson.h", usr="some-usr")
         self.assertEqual(finding.key(), ("src/domain/RawJson.h", "some-usr"))
+
+
+class CanonicalSourceManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        scratch = repo / "build"
+        scratch.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=str(scratch))
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_public_duplicate_is_expected_to_arrive_deduplicated(self) -> None:
+        source = self.root / "Public.cpp"
+        source.write_text("int value = 0;\n", encoding="utf-8")
+        self.assertEqual(
+            ceh._canonical_source_manifest([source], "Probe"),
+            [source.resolve()],
+        )
+
+    def test_symlink_alias_collision_fails_closed(self) -> None:
+        source = self.root / "Source.cpp"
+        alias = self.root / "Alias.cpp"
+        source.write_text("int value = 0;\n", encoding="utf-8")
+        alias.symlink_to(source)
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._canonical_source_manifest([source, alias], "Probe")
+
+    def test_hardlink_collision_fails_closed(self) -> None:
+        source = self.root / "Source.cpp"
+        alias = self.root / "Alias.cpp"
+        source.write_text("int value = 0;\n", encoding="utf-8")
+        os.link(source, alias)
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._canonical_source_manifest([source, alias], "Probe")
 
 
 class ClosureRootednessTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Prove, via real compiler-AST inspection (libclang), that no PUBLIC
-declaration in EITHER of this project's two production public header sets
+declaration in this project's production headers or compiled target TUs
 returns a QJsonObject/QJsonArray/QJsonValue-family type, except for a tiny,
 explicitly enumerated allowlist of legitimate symbols:
 
@@ -19,6 +19,14 @@ explicitly enumerated allowlist of legitimate symbols:
     arkham_foundation target). Its only permitted QJson-returning symbols
     are AuthModels.h's two legitimate request-body encoders
     (AuthenticateRequest::toJson, RegisterRequest::toJson).
+  - Every compile command owned by the application target, including
+    src/main.cpp, AUTOMOC, QML type-registration/cache, and RCC-generated
+    units, under the foundation/application closure. No app-local encoder
+    exception exists.
+
+Every compile-command target is reverse-inventoried against explicit CMake
+target metadata. Unknown production targets fail; external, test, and
+try-compile commands are excluded only by exact target records.
 
 Both header sets are audited by this ONE script/policy, not just the
 domain one: a review round demonstrated that scoping the AST scan to
@@ -474,6 +482,7 @@ _CXCursor_StructDecl = 2
 _CXCursor_ClassDecl = 4
 _CXCursor_ClassTemplate = 31
 _CXCursor_FunctionDecl = 8
+_CXCursor_ParmDecl = 10
 _CXCursor_CXXMethod = 21
 _CXCursor_Namespace = 22
 _CXCursor_ConversionFunction = 26
@@ -485,6 +494,7 @@ _CXCursor_UsingDeclaration = 35
 _CXCursor_TypeAliasDecl = 36
 _CXCursor_OverloadedDeclRef = 49
 _CXCursor_NoDeclFound = 71
+_CXCursor_AnnotateAttr = 406
 _CXCursor_FriendDecl = 603
 _CXCursor_TemplateTypeParameter = 27
 
@@ -543,9 +553,13 @@ _INHERITABLE_ACCESS_SPECIFIERS = frozenset({_CX_CXXPublic, _CX_CXXProtected})
 _CXType_Pointer = 101
 _CXType_LValueReference = 103
 _CXType_RValueReference = 104
+_CXType_FunctionNoProto = 110
+_CXType_FunctionProto = 111
+_CXType_MemberPointer = 117
 _REFERENCE_OR_POINTER_TYPE_KINDS = frozenset(
     {_CXType_Pointer, _CXType_LValueReference, _CXType_RValueReference}
 )
+_FUNCTION_TYPE_KINDS = frozenset({_CXType_FunctionNoProto, _CXType_FunctionProto})
 
 # CXLinkageKind values (see clang-c/Index.h): only a declaration with
 # genuinely external linkage can be referenced (e.g. via an ad-hoc
@@ -740,6 +754,12 @@ class _LibClang:
         lib.clang_Type_getNumTemplateArguments.argtypes = [_CXType]
         lib.clang_Type_getTemplateArgumentAsType.restype = _CXType
         lib.clang_Type_getTemplateArgumentAsType.argtypes = [_CXType, ctypes.c_uint]
+        lib.clang_getNumArgTypes.restype = ctypes.c_int
+        lib.clang_getNumArgTypes.argtypes = [_CXType]
+        lib.clang_getArgType.restype = _CXType
+        lib.clang_getArgType.argtypes = [_CXType, ctypes.c_uint]
+        lib.clang_getResultType.restype = _CXType
+        lib.clang_getResultType.argtypes = [_CXType]
 
         # clang_Cursor_getNumArguments()/clang_Cursor_getArgument(): work
         # directly on a function-like DECLARATION cursor (not merely a
@@ -942,6 +962,173 @@ def _is_qjson_family(canonical_type_spelling: str) -> bool:
 
 _MAX_TYPE_DEPTH = 32
 
+_OUTPUT_CAPABLE_TEMPLATE_PREFIXES = (
+    "std::shared_ptr<",
+    "std::unique_ptr<",
+    "std::weak_ptr<",
+    "std::reference_wrapper<",
+    "std::span<",
+    "QSharedPointer<",
+    "QWeakPointer<",
+    "QPointer<",
+    "QScopedPointer<",
+    "QSharedDataPointer<",
+    "QExplicitlySharedDataPointer<",
+)
+_CALLABLE_TEMPLATE_PREFIXES = (
+    "std::function<",
+    "std::move_only_function<",
+)
+
+
+def _normalized_type_spelling(spelling: str) -> str:
+    return "".join(spelling.split()).removeprefix("const")
+
+
+def _has_template_prefix(spelling: str, prefixes: Sequence[str]) -> bool:
+    normalized = _normalized_type_spelling(spelling)
+    return any(
+        normalized.startswith(prefix)
+        or normalized.startswith(prefix.rsplit("::", 1)[-1])
+        for prefix in prefixes
+    )
+
+
+def _is_dependent_type(clang: "_LibClang", value_type: "_CXType") -> bool:
+    canonical = clang.lib.clang_getCanonicalType(value_type)
+    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
+    declaration = clang.lib.clang_getTypeDeclaration(canonical)
+    return (
+        "type-parameter-" in spelling
+        or spelling in ("", "<dependent type>")
+        or clang.lib.clang_getCursorKind(declaration)
+        == _CXCursor_TemplateTypeParameter
+    )
+
+
+def _json_payload_path(
+    clang: "_LibClang", value_type: "_CXType", depth: int = 0
+) -> str | None:
+    """Find JSON anywhere in a value graph, intentionally ignoring cv.
+    Used only for callback/signal arguments whose direction is outward."""
+
+    if depth > _MAX_TYPE_DEPTH:
+        raise EncoderHygieneError(
+            f"Callback JSON payload walk exceeded {_MAX_TYPE_DEPTH} levels"
+        )
+    canonical = clang.lib.clang_getCanonicalType(value_type)
+    if canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS or canonical.kind == _CXType_MemberPointer:
+        pointee = clang.lib.clang_getPointeeType(canonical)
+        if pointee.kind != 0:
+            return _json_payload_path(clang, pointee, depth + 1)
+    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
+    if _is_qjson_family(spelling):
+        return spelling
+    argument_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
+    for index in range(max(argument_count, 0)):
+        found = _json_payload_path(
+            clang,
+            clang.lib.clang_Type_getTemplateArgumentAsType(canonical, index),
+            depth + 1,
+        )
+        if found is not None:
+            return found
+    return None
+
+
+def _callback_json_path(
+    clang: "_LibClang", value_type: "_CXType", depth: int = 0
+) -> str | None:
+    if depth > _MAX_TYPE_DEPTH:
+        raise EncoderHygieneError(
+            f"Callback type walk exceeded {_MAX_TYPE_DEPTH} levels"
+        )
+    original_spelling = clang.to_str(
+        clang.lib.clang_getTypeSpelling(value_type)
+    )
+    canonical = clang.lib.clang_getCanonicalType(value_type)
+    if canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS or canonical.kind == _CXType_MemberPointer:
+        pointee = clang.lib.clang_getPointeeType(canonical)
+        if pointee.kind != 0:
+            return _callback_json_path(clang, pointee, depth + 1)
+        return None
+    if canonical.kind in _FUNCTION_TYPE_KINDS:
+        argument_count = clang.lib.clang_getNumArgTypes(canonical)
+        for index in range(max(argument_count, 0)):
+            found = _json_payload_path(
+                clang, clang.lib.clang_getArgType(canonical, index), depth + 1
+            )
+            if found is not None:
+                return found
+        return None
+
+    spelling = clang.to_str(clang.lib.clang_getTypeSpelling(canonical))
+    template_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
+    if _has_template_prefix(
+        spelling, _CALLABLE_TEMPLATE_PREFIXES
+    ) or _has_template_prefix(
+        original_spelling, _CALLABLE_TEMPLATE_PREFIXES
+    ):
+        if template_count < 1:
+            return "QJsonObject-capable unresolved callable wrapper"
+        callable_type = clang.lib.clang_Type_getTemplateArgumentAsType(canonical, 0)
+        if _is_dependent_type(clang, callable_type):
+            return "QJsonObject-capable unresolved callable wrapper"
+        return _callback_json_path(clang, callable_type, depth + 1)
+
+    # Optional/container/alias wrappers around a callable retain the
+    # callback's outward direction.
+    for index in range(max(template_count, 0)):
+        found = _callback_json_path(
+            clang,
+            clang.lib.clang_Type_getTemplateArgumentAsType(canonical, index),
+            depth + 1,
+        )
+        if found is not None:
+            return found
+    return None
+
+
+def _cursor_has_annotation(
+    clang: "_LibClang", cursor: "_CXCursor", annotation: str
+) -> bool:
+    found = False
+
+    def visit(child: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        nonlocal found
+        if (
+            clang.lib.clang_getCursorKind(child) == _CXCursor_AnnotateAttr
+            and clang.to_str(clang.lib.clang_getCursorDisplayName(child))
+            == annotation
+        ):
+            found = True
+        return 1
+
+    callback = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(cursor, callback, None)
+    return found
+
+
+def _parameter_cursors(
+    clang: "_LibClang", cursor: "_CXCursor"
+) -> list[_CXCursor]:
+    count = clang.lib.clang_Cursor_getNumArguments(cursor)
+    if count >= 0:
+        return [
+            clang.lib.clang_Cursor_getArgument(cursor, index)
+            for index in range(count)
+        ]
+    parameters: list[_CXCursor] = []
+
+    def visit(child: "_CXCursor", _parent: "_CXCursor", _client_data) -> int:
+        if clang.lib.clang_getCursorKind(child) == _CXCursor_ParmDecl:
+            parameters.append(child)
+        return 1
+
+    callback = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(cursor, callback, None)
+    return parameters
+
 
 def _mutable_json_path(
     clang: "_LibClang",
@@ -966,6 +1153,9 @@ def _mutable_json_path(
             f"JSON output-parameter type walk exceeded {_MAX_TYPE_DEPTH} levels"
         )
 
+    original_spelling = clang.to_str(
+        clang.lib.clang_getTypeSpelling(value_type)
+    )
     canonical = clang.lib.clang_getCanonicalType(value_type)
     kind = canonical.kind
     if kind in _REFERENCE_OR_POINTER_TYPE_KINDS:
@@ -998,6 +1188,22 @@ def _mutable_json_path(
             if directly_mutable and not clang.lib.clang_isConstQualifiedType(canonical):
                 return spelling
         return None
+
+    if _has_template_prefix(
+        spelling, _OUTPUT_CAPABLE_TEMPLATE_PREFIXES
+    ) or _has_template_prefix(
+        original_spelling, _OUTPUT_CAPABLE_TEMPLATE_PREFIXES
+    ):
+        if template_arg_count < 1:
+            return "QJsonObject-capable unresolved output wrapper"
+        pointee_argument = clang.lib.clang_Type_getTemplateArgumentAsType(
+            canonical, 0
+        )
+        if _is_dependent_type(clang, pointee_argument):
+            return "QJsonObject-capable unresolved output wrapper"
+        return _mutable_json_path(
+            clang, pointee_argument, directly_mutable=True, depth=depth + 1
+        )
 
     wrapper_mutable = directly_mutable and not bool(
         clang.lib.clang_isConstQualifiedType(canonical)
@@ -1050,24 +1256,45 @@ def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tu
         return True, result_spelling
 
     if kind in _OUTPARAM_CHECKED_KINDS:
-        num_args = clang.lib.clang_Cursor_getNumArguments(cursor)
-        for arg_index in range(max(num_args, 0)):
-            parm_cursor = clang.lib.clang_Cursor_getArgument(cursor, arg_index)
+        is_qt_signal = kind == _CXCursor_CXXMethod and _cursor_has_annotation(
+            clang, cursor, "qt_signal"
+        )
+        for arg_index, parm_cursor in enumerate(_parameter_cursors(clang, cursor)):
             parm_type = clang.lib.clang_getCursorType(parm_cursor)
             canonical_parm = clang.lib.clang_getCanonicalType(parm_type)
-            if canonical_parm.kind in _REFERENCE_OR_POINTER_TYPE_KINDS:
-                mutable_json = _mutable_json_path(
-                    clang, canonical_parm, directly_mutable=True
-                )
-                if mutable_json is not None:
-                    parm_spelling = clang.to_str(
-                        clang.lib.clang_getTypeSpelling(canonical_parm)
-                    )
+            parm_spelling = clang.to_str(
+                clang.lib.clang_getTypeSpelling(canonical_parm)
+            )
+
+            if is_qt_signal:
+                signal_payload = _json_payload_path(clang, canonical_parm)
+                if signal_payload is not None:
                     return (
                         True,
-                        "non-const output/inout parameter "
-                        f"#{arg_index}: {parm_spelling} (mutable {mutable_json})",
+                        f"Qt signal output parameter #{arg_index}: "
+                        f"{parm_spelling} (outbound {signal_payload})",
                     )
+
+            callback_payload = _callback_json_path(clang, canonical_parm)
+            if callback_payload is not None:
+                return (
+                    True,
+                    f"callback output parameter #{arg_index}: "
+                    f"{parm_spelling} (outbound {callback_payload})",
+                )
+
+            mutable_json = _mutable_json_path(
+                clang,
+                canonical_parm,
+                directly_mutable=canonical_parm.kind
+                in _REFERENCE_OR_POINTER_TYPE_KINDS,
+            )
+            if mutable_json is not None:
+                return (
+                    True,
+                    "non-const output/inout parameter "
+                    f"#{arg_index}: {parm_spelling} (mutable {mutable_json})",
+                )
 
     return False, result_spelling
 
@@ -1509,10 +1736,32 @@ def _target_and_configuration_from_output(output: Path) -> tuple[str, str]:
     return target, configuration
 
 
-def _compile_contexts_for_source(
-    compile_commands: Sequence[dict], source: Path
+def _validate_compile_contexts(contexts: Sequence[CompileContext]) -> None:
+    identities = [context.identity() for context in contexts]
+    if len(identities) != len(set(identities)):
+        raise EncoderHygieneError(
+            "Duplicate indistinguishable compile commands found; "
+            "each target/configuration/object context must be unique"
+        )
+    outputs = [context.output for context in contexts]
+    if len(outputs) != len(set(outputs)):
+        raise EncoderHygieneError(
+            f"Multiple compile commands claim the same object output: {outputs}"
+        )
+    target_configurations = [
+        (context.source, context.target, context.configuration)
+        for context in contexts
+    ]
+    if len(target_configurations) != len(set(target_configurations)):
+        raise EncoderHygieneError(
+            "Multiple unexplained object commands compile one source for the same "
+            "target/configuration; ownership is ambiguous"
+        )
+
+
+def _all_compile_contexts(
+    compile_commands: Sequence[dict],
 ) -> list[CompileContext]:
-    resolved = source.resolve()
     contexts: list[CompileContext] = []
     for entry in compile_commands:
         directory_value = entry.get("directory")
@@ -1521,16 +1770,14 @@ def _compile_contexts_for_source(
                 f"compile_commands.json entry has no exact working directory: {entry!r}"
             )
         directory = Path(directory_value).resolve()
-        entry_source = _entry_path(entry, "file", directory)
-        if entry_source != resolved:
-            continue
+        source = _entry_path(entry, "file", directory)
         output = _entry_path(entry, "output", directory)
         target, configuration = _target_and_configuration_from_output(output)
         raw_tokens = _compile_entry_tokens(entry)
         arguments = tuple(_sanitize_compile_args(raw_tokens, entry["file"]))
         contexts.append(
             CompileContext(
-                source=resolved,
+                source=source,
                 directory=directory,
                 arguments=arguments,
                 output=output,
@@ -1538,31 +1785,23 @@ def _compile_contexts_for_source(
                 configuration=configuration,
             )
         )
+    _validate_compile_contexts(contexts)
+    return contexts
 
+
+def _compile_contexts_for_source(
+    compile_commands: Sequence[dict], source: Path
+) -> list[CompileContext]:
+    resolved = source.resolve()
+    contexts = [
+        context
+        for context in _all_compile_contexts(compile_commands)
+        if context.source == resolved
+    ]
     if not contexts:
         raise EncoderHygieneError(
             f"No compile_commands.json entry found for source {source}; every "
             "manifested source must have at least one target-owned object command"
-        )
-
-    identities = [context.identity() for context in contexts]
-    if len(identities) != len(set(identities)):
-        raise EncoderHygieneError(
-            f"Duplicate indistinguishable compile commands found for {source}; "
-            "each target/configuration/object context must be unique"
-        )
-    outputs = [context.output for context in contexts]
-    if len(outputs) != len(set(outputs)):
-        raise EncoderHygieneError(
-            f"Multiple compile commands claim the same object output for {source}: {outputs}"
-        )
-    target_configurations = [
-        (context.target, context.configuration) for context in contexts
-    ]
-    if len(target_configurations) != len(set(target_configurations)):
-        raise EncoderHygieneError(
-            f"Multiple unexplained object commands compile {source} for the same "
-            "target/configuration; ownership is ambiguous"
         )
     return contexts
 
@@ -1779,7 +2018,11 @@ class OwnedPathPolicy:
         return identity is not None and identity in self.physical_identities
 
 
-def _owned_path_policy(repo_root: Path, generated_roots: frozenset[Path]) -> OwnedPathPolicy:
+def _owned_path_policy(
+    repo_root: Path,
+    generated_roots: frozenset[Path],
+    generated_files: frozenset[Path] = frozenset(),
+) -> OwnedPathPolicy:
     roots = frozenset({(repo_root / "src").resolve()}) | generated_roots
     identities: set[tuple[int, int]] = set()
     for root in roots:
@@ -1790,6 +2033,13 @@ def _owned_path_policy(repo_root: Path, generated_roots: frozenset[Path]) -> Own
                 identity = _physical_identity(path)
                 if identity is not None:
                     identities.add(identity)
+    for path in generated_files:
+        identity = _physical_identity(path)
+        if identity is None:
+            raise EncoderHygieneError(
+                f"Owned generated compile unit is missing: {path}"
+            )
+        identities.add(identity)
     return OwnedPathPolicy(roots=roots, physical_identities=frozenset(identities))
 
 
@@ -1941,6 +2191,162 @@ class AutogenClosure:
     policy: str
     root: Path
     code_files: frozenset[Path]
+    source_moc_owners: tuple[tuple[Path, Path], ...]
+
+
+@dataclass(frozen=True)
+class TargetPolicy:
+    classification: str
+    policy: str
+    target: str
+    target_type: str
+    source_dir: Path
+    binary_dir: Path
+
+
+def _load_target_policies(clang_build_dir: Path) -> dict[str, TargetPolicy]:
+    manifest = clang_build_dir / "generated" / "target_policy.txt"
+    if not manifest.is_file():
+        raise EncoderHygieneError(f"Target policy manifest is missing: {manifest}")
+    policies: dict[str, TargetPolicy] = {}
+    for line_number, raw_line in enumerate(
+        manifest.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not raw_line:
+            continue
+        fields = raw_line.split("\t")
+        if len(fields) != 6:
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: expected "
+                "CLASSIFICATION<TAB>POLICY<TAB>TARGET<TAB>TYPE<TAB>SOURCE_DIR<TAB>BINARY_DIR"
+            )
+        classification, policy, target, target_type, source_dir, binary_dir = fields
+        if classification not in {"SCAN", "EXTERNAL", "TEST", "TRY_COMPILE"}:
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: invalid target classification {classification!r}"
+            )
+        if classification == "SCAN" and policy not in {
+            "domain",
+            "foundation",
+            "application",
+        }:
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: SCAN target has invalid policy {policy!r}"
+            )
+        if classification != "SCAN" and policy:
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: excluded target must not carry policy {policy!r}"
+            )
+        if not target or target in policies or not target_type:
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: empty/duplicate target identity"
+            )
+        source_path = Path(source_dir).resolve()
+        binary_path = Path(binary_dir).resolve()
+        if not source_path.is_dir() or not binary_path.is_dir():
+            raise EncoderHygieneError(
+                f"{manifest}:{line_number}: target source/binary directory is missing"
+            )
+        policies[target] = TargetPolicy(
+            classification=classification,
+            policy=policy,
+            target=target,
+            target_type=target_type,
+            source_dir=source_path,
+            binary_dir=binary_path,
+        )
+    if not policies:
+        raise EncoderHygieneError(f"Target policy manifest is empty: {manifest}")
+    return policies
+
+
+def _parse_autogen_source_mocs(
+    metadata: dict, metadata_path: Path, root: Path
+) -> dict[Path, Path]:
+    sources = metadata.get("SOURCES")
+    if not isinstance(sources, list):
+        raise EncoderHygieneError(f"{metadata_path}: SOURCES must be an array")
+    source_modes: dict[Path, str] = {}
+    for record in sources:
+        if (
+            not isinstance(record, list)
+            or len(record) != 3
+            or not isinstance(record[0], str)
+            or not isinstance(record[1], str)
+            or record[2] is not None
+        ):
+            raise EncoderHygieneError(
+                f"Malformed SOURCES entry in {metadata_path}: {record!r}"
+            )
+        source = Path(record[0]).resolve()
+        if source in source_modes or record[1] not in {"MU", "Mu"}:
+            raise EncoderHygieneError(
+                f"Duplicate/unsupported AUTOGEN source record in {metadata_path}: {record!r}"
+            )
+        source_modes[source] = record[1]
+
+    owners: dict[Path, Path] = {}
+    suffixes = [""]
+    if metadata.get("MULTI_CONFIG") is True:
+        suffixes = sorted(
+            key.removeprefix("PARSE_CACHE_FILE_")
+            for key, value in metadata.items()
+            if key.startswith("PARSE_CACHE_FILE_")
+            and isinstance(value, str)
+            and Path(value).is_file()
+        )
+    if not suffixes:
+        raise EncoderHygieneError(
+            f"{metadata_path}: no built AUTOGEN configuration has a ParseCache"
+        )
+
+    for suffix in suffixes:
+        key_suffix = f"_{suffix}" if suffix else ""
+        parse_cache_value = metadata.get(f"PARSE_CACHE_FILE{key_suffix}")
+        include_dir_value = metadata.get(f"INCLUDE_DIR{key_suffix}")
+        if not isinstance(parse_cache_value, str) or not isinstance(include_dir_value, str):
+            raise EncoderHygieneError(
+                f"{metadata_path}: missing explicit ParseCache/include paths for {suffix or 'single-config'}"
+            )
+        parse_cache = Path(parse_cache_value).resolve()
+        include_dir = Path(include_dir_value).resolve()
+        if not parse_cache.is_file() or not include_dir.is_relative_to(root):
+            raise EncoderHygieneError(
+                f"{metadata_path}: source-MOC parse cache/include directory is missing or outside AUTOGEN"
+            )
+
+        mids: dict[Path, list[str]] = {source: [] for source in source_modes}
+        current: Path | None = None
+        lines = parse_cache.read_text(encoding="utf-8").splitlines()
+        if not lines or lines[0] != "# Generated by CMake. Changes will be overwritten.":
+            raise EncoderHygieneError(
+                f"{parse_cache}: missing CMake ParseCache provenance header"
+            )
+        for line in lines[1:]:
+            if line and not line.startswith(" "):
+                current = Path(line).resolve()
+                continue
+            if line.startswith(" mid:"):
+                if current not in mids:
+                    raise EncoderHygieneError(
+                        f"{parse_cache}: source-local MOC belongs to unregistered source {current}"
+                    )
+                mids[current].append(line[len(" mid:") :])
+
+        for source in source_modes:
+            includes = mids[source]
+            for include in includes:
+                if not include.endswith(".moc") or Path(include).is_absolute():
+                    raise EncoderHygieneError(
+                        f"{parse_cache}: invalid source-local MOC include {include!r}"
+                    )
+                output = (include_dir / include).resolve()
+                if not output.is_relative_to(include_dir) or output in owners:
+                    raise EncoderHygieneError(
+                        f"{parse_cache}: escaping/duplicate source-local MOC output {output}"
+                    )
+                owners[output] = source
+    return owners
 
 
 def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosure]]:
@@ -1950,7 +2356,11 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
             f"Owned AUTOGEN target manifest is missing: {manifest}"
         )
 
-    closures: dict[str, list[AutogenClosure]] = {"domain": [], "foundation": []}
+    closures: dict[str, list[AutogenClosure]] = {
+        "domain": [],
+        "foundation": [],
+        "application": [],
+    }
     seen_targets: set[str] = set()
     for line_number, raw_line in enumerate(
         manifest.read_text(encoding="utf-8").splitlines(), start=1
@@ -1993,13 +2403,31 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
                 f"AutogenInfo.json={metadata_root}"
             )
 
-        compilation = Path(metadata.get("MOC_COMPILATION_FILE", "")).resolve()
-        if compilation.parent != root or not compilation.is_file():
-            raise EncoderHygieneError(
-                f"AUTOGEN compilation unit for {target} is missing/outside its "
-                f"owned root: {compilation}"
+        compilation_keys = ["MOC_COMPILATION_FILE"]
+        if metadata.get("MULTI_CONFIG") is True:
+            compilation_keys = sorted(
+                key
+                for key, value in metadata.items()
+                if key.startswith("MOC_COMPILATION_FILE_")
+                and isinstance(value, str)
+                and Path(value).is_file()
             )
-        expected_code = {compilation}
+        compilations = {
+            Path(metadata.get(key, "")).resolve() for key in compilation_keys
+        }
+        if not compilations or any(
+            compilation.parent != root or not compilation.is_file()
+            for compilation in compilations
+        ):
+            raise EncoderHygieneError(
+                f"AUTOGEN compilation units for {target} are missing/outside "
+                f"their owned root: {sorted(compilations)}"
+            )
+        source_moc_owners = _parse_autogen_source_mocs(
+            metadata, metadata_path, root
+        )
+        expected_code = {*compilations, *source_moc_owners.keys()}
+        header_mocs: set[Path] = set()
         for header_record in metadata.get("HEADERS", []):
             if not isinstance(header_record, list) or len(header_record) < 3:
                 raise EncoderHygieneError(
@@ -2010,13 +2438,16 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
                 generated = (root / output).resolve()
                 if generated.is_file():
                     expected_code.add(generated)
+                    header_mocs.add(generated)
 
         actual_code = {
             path.resolve()
             for path in root.rglob("*")
             if path.is_file()
             and path.suffix.lower() in _CXX_GENERATED_SUFFIXES
-            and path.name != "moc_predefs.h"
+            and not _re.fullmatch(
+                r"moc_predefs(?:_[A-Za-z0-9_]+)?\.h", path.name
+            )
         }
         unexplained = actual_code - expected_code
         missing = expected_code - actual_code
@@ -2031,22 +2462,29 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
                 "project-owned and never trusted as external:\n" + "\n".join(details)
             )
 
-        for generated in expected_code - {compilation}:
+        for generated in expected_code - compilations:
             prefix = generated.read_text(encoding="utf-8", errors="replace")[:512]
             if "Meta object code from reading C++ file" not in prefix or "Qt Meta Object Compiler" not in prefix:
                 raise EncoderHygieneError(
                     f"Expected CMake-declared MOC artifact lacks the genuine Qt "
                     f"moc provenance banner: {generated}"
                 )
-        compilation_text = compilation.read_text(encoding="utf-8", errors="replace")
-        if "This file is autogenerated. Changes will be overwritten." not in compilation_text[:256]:
-            raise EncoderHygieneError(
-                f"AUTOGEN aggregation unit lacks CMake's generated provenance banner: "
-                f"{compilation}"
-            )
-        for generated in expected_code - {compilation}:
+        compilation_texts = {
+            compilation: compilation.read_text(encoding="utf-8", errors="replace")
+            for compilation in compilations
+        }
+        for compilation, compilation_text in compilation_texts.items():
+            if "This file is autogenerated. Changes will be overwritten." not in compilation_text[:256]:
+                raise EncoderHygieneError(
+                    f"AUTOGEN aggregation unit lacks CMake's generated provenance banner: "
+                    f"{compilation}"
+                )
+        for generated in header_mocs:
             relative = generated.relative_to(root).as_posix()
-            if f'#include "{relative}"' not in compilation_text:
+            if not any(
+                f'#include "{relative}"' in text
+                for text in compilation_texts.values()
+            ):
                 raise EncoderHygieneError(
                     f"CMake-declared MOC artifact is not enumerated by the target's "
                     f"audited aggregation unit: {generated}"
@@ -2058,6 +2496,9 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
                 policy=policy,
                 root=root,
                 code_files=frozenset(expected_code),
+                source_moc_owners=tuple(
+                    sorted(source_moc_owners.items(), key=lambda item: str(item[0]))
+                ),
             )
         )
     return closures
@@ -2405,6 +2846,8 @@ def _scan_sources(
     allowed_closure: frozenset[Path],
     seen: set[tuple],
     owned_paths: OwnedPathPolicy | None = None,
+    target: str | None = None,
+    contexts: Sequence[CompileContext] | None = None,
 ) -> tuple[list[str], list[Finding]]:
     """Independently parse every REAL production .cpp in `sources` as its
     own translation unit (see _parse_source_as_own_tu()) in every exact
@@ -2641,8 +3084,25 @@ def _scan_sources(
 
         return visitor
 
+    all_contexts = (
+        list(contexts)
+        if contexts is not None
+        else _all_compile_contexts(compile_commands)
+    )
+    contexts_by_source: dict[Path, list[CompileContext]] = {}
+    for context in all_contexts:
+        if target is None or context.target == target:
+            contexts_by_source.setdefault(context.source, []).append(context)
+
     for source in sources:
-        for context in _compile_contexts_for_source(compile_commands, source):
+        source_real = source.resolve()
+        source_contexts = contexts_by_source.get(source_real, [])
+        if not source_contexts:
+            raise EncoderHygieneError(
+                f"No exact compile context for source {source} in "
+                f"target {target or '<any registered target>'}"
+            )
+        for context in source_contexts:
             tu = _parse_source_as_own_tu(clang, idx, context, sysroot_args)
             try:
                 violations.extend(
@@ -2688,9 +3148,79 @@ def _read_manifest(path: Path) -> list[Path]:
     return entries
 
 
+def _canonical_source_manifest(
+    entries: Sequence[Path], label: str
+) -> list[Path]:
+    canonical: list[Path] = []
+    seen_paths: set[Path] = set()
+    seen_identities: set[tuple[int, int]] = set()
+    for entry in entries:
+        if not entry.is_file():
+            raise EncoderHygieneError(
+                f"{label} source manifest entry is missing/not regular: {entry}"
+            )
+        real = entry.resolve()
+        identity = _physical_identity(real)
+        if (
+            real in seen_paths
+            or identity is None
+            or identity in seen_identities
+        ):
+            raise EncoderHygieneError(
+                f"{label} source manifest contains an aliased/duplicate physical "
+                f"source identity: {entry} -> {real}"
+            )
+        seen_paths.add(real)
+        seen_identities.add(identity)
+        canonical.append(real)
+    return canonical
+
+
+def _validate_target_inventory(
+    policies: dict[str, TargetPolicy],
+    contexts: Sequence[CompileContext],
+    external_roots: frozenset[Path],
+) -> None:
+    contexts_by_target: dict[str, list[CompileContext]] = {}
+    for context in contexts:
+        contexts_by_target.setdefault(context.target, []).append(context)
+
+    unknown = sorted(set(contexts_by_target) - set(policies))
+    stale = sorted(set(policies) - set(contexts_by_target))
+    if unknown or stale:
+        details = [
+            *(f"  unowned compile-command target: {target}" for target in unknown),
+            *(f"  registered target has no compile command: {target}" for target in stale),
+        ]
+        raise EncoderHygieneError(
+            "Production compile-command reverse inventory is incomplete:\n"
+            + "\n".join(details)
+        )
+
+    for target, policy in policies.items():
+        target_contexts = contexts_by_target[target]
+        if policy.classification == "EXTERNAL":
+            for context in target_contexts:
+                if not (
+                    any(
+                        context.source.is_relative_to(root)
+                        for root in external_roots
+                    )
+                    and any(
+                        context.output.is_relative_to(root)
+                        for root in external_roots
+                    )
+                ):
+                    raise EncoderHygieneError(
+                        f"Target {target!r} is marked EXTERNAL but compile context "
+                        f"is not physically inside registered dependency roots: "
+                        f"{context.source} -> {context.output}"
+                    )
+
+
 def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
-    """Configure (and build both the arkham_domain_models AND
-    arkham_foundation targets in) a dedicated CMake build directory using
+    """Configure and build every CMake-metadata-registered production
+    SCAN target in a dedicated CMake build directory using
     Clang explicitly as the compiler, independent of whatever compiler
     this project's default/main build directory happens to use
     (ubuntu-latest's default is GCC, which exposes no libclang at all).
@@ -2699,11 +3229,9 @@ def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
     _sanitize_compile_args()) rather than guessing which of an arbitrary
     other compiler's flags libclang would accept.
 
-    Building arkham_foundation transitively builds arkham_domain_models
-    too (it links it PUBLIC), but both are named explicitly so this
-    step's intent -- "both production library targets, and therefore
-    both header sets' manifests, are ready to scan" -- is not left
-    implicit."""
+    The target list comes from generated target_policy.txt rather than a
+    hard-coded pair, so application/generated production units cannot be
+    omitted when a target is added."""
 
     clangxx = os.environ.get("ARKHAM_CLANGXX", "clang++")
     if shutil.which(clangxx) is None:
@@ -2739,8 +3267,18 @@ def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
         configure_cmd.append(f"-DCMAKE_PREFIX_PATH={qt_prefix}")
 
     subprocess.run(configure_cmd, check=True, cwd=repo_root)
+    target_policies = _load_target_policies(build_dir)
+    scan_targets = [
+        target
+        for target, policy in target_policies.items()
+        if policy.classification == "SCAN"
+    ]
+    if not scan_targets:
+        raise EncoderHygieneError(
+            "CMake target policy metadata contains no production SCAN target"
+        )
     subprocess.run(
-        ["cmake", "--build", str(build_dir), "--target", "arkham_domain_models", "arkham_foundation"],
+        ["cmake", "--build", str(build_dir), "--target", *scan_targets],
         check=True,
         cwd=repo_root,
     )
@@ -2783,11 +3321,39 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     # glob guess.
     generated_dir = clang_build_dir / "generated"
     domain_headers = _read_manifest(generated_dir / "domain_headers.txt")
-    domain_sources = _read_manifest(generated_dir / "domain_sources.txt")
+    domain_sources = _canonical_source_manifest(
+        _read_manifest(generated_dir / "domain_sources.txt"), "Domain"
+    )
     domain_fragments = _read_manifest(generated_dir / "domain_fragments.txt")
     foundation_headers = _read_manifest(generated_dir / "foundation_headers.txt")
-    foundation_sources = _read_manifest(generated_dir / "foundation_sources.txt")
+    foundation_sources = _canonical_source_manifest(
+        _read_manifest(generated_dir / "foundation_sources.txt"), "Foundation"
+    )
     foundation_fragments = _read_manifest(generated_dir / "foundation_fragments.txt")
+
+    all_contexts = _all_compile_contexts(compile_commands)
+    target_policies = _load_target_policies(clang_build_dir)
+    external_roots = _external_roots(clang_build_dir.resolve())
+    _validate_target_inventory(target_policies, all_contexts, external_roots)
+    contexts_by_target: dict[str, list[CompileContext]] = {}
+    for context in all_contexts:
+        contexts_by_target.setdefault(context.target, []).append(context)
+
+    all_compiled_sources = {context.source for context in all_contexts}
+    for label, sources in (
+        ("Domain", domain_sources),
+        ("Foundation", foundation_sources),
+    ):
+        stale_sources = sorted(set(sources) - all_compiled_sources)
+        if stale_sources:
+            raise EncoderHygieneError(
+                f"{label} source manifest has no exact target/config compile context:\n"
+                + "\n".join(f"  {source}" for source in stale_sources)
+            )
+    source_owner_policy = {
+        **{source: "foundation" for source in foundation_sources},
+        **{source: "domain" for source in domain_sources},
+    }
 
     # Every manifest entry must physically live inside the root it claims
     # to belong to (see _validate_closure_rootedness()) *before* it is
@@ -2804,17 +3370,32 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         foundation_headers + foundation_fragments, foundation_root, "Foundation header/fragment"
     )
     autogen_closures = _load_autogen_closures(clang_build_dir)
-    domain_generated_closure = frozenset(
-        path
-        for closure in autogen_closures["domain"]
-        for path in closure.code_files
-    )
-    foundation_generated_closure = frozenset(
-        path
-        for closure in autogen_closures["foundation"]
-        for path in closure.code_files
-    )
-    domain_closure = domain_source_closure | domain_generated_closure
+    autogen_by_target: dict[str, AutogenClosure] = {}
+    for closures in autogen_closures.values():
+        for closure in closures:
+            target_policy = target_policies.get(closure.target)
+            if (
+                target_policy is None
+                or target_policy.classification != "SCAN"
+                or target_policy.policy != closure.policy
+                or closure.target in autogen_by_target
+            ):
+                raise EncoderHygieneError(
+                    f"AUTOGEN target {closure.target!r} has missing/mismatched "
+                    "production target ownership metadata"
+                )
+            for generated, owner in closure.source_moc_owners:
+                if not any(
+                    context.source == owner
+                    for context in contexts_by_target[closure.target]
+                ):
+                    raise EncoderHygieneError(
+                        f"Source-local MOC {generated} owner {owner} has no exact "
+                        f"compile context in target {closure.target}"
+                    )
+            autogen_by_target[closure.target] = closure
+
+    domain_closure = domain_source_closure
     # foundation -> domain is the allowed dependency direction
     # (arkham_foundation legitimately links arkham_domain_models); the
     # reverse, domain -> foundation, is exactly the forbidden direction a
@@ -2824,7 +3405,6 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     foundation_closure = (
         domain_source_closure
         | foundation_source_closure
-        | foundation_generated_closure
     )
 
     libclang_path = _find_libclang()
@@ -2833,12 +3413,34 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     is_macos = platform.system() == "Darwin"
     sysroot_args = ["-isysroot", _macos_sdk_sysroot()] if is_macos else []
 
-    domain_contexts = _header_compile_contexts(
-        compile_commands, domain_sources, "domain"
-    )
-    foundation_contexts = _header_compile_contexts(
-        compile_commands, foundation_sources, "foundation"
-    )
+    policy_contexts: dict[str, list[CompileContext]] = {}
+    for policy in ("domain", "foundation", "application"):
+        candidates = [
+            context
+            for target, target_policy in target_policies.items()
+            if target_policy.classification == "SCAN"
+            for context in contexts_by_target[target]
+            if (
+                target_policy.policy == policy
+                or source_owner_policy.get(context.source) == policy
+            )
+        ]
+        unique: dict[tuple, CompileContext] = {}
+        for context in candidates:
+            unique.setdefault(
+                (
+                    context.target,
+                    context.configuration,
+                    context.directory,
+                    context.arguments,
+                ),
+                context,
+            )
+        policy_contexts[policy] = list(unique.values())
+    if not policy_contexts["domain"] or not policy_contexts["foundation"]:
+        raise EncoderHygieneError(
+            "Target policy metadata must provide domain and foundation scan contexts"
+        )
 
     idx = clang.lib.clang_createIndex(0, 0)
     if not idx:
@@ -2851,25 +3453,31 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     # one wrapper TU, and must only ever be recorded/counted once overall.
     seen: set[tuple] = set()
     structural_violations: list[str] = []
-    clang_build_dir_resolved = clang_build_dir.resolve()
-    external_roots = _external_roots(clang_build_dir_resolved)
     generated_roots = frozenset(
         closure.root
         for policy_closures in autogen_closures.values()
         for closure in policy_closures
     )
-    owned_paths = _owned_path_policy(repo_root, generated_roots)
+    generated_compile_units = frozenset(
+        context.source
+        for context in all_contexts
+        if target_policies[context.target].classification == "SCAN"
+        and not context.source.is_relative_to((repo_root / "src").resolve())
+    )
+    owned_paths = _owned_path_policy(
+        repo_root, generated_roots, generated_compile_units
+    )
 
     try:
         findings = _scan_headers(
             clang,
             idx,
             domain_headers + domain_fragments,
-            domain_contexts,
+            policy_contexts["domain"],
             sysroot_args,
             repo_root,
             external_roots,
-            domain_closure,
+            domain_source_closure,
             seen,
             structural_violations,
             owned_paths,
@@ -2878,7 +3486,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             clang,
             idx,
             foundation_headers + foundation_fragments,
-            foundation_contexts,
+            policy_contexts["foundation"],
             sysroot_args,
             repo_root,
             external_roots,
@@ -2888,61 +3496,63 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             owned_paths,
         )
 
-        # A review round demonstrated this script previously never
-        # independently parsed a single real source file at all --
-        # domain_sources.txt/foundation_sources.txt were read only to
-        # borrow one "representative" compile-args list for scanning
-        # *headers* -- so a production .cpp could #include an
-        # absolute/"../"-relative/symlinked/generated forbidden header,
-        # inherit whatever lossy encoders it declares, and compile with
-        # this check staying green. A further review round demonstrated
-        # that even after independent source parsing was added, it only
-        # ever checked the inclusion graph, never collecting new
-        # QJson-family Finding objects at all -- a genuinely new,
-        # source-only, externally-linked encoder declaration (with no
-        # header declaration anywhere) passed unaudited (see
-        # _scan_sources()'s own doc comment for exactly how this is now
-        # closed via clang_getCanonicalCursor()/clang_getCursorLinkage()).
-        # Each source here is parsed with its own exact
-        # compile_commands.json entry (never a borrowed one), and both
-        # source manifests are themselves generated directly from
-        # arkham_domain_models'/arkham_foundation's own live CMake
-        # SOURCES/INTERFACE_SOURCES (+ AUTOMOC-generated
-        # mocs_compilation.cpp, when applicable) metadata (see
-        # arkham_write_target_source_manifest() in
-        # cmake/PathManifest.cmake) -- never a hand-authored variable --
-        # so this scan can never silently miss a source added via a
-        # later target_sources() call, an INTERFACE_SOURCES entry, or a
-        # Qt AUTOMOC-generated compilation unit either.
-        domain_source_violations, domain_source_findings = _scan_sources(
-            clang,
-            idx,
-            domain_sources,
-            compile_commands,
-            sysroot_args,
-            repo_root,
-            external_roots,
-            domain_closure,
-            seen,
-            owned_paths,
-        )
-        structural_violations.extend(domain_source_violations)
-        findings += domain_source_findings
-
-        foundation_source_violations, foundation_source_findings = _scan_sources(
-            clang,
-            idx,
-            foundation_sources,
-            compile_commands,
-            sysroot_args,
-            repo_root,
-            external_roots,
-            foundation_closure,
-            seen,
-            owned_paths,
-        )
-        structural_violations.extend(foundation_source_violations)
-        findings += foundation_source_findings
+        base_closures = {
+            "domain": domain_source_closure,
+            "foundation": foundation_closure,
+            "application": foundation_closure,
+        }
+        for target, target_policy in target_policies.items():
+            if target_policy.classification != "SCAN":
+                continue
+            target_contexts = contexts_by_target[target]
+            target_sources = sorted({context.source for context in target_contexts}, key=str)
+            for context in target_contexts:
+                if not context.output.is_relative_to(target_policy.binary_dir):
+                    raise EncoderHygieneError(
+                        f"Target {target} object output escapes its CMake BINARY_DIR: "
+                        f"{context.output}"
+                    )
+                if not context.source.is_relative_to((repo_root / "src").resolve()) and not (
+                    context.source.is_relative_to(target_policy.binary_dir)
+                    or context.source.is_relative_to(target_policy.source_dir)
+                ):
+                    raise EncoderHygieneError(
+                        f"Target {target} source is neither repo-owned nor generated "
+                        f"under its exact CMake source/binary ownership: {context.source}"
+                    )
+            target_generated = autogen_by_target.get(target)
+            effective_groups: dict[str, list[Path]] = {}
+            for source in target_sources:
+                effective_policy = source_owner_policy.get(
+                    source, target_policy.policy
+                )
+                effective_groups.setdefault(effective_policy, []).append(source)
+            for effective_policy, group_sources in effective_groups.items():
+                allowed_closure = (
+                    base_closures[effective_policy]
+                    | frozenset(group_sources)
+                    | (
+                        target_generated.code_files
+                        if target_generated is not None
+                        else frozenset()
+                    )
+                )
+                target_violations, target_findings = _scan_sources(
+                    clang,
+                    idx,
+                    group_sources,
+                    compile_commands,
+                    sysroot_args,
+                    repo_root,
+                    external_roots,
+                    allowed_closure,
+                    seen,
+                    owned_paths,
+                    target=target,
+                    contexts=all_contexts,
+                )
+                structural_violations.extend(target_violations)
+                findings += target_findings
     finally:
         clang.lib.clang_disposeIndex(idx)
 
@@ -2976,7 +3586,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Dedicated Clang-toolchain build directory this script configures "
-        "and builds arkham_domain_models/arkham_foundation in (default: "
+        "and builds every registered production SCAN target in (default: "
         "<repo-root>/build-encoder-hygiene).",
     )
     parser.add_argument(
@@ -3066,7 +3676,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"Encoder hygiene: {len(findings)} public QJson-returning declaration(s) "
-        "found across the domain-model and foundation header/fragment sets, all "
+        "found across all explicitly-owned production targets, all "
         f"{len(ALLOWLIST)} allowlist entries accounted for at their exact "
         "expected occurrence count, zero violations, and every header, fragment, "
         "source target/configuration, and owned AUTOGEN unit stayed within its "

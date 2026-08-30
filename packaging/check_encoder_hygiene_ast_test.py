@@ -615,6 +615,132 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
                 self.assertEqual(violations, [])
                 self.assertEqual(findings, [])
 
+    def test_smart_pointer_output_channels_and_const_pointee_controls(self) -> None:
+        prelude = (
+            "#include <functional>\n"
+            "#include <memory>\n"
+            "#include <optional>\n"
+            "struct QJsonObject {};\n"
+            "template<class T> struct Box { T value; };\n"
+            "template<class T> struct QSharedPointer {};\n"
+            "template<class T> struct QPointer {};\n"
+            "using SharedAlias = std::shared_ptr<QJsonObject>;\n"
+        )
+        rejected = {
+            "shared value": "std::shared_ptr<QJsonObject>",
+            "shared const ref mutable pointee": "const std::shared_ptr<QJsonObject> &",
+            "nested optional shared": "std::optional<std::shared_ptr<QJsonObject>>",
+            "unique value": "std::unique_ptr<QJsonObject>",
+            "qt shared": "QSharedPointer<QJsonObject>",
+            "qt pointer const ref": "const QPointer<QJsonObject> &",
+            "alias": "SharedAlias",
+            "nested wrapper pointee": "std::shared_ptr<Box<QJsonObject>>",
+        }
+        for label, parameter in rejected.items():
+            with self.subTest(label=label):
+                header = self._write(
+                    f"smart-{label.replace(' ', '-')}.h",
+                    prelude + f"void mutate({parameter} value);\n",
+                )
+                findings, violations = self._scan_header_fixture(
+                    header, frozenset({header.resolve()})
+                )
+                self.assertEqual(violations, [])
+                self.assertEqual(len(findings), 1)
+
+        accepted = {
+            "shared const pointee": "std::shared_ptr<const QJsonObject>",
+            "shared const pointee ref": "const std::shared_ptr<const QJsonObject> &",
+            "direct optional value": "std::optional<QJsonObject>",
+        }
+        for label, parameter in accepted.items():
+            with self.subTest(label=label):
+                header = self._write(
+                    f"smart-safe-{label.replace(' ', '-')}.h",
+                    prelude + f"void consume({parameter} value);\n",
+                )
+                findings, violations = self._scan_header_fixture(
+                    header, frozenset({header.resolve()})
+                )
+                self.assertEqual(violations, [])
+                self.assertEqual(findings, [])
+
+    def test_callback_parameters_reverse_json_direction(self) -> None:
+        prelude = (
+            "#include <functional>\n"
+            "#include <memory>\n"
+            "#include <optional>\n"
+            "struct QJsonObject {};\n"
+            "struct Sink { void receive(const QJsonObject &); };\n"
+            "using CallbackAlias = void (*)(const QJsonObject &);\n"
+            "using LambdaLike = std::function<void(const QJsonObject &)>;\n"
+        )
+        rejected = {
+            "function pointer": "void (*callback)(const QJsonObject &)",
+            "std function": "std::function<void(const QJsonObject &)>",
+            "function alias": "CallbackAlias",
+            "lambda-like alias": "LambdaLike",
+            "member pointer": "void (Sink::*callback)(const QJsonObject &)",
+            "optional callback": "std::optional<std::function<void(QJsonObject)>>",
+            "immutable shared payload callback": "std::function<void(std::shared_ptr<const QJsonObject>)>",
+        }
+        for label, parameter in rejected.items():
+            with self.subTest(label=label):
+                header = self._write(
+                    f"callback-{label.replace(' ', '-')}.h",
+                    prelude + f"void publish({parameter});\n",
+                )
+                findings, violations = self._scan_header_fixture(
+                    header, frozenset({header.resolve()})
+                )
+                self.assertEqual(violations, [])
+                self.assertEqual(len(findings), 1)
+                self.assertIn(
+                    "callback output", findings[0].canonical_return_type
+                )
+
+        header = self._write(
+            "callback-safe-decoders.h",
+            prelude
+            + "void decodeWith(std::function<QJsonObject(int)> decoder);\n"
+            + "void notifyWith(std::function<void(int)> callback);\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        self.assertEqual(findings, [])
+
+    def test_qt_signal_json_payload_is_outbound_but_normal_input_is_not(self) -> None:
+        header = self._write(
+            "SignalDirection.h",
+            "struct QJsonObject {};\n"
+            "struct Publisher {\n"
+            "  __attribute__((annotate(\"qt_signal\"))) "
+            "void emitted(const QJsonObject &value);\n"
+            "  void decode(const QJsonObject &value);\n"
+            "};\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("Qt signal output", findings[0].canonical_return_type)
+
+    def test_unresolved_smart_pointer_template_fails_closed(self) -> None:
+        header = self._write(
+            "UnresolvedSmartPointer.h",
+            "#include <memory>\n"
+            "template<class T> void expose(std::shared_ptr<T> value);\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        self.assertEqual(len(findings), 1)
+        self.assertIn("unresolved output wrapper", findings[0].canonical_return_type)
+
     def test_dependent_public_and_protected_inheritance_fail_closed(self) -> None:
         header = self._write(
             "DependentInheritance.h",
@@ -904,7 +1030,13 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         return path
 
-    def _configure_and_build(self, targets: list[str], *, qt: bool = False) -> None:
+    def _configure_and_build(
+        self,
+        targets: list[str],
+        *,
+        qt: bool = False,
+        multi_config: bool = False,
+    ) -> None:
         clangxx = os.environ.get("ARKHAM_CLANGXX", "clang++")
         command = [
             "cmake",
@@ -913,11 +1045,12 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             "-B",
             str(self.build),
             "-G",
-            "Ninja",
+            "Ninja Multi-Config" if multi_config else "Ninja",
             f"-DCMAKE_CXX_COMPILER={clangxx}",
-            "-DCMAKE_BUILD_TYPE=Debug",
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         ]
+        if not multi_config:
+            command.append("-DCMAKE_BUILD_TYPE=Debug")
         ninja = shutil.which("ninja")
         if ninja is None and shutil.which("mise"):
             ninja = subprocess.check_output(
@@ -938,7 +1071,14 @@ class ProductionCMakeSeamTests(unittest.TestCase):
                 command, check=True, cwd=self.root, capture_output=True, text=True
             )
             subprocess.run(
-                ["cmake", "--build", str(self.build), "--target", *targets],
+                [
+                    "cmake",
+                    "--build",
+                    str(self.build),
+                    *(["--config", "Debug"] if multi_config else []),
+                    "--target",
+                    *targets,
+                ],
                 check=True,
                 cwd=self.root,
                 capture_output=True,
@@ -956,12 +1096,15 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             'file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")\n'
             'file(WRITE "${CMAKE_BINARY_DIR}/generated/external_roots.txt" "")\n'
             'file(WRITE "${CMAKE_BINARY_DIR}/generated/autogen_targets.txt" "")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/generated/target_policy.txt" "")\n'
             'file(WRITE "${CMAKE_BINARY_DIR}/generated/domain_fragments.txt" "")\n'
             'file(WRITE "${CMAKE_BINARY_DIR}/generated/foundation_fragments.txt" "")\n'
         )
 
     def _register_manifests(self, domain: str, foundation: str, *, automoc: bool = False) -> str:
         text = (
+            f'arkham_append_encoder_hygiene_target(TARGET {domain} CLASSIFICATION SCAN POLICY domain OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/target_policy.txt")\n'
+            f'arkham_append_encoder_hygiene_target(TARGET {foundation} CLASSIFICATION SCAN POLICY foundation OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/target_policy.txt")\n'
             f'cmake_language(DEFER CALL arkham_write_target_header_set_manifest TARGET {domain} OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/domain_headers.txt")\n'
             f'cmake_language(DEFER CALL arkham_write_target_source_manifest TARGET {domain} OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/domain_sources.txt")\n'
             f'cmake_language(DEFER CALL arkham_write_target_header_set_manifest TARGET {foundation} OUTPUT_FILE "${{CMAKE_BINARY_DIR}}/generated/foundation_headers.txt")\n'
@@ -1004,6 +1147,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_library(consumer STATIC src/domain/Shared.cpp)\n"
             'target_include_directories(consumer PRIVATE "${CMAKE_SOURCE_DIR}/src/domain")\n'
             "target_compile_definitions(consumer PRIVATE CONSUMER_ENCODER)\n"
+            'arkham_append_encoder_hygiene_target(TARGET consumer CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + self._register_manifests("domain", "foundation")
         )
         self._write("CMakeLists.txt", cmake)
@@ -1047,6 +1191,146 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         with self.assertRaisesRegex(ceh.EncoderHygieneError, "owned file"):
             ceh.run_check(self.root, self.build, skip_configure=True)
 
+    def test_application_main_macro_and_generated_tus_are_scanned(self) -> None:
+        self._write("src/domain/Domain.h", "#pragma once\n")
+        self._write("src/domain/Domain.cpp", "int domainValue = 0;\n")
+        self._write("src/Foundation.h", "#pragma once\n")
+        self._write("src/Foundation.cpp", "int foundationValue = 0;\n")
+        self._write(
+            "src/main.cpp",
+            "struct QJsonObject {};\n"
+            "QJsonObject appSourceEncoder() { return {}; }\n"
+            "#ifdef APP_CONTEXT_ENCODER\n"
+            "QJsonObject macroAppEncoder() { return {}; }\n"
+            "#endif\n"
+            "int main() { return 0; }\n",
+        )
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(ApplicationInventory CXX)\n"
+            + self._manifest_prelude()
+            + "add_library(domain STATIC src/domain/Domain.cpp)\n"
+            'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h")\n'
+            + "add_library(foundation STATIC src/Foundation.cpp)\n"
+            'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
+            + 'file(WRITE "${CMAKE_BINARY_DIR}/GeneratedApp.cpp" "struct QJsonObject {}; QJsonObject generatedAppEncoder() { return {}; }\\n")\n'
+            + 'add_executable(app src/main.cpp "${CMAKE_BINARY_DIR}/GeneratedApp.cpp")\n'
+            + "target_compile_definitions(app PRIVATE APP_CONTEXT_ENCODER)\n"
+            + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + self._register_manifests("domain", "foundation")
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(["domain", "foundation", "app"])
+        findings = ceh.run_check(self.root, self.build, skip_configure=True)
+        self.assertEqual(
+            {finding.display_name for finding in findings},
+            {
+                "appSourceEncoder()",
+                "macroAppEncoder()",
+                "generatedAppEncoder()",
+            },
+        )
+
+    def test_unknown_compile_target_fails_reverse_inventory(self) -> None:
+        self._write("src/domain/Domain.h", "#pragma once\n")
+        self._write("src/domain/Domain.cpp", "int domainValue = 0;\n")
+        self._write("src/Foundation.h", "#pragma once\n")
+        self._write("src/Foundation.cpp", "int foundationValue = 0;\n")
+        self._write("tests/UnownedTest.cpp", "int rogueValue = 0;\n")
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(UnknownTarget CXX)\n"
+            + self._manifest_prelude()
+            + "add_library(domain STATIC src/domain/Domain.cpp)\n"
+            'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h")\n'
+            + "add_library(foundation STATIC src/Foundation.cpp)\n"
+            'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
+            + "add_library(apparently_test STATIC tests/UnownedTest.cpp)\n"
+            + self._register_manifests("domain", "foundation")
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(["domain", "foundation", "apparently_test"])
+        with self.assertRaisesRegex(
+            ceh.EncoderHygieneError,
+            "unowned compile-command target: apparently_test",
+        ):
+            ceh.run_check(self.root, self.build, skip_configure=True)
+
+    def test_test_trycompile_and_external_targets_need_explicit_metadata(self) -> None:
+        self._write("src/domain/Domain.h", "#pragma once\n")
+        self._write("src/domain/Domain.cpp", "int domainValue = 0;\n")
+        self._write("src/Foundation.h", "#pragma once\n")
+        self._write("src/Foundation.cpp", "int foundationValue = 0;\n")
+        self._write(
+            "tests/TestOnly.cpp",
+            "struct QJsonObject {}; QJsonObject testOnlyEncoder() { return {}; }\n",
+        )
+        self._write(
+            "checks/TryOnly.cpp",
+            "struct QJsonObject {}; QJsonObject tryOnlyEncoder() { return {}; }\n",
+        )
+        self._write(
+            "external/External.cpp",
+            "struct QJsonObject {}; QJsonObject dependencyEncoder() { return {}; }\n",
+        )
+        self._write(
+            "external/CMakeLists.txt",
+            "add_library(external_dep STATIC External.cpp)\n",
+        )
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(ExplicitExclusions CXX)\n"
+            + self._manifest_prelude()
+            + 'file(WRITE "${CMAKE_BINARY_DIR}/generated/external_roots.txt" "${CMAKE_SOURCE_DIR}/external\\n${CMAKE_BINARY_DIR}/external\\n")\n'
+            + "add_library(domain STATIC src/domain/Domain.cpp)\n"
+            'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h")\n'
+            + "add_library(foundation STATIC src/Foundation.cpp)\n"
+            'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
+            + "add_library(test_only STATIC tests/TestOnly.cpp)\n"
+            + "add_library(try_only STATIC checks/TryOnly.cpp)\n"
+            + "add_subdirectory(external)\n"
+            + 'arkham_append_encoder_hygiene_target(TARGET test_only CLASSIFICATION TEST OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET try_only CLASSIFICATION TRY_COMPILE OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET external_dep CLASSIFICATION EXTERNAL OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + self._register_manifests("domain", "foundation")
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(
+            ["domain", "foundation", "test_only", "try_only", "external_dep"]
+        )
+        self.assertEqual(
+            ceh.run_check(self.root, self.build, skip_configure=True), []
+        )
+
+    def test_source_local_moc_uses_exact_built_configuration_paths(self) -> None:
+        self._write(
+            "src/domain/Source.cpp",
+            "#include <QObject>\n"
+            "class MultiConfigObject : public QObject {\n"
+            "  Q_OBJECT\n"
+            "};\n"
+            '#include "Source.moc"\n',
+        )
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(MultiConfigSourceMoc CXX)\n"
+            "find_package(Qt6 REQUIRED COMPONENTS Core)\n"
+            "set(CMAKE_AUTOMOC ON)\n"
+            + self._manifest_prelude()
+            + "add_library(domain STATIC src/domain/Source.cpp)\n"
+            + "target_link_libraries(domain PUBLIC Qt6::Core)\n"
+            + 'cmake_language(DEFER CALL arkham_append_target_autogen_manifest TARGET domain POLICY domain OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/autogen_targets.txt")\n'
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(
+            ["domain"], qt=True, multi_config=True
+        )
+        closures = ceh._load_autogen_closures(self.build)
+        self.assertEqual(len(closures["domain"]), 1)
+        source_mocs = dict(closures["domain"][0].source_moc_owners)
+        self.assertEqual(len(source_mocs), 1)
+        self.assertIn("include_Debug", str(next(iter(source_mocs))))
+
     def test_owned_autogen_is_exact_and_genuine_moc_still_passes(self) -> None:
         self._write(
             "src/domain/Domain.h",
@@ -1056,7 +1340,15 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             "  Q_OBJECT\n"
             "};\n",
         )
-        self._write("src/domain/Domain.cpp", '#include "Domain.h"\n')
+        domain_source = self._write(
+            "src/domain/Domain.cpp",
+            '#include "Domain.h"\n'
+            "#include <QObject>\n"
+            "class SourceLocalObject : public QObject {\n"
+            "  Q_OBJECT\n"
+            "};\n"
+            '#include "Domain.moc"\n',
+        )
         self._write("src/Foundation.h", "#pragma once\n")
         self._write("src/Foundation.cpp", '#include "Foundation.h"\n')
         cmake = (
@@ -1078,6 +1370,42 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         self.assertEqual(ceh.run_check(self.root, self.build, skip_configure=True), [])
 
         autogen = self.build / "domain_autogen"
+        source_moc = autogen / "include" / "Domain.moc"
+        self.assertTrue(source_moc.is_file())
+        self.assertNotIn(
+            "Domain.moc",
+            (autogen / "mocs_compilation.cpp").read_text(encoding="utf-8"),
+        )
+        source_moc_bytes = source_moc.read_bytes()
+        source_moc.unlink()
+        with self.assertRaisesRegex(ceh.EncoderHygieneError, "missing generated"):
+            ceh.run_check(self.root, self.build, skip_configure=True)
+        source_moc.write_bytes(source_moc_bytes)
+
+        autogen_info = self.build / "CMakeFiles/domain_autogen.dir/AutogenInfo.json"
+        metadata = json.loads(autogen_info.read_text(encoding="utf-8"))
+        malformed = dict(metadata)
+        malformed["SOURCES"] = [["malformed"]]
+        autogen_info.write_text(json.dumps(malformed), encoding="utf-8")
+        with self.assertRaisesRegex(ceh.EncoderHygieneError, "Malformed SOURCES"):
+            ceh.run_check(self.root, self.build, skip_configure=True)
+        autogen_info.write_text(json.dumps(metadata), encoding="utf-8")
+
+        with domain_source.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "\n#include <QJsonObject>\n"
+                "QJsonObject sourceLocalAdjacentEncoder() { return {}; }\n"
+            )
+        adjacent_findings = ceh.run_check(
+            self.root, self.build, skip_configure=True
+        )
+        self.assertTrue(
+            any(
+                "sourceLocalAdjacentEncoder" in finding.display_name
+                for finding in adjacent_findings
+            )
+        )
+
         moc = next(path for path in autogen.rglob("moc_Domain.cpp"))
         with moc.open("a", encoding="utf-8") as stream:
             stream.write(
@@ -1089,7 +1417,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             any("generatedWrapperEncoder" in finding.display_name for finding in findings)
         )
 
-        (autogen / "Lossy.h").write_text(
+        (autogen / "include" / "Rogue.moc").write_text(
             "struct QJsonObject {}; QJsonObject hiddenEncoder();\n",
             encoding="utf-8",
         )

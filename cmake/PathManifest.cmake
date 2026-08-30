@@ -382,26 +382,45 @@ function(arkham_write_target_source_manifest)
     unset(_arkham_tsm_own_sources)
     unset(_arkham_tsm_interface_sources)
 
-    # FILE_SET-registered headers do NOT appear in a target's plain
-    # SOURCES property (a separate CMake property/concept entirely) --
-    # this list is exactly the ordinary (non-FILE_SET) sources passed to
-    # add_library()/target_sources(), i.e. real .cpp translation units,
-    # each SOURCE_DIR-relative (never absolute) as CMake itself stores
-    # them for a target defined via add_library(... ${SOURCES_VAR}) in
-    # this same directory scope.
-    set(_arkham_tsm_lines "")
+    # PUBLIC sources occur in both SOURCES and INTERFACE_SOURCES. Resolve
+    # every entry to one normalized physical path and deduplicate that
+    # combined universe before writing; target/config command ownership
+    # remains separate in target_policy.txt/compile_commands.json.
+    set(_arkham_tsm_normalized_sources "")
     foreach(_arkham_tsm_path IN LISTS _arkham_tsm_sources)
+        if(_arkham_tsm_path MATCHES "\\$<")
+            message(FATAL_ERROR
+                "arkham_write_target_source_manifest: generator-expression source "
+                "'${_arkham_tsm_path}' cannot be assigned one fail-closed physical identity")
+        endif()
         cmake_path(IS_RELATIVE _arkham_tsm_path _arkham_tsm_is_relative)
         if(_arkham_tsm_is_relative)
-            string(APPEND _arkham_tsm_lines "${_arkham_tsm_source_dir}/${_arkham_tsm_path}\n")
+            cmake_path(ABSOLUTE_PATH _arkham_tsm_path
+                BASE_DIRECTORY "${_arkham_tsm_source_dir}"
+                NORMALIZE
+                OUTPUT_VARIABLE _arkham_tsm_absolute)
         else()
-            string(APPEND _arkham_tsm_lines "${_arkham_tsm_path}\n")
+            cmake_path(NORMAL_PATH _arkham_tsm_path
+                OUTPUT_VARIABLE _arkham_tsm_absolute)
         endif()
+        file(REAL_PATH "${_arkham_tsm_absolute}" _arkham_tsm_real)
+        list(APPEND _arkham_tsm_normalized_sources "${_arkham_tsm_real}")
     endforeach()
     unset(_arkham_tsm_path)
     unset(_arkham_tsm_is_relative)
+    unset(_arkham_tsm_absolute)
+    unset(_arkham_tsm_real)
     unset(_arkham_tsm_sources)
     unset(_arkham_tsm_source_dir)
+    list(REMOVE_DUPLICATES _arkham_tsm_normalized_sources)
+    list(SORT _arkham_tsm_normalized_sources)
+
+    set(_arkham_tsm_lines "")
+    foreach(_arkham_tsm_path IN LISTS _arkham_tsm_normalized_sources)
+        string(APPEND _arkham_tsm_lines "${_arkham_tsm_path}\n")
+    endforeach()
+    unset(_arkham_tsm_path)
+    unset(_arkham_tsm_normalized_sources)
 
     # AUTOMOC's own generated aggregation translation unit is compiled as
     # part of this target (see the doc comment above this function) but
@@ -440,8 +459,8 @@ function(arkham_append_target_autogen_manifest)
     if(NOT ARG_TARGET)
         message(FATAL_ERROR "arkham_append_target_autogen_manifest: TARGET is required")
     endif()
-    if(NOT ARG_POLICY MATCHES "^(domain|foundation)$")
-        message(FATAL_ERROR "arkham_append_target_autogen_manifest: POLICY must be domain or foundation")
+    if(NOT ARG_POLICY MATCHES "^(domain|foundation|application)$")
+        message(FATAL_ERROR "arkham_append_target_autogen_manifest: POLICY must be domain, foundation, or application")
     endif()
     if(NOT ARG_OUTPUT_FILE)
         message(FATAL_ERROR "arkham_append_target_autogen_manifest: OUTPUT_FILE is required")
@@ -463,4 +482,39 @@ function(arkham_append_target_autogen_manifest)
         unset(_arkham_tam_autogen_dir)
     endif()
     unset(_arkham_tam_automoc)
+endfunction()
+
+# Record every target that may contribute a compile_commands.json entry.
+# SCAN targets receive a domain/foundation/application closure; EXTERNAL,
+# TEST, and TRY_COMPILE exclusions are exact target metadata, never
+# inferred from a path or target-name pattern.
+function(arkham_append_encoder_hygiene_target)
+    set(oneValueArgs TARGET CLASSIFICATION POLICY OUTPUT_FILE)
+    cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
+
+    if(NOT ARG_TARGET OR NOT TARGET ${ARG_TARGET})
+        message(FATAL_ERROR "arkham_append_encoder_hygiene_target: TARGET must name an existing target")
+    endif()
+    if(NOT ARG_CLASSIFICATION MATCHES "^(SCAN|EXTERNAL|TEST|TRY_COMPILE)$")
+        message(FATAL_ERROR "arkham_append_encoder_hygiene_target: invalid CLASSIFICATION '${ARG_CLASSIFICATION}'")
+    endif()
+    if(ARG_CLASSIFICATION STREQUAL "SCAN")
+        if(NOT ARG_POLICY MATCHES "^(domain|foundation|application)$")
+            message(FATAL_ERROR "arkham_append_encoder_hygiene_target: SCAN requires domain, foundation, or application POLICY")
+        endif()
+    elseif(ARG_POLICY)
+        message(FATAL_ERROR "arkham_append_encoder_hygiene_target: excluded targets must not specify POLICY")
+    endif()
+    if(NOT ARG_OUTPUT_FILE)
+        message(FATAL_ERROR "arkham_append_encoder_hygiene_target: OUTPUT_FILE is required")
+    endif()
+
+    get_target_property(_arkham_eht_type ${ARG_TARGET} TYPE)
+    get_target_property(_arkham_eht_source_dir ${ARG_TARGET} SOURCE_DIR)
+    get_target_property(_arkham_eht_binary_dir ${ARG_TARGET} BINARY_DIR)
+    file(APPEND "${ARG_OUTPUT_FILE}"
+        "${ARG_CLASSIFICATION}\t${ARG_POLICY}\t${ARG_TARGET}\t${_arkham_eht_type}\t${_arkham_eht_source_dir}\t${_arkham_eht_binary_dir}\n")
+    unset(_arkham_eht_type)
+    unset(_arkham_eht_source_dir)
+    unset(_arkham_eht_binary_dir)
 endfunction()

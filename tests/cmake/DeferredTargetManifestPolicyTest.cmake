@@ -115,6 +115,7 @@ file(WRITE "${ARKHAM_SCRATCH_DIR}/headers3/C.h" "// scratch header, not part of 
 file(WRITE "${ARKHAM_SCRATCH_DIR}/dummy.cpp" "int arkham_deferred_manifest_probe_dummy() { return 0; }\n")
 file(WRITE "${ARKHAM_SCRATCH_DIR}/dummy2.cpp" "int arkham_deferred_manifest_probe_dummy2() { return 1; }\n")
 file(WRITE "${ARKHAM_SCRATCH_DIR}/dummy3.cpp" "int arkham_deferred_manifest_probe_dummy3() { return 2; }\n")
+file(WRITE "${ARKHAM_SCRATCH_DIR}/public.cpp" "int arkham_deferred_manifest_probe_public() { return 3; }\n")
 
 file(WRITE "${ARKHAM_SCRATCH_DIR}/CMakeLists.txt" [=[
 cmake_minimum_required(VERSION 3.25)
@@ -162,6 +163,7 @@ target_sources(probe_target PUBLIC
     FILES "${CMAKE_CURRENT_SOURCE_DIR}/headers2/B.h"
 )
 target_sources(probe_target PRIVATE dummy2.cpp)
+target_sources(probe_target PUBLIC public.cpp)
 
 # --- INTERFACE-visibility FILE_SET/source: proves both that
 # INTERFACE_HEADER_SETS/INTERFACE_SOURCES are unioned in at all, and
@@ -340,15 +342,16 @@ endif()
 message(STATUS "Case 3 (immediate source manifest correctly omits the later-registered dummy2.cpp) passed.")
 
 # --- Case 4 (pass-after, sources): the deferred source manifest must
-# contain dummy.cpp, dummy2.cpp (plain SOURCES), AND dummy3.cpp
-# (INTERFACE_SOURCES). ---
-list(FILTER _sources_deferred INCLUDE REGEX "/dummy\\.cpp$|dummy2\\.cpp$|dummy3\\.cpp$")
+# contain dummy.cpp, dummy2.cpp, dummy3.cpp, and PUBLIC public.cpp
+# exactly once even though CMake places PUBLIC sources in both
+# SOURCES and INTERFACE_SOURCES. ---
+list(FILTER _sources_deferred INCLUDE REGEX "/dummy\\.cpp$|dummy2\\.cpp$|dummy3\\.cpp$|public\\.cpp$")
 list(LENGTH _sources_deferred _sources_deferred_count)
-if(NOT _sources_deferred_count EQUAL 3)
+if(NOT _sources_deferred_count EQUAL 4)
     message(FATAL_ERROR
-        "Case 4 (deferred source manifest) expected exactly dummy.cpp, dummy2.cpp, and dummy3.cpp (3 entries) but found ${_sources_deferred_count}: ${_sources_deferred}")
+        "Case 4 (deferred source manifest) expected exactly dummy.cpp, dummy2.cpp, dummy3.cpp, and one public.cpp (4 entries) but found ${_sources_deferred_count}: ${_sources_deferred}")
 endif()
-message(STATUS "Case 4 (deferred source manifest correctly contains dummy.cpp, dummy2.cpp, and dummy3.cpp) passed.")
+message(STATUS "Case 4 (deferred source manifest contains private/interface/public sources with PUBLIC deduplicated) passed.")
 
 # --- InterfaceHeaderSetIsIncludedInManifestTest: Case 5 (fail-before)
 # proves the historical "assumed INTERFACE_HEADER_SET_<name> property"
