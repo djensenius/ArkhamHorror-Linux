@@ -147,6 +147,24 @@ private slots:
   // literal on reparse.
   void toJsonBytesPreservesNumericPrecisionInUnconstrainedFieldsOnEncode();
   void toJsonBytesPreservesUnknownTaggedUnionPrecisionOnEncode();
+  // "Stop whack-a-mole" cumulative review item 1: SkillIcon/CardCost/
+  // GameValue/CardDef::toJson() now compose a complete toRawJson() AST
+  // and convert exactly ONCE via Value::toExactQJsonObject() (never the
+  // old lossy Value::toQJson(), now renamed/privatized
+  // toLossyQJsonForTestingOnly()), so a non-qint64-exact number, a
+  // duplicate key, or a nested Undefined anywhere inside an unknown tag's
+  // raw contents (or CardDef's unconstrained meta field) must now make
+  // the QJsonObject-typed toJson() itself fail -- not merely toJsonBytes()
+  // above, which was already proven lossless. Only SkillIcon gets the
+  // duplicate-key/Undefined pair directly (CardCost/GameValue/CardDef
+  // share the exact same Value::toExactQJsonObject() primitive, already
+  // exercised for those two shapes by RawJsonTests.cpp).
+  void skillIconToJsonRejectsHugeExponentInUnknownTagContents();
+  void skillIconToJsonRejectsDuplicateKeyInUnknownTagContents();
+  void skillIconToJsonRejectsNestedUndefinedInUnknownTagContents();
+  void cardCostToJsonRejectsHugeExponentInUnknownTagContents();
+  void gameValueToJsonRejectsHugeExponentInUnknownTagContents();
+  void cardDefToJsonRejectsHugeExponentInMetaField();
 
   // Round-9 item 6: encodeClosedEnum() now returns a typed failure rather
   // than Q_UNREACHABLE_RETURN when given an enum value fabricated via
@@ -550,7 +568,10 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     const auto result = CardCost::fromJson(obj, u"cost");
     if (!result)
       QFAIL(qPrintable(result.error()));
-    QCOMPARE(result->toJson(), obj);
+    const auto encoded = result->toJson();
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    QCOMPARE(*encoded, obj);
   }
 
   // MaxDynamicCost/AnyMatchingCardCost preserve their raw payload verbatim.
@@ -564,7 +585,10 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     const auto result = CardCost::fromJson(obj, u"cost");
     if (!result)
       QFAIL(qPrintable(result.error()));
-    QCOMPARE(result->toJson(), obj);
+    const auto encoded = result->toJson();
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    QCOMPARE(*encoded, obj);
   }
 
   const QJsonArray matchingEnemyFieldContents{
@@ -579,7 +603,10 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
     QFAIL(qPrintable(matchingEnemyFieldResult.error()));
   QVERIFY(matchingEnemyFieldResult->rawContents() ==
           toRawJson(QJsonValue(matchingEnemyFieldContents)));
-  QCOMPARE(matchingEnemyFieldResult->toJson(), matchingEnemyFieldObj);
+  const auto matchingEnemyFieldEncoded = matchingEnemyFieldResult->toJson();
+  if (!matchingEnemyFieldEncoded)
+    QFAIL(qPrintable(matchingEnemyFieldEncoded.error()));
+  QCOMPARE(*matchingEnemyFieldEncoded, matchingEnemyFieldObj);
 
   const QJsonObject staticObj{
       {QStringLiteral("tag"), QStringLiteral("StaticCost")},
@@ -588,7 +615,10 @@ void CardCatalogTests::allCardCostVariantsRoundTrip() {
   if (!staticResult)
     QFAIL(qPrintable(staticResult.error()));
   QCOMPARE(*staticResult->staticAmount(), qint64(5));
-  QCOMPARE(staticResult->toJson(), staticObj);
+  const auto staticEncoded = staticResult->toJson();
+  if (!staticEncoded)
+    QFAIL(qPrintable(staticEncoded.error()));
+  QCOMPARE(*staticEncoded, staticObj);
 }
 
 void CardCatalogTests::allGameValueVariantsRoundTrip() {
@@ -597,7 +627,10 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r1 = GameValue::fromJson(staticObj, u"gv");
   if (!r1)
     QFAIL(qPrintable(r1.error()));
-  QCOMPARE(r1->toJson(), staticObj);
+  auto r1Encoded = r1->toJson();
+  if (!r1Encoded)
+    QFAIL(qPrintable(r1Encoded.error()));
+  QCOMPARE(*r1Encoded, staticObj);
 
   const QJsonObject perPlayerObj{
       {QStringLiteral("tag"), QStringLiteral("PerPlayer")},
@@ -605,7 +638,10 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   auto r2 = GameValue::fromJson(perPlayerObj, u"gv");
   if (!r2)
     QFAIL(qPrintable(r2.error()));
-  QCOMPARE(r2->toJson(), perPlayerObj);
+  auto r2Encoded = r2->toJson();
+  if (!r2Encoded)
+    QFAIL(qPrintable(r2Encoded.error()));
+  QCOMPARE(*r2Encoded, perPlayerObj);
 
   const QJsonObject staticWithPerPlayerObj{
       {QStringLiteral("tag"), QStringLiteral("StaticWithPerPlayer")},
@@ -614,7 +650,10 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
   if (!r3)
     QFAIL(qPrintable(r3.error()));
   QCOMPARE(r3->contents(), (QList<qint64>{qint64(3), qint64(1)}));
-  QCOMPARE(r3->toJson(), staticWithPerPlayerObj);
+  auto r3Encoded = r3->toJson();
+  if (!r3Encoded)
+    QFAIL(qPrintable(r3Encoded.error()));
+  QCOMPARE(*r3Encoded, staticWithPerPlayerObj);
 
   const QJsonObject byPlayerCountObj{
       {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
@@ -624,14 +663,20 @@ void CardCatalogTests::allGameValueVariantsRoundTrip() {
     QFAIL(qPrintable(r4.error()));
   QCOMPARE(r4->contents(),
            (QList<qint64>{qint64(2), qint64(3), qint64(4), qint64(5)}));
-  QCOMPARE(r4->toJson(), byPlayerCountObj);
+  auto r4Encoded = r4->toJson();
+  if (!r4Encoded)
+    QFAIL(qPrintable(r4Encoded.error()));
+  QCOMPARE(*r4Encoded, byPlayerCountObj);
 
   for (const auto &tag : {"ValueX"_L1, "ValueStar"_L1, "ValueUnknown"_L1}) {
     const QJsonObject obj{{QStringLiteral("tag"), QString(tag)}};
     auto r = GameValue::fromJson(obj, u"gv");
     if (!r)
       QFAIL(qPrintable(r.error()));
-    QCOMPARE(r->toJson(), obj);
+    auto encoded = r->toJson();
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    QCOMPARE(*encoded, obj);
   }
 
   const QJsonObject badStaticWithPerPlayerCount{
@@ -664,7 +709,10 @@ void CardCatalogTests::
   const QJsonObject expected{
       {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
       {QStringLiteral("contents"), QJsonArray{10, 20, 30, 40}}};
-  QCOMPARE(value.toJson(), expected);
+  auto encoded = value.toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, expected);
 }
 
 void CardCatalogTests::allSkillIconVariantsRoundTrip() {
@@ -718,7 +766,10 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
   QCOMPARE(result->tag(), CardCostTag::Unknown);
   QVERIFY(!result->staticAmount().has_value());
   QVERIFY(result->unknownRaw() == toRawJson(withContents));
-  QCOMPARE(result->toJson(), withContents);
+  const auto withContentsEncoded = result->toJson();
+  if (!withContentsEncoded)
+    QFAIL(qPrintable(withContentsEncoded.error()));
+  QCOMPARE(*withContentsEncoded, withContents);
 
   const QJsonObject withoutContents{
       {QStringLiteral("tag"), QStringLiteral("AnotherFutureCostTag")}};
@@ -727,7 +778,10 @@ void CardCatalogTests::unrecognizedCardCostTagPreservedNotRejected() {
     QFAIL(qPrintable(result2.error()));
   QCOMPARE(result2->tag(), CardCostTag::Unknown);
   QVERIFY(result2->unknownRaw() == toRawJson(withoutContents));
-  QCOMPARE(result2->toJson(), withoutContents);
+  const auto withoutContentsEncoded = result2->toJson();
+  if (!withoutContentsEncoded)
+    QFAIL(qPrintable(withoutContentsEncoded.error()));
+  QCOMPARE(*withoutContentsEncoded, withoutContents);
 
   // There is no public factory that lets calling code fabricate an
   // Unknown-kind CardCost directly.
@@ -745,7 +799,10 @@ void CardCatalogTests::unrecognizedGameValueTagPreservedNotRejected() {
   // "ValueUnknown".
   QVERIFY(result->tag() != GameValueTag::ValueUnknown);
   QVERIFY(result->unknownRaw() == toRawJson(obj));
-  QCOMPARE(result->toJson(), obj);
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void CardCatalogTests::unrecognizedSkillIconTagPreservedNotRejected() {
@@ -936,7 +993,10 @@ void CardCatalogTests::missingContentsRejectedForRawPayloadCardCostTags() {
     if (!nullResult)
       QFAIL(qPrintable(nullResult.error()));
     QVERIFY(nullResult->rawContents().isNull());
-    QCOMPARE(nullResult->toJson(), nullContents);
+    const auto nullEncoded = nullResult->toJson();
+    if (!nullEncoded)
+      QFAIL(qPrintable(nullEncoded.error()));
+    QCOMPARE(*nullEncoded, nullContents);
   }
 
   // MatchingEnemyFieldCost has a real fixed-arity wire shape, so null is
@@ -997,8 +1057,11 @@ void CardCatalogTests::rawPayloadCardCostFactoriesValidateContents() {
   QCOMPARE(matchingEnemyFieldCost->tag(), CardCostTag::MatchingEnemyFieldCost);
   QVERIFY(matchingEnemyFieldCost->rawContents() ==
           validMatchingEnemyFieldContents);
+  const auto matchingEnemyFieldCostEncoded = matchingEnemyFieldCost->toJson();
+  if (!matchingEnemyFieldCostEncoded)
+    QFAIL(qPrintable(matchingEnemyFieldCostEncoded.error()));
   QCOMPARE(
-      matchingEnemyFieldCost->toJson(),
+      *matchingEnemyFieldCostEncoded,
       (QJsonObject{
           {QStringLiteral("tag"), QStringLiteral("MatchingEnemyFieldCost")},
           {QStringLiteral("contents"), validMatchingEnemyFieldContentsQJson},
@@ -1733,6 +1796,112 @@ void CardCatalogTests::
       QStringLiteral("9007199254740993"));
 }
 
+void CardCatalogTests::
+    skillIconToJsonRejectsHugeExponentInUnknownTagContents() {
+  // "Stop whack-a-mole" cumulative review item 1: SkillIcon::toJson() now
+  // composes toRawJson() and converts exactly once via
+  // Value::toExactQJsonObject(), so a huge-exponent literal (no exact
+  // double representation) nested inside an unrecognized tag's contents
+  // must now make the QJsonObject-typed toJson() fail outright -- the old
+  // Value::toQJson() (now private/test-only toLossyQJsonForTestingOnly())
+  // would have silently rounded it instead.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"tag\":\"SomeFutureIcon\",\"contents\":{\"scale\":1e300}}");
+  const auto decoded =
+      SkillIcon::fromRawJson(*Json::Value::parse(bytes, u"skill"), u"skill");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  QCOMPARE(decoded->tag(), SkillIconTag::Unknown);
+  const auto encoded = decoded->toJson();
+  QVERIFY(!encoded.has_value());
+}
+
+void CardCatalogTests::
+    skillIconToJsonRejectsDuplicateKeyInUnknownTagContents() {
+  // Value::makeObject() (unlike Value::parse()) can transiently hold a
+  // duplicate key, so a hand-built unknown-tag payload -- never reachable
+  // via fromRawBytes()'s parse-first entry point, but reachable through
+  // fromRawJson() given an already-constructed AST -- must still be
+  // rejected by toJson()'s exact conversion, not silently collapsed to
+  // whichever occurrence QJsonObject::insert() happens to keep.
+  const Json::Value raw = Json::Value::makeObject(
+      {{QStringLiteral("tag"),
+        Json::Value::makeString(QStringLiteral("SomeFutureIcon"))},
+       {QStringLiteral("contents"),
+        Json::Value::makeObject(
+            {{QStringLiteral("dup"), Json::Value::makeBool(true)},
+             {QStringLiteral("dup"), Json::Value::makeBool(false)}})}});
+  const auto decoded = SkillIcon::fromRawJson(raw, u"skill");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  const auto encoded = decoded->toJson();
+  QVERIFY(!encoded.has_value());
+}
+
+void CardCatalogTests::
+    skillIconToJsonRejectsNestedUndefinedInUnknownTagContents() {
+  // Same rationale as the duplicate-key case immediately above, for a
+  // nested Kind::Undefined member (decode never produces one, but a
+  // caller can build this AST directly via makeObject()/the default
+  // Value{} constructor).
+  const Json::Value raw = Json::Value::makeObject(
+      {{QStringLiteral("tag"),
+        Json::Value::makeString(QStringLiteral("SomeFutureIcon"))},
+       {QStringLiteral("contents"),
+        Json::Value::makeObject(
+            {{QStringLiteral("present"), Json::Value::makeBool(true)},
+             {QStringLiteral("vanishes"), Json::Value{}}})}});
+  const auto decoded = SkillIcon::fromRawJson(raw, u"skill");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  const auto encoded = decoded->toJson();
+  QVERIFY(!encoded.has_value());
+}
+
+void CardCatalogTests::cardCostToJsonRejectsHugeExponentInUnknownTagContents() {
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"tag\":\"FutureCost\",\"contents\":{\"scale\":1e300}}");
+  const auto decoded =
+      CardCost::fromRawJson(*Json::Value::parse(bytes, u"cost"), u"cost");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  const auto encoded = decoded->toJson();
+  QVERIFY(!encoded.has_value());
+}
+
+void CardCatalogTests::
+    gameValueToJsonRejectsHugeExponentInUnknownTagContents() {
+  const QByteArray bytes =
+      QByteArrayLiteral("{\"tag\":\"FutureValue\",\"contents\":[1e300]}");
+  const auto decoded =
+      GameValue::fromRawJson(*Json::Value::parse(bytes, u"gv"), u"gv");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  const auto encoded = decoded->toJson();
+  QVERIFY(!encoded.has_value());
+}
+
+void CardCatalogTests::cardDefToJsonRejectsHugeExponentInMetaField() {
+  // Companion to rawBytesPreserveNumericPrecisionInUnconstrainedFields()
+  // above, which only proves the DECODE side keeps this literal exact:
+  // CardDef::toJson() now composes toRawJson() and converts exactly once
+  // via Value::toExactQJsonObject(), so re-encoding the very same
+  // decoded CardDef must now fail outright rather than silently round
+  // meta.hugeExponent through the old lossy adapter.
+  const QByteArray bytes = R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1",
+    "meta": {"hugeExponent": 1e300}
+  })";
+  const auto result = CardDef::fromRawBytes(bytes, u"card");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  const auto encoded = result->toJson();
+  QVERIFY(!encoded.has_value());
+}
+
 void CardCatalogTests::skillTypeFactoryRejectsOutOfRangeEnumValue() {
   // SkillIcon has a private constructor: skillType() is the only way to
   // populate m_skill, so it alone must reject a static_cast fabricated
@@ -1932,7 +2101,10 @@ void CardCatalogTests::
   const QJsonObject expected{
       {QStringLiteral("tag"), QStringLiteral("ByPlayerCount")},
       {QStringLiteral("contents"), QJsonArray{10, 20, 30, 40}}};
-  QCOMPARE(source.toJson(), expected);
+  auto sourceEncoded = source.toJson();
+  if (!sourceEncoded)
+    QFAIL(qPrintable(sourceEncoded.error()));
+  QCOMPARE(*sourceEncoded, expected);
 }
 
 void CardCatalogTests::
@@ -1996,7 +2168,10 @@ void CardCatalogTests::cardCostUnknownTagMoveConstructLeavesSourceRawIntact() {
   // original raw object.
   QCOMPARE(source.tag(), CardCostTag::Unknown);
   QVERIFY(source.unknownRaw() == toRawJson(obj));
-  QCOMPARE(source.toJson(), obj);
+  auto sourceEncoded = source.toJson();
+  if (!sourceEncoded)
+    QFAIL(qPrintable(sourceEncoded.error()));
+  QCOMPARE(*sourceEncoded, obj);
 }
 
 QTEST_APPLESS_MAIN(CardCatalogTests)

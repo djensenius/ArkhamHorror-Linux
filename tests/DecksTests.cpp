@@ -181,6 +181,30 @@ private slots:
   void cardNameToJsonRejectsLoneSurrogateInSubtitle();
   void externalDeckIdTextKindToJsonRejectsLoneSurrogate();
   void deckListToJsonRejectsLoneSurrogateInCardSlotsKey();
+  // "Stop whack-a-mole" cumulative review item 2: DeckList::toJson() now
+  // composes a complete toRawJson() AST and converts exactly once via
+  // Value::toExactQJsonObject() -- rather than the old hand-inserted
+  // investigatorName/meta/url/id/name QJsonObject fields -- so each of
+  // these plain, unvalidated-by-factory QString/optional<QString> fields
+  // must individually be proven to still reject a lone surrogate through
+  // the new encoder, not merely investigatorCode's CardCode-validated key
+  // above. Deck itself directly holds two more such fields (name/url,
+  // beyond its embedded DeckList's own), covered by the two Deck-level
+  // tests further below.
+  void deckListToJsonRejectsLoneSurrogateInInvestigatorName();
+  void deckListToJsonRejectsLoneSurrogateInMeta();
+  void deckListToJsonRejectsLoneSurrogateInUrl();
+  void deckListToJsonRejectsLoneSurrogateInId();
+  void deckListToJsonRejectsLoneSurrogateInName();
+  void deckToJsonRejectsLoneSurrogateInName();
+  void deckToJsonRejectsLoneSurrogateInUrl();
+  // "Stop whack-a-mole" cumulative review item 2 (array/node-count half):
+  // DeckValidationResult::toJson() now builds the complete error array as
+  // a Json::Value AST and converts exactly once via
+  // Value::toExactQJsonArray(), so it must enforce
+  // ParseLimits::production()'s overall maxArrayElements bound, not just
+  // each individually-valid DeckValidationError element.
+  void deckValidationResultToJsonRejectsOverArrayElementLimit();
   void deckOperationErrorToJsonRejectsLoneSurrogateInErrorMsg();
   // Round-18-cumulative-review item 1: every retained fragment toJson()
   // above used to check *only* for a lone/mismatched UTF-16 surrogate,
@@ -1184,7 +1208,8 @@ void DecksTests::requireIntValueAcceptsExactInt64Max() {
   // qint64::max() (2^63-1) is not exactly representable as a double and
   // rounds UP to 2^63 -- a naive `toDouble() >= 2^63` boundary check
   // incorrectly rejects this value. QJsonValue(qint64) is the same
-  // constructor RawJson::Value::toQJson() uses for contract-domain
+  // constructor RawJson::Value::toExactQJson()/
+  // toLossyQJsonForTestingOnly() both use for contract-domain
   // integers, so this exercises the exact storage path production code
   // relies on.
   constexpr qint64 kMax = std::numeric_limits<qint64>::max();
@@ -1809,7 +1834,7 @@ void DecksTests::
 }
 
 void DecksTests::deckListToJsonRejectsLoneSurrogateInCardSlotsKey() {
-  // Direct fragment-level test for encodeCardQuantityMap() (private to
+  // Direct fragment-level test for rawEncodeCardQuantityMap() (private to
   // Decks.cpp, exercised here only through the public DeckList::toJson()
   // it composes into): a CardCode key holding a lone surrogate must
   // reject the whole map rather than silently producing a
@@ -1827,6 +1852,150 @@ void DecksTests::deckListToJsonRejectsLoneSurrogateInCardSlotsKey() {
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("lone UTF-16 surrogate")),
            qPrintable(encoded.error()));
+}
+
+void DecksTests::deckListToJsonRejectsLoneSurrogateInInvestigatorName() {
+  QString lone;
+  lone += QChar(0xD800);
+  const DeckList list{
+      .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
+      .investigatorName = lone,
+  };
+  const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("investigator_name")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckListToJsonRejectsLoneSurrogateInMeta() {
+  QString lone;
+  lone += QChar(0xDC00);
+  const DeckList list{
+      .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
+      .investigatorName = QStringLiteral("Name"),
+      .meta = lone,
+  };
+  const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("meta")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckListToJsonRejectsLoneSurrogateInUrl() {
+  QString lone;
+  lone += QChar(0xD800);
+  const DeckList list{
+      .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
+      .investigatorName = QStringLiteral("Name"),
+      .url = lone,
+  };
+  const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("url")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckListToJsonRejectsLoneSurrogateInId() {
+  QString lone;
+  lone += QChar(0xDC00);
+  const DeckList list{
+      .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
+      .investigatorName = QStringLiteral("Name"),
+      .id = lone,
+  };
+  const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("id")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckListToJsonRejectsLoneSurrogateInName() {
+  QString lone;
+  lone += QChar(0xD800);
+  const DeckList list{
+      .investigatorCode = *CardCode::parse(QStringLiteral("c01001")),
+      .investigatorName = QStringLiteral("Name"),
+      .name = lone,
+  };
+  const auto encoded = list.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("name")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckToJsonRejectsLoneSurrogateInName() {
+  const QUuid uuid = QUuid::createUuid();
+  const auto deckId = DeckId::parse(uuid.toString(QUuid::WithoutBraces));
+  if (!deckId)
+    QFAIL(qPrintable(deckId.error()));
+  QString lone;
+  lone += QChar(0xD800);
+  const Deck deck{
+      .id = *deckId,
+      .name = lone,
+      .investigatorName = QStringLiteral("Name"),
+      .list = DeckList{.investigatorCode =
+                           *CardCode::parse(QStringLiteral("c01001")),
+                       .investigatorName = QStringLiteral("Name")},
+  };
+  const auto encoded = deck.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("name")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckToJsonRejectsLoneSurrogateInUrl() {
+  const QUuid uuid = QUuid::createUuid();
+  const auto deckId = DeckId::parse(uuid.toString(QUuid::WithoutBraces));
+  if (!deckId)
+    QFAIL(qPrintable(deckId.error()));
+  QString lone;
+  lone += QChar(0xDC00);
+  const Deck deck{
+      .id = *deckId,
+      .url = lone,
+      .name = QStringLiteral("Name"),
+      .investigatorName = QStringLiteral("Name"),
+      .list = DeckList{.investigatorCode =
+                           *CardCode::parse(QStringLiteral("c01001")),
+                       .investigatorName = QStringLiteral("Name")},
+  };
+  const auto encoded = deck.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("url")),
+           qPrintable(encoded.error()));
+}
+
+void DecksTests::deckValidationResultToJsonRejectsOverArrayElementLimit() {
+  // "Stop whack-a-mole" cumulative review item 2: DeckValidationResult::
+  // toJson() now builds the complete error array as a Json::Value AST and
+  // converts exactly once via Value::toExactQJsonArray(), so
+  // ParseLimits::production()'s maxArrayElements (20'000) bound must
+  // apply to the array as a whole, not just to each individually-valid
+  // DeckValidationError element.
+  QList<DeckValidationError> errors;
+  errors.reserve(20'001);
+  for (int i = 0; i < 20'001; ++i) {
+    const auto code = CardCode::parse(QStringLiteral("c%1").arg(i));
+    if (!code)
+      QFAIL(qPrintable(code.error()));
+    errors.append(DeckValidationError{.cardCode = *code});
+  }
+  auto overLimit = DeckValidationResult::errors(errors);
+  if (!overLimit)
+    QFAIL(qPrintable(overLimit.error()));
+  const auto overLimitEncoded = overLimit->toJson();
+  QVERIFY(!overLimitEncoded.has_value());
+
+  errors.removeLast();
+  QCOMPARE(errors.size(), 20'000);
+  auto atLimit = DeckValidationResult::errors(errors);
+  if (!atLimit)
+    QFAIL(qPrintable(atLimit.error()));
+  const auto atLimitEncoded = atLimit->toJson();
+  if (!atLimitEncoded)
+    QFAIL(qPrintable(atLimitEncoded.error()));
+  QCOMPARE(atLimitEncoded->size(), 20'000);
 }
 
 void DecksTests::deckOperationErrorToJsonRejectsLoneSurrogateInErrorMsg() {
@@ -1851,8 +2020,8 @@ void DecksTests::
   // Enclosing-request parity companion to
   // cardCodeToJsonRejectsStringExceedingProductionLengthBudget above:
   // DeckList::investigatorCode is a CardCode field composed by
-  // encodeCardQuantityMap()'s sibling code in DeckList::toJson() via the
-  // same Value::toExactQJsonObject() path, so it must reject the
+  // rawEncodeCardQuantityMap()'s sibling code in DeckList::toRawJson()
+  // via the same Value::toExactQJsonObject() path, so it must reject the
   // identical over-length code the direct fragment test now also
   // rejects.
   QString overLong = QStringLiteral("c");

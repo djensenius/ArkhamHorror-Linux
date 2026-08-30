@@ -76,6 +76,14 @@ private slots:
   gameListRowToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode();
   void
   encodeGameListToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode();
+  // "Stop whack-a-mole" cumulative review item 1: GameListRow::toJson()
+  // now composes toRawJson() and converts exactly once via
+  // Value::toExactQJsonObject(), so re-encoding a decoded row carrying a
+  // non-qint64-exact (huge-exponent) literal nested inside an unknown
+  // gameState tag must now fail outright -- companion to
+  // gameListRowToJsonBytesPreservesUnknownGameStateHugeNestedNumberOnEncode
+  // above, which only proves toJsonBytes() (the lossless path) survives.
+  void gameListRowToJsonRejectsHugeExponentInUnknownGameStateNestedContents();
   void decodeGameListFromRawBytesMatchesQJsonPathOnSameFixture();
   void decodeGameListFromRawBytesRejectsDuplicateObjectKey();
 
@@ -151,6 +159,12 @@ private slots:
   campaignOptionRawBytesPreserveHugeNestedNumericLiteralInUnknownContents();
   void
   campaignOptionToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode();
+  // "Stop whack-a-mole" cumulative review item 1: CampaignOption::toJson()
+  // now composes toRawJson() and converts exactly once via
+  // Value::toExactQJsonObject(), so re-encoding must now fail outright for
+  // the same non-qint64-exact literal the immediately-preceding test
+  // already proved toJsonBytes() preserves losslessly.
+  void campaignOptionToJsonRejectsHugeExponentInUnknownTagContents();
   // Round-9/10 item 3: a KNOWN tag's decoded response object can also carry
   // an explicit "contents": null and/or a future additive sibling key --
   // just as an unrecognized tag can (see the two tests above) -- and that
@@ -277,8 +291,17 @@ private slots:
   void encodeOpenSeatsRejectsLoneSurrogateInCardCode();
   void investigatorSummaryToJsonRejectsLoneSurrogateInId();
   void scenarioSummaryToJsonRejectsLoneSurrogateInName();
+  void scenarioSummaryToJsonRejectsLoneSurrogateInVariant();
   void campaignSummaryToJsonRejectsLoneSurrogateInId();
   void gameListRowToJsonRejectsLoneSurrogateThroughInvestigatorSummary();
+  // "Stop whack-a-mole" cumulative review item 2: encodeOpenSeats() (see
+  // encodeOpenSeatsRejectsLoneSurrogateInCardCode above for its
+  // test/round-trip-only status) now builds the whole array as a
+  // Json::Value AST and converts exactly once via
+  // Value::toExactQJsonArray(), so it must also enforce
+  // ParseLimits::production()'s overall array-element bound, not merely
+  // each element's own individually-exact CardCode::toJson().
+  void encodeOpenSeatsRejectsOverArrayElementLimit();
 
   // Round-19-cumulative-review item 3: GameState/GameListRow/
   // CampaignOption/CampaignOptionRequest had no user-declared copy/move,
@@ -470,9 +493,11 @@ void GamesTests::
   if (!decoded)
     QFAIL(qPrintable(decoded.error()));
 
-  // toJson()/QJsonObject is intentionally lossy here (double-backed), so
-  // this proves ONLY toJsonBytes() (routing gameState through
-  // GameState::toRawJson(), not toJson()) survives the huge literal.
+  // toJson() is now also exact (see
+  // gameListRowToJsonRejectsHugeExponentInUnknownGameStateNestedContents
+  // below for the case it must now reject), so this test specifically
+  // exercises toJsonBytes()'s independent RawJson/Json::Value path,
+  // which composes GameState::toRawJson() rather than toJson().
   const auto encoded = decoded->toJsonBytes();
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
@@ -485,6 +510,26 @@ void GamesTests::
                .toRawNumber()
                .literal(),
            QStringLiteral("9007199254740993"));
+}
+
+void GamesTests::
+    gameListRowToJsonRejectsHugeExponentInUnknownGameStateNestedContents() {
+  // Companion to the test immediately above: the same decoded row, but
+  // with a huge-exponent (non-qint64-exact) literal instead of an
+  // exact-int64 one, must now make the QJsonObject-typed toJson() itself
+  // fail -- not merely produce a normal-looking-but-rounded object, as
+  // the old lossy Value::toQJson()-based encoder would have.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"id\":\"00000000-0000-0000-0000-000000000099\",\"scenario\":null,"
+      "\"campaign\":null,\"gameState\":{\"tag\":\"IsSuspended\",\"contents\":"
+      "{\"since\":1e300}},\"name\":\"Row\",\"investigators\":[],"
+      "\"otherInvestigators\":[],\"multiplayerVariant\":\"Solo\","
+      "\"hasOpenSeats\":false}");
+  const auto decoded = GameListRow::fromRawBytes(bytes, u"row");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  const auto encoded = decoded->toJson();
+  QVERIFY(!encoded.has_value());
 }
 
 void GamesTests::
@@ -550,7 +595,10 @@ void GamesTests::unknownGameStateTagPreservedAndRoundTrips() {
   QCOMPARE(result->kind(), GameState::Kind::Unknown);
   QCOMPARE(result->unknownTag(), QStringLiteral("IsSuspended"));
   QVERIFY(result->unknownContents().isUndefined());
-  QCOMPARE(result->toJson(), obj);
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void GamesTests::unknownGameStateTagWithContentsPreservedAndRoundTrips() {
@@ -571,7 +619,10 @@ void GamesTests::unknownGameStateTagWithContentsPreservedAndRoundTrips() {
   QCOMPARE(
       result->unknownContents().value(QLatin1StringView("reason")).toString(),
       QStringLiteral("maintenance"));
-  QCOMPARE(result->toJson(), obj);
+  const auto encoded = result->toJson();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, obj);
 }
 
 void GamesTests::gameStatePendingRejectsNullUuidInPlayerIds() {
@@ -668,8 +719,10 @@ void GamesTests::gameStateRawBytesPreserveAdditiveFieldBesideTagAndContents() {
                .literal(),
            QStringLiteral("123456"));
   const auto encoded = result->toJson();
-  QCOMPARE(encoded.value(QStringLiteral("since")).toInt(), 123456);
-  QCOMPARE(QJsonDocument(encoded).toJson(QJsonDocument::Compact),
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->value(QStringLiteral("since")).toInt(), 123456);
+  QCOMPARE(QJsonDocument(*encoded).toJson(QJsonDocument::Compact),
            QJsonDocument::fromJson(bytes).toJson(QJsonDocument::Compact));
 }
 
@@ -695,28 +748,27 @@ void GamesTests::
   QCOMPARE(nested.toArray().at(1).toRawNumber().literal(),
            QStringLiteral("1e300"));
 
-  // toJson() re-emits the complete raw object; parsing it back through the
-  // canonical byte decoder must yield the identical numeric literals --
-  // proof the QJsonObject-typed toJson() convenience encoder still carries
-  // the exact digits forward for any caller that re-parses it byte-exact,
-  // even though QJsonObject's own in-memory storage is double-backed.
-  const QByteArray reencoded =
-      QJsonDocument(result->toJson()).toJson(QJsonDocument::Compact);
-  const auto reparsed = GameState::fromRawBytes(reencoded, u"gameState");
-  if (!reparsed)
-    QFAIL(qPrintable(reparsed.error()));
-  const Json::Value reparsedNested =
-      reparsed->unknownContents().value(QLatin1StringView("nested"));
-  QCOMPARE(reparsedNested.toArray().at(0).toRawNumber().literal(),
-           QStringLiteral("9007199254740993"));
+  // toJson() now routes through Value::toExactQJsonObject() (see
+  // RawJson.h), which typed-rejects any numeric literal that cannot
+  // round-trip byte-exact through QJsonValue's int64-or-double storage
+  // rather than silently rounding it: 1e300 is not exactly representable
+  // as a double whose re-serialization reproduces this literal, so the
+  // whole object must fail closed instead of returning a
+  // normal-looking-but-altered QJsonObject. toJsonBytes() (see
+  // gameStateToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode()
+  // below) remains the canonical lossless encoder for this same input.
+  const auto reencodedResult = result->toJson();
+  QVERIFY(!reencodedResult.has_value());
+  QVERIFY2(reencodedResult.error().contains(QStringLiteral("1e300")),
+           qPrintable(reencodedResult.error()));
 }
 
 void GamesTests::
     gameStateToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode() {
-  // Unlike the toJson()-mediated round trip above (which can only carry an
-  // exact-int64 literal like 9007199254740993 forward, not a huge-exponent
-  // literal like 1e300, since QJsonValue's storage is int64-or-double),
-  // toJsonBytes() is the canonical lossless encoder: both survive.
+  // Unlike toJson() above (which now typed-rejects the whole object
+  // rather than rounding a huge-exponent literal like 1e300, since
+  // QJsonValue's storage is int64-or-double), toJsonBytes() is the
+  // canonical lossless encoder: both 9007199254740993 and 1e300 survive.
   const QByteArray bytes =
       QByteArrayLiteral("{\"tag\":\"IsSuspended\",\"contents\":{\"nested\":"
                         "[9007199254740993,1e300]}}");
@@ -1395,9 +1447,12 @@ void GamesTests::
 
 void GamesTests::
     campaignOptionToJsonBytesPreservesUnknownHugeNestedNumericLiteralOnEncode() {
-  // toJsonBytes() is the canonical lossless encoder (unlike the
-  // QJsonObject-typed toJson()), so a huge-exponent literal alongside an
-  // exact-int64 literal both survive an encode-then-decode round trip.
+  // toJsonBytes() is the canonical lossless encoder, independently
+  // implemented from toJson() (see
+  // campaignOptionToJsonRejectsHugeExponentInUnknownTagContents below,
+  // which now proves toJson() rejects the very literal this test proves
+  // toJsonBytes() preserves), so both an exact-int64 and a huge-exponent
+  // literal survive an encode-then-decode round trip here.
   const QByteArray bytes =
       QByteArrayLiteral("{\"tag\":\"FutureOption\",\"contents\":{\"limit\":"
                         "9007199254740993,\"scale\":1e300}}");
@@ -1422,6 +1477,21 @@ void GamesTests::
                .toRawNumber()
                .literal(),
            QStringLiteral("1e300"));
+}
+
+void GamesTests::campaignOptionToJsonRejectsHugeExponentInUnknownTagContents() {
+  // "Stop whack-a-mole" cumulative review item 1: CampaignOption::toJson()
+  // now composes toRawJson() and converts exactly once via
+  // Value::toExactQJsonObject(), so re-encoding a decoded option carrying
+  // a huge-exponent (non-qint64-exact) literal nested inside an unknown
+  // tag's contents must fail outright.
+  const QByteArray bytes = QByteArrayLiteral(
+      "{\"tag\":\"FutureOption\",\"contents\":{\"scale\":1e300}}");
+  const auto decoded = CampaignOption::fromRawBytes(bytes, u"option");
+  if (!decoded)
+    QFAIL(qPrintable(decoded.error()));
+  const auto encoded = decoded->toJson();
+  QVERIFY(!encoded.has_value());
 }
 
 void GamesTests::
@@ -2326,6 +2396,33 @@ void GamesTests::encodeOpenSeatsRejectsLoneSurrogateInCardCode() {
            qPrintable(encoded.error()));
 }
 
+void GamesTests::encodeOpenSeatsRejectsOverArrayElementLimit() {
+  // "Stop whack-a-mole" cumulative review item 2: encodeOpenSeats() now
+  // builds the complete array as a Json::Value AST and converts exactly
+  // once via Value::toExactQJsonArray(), so ParseLimits::production()'s
+  // maxArrayElements (20'000) bound must apply to the array as a whole,
+  // not just to each individually-valid CardCode element -- the exact
+  // "hand-appended array bypasses the overall bound" antipattern this
+  // review round's item 2 named encodeOpenSeats() for specifically.
+  QList<CardCode> seats;
+  seats.reserve(20'001);
+  for (int i = 0; i < 20'001; ++i) {
+    const auto code = CardCode::parse(QStringLiteral("c%1").arg(i));
+    if (!code)
+      QFAIL(qPrintable(code.error()));
+    seats.append(*code);
+  }
+  const auto overLimit = encodeOpenSeats(seats);
+  QVERIFY(!overLimit.has_value());
+
+  seats.removeLast();
+  QCOMPARE(seats.size(), 20'000);
+  const auto atLimit = encodeOpenSeats(seats);
+  if (!atLimit)
+    QFAIL(qPrintable(atLimit.error()));
+  QCOMPARE(atLimit->size(), 20'000);
+}
+
 void GamesTests::investigatorSummaryToJsonRejectsLoneSurrogateInId() {
   // Direct fragment-level test proving InvestigatorSummary::toJson() (now
   // that CardCode::toJson() is itself fallible) checks-and-propagates its
@@ -2358,6 +2455,27 @@ void GamesTests::scenarioSummaryToJsonRejectsLoneSurrogateInName() {
   const auto encoded = summary.toJson();
   QVERIFY(!encoded.has_value());
   QVERIFY2(encoded.error().contains(QStringLiteral("name")),
+           qPrintable(encoded.error()));
+}
+
+void GamesTests::scenarioSummaryToJsonRejectsLoneSurrogateInVariant() {
+  // Companion to scenarioSummaryToJsonRejectsLoneSurrogateInName above:
+  // variant is a plain, unvalidated std::optional<QString> (no CardName/
+  // CardCode-style validating factory), so ScenarioSummary::toJson() must
+  // itself check it for a lone surrogate rather than assuming an
+  // unconstrained optional string is always safe to embed.
+  QString lone;
+  lone += QChar(0xDC00);
+  const ScenarioSummary summary{
+      .id = *CardCode::parse(QStringLiteral("c01104")),
+      .difficulty = Difficulty::Standard,
+      .name =
+          CardName{.title = QStringLiteral("Name"), .subtitle = std::nullopt},
+      .variant = lone,
+  };
+  const auto encoded = summary.toJson();
+  QVERIFY(!encoded.has_value());
+  QVERIFY2(encoded.error().contains(QStringLiteral("variant")),
            qPrintable(encoded.error()));
 }
 
@@ -2465,7 +2583,10 @@ void GamesTests::gameStateUnknownTagMoveConstructLeavesSourceRawIntact() {
   QCOMPARE(source.kind(), GameState::Kind::Unknown);
   QCOMPARE(source.unknownTag(), QStringLiteral("IsSuspended"));
   QVERIFY(source.unknownRaw() == toRawJson(obj));
-  QCOMPARE(source.toJson(), obj);
+  const auto sourceEncoded = source.toJson();
+  if (!sourceEncoded)
+    QFAIL(qPrintable(sourceEncoded.error()));
+  QCOMPARE(*sourceEncoded, obj);
 }
 
 void GamesTests::gameListRowSuccessMoveConstructLeavesSourceFieldsIntact() {
