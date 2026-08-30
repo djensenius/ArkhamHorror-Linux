@@ -391,6 +391,69 @@ class VerifyTests(unittest.TestCase):
         failures = vcp.verify(tree, self._scratch, governed_digests=stale_digests)
         self.assertTrue(any("ContractPin.cpp is stale" in f for f in failures))
 
+    def test_symlinked_directory_under_scanned_dir_is_not_traversed(self):
+        # A symlinked directory placed under a _SCANNED_DIRS entry must be
+        # reported as an extra/ungoverned entry itself, and its contents
+        # (which live entirely outside contracts/schemas) must never be
+        # walked into or reported -- proving os.walk(followlinks=False)
+        # actually stops descent rather than merely being requested.
+        outside = self._scratch.parent / "outside-secret"
+        if outside.exists():
+            shutil.rmtree(outside)
+        outside.mkdir(parents=True)
+        (outside / "leaked.schema.json").write_bytes(b"{}")
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
+
+        link = self._scratch / "contracts/schemas/evil-link"
+        link.symlink_to(outside, target_is_directory=True)
+
+        tree = FakeTree(_baseline_blobs())
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(
+            any("contracts/schemas/evil-link" in f and "not reachable" in f for f in failures),
+            f"expected the symlinked directory itself to be flagged as extra, got: {failures}",
+        )
+        self.assertFalse(
+            any("leaked.schema.json" in f for f in failures),
+            "must never traverse through a symlinked directory to report its contents",
+        )
+
+    def test_symlinked_file_under_scanned_dir_flagged_without_following(self):
+        # A symlink FILE (not directory) under a scanned dir must also be
+        # reported as extra by its own path, never silently accepted just
+        # because os.walk()'s filenames listing includes it.
+        outside = self._scratch.parent / "outside-secret-file"
+        if outside.exists():
+            shutil.rmtree(outside)
+        outside.mkdir(parents=True)
+        target = outside / "elsewhere.schema.json"
+        target.write_bytes(b"{}")
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
+
+        link = self._scratch / "contracts/schemas/sneaky.schema.json"
+        link.symlink_to(target)
+
+        tree = FakeTree(_baseline_blobs())
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(
+            any("contracts/schemas/sneaky.schema.json" in f and "not reachable" in f for f in failures),
+            f"expected the symlink file itself to be flagged as extra, got: {failures}",
+        )
+
+    def test_symlinked_directory_cycle_under_scanned_dir_does_not_hang(self):
+        # A directory symlink pointing back at its own scanned ancestor
+        # (a cycle) must not cause unbounded recursion/hang; it must be
+        # reported as an extra entry like any other symlinked directory.
+        link = self._scratch / "contracts/schemas/self-loop"
+        link.symlink_to(self._scratch / "contracts/schemas", target_is_directory=True)
+
+        tree = FakeTree(_baseline_blobs())
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(
+            any("contracts/schemas/self-loop" in f and "not reachable" in f for f in failures),
+            f"expected the cyclic symlink itself to be flagged as extra, got: {failures}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

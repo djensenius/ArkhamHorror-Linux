@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import posixpath
 import re
 import stat
@@ -432,19 +433,51 @@ def compute_governed_paths(tree: GitTree) -> set[str]:
 def find_local_extra_files(repo_root: Path, governed: set[str]) -> list[str]:
     """Scans _SCANNED_DIRS for files not present in `governed` -- an
     ungoverned schema/fixture added locally without being reachable from
-    ROOT_SCHEMAS's $ref/manifest closure."""
+    ROOT_SCHEMAS's $ref/manifest closure.
+
+    Walks with os.walk(..., followlinks=False) rather than Path.rglob("*"):
+    this script runs in CI against untrusted PR content, and rglob()'s
+    default traversal follows symlinked directories on the Python
+    versions this project targets, so a symlink introduced under
+    contracts/schemas or contracts/fixtures pointing outside the repo (or
+    at itself, forming a cycle) would otherwise be silently followed --
+    scanning/reporting paths outside the repository, or hanging on a
+    cyclic symlink -- rather than being caught below by the same
+    "governed paths must be plain regular files, never a symlink" policy
+    verify() already enforces (see its own is_symlink() check). Every
+    symlink encountered here -- whether it resolves to a directory (never
+    descended into) or a file -- is therefore itself reported as an extra,
+    ungoverned entry: a real governed fixture is always a plain file with
+    content this script hashes directly, never a symlink whose target
+    could point anywhere.
+    """
     extras: list[str] = []
     for scanned_dir in _SCANNED_DIRS:
         directory = repo_root / scanned_dir
         if not directory.is_dir():
             continue
-        for child in sorted(directory.rglob("*")):
-            if child.is_dir():
-                continue
-            relative = child.relative_to(repo_root).as_posix()
-            if relative not in governed:
-                extras.append(relative)
-    return extras
+        for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+            current = Path(dirpath)
+            kept_dirnames = []
+            for name in dirnames:
+                child = current / name
+                if child.is_symlink():
+                    relative = child.relative_to(repo_root).as_posix()
+                    if relative not in governed:
+                        extras.append(relative)
+                else:
+                    kept_dirnames.append(name)
+            # Also belt-and-suspenders against followlinks=False somehow
+            # still queuing a symlinked directory on some platform: only
+            # the non-symlink subdirectories collected above are kept for
+            # os.walk to recurse into.
+            dirnames[:] = kept_dirnames
+            for name in filenames:
+                child = current / name
+                relative = child.relative_to(repo_root).as_posix()
+                if relative not in governed:
+                    extras.append(relative)
+    return sorted(extras)
 
 
 def verify(
