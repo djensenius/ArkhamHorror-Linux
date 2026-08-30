@@ -17,6 +17,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1171,6 +1172,9 @@ walkOwnedSuffixNoFollowFromFd(int anchorFd, const MountIdentity &anchorMount,
     if (fstatat(currentFd, componentUtf8.constData(), &st,
                 AT_SYMLINK_NOFOLLOW) != 0) {
       if (errno != ENOENT || !allowCreateMissingComponents) {
+        qWarning() << "AssetCache: failed to stat owned-suffix component"
+                   << component << "(errno" << errno
+                   << QString::fromLocal8Bit(strerror(errno)) << ")";
         ::close(currentFd);
         return std::nullopt;
       }
@@ -1180,11 +1184,18 @@ walkOwnedSuffixNoFollowFromFd(int anchorFd, const MountIdentity &anchorMount,
       // ever be substituted into.
       if (mkdirat(currentFd, componentUtf8.constData(), 0700) != 0 &&
           errno != EEXIST) {
+        qWarning() << "AssetCache: failed to create owned-suffix component"
+                   << component << "(errno" << errno
+                   << QString::fromLocal8Bit(strerror(errno)) << ")";
         ::close(currentFd);
         return std::nullopt;
       }
       if (fstatat(currentFd, componentUtf8.constData(), &st,
                   AT_SYMLINK_NOFOLLOW) != 0) {
+        qWarning() << "AssetCache: failed to stat just-created owned-suffix "
+                      "component"
+                   << component << "(errno" << errno
+                   << QString::fromLocal8Bit(strerror(errno)) << ")";
         ::close(currentFd);
         return std::nullopt;
       }
@@ -1198,9 +1209,13 @@ walkOwnedSuffixNoFollowFromFd(int anchorFd, const MountIdentity &anchorMount,
       return std::nullopt;
     }
     bool usedStrongNoXdev = false;
+    errno = 0;
     const int nextFd = openDirectoryComponentNoFollow(
         currentFd, componentUtf8.constData(), &usedStrongNoXdev);
     if (nextFd < 0) {
+      qWarning() << "AssetCache: failed to open owned-suffix component"
+                 << component << "(errno" << errno
+                 << QString::fromLocal8Bit(strerror(errno)) << ")";
       ::close(currentFd);
       return std::nullopt;
     }
@@ -1608,10 +1623,25 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     // walkOwnedSuffixNoFollowFromFd() already applies.
     const bool transitionMayBeAttemptedHere = homeIsAuthenticated;
     bool usedStrongNoXdev = false;
+    errno = 0;
     const int nextFd = openDirectoryComponentNoFollow(
         currentFd, componentUtf8.constData(), &usedStrongNoXdev,
         /*confirmedCrossMountViaKernel=*/nullptr, transitionMayBeAttemptedHere);
     if (nextFd < 0) {
+      // Diagnostic-only (this branch was previously entirely silent,
+      // making a real, once-off CI-only failure of this kind
+      // impossible to root-cause from CI output alone): errno here is
+      // whatever openDirectoryComponentNoFollow()'s own final,
+      // authoritative attempt (openat2's own refusal reason if that
+      // path was taken and did not fall back, otherwise the portable
+      // openat() fallback's own reason) left behind.
+      qWarning() << "AssetCache: failed to open home-path component"
+                 << component << "beneath" << home << "(errno" << errno
+                 << QString::fromLocal8Bit(strerror(errno))
+                 << ", mount transition"
+                 << (transitionMayBeAttemptedHere ? "permitted"
+                                                  : "not permitted")
+                 << "here)";
       ::close(currentFd);
       return std::nullopt;
     }
