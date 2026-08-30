@@ -539,7 +539,12 @@ COMPONENT_EXPECTED_SOURCE_PACKAGES: dict[str, frozenset[str]] = {
     "pcre": frozenset({"pcre3"}),
     "libpng": frozenset({"libpng1.6"}),
     "systemd": frozenset({"systemd"}),
-    "zstd": frozenset({"zstd"}),
+    # Ubuntu 22.04 "Jammy"'s libzstd1 binary package is built from a
+    # source package literally named "libzstd" (not "zstd" -- there is
+    # no bare "zstd" source package in this release at all). Confirmed
+    # via `dpkg -S`/`dpkg-query -W -f='${source:Package}'` against a
+    # real, unmodified ubuntu:22.04 container.
+    "zstd": frozenset({"libzstd"}),
     "libjpeg": frozenset({"libjpeg-turbo"}),
     "bzip2": frozenset({"bzip2"}),
     "libavif": frozenset({"libavif"}),

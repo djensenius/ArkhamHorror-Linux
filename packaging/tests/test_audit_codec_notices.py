@@ -1442,6 +1442,92 @@ class RealSystemPackageProvenanceTests(unittest.TestCase):
         self.assertIsNotNone(problem)
         self.assertIn("krb5", problem)
 
+    def test_every_expected_source_package_agrees_with_whatever_is_really_installed(
+        self,
+    ) -> None:
+        """Round-N+ review regression: a previous version of this table
+        mapped component "zstd" to expected Debian source package
+        "zstd", but Ubuntu 22.04's real libzstd1 binary package is
+        actually built from a source package literally named "libzstd"
+        -- there is no bare "zstd" source package in that release at
+        all. That one-line typo was NOT caught by
+        test_real_system_library_matches_its_expected_component above
+        (which only ever exercises libz.so.1/zlib1g, a library
+        guaranteed present even on the barest container) -- it only
+        surfaced later, against the real appimage-smoke CI runner, once
+        libzstd1 happened to actually be installed there as a
+        transitive dependency.
+
+        This test closes that gap generically, for every entry in
+        COMPONENT_EXPECTED_SOURCE_PACKAGES at once, rather than only the
+        one or two libraries a hermetic bare-container test can rely on
+        being present: it globs every real file under
+        _SYSTEM_LIBRARY_SEARCH_DIRS, matches each basename against
+        COMPONENT_PATTERNS to find which component (if any) it would be
+        classified as, and -- for every match whose component has an
+        entry in COMPONENT_EXPECTED_SOURCE_PACKAGES and whose real dpkg
+        provenance can actually be captured -- asserts the table agrees
+        with the live system. On a typical Debian/Ubuntu development or
+        CI host with a reasonably full base system plus whatever
+        packages this project's own CI steps installed, this exercises
+        a large fraction of the table for free, with zero new
+        hardcoded package names to keep in sync by hand; on a
+        near-empty container it simply covers less (never spuriously
+        failing), so it is deliberately additive/best-effort rather
+        than an exhaustive guarantee -- exactly the same honest
+        degradation policy as capture_package_provenance() itself."""
+        problems: list[str] = []
+        checked = 0
+        seen_paths: set[Path] = set()
+        for search_dir in audit._SYSTEM_LIBRARY_SEARCH_DIRS:
+            if not search_dir.is_dir():
+                continue
+            try:
+                entries = list(search_dir.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    resolved = entry.resolve()
+                except OSError:
+                    continue
+                if not resolved.is_file() or resolved in seen_paths:
+                    continue
+                basename = entry.name
+                component = None
+                for pattern, pattern_component in audit.COMPONENT_PATTERNS:
+                    if pattern.match(basename):
+                        component = pattern_component
+                        break
+                if component is None:
+                    continue
+                if component not in audit.COMPONENT_EXPECTED_SOURCE_PACKAGES:
+                    continue
+                provenance = audit.capture_package_provenance(basename)
+                if provenance is None:
+                    continue
+                seen_paths.add(resolved)
+                checked += 1
+                problem = audit.validate_component_package_provenance(
+                    component, provenance
+                )
+                if problem is not None:
+                    problems.append(problem)
+        if checked == 0:
+            self.skipTest(
+                "no real system library on this host matched any "
+                "COMPONENT_PATTERNS entry with a COMPONENT_EXPECTED_"
+                "SOURCE_PACKAGES mapping -- nothing to cross-check here"
+            )
+        self.assertEqual(
+            problems,
+            [],
+            f"COMPONENT_EXPECTED_SOURCE_PACKAGES disagreed with "
+            f"{len(problems)} real, currently-installed system "
+            f"package(s) (checked {checked} matched libraries): "
+            + "; ".join(problems),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
