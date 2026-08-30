@@ -443,6 +443,51 @@ def compute_governed_paths(tree: GitTree) -> set[str]:
     )
 
 
+def _first_symlink_path_component(repo_root: Path, relative_path: str) -> str | None:
+    """Walks from `repo_root` down through every component of
+    `relative_path` (each ancestor directory, then the leaf itself, in
+    that root-to-leaf order), lstat-ing each one individually via
+    os.lstat() -- never Path.is_dir()/Path.exists()/Path.resolve(), all of
+    which follow symlinks transparently -- and returns the repo-relative,
+    POSIX-style path of the first component found to be a symlink, or
+    None if every component that exists is a plain, non-symlink entry.
+
+    This exists because `os.walk(..., followlinks=False)` only refuses to
+    *recurse into* a symlinked subdirectory it encounters *during* the
+    walk: it does nothing to stop the walk's own root argument -- or any
+    ancestor directory component of a single governed file path checked
+    directly (never walked) -- from itself being a symlink. Handing
+    `repo_root / "contracts/schemas"` straight to os.walk(), or checking
+    only a governed leaf file's own is_symlink() while ignoring whether
+    "contracts" or "contracts/schemas" above it is a symlink, would let a
+    symlinked `contracts`, `contracts/schemas`, or `contracts/fixtures`
+    root (or any intermediate parent) silently redirect every path
+    beneath it outside the repository while individual leaf entries keep
+    looking like ordinary files/directories.
+    """
+    current = repo_root
+    for part in relative_path.split("/"):
+        if not part or part in (".", ".."):
+            # Governed/scanned paths are always repo-relative, forward-
+            # slash, ROOT_SCHEMAS-derived literals (see module docstring)
+            # -- never attacker-controlled -- so this is just a defensive
+            # guard against an unexpected empty/dot component, not a
+            # traversal vector.
+            continue
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except OSError:
+            # A missing component is reported by the existing missing-
+            # file (verify()) or absent-directory (find_local_extra_files
+            # skips a non-existent scanned dir) checks; this helper only
+            # ever rejects a symlink it can actually see.
+            return None
+        if stat.S_ISLNK(mode):
+            return current.relative_to(repo_root).as_posix()
+    return None
+
+
 def find_local_extra_files(repo_root: Path, governed: set[str]) -> list[str]:
     """Scans _SCANNED_DIRS for files not present in `governed` -- an
     ungoverned schema/fixture added locally without being reachable from
@@ -463,9 +508,26 @@ def find_local_extra_files(repo_root: Path, governed: set[str]) -> list[str]:
     ungoverned entry: a real governed fixture is always a plain file with
     content this script hashes directly, never a symlink whose target
     could point anywhere.
+
+    Before starting each scanned directory's own os.walk(), also checks
+    every path component from repo_root down to (and including) that
+    scanned directory itself via _first_symlink_path_component(): the
+    followlinks=False guard below only protects subdirectories
+    encountered *during* the walk, never the walk's own root argument, so
+    a symlinked `contracts`, `contracts/schemas`, or `contracts/fixtures`
+    would otherwise be walked straight through unreported.
     """
     extras: list[str] = []
     for scanned_dir in _SCANNED_DIRS:
+        symlink_component = _first_symlink_path_component(repo_root, scanned_dir)
+        if symlink_component is not None:
+            # A single symlinked ancestor (e.g. "contracts" itself) is
+            # the shared parent of every _SCANNED_DIRS entry, so this
+            # branch can be reached once per scanned_dir for the exact
+            # same offending component; only report it once.
+            if symlink_component not in governed and symlink_component not in extras:
+                extras.append(symlink_component)
+            continue
         directory = repo_root / scanned_dir
         if not directory.is_dir():
             continue
@@ -530,15 +592,24 @@ def verify(
         backend_bytes = tree.blob_bytes(relative_path)
         local_path = repo_root / relative_path
 
-        if not local_path.exists() and not local_path.is_symlink():
-            failures.append(f"{relative_path}: vendored file is missing")
-            continue
-        if local_path.is_symlink():
+        # Checks every path component from repo_root down to (and
+        # including) this governed file -- not just the leaf's own
+        # is_symlink() -- so a symlinked ancestor directory (e.g.
+        # `contracts` or `contracts/schemas` itself replaced with a
+        # symlink) is rejected before this loop ever reads/hashes bytes
+        # through it, even though the leaf path itself would otherwise
+        # still look like an ordinary file.
+        symlink_component = _first_symlink_path_component(repo_root, relative_path)
+        if symlink_component is not None:
             failures.append(
-                f"{relative_path}: vendored path is a symlink, not a plain "
-                "regular file -- rejected even if its target's bytes "
+                f"{relative_path}: path component {symlink_component!r} is "
+                "a symlink, not a plain regular file/directory -- rejected "
+                "before traversal/read, even if its target's bytes "
                 "currently match"
             )
+            continue
+        if not local_path.exists():
+            failures.append(f"{relative_path}: vendored file is missing")
             continue
         local_stat = local_path.lstat()
         if not stat.S_ISREG(local_stat.st_mode):

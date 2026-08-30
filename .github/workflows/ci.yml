@@ -34,6 +34,13 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      # Offline unit tests for the provenance script's own logic
+      # (closure discovery, symlink-at-root/ancestor rejection,
+      # exact-mode/byte checks) against an in-memory fake backend tree,
+      # run before the live network check below so a regression in the
+      # checker itself is caught even if it would otherwise still "pass"
+      # against the real pinned backend commit.
+      - run: mise run contracts:test-provenance-script
       - run: mise run contracts:verify-provenance
 
   format:

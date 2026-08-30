@@ -512,6 +512,111 @@ class VerifyTests(unittest.TestCase):
             f"expected the cyclic symlink itself to be flagged as extra, got: {failures}",
         )
 
+    def test_symlinked_scanned_root_itself_is_rejected_before_traversal(self):
+        # A _SCANNED_DIRS entry -- contracts/schemas itself, the very
+        # argument os.walk() is invoked with -- being replaced by a
+        # symlink is NOT protected against by os.walk(..., followlinks=
+        # False): that flag only stops descent into a symlinked
+        # subdirectory encountered *during* the walk, never the walk's
+        # own root. Plant byte-identical copies of every governed schema
+        # under the symlink target so a naive byte-comparison-only check
+        # would otherwise be fooled; this must still fail closed, both
+        # as an extra/ungoverned entry for the scanned root itself and as
+        # a symlink-component failure for every governed file
+        # find_local_extra_files/verify() would otherwise read straight
+        # through it.
+        outside = self._scratch.parent / "outside-root-swap"
+        if outside.exists():
+            shutil.rmtree(outside)
+        outside.mkdir(parents=True)
+        for rel, data in _baseline_blobs().items():
+            if rel.startswith("contracts/schemas/"):
+                (outside / Path(rel).name).write_bytes(data)
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
+
+        real_schemas = self._scratch / "contracts/schemas"
+        shutil.rmtree(real_schemas)
+        real_schemas.symlink_to(outside, target_is_directory=True)
+
+        tree = FakeTree(_baseline_blobs())
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(
+            any("contracts/schemas" in f and "not reachable" in f for f in failures),
+            f"expected contracts/schemas itself to be flagged as an extra, got: {failures}",
+        )
+        self.assertTrue(
+            any("catalog.schema.json" in f and "is a symlink" in f for f in failures),
+            f"expected a symlink-component failure for a governed file living under the "
+            f"symlinked scanned root, got: {failures}",
+        )
+
+    def test_symlinked_contracts_ancestor_is_rejected_before_traversal(self):
+        # A still-more-upstream variant of the same bypass: `contracts`
+        # itself -- the shared parent of BOTH contracts/schemas and
+        # contracts/fixtures -- being replaced by a symlink. Neither
+        # os.walk(..., followlinks=False) nor a leaf-only is_symlink()
+        # check on an individual governed file protects against an
+        # ancestor directory component being a symlink; only a full
+        # root-to-leaf component walk (_first_symlink_path_component)
+        # catches this.
+        outside = self._scratch.parent / "outside-contracts-swap"
+        if outside.exists():
+            shutil.rmtree(outside)
+        shutil.copytree(self._scratch / "contracts", outside)
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
+
+        real_contracts = self._scratch / "contracts"
+        shutil.rmtree(real_contracts)
+        real_contracts.symlink_to(outside, target_is_directory=True)
+
+        tree = FakeTree(_baseline_blobs())
+        failures = vcp.verify(tree, self._scratch)
+        self.assertTrue(
+            any("contracts" in f and "not reachable" in f for f in failures),
+            f"expected the 'contracts' ancestor itself to be flagged as an extra, got: {failures}",
+        )
+        self.assertTrue(
+            any("manifest.json" in f and "'contracts'" in f and "is a symlink" in f for f in failures),
+            f"expected a symlink-component failure naming 'contracts' for a governed file "
+            f"living underneath it, got: {failures}",
+        )
+        # Every governed schema/fixture file underneath the symlinked
+        # ancestor must fail closed the same way, not just one example.
+        self.assertTrue(
+            any("decks.schema.json" in f and "is a symlink" in f for f in failures),
+            f"expected the symlink-component failure to apply to every governed path "
+            f"beneath the symlinked ancestor, got: {failures}",
+        )
+
+    def test_first_symlink_path_component_helper_directly(self):
+        # Unit-level coverage of the helper itself, independent of
+        # verify()/find_local_extra_files() call sites: absent
+        # components, a plain nested file, a leaf symlink, and an
+        # ancestor symlink all resolve as documented.
+        self.assertIsNone(
+            vcp._first_symlink_path_component(self._scratch, "contracts/does-not-exist.json")
+        )
+        self.assertIsNone(
+            vcp._first_symlink_path_component(self._scratch, "contracts/manifest.json")
+        )
+
+        leaf_link = self._scratch / "contracts/fixtures/leaf-link.json"
+        leaf_link.symlink_to(self._scratch / "contracts/fixtures/catalog.json")
+        self.assertEqual(
+            vcp._first_symlink_path_component(self._scratch, "contracts/fixtures/leaf-link.json"),
+            "contracts/fixtures/leaf-link.json",
+        )
+
+        real_schemas = self._scratch / "contracts/schemas"
+        shutil.rmtree(real_schemas)
+        real_schemas.symlink_to(self._scratch / "contracts/fixtures", target_is_directory=True)
+        self.assertEqual(
+            vcp._first_symlink_path_component(
+                self._scratch, "contracts/schemas/catalog.schema.json"
+            ),
+            "contracts/schemas",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
