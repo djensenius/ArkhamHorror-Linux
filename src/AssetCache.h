@@ -3,6 +3,7 @@
 #include "AssetTypes.h"
 
 #include <QByteArray>
+#include <QCache>
 #include <QDateTime>
 #include <QHash>
 #include <QImage>
@@ -10,10 +11,9 @@
 #include <QSize>
 #include <QString>
 #include <QUrl>
+#include <limits>
 #include <memory>
 #include <optional>
-
-template <typename Key, typename T> class QCache;
 
 namespace Arkham {
 
@@ -310,6 +310,44 @@ public:
   // the same key independent of any live AssetCache instance.
   [[nodiscard]] static QString cacheKeyFor(const QUrl &resolvedCandidateUrl);
 
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): sentinel `issuedGeneration` value accepted
+  // by store()/touchAfterNotModified()/promoteToMemory()/
+  // updateMemoryDecodedImage() meaning "apply unconditionally, entirely
+  // outside the cross-instance CAS protocol" -- see issueKeyGeneration()
+  // below for the real protocol this opts out of, and each of those
+  // methods' own comments for why this is also each one's default.
+  static constexpr quint64 kUnconditionalGeneration =
+      (std::numeric_limits<quint64>::max)();
+
+  // Mints and returns a fresh, strictly-increasing per-key ISSUANCE
+  // token, shared across every same-process, same-root sibling
+  // AssetCache instance (via the process-wide RootAuthority -- see its
+  // own comment in the .cpp) exactly like m_mutex/m_nextAccessSequence
+  // already are. A caller (in production, exclusively
+  // AssetRequestCoordinator) must call this exactly once, synchronously,
+  // at the moment it BEGINS an operation that may eventually publish a
+  // result for `key` (a fresh network fetch or a conditional
+  // revalidation), and must thread the returned token through to
+  // whichever of store()/touchAfterNotModified()/promoteToMemory()/
+  // updateMemoryDecodedImage() that SAME operation may eventually call
+  // for `key`.
+  //
+  // Each of those methods only actually applies its mutation if the
+  // token it was given is still >= `key`'s current applied watermark AT
+  // THAT MOMENT; invalidate() (called by ANY same-root sibling, not
+  // just this instance) advances that watermark strictly past every
+  // token issued (by ANY sibling) up to the moment it ran -- see
+  // invalidate()'s own comment -- so a token issued strictly before a
+  // concurrent invalidate() can never successfully publish afterward,
+  // closing the "an older, already-in-flight fetch republishes state a
+  // newer, already-applied invalidate() just durably removed" race.
+  // Every one of those methods defaults to kUnconditionalGeneration
+  // (apply unconditionally, never checking or advancing this watermark
+  // at all) for backward compatibility with every pre-existing caller
+  // that never participates in this protocol.
+  [[nodiscard]] quint64 issueKeyGeneration(const QString &key);
+
   // Fast path: memory-only lookup. Review item 11: on a hit, this ALSO
   // refreshes `key`'s PERSISTED on-disk recency witness (monotonic
   // access sequence + wall-clock timestamp), non-durably (see the class
@@ -330,13 +368,35 @@ public:
 
   // Publishes a freshly-fetched entry to both memory and disk. `entry`'s
   // insertedAt/lastAccess timestamps are set to "now" if left at zero.
-  void store(const QString &key, CachedEntry entry);
+  //
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): `issuedGeneration`, when supplied, gates
+  // this publish behind the shared cross-instance CAS protocol -- see
+  // issueKeyGeneration()'s own comment for the full contract. Defaults
+  // to kUnconditionalGeneration (apply unconditionally, exactly this
+  // method's entire prior behavior) so every pre-existing call site --
+  // in particular, this project's own extensive direct fixture-setup
+  // test suite, which seeds cache state directly and never exercises
+  // two same-root sibling instances racing over one key at all --
+  // continues to work with zero changes required. A caller that DOES
+  // need this publish to be safely droppable by a concurrent
+  // invalidate() from a same-root sibling (in production, exclusively
+  // AssetRequestCoordinator) must capture a real token via
+  // issueKeyGeneration() at the moment it begins the operation that
+  // produced `entry`, and pass that token here instead.
+  void store(const QString &key, CachedEntry entry,
+             quint64 issuedGeneration = kUnconditionalGeneration);
 
   // After a successful conditional (304) response: refresh lastAccess (and
   // optionally a renewed ETag/Last-Modified) without touching the payload
   // bytes at all.
-  void touchAfterNotModified(const QString &key, const QString &newEtag,
-                             const QString &newLastModified);
+  //
+  // See store()'s comment for `issuedGeneration`'s exact contract and
+  // default.
+  void
+  touchAfterNotModified(const QString &key, const QString &newEtag,
+                        const QString &newLastModified,
+                        quint64 issuedGeneration = kUnconditionalGeneration);
 
   // Patches an already memory-resident entry's decodedImage in place
   // (recomputing its cost accordingly), if `key` still has one. A no-op if
@@ -347,7 +407,12 @@ public:
   // memory cache for a disk hit that never carried a decoded QImage (only
   // encodedBytes/metadata are ever persisted to disk), so a later
   // lookupMemory() hit for the same key does not need to redecode.
-  void updateMemoryDecodedImage(const QString &key, const QImage &image);
+  //
+  // See store()'s comment for `issuedGeneration`'s exact contract and
+  // default.
+  void
+  updateMemoryDecodedImage(const QString &key, const QImage &image,
+                           quint64 issuedGeneration = kUnconditionalGeneration);
 
   // Unconditionally inserts `entry` into memory (no disk I/O at all --
   // the payload/metadata are assumed already correctly persisted).
@@ -360,7 +425,11 @@ public:
   // right after a successful 304 (confirmed-unchanged) revalidation, so
   // a subsequent same-process request short-circuits via lookupMemory()
   // instead of repeating the conditional GET.
-  void promoteToMemory(const QString &key, CachedEntry entry);
+  //
+  // See store()'s comment for `issuedGeneration`'s exact contract and
+  // default.
+  void promoteToMemory(const QString &key, CachedEntry entry,
+                       quint64 issuedGeneration = kUnconditionalGeneration);
 
   // Round-6 item 6: whether invalidate() managed to durably commit
   // `key`'s tombstone -- i.e. whether the manifest naming its live
@@ -526,6 +595,24 @@ public:
   resolveTrustedDirectoryNoFollowForTesting(const QString &absoluteTargetPath,
                                             bool allowCreateMissingComponents);
 
+  // Test-only, deterministic, UNPRIVILEGED exposure of
+  // mountTransitionIsIndependentlyPolicyQualified() (AssetCache.cpp) --
+  // the independent "is this mount transition's destination actually
+  // policy-qualified" check (real ownership/mode plus, on Linux, a
+  // kernel-recorded trusted-local-filesystem-type record) resolveHome-
+  // DirectoryNoFollow() consults for EVERY mount transition it
+  // considers granting. Lets a test exercise the exact decision
+  // function directly against an ordinary, unprivileged directory
+  // fixture (e.g. one deliberately chmod()'d group/world-writable),
+  // without needing a real mount transition (and therefore without
+  // needing real mount privilege) to reach it at all. Returns
+  // std::nullopt if `directoryPath` itself could not even be opened
+  // no-follow (a test setup failure, distinguishable from the real
+  // policy decision itself).
+  [[nodiscard]] static std::optional<bool>
+  mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+      const QString &directoryPath);
+
   // Test-only, UNPRIVILEGED witness for whether this build actually
   // resolved the kernel's per-mount identifier (Linux 5.8+'s statx()
   // STATX_MNT_ID) for an ordinary directory (`path`) at RUNTIME -- i.e.
@@ -576,6 +663,26 @@ public:
   static void setAuthoritativeAccountHomeDirectoryOverrideForTesting(
       bool active, const QString &value = QString());
 
+  // Test-only, deterministic, UNPRIVILEGED override of
+  // mountTransitionIsIndependentlyPolicyQualified()'s independent
+  // "is this mount transition's destination actually policy-qualified"
+  // filesystem-type evidence (AssetCache.cpp) -- there is no portable,
+  // unprivileged way to make the kernel's own /proc/self/mountinfo (or
+  // its non-Linux equivalent, which does not exist in this project at
+  // all) report an arbitrary filesystem type for an ordinary,
+  // unprivileged test fixture. Lets a test force either answer
+  // deterministically: `active=true, qualified=<value>` makes the
+  // filesystem-type evidence behave as exactly `qualified`, regardless
+  // of the real mount table (this does NOT bypass the real, always-
+  // enforced ownership/mode check, which an unprivileged test can
+  // already exercise directly via chmod()/real file ownership).
+  // `active=false` (the default, and what a test MUST reset back to
+  // before returning, ideally via an RAII scope guard) restores the
+  // real per-platform lookup; production code paths never depend on
+  // this outside of a test binary calling the setter below.
+  static void setMountTransitionPolicyQualificationOverrideForTesting(
+      bool active, bool qualified = false);
+
   // Test-only, deterministic, UNPRIVILEGED injection of an INDETERMINATE
   // (never partial) directory-listing failure -- see
   // listAllEntriesRelativeOnce()/listAllEntriesRelative()'s own comments
@@ -592,6 +699,26 @@ public:
   // this process-wide override never leaks into an unrelated, later
   // test.
   static void setListAllEntriesRelativeForcedFailureForTesting(bool active);
+
+  // Test-only, deterministic simulation of "this process has already
+  // forked without an intervening exec()" -- see
+  // processHasForkedSinceLastExec()'s comment in AssetCache.cpp for the
+  // real mechanism this exercises (a lock-free
+  // std::atomic<pid_t>, written ONLY by the real pthread_atfork()
+  // child-handler in actual production). A real fork() combined with
+  // further Qt/heap object construction in the child is independently
+  // unsafe on this platform (verified: reliably SIGABRTs), an unrelated
+  // general hazard -- this lets a test instead force the EXACT same
+  // observable state a real forked-without-exec child would already be
+  // in, then construct an ordinary, in-process AssetCache and exercise
+  // the real production acquireExclusiveRootOwnershipOrFailClosed()
+  // entry point against it, deterministically and without any real
+  // fork(). `active=true` forces
+  // processHasForkedSinceLastExec() to report true (as if this exact
+  // process had already forked); `active=false` (the default, and what
+  // a test MUST reset back to before returning, ideally via an RAII
+  // scope guard) restores the real, unforced state.
+  static void setForkedSinceLastExecForcedStateForTesting(bool active);
 
 private:
   struct DiskMetadata {
@@ -698,6 +825,42 @@ private:
   // m_mutex (the counter is not independently synchronized) -- see the
   // class comment for the recovery/uniqueness argument.
   [[nodiscard]] quint64 nextAccessSequenceLocked();
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): the read half of the shared cross-instance
+  // issuance/applied-watermark CAS protocol -- see issueKeyGeneration()'s
+  // own (public) comment for the full contract. Callers must already
+  // hold m_mutex. A key never yet published or invalidated implicitly
+  // starts at generation 0.
+  [[nodiscard]] quint64 currentKeyGenerationLocked(const QString &key) const;
+  // The single CAS gate every one of store()/touchAfterNotModified()/
+  // promoteToMemory()/updateMemoryDecodedImage()'s actual mutations goes
+  // through: kUnconditionalGeneration always succeeds (and, matching its
+  // own documented contract, never advances the watermark at all -- a
+  // caller passing it is, by definition, opting out of this protocol
+  // entirely, not merely providing a bypass value that would otherwise
+  // corrupt real participants' own bookkeeping); any other value
+  // succeeds -- applying it as `key`'s new watermark and returning true
+  // -- iff it is not strictly less than `key`'s CURRENT watermark
+  // (i.e. no invalidate() or newer-issued, already-applied publish has
+  // moved past it yet); otherwise returns false, and the caller must
+  // apply NONE of its intended mutation. Callers must already hold
+  // m_mutex.
+  [[nodiscard]] bool tryApplyKeyGenerationLocked(const QString &key,
+                                                 quint64 issuedGeneration);
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): called by invalidate() -- see its own
+  // comment -- to advance `key`'s applied watermark strictly past every
+  // token issueKeyGeneration() has EVER handed out for `key` up to this
+  // exact moment (never merely past the current watermark by one, which
+  // would NOT necessarily exceed a token issued -- but not yet
+  // applied -- moments before this call), so that no already-issued
+  // token can ever successfully tryApplyKeyGenerationLocked() again
+  // after this runs. Also advances the issuance counter itself to match,
+  // so a FUTURE issueKeyGeneration() call for the same key continues to
+  // mint values that are actually capable of satisfying the new
+  // watermark (never permanently stuck behind it). Callers must already
+  // hold m_mutex.
+  void advanceKeyGenerationPastAllIssuedLocked(const QString &key);
   // Round-4/5 review item 4: mints a fresh, unique generation identifier
   // for a single store() transaction -- see DiskMetadata::generationId's
   // comment for why this must be independent of the payload's own
@@ -780,7 +943,29 @@ private:
   // (where a reference member would have to be bound) has already run.
   mutable QMutex *m_mutex{&m_privateMutexFallback};
   mutable QMutex m_privateMutexFallback;
-  QCache<QString, CachedEntry> *m_memory;
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): NEVER this instance's own private memory
+  // cache when disk authority is shared with same-root siblings --
+  // mirrors m_mutex/m_nextAccessSequence exactly (see their own
+  // comments) and RootAuthority's own comment in the .cpp for the full
+  // rationale. Always non-null: defaults to
+  // &m_privateMemoryFallback (used whenever disk is disabled or a
+  // genuinely different process already owns the root) and is
+  // repointed, in the constructor body, at the shared per-root
+  // RootAuthority's own memory cache the moment this instance
+  // successfully joins one.
+  QCache<QString, CachedEntry> *m_memory{&m_privateMemoryFallback};
+  QCache<QString, CachedEntry> m_privateMemoryFallback;
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): the shared halves of the issuance/applied-
+  // watermark CAS protocol -- see issueKeyGeneration()'s own (public)
+  // comment for the full contract. Repointed alongside m_memory above.
+  QHash<QString, quint64> *m_keyIssuedGeneration{
+      &m_privateKeyIssuedGenerationFallback};
+  QHash<QString, quint64> m_privateKeyIssuedGenerationFallback;
+  QHash<QString, quint64> *m_keyAppliedGeneration{
+      &m_privateKeyAppliedGenerationFallback};
+  QHash<QString, quint64> m_privateKeyAppliedGenerationFallback;
   // Review round-3 item 9: an already-open, O_DIRECTORY|O_NOFOLLOW|
   // O_CLOEXEC descriptor for `m_directory`, opened once at construction
   // and retained for this instance's entire lifetime, together with the

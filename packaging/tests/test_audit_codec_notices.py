@@ -26,6 +26,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from hashlib import md5
 from pathlib import Path
 from unittest import mock
 
@@ -1370,6 +1371,91 @@ def _test_grant_execute_permission_to_highest_vaddr_load_segment(path: Path) -> 
     path.write_bytes(bytes(data))
 
 
+def _test_mutate_e_machine(path: Path) -> None:
+    """Directly patches the raw ELF64 header's own e_machine field (a
+    2-byte little-endian value at fixed file offset 0x12) -- simulating
+    a whole-object, different-target-ISA substitution attack (e.g.
+    swapping a real x86-64 plugin for one built for a different
+    architecture entirely) that touches no section's own content, no
+    program header, no `.dynamic` tag, and no PT_LOAD segment topology
+    at all -- which only a check of the ELF header's own identity
+    fields (class/data/type/OSABI/machine) can catch. Round-N+ review
+    (HIGH, "canonical ELF identity misses ELF class/data/type/OSABI/
+    machine")."""
+    data = bytearray(path.read_bytes())
+    e_machine = struct.unpack_from("<H", data, 0x12)[0]
+    # EM_386 (3) is a real, distinct machine value readelf recognizes
+    # by name (as opposed to an arbitrary, possibly-"<unknown>" one),
+    # and is never the real value for a genuine x86-64 build this
+    # project's own toolchain produces (EM_X86_64 == 62).
+    struct.pack_into("<H", data, 0x12, 3 if e_machine != 3 else 4)
+    path.write_bytes(bytes(data))
+
+
+def _test_append_orphan_trailing_load_segment(path: Path) -> None:
+    """Appends a brand-new, genuinely real PT_LOAD program header entry
+    -- together with the arbitrary "malicious" byte content it maps --
+    entirely by APPENDING to the end of the file and relocating the
+    program header TABLE itself into that newly appended region
+    (updating only the ELF header's own e_phoff/e_phnum fields to
+    point at it). Deliberately does NOT touch any existing section
+    header, section content, or existing program header entry at all,
+    and deliberately does NOT add any new section header for the
+    appended bytes -- reproducing, via genuinely real ELF bytes real
+    `readelf` will parse, the round-N+ review's exact "regular trailing
+    data LOAD [segment] passes" finding: section headers are entirely
+    optional, loader-irrelevant metadata (the kernel/dynamic loader
+    only ever consults program headers, never section headers, to map
+    memory), so this is a fully legal ELF object with a real,
+    completely orphan (section-less) LOAD segment an attacker could
+    use to smuggle arbitrary mapped bytes past any section-keyed check.
+    Its own flags are deliberately the exact "RW " triple -- the same
+    shape a genuine patchelf append always carries -- so that only a
+    section-correlation-aware check (not a bare flags-based one) can
+    tell the two apart."""
+    data = bytearray(path.read_bytes())
+    e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+    old_table = data[e_phoff : e_phoff + e_phnum * e_phentsize]
+
+    malicious_content = b"\xde\xad\xbe\xef" * 64
+    malicious_offset = len(data)
+    data.extend(malicious_content)
+
+    PT_LOAD = 1
+    PF_R = 4
+    PF_W = 2
+    # Any p_vaddr congruent to malicious_offset modulo p_align (here
+    # 0x1000) satisfies the ELF spec's own PT_LOAD alignment
+    # constraint; readelf itself never validates that the chosen
+    # address range doesn't overlap another segment (it merely reports
+    # the fields verbatim), so an arbitrary, sufficiently high
+    # placeholder address is sufficient for a parse-only test fixture
+    # -- this object is never actually executed by a real loader.
+    align = 0x1000
+    vaddr = 0x0F000000 + (malicious_offset % align)
+    new_entry = struct.pack(
+        "<IIQQQQQQ",
+        PT_LOAD,
+        PF_R | PF_W,
+        malicious_offset,
+        vaddr,
+        vaddr,
+        len(malicious_content),
+        len(malicious_content),
+        align,
+    )
+
+    new_table_offset = len(data)
+    data.extend(old_table)
+    data.extend(new_entry)
+
+    struct.pack_into("<Q", data, 0x20, new_table_offset)
+    struct.pack_into("<H", data, 0x38, e_phnum + 1)
+    path.write_bytes(bytes(data))
+
+
 def _test_section_virtual_range(path: Path, section_name: str) -> tuple[int, int]:
     """Returns (virtual_address, size) of the named section, parsed via
     `readelf -SW` independently of production code (see the module
@@ -2343,6 +2429,121 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
             audit._canonical_load_digest(mutated),
         )
 
+    def test_read_elf_header_identity_extracts_all_five_fields(self) -> None:
+        # Round-N+ review (HIGH, "canonical ELF identity misses ELF
+        # class/data/type/OSABI/machine"): direct proof
+        # _read_elf_header_identity() actually parses a real object's
+        # own header rather than merely being wired in but silently
+        # returning None.
+        reference = self.root / "header_identity_ref.so"
+        self._build_rich_shared_object(reference)
+        identity = audit._read_elf_header_identity(reference)
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity["class"], "ELF64")
+        self.assertIn("little endian", identity["data"])
+        self.assertIn("DYN", identity["type"])
+        self.assertIn("X86-64", identity["machine"])
+
+    def test_canonical_load_digest_detects_e_machine_substitution(self) -> None:
+        # Round-N+ review (HIGH, "canonical ELF identity misses ELF
+        # class/data/type/OSABI/machine"): a whole-object,
+        # different-target-ISA substitution touches NO section content,
+        # NO program header, and NO `.dynamic` tag at all -- before this
+        # fix, nothing in this digest would have detected it as long as
+        # the substitute coincidentally reused the reference's own
+        # section/segment layout (exactly what this fixture, a byte-
+        # for-byte copy with only e_machine mutated, guarantees).
+        reference = self.root / "machine_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "machine_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        _test_mutate_e_machine(mutated)
+
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertEqual(
+            audit._ordered_load_segment_flags(reference),
+            audit._ordered_load_segment_flags(mutated),
+        )
+        reference_identity = audit._read_elf_header_identity(reference)
+        mutated_identity = audit._read_elf_header_identity(mutated)
+        assert reference_identity is not None and mutated_identity is not None
+        self.assertNotEqual(
+            reference_identity["machine"], mutated_identity["machine"]
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_orphan_appended_trailing_load_segment(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "canonical ELF identity ... strips all
+        # trailing RW LOAD indiscriminately"): the exact "regular
+        # trailing data LOAD [segment] passes" finding, reproduced with
+        # genuinely real ELF bytes real readelf parses -- a brand-new,
+        # real PT_LOAD segment appended with the SAME "RW " flags shape
+        # a genuine patchelf append always carries, but with NO
+        # section-header correlation at all (section headers are
+        # entirely optional, loader-irrelevant metadata; the loader
+        # only ever consults program headers to map memory). The prior,
+        # purely flags-based trailing-strip heuristic would have
+        # silently discarded this from the digest; the section-
+        # correlation-aware fix must not.
+        reference = self.root / "orphan_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "orphan_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        _test_append_orphan_trailing_load_segment(mutated)
+
+        # Sanity: the injected segment really is shaped exactly like a
+        # tolerated, legitimate append (same trailing "RW " flags), so
+        # only the section-correlation check -- not the flags alone --
+        # can tell the two apart.
+        mutated_flags = audit._ordered_load_segment_flags(mutated)
+        self.assertEqual(mutated_flags[-1], "RW ")
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_segment_prefix(reference),
+            audit._canonical_load_segment_prefix(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_load_segment_section_membership_reports_no_sections_for_the_orphan_segment(
+        self,
+    ) -> None:
+        # Direct, non-digest unit proof of
+        # _load_segment_section_membership()'s own contract for exactly
+        # this shape of attack: the orphan trailing segment maps ZERO
+        # section names (never a missing key -- see that function's
+        # own docstring), which is what lets
+        # _canonical_load_segment_prefix() distinguish it from a
+        # genuine, section-correlated patchelf append.
+        mutated = self.root / "orphan_membership_mut.so"
+        self._build_rich_shared_object(mutated)
+        _test_append_orphan_trailing_load_segment(mutated)
+        headers = audit._read_program_headers(mutated)
+        orphan_index = max(
+            (
+                index
+                for index, header in enumerate(headers)
+                if header["type"] == "LOAD"
+            ),
+            key=lambda index: int(headers[index]["vaddr"], 16),
+        )
+        membership = audit._load_segment_section_membership(mutated)
+        self.assertEqual(membership.get(orphan_index, []), [])
+
 
 class PackageProvenanceTests(unittest.TestCase):
     """Round-N+ review (MEDIUM, "libcom_err provenance/version inferred
@@ -2395,6 +2596,7 @@ class PackageProvenanceTests(unittest.TestCase):
                     "package": "libfoo1",
                     "version": "1.2.3-1ubuntu1",
                     "sourcePackage": "foosource",
+                    "dpkgFileIntegrity": "unavailable",
                 },
             )
 
@@ -2676,6 +2878,7 @@ class PackageProvenanceTests(unittest.TestCase):
                 "package": "libfoo1",
                 "version": "1.2.3-1ubuntu1",
                 "sourcePackage": "foosource",
+                "dpkgFileIntegrity": "unavailable",
                 "systemPath": str((system_dir / "libfoo.so.1").resolve()),
                 "systemSha256": audit._sha256(system_dir / "libfoo.so.1"),
                 "bundledCanonicalLoadDigest": "same-digest",
@@ -2930,18 +3133,21 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             return_value=("1.2.3-1ubuntu1", "foosource"),
         ):
             captured = audit.capture_distro_source_provenance(
-                {"libfoo.so.1": resolved_path}
+                {"libfoo.so.1": [resolved_path]}
             )
         self.assertEqual(
             captured,
             {
-                "libfoo.so.1": {
-                    "path": str(resolved_path),
-                    "sha256": audit._sha256(resolved_path),
-                    "package": "libfoo1",
-                    "version": "1.2.3-1ubuntu1",
-                    "sourcePackage": "foosource",
-                }
+                "libfoo.so.1": [
+                    {
+                        "path": str(resolved_path),
+                        "sha256": audit._sha256(resolved_path),
+                        "package": "libfoo1",
+                        "version": "1.2.3-1ubuntu1",
+                        "sourcePackage": "foosource",
+                        "dpkgFileIntegrity": "unavailable",
+                    }
+                ]
             },
         )
 
@@ -2950,9 +3156,13 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
     ) -> None:
         # A resolved path that no longer exists, or is not dpkg-owned
         # at all (e.g. a project-vendored library `ldd` also happens to
-        # resolve), is honestly omitted rather than fabricating a
-        # record -- exactly like every other provenance mechanism in
-        # this module already does.
+        # resolve), is honestly omitted from that soname's candidate
+        # list rather than fabricating a record -- exactly like every
+        # other provenance mechanism in this module already does. The
+        # soname key itself is still present, mapped to an empty list
+        # (Round-N+ review, "distro provenance collapses identity"):
+        # this lets a caller distinguish "we tried, but nothing was
+        # dpkg-provable" from "this soname was never even a candidate".
         missing_path = self.tmp_path / "does-not-exist.so.1"
         unowned_path = self.tmp_path / "libunowned.so.1"
         unowned_path.write_bytes(b"\x00")
@@ -2960,9 +3170,46 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             audit, "_dpkg_owning_package", return_value=None
         ):
             captured = audit.capture_distro_source_provenance(
-                {"missing.so.1": missing_path, "libunowned.so.1": unowned_path}
+                {"missing.so.1": [missing_path], "libunowned.so.1": [unowned_path]}
             )
-        self.assertEqual(captured, {})
+        self.assertEqual(captured, {"missing.so.1": [], "libunowned.so.1": []})
+
+    def test_capture_distro_source_provenance_preserves_distinct_requester_resolutions(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "distro provenance collapses identity
+        # ... keyed SONAME/basename overwrites different requester
+        # resolutions"): two different first-party requesters resolve
+        # the SAME soname to two DIFFERENT real, dpkg-owned files --
+        # both must survive as distinct candidates, never collapsed to
+        # a single "winner".
+        path_a = self.tmp_path / "a" / "libshared.so.1"
+        path_a.parent.mkdir()
+        path_a.write_bytes(b"\x00")
+        path_b = self.tmp_path / "b" / "libshared.so.1"
+        path_b.parent.mkdir()
+        path_b.write_bytes(b"\x01")
+
+        def fake_dpkg_owning_package(path: Path) -> str | None:
+            return {path_a: "pkg-a", path_b: "pkg-b"}.get(path)
+
+        def fake_dpkg_package_metadata(package: str) -> tuple[str, str]:
+            return {
+                "pkg-a": ("1.0-1", "source-a"),
+                "pkg-b": ("2.0-1", "source-b"),
+            }[package]
+
+        with mock.patch.object(
+            audit, "_dpkg_owning_package", side_effect=fake_dpkg_owning_package
+        ), mock.patch.object(
+            audit, "_dpkg_package_metadata", side_effect=fake_dpkg_package_metadata
+        ):
+            captured = audit.capture_distro_source_provenance(
+                {"libshared.so.1": [path_a, path_b]}
+            )
+        self.assertEqual(len(captured["libshared.so.1"]), 2)
+        packages = {entry["package"] for entry in captured["libshared.so.1"]}
+        self.assertEqual(packages, {"pkg-a", "pkg-b"})
 
     def test_bind_to_captured_provenance_returns_not_found_when_absent_from_manifest(
         self,
@@ -2989,13 +3236,15 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         # time and this classify invocation.
         captured_path.write_bytes(b"\xff\xffdecoy-substituted-content")
         manifest = {
-            "libfoo.so.1": {
-                "path": str(captured_path),
-                "sha256": original_sha256,
-                "package": "libfoo1",
-                "version": "1.2.3-1ubuntu1",
-                "sourcePackage": "foosource",
-            }
+            "libfoo.so.1": [
+                {
+                    "path": str(captured_path),
+                    "sha256": original_sha256,
+                    "package": "libfoo1",
+                    "version": "1.2.3-1ubuntu1",
+                    "sourcePackage": "foosource",
+                }
+            ]
         }
         bundled_lib = self.tmp_path / "bundled" / "libfoo.so.1"
         bundled_lib.parent.mkdir()
@@ -3010,20 +3259,23 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         self,
     ) -> None:
         manifest = {
-            "libfoo.so.1": {
-                "path": str(self.tmp_path / "gone" / "libfoo.so.1"),
-                "sha256": "deadbeef",
-                "package": "libfoo1",
-                "version": "1.2.3-1ubuntu1",
-                "sourcePackage": "foosource",
-            }
+            "libfoo.so.1": [
+                {
+                    "path": str(self.tmp_path / "gone" / "libfoo.so.1"),
+                    "sha256": "deadbeef",
+                    "package": "libfoo1",
+                    "version": "1.2.3-1ubuntu1",
+                    "sourcePackage": "foosource",
+                }
+            ]
         }
         bundled_lib = self.tmp_path / "libfoo.so.1"
         bundled_lib.write_bytes(b"\x00")
         binding = audit.bind_bundled_library_to_captured_provenance(
             bundled_lib, manifest
         )
-        self.assertEqual(binding, {"status": "not_found"})
+        self.assertEqual(binding["status"], "content_mismatch")
+        self.assertEqual(binding["candidateCount"], 1)
 
     def test_bind_to_captured_provenance_detects_content_mismatch_against_bundled(
         self,
@@ -3036,13 +3288,15 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         captured_path.parent.mkdir()
         captured_path.write_bytes(b"\x00\x01")
         manifest = {
-            "libfoo.so.1": {
-                "path": str(captured_path),
-                "sha256": audit._sha256(captured_path),
-                "package": "libfoo1",
-                "version": "1.2.3-1ubuntu1",
-                "sourcePackage": "foosource",
-            }
+            "libfoo.so.1": [
+                {
+                    "path": str(captured_path),
+                    "sha256": audit._sha256(captured_path),
+                    "package": "libfoo1",
+                    "version": "1.2.3-1ubuntu1",
+                    "sourcePackage": "foosource",
+                }
+            ]
         }
         bundled_lib = self.tmp_path / "bundled" / "libfoo.so.1"
         bundled_lib.parent.mkdir()
@@ -3065,13 +3319,15 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         captured_path.parent.mkdir()
         captured_path.write_bytes(b"\x00\x01")
         manifest = {
-            "libfoo.so.1": {
-                "path": str(captured_path),
-                "sha256": audit._sha256(captured_path),
-                "package": "libfoo1",
-                "version": "1.2.3-1ubuntu1",
-                "sourcePackage": "foosource",
-            }
+            "libfoo.so.1": [
+                {
+                    "path": str(captured_path),
+                    "sha256": audit._sha256(captured_path),
+                    "package": "libfoo1",
+                    "version": "1.2.3-1ubuntu1",
+                    "sourcePackage": "foosource",
+                }
+            ]
         }
         bundled_lib = self.tmp_path / "bundled" / "libfoo.so.1"
         bundled_lib.parent.mkdir()
@@ -3086,6 +3342,8 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             binding,
             {
                 "status": "matched",
+                "path": str(captured_path),
+                "sha256": audit._sha256(captured_path),
                 "package": "libfoo1",
                 "version": "1.2.3-1ubuntu1",
                 "sourcePackage": "foosource",
@@ -3095,14 +3353,64 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             },
         )
 
+    def test_bind_to_captured_provenance_matches_second_candidate_when_first_disagrees(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "distro provenance collapses identity
+        # ... keyed SONAME/basename overwrites different requester
+        # resolutions"): TWO distinct requesters resolved the same
+        # soname to two different real files; the bundled copy only
+        # needs to genuinely match ONE of them to be legitimate.
+        first_candidate = self.tmp_path / "first" / "libshared.so.1"
+        first_candidate.parent.mkdir()
+        first_candidate.write_bytes(b"\x00\x01")
+        second_candidate = self.tmp_path / "second" / "libshared.so.1"
+        second_candidate.parent.mkdir()
+        second_candidate.write_bytes(b"\x02\x03")
+        manifest = {
+            "libshared.so.1": [
+                {
+                    "path": str(first_candidate),
+                    "sha256": audit._sha256(first_candidate),
+                    "package": "pkg-a",
+                    "version": "1.0-1",
+                    "sourcePackage": "source-a",
+                },
+                {
+                    "path": str(second_candidate),
+                    "sha256": audit._sha256(second_candidate),
+                    "package": "pkg-b",
+                    "version": "2.0-1",
+                    "sourcePackage": "source-b",
+                },
+            ]
+        }
+        bundled_lib = self.tmp_path / "bundled" / "libshared.so.1"
+        bundled_lib.parent.mkdir()
+        bundled_lib.write_bytes(b"\x02\x03")
+        with mock.patch.object(
+            audit,
+            "_canonical_load_digest",
+            side_effect=lambda p: {
+                first_candidate: "digest-first",
+                second_candidate: "digest-second",
+                bundled_lib: "digest-second",
+            }[p],
+        ):
+            binding = audit.bind_bundled_library_to_captured_provenance(
+                bundled_lib, manifest
+            )
+        self.assertEqual(binding["status"], "matched")
+        self.assertEqual(binding["sourcePackage"], "source-b")
+
     def test_load_distro_provenance_manifest_round_trips_real_json(self) -> None:
         manifest_path = self.tmp_path / "manifest.json"
         manifest_path.write_text(
-            json.dumps({"libfoo.so.1": {"path": "/x", "sha256": "abc"}})
+            json.dumps({"libfoo.so.1": [{"path": "/x", "sha256": "abc"}]})
         )
         self.assertEqual(
             audit.load_distro_provenance_manifest(manifest_path),
-            {"libfoo.so.1": {"path": "/x", "sha256": "abc"}},
+            {"libfoo.so.1": [{"path": "/x", "sha256": "abc"}]},
         )
 
     def test_load_distro_provenance_manifest_rejects_missing_file(self) -> None:
@@ -3278,9 +3586,14 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             "when resolve_ldd_dependencies() reports zero dependencies "
             "referencing it (dlopen-only, never DT_NEEDED-linked)",
         )
-        self.assertEqual(manifest["libsecret-1.so.0"]["path"], str(libsecret_input))
-        self.assertEqual(manifest["libsecret-1.so.0"]["package"], "libsecret-1-0")
-        self.assertEqual(manifest["libsecret-1.so.0"]["sourcePackage"], "libsecret")
+        self.assertEqual(len(manifest["libsecret-1.so.0"]), 1)
+        self.assertEqual(
+            manifest["libsecret-1.so.0"][0]["path"], str(libsecret_input)
+        )
+        self.assertEqual(manifest["libsecret-1.so.0"][0]["package"], "libsecret-1-0")
+        self.assertEqual(
+            manifest["libsecret-1.so.0"][0]["sourcePackage"], "libsecret"
+        )
         # The real dependency captured from the executable's own real
         # ldd resolution must still be present too -- the fix is purely
         # additive.
@@ -3350,7 +3663,13 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             )
         self.assertEqual(exit_code, 0)
         manifest = json.loads(output_path.read_text())
-        self.assertEqual(manifest["libz.so.1"]["path"], str(libz_input))
+        # Both the dependency-derived resolution (from scanning
+        # qt_plugin) and the explicit self-entry resolve to the exact
+        # same real path, so they dedupe to a single candidate --
+        # never silently discarding either, and never fabricating a
+        # spurious second, duplicate candidate for the identical file.
+        self.assertEqual(len(manifest["libz.so.1"]), 1)
+        self.assertEqual(manifest["libz.so.1"][0]["path"], str(libz_input))
 
 
 class QtSdkBundledProvenanceTests(unittest.TestCase):
@@ -3387,10 +3706,9 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
     ) -> None:
         bundled = self.root / "libicudata.so.73"
         bundled.write_bytes(_FAKE_ELF_BYTES)
-        self.assertEqual(
-            audit.bind_bundled_library_to_qt_sdk_provenance(bundled, None),
-            {"status": "qt_reference_dir_unavailable"},
-        )
+        binding = audit.bind_bundled_library_to_qt_sdk_provenance(bundled, None)
+        self.assertEqual(binding["status"], "qt_reference_dir_unavailable")
+        self.assertIn("allowedTransform", binding)
 
     def test_bind_qt_sdk_returns_not_found_when_reference_copy_absent(
         self,
@@ -3449,11 +3767,33 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
     def test_validate_qt_sdk_provenance_no_op_when_reference_dir_unavailable(
         self,
     ) -> None:
+        # require_provenance=False remains a legitimate, honest no-op:
+        # a caller that never even attempted to supply --qt-reference-
+        # dir at all (this module's own basename-only classification
+        # unit tests, or a non-CI/non-required invocation) is not
+        # asserting anything about Qt SDK provenance to begin with.
         self.assertIsNone(
             audit.validate_bundled_library_qt_sdk_provenance(
-                "icu", {"status": "qt_reference_dir_unavailable"}, True
+                "icu", {"status": "qt_reference_dir_unavailable"}, False
             )
         )
+
+    def test_validate_qt_sdk_provenance_rejects_reference_dir_unavailable_when_required(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "require_provenance accepts
+        # qt_reference_dir_unavailable"): this is the exact scenario
+        # this project's own pinned `ubuntu-22.04` `appimage-smoke` CI
+        # job passing --require-package-provenance must never silently
+        # tolerate -- an accidentally-omitted --qt-reference-dir flag
+        # must hard-fail, never silently pass as "nothing to check
+        # here", exactly mirroring "not_found"'s own require_provenance
+        # semantics.
+        problem = audit.validate_bundled_library_qt_sdk_provenance(
+            "icu", {"status": "qt_reference_dir_unavailable"}, True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("icu", problem)
 
     def test_validate_qt_sdk_provenance_rejects_not_found_only_when_required(
         self,
@@ -3480,12 +3820,55 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
         self.assertIn("icu", problem)
 
     def test_validate_qt_sdk_provenance_accepts_matched(self) -> None:
-        binding = {"status": "matched", "referencePath": "/qt/lib/libicudata.so.73"}
+        binding = {
+            "status": "matched",
+            "referencePath": "/qt/lib/libicudata.so.73",
+            "sdkVersion": audit.EXPECTED_QT_SDK_VERSION,
+        }
         self.assertIsNone(
             audit.validate_bundled_library_qt_sdk_provenance(
                 "icu", binding, require_provenance=True
             )
         )
+
+    def test_validate_qt_sdk_provenance_rejects_sdk_version_drift_unconditionally(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "sdkVersion ... trusted with zero
+        # cross-check against anything the module itself governs"): a
+        # binding claiming a DIFFERENT Qt SDK version than this
+        # project's own governed EXPECTED_QT_SDK_VERSION pin is a real,
+        # reported failure -- unconditionally, even without
+        # require_provenance, exactly like a distro package's own
+        # exact-version pin.
+        binding = {
+            "status": "matched",
+            "referencePath": "/qt/lib/libicudata.so.73",
+            "sdkVersion": "1.2.3-not-the-real-pinned-version",
+        }
+        problem = audit.validate_bundled_library_qt_sdk_provenance("icu", binding)
+        self.assertIsNotNone(problem)
+        self.assertIn("icu", problem)
+        self.assertIn("1.2.3-not-the-real-pinned-version", problem)
+
+    def test_validate_qt_sdk_provenance_requires_sdk_version_when_provenance_required(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH): a "matched" binding with NO
+        # "sdkVersion" at all (--qt-sdk-version was never supplied to
+        # this exact invocation) must itself hard-fail once
+        # require_provenance is True -- the governed pin can only ever
+        # protect a run that actually supplies something to check it
+        # against.
+        binding = {"status": "matched", "referencePath": "/qt/lib/libicudata.so.73"}
+        self.assertIsNone(
+            audit.validate_bundled_library_qt_sdk_provenance("icu", binding)
+        )
+        problem = audit.validate_bundled_library_qt_sdk_provenance(
+            "icu", binding, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("icu", problem)
 
     def test_cmd_classify_uses_qt_sdk_provenance_for_icu_never_dpkg(self) -> None:
         # End-to-end regression test for the actual CI failure: on a
@@ -3552,6 +3935,8 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
                     "--require-package-provenance",
                     "--distro-provenance-manifest",
                     str(manifest_path),
+                    "--qt-sdk-version",
+                    audit.EXPECTED_QT_SDK_VERSION,
                 ]
             )
         self.assertEqual(exit_code, 0, stderr.getvalue())
@@ -4388,6 +4773,92 @@ class DpkgOwningPackageUsrMergePathFormTests(unittest.TestCase):
         self.assertEqual(queried, ["/opt/qt/lib/libQt6Core.so.6"])
 
 
+class DpkgRecordedFileMd5UsrMergePathFormTests(unittest.TestCase):
+    """Docker/`ubuntu:22.04` validation of this exact PR (real dpkg,
+    real installed zlib1g) surfaced a SECOND, independent usrmerge path-
+    form gap from the one `DpkgOwningPackageUsrMergePathFormTests`
+    above already covers: `_dpkg_owning_package()` bridges the gap for
+    `dpkg -S <path>` subprocess queries, but `_dpkg_recorded_file_md5()`
+    is a completely separate code path -- it parses a package's own
+    `.md5sums` FILE CONTENT directly rather than invoking `dpkg -S` --
+    and, before this fix, matched only the single, literal resolved-
+    path form, with no usrmerge fallback of its own at all. Real
+    zlib1g on a real `ubuntu:22.04` container records
+    `lib/x86_64-linux-gnu/libz.so.1.2.11` (pre-merge form) in its
+    `.md5sums`, while `Path.resolve()` on the live, merged-/usr
+    filesystem returns `/usr/lib/x86_64-linux-gnu/libz.so.1.2.11` --
+    so the old code always reported "no matching entry" (silently
+    degrading to `dpkgFileIntegrity: unavailable`) for this and nearly
+    every other real system library under a merged-/usr top-level
+    directory, never actually verifying real file integrity at all.
+    These tests reproduce the exact fail-before/pass-after shape using
+    a real temporary `.md5sums` file (no real dpkg database needed --
+    portable and deterministic on any host)."""
+
+    def test_matches_a_pre_merge_recorded_path_from_a_post_merge_resolved_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            info_dir = Path(tmp) / "info"
+            info_dir.mkdir()
+            (info_dir / "zlib1g.md5sums").write_text(
+                "e6e98f694c050c5daa6a622672bdbf4d  "
+                "lib/x86_64-linux-gnu/libz.so.1.2.11\n"
+            )
+            with mock.patch.object(audit, "_DPKG_INFO_DIR", info_dir):
+                recorded = audit._dpkg_recorded_file_md5(
+                    "zlib1g",
+                    Path("/usr/lib/x86_64-linux-gnu/libz.so.1.2.11"),
+                )
+        self.assertEqual(recorded, "e6e98f694c050c5daa6a622672bdbf4d")
+
+    def test_matches_a_post_merge_recorded_path_from_a_pre_merge_resolved_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            info_dir = Path(tmp) / "info"
+            info_dir.mkdir()
+            (info_dir / "somepkg.md5sums").write_text(
+                "0123456789abcdef0123456789abcdef  "
+                "usr/lib/x86_64-linux-gnu/libsomething.so.1\n"
+            )
+            with mock.patch.object(audit, "_DPKG_INFO_DIR", info_dir):
+                recorded = audit._dpkg_recorded_file_md5(
+                    "somepkg",
+                    Path("/lib/x86_64-linux-gnu/libsomething.so.1"),
+                )
+        self.assertEqual(recorded, "0123456789abcdef0123456789abcdef")
+
+    def test_does_not_add_a_usrmerge_candidate_for_an_unrelated_top_level_path(
+        self,
+    ) -> None:
+        """A path outside the classic usrmerge compatibility directories
+        (e.g. a Qt SDK reference tree under `/opt/qt/...`) must never be
+        matched against a synthetic, meaningless alternate form -- an
+        entry recorded at `opt/qt/lib/libQt6Core.so.6` must not satisfy
+        a lookup for `usr/opt/qt/lib/libQt6Core.so.6` or vice versa."""
+        candidates = audit._merged_usr_relative_path_candidates(
+            Path("/opt/qt/lib/libQt6Core.so.6")
+        )
+        self.assertEqual(candidates, frozenset({"opt/qt/lib/libQt6Core.so.6"}))
+
+    def test_candidate_set_is_exactly_two_forms_for_a_usrmerge_directory(
+        self,
+    ) -> None:
+        candidates = audit._merged_usr_relative_path_candidates(
+            Path("/usr/lib/x86_64-linux-gnu/libz.so.1.2.11")
+        )
+        self.assertEqual(
+            candidates,
+            frozenset(
+                {
+                    "usr/lib/x86_64-linux-gnu/libz.so.1.2.11",
+                    "lib/x86_64-linux-gnu/libz.so.1.2.11",
+                }
+            ),
+        )
+
+
 @unittest.skipUnless(
     shutil.which("dpkg") and shutil.which("dpkg-query") and shutil.which("ldd"),
     "requires a real Debian/Ubuntu dpkg database and ldd to authenticate a "
@@ -4414,11 +4885,13 @@ class RealCaptureDistroSourceProvenancePathFormTests(unittest.TestCase):
             self.skipTest(
                 "ldd resolved zero dependencies for the real dpkg binary"
             )
-        captured = audit.capture_distro_source_provenance(resolved)
+        captured = audit.capture_distro_source_provenance(
+            {soname: [path] for soname, path in resolved.items()}
+        )
         missing_but_real = {
             soname: path
             for soname, path in resolved.items()
-            if soname not in captured and path.is_file()
+            if not captured.get(soname) and path.is_file()
         }
         # A real dependency may still legitimately be omitted if it is
         # genuinely not dpkg-owned on this host (e.g. a locally built
@@ -4434,6 +4907,116 @@ class RealCaptureDistroSourceProvenancePathFormTests(unittest.TestCase):
                 f"it IS really dpkg-owned -- this is exactly the "
                 f"path-form regression this test class guards against",
             )
+
+
+@unittest.skipUnless(
+    shutil.which("dpkg-query") is not None and Path("/var/lib/dpkg/info").is_dir(),
+    "requires a real Debian/Ubuntu dpkg database to authenticate a genuine "
+    "system library's own architecture/per-file integrity record",
+)
+class RealDpkgArchitectureAndFileIntegrityTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "distro provenance collapses identity ...
+    arch stripped" / "substituted self-consistent bytes pass"): proves
+    _dpkg_package_architecture()/_dpkg_recorded_file_md5()/
+    _dpkg_full_provenance_record() against a REAL dpkg database, never
+    only mocks -- libz.so.1 (zlib1g) is used for the same "always
+    already installed, no network/apt-get needed" reason
+    RealSystemPackageProvenanceTests does."""
+
+    def _real_libz_path(self) -> Path | None:
+        for search_dir in audit._SYSTEM_LIBRARY_SEARCH_DIRS:
+            candidate = search_dir / "libz.so.1"
+            if candidate.exists():
+                return candidate.resolve()
+        return None
+
+    def test_dpkg_package_architecture_reports_a_real_debian_architecture(
+        self,
+    ) -> None:
+        libz_path = self._real_libz_path()
+        if libz_path is None:
+            self.skipTest("no real libz.so.1 system copy found on this host")
+        package = audit._dpkg_owning_package(libz_path)
+        if package is None:
+            self.skipTest("real libz.so.1 copy is not dpkg-owned on this host")
+        architecture = audit._dpkg_package_architecture(package)
+        self.assertIsNotNone(architecture)
+        # A real dpkg-reported architecture is never empty/whitespace;
+        # the EXACT expected value (amd64) is asserted by
+        # EXPECTED_DISTRO_PACKAGE_ARCHITECTURE's own consuming
+        # validate_bundled_library_package_provenance() test coverage
+        # below -- this test only proves the raw dpkg-query plumbing
+        # itself returns a real, non-degenerate value.
+        self.assertTrue(architecture)
+
+    def test_dpkg_recorded_file_md5_matches_a_real_unmodified_system_file(
+        self,
+    ) -> None:
+        libz_path = self._real_libz_path()
+        if libz_path is None:
+            self.skipTest("no real libz.so.1 system copy found on this host")
+        package = audit._dpkg_owning_package(libz_path)
+        if package is None:
+            self.skipTest("real libz.so.1 copy is not dpkg-owned on this host")
+        recorded = audit._dpkg_recorded_file_md5(package, libz_path)
+        if recorded is None:
+            self.skipTest(
+                f"dpkg has no md5sums database entry for {package!r} on "
+                "this host"
+            )
+        actual = md5(libz_path.read_bytes()).hexdigest()
+        self.assertEqual(
+            recorded,
+            actual,
+            "dpkg's own recorded install-time checksum for the REAL, "
+            "unmodified system libz.so.1 must agree with that file's "
+            "own current content -- if this ever disagrees on a real, "
+            "untampered host, _dpkg_recorded_file_md5()'s own path-"
+            "matching logic (not the system itself) is broken",
+        )
+
+    def test_dpkg_full_provenance_record_detects_local_tampering_of_a_real_file(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "substituted self-consistent bytes
+        # pass"): copy the REAL system libz.so.1 to a scratch path,
+        # locally tamper with its bytes, then force _dpkg_owning_
+        # package()/_dpkg_package_metadata() to (correctly, honestly)
+        # report the REAL package/version for that scratch path -- the
+        # exact "package/version metadata untouched, but the actual
+        # file bytes were replaced locally" scenario dpkg's own
+        # per-file md5 (not the version string) is the only thing that
+        # can catch.
+        libz_path = self._real_libz_path()
+        if libz_path is None:
+            self.skipTest("no real libz.so.1 system copy found on this host")
+        package = audit._dpkg_owning_package(libz_path)
+        if package is None:
+            self.skipTest("real libz.so.1 copy is not dpkg-owned on this host")
+        recorded = audit._dpkg_recorded_file_md5(package, libz_path)
+        if recorded is None:
+            self.skipTest(
+                f"dpkg has no md5sums database entry for {package!r} on "
+                "this host"
+            )
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            scratch_path = Path(scratch_dir) / "libz.so.1"
+            original_bytes = libz_path.read_bytes()
+            scratch_path.write_bytes(original_bytes + b"\x00tampered-locally")
+            with mock.patch.object(
+                audit, "_dpkg_owning_package", return_value=package
+            ), mock.patch.object(
+                audit,
+                "_dpkg_recorded_file_md5",
+                side_effect=lambda pkg, path: (
+                    recorded if path == scratch_path else None
+                ),
+            ):
+                record = audit._dpkg_full_provenance_record(scratch_path)
+            self.assertIsNotNone(record)
+            self.assertEqual(record["dpkgFileIntegrity"], "mismatch")
+            self.assertEqual(record["dpkgRecordedMd5"], recorded)
+            self.assertNotEqual(record["dpkgActualMd5"], recorded)
 
 
 if __name__ == "__main__":

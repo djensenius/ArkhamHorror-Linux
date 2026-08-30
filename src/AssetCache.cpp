@@ -14,7 +14,9 @@
 #include <QStandardPaths>
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -292,6 +294,26 @@ std::atomic<bool> g_forceMountIdUnavailableForTesting{false};
 // flag itself is observed true.
 std::atomic<bool> g_authoritativeAccountHomeOverrideActiveForTesting{false};
 QString g_authoritativeAccountHomeOverrideValueForTesting;
+
+// Cumulative review (independent re-review, MEDIUM, "home trust still
+// pathname-only"): mountTransitionIsIndependentlyPolicyQualified()'s
+// real implementation (below) consults the kernel's own
+// /proc/self/mountinfo record on Linux, which this project has no
+// portable, unprivileged way to substitute a FAKE answer for (an
+// ordinary process cannot plant an arbitrary filesystem-type record
+// into the kernel's own mount table without real mount privilege). This
+// process-wide, test-only override lets a test force either answer
+// deterministically -- proving both the "an untrusted/unrecognized
+// filesystem type is refused even with perfect ownership/mode" and "a
+// trusted filesystem type is accepted" branches of the real decision
+// function, hermetically, without needing real mount privilege at all.
+// `g_..Active` false (the default, and what a test MUST reset back to
+// before returning, ideally via an RAII scope guard) means "use the
+// real /proc/self/mountinfo lookup (Linux) or the conservative
+// non-Linux refusal, unmodified"; production code paths never depend on
+// this outside of a test binary calling the setter below.
+std::atomic<bool> g_forceMountTransitionPolicyOverrideActiveForTesting{false};
+std::atomic<bool> g_forceMountTransitionPolicyOverrideValueForTesting{false};
 
 // Test-only, deterministic, UNPRIVILEGED injection of an INDETERMINATE
 // directory-listing failure -- see
@@ -1316,6 +1338,169 @@ std::optional<QString> authoritativeAccountHomeDirectory() {
 #endif
 }
 
+// Cumulative review (independent re-review, MEDIUM, "home trust still
+// pathname-only"): $HOME==account-database-home text equality alone
+// (authoritativeAccountHomeDirectory(), above) proves ONLY that the
+// account database agrees on the PATH; it says nothing at all about
+// WHO owns, or how permissive the mode of, the directory a mount
+// transition would actually land on -- a hostile mount (or a
+// misconfigured shared/multi-user host) could still plant something
+// group- or world-writable, or owned by a different uid entirely,
+// exactly at that authenticated path. Every transition this project
+// ever grants (not merely the walk's first/only one -- see the sibling
+// mount-identity-policy check below for why a real SteamOS-style
+// topology legitimately needs MORE than one) must independently satisfy
+// this OWNERSHIP/MODE policy on the resulting directory: owned by
+// exactly this process's own real uid, and never writable by group or
+// other. fstat() (not the AT_SYMLINK_NOFOLLOW-guarded fstatat() used
+// earlier in this same walk) is used here deliberately: `fd` is already
+// an OPEN, already-no-follow-verified directory descriptor at this
+// point, so this call can never itself race or re-resolve any path
+// component at all.
+bool directoryDescriptorPassesOwnerAndModePolicy(int fd) {
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    return false;
+  }
+  if (st.st_uid != ::getuid()) {
+    return false;
+  }
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    return false;
+  }
+  return true;
+}
+
+#if defined(__linux__)
+// Cumulative review (independent re-review, MEDIUM, "home trust still
+// pathname-only" -- "trusted deployment/mount identity independently
+// established"): ownership/mode alone still cannot distinguish an
+// ordinary, locally-backed mount (a real dedicated "/home" partition,
+// or SteamOS's own "/home/deck" split) from a hostile or simply
+// unsuitable mount an attacker (or a misconfigured deployment) placed
+// at the exact same authenticated path with innocuous-looking
+// ownership/mode -- e.g. a FUSE-backed or network filesystem an
+// unprivileged, co-located process/service can still influence the
+// CONTENTS of at any moment, an assumption this project's whole
+// "beneath home is trusted, single-owner, no other process mutates it
+// concurrently" cache model depends on. /proc/self/mountinfo is the
+// kernel's own authoritative record of every mount's real filesystem
+// TYPE, completely independent of anything userspace (or this
+// traversal's own prior steps) computed -- this project trusts only a
+// small, explicit allowlist of ordinary LOCAL filesystem types known to
+// behave like a normal, single-owner block/tmpfs-backed mount; anything
+// else (nfs, cifs, sshfs, any fuse.* type, 9p, etc.) is refused, no
+// matter how ownership/mode otherwise look.
+const QSet<QString> &trustedLocalMountFilesystemTypes() {
+  static const QSet<QString> types = {
+      QStringLiteral("ext2"),  QStringLiteral("ext3"),
+      QStringLiteral("ext4"),  QStringLiteral("xfs"),
+      QStringLiteral("btrfs"), QStringLiteral("f2fs"),
+      QStringLiteral("tmpfs"), QStringLiteral("overlay"),
+  };
+  return types;
+}
+
+// True iff /proc/self/mountinfo records `canonicalMountPoint` (which
+// MUST already be an absolute, kernel-canonicalized path -- see this
+// function's own call site, which derives it from
+// /proc/self/fd/<already-open-directory-fd> via readlink(), never from
+// any caller-supplied or re-resolved path string) as an ACTUAL mount
+// point whose filesystem type is in the trusted-local allowlist above.
+// mountinfo's documented format is
+// "id parentId major:minor root mountPoint options [tags] - fstype
+// source superOptions"; when the SAME mount point appears more than
+// once (a later mount stacked directly on top of an earlier one at the
+// identical path -- ordinary, valid mount-table behaviour), the LAST
+// matching line is authoritative, matching the kernel's own current
+// view exactly.
+bool mountPointHasTrustedLocalFilesystemType(
+    const QString &canonicalMountPoint) {
+  if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
+          std::memory_order_acquire)) {
+    return g_forceMountTransitionPolicyOverrideValueForTesting.load(
+        std::memory_order_acquire);
+  }
+  QFile mountinfo(QStringLiteral("/proc/self/mountinfo"));
+  if (!mountinfo.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    return false;
+  }
+  bool found = false;
+  bool trusted = false;
+  while (!mountinfo.atEnd()) {
+    const QString line = QString::fromUtf8(mountinfo.readLine());
+    const int dashIndex = line.indexOf(QStringLiteral(" - "));
+    if (dashIndex < 0) {
+      continue;
+    }
+    const QStringList beforeDash =
+        line.left(dashIndex).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    // Fields, in order: 0 mount-id, 1 parent-id, 2 major:minor, 3 root,
+    // 4 mount point, then options/optional tags -- only field 4 is
+    // needed here.
+    if (beforeDash.size() < 5) {
+      continue;
+    }
+    if (beforeDash.at(4) != canonicalMountPoint) {
+      continue;
+    }
+    const QStringList afterDash =
+        line.mid(dashIndex + 3).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    if (afterDash.isEmpty()) {
+      continue;
+    }
+    found = true;
+    trusted = trustedLocalMountFilesystemTypes().contains(afterDash.at(0));
+  }
+  return found && trusted;
+}
+#endif
+
+// Cumulative review (independent re-review, MEDIUM, "home trust still
+// pathname-only"): the independent "is this mount transition's
+// destination actually policy-qualified" check --
+// directoryDescriptorPassesOwnerAndModePolicy() PLUS, on Linux, the
+// kernel's own mountinfo filesystem-type record -- consulted for EVERY
+// mount transition this walk permits, not merely a single, hard-coded
+// "first one wins" position (see resolveHomeDirectoryNoFollow()'s own
+// comment for why capping this at exactly one transition was itself
+// part of the defect: a real SteamOS-style deployment can legitimately
+// need more than one, e.g. a dedicated "/home" partition AND a further
+// per-user data mount beneath it -- each must independently qualify,
+// with no artificial ceiling on how many organically occur). On a
+// non-Linux platform, there is no equivalent independent kernel-level
+// mount-identity source this project can consult at all (no
+// /proc/self/mountinfo equivalent is used elsewhere in this file
+// either) -- ownership/mode alone is not, by itself, sufficient
+// evidence of a TRUSTED mount origin, so this conservatively refuses
+// every transition there unless a test has explicitly forced a
+// deterministic answer via the override below.
+bool mountTransitionIsIndependentlyPolicyQualified(int fd) {
+  if (!directoryDescriptorPassesOwnerAndModePolicy(fd)) {
+    return false;
+  }
+#if defined(__linux__)
+  char procFdPath[64];
+  std::snprintf(procFdPath, sizeof(procFdPath), "/proc/self/fd/%d", fd);
+  char resolved[PATH_MAX];
+  const ssize_t resolvedLen =
+      ::readlink(procFdPath, resolved, sizeof(resolved) - 1);
+  if (resolvedLen <= 0) {
+    return false;
+  }
+  resolved[resolvedLen] = '\0';
+  return mountPointHasTrustedLocalFilesystemType(
+      QString::fromLocal8Bit(resolved));
+#else
+  if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
+          std::memory_order_acquire)) {
+    return g_forceMountTransitionPolicyOverrideValueForTesting.load(
+        std::memory_order_acquire);
+  }
+  return false;
+#endif
+}
+
 std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
   const QString home = QDir::cleanPath(QDir::homePath());
   if (home.isEmpty() || !home.startsWith(QLatin1Char('/'))) {
@@ -1348,45 +1533,54 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     return std::nullopt;
   }
   // Cumulative review (PR #18, MEDIUM, "home mount auth wrong
-  // boundary"): a previous version of this walk hard-coded the
+  // boundary"; independent re-review, MEDIUM, "home trust still
+  // pathname-only"): a previous version of this walk hard-coded the
   // permitted mount-transition point to home's OWN final path
   // component (e.g. the "deck" in "/home/deck"), enforcing FULL
   // same-mount continuity for every ancestor component (e.g. "home")
   // via the same no-transition-permitted-anywhere policy an
-  // outside-home configured path gets. That hard-coded assumption is
-  // wrong in both directions: (1) a real, entirely legitimate topology
-  // commonly places "/home" ITSELF on its own dedicated partition
-  // separate from "/" (an ordinary distribution default, not a
-  // SteamOS-specific "/home/deck" split) -- the ancestor walk's strict
-  // same-mount requirement rejected that legitimate setup before the
-  // authenticated-transition check for the final component ever ran;
-  // and (2) the final-component exception was granted purely from
+  // outside-home configured path gets. That hard-coded assumption was
+  // wrong in multiple directions: (1) a real, entirely legitimate
+  // topology commonly places "/home" ITSELF on its own dedicated
+  // partition separate from "/" (an ordinary distribution default, not
+  // a SteamOS-specific "/home/deck" split) -- the ancestor walk's
+  // strict same-mount requirement rejected that legitimate setup before
+  // the authenticated-transition check for the final component ever
+  // ran; (2) the final-component exception was granted purely from
   // `homeIsAuthenticated` (a path-STRING match against the account
-  // database) without independently confirming that a mount transition
-  // there is even the ACTUAL topology in play, rather than treating
-  // whichever single component genuinely carries the transition as the
-  // one to authenticate.
+  // database) without independently confirming EITHER that a mount
+  // transition there is even the ACTUAL topology in play, or that the
+  // destination is actually policy-qualified (ownership/mode/kernel-
+  // recorded filesystem type -- see
+  // mountTransitionIsIndependentlyPolicyQualified()'s own comment); and
+  // (3) capping the walk at exactly ONE permitted transition, ever, is
+  // itself too rigid for a real SteamOS-style deployment, which can
+  // legitimately need MORE than one (e.g. a dedicated "/home" partition
+  // AND a further per-user data mount beneath it).
   //
   // The fixed policy: walk every component of home's own path from "/"
   // in order, tracking the CURRENT mount identity as it goes (starting
-  // from "/"'s own). At most ONE mount transition is permitted across
-  // the ENTIRE walk, wherever it organically occurs (an ancestor
-  // component, the final component, or nowhere at all for a
-  // single-mount system) -- never assumed to be any particular,
-  // hard-coded position -- and ONLY when `homeIsAuthenticated`. A
-  // second transition anywhere later in the same walk (e.g. an
-  // additional, unexpected bind mount stacked beneath an already-
-  // authenticated transition) is refused outright, exactly like an
-  // unauthenticated transition would be. When home is NOT
-  // authenticated, zero transitions are permitted anywhere -- the
-  // exact same strict, no-transition policy an outside-home configured
-  // path already gets via walkOwnedSuffixNoFollowFromFd().
+  // from "/"'s own). A mount transition is permitted at ANY component
+  // where it organically occurs (never assumed to be any particular,
+  // hard-coded position, and with no artificial cap on how many occur)
+  // -- but ONLY when BOTH `homeIsAuthenticated` (the path-string match
+  // against the account database) AND the destination directory
+  // independently passes mountTransitionIsIndependentlyPolicyQualified()
+  // (real ownership/mode plus kernel-recorded trusted-local-filesystem-
+  // type evidence, entirely independent of the path-string match).
+  // Every individual transition is evaluated on its own merits: one
+  // qualifying transition does not grant blanket permission to any
+  // later, differently-qualified (or unqualified) one, and one that
+  // fails this check is refused outright, exactly like an
+  // unauthenticated transition would be. When home is NOT authenticated
+  // at all, zero transitions are permitted anywhere -- the exact same
+  // strict, no-transition policy an outside-home configured path
+  // already gets via walkOwnedSuffixNoFollowFromFd().
   int currentFd = ::open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (currentFd < 0) {
     return std::nullopt;
   }
   MountIdentity currentMount = mountIdentityForFd(currentFd);
-  bool transitionUsed = false;
   for (const QString &component : homeComponents) {
     const QByteArray componentUtf8 = component.toUtf8();
     struct stat st {};
@@ -1404,20 +1598,19 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     }
     // A transition is only ever ATTEMPTED (i.e. the kernel-level
     // RESOLVE_NO_XDEV guarantee is deliberately not requested for this
-    // one open) when home is authenticated AND no transition has been
-    // consumed yet; every other component is opened with the full
-    // kernel-enforced no-cross-mount guarantee exactly like an
-    // outside-home path. `usedStrongNoXdev` reports whether that
-    // kernel-level guarantee actually applied to THIS component, so the
-    // correct comparator (permissive when the kernel already proved
-    // same-mount, strict/mount-id-required when it did not) is chosen
-    // below -- exactly the fail-closed convention
+    // one open) when home is authenticated at all -- every OTHER
+    // component is opened with the full kernel-enforced no-cross-mount
+    // guarantee exactly like an outside-home path. `usedStrongNoXdev`
+    // reports whether that kernel-level guarantee actually applied to
+    // THIS component, so the correct comparator (permissive when the
+    // kernel already proved same-mount, strict/mount-id-required when
+    // it did not) is chosen below -- exactly the fail-closed convention
     // walkOwnedSuffixNoFollowFromFd() already applies.
-    const bool allowTransitionHere = homeIsAuthenticated && !transitionUsed;
+    const bool transitionMayBeAttemptedHere = homeIsAuthenticated;
     bool usedStrongNoXdev = false;
     const int nextFd = openDirectoryComponentNoFollow(
         currentFd, componentUtf8.constData(), &usedStrongNoXdev,
-        /*confirmedCrossMountViaKernel=*/nullptr, allowTransitionHere);
+        /*confirmedCrossMountViaKernel=*/nullptr, transitionMayBeAttemptedHere);
     if (nextFd < 0) {
       ::close(currentFd);
       return std::nullopt;
@@ -1432,22 +1625,24 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     sameMount = mountIdentityMatches(nextMount, currentMount);
 #endif
     if (!sameMount) {
-      if (!allowTransitionHere) {
-        // Either home is not authenticated (zero transitions ever
-        // permitted), or this would be a SECOND transition in the same
-        // walk (only one is ever permitted) -- fail closed exactly like
-        // an unauthenticated/outside-home mount-transition attempt.
-        qWarning()
-            << "AssetCache: refusing to treat" << home
-            << "as a trusted home directory anchor -- component" << component
-            << "resolves onto a different mount than expected, and no "
-               "further authenticated mount transition is permitted here "
-               "(unauthenticated or repeated mount-transition guard)";
+      // Every transition -- not merely the first one ever encountered
+      // -- must independently be BOTH authenticated (home matches the
+      // account database) AND policy-qualified (ownership/mode plus, on
+      // Linux, a kernel-recorded trusted-local filesystem type) before
+      // it is ever granted.
+      if (!transitionMayBeAttemptedHere ||
+          !mountTransitionIsIndependentlyPolicyQualified(nextFd)) {
+        qWarning() << "AssetCache: refusing to treat" << home
+                   << "as a trusted home directory anchor -- component"
+                   << component
+                   << "resolves onto a different mount than expected, and this "
+                      "mount transition is not independently policy-qualified "
+                      "(unauthenticated $HOME, or the destination fails the "
+                      "ownership/mode/filesystem-type policy)";
         ::close(currentFd);
         ::close(nextFd);
         return std::nullopt;
       }
-      transitionUsed = true;
     }
     ::close(currentFd);
     currentFd = nextFd;
@@ -1827,6 +2022,54 @@ struct RootAuthority {
   QMutex mutex;
   quint64 nextAccessSequence{1};
   int lockFd{-1};
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete ... each AssetCache owns memory and per-key
+  // issue/invalidation, store has no token"): previously ONLY
+  // mutex/nextAccessSequence/lockFd were actually shared across
+  // same-process, same-root sibling AssetCache instances -- each
+  // sibling still kept its OWN private QCache memory tier and had NO
+  // shared concept of "this key was just invalidated" at all. That let
+  // one sibling's invalidate() (e.g. an authoritative 404) leave a
+  // completely different sibling's own memory cache -- and, far worse,
+  // an already-in-flight publish a sibling had already started
+  // computing before the invalidate ran -- free to republish the exact
+  // entry the invalidate() call was supposed to durably remove, the
+  // instant that sibling's own in-flight store()/touchAfterNotModified()
+  // call eventually completed.
+  //
+  // `memory` is now the ONE, single, genuinely shared QCache instance
+  // every same-root sibling's own m_memory pointer is repointed at (see
+  // AssetCache::AssetCache()), exactly mirroring how m_mutex/
+  // m_nextAccessSequence are already repointed -- so ANY sibling's
+  // invalidate() immediately removes the entry every OTHER sibling
+  // would also see, with no possible staleness window at all (it is
+  // literally the same C++ object, not a separately-synchronized copy).
+  //
+  // `keyIssuedGeneration`/`keyAppliedGeneration` implement the same
+  // two-counter issuance/applied-watermark optimistic-concurrency
+  // scheme AssetRequestCoordinator's own currentCacheKeyGeneration()/
+  // issueCacheKeyGeneration()/tryApplyCacheKeyMutation() already
+  // establish and this project's own cumulative review already
+  // accepted as sound -- but scoped to THIS shared authority (i.e.
+  // genuinely cross-instance, not merely cross-operation within one
+  // coordinator) rather than to one AssetRequestCoordinator's own
+  // private, per-instance bookkeeping. See AssetCache::
+  // issueKeyGeneration()/tryApplyKeyGenerationLocked()/
+  // advanceKeyGenerationPastAllIssuedLocked() in this file for the
+  // exact contract: a caller (in production, exclusively
+  // AssetRequestCoordinator) mints a token via issueKeyGeneration() the
+  // moment it BEGINS an operation that may eventually publish a result
+  // for a key, and threads that SAME token through to whichever
+  // store()/touchAfterNotModified()/promoteToMemory()/
+  // updateMemoryDecodedImage() call it may eventually make for that
+  // key; invalidate() (called by ANY sibling) advances the shared
+  // watermark strictly past every token issued (by ANY sibling) up to
+  // that point, so any such already-issued-but-not-yet-published token
+  // can never successfully publish afterward -- closing exactly the
+  // "older pre-404 fetch can republish" race.
+  QCache<QString, AssetCache::CachedEntry> memory;
+  QHash<QString, quint64> keyIssuedGeneration;
+  QHash<QString, quint64> keyAppliedGeneration;
 
   ~RootAuthority() {
     if (lockFd >= 0) {
@@ -1856,6 +2099,71 @@ QString rootLockRegistryKeyFor(quint64 device, quint64 inode) {
   return QString::number(device) + QLatin1Char(':') + QString::number(inode);
 }
 
+// Cumulative review (independent re-review, MEDIUM, "atfork child
+// handler unsafe"): calling QHash::clear() (heap deallocation), or
+// touching any QMutex, from *inside* a pthread_atfork() child handler
+// is not async-signal-safe -- a DIFFERENT thread in the PARENT may have
+// been mid-malloc()/mid-free() (holding libc's own internal allocator
+// arena lock) or mid-acquisition of rootLockRegistryMutex() itself at
+// the exact instant some OTHER thread called fork(); the CHILD inherits
+// only the single forking thread, so whichever thread would eventually
+// have released that lock in the parent simply does not exist in the
+// child, and any heap/Qt/lock operation the HANDLER ITSELF performs can
+// deadlock forever before the child ever executes a single line of its
+// own ordinary code.
+//
+// Root fix: the child handler below now performs ONLY a POSIX
+// async-signal-safe getpid() call (explicitly listed as async-signal-
+// safe by POSIX.1-2017 signal-safety(7)) and a single lock-free
+// std::atomic<pid_t> store -- no heap allocation, no QMutex, no QHash,
+// no destructors, nothing that could observe or depend on any other
+// thread's inherited lock state. `forkedChildObservedPidStorage()`
+// becomes, and permanently remains for the rest of THIS process's
+// lifetime, equal to this exact process's own pid the instant a bare
+// fork() (without an immediate exec()) produces it -- an exec() wipes
+// this (and every other static) back to zero by loading a genuinely
+// fresh process image, which is exactly the "require exec for fresh
+// authority" contract below relies on.
+//
+// Every ordinary (non-signal-handler) caller that would otherwise touch
+// rootLockRegistryMutex()/rootLockRegistry() --
+// acquireExclusiveRootOwnershipOrFailClosed() and
+// rootLockRegistryHasLiveEntryForTesting() -- checks
+// processHasForkedSinceLastExec() FIRST and, if true, fails closed /
+// reports "no live entry" WITHOUT EVER TOUCHING the (possibly still
+// perfectly valid, but deliberately never consulted) registry map or
+// its mutex at all: a process that has forked without exec-ing
+// permanently requires a fresh exec() before it will ever attempt disk-
+// cache authority again, exactly like the "single-owner cache-root lock
+// with fail-closed memory-only secondary processes" model this
+// project's cumulative review already established as sound for
+// wholly-separate, unrelated processes racing the same root -- applied
+// here to a forked-but-not-exec'd child instead.
+std::atomic<pid_t> &forkedChildObservedPidStorage() {
+  static std::atomic<pid_t> pid{0};
+  return pid;
+}
+
+// Test-only forced override for
+// AssetCache::setForkedSinceLastExecForcedStateForTesting() -- see that
+// declaration's own comment in AssetCache.h. A plain std::atomic<bool>
+// is safe to touch from ordinary (non-signal-handler) test code; this
+// is never written from inside the real pthread_atfork() handler
+// itself.
+std::atomic<bool> g_forceForkedSinceLastExecForTesting{false};
+
+bool processHasForkedSinceLastExec() {
+  if (g_forceForkedSinceLastExecForTesting.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  const pid_t observed =
+      forkedChildObservedPidStorage().load(std::memory_order_relaxed);
+  // pid_t 0 is never a valid process id (reserved/unused on every POSIX
+  // platform this project targets), so it doubles safely as "never
+  // observed a fork" without a separate bool flag.
+  return observed != 0 && observed == ::getpid();
+}
+
 // See the class comment above ("fork child inherits registry and
 // falsely joins parent"). Installed exactly once per process, on first
 // use of this registry, via std::call_once.
@@ -1866,23 +2174,13 @@ void registerForkSafetyOnce() {
     ::pthread_atfork(
         /*prepare=*/nullptr, /*parent=*/nullptr,
         /*child=*/[]() {
-          // Deliberately does NOT lock rootLockRegistryMutex() first:
-          // the "prepare"/"parent" handlers (which we do not install)
-          // are the correct place to do that dance for a mutex that
-          // must remain consistent WITHIN the parent across the fork;
-          // here, in the CHILD, immediately after fork() returns, this
-          // process is the only thread that exists (fork() only
-          // duplicates the calling thread), so no concurrent access to
-          // the registry is possible yet, and simply resetting it
-          // in-place is both safe and sufficient. Any RootAuthority
-          // objects an inherited (pre-fork) AssetCache instance still
-          // privately holds a shared_ptr to are left untouched here --
-          // the fix's actual, scoped contract is that a NEW AssetCache
-          // constructed after this point never joins one of those
-          // stale entries, not that pre-existing inherited C++ objects
-          // are made fork-safe in general (a far broader, unrelated
-          // concern this class's contract never claimed to cover).
-          rootLockRegistry().clear();
+          // Async-signal-safe ONLY: see the comment above this
+          // function. getpid() and a lock-free std::atomic<pid_t>
+          // store are the entire handler body -- deliberately NOT
+          // rootLockRegistry().clear() (see the fail-closed gate every
+          // caller of the registry now performs instead).
+          forkedChildObservedPidStorage().store(::getpid(),
+                                                std::memory_order_relaxed);
         });
   });
 #endif
@@ -1907,6 +2205,22 @@ acquireExclusiveRootOwnershipOrFailClosed(int rootFd, quint64 device,
     return nullptr;
   }
   registerForkSafetyOnce();
+  // Cumulative review (independent re-review, MEDIUM, "atfork child
+  // handler unsafe"): a process that has forked without an intervening
+  // exec() never touches rootLockRegistryMutex()/rootLockRegistry() at
+  // all -- not even a read-only find() -- and permanently fails closed
+  // (memory-only) for this and every future instance in THIS process,
+  // exactly as if a wholly separate, unrelated process already owned
+  // this root. See processHasForkedSinceLastExec()'s comment for why
+  // this is both necessary (the registry may contain byte-for-byte
+  // copies of the parent's own live weak_ptr/shared_ptr control blocks,
+  // which would otherwise let this child "join" an authority whose real
+  // OS-level flock() it never itself acquired) and sufficient (an
+  // exec() is the only way back to a genuinely fresh, independent
+  // acquisition attempt).
+  if (processHasForkedSinceLastExec()) {
+    return nullptr;
+  }
   const QString key = rootLockRegistryKeyFor(device, inode);
   QMutexLocker locker(&rootLockRegistryMutex());
   QHash<QString, std::weak_ptr<RootAuthority>> &registry = rootLockRegistry();
@@ -1978,18 +2292,25 @@ AssetOutcome<std::unique_ptr<AssetCache>> AssetCache::create(Config config) {
       std::make_unique<AssetCache>(std::move(config)));
 }
 
-AssetCache::AssetCache(Config config)
-    : m_config(std::move(config)),
-      m_memory(new QCache<QString, CachedEntry>()) {
+AssetCache::AssetCache(Config config) : m_config(std::move(config)) {
   // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
   // publicly constructible"): computed FIRST, from the exact same
   // validateConfiguration() a caller could have (and, via create(),
   // should have) already checked BEFORE ever reaching this
   // constructor -- see isValid()/configurationError()'s own comment.
   m_configurationError = validateConfiguration(m_config);
-  m_memory->setMaxCost(configHasValidMemoryByteLimit(m_config)
-                           ? m_config.memoryMaxCostBytes
-                           : 0);
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): deliberately NOT set here anymore -- at
+  // this point in construction it is not yet known whether m_memory
+  // will end up pointing at this instance's own private fallback (the
+  // common case, and every disk-disabled case) or a shared,
+  // already-in-use RootAuthority::memory a same-root sibling created
+  // first (in which case a fresh instance forcibly shrinking/growing
+  // the ALREADY-LIVE shared cache out from under every sibling still
+  // using it would be a real, if narrow, behavioural regression for
+  // them). Moved to immediately before reapAndEnforceQuota() below,
+  // once m_memory's final target for this instance's entire lifetime
+  // is fully resolved.
   // Cumulative review (PR #18, MEDIUM, "invalid memory config still
   // mutates disk"): a config error of ANY kind -- an invalid
   // memoryMaxCostBytes just as much as an invalid diskMaxBytes -- makes
@@ -2113,6 +2434,20 @@ AssetCache::AssetCache(Config config)
           // this process.
           m_mutex = &authority->mutex;
           m_nextAccessSequence = &authority->nextAccessSequence;
+          // Cumulative review (independent re-review, HIGH, "shared
+          // root authority incomplete"): repoint this instance's own
+          // m_memory/m_keyIssuedGeneration/m_keyAppliedGeneration AT
+          // the shared authority's fields too, exactly like m_mutex/
+          // m_nextAccessSequence immediately above -- see
+          // RootAuthority's own comment for the full rationale. From
+          // this point on, every same-root sibling literally shares one
+          // memory cache and one per-key issuance/applied-generation
+          // watermark, so one sibling's invalidate() is instantly
+          // visible to (and can never be raced by an older,
+          // already-in-flight publish from) every other sibling.
+          m_memory = &authority->memory;
+          m_keyIssuedGeneration = &authority->keyIssuedGeneration;
+          m_keyAppliedGeneration = &authority->keyAppliedGeneration;
           m_rootAuthorityHandle = std::move(authority);
         } else {
           qWarning() << "AssetCache: a different process already holds "
@@ -2128,11 +2463,29 @@ AssetCache::AssetCache(Config config)
     }
 #endif
   }
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): applied HERE, once m_memory's final target
+  // (this instance's own private fallback, or a same-root sibling's
+  // already-shared RootAuthority::memory) is fully resolved -- see the
+  // comment where this call used to live, right after
+  // validateConfiguration(), for why doing it that early was wrong.
+  m_memory->setMaxCost(configHasValidMemoryByteLimit(m_config)
+                           ? m_config.memoryMaxCostBytes
+                           : 0);
   reapAndEnforceQuota();
 }
 
 AssetCache::~AssetCache() {
-  delete m_memory;
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): m_memory is no longer unconditionally this
+  // instance's own heap allocation -- see RootAuthority's own comment.
+  // Nothing to do here at all: when it points at this instance's own
+  // m_privateMemoryFallback (a plain value member), the compiler-
+  // generated member-destruction order below destroys it automatically;
+  // when it instead points at a shared RootAuthority::memory, that
+  // object is owned by the RootAuthority itself and is torn down only
+  // once the LAST same-process sibling's m_rootAuthorityHandle share is
+  // released, never by this destructor at all.
 #if defined(Q_OS_UNIX)
   // m_rootAuthorityHandle's own shared_ptr destruction (implicit,
   // default member-destruction order, happens automatically here)
@@ -2160,6 +2513,18 @@ int AssetCache::rootLockFileDescriptorForTesting() const {
 
 bool AssetCache::rootLockRegistryHasLiveEntryForTesting() const {
 #if defined(Q_OS_UNIX)
+  // Cumulative review (independent re-review, MEDIUM, "atfork child
+  // handler unsafe"): the atfork child handler no longer clears (or
+  // touches at all) the registry -- it only stores this process's pid
+  // into an async-signal-safe atomic, so a forked-without-exec process
+  // must never read rootLockRegistry() either, exactly matching the
+  // production acquisition path's own guard in
+  // acquireExclusiveRootOwnershipOrFailClosed(). This preserves this
+  // accessor's documented observable contract (returns false in a
+  // just-forked child, unconditionally) via the new, safer mechanism.
+  if (processHasForkedSinceLastExec()) {
+    return false;
+  }
   if (m_rootDevice == 0 && m_rootInode == 0) {
     return false;
   }
@@ -2245,6 +2610,54 @@ AssetCache::lookupMemory(const QString &key) {
 
 quint64 AssetCache::nextAccessSequenceLocked() {
   return (*m_nextAccessSequence)++;
+}
+
+quint64 AssetCache::issueKeyGeneration(const QString &key) {
+  QMutexLocker locker(m_mutex);
+  const quint64 next = m_keyIssuedGeneration->value(key, 0) + 1;
+  (*m_keyIssuedGeneration)[key] = next;
+  return next;
+}
+
+quint64 AssetCache::currentKeyGenerationLocked(const QString &key) const {
+  return m_keyAppliedGeneration->value(key, 0);
+}
+
+bool AssetCache::tryApplyKeyGenerationLocked(const QString &key,
+                                             quint64 issuedGeneration) {
+  if (issuedGeneration == kUnconditionalGeneration) {
+    // See kUnconditionalGeneration's own comment: a caller opting out of
+    // this protocol entirely always succeeds, and never touches the
+    // watermark at all -- so it can never advance it past a value a REAL
+    // participant might still legitimately need to satisfy.
+    return true;
+  }
+  if (issuedGeneration < currentKeyGenerationLocked(key)) {
+    return false;
+  }
+  (*m_keyAppliedGeneration)[key] = issuedGeneration;
+  return true;
+}
+
+void AssetCache::advanceKeyGenerationPastAllIssuedLocked(const QString &key) {
+  const quint64 issuedCeiling = m_keyIssuedGeneration->value(key, 0);
+  const quint64 appliedCeiling = m_keyAppliedGeneration->value(key, 0);
+  // Strictly past whichever of "the highest token ever issued" or "the
+  // highest token ever applied" is greater -- either one could already
+  // exceed the other (an issued-but-not-yet-applied token is common; an
+  // applied value exceeding the issued ceiling should never happen in
+  // practice, since applying REQUIRES an issued token, but is guarded
+  // defensively here regardless) -- so NO already-issued token can ever
+  // satisfy `>= ` this new watermark afterward.
+  const quint64 newWatermark = std::max(issuedCeiling, appliedCeiling) + 1;
+  (*m_keyAppliedGeneration)[key] = newWatermark;
+  // Keep the issuance counter itself in sync: without this, a FUTURE
+  // issueKeyGeneration() call for this same key would keep minting
+  // values starting from the OLD (now stale) issuedCeiling, which could
+  // remain permanently unable to satisfy the new watermark.
+  if (m_keyIssuedGeneration->value(key, 0) < newWatermark) {
+    (*m_keyIssuedGeneration)[key] = newWatermark;
+  }
 }
 
 void AssetCache::touchAccessRecencyLocked(const QString &key) {
@@ -3082,7 +3495,8 @@ AssetCache::lookupDisk(const QString &key) {
   return entry;
 }
 
-void AssetCache::store(const QString &key, CachedEntry entry) {
+void AssetCache::store(const QString &key, CachedEntry entry,
+                       quint64 issuedGeneration) {
   if (!isValidKey(key)) {
     // Never let a malformed key reach payloadPath()/metadataPath() below
     // -- see isValidKey()'s comment. Rejecting the whole store() as a
@@ -3114,6 +3528,16 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
 
   {
     QMutexLocker locker(m_mutex);
+    // Cumulative review (independent re-review, HIGH, "shared root
+    // authority incomplete"): checked FIRST, before touching memory OR
+    // disk at all -- a same-root sibling's invalidate() that ran after
+    // this token was issued (see issueKeyGeneration()'s comment) but
+    // before this store() call actually acquired the lock must cause
+    // this ENTIRE publish to be dropped as stale, never a partial
+    // memory-only (or disk-only) apply.
+    if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
+      return;
+    }
     auto *heapEntry = new CachedEntry(entry);
     m_memory->insert(key, heapEntry, static_cast<qsizetype>(entry.costBytes()));
 
@@ -3306,7 +3730,8 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
 
 void AssetCache::touchAfterNotModified(const QString &key,
                                        const QString &newEtag,
-                                       const QString &newLastModified) {
+                                       const QString &newLastModified,
+                                       quint64 issuedGeneration) {
   if (m_diskCacheDisabled) {
     return;
   }
@@ -3316,6 +3741,14 @@ void AssetCache::touchAfterNotModified(const QString &key,
     return;
   }
   QMutexLocker locker(m_mutex);
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): see store()'s identical check for the full
+  // rationale -- a same-root sibling's invalidate() since this token was
+  // issued must drop this ENTIRE publish (memory refresh included),
+  // never leave a stale disk metadata rewrite or memory touch behind.
+  if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
+    return;
+  }
   if (!verifyRootAnchorLocked()) {
     return;
   }
@@ -3365,8 +3798,13 @@ void AssetCache::touchAfterNotModified(const QString &key,
 }
 
 void AssetCache::updateMemoryDecodedImage(const QString &key,
-                                          const QImage &image) {
+                                          const QImage &image,
+                                          quint64 issuedGeneration) {
   QMutexLocker locker(m_mutex);
+  // See store()'s identical check for the full rationale.
+  if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
+    return;
+  }
   CachedEntry *existing = m_memory->object(key);
   if (!existing) {
     return; // evicted since the caller's lookup; a later lookup redecodes
@@ -3381,7 +3819,8 @@ void AssetCache::updateMemoryDecodedImage(const QString &key,
   m_memory->insert(key, updated, static_cast<qsizetype>(updated->costBytes()));
 }
 
-void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
+void AssetCache::promoteToMemory(const QString &key, CachedEntry entry,
+                                 quint64 issuedGeneration) {
   if (!isValidKey(key)) {
     // Unlike lookupDisk()/store()/touchAfterNotModified(), this method
     // never turns `key` into a filesystem path, so a malformed key can't
@@ -3394,6 +3833,10 @@ void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
     return;
   }
   QMutexLocker locker(m_mutex);
+  // See store()'s identical check for the full rationale.
+  if (!tryApplyKeyGenerationLocked(key, issuedGeneration)) {
+    return;
+  }
   auto *heapEntry = new CachedEntry(std::move(entry));
   m_memory->insert(key, heapEntry,
                    static_cast<qsizetype>(heapEntry->costBytes()));
@@ -3406,6 +3849,17 @@ AssetCache::InvalidateResult AssetCache::invalidate(const QString &key) {
   }
   QMutexLocker locker(m_mutex);
   m_memory->remove(key);
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): advance the watermark BEFORE the disk delete
+  // below (order doesn't matter for correctness here since both happen
+  // under the same held m_mutex, but this ordering makes the intent
+  // clear: "publication is now closed for every already-issued token"
+  // is established first). See advanceKeyGenerationPastAllIssuedLocked()'s
+  // comment for the full contract -- this is what makes an in-flight
+  // instance A publish, issued strictly before this invalidate() but
+  // completing its own store()/etc. strictly after, get correctly
+  // rejected rather than silently reviving the just-invalidated entry.
+  advanceKeyGenerationPastAllIssuedLocked(key);
   const DeleteEntryOutcome outcome = deleteEntry(key);
   return outcome.manifestDurablyAbsent ? InvalidateResult::DurablyInvalidated
                                        : InvalidateResult::PersistenceFailed;
@@ -3860,6 +4314,25 @@ bool AssetCache::resolveTrustedDirectoryNoFollowForTesting(
 #endif
 }
 
+std::optional<bool>
+AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+    const QString &directoryPath) {
+#if defined(Q_OS_UNIX)
+  const QByteArray pathUtf8 = directoryPath.toUtf8();
+  const int fd = ::open(pathUtf8.constData(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  const bool qualified = mountTransitionIsIndependentlyPolicyQualified(fd);
+  ::close(fd);
+  return qualified;
+#else
+  Q_UNUSED(directoryPath);
+  return std::nullopt;
+#endif
+}
+
 bool AssetCache::mountIdentificationSupportedForTesting(const QString &path) {
 #if defined(__linux__) && defined(STATX_MNT_ID)
   const QByteArray pathUtf8 = QFile::encodeName(path);
@@ -3896,9 +4369,26 @@ void AssetCache::setAuthoritativeAccountHomeDirectoryOverrideForTesting(
       active, std::memory_order_release);
 }
 
+void AssetCache::setMountTransitionPolicyQualificationOverrideForTesting(
+    bool active, bool qualified) {
+  // Value is stored BEFORE the active flag (release ordering); every
+  // reader (mountPointHasTrustedLocalFilesystemType() on Linux,
+  // mountTransitionIsIndependentlyPolicyQualified()'s non-Linux branch
+  // otherwise) checks the flag first with acquire ordering, guaranteeing
+  // it observes this exact value whenever it sees the override active.
+  g_forceMountTransitionPolicyOverrideValueForTesting.store(
+      qualified, std::memory_order_release);
+  g_forceMountTransitionPolicyOverrideActiveForTesting.store(
+      active, std::memory_order_release);
+}
+
 void AssetCache::setListAllEntriesRelativeForcedFailureForTesting(bool active) {
   g_forceListAllEntriesRelativeFailureForTesting.store(
       active, std::memory_order_relaxed);
+}
+
+void AssetCache::setForkedSinceLastExecForcedStateForTesting(bool active) {
+  g_forceForkedSinceLastExecForTesting.store(active, std::memory_order_relaxed);
 }
 
 } // namespace Arkham

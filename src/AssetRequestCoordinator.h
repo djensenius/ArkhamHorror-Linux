@@ -386,11 +386,18 @@ private:
   // threaded through to the eventual completeCacheReadOrQuarantine() call
   // so a quarantine discovered there can be CAS-gated against whatever
   // may have mutated this cache key during the queued-delivery hop.
+  // `assetCacheGeneration`: see completeCacheReadOrQuarantine()'s own
+  // comment -- the separate, AssetCache-level token, minted via
+  // AssetCache::issueKeyGeneration() at the exact same moment as
+  // `expectedGeneration`, protecting against a same-root SIBLING
+  // instance's concurrent invalidate() rather than merely another
+  // operation in this same coordinator.
   RequestHandle
   registerCacheHitCompletion(const AssetKey &key, ResultCallback callback,
                              QVector<AssetCandidate> candidates,
                              int candidateIndex, AssetCache::CachedEntry entry,
-                             QString cacheKey, quint64 expectedGeneration);
+                             QString cacheKey, quint64 expectedGeneration,
+                             quint64 assetCacheGeneration);
   // Finds an already in-flight operation (revalidation or ordinary
   // candidate fetch) whose AssetKey canonicalizes to the same opKey, so a
   // new request() call can attach as an additional consumer instead of
@@ -435,6 +442,18 @@ private:
   struct CandidateAttempt {
     QString cacheKey;
     quint64 issuedGeneration{0};
+    // Cumulative review (independent re-review, HIGH, "shared root
+    // authority incomplete", "store has no token"): the SEPARATE,
+    // AssetCache-level token for this attempt -- see
+    // completeCacheReadOrQuarantine()'s comment for the full contract
+    // distinguishing it from `issuedGeneration` above. Minted via
+    // AssetCache::issueKeyGeneration() at the exact same moment
+    // `issuedGeneration` is minted (see startCandidate()/
+    // startRevalidation()), and threaded unchanged through
+    // dispatchCandidateFetchResult()/dispatchRevalidationResult() to
+    // every store()/touchAfterNotModified() call this attempt's
+    // completion may make.
+    quint64 assetCacheGeneration{0};
     AssetNetworkFetcher::FetchHandle fetchHandle;
     bool isRevalidation{false};
     QVector<quint64> subscriberOperationIds;
@@ -481,9 +500,11 @@ private:
   // startCandidate()'s callback used to run inline for a single
   // operation (advance candidates on a definitive 404, complete on
   // success/other error) -- see startCandidate()'s comment.
+  // `assetCacheGeneration`: see CandidateAttempt::assetCacheGeneration's
+  // comment -- threaded unchanged to the store() call this may make.
   void dispatchCandidateFetchResult(
       const QString &cacheKey, quint64 issuedGeneration,
-      const QVector<quint64> &subscribers,
+      quint64 assetCacheGeneration, const QVector<quint64> &subscribers,
       AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result);
   // Identical role for a completed CONDITIONAL (revalidation) fetch
   // outcome -- see startRevalidation()'s comment for the full set of
@@ -491,9 +512,12 @@ private:
   // 304-touch-and-promote, fresh-200-replace), each still applied
   // independently per subscriber using THAT subscriber's own staleEntry/
   // candidateIndex even though the network round trip was shared.
+  // `assetCacheGeneration`: see CandidateAttempt::assetCacheGeneration's
+  // comment -- threaded unchanged to whichever of touchAfterNotModified()/
+  // store() this may make.
   void dispatchRevalidationResult(
       const QString &cacheKey, quint64 issuedGeneration,
-      const QVector<quint64> &subscribers,
+      quint64 assetCacheGeneration, const QVector<quint64> &subscribers,
       AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result);
   // Round-6 item 8: removes `operationId` from whichever CandidateAttempt
   // it is currently subscribed to (a no-op if `pendingAttemptKey` is
@@ -563,10 +587,25 @@ private:
   // superseded by a more recently issued operation -- either one applied
   // to a now-stale view of this cache key could otherwise resurrect or
   // destroy state a newer operation already established.
+  // `assetCacheGeneration`: cumulative review (independent re-review,
+  // HIGH, "shared root authority incomplete", "store has no token") --
+  // the SEPARATE, AssetCache-level token minted via
+  // AssetCache::issueKeyGeneration() at the exact same moment
+  // `expectedGeneration` was minted (see the call sites), threaded
+  // through unchanged to whichever of promoteToMemory()/
+  // updateMemoryDecodedImage() this call may go on to make. This is
+  // deliberately a SECOND, independent token from `expectedGeneration`:
+  // `expectedGeneration`/tryApplyCacheKeyMutation() only ever protects
+  // against a race with ANOTHER OPERATION IN THIS SAME COORDINATOR
+  // INSTANCE, while `assetCacheGeneration` protects against a race with
+  // ANY same-root AssetCache SIBLING INSTANCE (including ones owned by a
+  // different AssetRequestCoordinator entirely) -- see AssetCache::
+  // issueKeyGeneration()'s own comment for that layer's full contract.
   void completeCacheReadOrQuarantine(quint64 operationId,
                                      AssetCache::CachedEntry entry,
                                      const QString &cacheKey,
                                      quint64 expectedGeneration,
+                                     quint64 assetCacheGeneration,
                                      bool promoteOnSuccess);
 
   // Round-7/8 item 7 (MEDIUM, "cache-hit read/decode occurs before
@@ -592,6 +631,17 @@ private:
   struct GroupWaiter {
     quint64 operationId{0};
     quint64 expectedGeneration{0};
+    // Cumulative review (independent re-review, HIGH, "shared root
+    // authority incomplete"): the separate, AssetCache-level token --
+    // see completeCacheReadOrQuarantine()'s comment -- minted
+    // independently by EACH waiter at its own cache-hit moment (see
+    // request()'s two lookupMemory()/lookupDisk() call sites), exactly
+    // mirroring expectedGeneration's own per-waiter nature: two waiters
+    // joining the same decode group may still have observed the shared
+    // cache key at genuinely different moments, so each carries its own
+    // token, applied independently (in registration order) by
+    // completeCacheReadGroupOrQuarantine()'s per-waiter loop.
+    quint64 assetCacheGeneration{0};
   };
   // One (cacheKey, format) pair's currently in-flight, not-yet-decoded
   // shared cache read: `entry` is the bytes exactly one Operation (the

@@ -162,6 +162,22 @@ private slots:
   // ever issued at all.
   void
   requestAgainstAnInvalidlyConfiguredCacheFailsImmediatelyWithoutNetworkAccess();
+  // Cumulative independent re-review (HIGH, "shared root authority
+  // incomplete", "store has no token"): proves the production
+  // AssetRequestCoordinator dispatch path (not just AssetCache's own
+  // unit tests) genuinely threads the new, SEPARATE AssetCache-level
+  // generation token all the way through a real, slow-dripped in-flight
+  // HTTP fetch and its store()/touchAfterNotModified() publication, so a
+  // SIBLING AssetCache instance's (standing in for a second coordinator
+  // or process sharing the same physical cache root) concurrent,
+  // authoritative invalidate() can never be resurrected by this
+  // coordinator's own already-in-flight, now-stale success -- while
+  // still genuinely delivering that real network result to ITS OWN
+  // caller.
+  void
+  crossInstanceSiblingDefinitiveInvalidateDuringInFlightFetchPreventsStalePublish();
+  void
+  crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidationPreventsStaleTouch();
 
 private:
   QString m_tempDirPath;

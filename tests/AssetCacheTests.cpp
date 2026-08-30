@@ -2836,6 +2836,25 @@ struct AuthoritativeAccountHomeOverrideGuard {
         /*active=*/false);
   }
 };
+
+// RAII guard around
+// AssetCache::setMountTransitionPolicyQualificationOverrideForTesting() --
+// guarantees the process-wide override is always reset back to inactive
+// even when a QVERIFY inside the test body triggers an early return.
+struct MountTransitionPolicyQualificationOverrideGuard {
+  explicit MountTransitionPolicyQualificationOverrideGuard(bool qualified) {
+    AssetCache::setMountTransitionPolicyQualificationOverrideForTesting(
+        /*active=*/true, qualified);
+  }
+  MountTransitionPolicyQualificationOverrideGuard(
+      const MountTransitionPolicyQualificationOverrideGuard &) = delete;
+  MountTransitionPolicyQualificationOverrideGuard &
+  operator=(const MountTransitionPolicyQualificationOverrideGuard &) = delete;
+  ~MountTransitionPolicyQualificationOverrideGuard() {
+    AssetCache::setMountTransitionPolicyQualificationOverrideForTesting(
+        /*active=*/false);
+  }
+};
 } // namespace
 
 void AssetCacheTests::
@@ -3123,6 +3142,193 @@ void AssetCacheTests::
   QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
       configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
   QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+#endif
+}
+
+void AssetCacheTests::
+    mountTransitionPolicyRejectsGroupWritableDestinationEvenWhenFilesystemTypeQualifies() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("this policy is POSIX-specific; not applicable on this platform");
+#else
+  const QString dirPath =
+      m_tempDirPath + QStringLiteral("/group-writable-mount-destination");
+  QVERIFY(QDir().mkpath(dirPath));
+  QVERIFY(::chmod(QFile::encodeName(dirPath).constData(),
+                  S_IRWXU | S_IRGRP | S_IXGRP | S_IWGRP) == 0);
+
+  // The filesystem-type half of the decision is forced to "qualified"
+  // -- proving the refusal below comes ENTIRELY from the ownership/mode
+  // check, never masked by an incidental filesystem-type failure.
+  MountTransitionPolicyQualificationOverrideGuard fsTypeGuard(
+      /*qualified=*/true);
+
+  const std::optional<bool> verdict =
+      AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+          dirPath);
+  QVERIFY(verdict.has_value());
+  QVERIFY(!*verdict);
+#endif
+}
+
+void AssetCacheTests::
+    mountTransitionPolicyRejectsWorldWritableDestinationEvenWhenFilesystemTypeQualifies() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("this policy is POSIX-specific; not applicable on this platform");
+#else
+  const QString dirPath =
+      m_tempDirPath + QStringLiteral("/world-writable-mount-destination");
+  QVERIFY(QDir().mkpath(dirPath));
+  QVERIFY(::chmod(QFile::encodeName(dirPath).constData(),
+                  S_IRWXU | S_IROTH | S_IXOTH | S_IWOTH) == 0);
+
+  MountTransitionPolicyQualificationOverrideGuard fsTypeGuard(
+      /*qualified=*/true);
+
+  const std::optional<bool> verdict =
+      AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+          dirPath);
+  QVERIFY(verdict.has_value());
+  QVERIFY(!*verdict);
+#endif
+}
+
+void AssetCacheTests::
+    mountTransitionPolicyAcceptsOwnedNonWritableDestinationWhenFilesystemTypeQualifies() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("this policy is POSIX-specific; not applicable on this platform");
+#else
+  const QString dirPath =
+      m_tempDirPath + QStringLiteral("/ordinary-mount-destination");
+  QVERIFY(QDir().mkpath(dirPath));
+  // QDir::mkpath() already creates directories with a default mode
+  // that is neither group- nor world-writable and owned by this very
+  // process's own real uid -- exactly the ordinary, positive-control
+  // shape this test needs.
+  QVERIFY(::chmod(QFile::encodeName(dirPath).constData(), S_IRWXU) == 0);
+
+  MountTransitionPolicyQualificationOverrideGuard fsTypeGuard(
+      /*qualified=*/true);
+
+  const std::optional<bool> verdict =
+      AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+          dirPath);
+  QVERIFY(verdict.has_value());
+  QVERIFY(*verdict);
+#endif
+}
+
+void AssetCacheTests::
+    mountTransitionPolicyRejectsDestinationWhenFilesystemTypeOverrideReportsUnqualified() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("this policy is POSIX-specific; not applicable on this platform");
+#else
+  const QString dirPath =
+      m_tempDirPath +
+      QStringLiteral("/perfect-owner-mode-but-untrusted-fstype");
+  QVERIFY(QDir().mkpath(dirPath));
+  QVERIFY(::chmod(QFile::encodeName(dirPath).constData(), S_IRWXU) == 0);
+
+  // Ownership/mode are PERFECT here -- only the independent
+  // filesystem-type evidence is forced to report "not qualified"
+  // (modelling a real kernel-recorded network/FUSE-backed filesystem
+  // type), and the overall decision must still be refused.
+  MountTransitionPolicyQualificationOverrideGuard fsTypeGuard(
+      /*qualified=*/false);
+
+  const std::optional<bool> verdict =
+      AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+          dirPath);
+  QVERIFY(verdict.has_value());
+  QVERIFY(!*verdict);
+#endif
+}
+
+void AssetCacheTests::
+    multipleIndependentlyQualifiedMountTransitionsInTheSameHomeWalkAreAllPermitted() {
+  // Cumulative review (independent re-review, MEDIUM, "only one
+  // transition allowed"): bind-mounts BOTH an ancestor of home's final
+  // component AND home's own final component onto two SEPARATE real
+  // mounts, modelling a genuine SteamOS-style topology with more than
+  // one legitimate transition in the same walk. Both destinations are
+  // ordinary, unprivileged-created directories/tmpfs-or-local-backed
+  // bind sources with default (non-group/world-writable) ownership and
+  // mode, so both independently pass the real ownership/mode policy;
+  // the account database is forced to authenticate the final fake
+  // $HOME path, and the real /proc/self/mountinfo lookup is exercised
+  // unmodified (no filesystem-type override) -- proving genuinely BOTH
+  // transitions are granted through the real, unmodified production
+  // decision path end-to-end.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString grandparent =
+      m_tempDirPath + QStringLiteral("/multi-transition-grandparent");
+  QVERIFY(QDir().mkpath(grandparent));
+  const QString mountedAncestor =
+      grandparent + QStringLiteral("/mounted-ancestor");
+  QVERIFY(QDir().mkpath(mountedAncestor));
+
+  QTemporaryDir ancestorBindSourceDir;
+  QVERIFY(ancestorBindSourceDir.isValid());
+  const QString ancestorBindSource = ancestorBindSourceDir.path();
+  QVERIFY(QDir().mkpath(ancestorBindSource + QStringLiteral("/actual-home")));
+
+  QProcess ancestorMountProc;
+  ancestorMountProc.start(QStringLiteral("sudo"),
+                          {QStringLiteral("-n"), QStringLiteral("mount"),
+                           QStringLiteral("--bind"), ancestorBindSource,
+                           mountedAncestor});
+  const bool ancestorMounted = ancestorMountProc.waitForFinished(5000) &&
+                               ancestorMountProc.exitCode() == 0;
+  if (!ancestorMounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } ancestorUnmountGuard{mountedAncestor};
+
+  const QString fakeHome = mountedAncestor + QStringLiteral("/actual-home");
+  QVERIFY(QFileInfo::exists(fakeHome));
+
+  QTemporaryDir homeBindSourceDir;
+  QVERIFY(homeBindSourceDir.isValid());
+  const QString homeBindSource = homeBindSourceDir.path();
+
+  QProcess homeMountProc;
+  homeMountProc.start(QStringLiteral("sudo"),
+                      {QStringLiteral("-n"), QStringLiteral("mount"),
+                       QStringLiteral("--bind"), homeBindSource, fakeHome});
+  const bool homeMounted =
+      homeMountProc.waitForFinished(5000) && homeMountProc.exitCode() == 0;
+  if (!homeMounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct HomeUnmountGuard {
+    QString mountPoint;
+    ~HomeUnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } homeUnmountGuard{fakeHome};
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
 #endif
 }
 
@@ -3833,8 +4039,14 @@ void AssetCacheTests::
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/cooperating-instances.png")));
   first.store(key, makeEntry(QByteArrayLiteral("cooperating-bytes")));
-  // The second, sibling instance can see what the first durably wrote
-  // to disk (its own memory tier is naturally separate/cold).
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): the second, sibling instance now genuinely
+  // shares ONE memory cache with the first (see RootAuthority's own
+  // comment in AssetCache.cpp) -- this is a STRONGER guarantee than the
+  // disk-only cooperation this test used to document: the entry is
+  // visible to the second sibling's own memory tier directly, with no
+  // disk read required at all.
+  QVERIFY(second.lookupMemory(key).has_value());
   const auto hitFromSecond = second.lookupDisk(key);
   QVERIFY(hitFromSecond.has_value());
   QCOMPARE(hitFromSecond->encodedBytes, QByteArrayLiteral("cooperating-bytes"));
@@ -3966,6 +4178,19 @@ void AssetCacheTests::
     // read (see rootLockRegistryHasLiveEntryForTesting()'s own
     // comment) using only minimal, async-signal-safe-ish work before
     // _exit().
+    //
+    // A deliberately STRONGER proof -- actually constructing a
+    // brand-new AssetCache (with real QMutex/QCache/heap construction)
+    // in this exact forked-without-exec child -- was tried and
+    // reliably SIGABRTs on this platform: that is the very same
+    // general "fork() a live Qt process without exec()" hazard this
+    // comment already documents, reproducing independently of whether
+    // this fix's own guard runs first. See
+    // constructingAssetCacheAfterSimulatedForkFailsDiskAuthorityClosed()
+    // below for the deterministic, non-flaky way this file instead
+    // proves that exact "construct a brand-new AssetCache after a
+    // fork()" contract, without needing a real, hazardous fork() to do
+    // it.
     ::close(pipeFds[0]);
     const char verdict =
         parentCache.rootLockRegistryHasLiveEntryForTesting() ? '1' : '0';
@@ -3995,10 +4220,10 @@ void AssetCacheTests::
   // '0' -- the registry, from the CHILD's own post-fork perspective,
   // must be EMPTY for this root: registerForkSafetyOnce()'s
   // pthread_atfork() child-handler ran synchronously during the fork()
-  // call itself (before fork() ever returned to this child), clearing
-  // it -- proving the fix's actual, targeted contract: a forked child
-  // never inherits a live belief that it already owns this root's
-  // authority.
+  // call itself (before fork() ever returned to this child), permanently
+  // marking this process as forked-without-exec -- proving the fix's
+  // actual, targeted contract: a forked child never inherits a live
+  // belief that it already owns this root's authority.
   QCOMPARE(verdict, '0');
 
   // The parent's own instance must remain completely unaffected --
@@ -4007,4 +4232,306 @@ void AssetCacheTests::
   QVERIFY(!parentCache.isDiskCacheDisabledForTesting());
   QVERIFY(parentCache.rootLockRegistryHasLiveEntryForTesting());
 #endif
+}
+
+void AssetCacheTests::
+    constructingAssetCacheAfterSimulatedForkFailsDiskAuthorityClosed() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("this fork-safety mechanism is POSIX-specific; not applicable on "
+        "this platform");
+#else
+  // RAII-style guaranteed reset: whatever happens below (including a
+  // QVERIFY/QCOMPARE failure aborting the test function early), this
+  // process-wide override must never leak into an unrelated, later
+  // test.
+  struct ForcedForkStateGuard {
+    ~ForcedForkStateGuard() {
+      AssetCache::setForkedSinceLastExecForcedStateForTesting(false);
+    }
+  } guard;
+
+  QVERIFY(QDir(m_tempDirPath)
+              .mkpath(QStringLiteral("simulated-forked-child-root")));
+  const QString forkedRoot =
+      QDir(m_tempDirPath)
+          .filePath(QStringLiteral("simulated-forked-child-root"));
+
+  // Force processHasForkedSinceLastExec() to report exactly the same
+  // state a real pthread_atfork() child handler would have already left
+  // behind in a genuinely forked-without-exec process -- see that
+  // function's own comment in AssetCache.cpp.
+  AssetCache::setForkedSinceLastExecForcedStateForTesting(true);
+
+  // A brand-new AssetCache, constructed through the REAL, unmodified
+  // production constructor and acquireExclusiveRootOwnershipOrFailClosed()
+  // entry point, over a root NOBODY else holds a lock on, must still
+  // fail disk authority closed -- proving the review's exact demand
+  // ("continuing child must fail disk authority closed on first use")
+  // deterministically, without a real (and, verified independently,
+  // SIGABRT-hazardous) fork().
+  AssetCache forkedLikeCache(configFor(forkedRoot));
+  QVERIFY(forkedLikeCache.isDiskCacheDisabledForTesting());
+
+  // Memory-tier behaviour must remain completely unaffected by the
+  // fail-closed disk decision -- only disk authority is denied.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/simulated-forked-child.png")));
+  forkedLikeCache.store(key,
+                        makeEntry(QByteArrayLiteral("memory-only-post-fork")));
+  QVERIFY(forkedLikeCache.lookupMemory(key).has_value());
+
+  // Zero disk mutation: this root, which nothing else was ever
+  // contending for, must remain completely empty -- the fail-closed
+  // instance never even attempted to acquire or create anything on
+  // disk beneath it.
+  QCOMPARE(QDir(forkedRoot)
+               .entryList(QDir::NoDotAndDotDot | QDir::AllEntries)
+               .size(),
+           0);
+
+  // Complementary recovery contract: simulating an exec() (clearing the
+  // forced marker, exactly as a real exec() wipes every static back to
+  // its initial state) lets a FRESH AssetCache over a FRESH root regain
+  // full, ordinary disk authority again -- proving "require exec for
+  // fresh authority" is not a one-way, permanently-broken trap.
+  AssetCache::setForkedSinceLastExecForcedStateForTesting(false);
+  QVERIFY(QDir(m_tempDirPath)
+              .mkpath(QStringLiteral("simulated-post-exec-recovery-root")));
+  const QString postExecRoot =
+      QDir(m_tempDirPath)
+          .filePath(QStringLiteral("simulated-post-exec-recovery-root"));
+  AssetCache recoveredCache(configFor(postExecRoot));
+  QVERIFY(!recoveredCache.isDiskCacheDisabledForTesting());
+  const QString recoveredKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/post-exec-recovery.png")));
+  recoveredCache.store(recoveredKey,
+                       makeEntry(QByteArrayLiteral("disk-recovered-bytes")));
+  QVERIFY(recoveredCache.lookupDisk(recoveredKey).has_value());
+#endif
+}
+
+void AssetCacheTests::
+    siblingInvalidateImmediatelyClearsAnotherSiblingsMemoryView() {
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/shared-memory-invalidate.png")));
+  first.store(key, makeEntry(QByteArrayLiteral("shared-memory-bytes")));
+
+  // Both siblings genuinely share one memory object -- see
+  // RootAuthority's own comment in AssetCache.cpp.
+  QVERIFY(first.lookupMemory(key).has_value());
+  QVERIFY(second.lookupMemory(key).has_value());
+
+  // The second sibling invalidates the key (e.g. an authoritative 404
+  // discovered by a request that second, not first, happens to be
+  // servicing).
+  QCOMPARE(second.invalidate(key),
+           AssetCache::InvalidateResult::DurablyInvalidated);
+
+  // Fail-before/pass-after: prior to this fix, `first` kept its OWN
+  // private QCache, so this entry would have remained memory-resident
+  // in `first` indefinitely despite `second`'s durable invalidate --
+  // this must now be instantly, unconditionally absent from BOTH
+  // siblings' view, since it is literally the same shared object.
+  QVERIFY(!first.lookupMemory(key).has_value());
+  QVERIFY(!second.lookupMemory(key).has_value());
+  QVERIFY(!first.lookupDisk(key).has_value());
+}
+
+void AssetCacheTests::
+    staleIssuedGenerationTokenCannotPublishThroughAnyMutatingEntryPointAfterConcurrentInvalidate() {
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  // --- store(): a token issued before a concurrent invalidate must
+  // never be able to publish a brand-new entry afterward. ---
+  {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/stale-token-store.png")));
+    const quint64 staleToken = first.issueKeyGeneration(key);
+    QCOMPARE(
+        second.invalidate(key),
+        AssetCache::InvalidateResult::DurablyInvalidated); // advances the
+                                                           // shared watermark
+                                                           // past staleToken
+    first.store(key, makeEntry(QByteArrayLiteral("must-never-publish")),
+                staleToken);
+    QVERIFY2(!first.lookupMemory(key).has_value(),
+             "store() published using a token issued before a concurrent "
+             "invalidate()");
+    QVERIFY2(!first.lookupDisk(key).has_value(),
+             "store() persisted to disk using a stale generation token");
+  }
+
+  // --- touchAfterNotModified(): a stale attempt's confirmed-current
+  // revalidation must never clobber a NEWER, already-published entry's
+  // metadata. This is the exact production race the review describes:
+  // "delayed 200 vs 404/clear" (here: delayed 304-confirm vs.
+  // clear-then-republish). ---
+  {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/stale-token-touch.png")));
+    AssetCache::CachedEntry v1 = makeEntry(QByteArrayLiteral("touch-v1"));
+    v1.etag = QStringLiteral("\"v1-etag\"");
+    first.store(key, v1); // baseline, unconditional (legacy call site)
+    QVERIFY(first.lookupDisk(key).has_value());
+
+    // Instance A "begins" a revalidation attempt against v1, capturing
+    // its token before anything else changes.
+    const quint64 staleToken = first.issueKeyGeneration(key);
+
+    // A durable invalidate, followed by a genuinely NEWER publish
+    // (representing a fresh, legitimate fetch racing ahead of A's
+    // in-flight revalidation) -- both via second, both unconditional
+    // (as any call site not itself carrying the stale token legitimately
+    // is).
+    QCOMPARE(second.invalidate(key),
+             AssetCache::InvalidateResult::DurablyInvalidated);
+    AssetCache::CachedEntry v2 = makeEntry(QByteArrayLiteral("touch-v2"));
+    v2.etag = QStringLiteral("\"v2-etag\"");
+    second.store(key, v2);
+
+    // A's stale revalidation now completes with a 304, carrying its OLD
+    // token -- this must be rejected outright, never overwriting v2's
+    // metadata with a "confirmed still v1" refresh.
+    first.touchAfterNotModified(key, QStringLiteral("\"attacker-etag\""),
+                                QString(), staleToken);
+
+    const auto afterStaleTouch = first.lookupDisk(key);
+    QVERIFY(afterStaleTouch.has_value());
+    QCOMPARE(afterStaleTouch->etag, QStringLiteral("\"v2-etag\""));
+    QCOMPARE(afterStaleTouch->encodedBytes, QByteArrayLiteral("touch-v2"));
+  }
+
+  // --- promoteToMemory(): a stale token must never even seed a
+  // brand-new memory-only entry. ---
+  {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/stale-token-promote.png")));
+    const quint64 staleToken = first.issueKeyGeneration(key);
+    QCOMPARE(second.invalidate(key),
+             AssetCache::InvalidateResult::DurablyInvalidated);
+    first.promoteToMemory(
+        key, makeEntry(QByteArrayLiteral("must-never-promote")), staleToken);
+    QVERIFY2(!first.lookupMemory(key).has_value(),
+             "promoteToMemory() published using a stale generation token");
+  }
+
+  // --- updateMemoryDecodedImage(): a stale token must never overwrite a
+  // NEWER entry's decoded image. ---
+  {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/stale-token-decode.png")));
+    first.store(key, makeEntry(QByteArrayLiteral("decode-v1")));
+    const quint64 staleToken = first.issueKeyGeneration(key);
+    QCOMPARE(second.invalidate(key),
+             AssetCache::InvalidateResult::DurablyInvalidated);
+    AssetCache::CachedEntry v2 = makeEntry(QByteArrayLiteral("decode-v2"));
+    QImage legitimateImage(2, 2, QImage::Format_RGB32);
+    legitimateImage.fill(Qt::green);
+    v2.decodedImage = legitimateImage;
+    second.store(key, v2);
+
+    QImage attackerImage(2, 2, QImage::Format_RGB32);
+    attackerImage.fill(Qt::red);
+    first.updateMemoryDecodedImage(key, attackerImage, staleToken);
+
+    const auto afterStaleUpdate = first.lookupMemory(key);
+    QVERIFY(afterStaleUpdate.has_value());
+    QVERIFY2(!afterStaleUpdate->decodedImage.isNull(),
+             "the legitimate v2 decoded image was wrongly cleared");
+    QCOMPARE(afterStaleUpdate->decodedImage.pixelColor(0, 0),
+             QColor(Qt::green));
+  }
+}
+
+void AssetCacheTests::
+    unconditionalGenerationDefaultAlwaysPublishesEvenAfterConcurrentInvalidate() {
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/unconditional-default.png")));
+
+  // Even after an unrelated sibling invalidate advances the shared
+  // watermark for this key, a caller that never opted into the CAS
+  // protocol at all (the default kUnconditionalGeneration, exactly what
+  // every existing call site in this file and every current
+  // AssetRequestCoordinator call site still uses) must be completely
+  // unaffected -- proving the new protocol is strictly opt-in, never a
+  // silently-mandatory behavior change for pre-existing callers.
+  QCOMPARE(second.invalidate(key),
+           AssetCache::InvalidateResult::DurablyInvalidated);
+  first.store(key, makeEntry(QByteArrayLiteral("unconditional-bytes")));
+  QVERIFY(first.lookupMemory(key).has_value());
+  QCOMPARE(first.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("unconditional-bytes"));
+
+  first.promoteToMemory(key,
+                        makeEntry(QByteArrayLiteral("unconditional-promoted")));
+  QCOMPARE(first.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("unconditional-promoted"));
+
+  QImage image(2, 2, QImage::Format_RGB32);
+  image.fill(Qt::blue);
+  first.updateMemoryDecodedImage(key, image);
+  QCOMPARE(first.lookupMemory(key)->decodedImage.pixelColor(0, 0),
+           QColor(Qt::blue));
+
+  first.touchAfterNotModified(key, QStringLiteral("\"unconditional-etag\""),
+                              QString());
+  QCOMPARE(first.lookupDisk(key)->etag,
+           QStringLiteral("\"unconditional-etag\""));
+}
+
+void AssetCacheTests::
+    freshlyIssuedTokenAfterInvalidateCanStillPublishNormally() {
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(QUrl(
+      QStringLiteral("https://example.com/fresh-token-after-invalidate.png")));
+
+  const quint64 staleToken = first.issueKeyGeneration(key);
+  QCOMPARE(second.invalidate(key),
+           AssetCache::InvalidateResult::DurablyInvalidated);
+  // The stale token (issued before the invalidate) must fail...
+  first.store(key, makeEntry(QByteArrayLiteral("must-never-publish")),
+              staleToken);
+  QVERIFY(!first.lookupMemory(key).has_value());
+
+  // ...but a FRESH token, issued strictly AFTER the invalidate, must
+  // succeed normally -- proving advanceKeyGenerationPastAllIssuedLocked()
+  // only rejects tokens that predate it, never permanently poisons the
+  // key against all future legitimate publication.
+  const quint64 freshToken = first.issueKeyGeneration(key);
+  QVERIFY2(freshToken > staleToken,
+           "a token issued after invalidate() must exceed one issued "
+           "before it");
+  first.store(key, makeEntry(QByteArrayLiteral("legitimate-fresh-bytes")),
+              freshToken);
+  const auto afterFreshStore = first.lookupMemory(key);
+  QVERIFY(afterFreshStore.has_value());
+  QCOMPARE(afterFreshStore->encodedBytes,
+           QByteArrayLiteral("legitimate-fresh-bytes"));
+
+  // Further mutations using the SAME fresh token (representing later
+  // stages of the same still-current attempt, e.g. a subsequent 304
+  // revalidation or an on-demand decode publish) must also continue to
+  // succeed.
+  QImage image(2, 2, QImage::Format_RGB32);
+  image.fill(Qt::yellow);
+  first.updateMemoryDecodedImage(key, image, freshToken);
+  QCOMPARE(first.lookupMemory(key)->decodedImage.pixelColor(0, 0),
+           QColor(Qt::yellow));
 }

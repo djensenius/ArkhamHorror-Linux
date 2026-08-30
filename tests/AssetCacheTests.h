@@ -207,8 +207,8 @@ private slots:
   // Negative control for the test above: the identical ancestor
   // bind-mount shape, but unauthenticated -- must be rejected exactly
   // like every other unauthenticated mount transition, proving the
-  // fix's "at most one transition, only when authenticated" rule
-  // applies uniformly regardless of WHERE in home's path the
+  // fix's "only when authenticated AND independently policy-qualified"
+  // rule applies uniformly regardless of WHERE in home's path the
   // transition organically falls. Requires a real bind mount
   // (root-privileged); QSKIP when unavailable.
   void
@@ -220,6 +220,53 @@ private slots:
   // back to treating an unproven mount boundary as safe.
   void
   unauthenticatedHomeWithDegradedMountIdentificationFailsClosedEvenUnmounted();
+  // Cumulative review (independent re-review, MEDIUM, "home trust
+  // still pathname-only"): direct, deterministic, UNPRIVILEGED proof of
+  // mountTransitionIsIndependentlyPolicyQualified()'s real ownership/
+  // mode enforcement, exercised via
+  // mountTransitionIsIndependentlyPolicyQualifiedForTesting() against
+  // an ordinary directory this test itself owns and chmod()s -- no real
+  // mount transition (and therefore no mount privilege) is needed to
+  // reach this exact decision function at all. A group-writable
+  // destination must be refused even though ownership matches and (via
+  // the deterministic filesystem-type override) the kernel-recorded
+  // filesystem type would otherwise qualify.
+  void
+  mountTransitionPolicyRejectsGroupWritableDestinationEvenWhenFilesystemTypeQualifies();
+  // Sibling of the test above: a world-writable destination must be
+  // refused for the identical reason.
+  void
+  mountTransitionPolicyRejectsWorldWritableDestinationEvenWhenFilesystemTypeQualifies();
+  // Positive control for the two tests above: an ordinary directory
+  // owned by this process's own real uid, with neither group- nor
+  // world-write bits set, passes the ownership/mode half of the policy
+  // -- combined with the deterministic filesystem-type override
+  // reporting "qualified", the overall decision is granted.
+  void
+  mountTransitionPolicyAcceptsOwnedNonWritableDestinationWhenFilesystemTypeQualifies();
+  // Cumulative review (independent re-review, MEDIUM, "trusted
+  // deployment/mount identity independently established"): even with
+  // PERFECT ownership/mode, an untrusted/unrecognized filesystem-type
+  // verdict (forced via
+  // setMountTransitionPolicyQualificationOverrideForTesting(), modelling
+  // what a real kernel-recorded network/FUSE-backed filesystem type
+  // would report) must still refuse the overall policy decision --
+  // ownership/mode alone is never sufficient on its own.
+  void
+  mountTransitionPolicyRejectsDestinationWhenFilesystemTypeOverrideReportsUnqualified();
+  // Cumulative review (independent re-review, MEDIUM, "only one
+  // transition allowed"): unlike every test above (which permitted at
+  // most a single mount transition across the whole home-path walk),
+  // this bind-mounts BOTH an ancestor of home's final component AND
+  // home's own final component onto two SEPARATE, independent real
+  // mounts -- modelling a genuine SteamOS-style topology with more than
+  // one legitimate transition in the same walk (e.g. a dedicated
+  // "/home" partition AND a further per-user data mount beneath it) --
+  // and proves the resolver now permits BOTH, closing the prior
+  // artificial "at most one, ever" cap. Requires two real bind mounts
+  // (root-privileged); QSKIP when unavailable.
+  void
+  multipleIndependentlyQualifiedMountTransitionsInTheSameHomeWalkAreAllPermitted();
 
   // Round-9+ review: for a caller-supplied Config::directory, this
   // resolver must still never auto-create ANY missing component, even
@@ -364,17 +411,82 @@ private slots:
   // Cumulative review (PR #18, HIGH, "same-process cache instances
   // unsynchronized" -- "fork child inherits registry and falsely joins
   // parent"): a real, raw fork() (never QProcess/exec) while this
-  // process already holds a live root lock; the CHILD immediately
-  // constructs a brand-new AssetCache over the exact SAME root and
-  // reports (via its own exit code, then _exit()s immediately, never
-  // running inherited C++ destructors) whether it believes disk
-  // persistence is enabled. It must NOT: registerForkSafetyOnce()'s
-  // atfork child-handler clears the process-wide registry the instant
-  // fork() returns, so the child's new instance always performs its
-  // own independent (and, here, correctly failing) acquisition attempt
-  // rather than wrongly "joining" the parent's inherited authority
-  // object as though it were an ordinary same-process sibling.
+  // process already holds a live root lock; the CHILD reports (via a
+  // pipe, then _exit()s immediately, never running inherited C++
+  // destructors) whether the raw process-wide root-lock registry
+  // still appears to hold a live entry for this root from its own
+  // post-fork perspective. It must NOT: this exercises the exact,
+  // narrow mechanism the fix actually relies on
+  // (processHasForkedSinceLastExec(), consulted by
+  // rootLockRegistryHasLiveEntryForTesting() itself) via a minimal,
+  // single-threaded-window read that is safe immediately post-fork.
+  // Deliberately does NOT construct a further Qt object (e.g. a new
+  // AssetCache) in the forked child: a live Qt process is not
+  // generally safe to fork() without an immediate exec() at all
+  // (verified independently -- doing so reliably SIGABRTs on this
+  // platform), a hazard unrelated to this fix.
+  // See constructingAssetCacheAfterSimulatedForkFailsDiskAuthorityClosed()
+  // for the deterministic, non-hazardous way this file instead proves
+  // the stronger "a brand-new AssetCache constructed after a fork()
+  // fails disk authority closed" contract.
   void forkedChildProcessNeverJoinsParentsInheritedRootAuthority();
+  // Cumulative review (independent re-review, MEDIUM, "atfork child
+  // handler unsafe"): proves the review's specific demand --
+  // "continuing child must fail disk authority closed on first use"
+  // -- end-to-end through the REAL production entry point
+  // (acquireExclusiveRootOwnershipOrFailClosed(), via a normal,
+  // in-process AssetCache construction), WITHOUT a real fork() (which
+  // independently SIGABRTs when combined with further Qt/heap
+  // construction on this platform -- an unrelated, general hazard, not
+  // a defect in this fix; see the comment above). Uses a test-only
+  // hook to force processHasForkedSinceLastExec() to observe exactly
+  // the same state a real atfork child handler would have left behind
+  // (this process's own current pid recorded as "already forked"),
+  // then restores it afterward -- deterministic, no real fork(),
+  // exercises the identical guard the real forked path relies on.
+  // Also proves the complementary "exec() is the only way back"
+  // recovery contract: after simulating an exec() (clearing the
+  // forced-fork marker), a fresh AssetCache over a fresh root regains
+  // full disk authority normally.
+  void constructingAssetCacheAfterSimulatedForkFailsDiskAuthorityClosed();
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): two SIMULTANEOUSLY LIVE same-process
+  // instances over the same root -- one sibling's invalidate() must be
+  // INSTANTLY visible in another sibling's OWN memory tier (no
+  // independent, staler private copy left behind at all), proving
+  // memory is genuinely one shared object, not merely
+  // independently-synchronized copies.
+  void siblingInvalidateImmediatelyClearsAnotherSiblingsMemoryView();
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete" -- "store has no token"): a token issued via
+  // issueKeyGeneration() BEFORE a concurrent sibling's invalidate() for
+  // the exact same key must be rejected by every one of store()/
+  // touchAfterNotModified()/promoteToMemory()/updateMemoryDecodedImage()
+  // afterward -- proving the exact "older pre-404 fetch can republish"
+  // race the review describes is now closed for all four mutating
+  // entry points, not merely one.
+  void
+  staleIssuedGenerationTokenCannotPublishThroughAnyMutatingEntryPointAfterConcurrentInvalidate();
+  // Positive control / backward-compatibility proof: every existing
+  // call site in this suite (and in production, until
+  // AssetRequestCoordinator is updated) omits the new trailing
+  // generation parameter entirely, relying on its default
+  // (kUnconditionalGeneration) to keep behaving exactly as before --
+  // unconditionally applying regardless of any concurrent invalidate.
+  // This is the fail-before/pass-after pair to the test above: proves
+  // the CAS protocol is opt-in per caller, never silently mandatory in
+  // a way that would break every pre-existing test in this file.
+  void
+  unconditionalGenerationDefaultAlwaysPublishesEvenAfterConcurrentInvalidate();
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete"): invalidate()'s watermark-advance must never
+  // PERMANENTLY poison a key -- a freshly issued token, minted strictly
+  // AFTER the invalidate(), must still succeed at every one of store()/
+  // touchAfterNotModified()/promoteToMemory()/updateMemoryDecodedImage(),
+  // proving advanceKeyGenerationPastAllIssuedLocked() only rejects
+  // tokens that predate it, never blocks all future publication for
+  // that key.
+  void freshlyIssuedTokenAfterInvalidateCanStillPublishNormally();
 
 private:
   QString m_tempDirPath;

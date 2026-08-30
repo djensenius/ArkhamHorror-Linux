@@ -220,9 +220,14 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
       // fetch issued after this exact moment for the same cache key
       // correctly outranks this cache hit's own eventual decode/promote
       // side effects, regardless of which one finishes first.
+      // Cumulative review (independent re-review, HIGH, "shared root
+      // authority incomplete"): mint the SEPARATE AssetCache-level token
+      // (m_cache.issueKeyGeneration()) at this exact same moment too --
+      // see CandidateAttempt::assetCacheGeneration's comment.
       return registerCacheHitCompletion(
           key, std::move(callback), candidates, candidateIndex, std::move(*hit),
-          cacheKey, issueCacheKeyGeneration(cacheKey));
+          cacheKey, issueCacheKeyGeneration(cacheKey),
+          m_cache.issueKeyGeneration(cacheKey));
     }
 
     if (auto hit = m_cache.lookupDisk(cacheKey)) {
@@ -234,7 +239,8 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
         // above -- mint, never merely read.
         return registerCacheHitCompletion(
             key, std::move(callback), candidates, candidateIndex,
-            std::move(entry), cacheKey, issueCacheKeyGeneration(cacheKey));
+            std::move(entry), cacheKey, issueCacheKeyGeneration(cacheKey),
+            m_cache.issueKeyGeneration(cacheKey));
       }
 
       // A disk hit carrying validators is revalidated with a real
@@ -605,8 +611,8 @@ AssetRequestCoordinator::RequestHandle
 AssetRequestCoordinator::registerCacheHitCompletion(
     const AssetKey &key, ResultCallback callback,
     QVector<AssetCandidate> candidates, int candidateIndex,
-    AssetCache::CachedEntry entry, QString cacheKey,
-    quint64 expectedGeneration) {
+    AssetCache::CachedEntry entry, QString cacheKey, quint64 expectedGeneration,
+    quint64 assetCacheGeneration) {
   const quint64 handleId = m_nextHandle++;
   const quint64 operationId = m_nextOperationId++;
 
@@ -646,7 +652,8 @@ AssetRequestCoordinator::registerCacheHitCompletion(
       // scheduled -- the leader's own already-queued
       // completeCoalescedCacheDecode() call delivers to every waiter,
       // including this one, once it runs.
-      pendingIt->waiters.append(GroupWaiter{operationId, expectedGeneration});
+      pendingIt->waiters.append(
+          GroupWaiter{operationId, expectedGeneration, assetCacheGeneration});
       return RequestHandle{handleId};
     }
     // Defensive only: the cache's live bytes for this exact key changed
@@ -668,7 +675,8 @@ AssetRequestCoordinator::registerCacheHitCompletion(
       PendingCacheDecode{std::move(entry),
                          cacheKey,
                          expectedFormat,
-                         {GroupWaiter{operationId, expectedGeneration}}});
+                         {GroupWaiter{operationId, expectedGeneration,
+                                      assetCacheGeneration}}});
 
   QPointer<AssetRequestCoordinator> self(this);
   QMetaObject::invokeMethod(
@@ -702,7 +710,8 @@ bool AssetRequestCoordinator::isQuarantineWorthy(AssetErrorCode code) {
 
 void AssetRequestCoordinator::completeCacheReadOrQuarantine(
     quint64 operationId, AssetCache::CachedEntry entry, const QString &cacheKey,
-    quint64 expectedGeneration, bool promoteOnSuccess) {
+    quint64 expectedGeneration, quint64 assetCacheGeneration,
+    bool promoteOnSuccess) {
   auto it = m_operations.find(operationId);
   if (it == m_operations.end()) {
     return; // cancelled/destroyed before this queued call ran
@@ -723,8 +732,8 @@ void AssetRequestCoordinator::completeCacheReadOrQuarantine(
   // invalidate-once-then-retry) is bit-for-bit identical to what this
   // method used to implement directly for exactly one operationId.
   completeCacheReadGroupOrQuarantine(
-      {GroupWaiter{operationId, expectedGeneration}}, std::move(entry),
-      cacheKey, expectedFormat, promoteOnSuccess);
+      {GroupWaiter{operationId, expectedGeneration, assetCacheGeneration}},
+      std::move(entry), cacheKey, expectedFormat, promoteOnSuccess);
 }
 
 QString
@@ -756,10 +765,16 @@ void AssetRequestCoordinator::completeCacheReadGroupOrQuarantine(
       }
       AssetOutcome<AssetCache::CachedEntry> perWaiterOutcome(*outcome);
       if (tryApplyCacheKeyMutation(cacheKey, waiter.expectedGeneration)) {
+        // Cumulative review (independent re-review, HIGH, "shared root
+        // authority incomplete"): thread each waiter's own, SEPARATE
+        // AssetCache-level token through -- see GroupWaiter::
+        // assetCacheGeneration's comment.
         m_cache.updateMemoryDecodedImage(cacheKey,
-                                         perWaiterOutcome->decodedImage);
+                                         perWaiterOutcome->decodedImage,
+                                         waiter.assetCacheGeneration);
         if (promoteOnSuccess) {
-          m_cache.promoteToMemory(cacheKey, *perWaiterOutcome);
+          m_cache.promoteToMemory(cacheKey, *perWaiterOutcome,
+                                  waiter.assetCacheGeneration);
         }
       }
       completeOperation(waiter.operationId, std::move(perWaiterOutcome));
@@ -879,6 +894,7 @@ void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
     if (auto hit = m_cache.lookupMemory(cacheKey)) {
       completeCacheReadOrQuarantine(operationId, std::move(*hit), cacheKey,
                                     issueCacheKeyGeneration(cacheKey),
+                                    m_cache.issueKeyGeneration(cacheKey),
                                     /*promoteOnSuccess=*/false);
       return;
     }
@@ -888,6 +904,7 @@ void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
       if (entry.etag.isEmpty() && entry.lastModified.isEmpty()) {
         completeCacheReadOrQuarantine(operationId, std::move(entry), cacheKey,
                                       issueCacheKeyGeneration(cacheKey),
+                                      m_cache.issueKeyGeneration(cacheKey),
                                       /*promoteOnSuccess=*/false);
         return;
       }
@@ -969,10 +986,16 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
   // "Cross-logical-key races" paragraph. Shared by every subscriber that
   // later joins this same attempt -- see CandidateAttempt's comment.
   const quint64 expectedGeneration = issueCacheKeyGeneration(cacheKey);
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete", "store has no token"): the SEPARATE,
+  // AssetCache-level token, minted at this exact same moment -- see
+  // CandidateAttempt::assetCacheGeneration's comment.
+  const quint64 assetCacheGeneration = m_cache.issueKeyGeneration(cacheKey);
 
   CandidateAttempt attempt;
   attempt.cacheKey = cacheKey;
   attempt.issuedGeneration = expectedGeneration;
+  attempt.assetCacheGeneration = assetCacheGeneration;
   attempt.subscriberOperationIds.append(operationId);
   // Round-9+ review (HIGH): mint this attempt's own immutable identity
   // BEFORE inserting it, and capture it (not just attemptKey) into the
@@ -986,7 +1009,8 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
   const AssetFormat format = candidate.format;
   const AssetNetworkFetcher::FetchHandle fetchHandle = m_fetcher.fetch(
       *validatedUrl, format, {},
-      [self, attemptKey, attemptToken, cacheKey, expectedGeneration](
+      [self, attemptKey, attemptToken, cacheKey, expectedGeneration,
+       assetCacheGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {
           return;
@@ -1018,7 +1042,8 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
         const QVector<quint64> subscribers = attemptIt2->subscriberOperationIds;
         self->m_candidateAttempts.erase(attemptIt2);
         self->dispatchCandidateFetchResult(cacheKey, expectedGeneration,
-                                           subscribers, std::move(result));
+                                           assetCacheGeneration, subscribers,
+                                           std::move(result));
       });
   // Safe to set AFTER the fetch() call returns: fetch()'s callback
   // contract is always dispatched asynchronously (Qt::QueuedConnection or
@@ -1033,7 +1058,7 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
 
 void AssetRequestCoordinator::dispatchCandidateFetchResult(
     const QString &cacheKey, quint64 issuedGeneration,
-    const QVector<quint64> &subscribers,
+    quint64 assetCacheGeneration, const QVector<quint64> &subscribers,
     AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
   // Round-6 item 8: apply the CAS-guarded cache/negative-404 mutation for
   // `cacheKey` AT MOST ONCE for the whole coalesced group -- see the
@@ -1075,7 +1100,18 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
     AssetCache::CachedEntry entry = toCachedEntry(*result->asset);
     if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
       clearNegative404(cacheKey);
-      m_cache.store(cacheKey, entry);
+      // Cumulative review (independent re-review, HIGH, "shared root
+      // authority incomplete", "store has no token"): thread the
+      // SEPARATE, AssetCache-level token through -- see
+      // CandidateAttempt::assetCacheGeneration's comment. This closes
+      // the exact race the review describes: a same-root SIBLING
+      // AssetCache instance's concurrent invalidate() for this key
+      // (e.g. a newer, definitive 404 discovered by a different
+      // AssetRequestCoordinator/process) now correctly prevents this
+      // possibly-stale 200 from republishing, in addition to (never
+      // instead of) tryApplyCacheKeyMutation()'s own, coordinator-local
+      // protection above.
+      m_cache.store(cacheKey, entry, assetCacheGeneration);
     }
     successEntry = entry;
   }
@@ -1175,10 +1211,15 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
   // comment, and the class comment's "Cross-logical-key races" paragraph.
   // Shared by every subscriber that later joins this same attempt.
   const quint64 expectedGeneration = issueCacheKeyGeneration(cacheKey);
+  // Cumulative review (independent re-review, HIGH, "shared root
+  // authority incomplete", "store has no token"): see startCandidate()'s
+  // identical comment.
+  const quint64 assetCacheGeneration = m_cache.issueKeyGeneration(cacheKey);
 
   CandidateAttempt attempt;
   attempt.cacheKey = cacheKey;
   attempt.issuedGeneration = expectedGeneration;
+  attempt.assetCacheGeneration = assetCacheGeneration;
   attempt.isRevalidation = true;
   attempt.subscriberOperationIds.append(operationId);
   // Round-9+ review (HIGH): see startCandidate()'s identical comment
@@ -1192,7 +1233,8 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
   const AssetFormat format = candidate.format;
   const AssetNetworkFetcher::FetchHandle fetchHandle = m_fetcher.fetch(
       *validatedUrl, format, conditional,
-      [self, attemptKey, attemptToken, cacheKey, expectedGeneration](
+      [self, attemptKey, attemptToken, cacheKey, expectedGeneration,
+       assetCacheGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {
           return;
@@ -1210,7 +1252,8 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
         const QVector<quint64> subscribers = attemptIt2->subscriberOperationIds;
         self->m_candidateAttempts.erase(attemptIt2);
         self->dispatchRevalidationResult(cacheKey, expectedGeneration,
-                                         subscribers, std::move(result));
+                                         assetCacheGeneration, subscribers,
+                                         std::move(result));
       });
   // Safe to set AFTER fetch() returns -- see startCandidate()'s identical
   // comment.
@@ -1220,7 +1263,7 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
 
 void AssetRequestCoordinator::dispatchRevalidationResult(
     const QString &cacheKey, quint64 issuedGeneration,
-    const QVector<quint64> &subscribers,
+    quint64 assetCacheGeneration, const QVector<quint64> &subscribers,
     AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
   // Round-6 item 8: apply the CAS-guarded mutation for `cacheKey` AT MOST
   // ONCE for the whole coalesced group -- see startCandidate()'s
@@ -1269,8 +1312,17 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     // comment for the full rationale, including why no separate "post-
     // touch generation" is needed.
     if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
+      // Cumulative review (independent re-review, HIGH, "shared root
+      // authority incomplete"): thread the SEPARATE, AssetCache-level
+      // token -- see dispatchCandidateFetchResult()'s identical
+      // comment. This is exactly the "delayed 304-confirm vs.
+      // clear-then-republish" race the review describes: a same-root
+      // sibling's concurrent invalidate() (a newer definitive 404, or a
+      // newer fetch that already replaced this entry) now correctly
+      // prevents this stale confirmation from clobbering it.
       m_cache.touchAfterNotModified(cacheKey, result->refreshedEtag,
-                                    result->refreshedLastModified);
+                                    result->refreshedLastModified,
+                                    assetCacheGeneration);
     }
     verdict = Verdict::NotModifiedPromote;
   } else if (!result->asset.has_value()) {
@@ -1282,7 +1334,7 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     // (its content genuinely changed): replace the cached entry.
     freshEntry = toCachedEntry(*result->asset);
     if (tryApplyCacheKeyMutation(cacheKey, issuedGeneration)) {
-      m_cache.store(cacheKey, freshEntry);
+      m_cache.store(cacheKey, freshEntry, assetCacheGeneration);
     }
     verdict = Verdict::FreshReplace;
   }
@@ -1346,13 +1398,13 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
                 ? operation.candidates[operation.candidateIndex].format
                 : operation.key.format;
         staleIfErrorGroupWaiters.append(
-            GroupWaiter{subscriberId, issuedGeneration});
+            GroupWaiter{subscriberId, issuedGeneration, assetCacheGeneration});
       } else if (staleIfErrorGroupEntry->encodedBytes == stale.encodedBytes) {
         staleIfErrorGroupWaiters.append(
-            GroupWaiter{subscriberId, issuedGeneration});
+            GroupWaiter{subscriberId, issuedGeneration, assetCacheGeneration});
       } else {
         completeCacheReadOrQuarantine(subscriberId, stale, cacheKey,
-                                      issuedGeneration,
+                                      issuedGeneration, assetCacheGeneration,
                                       /*promoteOnSuccess=*/false);
       }
       break;
@@ -1370,13 +1422,13 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
                 ? operation.candidates[operation.candidateIndex].format
                 : operation.key.format;
         notModifiedGroupWaiters.append(
-            GroupWaiter{subscriberId, issuedGeneration});
+            GroupWaiter{subscriberId, issuedGeneration, assetCacheGeneration});
       } else if (notModifiedGroupEntry->encodedBytes == stale.encodedBytes) {
         notModifiedGroupWaiters.append(
-            GroupWaiter{subscriberId, issuedGeneration});
+            GroupWaiter{subscriberId, issuedGeneration, assetCacheGeneration});
       } else {
         completeCacheReadOrQuarantine(subscriberId, stale, cacheKey,
-                                      issuedGeneration,
+                                      issuedGeneration, assetCacheGeneration,
                                       /*promoteOnSuccess=*/true);
       }
       break;

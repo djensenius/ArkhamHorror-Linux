@@ -764,7 +764,99 @@ python3 "$auditor" "$dup_byte_tree" --auto-roots "$dup_byte_tree" --list-only >/
   || fail "case 23 (baseline): expected plugin_ok's own copy, beside its real dependency, to resolve cleanly once the broken duplicate is removed"
 echo "PASS: byte-identical plugin copies at different \$ORIGIN contexts are independently reachability-checked, never short-circuited by content-hash sameness"
 
+# --- Case 24: nested legacy DT_RPATH order (round-N+ review HIGH,
+# "nested legacy RPATH order reversed ... current requester RPATH must
+# precede inherited ancestors (B before A in A->B->C)"). This is the
+# strongest possible proof of this fix: rather than only asserting the
+# Python auditor's own internal consistency (as
+# test_audit_dependency_closure.py's NestedRpathOrderTests already
+# does, via mocked readelf text), this case builds a REAL,
+# genuinely-compiled A(executable)->B->target chain, ACTUALLY EXECUTES
+# it under the real glibc dynamic linker on this machine, and confirms
+# (1) which copy the real ld.so genuinely loads at runtime, then
+# independently confirms (2) that this auditor's own resolution of the
+# identical on-disk chain agrees with that same, empirically-observed
+# real loader outcome -- not merely with what this fix's own authors
+# assumed ld.so does.
+#
+# Chain: test_order_exe (the executable itself, own DT_RPATH=
+# "$ORIGIN:$ORIGIN/a_private" -- "$ORIGIN" locates its own direct
+# libtestorderb.so.1, "$ORIGIN/a_private" is the ancestor scope this
+# case is actually about) -> libtestorderb.so.1 (own DT_RPATH=
+# "$ORIGIN/b_private") -> libtestordertarget.so.1, present at BOTH
+# a_private/ (target_value() returns 7, needs libtestorder_a_marker.so.1)
+# and b_private/ (target_value() returns 42, needs
+# libtestorder_b_marker.so.1). Real glibc dependency resolution of
+# libtestorderb.so.1's own NEEDED entry must use libtestorderb.so.1's
+# OWN, nearer DT_RPATH (b_private) -- never the executable's inherited
+# one (a_private) -- so a real run of the executable must exit with
+# status 42, and this auditor's own closure must contain
+# libtestorder_b_marker.so.1 but never libtestorder_a_marker.so.1.
+#
+# NB: modern binutils (since ~2.28) emits the NEW DT_RUNPATH tag by
+# default for a plain "-rpath" linker option, not the legacy DT_RPATH
+# this case needs to genuinely exercise (DT_RUNPATH is non-transitive
+# by design, which would silently make this case pass for the wrong
+# reason). "--disable-new-dtags" forces the real, legacy DT_RPATH tag.
+order_tree="$work_dir/appdir_rpath_order"
+mkdir -p "$order_tree/a_private" "$order_tree/b_private"
 
+cat > order_marker_a.c <<'EOF'
+int marker_a_touch(void) { return 0; }
+EOF
+cat > order_marker_b.c <<'EOF'
+int marker_b_touch(void) { return 0; }
+EOF
+cat > order_target_a.c <<'EOF'
+int marker_a_touch(void);
+int target_value(void) { return 7 + marker_a_touch(); }
+EOF
+cat > order_target_b.c <<'EOF'
+int marker_b_touch(void);
+int target_value(void) { return 42 + marker_b_touch(); }
+EOF
+cat > order_b.c <<'EOF'
+int target_value(void);
+int call_target(void) { return target_value(); }
+EOF
+cat > order_root.c <<'EOF'
+int call_target(void);
+int main(void) { return call_target(); }
+EOF
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestorder_a_marker.so.1 \
+  -o "$order_tree/a_private/libtestorder_a_marker.so.1" order_marker_a.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestorder_b_marker.so.1 \
+  -o "$order_tree/b_private/libtestorder_b_marker.so.1" order_marker_b.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestordertarget.so.1 \
+  -o "$order_tree/a_private/libtestordertarget.so.1" order_target_a.c \
+  -L"$order_tree/a_private" -l:libtestorder_a_marker.so.1
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestordertarget.so.1 \
+  -o "$order_tree/b_private/libtestordertarget.so.1" order_target_b.c \
+  -L"$order_tree/b_private" -l:libtestorder_b_marker.so.1
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestorderb.so.1 -Wl,-rpath,'$ORIGIN/b_private' \
+  -Wl,--disable-new-dtags -Wl,--allow-shlib-undefined \
+  -o "$order_tree/libtestorderb.so.1" order_b.c \
+  -L"$order_tree/b_private" -l:libtestordertarget.so.1
+"$cc_bin" -fPIE -Wl,-rpath,'$ORIGIN:$ORIGIN/a_private' \
+  -Wl,--disable-new-dtags -Wl,--allow-shlib-undefined \
+  -o "$order_tree/test_order_exe" order_root.c \
+  -L"$order_tree" -l:libtestorderb.so.1
+
+set +e
+LD_LIBRARY_PATH= "$order_tree/test_order_exe"
+order_exit_status=$?
+set -e
+[[ $order_exit_status -eq 42 ]] \
+  || fail "case 24: expected the REAL glibc dynamic linker to resolve libtestorderb.so.1's own NEEDED entry via its own nearer DT_RPATH (b_private, exit 42), got exit $order_exit_status -- either this machine's ld.so genuinely behaves differently than assumed, or the compiled fixture is wrong"
+echo "PASS: a real compiled A(exe)->B->target chain confirms the actual glibc dynamic linker resolves B's own DT_RPATH before an inherited ancestor DT_RPATH (real exit code 42)"
+
+result_24="$(python3 "$auditor" "$order_tree" --root test_order_exe --list-only)"
+echo "$result_24" | grep -q "^libtestorder_b_marker.so.1$" \
+  || fail "case 24: expected this auditor's own resolution to agree with the real ld.so outcome and include libtestorder_b_marker.so.1, got: $result_24"
+echo "$result_24" | grep -q "^libtestorder_a_marker.so.1$" \
+  && fail "case 24: this auditor must never resolve via the executable's inherited, shadowed ancestor DT_RPATH: $result_24"
+echo "PASS: this auditor's own resolution of the identical real chain agrees with the empirically-observed real glibc loader outcome"
 
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,

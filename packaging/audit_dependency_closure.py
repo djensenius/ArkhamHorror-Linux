@@ -462,13 +462,18 @@ def _effective_search_dirs(
     no intermediate object resets it with its own DT_RUNPATH (see
     _next_inherited_rpath_chain()'s own docstring for the exact
     propagation rule). `inherited_rpath_chain` carries this accumulated,
-    still-live ancestor RPATH context into THIS object's own resolution
-    -- it is always searched first, before even this object's own
-    DT_RPATH/DT_RUNPATH and before global_search_dirs, exactly matching
-    real ld.so behavior: an ancestor's legacy RPATH was already
-    established as part of the process-wide search scope by the time
-    this object's own dependencies are resolved, regardless of what this
-    object itself declares.
+    still-live ancestor RPATH context into THIS object's own resolution.
+
+    Round-N+ review (HIGH, "nested legacy RPATH order reversed ...
+    current requester RPATH must precede inherited ancestors (B before A
+    in A->B->C)"): when THIS object itself also carries its own live
+    DT_RPATH, that own scope is the NEAREST one -- established most
+    recently, for the exact object whose own dependency is being
+    resolved right now -- and a real ld.so always consults it BEFORE
+    anything inherited from further up the chain. So this object's own
+    DT_RPATH entries (`own_dirs`, only when `kind == "rpath"`) are
+    always searched first, `inherited_rpath_chain` second, and
+    global_search_dirs last of the three -- never the other order.
 
     Round-9+ review (HIGH, "boolean resolver permits external path"): a
     RUNPATH/RPATH entry (after $ORIGIN expansion) that resolves OUTSIDE
@@ -515,26 +520,33 @@ def _effective_search_dirs(
     )
 
     ordered: list[Path] = []
-    # The still-live ancestor DT_RPATH scope (see this function's own
-    # docstring) is always searched first, regardless of this object's
-    # own tag -- a real ld.so already established it as part of the
-    # process-wide search scope before this object's own dependencies
-    # are ever resolved.
-    for candidate in inherited_rpath_chain:
-        if candidate not in ordered:
-            ordered.append(candidate)
     if kind == "rpath":
-        # Legacy DT_RPATH: searched BEFORE LD_LIBRARY_PATH.
+        # Legacy DT_RPATH: this object's OWN scope is the NEAREST one
+        # (see this function's own "nested legacy RPATH order reversed"
+        # docstring paragraph) and is always searched first -- before
+        # anything inherited from further up the chain, and before
+        # LD_LIBRARY_PATH.
         for d in own_dirs:
             if d not in ordered:
                 ordered.append(d)
+        for candidate in inherited_rpath_chain:
+            if candidate not in ordered:
+                ordered.append(candidate)
         for candidate in global_search_dirs:
             if candidate not in ordered:
                 ordered.append(candidate)
     else:
         # DT_RUNPATH (or neither tag present, in which case own_dirs is
-        # empty and this ordering is moot): LD_LIBRARY_PATH is searched
-        # BEFORE the object's own RUNPATH.
+        # empty and its position below is moot): the still-live ancestor
+        # DT_RPATH scope (see this function's own docstring) remains in
+        # effect regardless of this object's own tag -- a real ld.so
+        # already established it as part of the process-wide search
+        # scope before this object's own dependencies are ever resolved
+        # -- so it is searched first, then LD_LIBRARY_PATH, then (only
+        # for DT_RUNPATH) this object's own RUNPATH last.
+        for candidate in inherited_rpath_chain:
+            if candidate not in ordered:
+                ordered.append(candidate)
         for candidate in global_search_dirs:
             if candidate not in ordered:
                 ordered.append(candidate)
@@ -608,11 +620,23 @@ def _next_inherited_rpath_chain(
       - This object carries neither tag: whatever chain it inherited
         keeps propagating to its own dependencies completely unchanged
         -- it neither adds anything nor resets anything.
+
+    Round-N+ review (HIGH, "nested legacy RPATH order reversed ...
+    current requester RPATH must precede inherited ancestors (B before A
+    in A->B->C), dedupe preserving immediate-to-ancestor order"): this
+    object's OWN RPATH entries are the NEAREST scope -- established most
+    recently, one level closer to whatever this object's own
+    dependencies actually are -- so they must be placed BEFORE whatever
+    was inherited from further up the chain in the combined,
+    still-growing result, never after. A later duplicate (either another
+    of this object's own entries, or one already present in the
+    inherited chain) is dropped, preserving this immediate-to-ancestor
+    order for its first occurrence.
     """
     if kind == "runpath":
         return ()
-    combined = list(inherited_rpath_chain)
-    for d in own_dirs:
+    combined = list(own_dirs)
+    for d in inherited_rpath_chain:
         if d not in combined:
             combined.append(d)
     return tuple(combined)

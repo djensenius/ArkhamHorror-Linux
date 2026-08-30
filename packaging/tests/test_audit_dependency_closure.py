@@ -699,6 +699,82 @@ class InheritedRpathTransitivityTests(unittest.TestCase):
         self.assertIn("leaf_global_marker.so.1", bundled_closure)
 
 
+class NestedRpathOrderTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "nested legacy RPATH order reversed ...
+    current requester RPATH must precede inherited ancestors (B before A
+    in A->B->C), dedupe preserving immediate-to-ancestor order"): when
+    BOTH an object and something it inherited from further up the chain
+    carry a live legacy DT_RPATH scope, a real ld.so search always
+    consults the NEAREST (most recently established, i.e. the object
+    whose own dependency is actually being resolved right now) RPATH
+    scope BEFORE anything inherited from further up the chain -- never
+    the reverse. This is the exact "duplicate SONAME, divergent content"
+    shape the review calls out: A (root) and B (A's own direct
+    dependency) each carry their OWN DT_RPATH naming a private directory
+    that both happen to contain a same-named library -- one genuine
+    (reachable, and exercised further) and one which must NEVER be the
+    one a real load of B's own NEEDED entry actually resolves to."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lib_dir = Path(self.tmp.name).resolve()
+
+    def _write(self, rel: str) -> Path:
+        path = self.lib_dir / rel
+        _write_fake_elf(path)
+        return path
+
+    def _run_audit(self, dynamic_text: dict[Path, str], root: str = "libroot.so.1"):
+        def fake_dynamic_text(path: Path) -> str:
+            return dynamic_text[path]
+
+        with mock.patch.object(
+            audit, "_readelf_dynamic_text", side_effect=fake_dynamic_text
+        ):
+            return audit.audit_closure(self.lib_dir, [root])
+
+    def test_nearest_requesters_own_rpath_shadows_an_inherited_ancestor_rpath(
+        self,
+    ) -> None:
+        # A (root, DT_RPATH="$ORIGIN/zzz_a_private") -> B (DT_RPATH=
+        # "$ORIGIN/zzz_b_private") -> "libtarget.so.1", present at BOTH
+        # private locations with genuinely DIFFERENT further
+        # dependencies. A real ld.so resolving B's own NEEDED entry
+        # searches B's OWN still-live DT_RPATH scope (established most
+        # recently, for the object whose dependency is actually being
+        # resolved) BEFORE A's inherited one -- so it must resolve the
+        # B-private copy, never the A-private one, regardless of
+        # directory-name sort order (A's private dir is named to sort
+        # BEFORE B's, so this cannot pass by incidental ordering luck).
+        root = self._write("libroot.so.1")
+        libb = self._write("libb.so.1")
+        target_a_private = self._write("zzz_a_private/libtarget.so.1")
+        target_b_private = self._write("zzz_b_private/libtarget.so.1")
+        a_marker = self._write("zzz_a_private/liba_marker.so.1")
+        b_marker = self._write("zzz_b_private/libb_marker.so.1")
+
+        dynamic_text = {
+            root: _needed_and_rpath_text(["libb.so.1"], "$ORIGIN/zzz_a_private"),
+            libb: _needed_and_rpath_text(
+                ["libtarget.so.1"], "$ORIGIN/zzz_b_private"
+            ),
+            target_a_private: _needed_and_runpath_text(["liba_marker.so.1"], None),
+            target_b_private: _needed_and_runpath_text(["libb_marker.so.1"], None),
+            a_marker: _needed_and_runpath_text([], None),
+            b_marker: _needed_and_runpath_text([], None),
+        }
+
+        bundled_closure, missing, unreachable, _ = self._run_audit(dynamic_text)
+
+        self.assertEqual(missing, {})
+        self.assertEqual(unreachable, {})
+        # Decisive assertion: B's own nearer DT_RPATH shadows A's
+        # inherited one for resolving B's own NEEDED entry.
+        self.assertIn("libb_marker.so.1", bundled_closure)
+        self.assertNotIn("liba_marker.so.1", bundled_closure)
+
+
 class NextInheritedRpathChainUnitTests(unittest.TestCase):
     """Direct unit coverage of _next_inherited_rpath_chain()'s exact
     propagation rule, independent of the full BFS."""
@@ -710,12 +786,18 @@ class NextInheritedRpathChainUnitTests(unittest.TestCase):
         )
         self.assertEqual(result, ())
 
-    def test_rpath_extends_the_inherited_chain(self) -> None:
+    def test_rpath_extends_the_inherited_chain_with_own_entries_first(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "nested legacy RPATH order reversed"):
+        # the object's OWN entries -- the nearest, most-recently
+        # established scope -- must precede whatever it itself
+        # inherited from further up the chain.
         inherited = (Path("/a"),)
         result = audit._next_inherited_rpath_chain(
             "rpath", [Path("/own")], inherited
         )
-        self.assertEqual(result, (Path("/a"), Path("/own")))
+        self.assertEqual(result, (Path("/own"), Path("/a")))
 
     def test_no_tag_passes_the_inherited_chain_through_unchanged(self) -> None:
         inherited = (Path("/a"), Path("/b"))

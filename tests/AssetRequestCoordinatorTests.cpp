@@ -1176,7 +1176,6 @@ void AssetRequestCoordinatorTests::
   AssetNetworkFetcher fetcher(nam);
   AssetCache::Config cacheConfig;
   cacheConfig.directory = m_tempDirPath;
-  AssetCache cache(cacheConfig);
 
   const AssetKey key =
       makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
@@ -1188,7 +1187,20 @@ void AssetRequestCoordinatorTests::
   preSeeded.contentType = QStringLiteral("image/png");
   preSeeded.dimensions = QSize(4, 4);
   preSeeded.etag = QStringLiteral("\"stale-etag\"");
-  cache.store(cacheKey, preSeeded);
+  {
+    // Cumulative review (independent re-review, HIGH, "shared root
+    // authority incomplete"): every same-root AssetCache sibling now
+    // genuinely shares ONE memory cache for as long as any of them is
+    // still alive -- see RootAuthority's own comment -- so this seeding
+    // instance MUST go out of scope (releasing its share of the shared
+    // authority) before constructing "restartedCache" below, or
+    // restartedCache would simply join the still-live authority and
+    // inherit this seeded entry already memory-resident, never
+    // exercising the disk-hit-with-validators path this test exists to
+    // exercise at all.
+    AssetCache seedCache(cacheConfig);
+    seedCache.store(cacheKey, preSeeded);
+  }
 
   // A fresh AssetCache instance (simulating a process restart with empty
   // memory) forces this request through the disk-hit path rather than
@@ -1232,7 +1244,6 @@ void AssetRequestCoordinatorTests::
   AssetNetworkFetcher fetcher(nam);
   AssetCache::Config cacheConfig;
   cacheConfig.directory = m_tempDirPath;
-  AssetCache seedCache(cacheConfig);
 
   const AssetKey key =
       makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
@@ -1244,7 +1255,15 @@ void AssetRequestCoordinatorTests::
   preSeeded.contentType = QStringLiteral("image/png");
   preSeeded.dimensions = QSize(4, 4);
   preSeeded.etag = QStringLiteral("\"stale-etag\"");
-  seedCache.store(cacheKey, preSeeded);
+  {
+    // See diskHitWithValidatorsRevalidatesAndServesStaleOn304()'s
+    // identical comment: this seeding instance must go out of scope
+    // before any "restarted" instance is constructed, or the latter
+    // would join the still-live shared authority and inherit this
+    // entry already memory-resident.
+    AssetCache seedCache(cacheConfig);
+    seedCache.store(cacheKey, preSeeded);
+  }
 
   // Restart #1 (fresh memory, forces the disk-hit revalidation path):
   // revalidates against the pre-seeded "stale-etag" and receives a 304
@@ -1307,7 +1326,6 @@ void AssetRequestCoordinatorTests::
   AssetNetworkFetcher fetcher(nam);
   AssetCache::Config cacheConfig;
   cacheConfig.directory = m_tempDirPath;
-  AssetCache cache(cacheConfig);
 
   const AssetKey key =
       makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
@@ -1319,7 +1337,15 @@ void AssetRequestCoordinatorTests::
   preSeeded.contentType = QStringLiteral("image/png");
   preSeeded.dimensions = QSize(4, 4);
   preSeeded.etag = QStringLiteral("\"stale-etag\"");
-  cache.store(cacheKey, preSeeded);
+  {
+    // See diskHitWithValidatorsRevalidatesAndServesStaleOn304()'s
+    // identical comment: this seeding instance must go out of scope
+    // before "restartedCache" is constructed, or the latter would join
+    // the still-live shared authority and inherit this entry already
+    // memory-resident.
+    AssetCache seedCache(cacheConfig);
+    seedCache.store(cacheKey, preSeeded);
+  }
 
   // A fresh AssetCache instance (simulating a process restart with empty
   // memory) forces the FIRST request through the disk-hit-with-validators
@@ -3654,4 +3680,212 @@ void AssetRequestCoordinatorTests::
   QCOMPARE(secondResult->error().code, AssetErrorCode::InvalidConfiguration);
   QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
            0);
+}
+
+void AssetRequestCoordinatorTests::
+    crossInstanceSiblingDefinitiveInvalidateDuringInFlightFetchPreventsStalePublish() {
+  // Cumulative independent re-review (HIGH, "shared root authority
+  // incomplete", "AssetCache.cpp:1826,3085,3402": "store has no
+  // token"). AssetRequestCoordinator's own per-instance
+  // issuedGeneration/tryApplyCacheKeyMutation() CAS (proved by
+  // delayedStaleFetchSuccessNeverOverwritesNewerCrossLogicalKeyCacheEntry
+  // above) only ever protects against races between operations of the
+  // SAME coordinator instance. It has no way to observe a SIBLING
+  // AssetRequestCoordinator/process that shares the identical physical
+  // AssetCache root directory and independently, durably invalidates the
+  // exact same resolved candidate/cache key while THIS coordinator's own
+  // fetch for that key is still genuinely in flight -- exactly the
+  // "delayed 200 vs 404/clear" race the review describes. This test
+  // proves the production dispatch path -- not merely AssetCache's own
+  // direct unit tests -- genuinely closes it, via a real, slow-dripped
+  // in-flight HTTP fetch.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  // Slow-dripped so there is a deterministic window, after request()
+  // mints its assetCacheGeneration token but before the fetch actually
+  // completes, in which the sibling's invalidate() is guaranteed to have
+  // already landed.
+  response.slowDrip = true;
+  response.chunkSize = 32;
+  response.chunkDelayMs = 20;
+  server.setResponse(path, response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cacheA(cacheConfig);
+  // A second AssetCache instance over the SAME physical root -- stands
+  // in for a sibling AssetRequestCoordinator/process sharing this cache
+  // (see RootAuthority's comment in AssetCache.cpp: same-root instances
+  // in this process genuinely share one authority object, exactly as
+  // independent processes would via the on-disk root lock/manifest).
+  AssetCache cacheB(cacheConfig);
+
+  AssetRequestCoordinator coordinatorA(cacheA, fetcher);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  std::optional<Result> result;
+  coordinatorA.request(key, [&](Result r) { result = std::move(r); });
+
+  // Genuinely in flight: the slow-dripped response has not finished
+  // arriving yet, and the coordinator's own assetCacheGeneration token
+  // was already minted synchronously inside request()/startCandidate()
+  // before this point.
+  QVERIFY(
+      QTest::qWaitFor([&]() { return server.requestCount(path) > 0; }, 5000));
+  QVERIFY(!result.has_value());
+
+  // The sibling instance now durably invalidates this exact cache key --
+  // standing in for a second, independent coordinator/process that has
+  // already discovered and persisted a definitive, authoritative 404 for
+  // the identical resolved candidate while A's fetch is still in flight.
+  QCOMPARE(cacheB.invalidate(cacheKey),
+           AssetCache::InvalidateResult::DurablyInvalidated);
+  QVERIFY(!cacheA.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cacheA.lookupMemory(cacheKey).has_value());
+
+  // Let A's in-flight, now-stale 200 finish arriving.
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+
+  // A's own caller still genuinely receives its real network result --
+  // this fix must never suppress DELIVERY to the consumer who asked for
+  // it, only the stale CACHE PERSISTENCE that would otherwise resurrect
+  // a sibling's newer, authoritative invalidate().
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+  QCOMPARE((**result).encodedBytes, response.body);
+
+  // Fail-before/pass-after: prior to threading assetCacheGeneration
+  // through dispatchCandidateFetchResult()'s store() call, A's stale
+  // success would unconditionally overwrite B's authoritative
+  // invalidate() the instant it completed. It must instead remain
+  // durably absent from disk and memory, from BOTH siblings' point of
+  // view, exactly as B left it.
+  QVERIFY(!cacheA.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cacheB.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cacheA.lookupMemory(cacheKey).has_value());
+  QVERIFY(!cacheB.lookupMemory(cacheKey).has_value());
+}
+
+void AssetRequestCoordinatorTests::
+    crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidationPreventsStaleTouch() {
+  // Companion to the fetch-path test above, for the revalidation
+  // (touchAfterNotModified) mutation instead of store(). A disk-hit-
+  // with-validators triggers a real conditional GET; while THAT is in
+  // flight, a sibling AssetCache instance both durably invalidates AND
+  // republishes a genuinely newer entry for the identical key (modelling
+  // a second coordinator/process that completed its own full fetch cycle
+  // in the interim); the origin then confirms 304 (still the OLD
+  // validator) for A's stale in-flight revalidation. Before threading
+  // assetCacheGeneration through dispatchRevalidationResult()'s
+  // touchAfterNotModified() call, this stale "confirmed unchanged" touch
+  // would have clobbered the sibling's newer entry's metadata --
+  // AssetCache-level rejection is the ONLY thing that can catch this,
+  // since the coordinator's own per-instance issuedGeneration CAS cannot
+  // observe a mutation made through a wholly separate AssetCache/
+  // coordinator instance.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8); // must never be served: a 304 is answered
+  response.etagForConditionalMatch = QStringLiteral("\"v1-etag\"").toUtf8();
+  server.setResponse(path, response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  {
+    // Scoped and destroyed before constructing cacheA below: RootAuthority
+    // instances sharing one physical root also genuinely share ONE memory
+    // cache (see AssetCache.cpp's RootAuthority comment) -- if this seed
+    // instance stayed alive, cacheA would inherit its still-live v1 memory
+    // entry and take the memory-hit path, which never revalidates at all.
+    // Destroying it here (dropping RootAuthority's refcount to zero) is
+    // exactly the established convention this codebase uses to force a
+    // genuine "restart with empty memory, disk-hit-with-validators" path
+    // -- see diskHitRevalidationCoalescesConcurrentIdenticalRequests()'s
+    // identical pattern above.
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry v1;
+    // Real, decodable PNG bytes: a confirmed-304 "stale-if-error" result
+    // is decoded via ensureDecoded() exactly like any other served entry
+    // (see registerCacheHitCompletion()'s comment) -- opaque placeholder
+    // bytes would fail that decode and take the (correct, but unrelated)
+    // quarantine-and-refetch path instead, masking the exact race this
+    // test exists to prove.
+    v1.encodedBytes = encodePng(4, 4);
+    v1.contentType = QStringLiteral("image/png");
+    v1.dimensions = QSize(4, 4);
+    v1.etag = QStringLiteral("\"v1-etag\"");
+    seedCache.store(cacheKey, v1);
+  }
+
+  // A fresh instance over the same root forces the disk-hit-with-
+  // validators path (never the memory-hit path, which never
+  // revalidates) -- same pattern as
+  // diskHitRevalidationCoalescesConcurrentIdenticalRequests() above.
+  AssetCache cacheA(cacheConfig);
+  AssetRequestCoordinator coordinatorA(cacheA, fetcher);
+
+  std::optional<Result> result;
+  coordinatorA.request(key, [&](Result r) { result = std::move(r); });
+
+  // The conditional GET's assetCacheGeneration token was minted
+  // synchronously inside request()/startRevalidation() above, before
+  // request() returned -- there has been no event-loop turn yet for the
+  // real HTTP round trip (even to a fast, non-slow-dripped mock server)
+  // to have completed, so this window is deterministic without needing
+  // slowDrip (which this mock server's bodyless-304 path does not
+  // support).
+  QVERIFY(!result.has_value());
+
+  // A second, independent AssetCache instance over the identical root --
+  // standing in for a sibling coordinator/process -- durably invalidates
+  // the stale v1 entry and republishes a genuinely newer v2, exactly as
+  // if it had already completed its own full fetch cycle for this key in
+  // the interim.
+  AssetCache cacheB(cacheConfig);
+  QCOMPARE(cacheB.invalidate(cacheKey),
+           AssetCache::InvalidateResult::DurablyInvalidated);
+  AssetCache::CachedEntry v2;
+  v2.encodedBytes = encodePng(6, 6);
+  v2.contentType = QStringLiteral("image/png");
+  v2.dimensions = QSize(6, 6);
+  v2.etag = QStringLiteral("\"v2-etag\"");
+  cacheB.store(cacheKey, v2);
+
+  // A's stale revalidation now completes with a 304 confirming the OLD
+  // (v1) validator -- this must be rejected outright by the AssetCache-
+  // level CAS, never overwriting v2's metadata with a "confirmed still
+  // v1" touch.
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+
+  const auto afterCompletion = cacheB.lookupDisk(cacheKey);
+  QVERIFY(afterCompletion.has_value());
+  QCOMPARE(afterCompletion->etag, QStringLiteral("\"v2-etag\""));
+  QCOMPARE(afterCompletion->encodedBytes, v2.encodedBytes);
+  // The origin was never asked for the full (unrelated) 8x8 fixture --
+  // proof the confirmed-304 path, not some fallback full refetch, is
+  // what actually ran.
+  QCOMPARE(server.requestCount(path), 1);
 }
