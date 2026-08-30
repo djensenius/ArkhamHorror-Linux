@@ -684,6 +684,26 @@ class FullElfDiscoveryAndFirstPartyExecutableTests(unittest.TestCase):
         inventory = audit.build_sbom_inventory(self.root)
         self.assertEqual(inventory[0]["classification"], "first-party")
 
+    def test_apprun_wrapped_alias_is_classified_first_party(self) -> None:
+        # A real produced AppImage's second (--plugin qt) linuxdeploy
+        # invocation renames the first invocation's AppRun (a symlink to
+        # usr/bin/arkham-horror) to "AppRun.wrapped", then writes its own
+        # generated launcher stub as the new "AppRun" -- both files
+        # coexist at the AppDir root and neither is a distinct
+        # third-party artifact. This exact scenario was only caught by
+        # actually running the CI packaging workflow.
+        self._write_fake_elf("AppRun")
+        self._write_fake_elf("AppRun.wrapped")
+        by_component, unmapped = audit.classify_all(self.root)
+        self.assertEqual(by_component, {})
+        self.assertEqual(unmapped, [])
+        inventory = audit.build_sbom_inventory(self.root)
+        classifications = {entry["path"]: entry["classification"] for entry in inventory}
+        self.assertEqual(
+            classifications,
+            {"AppRun": "first-party", "AppRun.wrapped": "first-party"},
+        )
+
     def test_arkham_horror_named_file_at_the_wrong_path_is_not_first_party(
         self,
     ) -> None:

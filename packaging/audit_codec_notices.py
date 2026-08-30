@@ -613,17 +613,35 @@ def classify_path(path: Path, qt_reference_dir: Path | None = None) -> str | Non
 # also discover AppRun, which lives as a sibling of usr/, not beneath
 # it). The main executable's relative path is therefore either
 # "usr/bin/arkham-horror" or "bin/arkham-horror" depending on which root
-# was scanned -- expressed below as a closed set of exact relative-path
-# SUFFIXES (matched against the tail of path.relative_to(lib_dir).parts,
-# never a basename-only match): a hostile file placed at some OTHER
-# path merely sharing one of these basenames -- e.g.
-# "usr/lib/plugins/generic/arkham-horror" -- still does not match either
+# was scanned.
+#
+# A real produced AppImage's linuxdeploy-plugin-qt run also emits a
+# second, distinct file at the AppDir root: it deploys AppRun as a
+# symlink to usr/bin/arkham-horror during the first ("populate")
+# linuxdeploy invocation, then, on the second ("package") invocation
+# (needed for --plugin qt's apprun-hooks mechanism), detects that
+# existing AppRun, renames it to "AppRun.wrapped", and writes its own
+# generated launcher stub as the new "AppRun" (which execs
+# AppRun.wrapped after running environment-setup hooks such as the Qt
+# plugin's). AppRun.wrapped is therefore always the SAME symlink to this
+# project's own executable under one more linuxdeploy-generated alias,
+# not a distinct third-party artifact -- observed only by actually
+# running the CI packaging workflow, not by this test suite alone,
+# since neither a local macOS build nor the earlier fixtures exercise
+# linuxdeploy's own two-invocation renaming behavior.
+#
+# Expressed below as a closed set of exact relative-path SUFFIXES
+# (matched against the tail of path.relative_to(lib_dir).parts, never a
+# basename-only match): a hostile file placed at some OTHER path merely
+# sharing one of these basenames -- e.g.
+# "usr/lib/plugins/generic/arkham-horror" -- still does not match any
 # suffix and must still be classified normally (and fail if unmapped).
 FIRST_PARTY_EXECUTABLE_RELATIVE_PATH_SUFFIXES: frozenset[tuple[str, ...]] = frozenset(
     {
         ("usr", "bin", "arkham-horror"),
         ("bin", "arkham-horror"),
         ("AppRun",),
+        ("AppRun.wrapped",),
     }
 )
 
