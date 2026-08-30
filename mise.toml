@@ -67,7 +67,7 @@ description = "Unit-test verify_contract_provenance.py's closure discovery/verif
 run = "python3 packaging/verify_contract_provenance_test.py"
 
 [tasks."contracts:check-encoder-hygiene"]
-description = "Prove via real compiler-AST inspection (libclang) that no public declaration in the domain-model header set (CardCatalog/Decks/Games/Identifiers/RawJson/JsonDecode) returns a QJson family type except the 12 explicitly allowlisted canonical adapters/decode helpers. Configures its own dedicated Clang-toolchain build directory."
+description = "Prove via real compiler-AST inspection (libclang) that no public declaration or #include anywhere across every registered domain/foundation header, fragment, and production source (parsed with its own exact compile command) returns a QJson/QVariant-JSON-container family type or crosses the domain->foundation dependency direction, except the 14 explicitly allowlisted canonical adapters/decode helpers. Configures its own dedicated Clang-toolchain build directory."
 run = "python3 packaging/check_encoder_hygiene.py"
 
 [tasks."contracts:test-encoder-hygiene-script"]

@@ -448,15 +448,54 @@ ValueOrError<std::optional<qint64>> requireNullableInt(const QJsonObject &obj,
   return std::optional<qint64>{*result};
 }
 
-ValueOrError<QUuid> decodeUuid(const QJsonValue &v, QStringView path) {
-  if (!v.isString())
-    return failure(QStringLiteral("%1: expected uuid string, got %2")
-                       .arg(path, typeName(v)));
-  const QString text = v.toString();
+namespace {
+// See detail::matchesBackendUuidGrammar()'s declaration in JsonDecode.h for
+// the full grammar rationale/citation. '0'-'9' is ASCII 0x30-0x39, 'A'-'F'
+// is 0x41-0x46, 'a'-'f' is 0x61-0x66 -- the exact three ranges
+// Data.UUID.Types.Internal.fromASCIIBytes's own `toDigit` accepts.
+[[nodiscard]] bool isBackendUuidHexDigit(char16_t code) noexcept {
+  return (code >= u'0' && code <= u'9') || (code >= u'A' && code <= u'F') ||
+         (code >= u'a' && code <= u'f');
+}
+} // namespace
+
+namespace detail {
+bool matchesBackendUuidGrammar(const QString &text) noexcept {
+  if (text.size() != 36)
+    return false;
+  for (int i = 0; i < 36; ++i) {
+    const char16_t code = text.at(i).unicode();
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (code != u'-')
+        return false;
+    } else if (!isBackendUuidHexDigit(code)) {
+      return false;
+    }
+  }
+  return true;
+}
+} // namespace detail
+
+namespace {
+// Shared by both decodeUuid() overloads below: each has already confirmed
+// its own Value/QJsonValue is a string and extracted its text before
+// calling this.
+[[nodiscard]] ValueOrError<QUuid> decodeUuidText(const QString &text,
+                                                 QStringView path) {
+  if (!detail::matchesBackendUuidGrammar(text))
+    return failure(QStringLiteral("%1: not a valid non-null uuid").arg(path));
   const QUuid parsed(text);
   if (parsed.isNull())
     return failure(QStringLiteral("%1: not a valid non-null uuid").arg(path));
   return parsed;
+}
+} // namespace
+
+ValueOrError<QUuid> decodeUuid(const QJsonValue &v, QStringView path) {
+  if (!v.isString())
+    return failure(QStringLiteral("%1: expected uuid string, got %2")
+                       .arg(path, typeName(v)));
+  return decodeUuidText(v.toString(), path);
 }
 
 ValueOrError<std::optional<QUuid>> decodeNullableUuid(const QJsonValue &v,
@@ -646,11 +685,7 @@ ValueOrError<QUuid> decodeUuid(const Json::Value &v, QStringView path) {
   if (!v.isString())
     return failure(QStringLiteral("%1: expected uuid string, got %2")
                        .arg(path, typeName(v)));
-  const QString text = v.toString();
-  const QUuid parsed(text);
-  if (parsed.isNull())
-    return failure(QStringLiteral("%1: not a valid non-null uuid").arg(path));
-  return parsed;
+  return decodeUuidText(v.toString(), path);
 }
 
 ValueOrError<std::optional<QUuid>> decodeNullableUuid(const Json::Value &v,

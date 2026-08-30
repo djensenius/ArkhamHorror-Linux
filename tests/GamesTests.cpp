@@ -78,6 +78,29 @@ ValueOrError<QJsonArray> encodeOpenSeats(const QList<CardCode> &seats) {
     raw.append(seat.toRawJson());
   return Json::Value::makeArray(raw).toExactQJsonArray();
 }
+
+// Shared skeleton for the UUID-grammar decode mutation tests below (see
+// "UUID text grammar (pinned backend's exact Data.UUID.fromText format)"):
+// an otherwise-valid CreateGameRequest::fromJson() payload (mirroring
+// malformedUuidInDeckIdsRejected's own fixture) with exactly one deckIds
+// slot, whose text is the only thing each test varies. Exercising the
+// real aggregate request decoder -- not Json::decodeUuid() in isolation
+// -- proves the strict grammar check is actually reachable from a real
+// wire boundary, matching this project's "assert through the actual
+// aggregate decoders and request boundaries" testing convention.
+QJsonObject createGameRequestObjectWithDeckIdText(const QString &deckIdText) {
+  return QJsonObject{
+      {QStringLiteral("deckIds"), QJsonArray{deckIdText}},
+      {QStringLiteral("playerCount"), 1},
+      {QStringLiteral("campaignId"), QJsonValue()},
+      {QStringLiteral("scenarioId"), QStringLiteral("01104")},
+      {QStringLiteral("difficulty"), QStringLiteral("Easy")},
+      {QStringLiteral("campaignName"), QStringLiteral("X")},
+      {QStringLiteral("multiplayerVariant"), QStringLiteral("Solo")},
+      {QStringLiteral("includeTarotReadings"), false},
+      {QStringLiteral("options"), QJsonArray{}},
+  };
+}
 } // namespace
 
 class GamesTests final : public QObject {
@@ -235,6 +258,18 @@ private slots:
   void wholeValueNotObjectRejected();
   void unrecognizedUltimatumOrBoonRejected();
   void unrecognizedClassSymbolInInvestigatorSummaryRejected();
+
+  // UUID text grammar (pinned backend's exact Data.UUID.fromText format,
+  // exercised through the real CreateGameRequest::fromJson() deckIds
+  // decode boundary -- see createGameRequestObjectWithDeckIdText() above)
+  void uuidBraceFormRejectedInDeckIds();
+  void uuidUrnPrefixFormRejectedInDeckIds();
+  void uuidNoHyphensFormRejectedInDeckIds();
+  void uuidPercentEncodedFormRejectedInDeckIds();
+  void uuidNonAsciiCharacterRejectedInDeckIds();
+  void uuidWrongHyphenPositionRejectedInDeckIds();
+  void uuidNilRejectedInDeckIds();
+  void uuidUppercaseHexAcceptedInDeckIds();
 
   // Additive unknown fields ignored ──────────────────────────────────────────
   void additiveUnknownFieldsIgnoredInChooseDeck();
@@ -1863,6 +1898,110 @@ void GamesTests::malformedCardCodeInInvestigatorSummaryRejected() {
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("id")),
            qPrintable(result.error()));
+}
+
+void GamesTests::uuidBraceFormRejectedInDeckIds() {
+  // QUuid's own constructor accepts this "{...}"-braced form and silently
+  // canonicalizes it; the pinned backend's Data.UUID.fromText (a strict
+  // 36-ASCII-character parse) never would, since braces push the total
+  // length to 38.
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("{01234567-89ab-cdef-0123-456789abcdef}"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("deckIds")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::uuidUrnPrefixFormRejectedInDeckIds() {
+  // QUuid also accepts this "urn:uuid:"-prefixed form; the backend's own
+  // parser does not (length is no longer exactly 36).
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("urn:uuid:01234567-89ab-cdef-0123-456789abcdef"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("deckIds")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::uuidNoHyphensFormRejectedInDeckIds() {
+  // 32 contiguous hex digits, no hyphens at all: still 32 characters
+  // (never 36), so both the length gate and the required-hyphen-position
+  // gate reject it.
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("0123456789abcdef0123456789abcdef"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("deckIds")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::uuidPercentEncodedFormRejectedInDeckIds() {
+  // A literal "%2d" in place of one hyphen (as a naive URL-decoding bug
+  // upstream of this client might produce): '%' is not a hex digit at any
+  // non-hyphen position, and not '-' at a hyphen position either.
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("01234567%2d89ab-cdef-0123-456789abcdef"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("deckIds")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::uuidNonAsciiCharacterRejectedInDeckIds() {
+  // A single non-ASCII character (U+00E9, "é") standing in for one hex
+  // digit: Data.UUID.Types.Internal.fromASCIIBytes's own `toDigit` only
+  // ever accepts the three plain-ASCII hex ranges, so any non-ASCII
+  // byte/character is rejected outright, never merely "the wrong digit".
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("0123456\u00E9-89ab-cdef-0123-456789abcdef"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("deckIds")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::uuidWrongHyphenPositionRejectedInDeckIds() {
+  // Same 36 characters, same multiset of hex digits and hyphens, but one
+  // hyphen shifted by one position (8-3-5-4-12 instead of 8-4-4-4-12):
+  // proves the check is a positional grammar, not merely "contains four
+  // hyphens and 32 hex digits somewhere".
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("01234567-89a-bcdef-0123-456789abcdef"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("deckIds")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::uuidNilRejectedInDeckIds() {
+  // The all-zero UUID matches the backend's own grammar exactly (Data.UUID
+  // never special-cases it) but is never a valid backend-assigned
+  // identity in this client's own domain invariant (see decodeUuid()'s doc
+  // comment in JsonDecode.h) -- this must still be rejected, by the
+  // separate isNull() check that runs after the grammar check succeeds.
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("00000000-0000-0000-0000-000000000000"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("deckIds")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::uuidUppercaseHexAcceptedInDeckIds() {
+  // Data.UUID.Types.Internal.fromASCIIBytes's own `toDigit` accepts
+  // 'A'-'F' identically to '0'-'9'/'a'-'f' (see decodeUuid()'s doc
+  // comment) -- this is a positive case proving the strict grammar check
+  // does not silently narrow acceptance to lowercase-only.
+  const auto obj = createGameRequestObjectWithDeckIdText(
+      QStringLiteral("01234567-89AB-CDEF-0123-456789ABCDEF"));
+  const auto result = CreateGameRequest::fromJson(obj, u"request");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->deckIds.size(), 1);
+  QVERIFY(result->deckIds.at(0).has_value());
+  QCOMPARE(*result->deckIds.at(0),
+           QUuid(QStringLiteral("01234567-89ab-cdef-0123-456789abcdef")));
 }
 
 void GamesTests::missingRequiredCampaignKeyRejected() {

@@ -48,6 +48,26 @@ clang_getFile() is used afterwards to hard-fail if the wrapper's
 `#include` somehow did not resolve to the exact intended file (rather
 than silently trusting that it did).
 
+A review round subsequently demonstrated that headers/fragments were the
+*only* thing ever independently parsed this way: domain_sources.txt/
+foundation_sources.txt were read only to borrow one "representative"
+compile-args list for scanning headers, so a REAL production .cpp file
+was never itself parsed/audited at all -- it could #include an
+absolute/"../"-relative/symlinked/generated forbidden header, inherit
+whatever lossy encoders that header declares, and compile with this
+check staying green throughout. This script now ALSO independently
+parses every real source in both manifests directly (see
+_parse_source_as_own_tu()/_scan_sources()) -- each with its own exact
+compile_commands.json entry, never a borrowed one, since (unlike a
+header) a real .cpp already has its own -- and audits its complete
+resolved inclusion graph exactly like a header's. Source scanning
+deliberately never collects new QJson-family findings, only inclusion-
+graph violations (see _scan_sources()'s own doc comment for why: every
+allowlisted encoder is declared in a header but *defined* out-of-line in
+its own .cpp, so naively scanning declarations located in a source
+itself would misclassify every legitimate encoder's own definition as an
+unrecognized violation).
+
 An even earlier version of this check (see git history:
 tests/EncoderHygieneTests.cpp) was a purely source-text regex/parser,
 which repeated review rounds proved could not keep up with an
@@ -264,7 +284,82 @@ if len(ALLOWLIST_BY_KEY) != len(ALLOWLIST):
         "that can only be an authoring mistake in this script itself."
     )
 
-_QJSON_FAMILY = ("QJsonObject", "QJsonArray", "QJsonValue")
+_QJSON_FAMILY = ("QJsonObject", "QJsonArray", "QJsonValue", "QJsonDocument")
+
+# QJsonDocument was added above after a review round demonstrated it was
+# absent from the prohibited family despite carrying the identical
+# numeric/duplicate-key/Undefined fidelity-loss risk as
+# QJsonObject/QJsonArray/QJsonValue -- it is a distinct Qt class (not a
+# typedef), so, exactly like the other three, its canonical type spelling
+# is simply "QJsonDocument" (with any const/reference/pointer qualifier
+# preserved verbatim around it), caught by the same substring match
+# _is_qjson_family() already applies to the rest of the family.
+#
+# Wrapped/reference/pointer-qualified forms of any family member (e.g.
+# "const QJsonObject &", "QJsonObject *") were empirically confirmed (see
+# packaging/check_encoder_hygiene_test.py's
+# QJsonFamilyWrappedFormsAreDetectedTests) to already be caught by this
+# same substring match against Clang's canonical type spelling, since
+# Clang's canonical spelling of a qualified/pointer type still contains
+# the unqualified class name verbatim. The same is true of every
+# standard-library wrapper/callable form checked
+# (std::optional<QJsonObject>, std::shared_ptr<QJsonObject>,
+# std::unique_ptr<QJsonObject>, std::function<QJsonObject()>) -- none of
+# those needed any code change.
+#
+# Qt's own QVariantMap/QVariantList/QVariantHash are a DIFFERENT,
+# real bypass, however: they are typedefs for QMap<QString,
+# QVariant>/QList<QVariant>/QHash<QString, QVariant> respectively, so
+# Clang's canonical type resolution replaces the typedef name entirely
+# with its underlying template instantiation -- "QVariantMap" itself
+# never appears anywhere in the canonical spelling libclang reports, so
+# simply adding it as another _QJSON_FAMILY substring (as this comment's
+# neighboring QJsonDocument entry could) would silently match nothing.
+# Qt itself defines lossless two-way conversions between these and the
+# QJson family (QJsonObject::toVariantMap()/fromVariantMap(),
+# QJsonArray::toVariantList()/fromVariantList()), so a public encoder
+# returning one of these three is exactly as capable of reintroducing
+# the numeric/duplicate-key/Undefined fidelity loss the exact adapters
+# exist to prevent -- see _is_qvariant_json_container() below, which
+# recognizes them by their actual canonical (post-typedef-resolution)
+# spelling instead.
+#
+# A bare `QVariant` return, by contrast, is NOT added to any prohibited
+# family: its own static type says nothing about what it happens to
+# contain at runtime (unlike QVariantMap/QVariantList/QVariantHash,
+# whose static type IS a JSON-shaped container), or a body would need to
+# be inspected to tell -- which this declaration-based AST policy
+# deliberately never does (see the module docstring's rationale for why
+# a purely source-text/body-parsing rule was abandoned as fundamentally
+# unable to keep up with an open-ended set of evasions; the same
+# argument for why the AST approach was adopted in the first place is
+# exactly why it must stay declaration-shape-based, not body-content-
+# based, here too). A legitimate, unrelated public `QVariant` getter
+# (e.g. a Q_PROPERTY-style accessor in the input/controller UI glue
+# layer) remains unaffected.
+_QVARIANT_JSON_CONTAINER_CANONICAL_FORMS = (
+    "QMap<QString,QVariant>",
+    "QList<QVariant>",
+    "QHash<QString,QVariant>",
+)
+
+
+def _is_qvariant_json_container(canonical_type_spelling: str) -> bool:
+    """True if `canonical_type_spelling` (Clang's canonical, fully
+    typedef-resolved type spelling) names QVariantMap/QVariantList/
+    QVariantHash, in any const/reference/pointer-qualified form -- see
+    the doc comment above _QVARIANT_JSON_CONTAINER_CANONICAL_FORMS for
+    why these must be matched by their post-typedef-resolution
+    template-instantiation spelling rather than their typedef'd name.
+
+    All whitespace is stripped from both sides of the comparison before
+    matching: Clang's exact template-argument-list spelling has been
+    empirically observed to vary in incidental whitespace (e.g. a space
+    or no space after a template-argument comma) across Clang
+    versions/platforms, and this check must not depend on that."""
+
+    normalized = "".join(canonical_type_spelling.split())
+    return any(form in normalized for form in _QVARIANT_JSON_CONTAINER_CANONICAL_FORMS)
 
 
 class EncoderHygieneError(RuntimeError):
@@ -551,7 +646,9 @@ class Finding:
 
 
 def _is_qjson_family(canonical_type_spelling: str) -> bool:
-    return any(family in canonical_type_spelling for family in _QJSON_FAMILY)
+    return any(family in canonical_type_spelling for family in _QJSON_FAMILY) or _is_qvariant_json_container(
+        canonical_type_spelling
+    )
 
 
 def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -> str:
@@ -791,29 +888,43 @@ def _audit_inclusion_graph(
     wrapper_filename: str,
     allowed_closure: frozenset[Path],
     repo_root: Path,
-    clang_build_dir: Path,
+    external_roots: frozenset[Path],
 ) -> list[str]:
     """Ask libclang for the complete resolved inclusion graph of
     `header`'s own wrapper TU (via clang_getInclusions() -- see the
     _LibClang binding above and the module docstring) and return one
     violation description per project-owned file (i.e. one whose own
     resolved, symlink-followed real path lies inside this repository's
-    tracked source tree -- anything outside it entirely is an external
-    Qt/system/toolchain header and always allowed unconditionally) it
-    reaches that is not a member of `allowed_closure`.
+    tracked source tree AND is not a member of any registered
+    `external_roots` -- see _external_roots() -- anything outside the
+    repository entirely, such as a Qt/system/toolchain header, is
+    always unconditionally external) it reaches that is not a member of
+    `allowed_closure`.
 
-    "Inside this repository's tracked source tree" deliberately excludes
-    anything resolving under `clang_build_dir` itself: this script
-    configures/builds its own dedicated CMake build directory (by
-    default `<repo_root>/build-encoder-hygiene`, i.e. physically NESTED
-    inside the repository), and CMake's FetchContent (see
-    CMakeLists.txt's QtKeychain declaration) downloads/builds genuinely
-    external third-party source and generates build artifacts (e.g.
-    qkeychain_export.h) directly under it -- none of that is part of
-    this repository's own tracked source, merely a byproduct of where
-    this particular check happens to configure its scratch build, and
-    must be classified exactly like any other external header, never as
-    an unregistered project file.
+    A review round demonstrated that an earlier revision blanket-exempted
+    EVERYTHING resolving under this script's own dedicated Clang-toolchain
+    build directory (by default `<repo_root>/build-encoder-hygiene`,
+    physically NESTED inside the repository) as "external", reasoning
+    that CMake's FetchContent (see CMakeLists.txt's QtKeychain
+    declaration) downloads/builds genuinely external third-party source
+    and generated build artifacts (e.g. qkeychain_export.h) directly
+    under it. That blanket exemption also silently exempted any
+    genuinely PROJECT-generated header/fragment placed anywhere else
+    under that same build directory (e.g. a hypothetical
+    `<build-dir>/generated/Lossy.inc` reached by a real header's
+    #include) -- proven by a review round that planted exactly such a
+    file with a lossy `QJsonObject` declaration and showed this check
+    stayed green. `external_roots` is therefore now a small, EXPLICIT
+    set of genuinely-external subtrees (currently: only
+    `<clang-build-dir>/_deps`, where FetchContent vendors/builds
+    qtkeychain's own real third-party source) -- everything else
+    resolving inside the repository, including every OTHER path under
+    the build directory (AUTOMOC's own internal per-target
+    `*_autogen/` directories, this script's own `generated/*.txt`
+    manifests, or any future project-generated header placed anywhere
+    else under it), is audited exactly like any other project file: it
+    must be a member of `allowed_closure` or this is a hard violation,
+    never a silent skip.
 
     This is independent of however the #include that reached the
     forbidden file was spelled: bare, "../"-relative, absolute, through
@@ -847,8 +958,10 @@ def _audit_inclusion_graph(
         if included_path.name == wrapper_basename:
             continue
         real = included_path.resolve()
-        if not real.is_relative_to(repo_root) or real.is_relative_to(clang_build_dir):
-            continue  # External (Qt/system/toolchain/FetchContent/build-artifact) header: always allowed.
+        if not real.is_relative_to(repo_root):
+            continue  # Outside the repo entirely: Qt/system/toolchain header, always external.
+        if any(real.is_relative_to(root) for root in external_roots):
+            continue  # Explicitly-registered external subtree (e.g. FetchContent-vendored source/build).
         if real not in allowed_closure:
             violations.append(
                 f"  {header} transitively #includes {included_path} "
@@ -861,6 +974,29 @@ def _audit_inclusion_graph(
     return violations
 
 
+def _external_roots(clang_build_dir: Path) -> frozenset[Path]:
+    """The small, EXPLICIT set of subtrees this script treats as
+    genuinely external (never subject to the domain/foundation
+    dependency-direction closure check), independent of the blanket
+    "anything under the build directory" exemption a review round
+    demonstrated was unsound (see _audit_inclusion_graph()'s own doc
+    comment for the exact bypass this replaces).
+
+    Currently this is exactly one root: `<clang-build-dir>/_deps`, where
+    CMake's FetchContent (see CMakeLists.txt's QtKeychain declaration)
+    downloads and builds qtkeychain's own real, genuinely third-party
+    source and generates its own build artifacts (e.g.
+    qkeychain_export.h) -- confirmed directly against this project's own
+    FetchContent_Declare() call, never assumed. Anything else resolving
+    under the build directory (this script's own `generated/*.txt`
+    manifests, AUTOMOC's per-target `*_autogen/` directories, or any
+    future project-generated header placed anywhere else under it) is
+    deliberately NOT included here, so it remains subject to the same
+    closure-membership audit as any other project file."""
+
+    return frozenset({(clang_build_dir / "_deps").resolve()})
+
+
 def _scan_headers(
     clang: _LibClang,
     idx: ctypes.c_void_p,
@@ -868,7 +1004,7 @@ def _scan_headers(
     compile_args: list[str],
     sysroot_args: list[str],
     repo_root: Path,
-    clang_build_dir: Path,
+    external_roots: frozenset[Path],
     allowed_closure: frozenset[Path],
     seen: set[tuple[str, int, str]],
     structural_violations: list[str],
@@ -932,7 +1068,7 @@ def _scan_headers(
         tu, wrapper_filename = _parse_header_as_own_tu(clang, idx, header, compile_args, sysroot_args)
         structural_violations.extend(
             _audit_inclusion_graph(
-                clang, tu, header, wrapper_filename, allowed_closure, repo_root, clang_build_dir
+                clang, tu, header, wrapper_filename, allowed_closure, repo_root, external_roots
             )
         )
         root = clang.lib.clang_getTranslationUnitCursor(tu)
@@ -940,6 +1076,171 @@ def _scan_headers(
         clang.lib.clang_disposeTranslationUnit(tu)
 
     return findings
+
+
+def _find_compile_command_for_source(compile_commands: list[dict], source: Path) -> dict:
+    """Look up `source`'s own EXACT compile_commands.json entry, matched
+    by its resolved absolute path -- never a "representative" entry
+    borrowed from some other file in the same target (see
+    _representative_compile_args(), which remains correct for
+    *headers*: a header has no compile_commands.json entry of its own at
+    all, since it is never itself compiled as a translation unit by the
+    real build). A review round demonstrated that never independently
+    parsing each real .cpp with its own exact compile command left every
+    production source file completely unaudited by this script's
+    dependency-direction policy -- this is the lookup that closes that
+    gap: a manifest-registered source with no matching compile command
+    is a hard failure, never a silent skip."""
+
+    resolved = source.resolve()
+    for entry in compile_commands:
+        if Path(entry["file"]).resolve() == resolved:
+            return entry
+    raise EncoderHygieneError(
+        f"No compile_commands.json entry found for source {source} -- every "
+        "manifest-registered source must have actually been compiled by the "
+        "dedicated Clang build directory (see _configure_clang_build_dir()); "
+        "a source manifest entry with no matching compile command is a hard "
+        "failure, since it means either the manifest and the real build have "
+        "silently drifted apart, or this source was never really built at all."
+    )
+
+
+def _parse_source_as_own_tu(
+    clang: _LibClang,
+    idx: ctypes.c_void_p,
+    source: Path,
+    compile_commands: list[dict],
+    sysroot_args: list[str],
+) -> ctypes.c_void_p:
+    """Parse a REAL production .cpp `source` directly, on disk, as its own
+    translation unit -- using its OWN exact compile_commands.json entry
+    (see _find_compile_command_for_source()), never flags borrowed from
+    any other file. Unlike _parse_header_as_own_tu(), no synthetic
+    wrapper/unsaved-file trick is needed here: a real source file already
+    exists on disk and already has its own exact compile command, so it
+    is handed to libclang exactly as the real build itself compiles it.
+
+    This is the root fix for the coverage gap a review round
+    demonstrated: this script's dependency-direction policy previously
+    audited only headers/fragments (via their own synthetic wrapper
+    TUs) -- a real, production .cpp could #include an
+    absolute/"../"-relative/symlinked/generated forbidden header,
+    inherit whatever lossy encoders it declares, and compile completely
+    unaudited by this script. This function is what makes every real
+    production source file's own, actual, resolved inclusion graph
+    independently observable too, exactly like a header's (see
+    _scan_sources()/_audit_inclusion_graph()).
+
+    Returns the raw `CXTranslationUnit` pointer (caller must dispose
+    it). Raises EncoderHygieneError on any parse failure or fatal
+    diagnostic, for the identical reason _parse_header_as_own_tu() does:
+    a source that does not compile cleanly cannot be trusted to have a
+    correct AST, so this refuses to silently scan a partial/
+    error-recovery one."""
+
+    entry = _find_compile_command_for_source(compile_commands, source)
+    compile_args = _sanitize_compile_args(entry["command"], entry["file"])
+    source_abs = str(source.resolve())
+
+    args_bytes = [a.encode("utf-8") for a in (compile_args + sysroot_args)]
+    argv = (ctypes.c_char_p * len(args_bytes))(*args_bytes)
+
+    tu_ptr = ctypes.c_void_p()
+    err = clang.lib.clang_parseTranslationUnit2(
+        idx,
+        source_abs.encode("utf-8"),
+        argv,
+        len(args_bytes),
+        None,
+        0,
+        0x0,
+        ctypes.byref(tu_ptr),
+    )
+    if err != 0 or not tu_ptr.value:
+        raise EncoderHygieneError(
+            f"libclang failed to parse production source {source} directly, "
+            f"using its own exact compile_commands.json entry (CXErrorCode="
+            f"{err}); this must never be silently skipped, since a "
+            "manifest-registered source this script cannot parse is a source "
+            "it cannot prove anything about."
+        )
+    tu = tu_ptr.value
+
+    diag_count = clang.lib.clang_getNumDiagnostics(tu)
+    fatal_diagnostics = []
+    for i in range(diag_count):
+        diag = clang.lib.clang_getDiagnostic(tu, i)
+        severity = clang.lib.clang_getDiagnosticSeverity(diag)
+        if severity >= 3:  # CXDiagnostic_Error or CXDiagnostic_Fatal
+            fatal_diagnostics.append(clang.to_str(clang.lib.clang_formatDiagnostic(diag, 0)))
+    if fatal_diagnostics:
+        clang.lib.clang_disposeTranslationUnit(tu)
+        raise EncoderHygieneError(
+            f"Clang reported {len(fatal_diagnostics)} error diagnostic(s) parsing "
+            f"{source} directly with its own exact compile command; a source "
+            "that does not compile cleanly cannot be trusted to have a correct "
+            "AST, so this check refuses to proceed rather than silently scan a "
+            "partial/error-recovery AST:\n" + "\n".join(f"  {d}" for d in fatal_diagnostics)
+        )
+
+    return tu
+
+
+def _scan_sources(
+    clang: _LibClang,
+    idx: ctypes.c_void_p,
+    sources: Sequence[Path],
+    compile_commands: list[dict],
+    sysroot_args: list[str],
+    repo_root: Path,
+    external_roots: frozenset[Path],
+    allowed_closure: frozenset[Path],
+) -> list[str]:
+    """Independently parse every REAL production .cpp in `sources` as its
+    own translation unit (see _parse_source_as_own_tu()) -- each with its
+    own exact compile_commands.json entry, never a borrowed/
+    "representative" one -- and audit its complete resolved inclusion
+    graph against `allowed_closure`, exactly like _scan_headers() already
+    does for headers/fragments (see _audit_inclusion_graph(), reused
+    unchanged here: a source's own file is skipped from the graph the
+    identical way a header's own wrapper "main file" entry is, by
+    passing the source's own path as the self-filtering
+    `wrapper_filename` argument).
+
+    Unlike _scan_headers(), this deliberately collects NO QJson-family
+    Finding objects from a source's own declarations. Every one of this
+    project's 14 allowlisted encoders is declared in a header but
+    *defined out-of-line* in its own .cpp (e.g.
+    src/domain/RawJson.cpp's `Value::toExactQJson()`,
+    src/AuthModels.cpp's `AuthenticateRequest::toJson()`) -- naively
+    collecting findings for declarations whose own resolved file is the
+    source itself would misclassify every legitimate encoder's own
+    out-of-line *definition* as an unrecognized new violation, since
+    ALLOWLIST keys each entry by its *header's* repo-relative path, not
+    its .cpp's (an out-of-line definition shares its declaration's USR
+    but not its declaration's file). Any genuinely *new* QJson-family
+    declaration would still have to be declared in some header to be
+    part of this project's public API surface at all -- an
+    out-of-line-only symbol with no header declaration has no way to be
+    called from another translation unit -- so header/fragment scanning
+    alone remains the correct, complete surface for Finding collection;
+    this function exists purely to close the inclusion-graph/
+    dependency-direction audit gap for real production sources a review
+    round demonstrated was completely unaudited."""
+
+    violations: list[str] = []
+    for source in sources:
+        tu = _parse_source_as_own_tu(clang, idx, source, compile_commands, sysroot_args)
+        try:
+            violations.extend(
+                _audit_inclusion_graph(
+                    clang, tu, source, str(source.resolve()), allowed_closure, repo_root, external_roots
+                )
+            )
+        finally:
+            clang.lib.clang_disposeTranslationUnit(tu)
+    return violations
 
 
 def _read_manifest(path: Path) -> list[Path]:
@@ -1090,6 +1391,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     seen: set[tuple[str, int, str]] = set()
     structural_violations: list[str] = []
     clang_build_dir_resolved = clang_build_dir.resolve()
+    external_roots = _external_roots(clang_build_dir_resolved)
 
     try:
         findings = _scan_headers(
@@ -1099,7 +1401,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             domain_args,
             sysroot_args,
             repo_root,
-            clang_build_dir_resolved,
+            external_roots,
             domain_closure,
             seen,
             structural_violations,
@@ -1111,10 +1413,53 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             foundation_args,
             sysroot_args,
             repo_root,
-            clang_build_dir_resolved,
+            external_roots,
             foundation_closure,
             seen,
             structural_violations,
+        )
+
+        # See _scan_sources()'s own doc comment for why REAL production
+        # .cpp files are audited for inclusion-graph/dependency-direction
+        # violations only (never for new QJson-family Finding objects):
+        # a review round demonstrated this script previously never
+        # independently parsed a single real source file at all --
+        # domain_sources.txt/foundation_sources.txt were read only to
+        # borrow one "representative" compile-args list for scanning
+        # *headers* -- so a production .cpp could #include an
+        # absolute/"../"-relative/symlinked/generated forbidden header,
+        # inherit whatever lossy encoders it declares, and compile with
+        # this check staying green. Each source here is parsed with its
+        # own exact compile_commands.json entry (never a borrowed one),
+        # and both source manifests are themselves generated directly
+        # from arkham_domain_models'/arkham_foundation's own live CMake
+        # SOURCES metadata (see arkham_write_target_source_manifest() in
+        # cmake/PathManifest.cmake) -- never a hand-authored variable --
+        # so this scan can never silently miss a source added via a
+        # later target_sources() call either.
+        structural_violations.extend(
+            _scan_sources(
+                clang,
+                idx,
+                domain_sources,
+                compile_commands,
+                sysroot_args,
+                repo_root,
+                external_roots,
+                domain_closure,
+            )
+        )
+        structural_violations.extend(
+            _scan_sources(
+                clang,
+                idx,
+                foundation_sources,
+                compile_commands,
+                sysroot_args,
+                repo_root,
+                external_roots,
+                foundation_closure,
+            )
         )
     finally:
         clang.lib.clang_disposeIndex(idx)

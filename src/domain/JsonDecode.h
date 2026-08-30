@@ -344,8 +344,41 @@ optionalRawArrayField(const Json::Value &obj, QLatin1StringView key,
 optionalRawObjectField(const Json::Value &obj, QLatin1StringView key,
                        QStringView path);
 
-// Strict non-null UUID decode: fails on null, on a malformed string, and on
-// the all-zero UUID (never a valid backend-assigned identity).
+namespace detail {
+// True only for a string matching the EXACT 36-ASCII-character grammar the
+// pinned backend's own UUID parser (the `uuid`/`uuid-types` Hackage
+// package's Data.UUID.fromText, which every backend UUID field ultimately
+// decodes through) requires: a hyphen at exactly positions 8/13/18/23, and
+// an ASCII hex digit -- '0'-'9', 'A'-'F', or 'a'-'f', either case, per
+// Data.UUID.Types.Internal.fromASCIIBytes's own `toDigit` -- at every other
+// one of the 36 positions, with no braces, no "urn:uuid:" prefix, no
+// percent-encoding, and no non-ASCII character anywhere (all of which that
+// function's own `B.length bs == 36` byte-length gate rejects outright,
+// since any of them changes the total length away from exactly 36).
+//
+// QUuid's own constructor is considerably more permissive than this --
+// besides the plain hyphenated form, it also accepts a "{...}"-braced form
+// and a "urn:uuid:"-prefixed form, silently canonicalizing either down to
+// the same value -- so calling QUuid's parser directly on unvalidated wire
+// input would let this client accept strings the real backend could never
+// have sent and would never itself accept back, masking a genuine
+// protocol-level incompatibility. This check is deliberately run BEFORE
+// QUuid's own parse in every UUID-accepting entry point (decodeUuid()
+// below and TypedId<Tag>::parse() in Identifiers.h) so that acceptance
+// here always implies the backend's own grammar would accept the same
+// bytes too -- it does not itself decide whether the all-zero (nil) UUID
+// is acceptable, which the backend's own parser treats as an ordinary,
+// valid, non-special UUID; nil rejection is this client's own separate,
+// pre-existing domain invariant, applied after this grammar check and
+// QUuid's own parse both succeed.
+[[nodiscard]] bool matchesBackendUuidGrammar(const QString &text) noexcept;
+} // namespace detail
+
+// Strict non-null UUID decode: fails on null, on a malformed string (judged
+// against the pinned backend's own exact grammar -- see
+// detail::matchesBackendUuidGrammar() above -- not merely QUuid's more
+// permissive parser), and on the all-zero UUID (never a valid
+// backend-assigned identity).
 [[nodiscard]] ValueOrError<QUuid> decodeUuid(const QJsonValue &v,
                                              QStringView path);
 [[nodiscard]] ValueOrError<QUuid> decodeUuid(const Json::Value &v,

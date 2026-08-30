@@ -172,6 +172,147 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ceh.classify(finding), "violation")
 
 
+class QJsonFamilyWrappedFormsAreDetectedTests(unittest.TestCase):
+    """Coverage for _is_qjson_family()'s handling of QJsonDocument (a
+    review-round addition to _QJSON_FAMILY) and of every
+    const/reference/pointer-qualified and standard-library
+    wrapper/callable form checked empirically against a real libclang
+    probe before that fix was written -- see the doc comment above
+    _QVARIANT_JSON_CONTAINER_CANONICAL_FORMS in check_encoder_hygiene.py
+    for the full narrative of what was and was not already covered by
+    the pre-existing substring match."""
+
+    def test_bare_qjsondocument_is_prohibited(self) -> None:
+        self.assertTrue(ceh._is_qjson_family("QJsonDocument"))
+
+    def test_qualified_and_pointer_qjsondocument_forms_are_prohibited(self) -> None:
+        for spelling in ("const QJsonDocument &", "QJsonDocument *", "QJsonDocument &&"):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(ceh._is_qjson_family(spelling))
+
+    def test_qualified_and_pointer_qjsonobject_forms_remain_prohibited(self) -> None:
+        for spelling in ("QJsonObject", "const QJsonObject &", "QJsonObject *"):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(ceh._is_qjson_family(spelling))
+
+    def test_standard_library_wrapper_and_callable_forms_are_prohibited(self) -> None:
+        for spelling in (
+            "std::optional<QJsonObject>",
+            "std::shared_ptr<QJsonObject>",
+            "std::unique_ptr<QJsonObject>",
+            "std::function<QJsonObject ()>",
+        ):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(ceh._is_qjson_family(spelling))
+
+    def test_unrelated_return_type_is_not_prohibited(self) -> None:
+        self.assertFalse(ceh._is_qjson_family("Arkham::ValueOrError<QString>"))
+
+
+class QVariantJsonContainerTests(unittest.TestCase):
+    """Coverage for _is_qvariant_json_container() and its wiring into
+    _is_qjson_family(): QVariantMap/QVariantList/QVariantHash are Qt
+    typedefs whose canonical (post-typedef-resolution) spelling is their
+    underlying template instantiation, never the typedef name itself --
+    see the doc comment above _QVARIANT_JSON_CONTAINER_CANONICAL_FORMS
+    for why a naive literal "QVariantMap" substring would silently match
+    nothing."""
+
+    def test_canonical_qvariantmap_spelling_with_space_is_prohibited(self) -> None:
+        self.assertTrue(ceh._is_qjson_family("QMap<QString, QVariant>"))
+
+    def test_canonical_qvariantmap_spelling_without_space_is_prohibited(self) -> None:
+        self.assertTrue(ceh._is_qjson_family("QMap<QString,QVariant>"))
+
+    def test_canonical_qvariantlist_spelling_is_prohibited(self) -> None:
+        self.assertTrue(ceh._is_qjson_family("QList<QVariant>"))
+
+    def test_canonical_qvarianthash_spelling_is_prohibited(self) -> None:
+        self.assertTrue(ceh._is_qjson_family("QHash<QString, QVariant>"))
+
+    def test_qualified_qvariantmap_form_is_prohibited(self) -> None:
+        self.assertTrue(ceh._is_qjson_family("const QMap<QString, QVariant> &"))
+
+    def test_bare_qvariant_is_not_prohibited(self) -> None:
+        # A bare QVariant's static type carries no information about
+        # whether it happens to hold JSON-shaped content at runtime --
+        # deliberately not flagged (see the doc comment in
+        # check_encoder_hygiene.py just above _QVARIANT_JSON_CONTAINER_CANONICAL_FORMS).
+        self.assertFalse(ceh._is_qjson_family("QVariant"))
+
+    def test_unrelated_qt_container_is_not_prohibited(self) -> None:
+        self.assertFalse(ceh._is_qjson_family("QMap<QString, int>"))
+
+
+class ExternalRootsTests(unittest.TestCase):
+    """Coverage for _external_roots(): the small, explicit set of
+    subtrees exempted from the domain/foundation dependency-direction
+    closure check, replacing the unsound blanket "anything under the
+    build directory" exemption a review round demonstrated let a
+    genuinely project-generated header/fragment placed anywhere else
+    under the build directory evade the audit (see
+    _audit_inclusion_graph()'s own doc comment)."""
+
+    def test_returns_exactly_the_deps_subtree(self) -> None:
+        build_dir = Path("/repo/build-encoder-hygiene")
+        roots = ceh._external_roots(build_dir)
+        self.assertEqual(roots, frozenset({(build_dir / "_deps").resolve()}))
+
+    def test_does_not_exempt_the_build_dir_itself(self) -> None:
+        build_dir = Path("/repo/build-encoder-hygiene")
+        roots = ceh._external_roots(build_dir)
+        self.assertNotIn(build_dir.resolve(), roots)
+
+    def test_does_not_exempt_a_generated_subdirectory_of_the_build_dir(self) -> None:
+        # Direct regression coverage for the reviewer-reported bypass: a
+        # genuinely project-generated header/fragment placed at
+        # <build-dir>/generated/Lossy.inc must NOT be exempt merely for
+        # residing somewhere under the build directory.
+        build_dir = Path("/repo/build-encoder-hygiene")
+        roots = ceh._external_roots(build_dir)
+        generated = (build_dir / "generated" / "Lossy.inc").resolve()
+        self.assertFalse(any(generated.is_relative_to(root) for root in roots))
+
+    def test_exempts_a_real_path_nested_under_deps(self) -> None:
+        build_dir = Path("/repo/build-encoder-hygiene")
+        roots = ceh._external_roots(build_dir)
+        nested = (build_dir / "_deps" / "qtkeychain-src" / "keychain.h").resolve()
+        self.assertTrue(any(nested.is_relative_to(root) for root in roots))
+
+
+class FindCompileCommandForSourceTests(unittest.TestCase):
+    """Coverage for _find_compile_command_for_source(): every
+    manifest-registered production .cpp must be matched to its OWN exact
+    compile_commands.json entry by resolved absolute path, never a
+    representative entry borrowed from another file in the same target
+    (that remains _representative_compile_args()'s separate, header-only
+    job) -- and a manifest entry with no matching compile command is a
+    hard failure, never a silent skip (see the reviewer-reported gap
+    this closes: a real .cpp previously compiled completely unaudited by
+    this script's dependency-direction policy)."""
+
+    def test_finds_entry_by_resolved_absolute_path(self) -> None:
+        compile_commands = [
+            {
+                "file": "/repo/src/domain/RawJson.cpp",
+                "command": "clang++ -std=c++23 -Isrc/domain -c /repo/src/domain/RawJson.cpp",
+            },
+            {
+                "file": "/repo/src/domain/Decks.cpp",
+                "command": "clang++ -std=c++23 -DOTHER -c /repo/src/domain/Decks.cpp",
+            },
+        ]
+        entry = ceh._find_compile_command_for_source(compile_commands, Path("/repo/src/domain/Decks.cpp"))
+        self.assertEqual(entry["file"], "/repo/src/domain/Decks.cpp")
+
+    def test_raises_when_no_matching_entry_exists(self) -> None:
+        compile_commands = [
+            {"file": "/repo/src/domain/RawJson.cpp", "command": "clang++ -c /repo/src/domain/RawJson.cpp"},
+        ]
+        with self.assertRaises(ceh.EncoderHygieneError):
+            ceh._find_compile_command_for_source(compile_commands, Path("/repo/src/domain/Decks.cpp"))
+
+
 class AllowlistEntryTests(unittest.TestCase):
     def test_key_is_file_and_usr_pair(self) -> None:
         entry = ceh.AllowlistEntry(file="src/domain/RawJson.h", usr="some-usr")

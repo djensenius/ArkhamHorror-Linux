@@ -80,6 +80,30 @@ endfunction()
 # has been processed, regardless of where in CMakeLists.txt this
 # function itself happens to be called from.
 #
+# A LATER review round showed this alone is still not sufficient:
+# HEADER_SETS itself (see the doc comment inside the function body
+# below) is read via a plain, immediate get_target_property() call --
+# `file(GENERATE)` only defers *evaluating the per-name file-list
+# generator expressions built from that already-captured names list*, it
+# does not retroactively discover a brand-new file-set *name* that a
+# later `target_sources(...FILE_SET <even-later-name>...)` call registers
+# after this function has already been invoked once. The names list is
+# captured too early, at ordinary configure-time call order, regardless
+# of file(GENERATE)'s own separate generate-time deferral for the
+# *values* of already-known names. Callers of this function (see
+# CMakeLists.txt) MUST therefore invoke it via
+# `cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" CALL
+# arkham_write_target_header_set_manifest ...)`, never directly -- this
+# defers the *entire call*, including its internal
+# get_target_property(... HEADER_SETS) read, until CMake finishes
+# processing the current directory scope (i.e. after every
+# target_sources() call anywhere later in the same CMakeLists.txt has
+# already executed), so a file set registered after the textual point
+# this function is invoked from is still captured. See
+# tests/cmake/DeferredTargetManifestPolicyTest.cmake for the real,
+# fail-before/pass-after CMake mutation test proving both the deferred
+# and (for contrast) non-deferred call behavior.
+#
 # Arguments:
 #   TARGET       The target whose HEADER_SETS this manifest is derived
 #                from (e.g. arkham_domain_models, arkham_foundation).
@@ -104,13 +128,14 @@ function(arkham_write_target_header_set_manifest)
 
     # HEADER_SETS itself (unlike HEADER_SET_<NAME>) is a plain,
     # immediately-available list of file-set *names* -- not a
-    # generator-expression-valued property -- so it can be read directly
-    # here at configure time via get_target_property(), as long as every
-    # target_sources(...FILE_SET...) call for this target earlier in
-    # this same configure run has already executed (true for both of
-    # this project's targets: their FILE_SET registrations happen
-    # immediately after their add_library() calls, well before this
-    # function is ever invoked on them).
+    # generator-expression-valued property -- so a get_target_property()
+    # call here sees every name registered on this target *as of the
+    # moment this function body actually executes*, which is why this
+    # function must only ever be invoked through the
+    # cmake_language(DEFER ...) wrapper documented above: called
+    # directly/immediately, this would only see whichever FILE_SET
+    # registrations happened to precede the call site textually, exactly
+    # the bug a review round demonstrated.
     get_target_property(_arkham_thsm_names ${ARG_TARGET} HEADER_SETS)
     if(NOT _arkham_thsm_names)
         message(FATAL_ERROR
@@ -141,4 +166,94 @@ function(arkham_write_target_header_set_manifest)
         CONTENT "$<JOIN:${_arkham_thsm_pieces},\n>\n"
     )
     unset(_arkham_thsm_pieces)
+endfunction()
+
+# Provides arkham_write_target_source_manifest(), the SOURCES-property
+# analog of arkham_write_target_header_set_manifest() above: writes a
+# one-absolute-path-per-line manifest derived directly from a target's
+# own live SOURCES/SOURCE_DIR target properties, rather than from a
+# hand-authored ARKHAM_DOMAIN_SOURCES/ARKHAM_FOUNDATION_SOURCES `set()`
+# variable. A review round demonstrated the domain/foundation dependency-
+# direction boundary was audited for headers/fragments only -- every real
+# production .cpp compiled straight past packaging/check_encoder_hygiene.py's
+# AST scan entirely, so a source file could #include an absolute/"../"/
+# symlinked/generated forbidden header, inherit a lossy encoder from it,
+# and compile cleanly while the policy stayed green (see run_check()'s
+# module docstring). Closing that gap requires the Python script to parse
+# every REAL .cpp with its own exact compile_commands.json entry (see
+# _scan_sources()); this manifest is what tells it, authoritatively, the
+# complete list of sources to do that for -- sourced from the same live
+# target metadata the build itself compiles, so it can never silently
+# miss a source added via a second/later target_sources() call the way a
+# hand-maintained variable could.
+#
+# Unlike HEADER_SET_<name>, plain SOURCES is not itself a per-config/
+# generator-expression-only-resolvable property in the way that would
+# require file(GENERATE) to read safely -- get_target_property(<tgt>
+# SOURCES) returns an ordinary, immediately-usable list of
+# SOURCE_DIR-relative paths once queried. The SAME early-snapshot hazard
+# arkham_write_target_header_set_manifest() has for HEADER_SETS still
+# applies here, though: calling this function BEFORE a later
+# target_sources(<tgt> PRIVATE ...) call registers more sources would
+# silently omit them. Callers MUST therefore invoke this function via the
+# identical cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+# CALL arkham_write_target_source_manifest ...) wrapper documented above
+# arkham_write_target_header_set_manifest() -- see
+# tests/cmake/DeferredTargetManifestPolicyTest.cmake for the matching
+# fail-before/pass-after mutation coverage.
+#
+# Arguments:
+#   TARGET       The target whose SOURCES this manifest is derived from.
+#   OUTPUT_FILE  Absolute path of the manifest file to write.
+function(arkham_write_target_source_manifest)
+    set(oneValueArgs TARGET OUTPUT_FILE)
+    cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
+
+    if(NOT ARG_TARGET)
+        message(FATAL_ERROR "arkham_write_target_source_manifest: TARGET is required")
+    endif()
+    if(NOT ARG_OUTPUT_FILE)
+        message(FATAL_ERROR "arkham_write_target_source_manifest: OUTPUT_FILE is required")
+    endif()
+    if(NOT TARGET ${ARG_TARGET})
+        message(FATAL_ERROR "arkham_write_target_source_manifest: no such target '${ARG_TARGET}'")
+    endif()
+
+    get_filename_component(_arkham_tsm_dir "${ARG_OUTPUT_FILE}" DIRECTORY)
+    file(MAKE_DIRECTORY "${_arkham_tsm_dir}")
+    unset(_arkham_tsm_dir)
+
+    get_target_property(_arkham_tsm_source_dir ${ARG_TARGET} SOURCE_DIR)
+    get_target_property(_arkham_tsm_sources ${ARG_TARGET} SOURCES)
+    if(NOT _arkham_tsm_sources)
+        message(FATAL_ERROR
+            "arkham_write_target_source_manifest: target '${ARG_TARGET}' has no "
+            "SOURCES at all -- nothing for the encoder-hygiene AST scanner to "
+            "audit for this target, which is almost certainly a build "
+            "misconfiguration rather than an intentionally sourceless target.")
+    endif()
+
+    # FILE_SET-registered headers do NOT appear in a target's plain
+    # SOURCES property (a separate CMake property/concept entirely) --
+    # this list is exactly the ordinary (non-FILE_SET) sources passed to
+    # add_library()/target_sources(), i.e. real .cpp translation units,
+    # each SOURCE_DIR-relative (never absolute) as CMake itself stores
+    # them for a target defined via add_library(... ${SOURCES_VAR}) in
+    # this same directory scope.
+    set(_arkham_tsm_lines "")
+    foreach(_arkham_tsm_path IN LISTS _arkham_tsm_sources)
+        cmake_path(IS_RELATIVE _arkham_tsm_path _arkham_tsm_is_relative)
+        if(_arkham_tsm_is_relative)
+            string(APPEND _arkham_tsm_lines "${_arkham_tsm_source_dir}/${_arkham_tsm_path}\n")
+        else()
+            string(APPEND _arkham_tsm_lines "${_arkham_tsm_path}\n")
+        endif()
+    endforeach()
+    unset(_arkham_tsm_path)
+    unset(_arkham_tsm_is_relative)
+    unset(_arkham_tsm_sources)
+    unset(_arkham_tsm_source_dir)
+
+    file(WRITE "${ARG_OUTPUT_FILE}" "${_arkham_tsm_lines}")
+    unset(_arkham_tsm_lines)
 endfunction()

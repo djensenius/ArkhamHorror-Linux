@@ -21,7 +21,16 @@ namespace Arkham {
 // existing ServerProfile/QSettingsProfileStore convention).
 template <typename Tag> class TypedId {
 public:
+  // Judged against the pinned backend's own exact UUID grammar -- see
+  // Json::detail::matchesBackendUuidGrammar()'s doc comment in
+  // JsonDecode.h -- not merely QUuid's own more permissive parser (which
+  // additionally accepts a "{...}"-braced form and a "urn:uuid:"-prefixed
+  // form), so this entry point can never accept text the real backend
+  // itself could not have produced or would not itself accept back.
   [[nodiscard]] static ValueOrError<TypedId> parse(const QString &text) {
+    if (!Json::detail::matchesBackendUuidGrammar(text))
+      return failure(
+          QStringLiteral("not a valid non-null uuid: \"%1\"").arg(text));
     const QUuid parsed(text);
     if (parsed.isNull())
       return failure(
