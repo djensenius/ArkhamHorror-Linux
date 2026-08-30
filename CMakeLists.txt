@@ -250,13 +250,32 @@ add_library(arkham_domain_models STATIC
 # cannot itself prove. BASE_DIRS matches this target's own
 # target_include_directories() below, so consumers see the identical
 # `#include "RawJson.h"`-style paths as before this split.
+#
+# ARKHAM_DOMAIN_HEADERS entries are declared relative to
+# CMAKE_CURRENT_SOURCE_DIR (e.g. "src/RawJson.h") because that is what
+# every other consumer of the list needs (the inventory check, and the
+# encoder-hygiene manifest write below, both join it against
+# CMAKE_CURRENT_SOURCE_DIR directly). FILE_SET's own relative-path
+# resolution rule for FILES is "relative to CMAKE_CURRENT_SOURCE_DIR",
+# the same rule ordinary target_sources() uses -- NOT relative to
+# BASE_DIRS, despite how that reads at a glance -- so passing the list
+# unmodified already resolves correctly today. To remove any doubt (for
+# a reader or reviewer comparing the BASE_DIRS suffix "/src" against a
+# FILES entry that starts with "src/") without depending on that
+# resolution rule at all, FILES below is built as this target's own
+# absolute paths instead: unambiguously a descendant of BASE_DIRS under
+# any interpretation, and identical to what CMake was already resolving
+# these relative entries to.
+list(TRANSFORM ARKHAM_DOMAIN_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/"
+    OUTPUT_VARIABLE _arkham_domain_headers_absolute)
 target_sources(arkham_domain_models
     PUBLIC
         FILE_SET arkham_domain_headers
         TYPE HEADERS
         BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        FILES ${ARKHAM_DOMAIN_HEADERS}
+        FILES ${_arkham_domain_headers_absolute}
 )
+unset(_arkham_domain_headers_absolute)
 
 target_include_directories(arkham_domain_models PUBLIC src)
 target_link_libraries(arkham_domain_models PUBLIC
@@ -306,13 +325,20 @@ add_library(arkham_foundation STATIC
     ${ARKHAM_FOUNDATION_SOURCES}
 )
 
+# See the arkham_domain_models FILE_SET above for why FILES is passed as
+# this target's own absolute paths rather than the
+# CMAKE_CURRENT_SOURCE_DIR-relative ARKHAM_FOUNDATION_HEADERS list
+# directly.
+list(TRANSFORM ARKHAM_FOUNDATION_HEADERS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/"
+    OUTPUT_VARIABLE _arkham_foundation_headers_absolute)
 target_sources(arkham_foundation
     PUBLIC
         FILE_SET arkham_foundation_headers
         TYPE HEADERS
         BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        FILES ${ARKHAM_FOUNDATION_HEADERS}
+        FILES ${_arkham_foundation_headers_absolute}
 )
+unset(_arkham_foundation_headers_absolute)
 
 target_include_directories(arkham_foundation PUBLIC src)
 target_link_libraries(arkham_foundation PUBLIC
