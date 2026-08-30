@@ -438,6 +438,30 @@ private:
     AssetNetworkFetcher::FetchHandle fetchHandle;
     bool isRevalidation{false};
     QVector<quint64> subscriberOperationIds;
+    // Round-9+ review (HIGH): an immutable, monotonic, NEVER-reused
+    // identity for THIS specific attempt object, minted once at
+    // creation (see m_nextCandidateAttemptToken below) and captured BY
+    // VALUE in every completion lambda that closes over this attempt.
+    // m_candidateAttempts is keyed by a STRING (candidateAttemptKey()),
+    // and that string key is deliberately reused across time -- when a
+    // sole subscriber cancels, unsubscribeFromCandidateAttempt() erases
+    // the map entry so a fresh request for the identical
+    // (cacheKey, format, validators) starts a genuinely new attempt
+    // under the SAME key. AssetNetworkFetcher::cancel() does not
+    // suppress its own attempt's eventual callback -- it still fires,
+    // asynchronously, with AssetErrorCode::Cancelled -- so if that new
+    // attempt is created and itself completes BEFORE the old,
+    // now-orphaned callback finally runs, the old callback's
+    // `m_candidateAttempts.find(attemptKey)` lookup would find the NEW
+    // attempt (matching by string key only) and could erase/corrupt it
+    // using the OLD, stale/cancelled result. Checking `token` for exact
+    // equality before any erase/dispatch closes this completely and
+    // unconditionally: a callback whose captured token no longer
+    // matches the live map entry's token (including "no entry at all")
+    // is uniformly treated as a safe, silent no-op, regardless of what
+    // numeric values m_cacheKeyIssuedGeneration happens to hold by the
+    // time it runs.
+    quint64 token{0};
   };
   // Identifies a CandidateAttempt: distinct cache keys, formats, or
   // conditional-validator snapshots (an unconditional first-try fetch
@@ -629,9 +653,25 @@ private:
   // have grown since the leader's registerCacheHitCompletion() call
   // scheduled this closure, if any sibling requests joined in the
   // meantime -- then defers to completeCacheReadGroupOrQuarantine(). A
-  // missing entry (defensive only: nothing else ever erases
-  // m_pendingCacheDecodes except this method) is a silent no-op.
+  // missing entry (the group was already fully pruned away by
+  // pruneCancelledPendingCacheDecodeWaiter() below, or -- defensive only
+  // -- some other unexpected path) is a silent no-op: the decode this
+  // closure was queued for simply never happens.
   void completeCoalescedCacheDecode(const QString &decodeKey);
+  // Round-9+ review item 3/7 ("fully cancelled PendingCacheDecode groups
+  // retained and still decode"): cancel() calls this for every
+  // operationId whose LAST consumer just left (i.e. the Operation itself
+  // is being removed from m_operations), so a waiter that will never be
+  // delivered to can never keep a shared decode group alive -- and, in
+  // particular, a group whose EVERY waiter cancels before its queued
+  // completeCoalescedCacheDecode() closure actually runs is erased
+  // entirely here, so that closure's later no-op (see its own comment)
+  // means the underlying near-32-megapixel decode never happens at all.
+  // A linear scan over m_pendingCacheDecodes (never over m_operations)
+  // is deliberate and cheap: this map's size is bounded by the number of
+  // distinct (cacheKey, format) pairs with a currently in-flight shared
+  // decode, not by the number of aliased waiters or historical requests.
+  void pruneCancelledPendingCacheDecodeWaiter(quint64 operationId);
 
   // Per-cache-key optimistic-concurrency counter (review item 6); see the
   // class comment's "Cross-logical-key races" paragraph. A cache key
@@ -740,6 +780,12 @@ private:
   AssetNetworkFetcher &m_fetcher;
   quint64 m_nextHandle{1};
   quint64 m_nextOperationId{1};
+  // Round-9+ review (HIGH): see CandidateAttempt::token's comment.
+  // Strictly increasing for the entire lifetime of this coordinator,
+  // never reused even across many cancel/replace cycles for the same
+  // cache key -- this is the ONLY property the token-equality check
+  // actually depends on.
+  quint64 m_nextCandidateAttemptToken{1};
   QHash<quint64, Operation> m_operations; // operationId -> Operation
   QHash<quint64, quint64>
       m_handleToOperation; // consumer handleId -> operationId

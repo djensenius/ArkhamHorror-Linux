@@ -799,13 +799,36 @@ void AssetRequestCoordinator::completeCoalescedCacheDecode(
     const QString &decodeKey) {
   auto it = m_pendingCacheDecodes.find(decodeKey);
   if (it == m_pendingCacheDecodes.end()) {
-    return; // defensive only -- see header comment
+    return; // see the header comment
   }
   PendingCacheDecode pending = std::move(it.value());
   m_pendingCacheDecodes.erase(it);
   completeCacheReadGroupOrQuarantine(pending.waiters, std::move(pending.entry),
                                      pending.cacheKey, pending.format,
                                      /*promoteOnSuccess=*/false);
+}
+
+void AssetRequestCoordinator::pruneCancelledPendingCacheDecodeWaiter(
+    quint64 operationId) {
+  for (auto it = m_pendingCacheDecodes.begin();
+       it != m_pendingCacheDecodes.end();) {
+    QVector<GroupWaiter> &waiters = it->waiters;
+    for (int i = waiters.size() - 1; i >= 0; --i) {
+      if (waiters[i].operationId == operationId) {
+        waiters.remove(i);
+      }
+    }
+    if (waiters.isEmpty()) {
+      // Every waiter that ever joined this group has now cancelled
+      // before its queued completeCoalescedCacheDecode() closure ran --
+      // erase the group entirely so that closure's own missing-entry
+      // check makes it a genuine no-op: the shared decode this group
+      // was formed for never happens at all.
+      it = m_pendingCacheDecodes.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
@@ -933,6 +956,11 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
   attempt.cacheKey = cacheKey;
   attempt.issuedGeneration = expectedGeneration;
   attempt.subscriberOperationIds.append(operationId);
+  // Round-9+ review (HIGH): mint this attempt's own immutable identity
+  // BEFORE inserting it, and capture it (not just attemptKey) into the
+  // completion lambda below -- see CandidateAttempt::token's comment.
+  const quint64 attemptToken = m_nextCandidateAttemptToken++;
+  attempt.token = attemptToken;
   m_candidateAttempts.insert(attemptKey, attempt);
   operation.pendingAttemptKey = attemptKey;
 
@@ -940,7 +968,7 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
   const AssetFormat format = candidate.format;
   const AssetNetworkFetcher::FetchHandle fetchHandle = m_fetcher.fetch(
       *validatedUrl, format, {},
-      [self, attemptKey, cacheKey, expectedGeneration](
+      [self, attemptKey, attemptToken, cacheKey, expectedGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {
           return;
@@ -954,9 +982,20 @@ void AssetRequestCoordinator::startCandidate(quint64 operationId) {
         // subscriber is also about to need) always starts a genuinely
         // fresh attempt rather than appending to one that has already
         // fired.
+        //
+        // Round-9+ review (HIGH): `attemptKey` alone is NOT sufficient
+        // to identify "this exact attempt" -- see
+        // CandidateAttempt::token's comment for the full race this
+        // closes. A missing entry, OR an entry present but bearing a
+        // DIFFERENT token than the one this callback captured at
+        // creation time, both mean "not mine any more": some other,
+        // newer attempt now occupies (or once occupied and has already
+        // been erased from) this same string key, and this callback
+        // must never touch it.
         auto attemptIt2 = self->m_candidateAttempts.find(attemptKey);
-        if (attemptIt2 == self->m_candidateAttempts.end()) {
-          return; // defensive only: should be unreachable
+        if (attemptIt2 == self->m_candidateAttempts.end() ||
+            attemptIt2->token != attemptToken) {
+          return;
         }
         const QVector<quint64> subscribers = attemptIt2->subscriberOperationIds;
         self->m_candidateAttempts.erase(attemptIt2);
@@ -1124,6 +1163,10 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
   attempt.issuedGeneration = expectedGeneration;
   attempt.isRevalidation = true;
   attempt.subscriberOperationIds.append(operationId);
+  // Round-9+ review (HIGH): see startCandidate()'s identical comment
+  // and CandidateAttempt::token's declaration comment.
+  const quint64 attemptToken = m_nextCandidateAttemptToken++;
+  attempt.token = attemptToken;
   m_candidateAttempts.insert(attemptKey, attempt);
   operation.pendingAttemptKey = attemptKey;
 
@@ -1131,17 +1174,20 @@ void AssetRequestCoordinator::startRevalidation(quint64 operationId) {
   const AssetFormat format = candidate.format;
   const AssetNetworkFetcher::FetchHandle fetchHandle = m_fetcher.fetch(
       *validatedUrl, format, conditional,
-      [self, attemptKey, cacheKey, expectedGeneration](
+      [self, attemptKey, attemptToken, cacheKey, expectedGeneration](
           AssetOutcome<AssetNetworkFetcher::ConditionalFetchResult> result) {
         if (!self) {
           return;
         }
         // Round-6 item 8: see startCandidate()'s identical comment --
         // extract subscribers and remove the attempt from the map
-        // before any dispatch.
+        // before any dispatch. Round-9+ review (HIGH): token-gated
+        // exactly like startCandidate()'s completion lambda -- see
+        // CandidateAttempt::token's comment.
         auto attemptIt2 = self->m_candidateAttempts.find(attemptKey);
-        if (attemptIt2 == self->m_candidateAttempts.end()) {
-          return; // defensive only: should be unreachable
+        if (attemptIt2 == self->m_candidateAttempts.end() ||
+            attemptIt2->token != attemptToken) {
+          return;
         }
         const QVector<quint64> subscribers = attemptIt2->subscriberOperationIds;
         self->m_candidateAttempts.erase(attemptIt2);
@@ -1223,6 +1269,16 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     verdict = Verdict::FreshReplace;
   }
 
+  // Round-9+ review item 3/7: accumulators for the batched, single-decode
+  // StaleIfError/NotModifiedPromote groups built up by the loop below --
+  // see the loop's own comments on each verdict case.
+  QVector<GroupWaiter> staleIfErrorGroupWaiters;
+  std::optional<AssetCache::CachedEntry> staleIfErrorGroupEntry;
+  AssetFormat staleIfErrorGroupFormat = AssetFormat::Png;
+  QVector<GroupWaiter> notModifiedGroupWaiters;
+  std::optional<AssetCache::CachedEntry> notModifiedGroupEntry;
+  AssetFormat notModifiedGroupFormat = AssetFormat::Png;
+
   for (const quint64 subscriberId : subscribers) {
     auto opIt = m_operations.find(subscriberId);
     if (opIt == m_operations.end()) {
@@ -1254,24 +1310,81 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
       }
       break;
     case Verdict::StaleIfError:
-      completeCacheReadOrQuarantine(subscriberId, stale, cacheKey,
-                                    issuedGeneration,
-                                    /*promoteOnSuccess=*/false);
+      // Round-9+ review item 3/7 ("aliases coalesce network but not
+      // cached/304 decode"): every subscriber of THIS attempt shares the
+      // identical (cacheKey, format, etag, lastModified) attempt key --
+      // see candidateAttemptKey()'s comment -- so their staleEntry is
+      // expected to be byte-identical too. Defer to the batched,
+      // single-decode path below instead of decoding independently per
+      // subscriber; the (rare, defensive-only) case where a subscriber's
+      // captured stale entry unexpectedly disagrees still falls back to
+      // an independent decode, exactly as registerCacheHitCompletion()
+      // does for the analogous cache-hit case.
+      if (!staleIfErrorGroupEntry.has_value()) {
+        staleIfErrorGroupEntry = stale;
+        staleIfErrorGroupFormat =
+            operation.candidateIndex >= 0 &&
+                    operation.candidateIndex < operation.candidates.size()
+                ? operation.candidates[operation.candidateIndex].format
+                : operation.key.format;
+        staleIfErrorGroupWaiters.append(
+            GroupWaiter{subscriberId, issuedGeneration});
+      } else if (staleIfErrorGroupEntry->encodedBytes == stale.encodedBytes) {
+        staleIfErrorGroupWaiters.append(
+            GroupWaiter{subscriberId, issuedGeneration});
+      } else {
+        completeCacheReadOrQuarantine(subscriberId, stale, cacheKey,
+                                      issuedGeneration,
+                                      /*promoteOnSuccess=*/false);
+      }
       break;
     case Verdict::NotModifiedPromote:
-      // A validator-carrying disk hit is normally withheld from memory
-      // promotion until it has actually been revalidated -- this 304 IS
-      // that revalidation, so completeCacheReadOrQuarantine() is asked
-      // to unconditionally promote the (now-decoded) entry on success.
-      completeCacheReadOrQuarantine(subscriberId, stale, cacheKey,
-                                    issuedGeneration,
-                                    /*promoteOnSuccess=*/true);
+      // Same batching principle as StaleIfError above -- a validator-
+      // carrying disk hit is normally withheld from memory promotion
+      // until it has actually been revalidated; this 304 IS that
+      // revalidation, so the batched group below is asked to
+      // unconditionally promote the (now-decoded) entry on success.
+      if (!notModifiedGroupEntry.has_value()) {
+        notModifiedGroupEntry = stale;
+        notModifiedGroupFormat =
+            operation.candidateIndex >= 0 &&
+                    operation.candidateIndex < operation.candidates.size()
+                ? operation.candidates[operation.candidateIndex].format
+                : operation.key.format;
+        notModifiedGroupWaiters.append(
+            GroupWaiter{subscriberId, issuedGeneration});
+      } else if (notModifiedGroupEntry->encodedBytes == stale.encodedBytes) {
+        notModifiedGroupWaiters.append(
+            GroupWaiter{subscriberId, issuedGeneration});
+      } else {
+        completeCacheReadOrQuarantine(subscriberId, stale, cacheKey,
+                                      issuedGeneration,
+                                      /*promoteOnSuccess=*/true);
+      }
       break;
     case Verdict::FreshReplace:
       completeOperation(subscriberId,
                         AssetOutcome<AssetCache::CachedEntry>(freshEntry));
       break;
     }
+  }
+
+  // Round-9+ review item 3/7: exactly one decode for the whole
+  // StaleIfError group, and exactly one for the whole NotModifiedPromote
+  // group -- never one per subscriber. Each waiter still applies its own
+  // independent issuance CAS inside completeCacheReadGroupOrQuarantine()
+  // (see its own comment), so a subscriber whose logical key has since
+  // been superseded still observes exactly the outcome an independent
+  // per-operation decode would have produced.
+  if (!staleIfErrorGroupWaiters.isEmpty()) {
+    completeCacheReadGroupOrQuarantine(
+        staleIfErrorGroupWaiters, *staleIfErrorGroupEntry, cacheKey,
+        staleIfErrorGroupFormat, /*promoteOnSuccess=*/false);
+  }
+  if (!notModifiedGroupWaiters.isEmpty()) {
+    completeCacheReadGroupOrQuarantine(
+        notModifiedGroupWaiters, *notModifiedGroupEntry, cacheKey,
+        notModifiedGroupFormat, /*promoteOnSuccess=*/true);
   }
 }
 
@@ -1439,6 +1552,12 @@ void AssetRequestCoordinator::cancel(RequestHandle handle) {
     if (fetchHandleToCancel.isValid()) {
       m_fetcher.cancel(fetchHandleToCancel);
     }
+    // Round-9+ review item 3/7: this operationId can no longer be
+    // delivered to -- see pruneCancelledPendingCacheDecodeWaiter()'s
+    // comment for why it must never keep a shared cache-hit decode group
+    // (and, transitively, that group's queued near-32-megapixel decode)
+    // alive on its own.
+    pruneCancelledPendingCacheDecodeWaiter(operationId);
     // Round-6 item 7: this operation has just stopped being in-flight
     // via cancellation, exactly as much as one that stopped via
     // completeOperation() -- its cache key(s) must be equally eligible

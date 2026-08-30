@@ -8,6 +8,7 @@
 
 #include <QBuffer>
 #include <QCoreApplication>
+#include <QDir>
 #include <QFile>
 #include <QImage>
 #include <QNetworkAccessManager>
@@ -275,7 +276,12 @@ using Result = AssetOutcome<AssetCache::CachedEntry>;
 } // namespace
 
 void AssetRequestCoordinatorTests::init() {
-  m_tempDir = std::make_unique<QTemporaryDir>();
+  // Round-9+ review: rooted under home so this exercises AssetCache's
+  // real home-anchored directory-resolution code path -- see
+  // AssetCacheTests::init()'s comment for the full rationale.
+  m_tempDir = std::make_unique<QTemporaryDir>(
+      QDir::homePath() +
+      QStringLiteral("/.arkham-asset-coordinator-test-XXXXXX"));
   QVERIFY(m_tempDir->isValid());
   m_tempDirPath = m_tempDir->path();
 }
@@ -3226,4 +3232,360 @@ void AssetRequestCoordinatorTests::
   // cancelled waiter never caused the group to skip decoding altogether,
   // nor did it cause a second, independent decode.
   QCOMPARE(coordinator.realDecodeCallCountForTesting(), 1);
+}
+
+void AssetRequestCoordinatorTests::
+    cancellingEveryWaiterInACoalescedCacheDecodeGroupPreventsTheDecodeEntirely() {
+  // Round-9+ review item 3/7 ("fully cancelled PendingCacheDecode groups
+  // retained and still decode"): unlike the test above (one survivor
+  // remains), THIS test cancels BOTH waiters of a shared cache-hit
+  // decode group before its single queued decode has had any chance to
+  // run at all. The group must be pruned entirely by cancel() itself
+  // (see pruneCancelledPendingCacheDecodeWaiter()'s comment) -- the
+  // decode this group was formed for must never run at all, not even
+  // once, since delivering it to anyone is now impossible.
+  MockHttpServer server;
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(8, 8);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(8, 8);
+  cache.store(cacheKey, preSeeded);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  const auto handleA =
+      coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
+  const auto handleB =
+      coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  QCOMPARE(coordinator.pendingCacheDecodeGroupCountForTesting(), 1);
+  QCOMPARE(coordinator.pendingCacheDecodeWaiterCountForTesting(
+               cacheKey, AssetFormat::Png),
+           2);
+
+  // Cancel BOTH waiters before the shared queued decode has run.
+  coordinator.cancel(handleA);
+  coordinator.cancel(handleB);
+
+  // The group must already be gone -- pruned synchronously by the
+  // second cancel(), which emptied its waiter list.
+  QCOMPARE(coordinator.pendingCacheDecodeGroupCountForTesting(), 0);
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
+  QVERIFY(!bool(*resultA));
+  QCOMPARE(resultA->error().code, AssetErrorCode::Cancelled);
+  QVERIFY(!bool(*resultB));
+  QCOMPARE(resultB->error().code, AssetErrorCode::Cancelled);
+
+  // The decisive assertion: zero real decodes ever ran. The group's own
+  // queued completeCoalescedCacheDecode() closure still runs (it was
+  // already scheduled before either cancellation), but finds nothing in
+  // m_pendingCacheDecodes and is a genuine no-op.
+  QCOMPARE(coordinator.realDecodeCallCountForTesting(), 0);
+}
+
+void AssetRequestCoordinatorTests::
+    concurrentAliasedRevalidationStaleIfErrorRequestsCoalesceIntoASingleDecode() {
+  // Round-9+ review item 3/7 ("aliases coalesce network but not cached/
+  // 304 decode"): two aliased logical keys (differing only in `locale`)
+  // both revalidate the identical pre-seeded disk entry (same cacheKey,
+  // same on-disk etag, so the same coalesced conditional GET -- see
+  // diskHitRevalidationCoalescesConcurrentIdenticalRequests()) against
+  // an origin that answers with a transport failure (500): the
+  // "stale-if-error" verdict must decode the served-stale entry exactly
+  // ONCE for the whole coalesced group, never once per aliased
+  // subscriber.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.status = 500;
+  response.reasonPhrase = "Internal Server Error";
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  {
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry preSeeded;
+    preSeeded.encodedBytes = encodePng(8, 8);
+    preSeeded.contentType = QStringLiteral("image/png");
+    preSeeded.dimensions = QSize(8, 8);
+    preSeeded.etag = QStringLiteral("\"shared-etag\"");
+    seedCache.store(cacheKey, preSeeded);
+  }
+  // A fresh AssetCache instance (simulating a restart) forces both
+  // requests through the disk-hit-with-validators/revalidation path --
+  // a memory hit would skip revalidation (and this coalescing) entirely.
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
+  coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  // Both operations share exactly one coalesced revalidation attempt.
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 2);
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
+
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QCOMPARE((**resultA).encodedBytes, (**resultB).encodedBytes);
+  QVERIFY(!(**resultA).decodedImage.isNull());
+  QVERIFY(!(**resultB).decodedImage.isNull());
+  QCOMPARE((**resultA).decodedImage.size(), QSize(8, 8));
+  QCOMPARE((**resultB).decodedImage.size(), QSize(8, 8));
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+
+  // The decisive assertion: exactly ONE real decode ran for both
+  // aliased subscribers sharing the one served-stale entry.
+  QCOMPARE(coordinator.realDecodeCallCountForTesting(), 1);
+}
+
+void AssetRequestCoordinatorTests::
+    concurrentAliasedRevalidationNotModifiedRequestsCoalesceIntoASingleDecode() {
+  // Same principle as the StaleIfError test above, but for a confirmed
+  // 304: two aliased logical keys share one coalesced conditional GET
+  // that comes back Not Modified, and must share exactly one decode of
+  // the now-promoted entry.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(32, 32); // must never be served to the caller
+  response.etagForConditionalMatch = "\"shared-etag\"";
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  {
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry preSeeded;
+    preSeeded.encodedBytes = encodePng(8, 8);
+    preSeeded.contentType = QStringLiteral("image/png");
+    preSeeded.dimensions = QSize(8, 8);
+    preSeeded.etag = QStringLiteral("\"shared-etag\"");
+    seedCache.store(cacheKey, preSeeded);
+  }
+  AssetCache restartedCache(cacheConfig);
+  AssetRequestCoordinator coordinator(restartedCache, fetcher);
+
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
+  coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 2);
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
+
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QVERIFY(!(**resultA).decodedImage.isNull());
+  QVERIFY(!(**resultB).decodedImage.isNull());
+  QCOMPARE((**resultA).decodedImage.size(), QSize(8, 8));
+  QCOMPARE((**resultB).decodedImage.size(), QSize(8, 8));
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           1);
+
+  // Both entries were promoted to memory by the shared 304 confirmation.
+  QVERIFY(restartedCache.lookupMemory(cacheKey).has_value());
+
+  // The decisive assertion: exactly ONE real decode ran for both
+  // aliased subscribers sharing the confirmed-current entry.
+  QCOMPARE(coordinator.realDecodeCallCountForTesting(), 1);
+}
+
+void AssetRequestCoordinatorTests::
+    staleCancelledAttemptCallbackNeverCorruptsReplacementNetworkFetch() {
+  // Round-9+ review (HIGH): see CandidateAttempt::token's declaration
+  // comment and this test's declaration comment in the header. Cancel a
+  // sole consumer's unconditional network fetch (which synchronously
+  // erases its CandidateAttempt from m_candidateAttempts and calls
+  // AssetNetworkFetcher::cancel() on the underlying fetch -- whose own
+  // Cancelled completion is always dispatched later via a queued
+  // invocation, never synchronously), then, in the SAME call stack,
+  // before that queued Cancelled callback has any chance to run, issue a
+  // brand new request for the IDENTICAL candidate. That new request
+  // necessarily reuses the exact same string-keyed attemptKey (same
+  // cacheKey/format/empty-validators). Pre-fix, the stale callback --
+  // when it eventually ran -- found the NEW attempt under that key,
+  // erased it, and dispatched its own stale Cancelled result to the new
+  // request's subscriber; the new attempt's real, later network
+  // completion then found nothing left in the map to dispatch to and
+  // was silently dropped.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+
+  std::optional<Result> cancelledResult;
+  const auto cancelledHandle = coordinator.request(
+      key, [&](Result r) { cancelledResult = std::move(r); });
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 1);
+
+  // Sole consumer: synchronously erases the CandidateAttempt and calls
+  // m_fetcher.cancel() on its fetch handle.
+  coordinator.cancel(cancelledHandle);
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 0);
+
+  std::optional<Result> replacementResult;
+  coordinator.request(key, [&](Result r) { replacementResult = std::move(r); });
+
+  // The replacement request must observe its OWN real, correct
+  // completion -- never the first (cancelled) attempt's stale Cancelled
+  // result, and never be silently dropped.
+  QVERIFY(
+      QTest::qWaitFor([&]() { return replacementResult.has_value(); }, 5000));
+  QVERIFY2(bool(*replacementResult),
+           qPrintable(replacementResult->error().message));
+  QVERIFY(!(**replacementResult).decodedImage.isNull());
+  QCOMPARE((**replacementResult).decodedImage.size(), QSize(8, 8));
+
+  // The original (cancelled) consumer still receives cancel()'s own
+  // Cancelled delivery, exactly as always.
+  QVERIFY(QTest::qWaitFor([&]() { return cancelledResult.has_value(); }, 5000));
+  QVERIFY(!bool(*cancelledResult));
+  QCOMPARE(cancelledResult->error().code, AssetErrorCode::Cancelled);
+}
+
+void AssetRequestCoordinatorTests::
+    staleCancelledAttemptCallbackNeverCorruptsReplacementRevalidation() {
+  // Round-9+ review (HIGH): identical race to the test above, but for
+  // the conditional-revalidation path (startRevalidation()) -- proving
+  // CandidateAttempt::token protects both call sites independently.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(8, 8);
+  response.extraHeaders.append(
+      qMakePair(QByteArray("ETag"), QByteArray("\"replacement-fresh-etag\"")));
+  server.setResponse(path, response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  // Pre-seed a stale disk-only entry (no memory hit) carrying a
+  // validator, exactly like the other revalidation tests above, so
+  // request() takes the conditional-revalidation branch rather than an
+  // unconditional network fetch.
+  {
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry preSeeded;
+    preSeeded.encodedBytes = encodePng(4, 4);
+    preSeeded.contentType = QStringLiteral("image/png");
+    preSeeded.dimensions = QSize(4, 4);
+    preSeeded.etag = QStringLiteral("\"stale-etag\"");
+    seedCache.store(cacheKey, preSeeded);
+  }
+  AssetCache cache(cacheConfig);
+  QVERIFY(cache.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cache.lookupMemory(cacheKey).has_value());
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  std::optional<Result> cancelledResult;
+  const auto cancelledHandle = coordinator.request(
+      key, [&](Result r) { cancelledResult = std::move(r); });
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 1);
+
+  // Sole consumer: synchronously erases the CandidateAttempt and calls
+  // m_fetcher.cancel() on the underlying conditional GET.
+  coordinator.cancel(cancelledHandle);
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 0);
+
+  std::optional<Result> replacementResult;
+  coordinator.request(key, [&](Result r) { replacementResult = std::move(r); });
+
+  // The replacement request must observe its OWN real, correct fresh-200
+  // completion (carrying the NEW etag) -- never the first (cancelled)
+  // attempt's stale Cancelled result, and never be silently dropped.
+  QVERIFY(
+      QTest::qWaitFor([&]() { return replacementResult.has_value(); }, 5000));
+  QVERIFY2(bool(*replacementResult),
+           qPrintable(replacementResult->error().message));
+  QVERIFY(!(**replacementResult).decodedImage.isNull());
+  QCOMPARE((**replacementResult).decodedImage.size(), QSize(8, 8));
+  const auto freshDiskEntry = cache.lookupDisk(cacheKey);
+  QVERIFY(freshDiskEntry.has_value());
+  QCOMPARE(freshDiskEntry->etag, QStringLiteral("\"replacement-fresh-etag\""));
+
+  // The original (cancelled) consumer still receives cancel()'s own
+  // Cancelled delivery, exactly as always.
+  QVERIFY(QTest::qWaitFor([&]() { return cancelledResult.has_value(); }, 5000));
+  QVERIFY(!bool(*cancelledResult));
+  QCOMPARE(cancelledResult->error().code, AssetErrorCode::Cancelled);
 }

@@ -115,6 +115,43 @@ private slots:
   void
   corruptCoalescedCacheHitInvalidatesExactlyOnceAndEachWaiterIndependentlyRefetches();
   void cancellingOneWaiterInACoalescedCacheDecodeGroupNeverAffectsAnother();
+  // Round-9+ review item 3/7 ("fully cancelled PendingCacheDecode groups
+  // retained and still decode"): when EVERY waiter of a shared cache-hit
+  // decode group cancels before its single queued decode has run, the
+  // group itself must be pruned entirely -- the decode must never
+  // happen at all, not even once, since there is no one left to deliver
+  // it to.
+  void
+  cancellingEveryWaiterInACoalescedCacheDecodeGroupPreventsTheDecodeEntirely();
+  // Round-9+ review item 3/7 ("aliases coalesce network but not cached/
+  // 304 decode"): two aliased logical keys revalidating the identical
+  // disk entry (same cacheKey/etag, so the same coalesced conditional
+  // GET -- see diskHitRevalidationCoalescesConcurrentIdenticalRequests())
+  // must ALSO share exactly one decode of the served-stale (or
+  // confirmed-304) entry -- never one independent decode per aliased
+  // subscriber, which would otherwise multiply a near-32-megapixel
+  // decode by the number of aliases sharing one revalidation.
+  void
+  concurrentAliasedRevalidationStaleIfErrorRequestsCoalesceIntoASingleDecode();
+  void
+  concurrentAliasedRevalidationNotModifiedRequestsCoalesceIntoASingleDecode();
+  // Round-9+ review (HIGH): CandidateAttempt::token closes a race where
+  // a sole consumer's cancellation synchronously removes/cancels its
+  // CandidateAttempt, and a fresh request for the IDENTICAL candidate
+  // issued immediately afterward (same call stack, before the old
+  // fetch's now-queued Cancelled callback has run) reuses the exact same
+  // string-keyed attemptKey. Without a per-attempt token, the OLD,
+  // stale, orphaned callback -- when it eventually runs -- finds the
+  // NEW attempt under that same key, erases it, and wrongly dispatches
+  // its own stale Cancelled result to the NEW request's subscriber,
+  // silently discarding the new attempt's real, later, correct
+  // completion. These two tests reproduce that exact interleaving for
+  // both the unconditional network-fetch path (startCandidate()) and
+  // the conditional revalidation path (startRevalidation()), and assert
+  // the replacement request always observes its OWN real, correct
+  // result.
+  void staleCancelledAttemptCallbackNeverCorruptsReplacementNetworkFetch();
+  void staleCancelledAttemptCallbackNeverCorruptsReplacementRevalidation();
 
 private:
   QString m_tempDirPath;
