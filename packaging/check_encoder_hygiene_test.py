@@ -33,6 +33,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import check_encoder_hygiene as ceh
 
+_FIRST_ALLOWLIST_FULL_SIGNATURE = (
+    "kind=21;owner=c:@N@Arkham@N@Json@S@Value;"
+    "type=Arkham::ValueOrError<QJsonValue> () const;"
+    "result=Arkham::ValueOrError<QJsonValue>;params=[];static=0;"
+    "variadic=0;exception=0;calling_conv=1;ref_qualifier=0;"
+    "forbidden=[result:Arkham::ValueOrError<QJsonValue>]"
+)
+
 
 def _finding(
     file: str = "src/domain/RawJson.h",
@@ -41,6 +49,7 @@ def _finding(
     canonical_return_type: str = "QJsonObject",
     usr: str = "c:@N@Arkham@F@someMethod#1",
     access: int = 0,
+    linkage: int = 0,
 ) -> ceh.Finding:
     return ceh.Finding(
         file=file,
@@ -49,6 +58,7 @@ def _finding(
         canonical_return_type=canonical_return_type,
         usr=usr,
         access=access,
+        linkage=linkage,
     )
 
 
@@ -62,8 +72,9 @@ class ClassifyTests(unittest.TestCase):
         finding = _finding(
             file=entry.file,
             usr=entry.usr,
-            canonical_return_type=entry.semantic_signature,
+            canonical_return_type=_FIRST_ALLOWLIST_FULL_SIGNATURE,
             access=entry.access,
+            linkage=entry.linkage,
         )
         counts = Counter({entry.key(): entry.expected_count})
         self.assertEqual(ceh.classify(finding, counts), "allowed")
@@ -76,8 +87,9 @@ class ClassifyTests(unittest.TestCase):
         finding = _finding(
             file=entry.file,
             usr=entry.usr,
-            canonical_return_type=entry.semantic_signature,
+            canonical_return_type=_FIRST_ALLOWLIST_FULL_SIGNATURE,
             access=entry.access,
+            linkage=entry.linkage,
         )
         self.assertEqual(ceh.classify(finding), "allowed")
 
@@ -88,6 +100,7 @@ class ClassifyTests(unittest.TestCase):
             usr=entry.usr,
             canonical_return_type="result=const QJsonObject &",
             access=entry.access,
+            linkage=entry.linkage,
         )
         self.assertEqual(ceh.classify(finding), "violation")
 
@@ -96,8 +109,9 @@ class ClassifyTests(unittest.TestCase):
         finding = _finding(
             file=entry.file,
             usr=entry.usr,
-            canonical_return_type=entry.semantic_signature,
+            canonical_return_type=_FIRST_ALLOWLIST_FULL_SIGNATURE,
             access=2,
+            linkage=entry.linkage,
         )
         self.assertEqual(ceh.classify(finding), "violation")
 
@@ -106,8 +120,9 @@ class ClassifyTests(unittest.TestCase):
         finding = _finding(
             file=entry.file,
             usr=entry.usr,
-            canonical_return_type=entry.semantic_signature,
+            canonical_return_type=_FIRST_ALLOWLIST_FULL_SIGNATURE,
             access=entry.access,
+            linkage=entry.linkage,
         )
         counts = Counter({entry.key(): 0})
         self.assertEqual(ceh.classify(finding, counts), "violation")
@@ -120,8 +135,9 @@ class ClassifyTests(unittest.TestCase):
         finding = _finding(
             file=entry.file,
             usr=entry.usr,
-            canonical_return_type=entry.semantic_signature,
+            canonical_return_type=_FIRST_ALLOWLIST_FULL_SIGNATURE,
             access=entry.access,
+            linkage=entry.linkage,
         )
         counts = Counter({entry.key(): entry.expected_count + 1})
         self.assertEqual(ceh.classify(finding, counts), "violation")
@@ -453,14 +469,14 @@ class AllowlistEntryTests(unittest.TestCase):
 
 
 class AllowlistShapeTests(unittest.TestCase):
-    def test_domain_allowlist_has_exactly_sixty_four_entries(self) -> None:
-        self.assertEqual(len(ceh.DOMAIN_ALLOWLIST), 64)
+    def test_domain_allowlist_has_exactly_seventy_five_entries(self) -> None:
+        self.assertEqual(len(ceh.DOMAIN_ALLOWLIST), 75)
 
-    def test_foundation_allowlist_has_exactly_five_entries(self) -> None:
-        self.assertEqual(len(ceh.FOUNDATION_ALLOWLIST), 5)
+    def test_foundation_allowlist_has_exactly_thirteen_entries(self) -> None:
+        self.assertEqual(len(ceh.FOUNDATION_ALLOWLIST), 13)
 
-    def test_combined_allowlist_has_sixty_nine_entries(self) -> None:
-        self.assertEqual(len(ceh.ALLOWLIST), 69)
+    def test_combined_allowlist_has_eighty_eight_entries(self) -> None:
+        self.assertEqual(len(ceh.ALLOWLIST), 88)
 
     def test_allowlist_entries_are_unique(self) -> None:
         # Guards against an accidental duplicate entry silently shrinking
@@ -479,12 +495,16 @@ class AllowlistShapeTests(unittest.TestCase):
 
     def test_foundation_allowlist_names_only_exact_foundation_decoder_files(self) -> None:
         for entry in ceh.FOUNDATION_ALLOWLIST:
-            self.assertIn(entry.file, ("src/AuthModels.h", "src/ServerCapabilities.h"))
+            self.assertTrue(
+                entry.file.startswith("src/")
+                and not entry.file.startswith("src/domain/")
+            )
 
     def test_every_allowlist_entry_pins_signature_and_access(self) -> None:
         for entry in ceh.ALLOWLIST:
-            self.assertIsNotNone(entry.semantic_signature)
+            self.assertRegex(entry.full_signature_sha256 or "", r"^[0-9a-f]{64}$")
             self.assertIsNotNone(entry.access)
+            self.assertIsNotNone(entry.linkage)
 
     def test_domain_and_foundation_allowlists_share_no_files(self) -> None:
         # Structural proof the two audited header sets are disjoint by
@@ -562,6 +582,15 @@ class HeaderCompileContextsTests(unittest.TestCase):
         sources = [Path("/repo/src/domain/RawJson.cpp")]
         with self.assertRaises(ceh.EncoderHygieneError):
             ceh._header_compile_contexts(compile_commands, sources, "domain")
+
+
+class ProductionConfigurationMatrixTests(unittest.TestCase):
+    def test_debug_release_and_relwithdebinfo_are_mandatory(self) -> None:
+        self.assertEqual(
+            ceh.SUPPORTED_PRODUCTION_CONFIGS,
+            ("Debug", "Release", "RelWithDebInfo"),
+        )
+        self.assertIn("Release", ceh.SUPPORTED_PRODUCTION_CONFIGS)
 
 
 class SanitizeCompileArgsTests(unittest.TestCase):

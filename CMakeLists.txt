@@ -88,6 +88,14 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/external_roots.txt"
 )
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/autogen_targets.txt" "")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/target_policy.txt" "")
+if(CMAKE_CONFIGURATION_TYPES)
+    string(REPLACE ";" "\n" _arkham_audited_configs "${CMAKE_CONFIGURATION_TYPES}")
+else()
+    set(_arkham_audited_configs "${CMAKE_BUILD_TYPE}")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/audited_configs.txt"
+    "${_arkham_audited_configs}\n")
+unset(_arkham_audited_configs)
 
 # FetchContent builds qtkeychain via add_subdirectory(), so the namespaced
 # alias normally created by the installed QtKeychainConfig.cmake does not

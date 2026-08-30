@@ -86,26 +86,22 @@ actually observed in unified seen data. A macro-conditional declaration
 visible only under this source's preprocessor state is therefore
 classified rather than skipped merely because its path is registered.
 If the canonical cursor's own file is the .cpp itself,
-this is a genuinely new declaration -- and it is recorded as a Finding
-(which can never match any ALLOWLIST entry, since every entry is keyed
-to a header path) if, and only if, it also has genuinely external
-linkage (clang_getCursorLinkage() == CXLinkage_External): a `static`- or
-anonymous-namespace-scoped helper has internal/unique-external linkage
-and categorically cannot be referenced from another translation unit at
-all, so it is correctly never flagged, no matter its own nominal access
-specifier.
+this is a genuinely new declaration and is recorded regardless of
+external/internal/static/anonymous linkage or public/protected/private
+access. Linkage and access are part of its exact allowance identity.
 
 A later series of reviews demonstrated that output-channel inference is
 itself an open-ended category error: pointer wrappers, arrays, callbacks,
 functors, and dependent bases can all expose the same wire type through
 different language machinery. The policy is therefore a closed positive
-boundary, not an output classifier. Every public/protected production
+boundary, not an output classifier. Every production
 function, constructor, conversion, alias, field, variable, and base is
 recursively searched for any semantic reference to QJsonObject,
 QJsonArray, QJsonValue, QJsonDocument, or QVariant JSON containers.
 Constness and presumed direction do not exempt it. The only accepted
-references are exact path + USR + canonical semantic signature + access +
-occurrence-count entries below, covering the intentional inbound decoders
+references are exact physical path/location + USR + full canonical
+signature digest + access + linkage + occurrence count + owning
+target/config observation entries below, covering the intentional inbound decoders
 and the bounded RawJson/Auth adapters.
 
 An even earlier version of this check (see git history:
@@ -254,6 +250,7 @@ import argparse
 import ctypes
 import ctypes.util
 import glob as globmod
+import hashlib
 import json
 import os
 import platform
@@ -264,7 +261,7 @@ import subprocess
 import sys
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -286,6 +283,8 @@ class AllowlistEntry:
     expected_count: int = 1
     semantic_signature: str | None = None
     access: int | None = None
+    linkage: int | None = None
+    full_signature_sha256: str | None = None
 
     def key(self) -> tuple[str, str]:
         return (self.file, self.usr)
@@ -375,8 +374,25 @@ _INBOUND_DOMAIN_SURFACES = (
     AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@fromQJson#&1$@S@QJsonValue#S", semantic_signature="param[0]=const QJsonValue &", access=1),
 )
 
+_INTERNAL_DOMAIN_SURFACES = (
+    AllowlistEntry("src/domain/RawJson.h", "c:@N@Arkham@N@Json@S@Value@F@toExactQJsonInner#&1$@N@Arkham@N@Json@S@ParseLimits#I#&K#1"),
+    AllowlistEntry("src/domain/CardCatalog.cpp", "c:CardCatalog.cpp@N@Arkham@aN@F@decodeCardCodeValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/CardCatalog.cpp", "c:CardCatalog.cpp@N@Arkham@aN@F@decodeCardNameValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/CardCatalog.cpp", "c:CardCatalog.cpp@N@Arkham@aN@F@decodeSkillIconValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/CardCatalog.cpp", "c:CardCatalog.cpp@N@Arkham@aN@F@decodeCardCostValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/CardCatalog.cpp", "c:CardCatalog.cpp@N@Arkham@aN@F@decodeGameValueValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/Decks.cpp", "c:Decks.cpp@N@Arkham@aN@F@decodeInvestigatorRefValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/Decks.cpp", "c:Decks.cpp@N@Arkham@aN@F@decodeExternalDeckId#&1$@S@QJsonObject#$@S@QStringView#"),
+    AllowlistEntry("src/domain/Decks.cpp", "c:Decks.cpp@N@Arkham@aN@F@decodeDeckListValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/Games.cpp", "c:Games.cpp@N@Arkham@aN@F@decodeGameStateValue#&1$@S@QJsonValue#$@S@QStringView#"),
+    AllowlistEntry("src/domain/Games.cpp", "c:Games.cpp@N@Arkham@aN@F@decodeGameListRow#&1$@S@QJsonValue#$@S@QStringView#"),
+)
+
 DOMAIN_ALLOWLIST: tuple[AllowlistEntry, ...] = (
-    _CANONICAL_ADAPTERS + _DECODE_HELPERS + _INBOUND_DOMAIN_SURFACES
+    _CANONICAL_ADAPTERS
+    + _DECODE_HELPERS
+    + _INBOUND_DOMAIN_SURFACES
+    + _INTERNAL_DOMAIN_SURFACES
 )
 
 # src/AuthModels.h: the two legitimate foundation-layer request-body
@@ -390,10 +406,149 @@ FOUNDATION_ALLOWLIST: tuple[AllowlistEntry, ...] = (
     AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@AuthToken@F@fromJson#&1$@S@QJsonObject#S", semantic_signature="param[0]=const QJsonObject &", access=1),
     AllowlistEntry("src/AuthModels.h", "c:@N@Arkham@S@CurrentUser@F@fromJson#&1$@S@QJsonObject#S", semantic_signature="param[0]=const QJsonObject &", access=1),
     AllowlistEntry("src/ServerCapabilities.h", "c:@N@Arkham@S@ServerCapabilities@F@fromJson#&1$@S@QJsonObject#S", semantic_signature="param[0]=const QJsonObject &", access=1),
+    AllowlistEntry("src/NetworkAuthenticationClient.h", "c:@N@Arkham@S@NetworkAuthenticationClient@F@issueTokenRequest#&1$@N@Arkham@S@ServerProfile#$@S@QStringView#&1$@S@QJsonObject#$@N@std@N@__1@S@function>#Fv(#$@N@Arkham@S@AuthResult>#$@N@Arkham@S@AuthToken)#"),
+    AllowlistEntry("src/AuthModels.cpp", "c:AuthModels.cpp@N@Arkham@aN@F@jsonTypeName#&1$@S@QJsonValue#"),
+    AllowlistEntry("src/AuthModels.cpp", "c:AuthModels.cpp@N@Arkham@aN@F@requireString#&1$@S@QJsonObject#$@S@QLatin1String#"),
+    AllowlistEntry("src/AuthModels.cpp", "c:AuthModels.cpp@N@Arkham@aN@F@requireBool#&1$@S@QJsonObject#$@S@QLatin1String#"),
+    AllowlistEntry("src/ServerCapabilities.cpp", "c:ServerCapabilities.cpp@N@Arkham@aN@F@jsonTypeName#&1$@S@QJsonValue#"),
+    AllowlistEntry("src/ServerCapabilities.cpp", "c:ServerCapabilities.cpp@N@Arkham@aN@F@requireString#&1$@S@QJsonObject#$@S@QLatin1String#"),
+    AllowlistEntry("src/QSettingsProfileStore.h", "c:@N@Arkham@S@QSettingsProfileStore@FI@m_ownedSettings"),
+    AllowlistEntry("src/QSettingsProfileStore.h", "c:@N@Arkham@S@QSettingsProfileStore@FI@m_settings"),
 )
 
 ALLOWLIST: tuple[AllowlistEntry, ...] = DOMAIN_ALLOWLIST + FOUNDATION_ALLOWLIST
+
+# SHA-256 of each entry's complete canonical declaration signature, in
+# ALLOWLIST order. The signature includes result, every parameter,
+# owner/type, static/member, cv/ref, variadic, exception, calling
+# convention, ref qualifier, and the recursive forbidden-type proof path.
+_FULL_SIGNATURE_SHA256 = (
+    "99a59561baeaa62ba82ebafaf80a8a3dcc53f45bd34abc562350e448aa7be61d",
+    "13bb4ed4a5f6e9e00e367ab417c646b5dd1ebd525cd6bef6581adf190e0b3312",
+    "1e9ef271f67e8dd37f6f68151df8135e8b376ef995c0427336d27d591d64f748",
+    "a5a6dcf0fbecd37f31da1ce28ba7a76c6f95ed2f1416dce4f9618d54cbce19fd",
+    "de0f89fd01f7fe3aa6098efd3e742440231af2bddb8c4aa0ecc5a59438014d6d",
+    "d654379d3da9c4a5a3c6aa650a72885730af4372fdf752c8435a43875331460f",
+    "64876764a7ae875fcc23aa95f16f32f74a53e3619bd004b914a4d9942d35862f",
+    "7afd07c61cfbaa4e4c5daae60b40d1b0ea1d6db516080db839d5ce126dd8f594",
+    "08e00595f3d34bed12b77f808a153a3b3f2b1afc0f3cab535abb0e45fa61bb4f",
+    "08e00595f3d34bed12b77f808a153a3b3f2b1afc0f3cab535abb0e45fa61bb4f",
+    "08e00595f3d34bed12b77f808a153a3b3f2b1afc0f3cab535abb0e45fa61bb4f",
+    "a8ef4111fce844fe7a38b85d7e1687a930c660791d2332e03f089f5f66bd81f7",
+    "19552113caab7e22682b95bb7d25bfd8af5920fd129f8a7d43d5f9845432bdb8",
+    "f24a0cf7292a965996aa9f863fb9298bace7b1677b0c8aa19c95eee83c5df35f",
+    "88c0afddcf5adb32a2aa3563c13142735de8ccbe98d6b82a731c2f99befc3a00",
+    "e6e824baef210f539225cbd946a04a581537ec50ab565e0ada89c73570b572ea",
+    "ca36746d7320b6f1f1acc72cf2c8031fa3a2d8be51580146268510988676c6ae",
+    "90f0547ebbb6d6cdaa99aa4371b3f2acc614fef755413fc5df2ab6536b7c9fca",
+    "0470f1f8d0ac5e2b272dfec3b310e643c1739c6cf759f39250fdc9f9ed46f5a2",
+    "36dce58dd6eb5c125fc8dfe340203ead2d9454620f97f0ffa5d0d339e3806a3f",
+    "49f006cf3358b300141ed235601c7b5d5e3fb473dd722a48366ff21741e88f07",
+    "04cc5684cb1b361211858efdd59b22865f3548d4738b9eda838f821a59af3b48",
+    "8412f8cce63607383f9dea545d2acd821f205fff8b674460977c52f0da91d923",
+    "db6193986aeeacbe9d4a226e65a9c16bb4b996d6510d5ffe6bdbff06c432935e",
+    "6ea005d54adfbfa5962bd0ff876c7925d0dc5934e1b8c0eb2eaff5cfc21024ed",
+    "fa8539aa6e17bd040e551b675fcc473464beae9e12e0ef16dddc0efb217c816d",
+    "a12b65525c5671b1705143e1cf1493420d836681f2959fe52344854eb9eb940d",
+    "8dbf9088d591d44f95db7dcc0ffe1200b808860e96112486c25cc98d33a72d7a",
+    "2300469f61a57d33424aa1840831d33e01b724ba539c1799ac019879512f83d2",
+    "d296108d1162449e25d0853d11326daafd82ca0be28bc90183c3e3bc123e6af9",
+    "b74ac3b4d9b229babbae68a02805f725dd695f18d66568d34924bffaf175b1c7",
+    "3f0611a2b2a389c392b2a849f128f11c5a2dc0582f739787280a5db4c0ab7f17",
+    "5c26050edbcd97786d708163743f8b917bcf2dee91d40bc3644540a5416fcc41",
+    "a263d4116d6251ff1b507d584dc68b1ff1a00260ed281d12090114c873601eb8",
+    "8cbb5d3f23b3d56eab067bccdf54de48278f38e3646c47af8f4c206db8c74972",
+    "02f107255bdb41a7d5a88cc10f6dbd688165d9c82fba66918e32e86e58f3675b",
+    "ad97b9b0a7ba39dd244d630528dd85c130d96316692679242cbe49f5b742a0f1",
+    "b3ce70313afab0067eb7e9c4961b6574d4057b0abc604a06c7576869ac571ce4",
+    "e15d29f7e94439a7dee1a973ee10d0a4cbf4cce8ac5853d44b5f64e9cdd34bf3",
+    "9ce7310597e3081990d2359d39bb1a1bbeab0a0878aed99218ed3ded813a987e",
+    "0a94432e3b1b105eaf818aa4f58b27ba28ab4c8e364b969089c937bda50e8b04",
+    "a2983b1b32ecbc2931890974b15313a3d3c4a5468a7aa92b528be3a4d344d19c",
+    "505da9b1d5607d245ca03f4bb1a0656430b4253f75cced1add6e97144649a163",
+    "c35a8813693950ae3e3e91115192f5ec408d8710432eb51373c1de25c99052d5",
+    "f504ace951b113e52d3f417a9d3fc210c3c0d16ec2550aae03091f7ac9afa6fd",
+    "e320575411954410fc8e96756e254d611b2454743f3965002ddc11a79597d44a",
+    "ba879a1d82f8ba68e5f6d308c240bfe3481ebef7f59b6c35ae25fcc586422a58",
+    "2df054407962f11b2161d9d7064bbe6e3997a7e74d4254c1fccaef64ef9b014a",
+    "1fed010c66fcebc450463aae40c5540f8b6e2e45177cea024f429deb0ad95d6a",
+    "0269f71e9ae0db50f6f9d7dc010567869b951e6df0542cbd6c5d186e10921bef",
+    "2d8911a752c3b0e79c1ef6ec2fac4eda9350fe72facff6a61f390d988c09e742",
+    "a517711e9d5bc6b6649b333d92a8fe30057414cf8ab0b6a178ab684883d2606d",
+    "a96746cd3928b9bd415c4a22c08e61a8e3aea327d26137e6fde5b74fc6c492c0",
+    "eb51cbe4afe9e3b4965318fefae70c5fb47fc257c8dcc93a01faf392033ad7e7",
+    "9fa579b3be6c27dd05cbc6556e8b63cff65595256d95d9a31057a94908add8e7",
+    "a96746cd3928b9bd415c4a22c08e61a8e3aea327d26137e6fde5b74fc6c492c0",
+    "eb51cbe4afe9e3b4965318fefae70c5fb47fc257c8dcc93a01faf392033ad7e7",
+    "9fa579b3be6c27dd05cbc6556e8b63cff65595256d95d9a31057a94908add8e7",
+    "a96746cd3928b9bd415c4a22c08e61a8e3aea327d26137e6fde5b74fc6c492c0",
+    "eb51cbe4afe9e3b4965318fefae70c5fb47fc257c8dcc93a01faf392033ad7e7",
+    "f1581535f014bcfb6d944b7b7c54572c326d89850c75230dace99c51cf9f61e4",
+    "55d0af07499d8ef65ce0cc145716b8df887ef8c6adaf4b866590e14be21558ee",
+    "b73edf4e67c7736a0125a3d62661b9abc31c9149a15ec33bc4bd43cd34a6f6b3",
+    "10c8ff5bd2546417e76a6bd0bd5d22fc4e87510c8f1b9f7f9056e1e2ccc6da67",
+    "a1199b0b6bc57a654a0e3c2d012c0ab7343459dbee9e1ab75b9468aeedf94dfd",
+    "8545422cef1a496ea73d0da7df72ff7d33b84dc05e85df3b9df6469a23b5d68b",
+    "75ff78356166af00c87a2d7c08caf8ee425a55fccce65f1ecb457927417ef2bf",
+    "5ed51fa0b97771442ee12cf218cbdcadbd8b6eefbdd9a1b34754943a23e6bd36",
+    "d6c36fff70e010475edc3570576df4701d018faee308381909095175cf0eaaae",
+    "b81f7c4d93f2720dbe4f73da2f9452e77a148355593e077dbfcc14a1b485705c",
+    "4815f71a0df07dd5f442cac03003e5febc267e92861f3870afdf6bb290fbe977",
+    "9b5e76650f84b5f9dc2b671b5cc6899b00b4c228036e290a8caf796239ae0fd7",
+    "59f230fe73df99538be4b8ee196f714d7174cd5dc2a65b64c5d9a9c2dfce36f8",
+    "b85306eb3eb9983b740375067983fa1a18a819eda634546d42e477e10834bc94",
+    "64a12400fff6312005d0a774fe6fbaea5d3c1d83e3a175ac61de250a30e1eb79",
+    "b218918c68e643c83f2bde7973a70c0a97b376048cfcbae4fdd516cc6d4ba780",
+    "9c21915c6844a780a46eeeaf33cdf74c14a031591132b6863be0d3fa82ad97ef",
+    "3bb547432865db8a9f5faf34cdb0244c222ca7b386bcb6b35720960141ba7751",
+    "08abad487a757d408ff5922db45bb3b1267cbd23956b42fd2bb4a57acdc6d748",
+    "bd3f6d06cb45ac45d847782e63c41c2de8765393d6071fe74f2017b38301206d",
+    "727dd0b7bf98d07eede4442734b01bdc11c79aa86b50814c5efada0f9e30e0aa",
+    "1f03517504bd23457781ad5518ddfee18b91ab604347b83152725df91e7d0cda",
+    "2a210c5bf6ed6d11075a64e87ec73dc39fdb4e19e82bdf5869c6d68d888bf523",
+    "591ddc9638979fd643c4d397efafd60d14d5121565052ca3a336dc324d9e2194",
+    "1f03517504bd23457781ad5518ddfee18b91ab604347b83152725df91e7d0cda",
+    "2a210c5bf6ed6d11075a64e87ec73dc39fdb4e19e82bdf5869c6d68d888bf523",
+    "e7a01e79fd74a4ca8f491e3b22aee0dc3fecde9da2789f04b80ece4f7d656661",
+    "60414f0a01d963397f22e2c56a3b1b5c7a34564a6c05442b08d6501645227724",
+)
+
+if len(_FULL_SIGNATURE_SHA256) != len(ALLOWLIST):
+    raise AssertionError("full declaration-signature pin count does not match ALLOWLIST")
+
+ALLOWLIST = tuple(
+    replace(
+        entry,
+        access=(
+            entry.access
+            if entry.access is not None
+            else 3
+            if "toExactQJsonInner" in entry.usr
+            or "issueTokenRequest" in entry.usr
+            or "QSettingsProfileStore@FI@" in entry.usr
+            else 0
+        ),
+        linkage=2 if "@aN@" in entry.usr else 4,
+        full_signature_sha256=signature_hash,
+    )
+    for entry, signature_hash in zip(
+        ALLOWLIST, _FULL_SIGNATURE_SHA256, strict=True
+    )
+)
+DOMAIN_ALLOWLIST = ALLOWLIST[: len(DOMAIN_ALLOWLIST)]
+FOUNDATION_ALLOWLIST = ALLOWLIST[len(DOMAIN_ALLOWLIST) :]
 ALLOWLIST_BY_KEY: dict[tuple[str, str], AllowlistEntry] = {e.key(): e for e in ALLOWLIST}
+ALLOWLIST_USRS = frozenset(entry.usr for entry in ALLOWLIST)
+# Exact semantic stop-points whose internals are governed separately:
+# RawJson::Value's two QJson bridges are explicit declaration allowances,
+# while bare QVariant is intentionally not a forbidden JSON container
+# (only its statically JSON-shaped Map/List/Hash forms are).
+SAFE_OPAQUE_RECORD_USRS = frozenset(
+    {
+        "c:@N@Arkham@N@Json@S@Value",
+        "c:@S@QVariant",
+    }
+)
 
 if len(ALLOWLIST_BY_KEY) != len(ALLOWLIST):
     raise AssertionError(
@@ -526,6 +681,7 @@ class _CXUnsavedFile(ctypes.Structure):
 # script actually consumed _CXCursor_StructDecl until the inheritance-
 # exposure walk added below started doing so.
 _CXCursor_StructDecl = 2
+_CXCursor_UnionDecl = 3
 _CXCursor_ClassDecl = 4
 _CXCursor_FieldDecl = 6
 _CXCursor_VarDecl = 9
@@ -543,13 +699,21 @@ _CXCursor_UsingDeclaration = 35
 _CXCursor_TypeAliasDecl = 36
 _CXCursor_OverloadedDeclRef = 49
 _CXCursor_NoDeclFound = 71
+_CXCursor_TranslationUnit = 300
 _CXCursor_FriendDecl = 603
 _CXCursor_TemplateTypeParameter = 27
 
 # The "shape-eligible" record/class-template kinds this script walks for
 # base-specifier/using-declaration inheritance exposure (see
 # _inherited_and_reexported_encoders()).
-_RECORD_LIKE_KINDS = frozenset({_CXCursor_StructDecl, _CXCursor_ClassDecl, _CXCursor_ClassTemplate})
+_RECORD_LIKE_KINDS = frozenset(
+    {
+        _CXCursor_StructDecl,
+        _CXCursor_UnionDecl,
+        _CXCursor_ClassDecl,
+        _CXCursor_ClassTemplate,
+    }
+)
 
 # Function-like declaration kinds with a meaningful result type.
 _FUNCTION_LIKE_KINDS = frozenset(
@@ -575,10 +739,6 @@ _CX_CXXInvalidAccessSpecifier = 0
 _CX_CXXPublic = 1
 _CX_CXXProtected = 2
 _CX_CXXPrivate = 3
-_PUBLIC_ACCESS_SPECIFIERS = frozenset({_CX_CXXInvalidAccessSpecifier, _CX_CXXPublic})
-_SURFACE_ACCESS_SPECIFIERS = frozenset(
-    {_CX_CXXInvalidAccessSpecifier, _CX_CXXPublic, _CX_CXXProtected}
-)
 _TYPE_SURFACE_KINDS = frozenset(
     {
         _CXCursor_TypeAliasDecl,
@@ -621,6 +781,7 @@ _ARRAY_TYPE_KINDS = frozenset(
         _CXType_DependentSizedArray,
     }
 )
+SUPPORTED_PRODUCTION_CONFIGS = ("Debug", "Release", "RelWithDebInfo")
 
 # CXLinkageKind values (see clang-c/Index.h): only a declaration with
 # genuinely external linkage can be referenced (e.g. via an ad-hoc
@@ -732,6 +893,12 @@ class _LibClang:
 
     def __init__(self, path: Path) -> None:
         self.lib = ctypes.CDLL(str(path))
+        self.forbidden_type_cache: dict[
+            tuple[int, str, bool, int, int], str | None
+        ] = {}
+        self.forbidden_type_active: set[
+            tuple[int, str, bool, int, int]
+        ] = set()
         lib = self.lib
 
         lib.clang_getCString.restype = ctypes.c_char_p
@@ -881,6 +1048,8 @@ class _LibClang:
         lib.clang_getCursorDisplayName.argtypes = [_CXCursor]
         lib.clang_getCursorUSR.restype = _CXString
         lib.clang_getCursorUSR.argtypes = [_CXCursor]
+        lib.clang_getCursorSemanticParent.restype = _CXCursor
+        lib.clang_getCursorSemanticParent.argtypes = [_CXCursor]
         lib.clang_getCXXAccessSpecifier.restype = ctypes.c_int
         lib.clang_getCXXAccessSpecifier.argtypes = [_CXCursor]
         lib.clang_getCursorResultType.restype = _CXType
@@ -889,10 +1058,27 @@ class _LibClang:
         lib.clang_getCanonicalType.argtypes = [_CXType]
         lib.clang_getTypeSpelling.restype = _CXString
         lib.clang_getTypeSpelling.argtypes = [_CXType]
+        lib.clang_Cursor_isVariadic.restype = ctypes.c_uint
+        lib.clang_Cursor_isVariadic.argtypes = [_CXCursor]
+        lib.clang_getCursorExceptionSpecificationType.restype = ctypes.c_int
+        lib.clang_getCursorExceptionSpecificationType.argtypes = [_CXCursor]
+        lib.clang_getFunctionTypeCallingConv.restype = ctypes.c_int
+        lib.clang_getFunctionTypeCallingConv.argtypes = [_CXType]
+        lib.clang_Type_getCXXRefQualifier.restype = ctypes.c_int
+        lib.clang_Type_getCXXRefQualifier.argtypes = [_CXType]
+        lib.clang_CXXMethod_isStatic.restype = ctypes.c_uint
+        lib.clang_CXXMethod_isStatic.argtypes = [_CXCursor]
 
         lib.clang_getCursorLocation.restype = _CXSourceLocation
         lib.clang_getCursorLocation.argtypes = [_CXCursor]
         lib.clang_getExpansionLocation.argtypes = [
+            _CXSourceLocation,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.clang_getSpellingLocation.argtypes = [
             _CXSourceLocation,
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.POINTER(ctypes.c_uint),
@@ -978,6 +1164,14 @@ class _LibClang:
         return result
 
     def cursor_file_and_line(self, cursor: _CXCursor) -> tuple[str | None, int]:
+        filename, line, _offset, _spelling_file, _spelling_offset = (
+            self.cursor_location_identity(cursor)
+        )
+        return filename, line
+
+    def cursor_location_identity(
+        self, cursor: _CXCursor
+    ) -> tuple[str | None, int, int, str | None, int]:
         loc = self.lib.clang_getCursorLocation(cursor)
         file_ptr = ctypes.c_void_p()
         line = ctypes.c_uint()
@@ -987,8 +1181,31 @@ class _LibClang:
             loc, ctypes.byref(file_ptr), ctypes.byref(line), ctypes.byref(col), ctypes.byref(offset)
         )
         if not file_ptr.value:
-            return None, 0
-        return self.to_str(self.lib.clang_getFileName(file_ptr)), line.value
+            return None, 0, 0, None, 0
+        expansion_file = self.to_str(self.lib.clang_getFileName(file_ptr))
+        spelling_file_ptr = ctypes.c_void_p()
+        spelling_line = ctypes.c_uint()
+        spelling_col = ctypes.c_uint()
+        spelling_offset = ctypes.c_uint()
+        self.lib.clang_getSpellingLocation(
+            loc,
+            ctypes.byref(spelling_file_ptr),
+            ctypes.byref(spelling_line),
+            ctypes.byref(spelling_col),
+            ctypes.byref(spelling_offset),
+        )
+        spelling_file = (
+            self.to_str(self.lib.clang_getFileName(spelling_file_ptr))
+            if spelling_file_ptr.value
+            else None
+        )
+        return (
+            expansion_file,
+            line.value,
+            offset.value,
+            spelling_file,
+            spelling_offset.value,
+        )
 
 
 @dataclass(frozen=True)
@@ -1001,6 +1218,11 @@ class Finding:
     canonical_return_type: str
     usr: str
     access: int = 0
+    linkage: int = 0
+    offset: int = 0
+    spelling_file: str = ""
+    spelling_offset: int = 0
+    observation_context: str = ""
 
     def key(self) -> tuple[str, str]:
         return (self.file, self.usr)
@@ -1076,6 +1298,7 @@ def _forbidden_type_fingerprint(
     value_type: "_CXType",
     depth: int = 0,
     visited_records: frozenset[str] = frozenset(),
+    traverse_records: bool = True,
 ) -> str | None:
     """Return the canonical outer type whenever any recursively reachable
     semantic component references a forbidden Qt wire container."""
@@ -1084,46 +1307,136 @@ def _forbidden_type_fingerprint(
         return None
     canonical = clang.lib.clang_getCanonicalType(value_type)
     spelling = _stable_type_spelling(clang, canonical)
+    cache_key = (
+        canonical.kind,
+        spelling,
+        traverse_records,
+        int(canonical.data[0] or 0),
+        int(canonical.data[1] or 0),
+    )
+    if cache_key in clang.forbidden_type_cache:
+        return clang.forbidden_type_cache[cache_key]
+    if cache_key in clang.forbidden_type_active:
+        return None
+    clang.forbidden_type_active.add(cache_key)
+
+    def finish(result: str | None) -> str | None:
+        clang.forbidden_type_active.discard(cache_key)
+        clang.forbidden_type_cache[cache_key] = result
+        return result
+
     if _is_qjson_family(spelling):
-        return spelling
+        return finish(spelling)
     if canonical.kind in _REFERENCE_OR_POINTER_TYPE_KINDS or canonical.kind == _CXType_MemberPointer:
         pointee = clang.lib.clang_getPointeeType(canonical)
-        if pointee.kind != 0 and _forbidden_type_fingerprint(
-            clang, pointee, depth + 1, visited_records
-        ):
-            return spelling
+        nested = (
+            _forbidden_type_fingerprint(
+                clang, pointee, depth + 1, visited_records, traverse_records
+            )
+            if pointee.kind != 0
+            else None
+        )
+        if nested:
+            return finish(f"{spelling}=>{nested}")
     if canonical.kind in _ARRAY_TYPE_KINDS:
-        if _forbidden_type_fingerprint(
+        nested = _forbidden_type_fingerprint(
             clang,
             clang.lib.clang_getArrayElementType(canonical),
             depth + 1,
             visited_records,
-        ):
-            return spelling
+            traverse_records,
+        )
+        if nested:
+            return finish(f"{spelling}=>{nested}")
     if canonical.kind in _FUNCTION_TYPE_KINDS:
         result = clang.lib.clang_getResultType(canonical)
-        if result.kind != 0 and _forbidden_type_fingerprint(
-            clang, result, depth + 1, visited_records
-        ):
-            return spelling
+        nested = (
+            _forbidden_type_fingerprint(
+                clang, result, depth + 1, visited_records, traverse_records
+            )
+            if result.kind != 0
+            else None
+        )
+        if nested:
+            return finish(f"{spelling}=>{nested}")
         for index in range(max(clang.lib.clang_getNumArgTypes(canonical), 0)):
-            if _forbidden_type_fingerprint(
+            nested = _forbidden_type_fingerprint(
                 clang,
                 clang.lib.clang_getArgType(canonical, index),
                 depth + 1,
                 visited_records,
-            ):
-                return spelling
+                traverse_records,
+            )
+            if nested:
+                return finish(f"{spelling}=>{nested}")
     template_count = clang.lib.clang_Type_getNumTemplateArguments(canonical)
     for index in range(max(template_count, 0)):
         argument = clang.lib.clang_Type_getTemplateArgumentAsType(
             canonical, index
         )
-        if argument.kind != 0 and _forbidden_type_fingerprint(
-            clang, argument, depth + 1, visited_records
-        ):
-            return spelling
-    return None
+        nested = (
+            _forbidden_type_fingerprint(
+                clang, argument, depth + 1, visited_records, traverse_records
+            )
+            if argument.kind != 0
+            else None
+        )
+        if nested:
+            return finish(f"{spelling}=>{nested}")
+    declaration = clang.lib.clang_getTypeDeclaration(canonical)
+    if traverse_records and clang.lib.clang_getCursorKind(declaration) in _RECORD_LIKE_KINDS:
+        record_usr = clang.to_str(clang.lib.clang_getCursorUSR(declaration))
+        if record_usr in SAFE_OPAQUE_RECORD_USRS:
+            return finish(None)
+        if not record_usr or record_usr not in visited_records:
+            nested_visited = (
+                visited_records | {record_usr}
+                if record_usr
+                else visited_records
+            )
+            found: str | None = None
+            def visit(
+                cursor: "_CXCursor", _parent: "_CXCursor", _client_data
+            ) -> int:
+                nonlocal found
+                kind = clang.lib.clang_getCursorKind(cursor)
+                cursor_usr = clang.to_str(
+                    clang.lib.clang_getCursorUSR(cursor)
+                )
+                if cursor_usr in ALLOWLIST_USRS:
+                    return 1
+                nested_types: list[_CXType] = []
+                nested_traverse_records = True
+                if kind in _SIGNATURE_DECL_KINDS:
+                    if kind in _FUNCTION_LIKE_KINDS:
+                        nested_types.append(
+                            clang.lib.clang_getCursorResultType(cursor)
+                        )
+                    nested_types.extend(
+                        clang.lib.clang_getCursorType(parameter)
+                        for parameter in _parameter_cursors(clang, cursor)
+                    )
+                    nested_traverse_records = False
+                elif kind in _TYPE_SURFACE_KINDS or kind in _RECORD_LIKE_KINDS:
+                    nested_types.append(clang.lib.clang_getCursorType(cursor))
+                for nested_type in nested_types:
+                    nested = _forbidden_type_fingerprint(
+                        clang,
+                        nested_type,
+                        depth + 1,
+                        nested_visited,
+                        nested_traverse_records,
+                    )
+                    if nested:
+                        found = nested
+                        return 0
+                return 1
+
+            callback = clang._visitor_func_type(visit)
+            clang.lib.clang_visitChildren(declaration, callback, None)
+            if found:
+                return finish(f"{spelling}=>{found}")
+    return finish(None)
 
 
 def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tuple[bool, str]:
@@ -1131,19 +1444,47 @@ def _is_encoder_shaped(clang: "_LibClang", cursor: "_CXCursor", kind: int) -> tu
     referenced by a production function signature, without inferring
     direction, mutability, ownership, or callback behavior."""
 
-    references: list[str] = []
+    has_forbidden = False
+    forbidden_references: list[str] = []
+    parameters = _parameter_cursors(clang, cursor)
+    result_spelling = "<constructor>"
     if kind in _FUNCTION_LIKE_KINDS:
         result = clang.lib.clang_getCursorResultType(cursor)
-        forbidden = _forbidden_type_fingerprint(clang, result)
-        if forbidden is not None:
-            references.append(f"result={forbidden}")
-    for index, parameter in enumerate(_parameter_cursors(clang, cursor)):
-        forbidden = _forbidden_type_fingerprint(
-            clang, clang.lib.clang_getCursorType(parameter)
+        result_spelling = _stable_type_spelling(clang, result)
+        result_forbidden = _forbidden_type_fingerprint(clang, result)
+        if result_forbidden is not None:
+            forbidden_references.append(f"result:{result_forbidden}")
+            has_forbidden = True
+    parameter_spellings: list[str] = []
+    for parameter in parameters:
+        parameter_type = clang.lib.clang_getCursorType(parameter)
+        parameter_spellings.append(
+            _stable_type_spelling(clang, parameter_type)
         )
-        if forbidden is not None:
-            references.append(f"param[{index}]={forbidden}")
-    return bool(references), ";".join(references) if references else "no forbidden Qt wire type"
+        parameter_forbidden = _forbidden_type_fingerprint(
+            clang, parameter_type
+        )
+        if parameter_forbidden is not None:
+            forbidden_references.append(
+                f"param[{len(parameter_spellings) - 1}]:{parameter_forbidden}"
+            )
+            has_forbidden = True
+    cursor_type = clang.lib.clang_getCanonicalType(
+        clang.lib.clang_getCursorType(cursor)
+    )
+    semantic_parent = clang.lib.clang_getCursorSemanticParent(cursor)
+    owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(semantic_parent))
+    full_signature = (
+        f"kind={kind};owner={owner_usr};type={_stable_type_spelling(clang, cursor_type)};"
+        f"result={result_spelling};params=[{'|'.join(parameter_spellings)}];"
+        f"static={int(kind == _CXCursor_CXXMethod and bool(clang.lib.clang_CXXMethod_isStatic(cursor)))};"
+        f"variadic={int(bool(clang.lib.clang_Cursor_isVariadic(cursor)))};"
+        f"exception={clang.lib.clang_getCursorExceptionSpecificationType(cursor)};"
+        f"calling_conv={clang.lib.clang_getFunctionTypeCallingConv(cursor_type)};"
+        f"ref_qualifier={clang.lib.clang_Type_getCXXRefQualifier(cursor_type)};"
+        f"forbidden=[{'|'.join(forbidden_references)}]"
+    )
+    return has_forbidden, full_signature
 
 
 def _resolve_using_declaration_targets(clang: "_LibClang", using_cursor: "_CXCursor") -> list:
@@ -1597,10 +1938,15 @@ def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -
     if entry is None:
         return "violation"
     if (
-        entry.semantic_signature is None
-        or entry.semantic_signature != finding.canonical_return_type
+        entry.full_signature_sha256 is None
+        or entry.full_signature_sha256
+        != hashlib.sha256(
+            finding.canonical_return_type.encode("utf-8")
+        ).hexdigest()
         or entry.access is None
         or entry.access != finding.access
+        or entry.linkage is None
+        or entry.linkage != finding.linkage
     ):
         return "violation"
     if counts is not None and counts[finding.key()] != entry.expected_count:
@@ -2629,6 +2975,15 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
         )
         expected_code = {*compilations, *source_moc_owners.keys()}
         header_mocs: set[Path] = set()
+        header_output_roots = [root]
+        if metadata.get("MULTI_CONFIG") is True:
+            header_output_roots = [
+                Path(value).resolve()
+                for key, value in metadata.items()
+                if key.startswith("INCLUDE_DIR_")
+                and isinstance(value, str)
+                and Path(value).is_dir()
+            ]
         for header_record in metadata.get("HEADERS", []):
             if not isinstance(header_record, list) or len(header_record) < 3:
                 raise EncoderHygieneError(
@@ -2636,10 +2991,11 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
                 )
             output = header_record[2]
             if isinstance(output, str) and output:
-                generated = (root / output).resolve()
-                if generated.is_file():
-                    expected_code.add(generated)
-                    header_mocs.add(generated)
+                for output_root in header_output_roots:
+                    generated = (output_root / output).resolve()
+                    if generated.is_file():
+                        expected_code.add(generated)
+                        header_mocs.add(generated)
 
         actual_code = {
             path.resolve()
@@ -2682,8 +3038,17 @@ def _load_autogen_closures(clang_build_dir: Path) -> dict[str, list[AutogenClosu
                 )
         for generated in header_mocs:
             relative = generated.relative_to(root).as_posix()
+            include_relative = next(
+                (
+                    generated.relative_to(output_root).as_posix()
+                    for output_root in header_output_roots
+                    if generated.is_relative_to(output_root)
+                ),
+                relative,
+            )
             if not any(
                 f'#include "{relative}"' in text
+                or f"#include <{include_relative}>" in text
                 for text in compilation_texts.values()
             ):
                 raise EncoderHygieneError(
@@ -2759,6 +3124,7 @@ def _scan_headers(
     its own closure #include it -- never once per including header)."""
 
     findings: list[Finding] = []
+    active_observation_context = ""
 
     def record_if_new(
         *,
@@ -2769,10 +3135,15 @@ def _scan_headers(
         shape_description: str,
         usr: str,
         access: int,
+        linkage: int,
+        offset: int,
+        spelling_file: str,
+        spelling_offset: int,
     ) -> None:
-        if dedup_key in seen:
+        observation_key = (active_observation_context, *dedup_key)
+        if observation_key in seen:
             return
-        seen.add(dedup_key)
+        seen.add(observation_key)
         findings.append(
             Finding(
                 file=real.relative_to(repo_root).as_posix(),
@@ -2781,24 +3152,44 @@ def _scan_headers(
                 canonical_return_type=shape_description,
                 usr=usr,
                 access=access,
+                linkage=linkage,
+                offset=offset,
+                spelling_file=spelling_file,
+                spelling_offset=spelling_offset,
+                observation_context=active_observation_context,
             )
         )
 
     def handle_own_declaration(cursor: _CXCursor, kind: int) -> None:
         canonical_cursor = clang.lib.clang_getCanonicalCursor(cursor)
-        filename, line = clang.cursor_file_and_line(canonical_cursor)
+        cursor_filename, _cursor_line = clang.cursor_file_and_line(cursor)
+        canonical_filename, _canonical_line = clang.cursor_file_and_line(
+            canonical_cursor
+        )
+        physical_cursor = (
+            canonical_cursor
+            if clang.lib.clang_isCursorDefinition(cursor)
+            and cursor_filename != canonical_filename
+            else cursor
+        )
+        (
+            filename,
+            line,
+            offset,
+            spelling_filename,
+            spelling_offset,
+        ) = clang.cursor_location_identity(physical_cursor)
         if filename is None:
             return
         real = Path(filename).resolve()
         if real not in allowed_closure:
             return
         access = clang.lib.clang_getCXXAccessSpecifier(canonical_cursor)
-        if access not in _SURFACE_ACCESS_SPECIFIERS:
-            return
         is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
         if not is_shaped:
             return
         usr = clang.to_str(clang.lib.clang_getCursorUSR(canonical_cursor))
+        linkage = clang.lib.clang_getCursorLinkage(canonical_cursor)
         signature_type = clang.lib.clang_getCanonicalType(
             clang.lib.clang_getCursorType(canonical_cursor)
         )
@@ -2819,30 +3210,47 @@ def _scan_headers(
             shape_description=shape_description,
             usr=usr,
             access=access,
+            linkage=linkage,
+            offset=offset,
+            spelling_file=(
+                str(Path(spelling_filename).resolve())
+                if spelling_filename
+                else ""
+            ),
+            spelling_offset=spelling_offset,
         )
 
     def handle_type_surface(
         cursor: _CXCursor, kind: int, parent: _CXCursor
     ) -> None:
-        filename, line = clang.cursor_file_and_line(cursor)
+        (
+            filename,
+            line,
+            offset,
+            spelling_filename,
+            spelling_offset,
+        ) = clang.cursor_location_identity(cursor)
         if filename is None:
             return
         real = Path(filename).resolve()
         if real not in allowed_closure:
             return
         access = clang.lib.clang_getCXXAccessSpecifier(cursor)
-        if access not in _SURFACE_ACCESS_SPECIFIERS:
-            return
-        type_spelling = _forbidden_type_fingerprint(
-            clang, clang.lib.clang_getCursorType(cursor)
-        )
-        if type_spelling is None:
+        cursor_type = clang.lib.clang_getCursorType(cursor)
+        forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
+        if forbidden_path is None:
             return
         usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
+        linkage = clang.lib.clang_getCursorLinkage(cursor)
         if not usr:
             owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(parent))
             usr = f"{owner_usr}@type-surface@{kind}@{line}"
-        description = f"type={type_spelling}"
+        owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(parent))
+        description = (
+            f"kind={kind};owner={owner_usr};"
+            f"type={_stable_type_spelling(clang, cursor_type)};"
+            f"forbidden={forbidden_path}"
+        )
         record_if_new(
             dedup_key=(str(real), line, usr, kind, description, access),
             real=real,
@@ -2853,6 +3261,14 @@ def _scan_headers(
             shape_description=description,
             usr=usr,
             access=access,
+            linkage=linkage,
+            offset=offset,
+            spelling_file=(
+                str(Path(spelling_filename).resolve())
+                if spelling_filename
+                else ""
+            ),
+            spelling_offset=spelling_offset,
         )
 
     def handle_inheritance_exposure(
@@ -2864,12 +3280,6 @@ def _scan_headers(
         if Path(filename).resolve() not in allowed_closure:
             return
         class_access = clang.lib.clang_getCXXAccessSpecifier(class_cursor)
-        if class_access not in (
-            _CX_CXXInvalidAccessSpecifier,
-            _CX_CXXPublic,
-            _CX_CXXProtected,
-        ):
-            return
         class_usr = clang.to_str(clang.lib.clang_getCursorUSR(class_cursor))
         for exposure in (
             exposures
@@ -2902,6 +3312,10 @@ def _scan_headers(
                     ),
                     usr=usr,
                     access=class_access,
+                    linkage=clang.lib.clang_getCursorLinkage(class_cursor),
+                    offset=0,
+                    spelling_file=str(attribution_real),
+                    spelling_offset=0,
                 )
                 continue
             source_kind = clang.lib.clang_getCursorKind(exposure.source_cursor)
@@ -2939,6 +3353,10 @@ def _scan_headers(
                 shape_description=shape_description,
                 usr=usr,
                 access=class_access,
+                linkage=clang.lib.clang_getCursorLinkage(class_cursor),
+                offset=0,
+                spelling_file=str(attribution_real),
+                spelling_offset=0,
             )
 
     def visitor(cursor: _CXCursor, parent: _CXCursor, _client_data) -> int:
@@ -2954,8 +3372,15 @@ def _scan_headers(
             return 2  # CXChildVisit_Recurse: still walk this class's own direct members normally.
         if kind in _SIGNATURE_DECL_KINDS:
             handle_own_declaration(cursor, kind)
-            return 1  # CXChildVisit_Continue: do not descend into the body.
+            return 2
         if kind in _TYPE_SURFACE_KINDS:
+            if (
+                kind == _CXCursor_VarDecl
+                and clang.lib.clang_getCursorKind(parent)
+                not in _RECORD_LIKE_KINDS
+                | {_CXCursor_Namespace, _CXCursor_TranslationUnit}
+            ):
+                return 2
             handle_type_surface(cursor, kind, parent)
             return 1
         return 2  # CXChildVisit_Recurse: keep looking for nested declarations.
@@ -2966,6 +3391,10 @@ def _scan_headers(
         raise EncoderHygieneError("Header scan received no target/configuration compile contexts")
     for header in headers:
         for context in compile_contexts:
+            active_observation_context = (
+                f"{context.target}|{context.configuration or '<single>'}|"
+                f"header:{header.resolve()}"
+            )
             tu, wrapper_filename = _parse_header_as_own_tu(
                 clang,
                 idx,
@@ -3142,6 +3571,7 @@ def _scan_sources(
 
     violations: list[str] = []
     findings: list[Finding] = []
+    active_observation_context = ""
 
     def finding_path(real: Path) -> str:
         try:
@@ -3152,7 +3582,24 @@ def _scan_sources(
     def make_visitor(source_real: Path):
         def record_own(cursor: _CXCursor, kind: int) -> None:
             canonical = clang.lib.clang_getCanonicalCursor(cursor)
-            canonical_filename, canonical_line = clang.cursor_file_and_line(canonical)
+            cursor_filename, _cursor_line = clang.cursor_file_and_line(cursor)
+            canonical_filename, _canonical_line = clang.cursor_file_and_line(
+                canonical
+            )
+            physical_cursor = (
+                canonical
+                if clang.lib.clang_isCursorDefinition(cursor)
+                and cursor_filename != canonical_filename
+                else cursor
+            )
+            (
+                physical_filename,
+                canonical_line,
+                offset,
+                spelling_filename,
+                spelling_offset,
+            ) = clang.cursor_location_identity(physical_cursor)
+            canonical_filename = physical_filename
             if canonical_filename is None:
                 return
             canonical_real = Path(canonical_filename).resolve()
@@ -3160,13 +3607,7 @@ def _scan_sources(
                 return
 
             access = clang.lib.clang_getCXXAccessSpecifier(canonical)
-            if access not in _SURFACE_ACCESS_SPECIFIERS:
-                return
-            if canonical_real == source_real:
-                linkage = clang.lib.clang_getCursorLinkage(cursor)
-                if linkage != _CXLinkage_External:
-                    return
-
+            linkage = clang.lib.clang_getCursorLinkage(canonical)
             is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
             if not is_shaped:
                 return
@@ -3187,9 +3628,10 @@ def _scan_sources(
                 access,
                 shape_description,
             )
-            if dedup_key in seen:
+            observation_key = (active_observation_context, *dedup_key)
+            if observation_key in seen:
                 return
-            seen.add(dedup_key)
+            seen.add(observation_key)
             findings.append(
                 Finding(
                     file=finding_path(canonical_real),
@@ -3200,25 +3642,38 @@ def _scan_sources(
                     canonical_return_type=shape_description,
                     usr=usr,
                     access=access,
+                    linkage=linkage,
+                    offset=offset,
+                    spelling_file=(
+                        str(Path(spelling_filename).resolve())
+                        if spelling_filename
+                        else ""
+                    ),
+                    spelling_offset=spelling_offset,
+                    observation_context=active_observation_context,
                 )
             )
 
         def record_type_surface(
             cursor: _CXCursor, kind: int, parent: _CXCursor
         ) -> None:
-            filename, line = clang.cursor_file_and_line(cursor)
+            (
+                filename,
+                line,
+                offset,
+                spelling_filename,
+                spelling_offset,
+            ) = clang.cursor_location_identity(cursor)
             if filename is None:
                 return
             real = Path(filename).resolve()
             if real not in allowed_closure and real != source_real:
                 return
             access = clang.lib.clang_getCXXAccessSpecifier(cursor)
-            if access not in _SURFACE_ACCESS_SPECIFIERS:
-                return
-            forbidden = _forbidden_type_fingerprint(
-                clang, clang.lib.clang_getCursorType(cursor)
-            )
-            if forbidden is None:
+            linkage = clang.lib.clang_getCursorLinkage(cursor)
+            cursor_type = clang.lib.clang_getCursorType(cursor)
+            forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
+            if forbidden_path is None:
                 return
             usr = clang.to_str(clang.lib.clang_getCursorUSR(cursor))
             if not usr:
@@ -3226,11 +3681,17 @@ def _scan_sources(
                     clang.lib.clang_getCursorUSR(parent)
                 )
                 usr = f"{owner_usr}@type-surface@{kind}@{line}"
-            description = f"type={forbidden}"
+            owner_usr = clang.to_str(clang.lib.clang_getCursorUSR(parent))
+            description = (
+                f"kind={kind};owner={owner_usr};"
+                f"type={_stable_type_spelling(clang, cursor_type)};"
+                f"forbidden={forbidden_path}"
+            )
             dedup_key = (str(real), line, usr, kind, description, access)
-            if dedup_key in seen:
+            observation_key = (active_observation_context, *dedup_key)
+            if observation_key in seen:
                 return
-            seen.add(dedup_key)
+            seen.add(observation_key)
             findings.append(
                 Finding(
                     file=finding_path(real),
@@ -3241,6 +3702,15 @@ def _scan_sources(
                     canonical_return_type=description,
                     usr=usr,
                     access=access,
+                    linkage=linkage,
+                    offset=offset,
+                    spelling_file=(
+                        str(Path(spelling_filename).resolve())
+                        if spelling_filename
+                        else ""
+                    ),
+                    spelling_offset=spelling_offset,
+                    observation_context=active_observation_context,
                 )
             )
 
@@ -3255,12 +3725,6 @@ def _scan_sources(
             if class_real not in allowed_closure and class_real != source_real:
                 return
             class_access = clang.lib.clang_getCXXAccessSpecifier(class_cursor)
-            if class_access not in (
-                _CX_CXXInvalidAccessSpecifier,
-                _CX_CXXPublic,
-                _CX_CXXProtected,
-            ):
-                return
             class_usr = clang.to_str(clang.lib.clang_getCursorUSR(class_cursor))
             for exposure in (
                 exposures
@@ -3323,9 +3787,10 @@ def _scan_sources(
                     source_signature,
                     exposure.reason,
                 )
-                if dedup_key in seen:
+                observation_key = (active_observation_context, *dedup_key)
+                if observation_key in seen:
                     continue
-                seen.add(dedup_key)
+                seen.add(observation_key)
                 findings.append(
                     Finding(
                         file=finding_path(attribution_real),
@@ -3334,6 +3799,8 @@ def _scan_sources(
                         canonical_return_type=shape_description,
                         usr=usr,
                         access=class_access,
+                        linkage=clang.lib.clang_getCursorLinkage(class_cursor),
+                        observation_context=active_observation_context,
                     )
                 )
 
@@ -3360,6 +3827,13 @@ def _scan_sources(
                 return 2
             if kind not in _SIGNATURE_DECL_KINDS:
                 if kind in _TYPE_SURFACE_KINDS:
+                    if (
+                        kind == _CXCursor_VarDecl
+                        and clang.lib.clang_getCursorKind(parent)
+                        not in _RECORD_LIKE_KINDS
+                        | {_CXCursor_Namespace, _CXCursor_TranslationUnit}
+                    ):
+                        return 2
                     record_type_surface(cursor, kind, parent)
                     return 1
                 return 2
@@ -3371,7 +3845,7 @@ def _scan_sources(
             canonical_real = Path(canonical_filename).resolve()
             if canonical_real == source_real or canonical_real in allowed_closure:
                 record_own(cursor, kind)
-            return 1
+            return 2
 
         return visitor
 
@@ -3394,6 +3868,10 @@ def _scan_sources(
                 f"target {target or '<any registered target>'}"
             )
         for context in source_contexts:
+            active_observation_context = (
+                f"{context.target}|{context.configuration or '<single>'}|"
+                f"source:{source_real}"
+            )
             tu = _parse_source_as_own_tu(clang, idx, context, sysroot_args)
             try:
                 violations.extend(
@@ -3554,13 +4032,23 @@ def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
         "-B",
         str(build_dir),
         "-G",
-        "Ninja",
+        "Ninja Multi-Config",
         f"-DCMAKE_CXX_COMPILER={clangxx}",
-        "-DCMAKE_BUILD_TYPE=Debug",
+        f"-DCMAKE_CONFIGURATION_TYPES={';'.join(SUPPORTED_PRODUCTION_CONFIGS)}",
         "-DBUILD_TESTING=OFF",
         "-DARKHAM_ENCODER_HYGIENE_CONFIGURE=ON",
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     ]
+    ninja = shutil.which("ninja")
+    if ninja is None and shutil.which("mise"):
+        ninja = subprocess.check_output(
+            ["mise", "which", "ninja"], text=True
+        ).strip()
+    if not ninja:
+        raise EncoderHygieneError(
+            "Ninja is required for the audited multi-config matrix"
+        )
+    configure_cmd.append(f"-DCMAKE_MAKE_PROGRAM={ninja}")
     if qt_prefix:
         configure_cmd.append(f"-DCMAKE_PREFIX_PATH={qt_prefix}")
 
@@ -3576,11 +4064,20 @@ def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
         raise EncoderHygieneError(
             "CMake target policy metadata contains no production SCAN target"
         )
-    subprocess.run(
-        ["cmake", "--build", str(build_dir), "--target", *scan_targets],
-        check=True,
-        cwd=repo_root,
-    )
+    for configuration in SUPPORTED_PRODUCTION_CONFIGS:
+        subprocess.run(
+            [
+                "cmake",
+                "--build",
+                str(build_dir),
+                "--config",
+                configuration,
+                "--target",
+                *scan_targets,
+            ],
+            check=True,
+            cwd=repo_root,
+        )
 
 
 def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> list[Finding]:
@@ -3631,6 +4128,16 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     foundation_fragments = _read_manifest(generated_dir / "foundation_fragments.txt")
 
     all_contexts = _all_compile_contexts(compile_commands)
+    audited_configs_path = generated_dir / "audited_configs.txt"
+    audited_configs = tuple(
+        line.strip()
+        for line in audited_configs_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+    if not audited_configs:
+        raise EncoderHygieneError(
+            f"Audited production configuration manifest is empty: {audited_configs_path}"
+        )
     target_policies = _load_target_policies(clang_build_dir)
     external_roots = _external_roots(clang_build_dir.resolve())
     _validate_target_inventory(target_policies, all_contexts, external_roots)
@@ -3643,6 +4150,23 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     contexts_by_target: dict[str, list[CompileContext]] = {}
     for context in all_contexts:
         contexts_by_target.setdefault(context.target, []).append(context)
+    for target, policy in target_policies.items():
+        if policy.classification != "SCAN" or policy.target_type == "INTERFACE_LIBRARY":
+            continue
+        actual_configs = {
+            context.configuration
+            for context in contexts_by_target.get(target, [])
+        }
+        expected_configs = (
+            set(audited_configs)
+            if len(audited_configs) > 1
+            else {""}
+        )
+        if actual_configs != expected_configs:
+            raise EncoderHygieneError(
+                f"Target {target} configuration coverage mismatch: "
+                f"expected={sorted(expected_configs)}, actual={sorted(actual_configs)}"
+            )
 
     all_compiled_sources = {context.source for context in all_contexts}
     for label, sources in (
@@ -4032,7 +4556,93 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             "inclusion graph can):\n" + "\n".join(structural_violations)
         )
 
-    return findings
+    physical_findings: dict[tuple, Finding] = {}
+    observed_contexts: dict[tuple, set[tuple[str, str]]] = {}
+    for finding in findings:
+        physical_key = (
+            finding.file,
+            finding.line,
+            finding.offset,
+            finding.spelling_file,
+            finding.spelling_offset,
+            finding.usr,
+            finding.canonical_return_type,
+            finding.access,
+            finding.linkage,
+        )
+        physical_findings.setdefault(physical_key, finding)
+        context_parts = finding.observation_context.split("|", 2)
+        if len(context_parts) >= 2:
+            observed_contexts.setdefault(physical_key, set()).add(
+                (context_parts[0], context_parts[1])
+            )
+
+    expected_contexts_by_file: dict[str, set[tuple[str, str]]] = {}
+    for target, headers in target_headers.items():
+        contexts = [
+            context
+            for context_target in target_header_contexts[target]
+            for context in contexts_by_target[context_target]
+        ]
+        for header in headers:
+            relative = (
+                header.relative_to(repo_root).as_posix()
+                if header.is_relative_to(repo_root)
+                else header.as_posix()
+            )
+            expected_contexts_by_file.setdefault(relative, set()).update(
+                (
+                    context.target,
+                    context.configuration or "<single>",
+                )
+                for context in contexts
+            )
+    for target, sources in target_source_manifests.items():
+        for source in sources:
+            if source.suffix.lower() not in cxx_source_suffixes:
+                continue
+            relative = (
+                source.relative_to(repo_root).as_posix()
+                if source.is_relative_to(repo_root)
+                else source.as_posix()
+            )
+            source_contexts = [
+                context
+                for context in all_contexts
+                if context.source == source
+            ]
+            if not source_contexts:
+                source_contexts = [
+                    context
+                    for context_target in target_header_contexts[target]
+                    for context in contexts_by_target[context_target]
+                ]
+            expected_contexts_by_file.setdefault(relative, set()).update(
+                (
+                    context.target,
+                    context.configuration or "<single>",
+                )
+                for context in source_contexts
+            )
+
+    missing_observations: list[str] = []
+    for physical_key, finding in physical_findings.items():
+        if finding.key() not in ALLOWLIST_BY_KEY:
+            continue
+        required = expected_contexts_by_file.get(finding.file, set())
+        missing = required - observed_contexts.get(physical_key, set())
+        if missing:
+            missing_observations.append(
+                f"  {finding.file}:{finding.line} {finding.usr}: "
+                f"missing target/config observations {sorted(missing)}"
+            )
+    if missing_observations:
+        raise EncoderHygieneError(
+            "Forbidden-type declaration observation matrix is incomplete:\n"
+            + "\n".join(missing_observations)
+        )
+
+    return list(physical_findings.values())
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -4049,7 +4659,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Dedicated Clang-toolchain build directory this script configures "
         "and builds every registered production SCAN target in (default: "
-        "<repo-root>/build-encoder-hygiene).",
+        "<repo-root>/build-encoder-hygiene-matrix).",
     )
     parser.add_argument(
         "--skip-configure",
@@ -4070,7 +4680,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = args.repo_root.resolve()
-    clang_build_dir = (args.clang_build_dir or (repo_root / "build-encoder-hygiene")).resolve()
+    clang_build_dir = (
+        args.clang_build_dir
+        or (repo_root / "build-encoder-hygiene-matrix")
+    ).resolve()
 
     try:
         findings = run_check(repo_root, clang_build_dir, args.skip_configure)

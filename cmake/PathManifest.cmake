@@ -430,7 +430,7 @@ function(arkham_write_target_source_manifest)
     # manifest (and therefore from the AST policy scan) the way a review
     # round demonstrated it previously was.
     get_target_property(_arkham_tsm_automoc ${ARG_TARGET} AUTOMOC)
-    if(_arkham_tsm_automoc)
+    if(_arkham_tsm_automoc AND NOT CMAKE_CONFIGURATION_TYPES)
         get_target_property(_arkham_tsm_autogen_dir ${ARG_TARGET} AUTOGEN_BUILD_DIR)
         if(NOT _arkham_tsm_autogen_dir)
             get_target_property(_arkham_tsm_binary_dir ${ARG_TARGET} BINARY_DIR)
@@ -587,6 +587,63 @@ function(_arkham_collect_buildsystem_targets directory out_var)
     set(${out_var} "${_arkham_cbt_all}" PARENT_SCOPE)
 endfunction()
 
+function(_arkham_target_reaches_interface current_target sought_target visited out_var)
+    if(current_target STREQUAL sought_target)
+        set(${out_var} TRUE PARENT_SCOPE)
+        return()
+    endif()
+    list(FIND visited "${current_target}" _arkham_tri_seen)
+    if(NOT _arkham_tri_seen EQUAL -1)
+        set(${out_var} FALSE PARENT_SCOPE)
+        return()
+    endif()
+    list(APPEND visited "${current_target}")
+    get_target_property(_arkham_tri_links ${current_target} LINK_LIBRARIES)
+    get_target_property(_arkham_tri_interface_links ${current_target} INTERFACE_LINK_LIBRARIES)
+    if(NOT _arkham_tri_links)
+        set(_arkham_tri_links "")
+    endif()
+    if(_arkham_tri_interface_links)
+        list(APPEND _arkham_tri_links ${_arkham_tri_interface_links})
+    endif()
+    foreach(_arkham_tri_link IN LISTS _arkham_tri_links)
+        if(_arkham_tri_link MATCHES "^\\$<LINK_ONLY:([^$<>]+)>$")
+            set(_arkham_tri_link "${CMAKE_MATCH_1}")
+        elseif(_arkham_tri_link MATCHES "\\$<")
+            message(FATAL_ERROR
+                "Encoder-hygiene target graph edge '${current_target}' -> "
+                "'${_arkham_tri_link}' is generator-expression encoded and cannot "
+                "be assigned a closed consumer context")
+        endif()
+        if(_arkham_tri_link MATCHES "^::@" OR
+                _arkham_tri_link MATCHES "^(debug|optimized|general)$")
+            continue()
+        endif()
+        if(TARGET ${_arkham_tri_link})
+            get_target_property(_arkham_tri_alias ${_arkham_tri_link} ALIASED_TARGET)
+            if(_arkham_tri_alias)
+                set(_arkham_tri_link "${_arkham_tri_alias}")
+            endif()
+            if(_arkham_tri_link STREQUAL sought_target)
+                set(${out_var} TRUE PARENT_SCOPE)
+                return()
+            endif()
+            get_target_property(_arkham_tri_class ${_arkham_tri_link}
+                ARKHAM_ENCODER_HYGIENE_CLASSIFICATION)
+            if(NOT _arkham_tri_class STREQUAL "SCAN")
+                continue()
+            endif()
+            _arkham_target_reaches_interface(
+                "${_arkham_tri_link}" "${sought_target}" "${visited}" _arkham_tri_reaches)
+            if(_arkham_tri_reaches)
+                set(${out_var} TRUE PARENT_SCOPE)
+                return()
+            endif()
+        endif()
+    endforeach()
+    set(${out_var} FALSE PARENT_SCOPE)
+endfunction()
+
 # At end-of-directory processing, prove every non-imported C++ target in
 # the complete directory tree has an explicit SCAN/EXEMPT record and emit
 # each SCAN target's own complete late/named/INTERFACE header universe.
@@ -636,19 +693,23 @@ function(arkham_write_encoder_hygiene_target_universe)
         set(_arkham_ehu_contexts "${_arkham_ehu_context}")
         if(_arkham_ehu_type STREQUAL "INTERFACE_LIBRARY")
             foreach(_arkham_ehu_candidate IN LISTS _arkham_ehu_targets)
+                if(_arkham_ehu_candidate STREQUAL _arkham_ehu_target)
+                    continue()
+                endif()
                 get_target_property(_arkham_ehu_candidate_class
                     ${_arkham_ehu_candidate} ARKHAM_ENCODER_HYGIENE_CLASSIFICATION)
                 if(NOT _arkham_ehu_candidate_class STREQUAL "SCAN")
                     continue()
                 endif()
-                get_target_property(_arkham_ehu_candidate_links
-                    ${_arkham_ehu_candidate} LINK_LIBRARIES)
-                if(NOT _arkham_ehu_candidate_links)
-                    set(_arkham_ehu_candidate_links "")
+                get_target_property(_arkham_ehu_candidate_type
+                    ${_arkham_ehu_candidate} TYPE)
+                if(_arkham_ehu_candidate_type STREQUAL "INTERFACE_LIBRARY")
+                    continue()
                 endif()
-                list(FIND _arkham_ehu_candidate_links
-                    "${_arkham_ehu_target}" _arkham_ehu_link_index)
-                if(NOT _arkham_ehu_link_index EQUAL -1)
+                _arkham_target_reaches_interface(
+                    "${_arkham_ehu_candidate}" "${_arkham_ehu_target}" ""
+                    _arkham_ehu_reaches_interface)
+                if(_arkham_ehu_reaches_interface)
                     list(APPEND _arkham_ehu_contexts "${_arkham_ehu_candidate}")
                 endif()
             endforeach()
@@ -683,6 +744,73 @@ function(arkham_write_encoder_hygiene_target_universe)
         endforeach()
 
         get_target_property(_arkham_ehu_source_dir ${_arkham_ehu_target} SOURCE_DIR)
+        get_target_property(_arkham_ehu_binary_dir
+            ${_arkham_ehu_target} BINARY_DIR)
+        get_target_property(_arkham_ehu_allow_qt_genex
+            ${_arkham_ehu_target} ARKHAM_ENCODER_HYGIENE_ALLOW_QT_GENERATED_EXPRESSIONS)
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(_arkham_ehu_supported_configs ${CMAKE_CONFIGURATION_TYPES})
+        else()
+            set(_arkham_ehu_supported_configs "${CMAKE_BUILD_TYPE}")
+        endif()
+        foreach(_arkham_ehu_property IN ITEMS
+                COMPILE_DEFINITIONS INTERFACE_COMPILE_DEFINITIONS
+                COMPILE_OPTIONS INTERFACE_COMPILE_OPTIONS
+                INCLUDE_DIRECTORIES INTERFACE_INCLUDE_DIRECTORIES
+                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES)
+            get_target_property(_arkham_ehu_property_values
+                ${_arkham_ehu_target} ${_arkham_ehu_property})
+            foreach(_arkham_ehu_property_value IN LISTS _arkham_ehu_property_values)
+                if(NOT _arkham_ehu_property_value MATCHES "\\$<")
+                    continue()
+                endif()
+                string(REGEX MATCHALL "CONFIG:[A-Za-z0-9_]+"
+                    _arkham_ehu_config_matches "${_arkham_ehu_property_value}")
+                if(NOT _arkham_ehu_config_matches)
+                    if(_arkham_ehu_property_value MATCHES
+                            "^\\$<BUILD_INTERFACE:([^$<>]+)>$")
+                        set(_arkham_ehu_build_interface_path "${CMAKE_MATCH_1}")
+                        cmake_path(IS_ABSOLUTE _arkham_ehu_build_interface_path
+                            _arkham_ehu_build_interface_absolute)
+                        if(_arkham_ehu_build_interface_absolute)
+                            cmake_path(IS_PREFIX _arkham_ehu_source_dir
+                                "${_arkham_ehu_build_interface_path}" NORMALIZE
+                                _arkham_ehu_build_from_source)
+                            cmake_path(IS_PREFIX _arkham_ehu_binary_dir
+                                "${_arkham_ehu_build_interface_path}" NORMALIZE
+                                _arkham_ehu_build_from_binary)
+                            if(_arkham_ehu_build_from_source OR
+                                    _arkham_ehu_build_from_binary)
+                                continue()
+                            endif()
+                        endif()
+                    endif()
+                    if(_arkham_ehu_allow_qt_genex)
+                        if("${_arkham_ehu_property_value}" STREQUAL
+                                "$<TARGET_PROPERTY:Qt6::Qml,INTERFACE_INCLUDE_DIRECTORIES>")
+                            continue()
+                        endif()
+                    endif()
+                    message(FATAL_ERROR
+                        "Encoder-hygiene target '${_arkham_ehu_target}' property "
+                        "${_arkham_ehu_property} contains an unresolved non-config "
+                        "generator expression '${_arkham_ehu_property_value}' "
+                        "(Qt-owned-expression allowance=${_arkham_ehu_allow_qt_genex})")
+                endif()
+                foreach(_arkham_ehu_config_match IN LISTS _arkham_ehu_config_matches)
+                    string(REPLACE "CONFIG:" "" _arkham_ehu_config
+                        "${_arkham_ehu_config_match}")
+                    list(FIND _arkham_ehu_supported_configs
+                        "${_arkham_ehu_config}" _arkham_ehu_config_index)
+                    if(_arkham_ehu_config_index EQUAL -1)
+                        message(FATAL_ERROR
+                            "Encoder-hygiene target '${_arkham_ehu_target}' property "
+                            "${_arkham_ehu_property} references unsupported config "
+                            "'${_arkham_ehu_config}'")
+                    endif()
+                endforeach()
+            endforeach()
+        endforeach()
         get_target_property(_arkham_ehu_sources ${_arkham_ehu_target} SOURCES)
         get_target_property(_arkham_ehu_interface_sources ${_arkham_ehu_target} INTERFACE_SOURCES)
         if(NOT _arkham_ehu_sources)
@@ -691,10 +819,6 @@ function(arkham_write_encoder_hygiene_target_universe)
         if(_arkham_ehu_interface_sources)
             list(APPEND _arkham_ehu_sources ${_arkham_ehu_interface_sources})
         endif()
-        get_target_property(_arkham_ehu_allow_qt_genex
-            ${_arkham_ehu_target} ARKHAM_ENCODER_HYGIENE_ALLOW_QT_GENERATED_EXPRESSIONS)
-        get_target_property(_arkham_ehu_binary_dir
-            ${_arkham_ehu_target} BINARY_DIR)
         set(_arkham_ehu_expected_qt_genex
             "$<BUILD_INTERFACE:$<$<BOOL:$<TARGET_PROPERTY:QT_CONSUMES_METATYPES>>:${_arkham_ehu_binary_dir}/meta_types/qt6${_arkham_ehu_target}_metatypes.json>>")
         foreach(_arkham_ehu_source IN LISTS _arkham_ehu_sources)
