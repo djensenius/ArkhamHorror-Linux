@@ -2,6 +2,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QtTest>
