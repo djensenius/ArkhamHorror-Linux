@@ -3,7 +3,6 @@
 #include "JsonDecode.h"
 
 #include <QJsonArray>
-#include <QJsonDocument>
 #include <cmath>
 
 using namespace Qt::StringLiterals;

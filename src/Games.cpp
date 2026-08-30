@@ -3,7 +3,6 @@
 #include "JsonDecode.h"
 
 #include <QJsonArray>
-#include <QJsonDocument>
 #include <array>
 #include <utility>
 
