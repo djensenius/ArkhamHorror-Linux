@@ -16,7 +16,25 @@
 using namespace Arkham;
 
 void AssetCacheTests::init() {
-  m_tempDir = std::make_unique<QTemporaryDir>();
+  // Round-9+ review: AssetCache's directory-resolution hardening now
+  // walks no-follow starting from the process's own home directory
+  // (see resolveTrustedDirectoryNoFollow()'s comment in AssetCache.cpp)
+  // rather than the filesystem root, specifically so it never has to
+  // reject legitimate OS-bootstrap symlinks like macOS's `/var` ->
+  // `/private/var` -- which sits between "/" and this project's OWN
+  // test fixtures, since QTemporaryDir's default (parameterless)
+  // constructor resolves under the OS temp location (`/var/folders/...`
+  // on macOS), not under home. Constructing every test's temporary
+  // directory explicitly UNDER home instead means these tests exercise
+  // the SAME, real, home-anchored code path a genuine deployment uses
+  // for both its default cache location (also normally under home:
+  // `~/.cache` on Linux, `~/Library/Caches` on macOS) and any
+  // caller-configured custom directory a user places under their own
+  // home directory -- rather than every single test run incidentally
+  // falling into this resolver's narrower, uncommon-case fallback
+  // branch for a path outside home instead.
+  m_tempDir = std::make_unique<QTemporaryDir>(
+      QDir::homePath() + QStringLiteral("/.arkham-asset-cache-test-XXXXXX"));
   QVERIFY(m_tempDir->isValid());
   m_tempDirPath = m_tempDir->path();
 }
@@ -1936,6 +1954,115 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    precreatedLeafBehindDeepIntermediateSymlinkInConfiguredDirectoryIsRejectedAndSentinelUntouched() {
+  // Round-9+ review (HIGH): the CORE demonstrated attack -- a
+  // configured directory whose full path already exists via a
+  // symlinked ancestor TWO levels above the leaf ("outer-symlink" ->
+  // sentinel, then a plain "inner-normal" directory, then the leaf
+  // "cache-leaf" itself, precreated under the sentinel so it exists
+  // through BOTH the symlink path and directly). The pre-round-9
+  // "longest existing prefix is a single trusted anchor" shortcut
+  // could never catch this: the WHOLE configured path resolves
+  // successfully (through the symlink), so nothing was ever identified
+  // as "still needing a no-follow walk" at all. The fixed resolver must
+  // instead walk every component -- home, ..., "outer-symlink",
+  // "inner-normal", "cache-leaf" -- individually, and reject the moment
+  // it reaches "outer-symlink" itself.
+  const QString sentinelDir =
+      m_tempDirPath + QStringLiteral("/deep-intermediate-sentinel");
+  QVERIFY(QDir().mkpath(sentinelDir + QStringLiteral("/inner-normal")));
+  QVERIFY(
+      QDir().mkpath(sentinelDir + QStringLiteral("/inner-normal/cache-leaf")));
+  const QString sentinelFile =
+      sentinelDir + QStringLiteral("/pre-existing.txt");
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("must-not-be-touched"));
+  }
+
+  const QString outerSymlink = m_tempDirPath + QStringLiteral("/outer-symlink");
+  QVERIFY(QFile::link(sentinelDir, outerSymlink));
+  QVERIFY(QFileInfo(outerSymlink).isSymLink());
+
+  const QString configuredDirectory =
+      outerSymlink + QStringLiteral("/inner-normal/cache-leaf");
+  // Confirm the leaf genuinely exists THROUGH the symlinked path --
+  // this is precisely what defeats a "does the whole thing already
+  // exist" shortcut.
+  QVERIFY(QFileInfo::exists(configuredDirectory));
+  QVERIFY(!QFileInfo(configuredDirectory).isSymLink());
+
+  AssetCache cache(configFor(configuredDirectory));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  // The sentinel's own pre-existing content is exactly as it was --
+  // this rejection is a pure read-only refusal, never a "helpfully
+  // clean it up" mutation, and nothing was ever created or touched
+  // anywhere along or beneath the symlinked path.
+  QVERIFY(QFileInfo::exists(sentinelFile));
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("must-not-be-touched"));
+  }
+
+  // The memory cache still works; only disk persistence is disabled.
+  const QString key = QString::fromLatin1(
+      QCryptographicHash::hash(
+          QByteArrayLiteral("deep-intermediate-symlink-key"),
+          QCryptographicHash::Sha256)
+          .toHex());
+  cache.store(key, makeEntry(QByteArrayLiteral("payload-bytes")));
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+}
+
+void AssetCacheTests::
+    cleanInstallWithEntirelyMissingCacheHierarchyIsCreatedSecurely() {
+  // Round-9+ review (MEDIUM, "clean install"): the default cache
+  // location's own ancestor components (everything the OS/desktop
+  // environment would normally already have created) must be created
+  // securely on demand when NONE of them exist yet -- not just this
+  // application's fixed "assets/v1" suffix beneath an assumed
+  // pre-existing OS parent. Exercise this directly against the same
+  // home-anchored resolver AssetCache::AssetCache() itself now uses,
+  // with an entirely fresh, multi-level, nowhere-yet-existing target
+  // path under this test's own temp-under-home directory.
+  const QString entirelyMissingHierarchy =
+      m_tempDirPath + QStringLiteral("/does-not-exist-yet/nested/assets/v1");
+  QVERIFY(!QFileInfo::exists(m_tempDirPath +
+                             QStringLiteral("/does-not-exist-yet")));
+
+  QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      entirelyMissingHierarchy, /*allowCreateMissingComponents=*/true));
+
+  QVERIFY(QFileInfo(entirelyMissingHierarchy).isDir());
+  QVERIFY(!QFileInfo(entirelyMissingHierarchy).isSymLink());
+  QVERIFY(
+      QFileInfo(m_tempDirPath + QStringLiteral("/does-not-exist-yet")).isDir());
+}
+
+void AssetCacheTests::
+    configuredDirectoryWithMissingLeafUnderHomeIsNeverAutoCreated() {
+  // Round-9+ review: the new home-anchored walker must preserve the
+  // pre-existing "never creates any part of a caller-supplied custom
+  // cache directory" guarantee exactly -- a configured directory whose
+  // leaf does not yet exist must fail closed (disk cache disabled),
+  // never be silently created, even though it is a plain, ordinary,
+  // non-symlinked path with no attack involved at all.
+  const QString parent = m_tempDirPath + QStringLiteral("/plain-parent");
+  QVERIFY(QDir().mkpath(parent));
+  const QString configuredDirectory =
+      parent + QStringLiteral("/not-yet-created-leaf");
+  QVERIFY(!QFileInfo::exists(configuredDirectory));
+
+  AssetCache cache(configFor(configuredDirectory));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+  QVERIFY(!QFileInfo::exists(configuredDirectory));
+}
+
+void AssetCacheTests::
     invalidateReportsPersistenceFailedWhenManifestUnlinkFails() {
   // Round-6 item 6: invalidate()'s durable-tombstone guarantee is only
   // meaningful if a genuine failure to commit it is actually reported,
@@ -2043,4 +2170,129 @@ void AssetCacheTests::
   QVERIFY(!QFileInfo::exists(manifestPath));
   AssetCache freshCache(configFor(m_tempDirPath));
   QVERIFY(!freshCache.lookupDisk(key).has_value());
+}
+
+void AssetCacheTests::
+    negativeDiskMaxBytesDisablesDiskCacheInsteadOfDestructivelyEvicting() {
+  // Round-9+ review (MEDIUM): before the fix, a negative diskMaxBytes
+  // drove reapAndEnforceQuota()'s high/low-water-mark math negative,
+  // so a genuinely-stored entry (whose on-disk byte total is always
+  // >= 0) was destructively evicted on the very next sweep (including
+  // the one this constructor itself runs) -- the entry seeded below via
+  // a VALID-config instance would not survive being opened by a
+  // negative-config instance pointed at the same directory. The fixed
+  // behaviour disables disk persistence entirely for the negative-
+  // config instance (fail-closed, matching the existing symlink/root-
+  // mismatch failure modes) instead of destructively touching the
+  // directory at all -- proving this, the entry seeded through a VALID
+  // sibling instance survives being read back afterward.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/negative-disk-limit.png")));
+  {
+    AssetCache seedCache(configFor(m_tempDirPath));
+    seedCache.store(key, makeEntry(QByteArray(64, 'z')));
+  }
+
+  AssetCache::Config invalidConfig = configFor(m_tempDirPath);
+  invalidConfig.diskMaxBytes = -1;
+  AssetCache cache(invalidConfig);
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  // The pre-seeded entry on disk must be completely untouched -- the
+  // invalid-config instance never enumerated, evicted, or otherwise
+  // wrote to the directory at all.
+  AssetCache verifyCache(configFor(m_tempDirPath));
+  const auto entry = verifyCache.lookupDisk(key);
+  QVERIFY(entry.has_value());
+  QCOMPARE(entry->encodedBytes, QByteArray(64, 'z'));
+}
+
+void AssetCacheTests::
+    negativeMemoryMaxCostBytesDisablesMemoryCacheRatherThanCrashing() {
+  // Companion to the disk case above: a negative memoryMaxCostBytes must
+  // never be forwarded to QCache::setMaxCost() as-is (which would evict
+  // every entry immediately, silently defeating the memory cache) --
+  // it is clamped to 0 (memory caching disabled for this instance) so
+  // the failure mode is an inert, predictable "no memory caching",
+  // never any kind of crash or destructive disk-side effect. Disk
+  // persistence, which is independently configured, remains fully
+  // functional.
+  AssetCache::Config invalidConfig = configFor(m_tempDirPath);
+  invalidConfig.memoryMaxCostBytes = -1;
+  AssetCache cache(invalidConfig);
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/negative-memory-limit.png")));
+  cache.store(key, makeEntry(QByteArray(64, 'w')));
+  // Disk persistence still works (this Config's diskMaxBytes is valid).
+  QVERIFY(cache.lookupDisk(key).has_value());
+  // But nothing survives in the in-process memory cache: setMaxCost(0)
+  // means QCache evicts on insertion.
+  QVERIFY(!cache.lookupMemory(key).has_value());
+}
+
+void AssetCacheTests::
+    invalidateAfterRootReplacementReportsPersistenceFailedNotDurable() {
+  // Round-9+ review (HIGH): deleteEntry()'s old guard --
+  // `if (m_diskCacheDisabled || !verifyRootAnchorLocked()) return {true,
+  // true};` -- folded two completely different situations into the
+  // same vacuous "durably absent" answer: (a) disk was NEVER available
+  // for this instance at all (genuinely vacuous -- nothing could ever
+  // be there), and (b) disk WAS available and verified at construction
+  // but root verification is failing RIGHT NOW on this exact call
+  // (a real manifest can still be sitting on disk, completely
+  // untouched, because this call never even attempted to remove it).
+  // invalidate() trusts a "durably absent" answer enough to record an
+  // authoritative negative-404 tombstone -- so case (b) reported as
+  // case (a) would let a still-live cached 200 "revive" later (a fresh
+  // process, or a sibling instance, that does not share this exact
+  // transient/replacement condition can still open that untouched
+  // manifest). This test proves invalidate() now reports the typed
+  // PersistenceFailed result instead, and that the entry genuinely
+  // does still physically exist afterwards.
+  const QString cacheRoot =
+      m_tempDirPath + QStringLiteral("/invalidate-root-replaced-root");
+  QVERIFY(QDir(m_tempDirPath)
+              .mkpath(QStringLiteral("invalidate-root-replaced-root")));
+
+  AssetCache cache(configFor(cacheRoot));
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/invalidate-after-replace.png")));
+  cache.store(key, makeEntry(QByteArrayLiteral("still-live-on-disk-bytes")));
+  QVERIFY(cache.lookupDisk(key).has_value());
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  // Replace the root exactly as
+  // rootReplacedAfterConstructionPermanentlyDisablesDiskIoForBothTargets()
+  // does: rename the original (still holding the real manifest for
+  // `key`) away, then create a brand-new, empty directory at the exact
+  // original path.
+  const QString renamedAwayRoot =
+      m_tempDirPath +
+      QStringLiteral("/invalidate-root-replaced-root-renamed-away");
+  QVERIFY(QDir().rename(cacheRoot, renamedAwayRoot));
+  QVERIFY(QDir(m_tempDirPath)
+              .mkpath(QStringLiteral("invalidate-root-replaced-root")));
+
+  // This is the very FIRST disk-touching call since the replacement --
+  // m_diskCacheDisabled is still false going in, so verifyRootAnchorLocked()
+  // is what actually fails, and does so for the first time, right here.
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+  const AssetCache::InvalidateResult result = cache.invalidate(key);
+  QCOMPARE(result, AssetCache::InvalidateResult::PersistenceFailed);
+  // The failed verification permanently disables disk I/O for this
+  // instance from here on, exactly like every other disk-touching
+  // method -- consistent with the rest of the class's contract.
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  // The manifest this call never actually touched must still be fully
+  // intact under the ORIGINAL (renamed-away) directory -- proving
+  // nothing was deleted, and that "PersistenceFailed" was the honest
+  // answer rather than a false "DurablyInvalidated".
+  AssetCache freshCacheOverOriginal(configFor(renamedAwayRoot));
+  const auto revived = freshCacheOverOriginal.lookupDisk(key);
+  QVERIFY(revived.has_value());
+  QCOMPARE(revived->encodedBytes,
+           QByteArrayLiteral("still-live-on-disk-bytes"));
 }

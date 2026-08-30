@@ -126,6 +126,15 @@ namespace Arkham {
 class AssetCache {
 public:
   struct Config {
+    // Round-9+ review (MEDIUM): a negative value here is an invalid
+    // configuration, never merely "no limit" or "unlimited" -- passing
+    // one disables the corresponding cache tier (memory or disk) for
+    // this instance's entire lifetime, fail-closed, rather than driving
+    // reapAndEnforceQuota()'s high/low-water-mark eviction math negative
+    // (which would otherwise destructively evict every entry on every
+    // construction and every periodic sweep). See
+    // AssetCache::AssetCache()'s and configHasValidDiskByteLimit()'s
+    // comments in the .cpp for the exact failure mode this closes.
     qint64 memoryMaxCostBytes;
     qint64 diskMaxBytes;
     QString directory; // empty = use QStandardPaths::CacheLocation default
@@ -342,6 +351,20 @@ public:
   [[nodiscard]] static bool directoryChainResolvesNoFollowForTesting(
       const QString &trustedAnchorPath,
       const QStringList &ownedSuffixComponents);
+
+  // Test-only exposure of the round-9+ home-anchored, arbitrary-depth
+  // directory resolver AssetCache::AssetCache() itself now uses (see
+  // resolveTrustedDirectoryNoFollow()'s comment in AssetCache.cpp),
+  // without needing a full AssetCache construction. Returns true iff
+  // `absoluteTargetPath` resolves to a genuine, non-symlink directory
+  // walking every component from a trusted starting point, with missing
+  // components created only when `allowCreateMissingComponents` is
+  // true -- exactly the same policy and code path
+  // AssetCache::AssetCache() applies for the default-location vs
+  // caller-configured-directory cases respectively.
+  [[nodiscard]] static bool
+  resolveTrustedDirectoryNoFollowForTesting(const QString &absoluteTargetPath,
+                                            bool allowCreateMissingComponents);
 
   // Test-only, UNPRIVILEGED witness for whether this build actually
   // resolved the kernel's per-mount identifier (Linux 5.8+'s statx()

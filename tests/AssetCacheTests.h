@@ -100,6 +100,33 @@ private slots:
   constructingWithIntermediateConfiguredDirectorySymlinkNeverAutoCreatesOrRecoversForeignDirectory();
   void bindMountOverOwnedSuffixComponentIsRejectedDuringChainResolution();
 
+  // Round-9+ review (HIGH): a configured directory whose full path
+  // ALREADY EXISTS on disk (even by way of an attacker-planted
+  // symlink for an intermediate ancestor two or more levels above the
+  // final leaf) must still be rejected -- the "longest existing
+  // prefix is a single trusted anchor" shortcut previously used for
+  // Config::directory could never detect this, since the whole path
+  // resolved successfully. Also proves the sentinel directory the
+  // symlink points at is left completely untouched.
+  void
+  precreatedLeafBehindDeepIntermediateSymlinkInConfiguredDirectoryIsRejectedAndSentinelUntouched();
+
+  // Round-9+ review: the default cache location (an OS-provided
+  // parent, e.g. `~/.cache` or `~/Library/Caches`) may not exist AT
+  // ALL on a genuinely clean install -- every one of its own missing
+  // ancestor components, not just this application's fixed
+  // "assets/v1" suffix, must be created (never merely assumed
+  // pre-existing) via the same secure, no-follow walker.
+  void cleanInstallWithEntirelyMissingCacheHierarchyIsCreatedSecurely();
+
+  // Round-9+ review: for a caller-supplied Config::directory, this
+  // resolver must still never auto-create ANY missing component, even
+  // when every component up to the last is already present -- exactly
+  // preserving the pre-existing "never creates any part of a
+  // caller-supplied custom cache directory" guarantee for the new,
+  // arbitrary-depth home-anchored walker.
+  void configuredDirectoryWithMissingLeafUnderHomeIsNeverAutoCreated();
+
   // Round-6 item 6: invalidate() must report a typed failure -- rather
   // than silently succeeding -- when the manifest unlink it depends on
   // for a durable tombstone genuinely cannot be committed.
@@ -113,6 +140,19 @@ private slots:
   // because a transient, unrelated directory-listing failure occurred.
   void
   deleteEntryUnlinksManifestDurablyEvenWhenPrefixEnumerationCannotBeCompleted();
+
+  // Round-9+ review (MEDIUM): a negative Config byte limit is an invalid
+  // configuration, never merely "unlimited" -- see Config's own doc
+  // comment in AssetCache.h.
+  void negativeDiskMaxBytesDisablesDiskCacheInsteadOfDestructivelyEvicting();
+  void negativeMemoryMaxCostBytesDisablesMemoryCacheRatherThanCrashing();
+
+  // Round-9+ review (HIGH): invalidate()/deleteEntry() must never
+  // report a key as durably, authoritatively gone when root
+  // verification failing on THIS call is the only reason nothing was
+  // actually deleted -- a real manifest can still be sitting there,
+  // untouched, discoverable by a different instance later.
+  void invalidateAfterRootReplacementReportsPersistenceFailedNotDurable();
 
 private:
   QString m_tempDirPath;

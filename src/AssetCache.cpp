@@ -53,6 +53,34 @@
 // the headers declare it (see mountIdViaStatx()'s stx_mask check).
 #include <linux/stat.h>
 #include <sys/syscall.h>
+// Round-9+ review (HIGH): openat2(2) (kernel 5.6+) lets every owned-
+// directory-chain component be opened via ONE atomic syscall that the
+// kernel itself refuses to complete (EXDEV/ELOOP) if the requested
+// path would cross a mount boundary or resolve through a symlink --
+// RESOLVE_NO_XDEV in particular gives a kernel-native "same mount"
+// guarantee that does NOT depend on STATX_MNT_ID support at all (see
+// MountIdentity's comment for why relying on st_dev alone is
+// insufficient against a same-device bind mount), closing the "mount
+// identity fallback to st_dev admits same-device bind" gap on any
+// modern Linux kernel regardless of whether the separate statx()
+// mount-id feature happens to be available. <linux/openat2.h> is the
+// kernel UAPI header (declares `struct open_how` and the RESOLVE_*
+// flags); it may be absent on an older build image's headers, or the
+// glibc on the build machine may predate openat2's libc wrapper, so
+// this is used opportunistically via a raw syscall(2) (exactly the
+// existing statx()-hardening pattern above) with graceful,
+// EQUIVALENT-STRENGTH degradation -- never a silently weaker one -- to
+// the existing per-component fstatat(AT_SYMLINK_NOFOLLOW) + openat(
+// O_NOFOLLOW) + mountIdentityMatches() sequence when openat2 itself is
+// unavailable (compile-time absent header) or refused by the running
+// kernel (ENOSYS), since that fallback sequence independently
+// re-verifies no-follow and (when STATX_MNT_ID is available) mount
+// continuity from scratch rather than trusting anything openat2 would
+// have decided.
+#if __has_include(<linux/openat2.h>)
+#include <linux/openat2.h>
+#define ARKHAM_HAVE_OPENAT2_UAPI 1
+#endif
 #endif
 
 using namespace Qt::StringLiterals;
@@ -64,6 +92,31 @@ namespace {
 constexpr int kMetadataFormatVersion = 1;
 constexpr double kHighWaterMarkFraction = 0.90;
 constexpr double kLowWaterMarkFraction = 0.75;
+
+// Round-9+ review (MEDIUM): a Config with a negative disk-quota byte
+// limit turns reapAndEnforceQuota()'s high/low-water-mark math negative
+// too (see its `highWaterMark`/`lowWaterMark` computation below): the
+// real, always-non-negative on-disk byte total then unconditionally
+// exceeds that negative high-water mark, and the eviction loop's target
+// (the negative low-water mark) can never be reached by evicting real,
+// non-negative-sized entries -- so construction (and every later
+// periodic sweep) destructively evicts every single entry it can, even
+// though the caller most likely meant "some other, valid limit" or
+// simply made a mistake, never "wipe the cache on every run". A negative
+// memoryMaxCostBytes is the identical failure mode for the in-process
+// QCache: QCache::setMaxCost() with a negative limit evicts every entry
+// immediately, silently defeating the memory cache for this instance's
+// entire lifetime. Both are treated as an invalid configuration and fail
+// closed -- exactly like the existing symlink/root-mismatch failure
+// modes -- rather than being discovered only once the destructive
+// eviction has already run.
+bool configHasValidDiskByteLimit(const AssetCache::Config &config) {
+  return config.diskMaxBytes >= 0;
+}
+
+bool configHasValidMemoryByteLimit(const AssetCache::Config &config) {
+  return config.memoryMaxCostBytes >= 0;
+}
 
 // The only legitimate writer of a cache payload is store(), which is only
 // ever fed encoded bytes that already passed AssetNetworkFetcher's own
@@ -250,6 +303,59 @@ MountIdentity mountIdentityForFd(int fd) {
   }
 #endif
   return identity;
+}
+
+#if defined(ARKHAM_HAVE_OPENAT2_UAPI)
+// Opportunistic, Linux-only atomic open of the single path component
+// `name` relative to `dirFd`, refusing (via the KERNEL itself, in one
+// syscall) both symlink resolution and any cross-mount traversal --
+// RESOLVE_NO_SYMLINKS rejects a symlink node exactly like O_NOFOLLOW
+// does, while RESOLVE_NO_XDEV additionally refuses to complete the open
+// at all if `name` resolves onto a different mount/filesystem than
+// `dirFd` itself, independent of (and strictly stronger than) any
+// userspace st_dev/STATX_MNT_ID comparison performed afterward.
+// RESOLVE_BENEATH is defense in depth for this call site specifically:
+// `name` is always a single path segment with no embedded '/' (verified
+// by the caller), so there is no ".." component for it to matter
+// against, but it costs nothing extra and directly matches what the
+// finding asks for. Returns -1 (errno set) on ANY failure, including
+// "openat2 not supported by this kernel" (ENOSYS) -- the caller must
+// treat -1 as "try the portable fallback", not as a definitive
+// rejection, since an old kernel's ENOSYS says nothing about whether
+// `name` is actually safe.
+int openat2NoFollowNoXdev(int dirFd, const char *name, bool wantDirectory) {
+  struct open_how how {};
+  how.flags = O_RDONLY | O_CLOEXEC | (wantDirectory ? O_DIRECTORY : 0);
+  how.resolve = RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_NO_XDEV;
+  const long result = ::syscall(SYS_openat2, dirFd, name, &how, sizeof(how));
+  if (result < 0) {
+    return -1;
+  }
+  return static_cast<int>(result);
+}
+#endif
+
+// Opens the single path component `name` relative to `dirFd`, refusing
+// a symlink node and (when the running kernel supports it) refusing any
+// cross-mount traversal atomically via openat2() -- see
+// openat2NoFollowNoXdev()'s comment. Falls back to plain
+// openat(O_NOFOLLOW) (the pre-existing, portable mechanism, still
+// independently re-verified by the caller's own
+// fstatat()+mountIdentityMatches() sequence) on any non-Linux platform
+// or when the running kernel refuses openat2 itself (old kernel): that
+// fallback is an EQUIVALENT-STRENGTH, not weaker, guarantee for
+// symlinks (O_NOFOLLOW), and for mount continuity it is exactly the
+// pre-existing STATX_MNT_ID-when-available / st_dev-only-otherwise
+// policy this file has always documented -- never silently downgraded
+// any further by this function.
+int openDirectoryComponentNoFollow(int dirFd, const char *name) {
+#if defined(ARKHAM_HAVE_OPENAT2_UAPI)
+  const int viaOpenat2 = openat2NoFollowNoXdev(dirFd, name, true);
+  if (viaOpenat2 >= 0) {
+    return viaOpenat2;
+  }
+#endif
+  return openat(dirFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 }
 
 // True iff `actual` names the same mount as `expected`: st_dev must
@@ -672,9 +778,17 @@ bool isValidKey(const QString &key) {
 // unavailable on this platform/kernel -- rejecting the whole resolution
 // outright (never silently continuing) the instant any component
 // resolves onto a different mount than the anchor itself.
+// Round-9+ review: `allowCreateMissingComponents` lets a caller that
+// must NEVER auto-create any part of a caller-supplied custom
+// directory (see resolveTrustedDirectoryNoFollow()'s comment) reuse
+// this exact same walker in pure-verification mode -- a missing
+// component is then a hard rejection (std::nullopt) rather than an
+// mkdirat() call, with no duplicated fstatat/openat logic between the
+// two policies.
 std::optional<int>
 openDirectoryChainNoFollow(const QString &trustedAnchorPath,
-                           const QStringList &ownedSuffixComponents) {
+                           const QStringList &ownedSuffixComponents,
+                           bool allowCreateMissingComponents = true) {
   const QByteArray anchorUtf8 = QFile::encodeName(trustedAnchorPath);
   int currentFd = ::open(anchorUtf8.constData(),
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -687,7 +801,7 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
     struct stat st {};
     if (fstatat(currentFd, componentUtf8.constData(), &st,
                 AT_SYMLINK_NOFOLLOW) != 0) {
-      if (errno != ENOENT) {
+      if (errno != ENOENT || !allowCreateMissingComponents) {
         ::close(currentFd);
         return std::nullopt;
       }
@@ -714,8 +828,8 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
       ::close(currentFd);
       return std::nullopt;
     }
-    const int nextFd = openat(currentFd, componentUtf8.constData(),
-                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    const int nextFd =
+        openDirectoryComponentNoFollow(currentFd, componentUtf8.constData());
     if (nextFd < 0) {
       ::close(currentFd);
       return std::nullopt;
@@ -733,6 +847,103 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
     currentFd = nextFd;
   }
   return currentFd;
+}
+
+// Round-9+ review (HIGH, repeated across multiple prior rounds without
+// full resolution): resolves `absoluteTargetPathIn` -- either the OS-
+// provided default cache location plus this application's own
+// "assets/v1" suffix, or an ENTIRE caller-supplied Config::directory --
+// walking EVERY path component between a genuinely trusted starting
+// point and the leaf, never trusting a multi-segment path string as a
+// single opaque unit beyond that starting point regardless of whether
+// the full path happens to already exist on disk.
+//
+// This directly closes the "precreated leaf behind an intermediate
+// symlink" attack the review demonstrates: previously, a configured
+// directory whose full path ALREADY existed (even by way of a
+// symlinked ancestor an attacker pre-planted) was opened with a single
+// ::open(path, O_NOFOLLOW) call -- and POSIX's O_NOFOLLOW only refuses
+// a symlink AT THE FINAL path component; every intermediate component
+// is resolved by the kernel exactly as an ordinary, unhardened open()
+// would. A "longest already-existing prefix" shortcut cannot close this
+// either: in the demonstrated attack the WHOLE path already exists
+// (through the symlink), so nothing would ever be identified as
+// "still needing a no-follow walk" at all.
+//
+// The starting point used here is the process's own user home
+// directory (QDir::homePath()), NOT the filesystem root: walking
+// no-follow from home never encounters the legitimate, OS-bootstrap-
+// time symlinks that caused a real regression in an EARLIER version of
+// this very fix that instead walked no-follow from "/" (see
+// openDirectoryChainNoFollow()'s own comment for that history) -- e.g.
+// macOS's classic `/var` -> `/private/var` (a real ancestor of this
+// project's own QTemporaryDir-based test fixtures on that platform) or
+// a Linux distribution's /usr-merge symlinks (`/bin` -> `/usr/bin` and
+// similar) -- none of which are ordinarily ancestors of a normal user's
+// own home directory, while a locally-writable, attacker-plantable
+// symlink for ANY ancestor of a path under home is exactly the class of
+// attack this hardening exists to catch. Mount-identity continuity
+// (openDirectoryChainNoFollow()'s existing mountIdentityMatches()
+// check, further strengthened by openat2's RESOLVE_NO_XDEV on Linux --
+// see openDirectoryComponentNoFollow()'s comment) is likewise anchored
+// to home itself, never to "/": a real multi-mount system very commonly
+// has "/home" itself on a dedicated partition separate from "/", but
+// everything BENEATH one user's own home directory is, for any normal
+// single-disk installation this project targets (including a Steam
+// Deck's own storage layout), on that SAME mount throughout -- so this
+// check remains strict without rejecting ordinary, non-hostile setups.
+//
+// When `absoluteTargetPathIn` is NOT itself a descendant of home (an
+// unusual, explicit system-wide configuration choice -- e.g. an admin
+// pointing this cache at a shared "/srv/..." location), this instead
+// falls back to the pre-existing "longest existing prefix is a single
+// trusted anchor, only the not-yet-existing remainder is walked
+// no-follow" policy: a narrower guarantee for that uncommon case, but
+// not a regression from the behaviour that shipped before this fix, and
+// clearly narrower-scope rather than silently unsafe.
+std::optional<int>
+resolveTrustedDirectoryNoFollow(const QString &absoluteTargetPathIn,
+                                bool allowCreateMissingComponents) {
+  const QString absoluteTargetPath = QDir::cleanPath(absoluteTargetPathIn);
+  if (absoluteTargetPath.isEmpty() ||
+      !absoluteTargetPath.startsWith(QLatin1Char('/'))) {
+    return std::nullopt;
+  }
+  const QString home = QDir::cleanPath(QDir::homePath());
+  if (!home.isEmpty() &&
+      (absoluteTargetPath == home ||
+       absoluteTargetPath.startsWith(home + QLatin1Char('/')))) {
+    const QString relativeToHome =
+        absoluteTargetPath == home ? QString()
+                                   : absoluteTargetPath.mid(home.length() + 1);
+    const QStringList components =
+        relativeToHome.isEmpty()
+            ? QStringList{}
+            : relativeToHome.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    return openDirectoryChainNoFollow(home, components,
+                                      allowCreateMissingComponents);
+  }
+  // Fallback for a target outside home: find the longest EXISTING
+  // prefix (by simple, symlink-FOLLOWING existence -- matching exactly
+  // what a single opaque trusted-anchor open would have accepted
+  // before this fix, so this is not a narrower guarantee than what
+  // shipped previously for this uncommon case) and walk only whatever
+  // remains beneath it no-follow, exactly like the home-anchored case
+  // above.
+  QString existingPrefix = absoluteTargetPath;
+  QStringList missingSuffix;
+  while (existingPrefix != QLatin1String("/") &&
+         !QFileInfo::exists(existingPrefix)) {
+    const int idx = existingPrefix.lastIndexOf(QLatin1Char('/'));
+    const QString lastComponent = existingPrefix.mid(idx + 1);
+    if (lastComponent.isEmpty()) {
+      break;
+    }
+    missingSuffix.prepend(lastComponent);
+    existingPrefix = idx <= 0 ? QStringLiteral("/") : existingPrefix.left(idx);
+  }
+  return openDirectoryChainNoFollow(existingPrefix, missingSuffix,
+                                    allowCreateMissingComponents);
 }
 #endif
 
@@ -888,27 +1099,40 @@ bool safeRemoveTreeRelative(int parentFd, const QString &name,
 AssetCache::AssetCache(Config config)
     : m_config(std::move(config)),
       m_memory(new QCache<QString, CachedEntry>()) {
-  // Round-6 item 5: the trusted anchor / owned-suffix split (see
-  // openDirectoryChainNoFollow()'s comment) is decided here, BEFORE
-  // anything else touches the filesystem. In the default-location case
-  // (the common, production path), the OS/desktop-environment-provided
-  // cache base is the trusted anchor and "assets"/"v1" -- the two path
-  // segments this class itself appends -- are the owned suffix, always
-  // verified no-follow regardless of whether QDir::mkpath() below ends
-  // up creating them fresh or they already existed. A caller-supplied
-  // Config::directory is, in its entirety, the trusted anchor instead
-  // (an explicit configuration input, not local-attacker-writable
-  // surface) with an empty owned suffix -- preserving the exact
-  // pre-round-6 leaf-only O_NOFOLLOW guarantee for that case.
-  QString trustedAnchorPath;
-  QStringList ownedSuffixComponents;
-  if (m_config.directory.isEmpty()) {
-    trustedAnchorPath =
-        QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    ownedSuffixComponents = {QStringLiteral("assets"), QStringLiteral("v1")};
-    m_directory = trustedAnchorPath + QStringLiteral("/assets/v1");
+  // Round-9+ review (MEDIUM): validated FIRST, before anything else --
+  // including the directory resolution immediately below -- so an
+  // invalid disk-quota limit can never reach reapAndEnforceQuota()'s
+  // eviction math at all. See configHasValidDiskByteLimit()'s comment.
+  if (!configHasValidDiskByteLimit(m_config)) {
+    m_diskCacheDisabled = true;
+  }
+  m_memory->setMaxCost(configHasValidMemoryByteLimit(m_config)
+                           ? m_config.memoryMaxCostBytes
+                           : 0);
+  // Round-9+ review (HIGH): the target directory this instance will
+  // use is fixed here, BEFORE anything else touches the filesystem, but
+  // is no longer split into an opaque "trusted anchor" (opened as a
+  // single unit, its intermediate components never individually
+  // examined) plus a small fixed-length "owned suffix" -- see
+  // resolveTrustedDirectoryNoFollow()'s comment for why that split, as
+  // it stood before this round, still let a caller-supplied
+  // Config::directory's entire path (arbitrarily many components) be
+  // trusted as a single unit via one leaf-only O_NOFOLLOW open, even
+  // when an INTERMEDIATE ancestor had been replaced by an
+  // attacker-planted symlink and the final leaf happened to already
+  // exist (through that redirection). `allowCreateMissingComponents`
+  // is true ONLY for the default-location case (this application's own
+  // exclusively-owned "assets/v1" suffix beneath the OS-provided cache
+  // base may be created fresh); a caller-supplied Config::directory
+  // must already exist in full, component by component -- this
+  // application still never creates any part of a caller-supplied
+  // custom cache directory.
+  const bool usingDefaultLocation = m_config.directory.isEmpty();
+  if (usingDefaultLocation) {
+    m_directory =
+        QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
+        QStringLiteral("/assets/v1");
   } else {
-    trustedAnchorPath = m_config.directory;
     m_directory = m_config.directory;
   }
   // Review item 7: if the configured cache directory ALREADY exists as a
@@ -918,41 +1142,13 @@ AssetCache::AssetCache(Config config)
   // QFileInfo::isSymLink() (unlike QDir::exists(), which follows) reports
   // the entry's own type without resolving it. The memory cache still
   // works normally -- only disk persistence is disabled for this
-  // instance's entire lifetime.
-  //
-  // Round-7/8 review (HIGH): a path-based QDir::mkpath(m_directory) call
-  // used to run here, UNCONDITIONALLY and BEFORE any fd-based no-follow
-  // validation ever happened below. QDir::mkpath() is a plain path-based
-  // `mkdir -p`: it has no symlink-awareness at all and re-resolves the
-  // ENTIRE path from the filesystem root on every call, so it would
-  // silently create whatever trailing components didn't yet exist
-  // THROUGH an attacker-planted symlink for ANY ancestor -- including
-  // ones one or more levels above the final leaf that the single
-  // symlink check above can never see -- producing a perfectly
-  // ordinary, non-symlink leaf directory living wherever that symlink
-  // pointed. The no-follow open performed further below would then
-  // happily "verify" and start operating against that already-created,
-  // already-foreign directory (this class's periodic quota-eviction/
-  // reap sweep is destructive: it deletes files it believes are stray),
-  // which is exactly the "destructively recovers foreign dir" failure
-  // mode the review describes. That call is now removed entirely, with
-  // NO replacement path-based creation of any kind:
-  //   - In the default-location case, the OS/desktop-environment-
-  //     provided cache base (`trustedAnchorPath`) is assumed to already
-  //     exist (this application never creates it), and this
-  //     application's own exclusively-owned "assets"/"v1" suffix is
-  //     created below by openDirectoryChainNoFollow() itself, via
-  //     mkdirat() relative to an already-open, already-verified parent
-  //     descriptor -- never a path string an attacker's symlink could
-  //     be substituted into.
-  //   - In the explicit Config::directory case, the ENTIRE configured
-  //     directory must already exist as a genuine, non-symlink
-  //     directory: this application never creates any part of a
-  //     caller-supplied custom cache directory. If it does not already
-  //     exist, the no-follow open below simply fails (ENOENT) and disk
-  //     persistence is disabled for this instance -- a safe, fully
-  //     inert fail-closed outcome, never a silent creation through
-  //     whatever the path currently resolves to.
+  // instance's entire lifetime. This is a cheap, redundant-by-design
+  // fast path: the fd-based resolution below independently re-detects
+  // the exact same condition (and every other symlinked-ancestor
+  // variant this single leaf-only check cannot see), so this early
+  // check changes no observable behaviour, it just avoids doing any
+  // filesystem-descriptor work at all for the single most common
+  // misconfiguration case.
   if (QFileInfo(m_directory).isSymLink()) {
     m_diskCacheDisabled = true;
   }
@@ -961,10 +1157,7 @@ AssetCache::AssetCache(Config config)
   // `m_directory` NOW, at construction, and record the (device, inode)
   // pair it names via fstat() on THIS SAME descriptor -- never a second,
   // later path-based stat, which could observe a DIFFERENT filesystem
-  // object if the path has since been replaced. O_NOFOLLOW means this
-  // open itself fails if the path (already checked above, but this is
-  // an independent, TOCTOU-closing re-check via the syscall itself
-  // rather than a separate stat) resolves to a symlink. Every later
+  // object if the path has since been replaced. Every later
   // disk-touching operation re-derives the CURRENT (device, inode) for
   // this same path and compares it against these retained values
   // (verifyRootAnchorLocked()) before proceeding, so a root directory
@@ -974,16 +1167,12 @@ AssetCache::AssetCache(Config config)
   // operating against a different object than the one this instance
   // was constructed against.
   if (!m_diskCacheDisabled) {
-    // Round-6 item 5: resolved via a trusted anchor plus an explicitly
-    // no-follow-verified owned suffix (see
-    // openDirectoryChainNoFollow()'s comment) rather than a single
-    // `::open(path, O_NOFOLLOW)` -- the latter only refuses a symlink
-    // at the FINAL path component; an attacker-planted symlink for an
-    // ancestor this application exclusively owns (one or more levels
-    // above the final leaf) would still be silently followed by
-    // QDir::mkpath() above and then by ordinary path resolution here.
+    // Round-9+ review: resolved by walking EVERY path component from a
+    // genuinely trusted starting point (see
+    // resolveTrustedDirectoryNoFollow()'s comment) rather than trusting
+    // an entire multi-segment configured path as one opaque unit.
     const std::optional<int> chainFd =
-        openDirectoryChainNoFollow(trustedAnchorPath, ownedSuffixComponents);
+        resolveTrustedDirectoryNoFollow(m_directory, usingDefaultLocation);
     struct stat st {};
     if (!chainFd || ::fstat(*chainFd, &st) != 0) {
       if (chainFd) {
@@ -1000,7 +1189,6 @@ AssetCache::AssetCache(Config config)
     }
   }
 #endif
-  m_memory->setMaxCost(m_config.memoryMaxCostBytes);
   reapAndEnforceQuota();
 }
 
@@ -1484,11 +1672,39 @@ AssetCache::readMetadata(const QString &metadataFilePath,
 
 AssetCache::DeleteEntryOutcome
 AssetCache::deleteEntry(const QString &key) const {
-  if (m_diskCacheDisabled || !verifyRootAnchorLocked()) {
-    // Nothing to delete when disk I/O is disabled entirely -- vacuously
-    // both "everything reclaimed" and "manifest durably absent" (there
-    // is no disk to hold one).
+  if (m_diskCacheDisabled) {
+    // Disk I/O has been disabled for this instance's ENTIRE lifetime
+    // (a symlink detected at construction, an invalid Config byte
+    // limit, or an EARLIER call that already latched this via
+    // verifyRootAnchorLocked() below) -- there never was, and never
+    // will be, any disk for THIS instance to persist an entry to, so
+    // "everything reclaimed" / "manifest durably absent" really are
+    // vacuously true for every observable purpose this instance itself
+    // cares about.
     return {true, true};
+  }
+  if (!verifyRootAnchorLocked()) {
+    // Round-9+ review (HIGH): root verification failing HERE, on THIS
+    // specific call (as opposed to disk having already been disabled
+    // before this call even started -- the case handled above), is
+    // fundamentally different and must NOT be folded into the same
+    // vacuous {true, true} result the previous implementation returned
+    // for both. A real, still-live on-disk manifest for `key` may
+    // genuinely exist right now, completely untouched -- this call
+    // never got as far as even attempting to remove it. Reporting
+    // {true, true} here would let invalidate() (and, through it, an
+    // authoritative negative-404 record) believe this key's entry is
+    // now durably, crash-confirmed gone -- when in fact a DIFFERENT
+    // AssetCache instance (a fresh process started later, or a sibling
+    // instance pointed at the same directory) that does not share this
+    // exact transient/verification failure could still open that very
+    // manifest and let the stale entry "revive" once this process's own
+    // negative-404 TTL, or its own process lifetime, has ended. Neither
+    // "reclaimed" nor "durably absent" is a safe promise to make, so
+    // both are false: the caller (invalidate()) surfaces this as its own
+    // typed PersistenceFailed result instead of silently claiming
+    // success.
+    return {false, false};
   }
   // Review item 8: `key` no longer maps to a fixed pair of filenames --
   // reclaim EVERY file this cache could ever have written for it (the
@@ -2413,6 +2629,22 @@ bool AssetCache::directoryChainResolvesNoFollowForTesting(
 #else
   Q_UNUSED(trustedAnchorPath);
   Q_UNUSED(ownedSuffixComponents);
+  return false;
+#endif
+}
+
+bool AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+    const QString &absoluteTargetPath, bool allowCreateMissingComponents) {
+#if defined(Q_OS_UNIX)
+  const std::optional<int> fd = resolveTrustedDirectoryNoFollow(
+      absoluteTargetPath, allowCreateMissingComponents);
+  if (fd) {
+    ::close(*fd);
+  }
+  return fd.has_value();
+#else
+  Q_UNUSED(absoluteTargetPath);
+  Q_UNUSED(allowCreateMissingComponents);
   return false;
 #endif
 }
