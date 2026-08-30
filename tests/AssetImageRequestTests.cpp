@@ -328,6 +328,91 @@ void AssetImageRequestTests::
 }
 
 void AssetImageRequestTests::
+    statusChangedObserverSeesFullyConsistentPropertySnapshot() {
+  // Copilot review (round-N+): statusChanged() must never fire while
+  // errorString()/errorCode()/image()/accessibleDescription() still hold
+  // a STALE value from the previous transition -- a directly-connected
+  // observer (including a QML binding that reacts to statusChanged() by
+  // re-reading those other properties) must always see a fully
+  // consistent snapshot. This is forced via a REAL, synchronous,
+  // direct-connection signal handler (not a queued/event-loop wait),
+  // exercising actual reentrancy into this object's own property
+  // getters from within its own signal emission -- not merely a
+  // sequential check of before/after.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(16, 16);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  AssetImageRequest request(coordinator);
+
+  // First load fails synchronously, populating a non-empty
+  // errorString/errorCode this test can later prove is no longer
+  // visible the instant statusChanged() reports the NEXT Loading
+  // transition.
+  request.load(makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                       QStringLiteral("a/b")));
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Error; },
+      5000));
+  QVERIFY(!request.errorString().isEmpty());
+  QVERIFY(request.errorCode() != 0);
+
+  struct Snapshot {
+    AssetImageRequest::Status status;
+    QString errorString;
+    int errorCode;
+    bool imageIsNull;
+    QString accessibleDescription;
+  };
+  QVector<Snapshot> snapshots;
+  QObject::connect(
+      &request, &AssetImageRequest::statusChanged, &request,
+      [&]() {
+        snapshots.push_back(Snapshot{
+            request.status(), request.errorString(), request.errorCode(),
+            request.image().isNull(), request.accessibleDescription()});
+      },
+      Qt::DirectConnection);
+
+  request.load(
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+
+  // The Idle/Error -> Loading transition's own statusChanged() delivery
+  // must already observe the cleared error and image, and the new
+  // "Loading ..." accessible description -- never the stale values from
+  // the just-superseded failed load().
+  QVERIFY(!snapshots.isEmpty());
+  const Snapshot &loadingSnapshot = snapshots.first();
+  QCOMPARE(loadingSnapshot.status, AssetImageRequest::Status::Loading);
+  QVERIFY(loadingSnapshot.errorString.isEmpty());
+  QCOMPARE(loadingSnapshot.errorCode, 0);
+  QVERIFY(loadingSnapshot.imageIsNull);
+  QVERIFY(loadingSnapshot.accessibleDescription.startsWith(
+      QStringLiteral("Loading")));
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Ready; },
+      5000));
+
+  // Likewise, the Loading -> Ready transition's statusChanged() delivery
+  // must already observe the newly-decoded image, never a null one.
+  QVERIFY(snapshots.size() >= 2);
+  const Snapshot &readySnapshot = snapshots.last();
+  QCOMPARE(readySnapshot.status, AssetImageRequest::Status::Ready);
+  QVERIFY(!readySnapshot.imageIsNull);
+  QVERIFY(readySnapshot.errorString.isEmpty());
+  QCOMPARE(readySnapshot.errorCode, 0);
+}
+
+void AssetImageRequestTests::
     reloadingAfterErrorEmitsErrorChangedWhenClearingStaleError() {
   MockHttpServer server;
   MockHttpServer::Response response;

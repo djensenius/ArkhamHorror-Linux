@@ -31,6 +31,7 @@ private slots:
   void destructionImmediatelyAfterImmediateCompletionNeverCrashes();
   void reloadingWithNewKeyClearsPreviousImageDuringLoading();
   void reloadingAfterErrorEmitsErrorChangedWhenClearingStaleError();
+  void statusChangedObserverSeesFullyConsistentPropertySnapshot();
 
 private:
   QString m_tempDirPath;

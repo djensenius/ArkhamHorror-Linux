@@ -74,7 +74,6 @@ signals:
   void accessibleDescriptionChanged();
 
 private:
-  void setStatus(Status status);
   void setAccessibleDescription(const QString &description);
 
   AssetRequestCoordinator &m_coordinator;
