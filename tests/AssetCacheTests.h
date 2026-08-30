@@ -190,6 +190,29 @@ private slots:
   // a real SteamOS-style dedicated "/home/deck" mount. Requires a real
   // bind mount (root-privileged); QSKIP when unavailable.
   void authenticatedHomeMountTransitionOntoADifferentMountIsPermitted();
+  // Cumulative review (PR #18, MEDIUM, "home mount auth wrong
+  // boundary"): the two tests above only ever exercise a mount
+  // transition landing on home's own FINAL path component. This test
+  // (and its rejected companion below) instead bind-mounts an
+  // ANCESTOR of home's final component -- modelling a real, ordinary
+  // dedicated "/home" partition (distinct from a SteamOS-style
+  // "/home/deck" split) -- and proves the resolver now correctly
+  // permits it when authenticated, closing the exact gap where a
+  // prior version of this resolver hard-coded the permitted
+  // transition point to home's own final component and rejected this
+  // equally-legitimate topology outright. Requires a real bind mount
+  // (root-privileged); QSKIP when unavailable.
+  void
+  authenticatedAncestorMountTransitionModellingADedicatedHomePartitionIsPermitted();
+  // Negative control for the test above: the identical ancestor
+  // bind-mount shape, but unauthenticated -- must be rejected exactly
+  // like every other unauthenticated mount transition, proving the
+  // fix's "at most one transition, only when authenticated" rule
+  // applies uniformly regardless of WHERE in home's path the
+  // transition organically falls. Requires a real bind mount
+  // (root-privileged); QSKIP when unavailable.
+  void
+  unauthenticatedAncestorMountTransitionModellingADedicatedHomePartitionIsRejected();
   // An unauthenticated $HOME whose mount-identification itself is
   // degraded (forced via setMountIdentificationDegradedForTesting(),
   // no privilege required) must fail closed exactly like an
@@ -225,6 +248,7 @@ private slots:
   // comment in AssetCache.h.
   void negativeDiskMaxBytesDisablesDiskCacheInsteadOfDestructivelyEvicting();
   void negativeMemoryMaxCostBytesDisablesMemoryCacheRatherThanCrashing();
+  void bothNegativeDiskAndMemoryLimitsDisableBothTiersWithZeroMutation();
 
   // Round-N+ review (MEDIUM, repeat finding, "invalid cache limits
   // publicly constructible"): AssetCache::validateConfiguration()/
@@ -315,6 +339,42 @@ private slots:
   // several existing tests in this very file already rely on).
   void
   sameProcessMultipleInstancesOverSameRootAllCooperateWithFullDiskAuthority();
+  // Cumulative review (PR #18, HIGH, "same-process cache instances
+  // unsynchronized" -- "dup() fd lacks CLOEXEC; exec child retains
+  // root"): with the lock held by a live AssetCache instance in THIS
+  // process, spawns a real child process (via QProcess, which uses
+  // fork()+exec() on POSIX) and independently inspects the child's OWN
+  // open-file-descriptor table for the exact fd number the parent's
+  // RootAuthority holds -- proving CLOEXEC actually prevented
+  // inheritance, rather than merely asserting the absence of an
+  // indirect symptom.
+  void execChildProcessNeverInheritsTheRootLockFileDescriptor();
+  // Cumulative review (PR #18, HIGH, "same-process cache instances
+  // unsynchronized" -- "duplicate LRU sequences"): two SIMULTANEOUSLY
+  // LIVE same-process instances over the same root, each storing a
+  // number of DIFFERENT keys, must never mint colliding
+  // access-sequence values -- a prior version of this class gave each
+  // instance its own private, independently-recovered counter, so two
+  // live instances would both recover the SAME starting value and then
+  // independently increment, guaranteeing collisions under exactly this
+  // scenario. This is a deterministic outcome check (not a timing race)
+  // that fails under the old per-instance-counter design and passes
+  // once the counter is genuinely shared.
+  void concurrentSameProcessInstancesNeverMintCollidingAccessSequenceValues();
+  // Cumulative review (PR #18, HIGH, "same-process cache instances
+  // unsynchronized" -- "fork child inherits registry and falsely joins
+  // parent"): a real, raw fork() (never QProcess/exec) while this
+  // process already holds a live root lock; the CHILD immediately
+  // constructs a brand-new AssetCache over the exact SAME root and
+  // reports (via its own exit code, then _exit()s immediately, never
+  // running inherited C++ destructors) whether it believes disk
+  // persistence is enabled. It must NOT: registerForkSafetyOnce()'s
+  // atfork child-handler clears the process-wide registry the instant
+  // fork() returns, so the child's new instance always performs its
+  // own independent (and, here, correctly failing) acquisition attempt
+  // rather than wrongly "joining" the parent's inherited authority
+  // object as though it were an ordinary same-process sibling.
+  void forkedChildProcessNeverJoinsParentsInheritedRootAuthority();
 
 private:
   QString m_tempDirPath;

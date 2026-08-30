@@ -145,31 +145,53 @@ namespace Arkham {
 // fsync'd and interpreted identically by every participant), this
 // class instead establishes exactly ONE process-wide coordinator per
 // canonical cache root (identified by (device, inode)) at a time -- see
-// acquireExclusiveRootOwnershipOrFailClosed()/
-// releaseRootOwnershipRegistration() in the .cpp for the full
-// mechanism: the first AssetCache instance for a given root in this
-// process takes an exclusive, advisory lock (flock(LOCK_EX | LOCK_NB)
-// on a dup() of the root directory descriptor) the instant the root is
-// opened; every OTHER instance for that SAME root, in this SAME
-// process, cooperates by joining that same registration (a reference
-// count) rather than competing for it -- multiple same-process
-// instances over one root remain fully supported, exactly as before.
-// Only a genuinely DIFFERENT process is ever denied. The underlying
-// lock is released the instant the LAST live same-process instance for
-// that root is destroyed (or, on a hard crash, by the kernel's own
-// process-exit fd cleanup, so a crashed owner can never leave a stale
-// lock behind for another process to wait on indefinitely). If a NEW
-// root's lock cannot be acquired for ANY reason -- a different process
-// already holds it, or any other failure -- that instance runs
-// memory-only, with disk persistence disabled for its entire lifetime
-// exactly as if disk I/O were unavailable for any other reason
-// (m_diskCacheDisabled): it never reads, writes, deletes, reaps, or
-// otherwise touches this directory. A contended or otherwise unprovable
-// lock therefore can never mint a durable disk-cache result, and at any
-// moment at most one live PROCESS ever has disk authority over a given
-// cache root -- eliminating the entire class of cross-process races
-// described above by construction, rather than trying to make them
-// individually safe.
+// acquireExclusiveRootOwnershipOrFailClosed()/RootAuthority in the .cpp
+// for the full mechanism: the first AssetCache instance for a given
+// root in this process takes an exclusive, advisory lock
+// (flock(LOCK_EX | LOCK_NB) on a CLOEXEC-flagged dup() of the root
+// directory descriptor) the instant the root is opened, and constructs
+// a single shared RootAuthority object (holding a genuinely SHARED
+// QMutex and a genuinely SHARED LRU/generation-minting access-sequence
+// counter) for it; every OTHER instance for that SAME root, in this
+// SAME process, joins that SAME authority object via a std::shared_ptr
+// (never merely a separate refcount alongside still-private state) --
+// this instance's own m_mutex and m_nextAccessSequence are repointed,
+// in the constructor, directly AT the shared authority's fields, so
+// EVERY disk-mutating operation any same-root sibling performs is
+// serialized through the identical mutex and mints access-sequence
+// values from the identical counter, closing the exact race a prior
+// version of this class had: same-process "cooperating" instances that
+// still kept fully private m_mutex/m_nextAccessSequence state could
+// interleave real store/invalidate/reap/touch calls against the same
+// on-disk files with no mutual exclusion at all, and could each mint
+// colliding LRU access-sequence values. Multiple same-process instances
+// over one root remain fully supported, exactly as before -- only a
+// genuinely DIFFERENT process is ever denied. The underlying lock is
+// released the instant the LAST live same-process instance for that
+// root (i.e. the last std::shared_ptr reference to its RootAuthority)
+// is destroyed (or, on a hard crash, by the kernel's own process-exit
+// fd cleanup, so a crashed owner can never leave a stale lock behind
+// for another process to wait on indefinitely). A pthread_atfork()
+// child-side handler unconditionally clears the process-wide registry
+// the instant this process forks: a forked child (before any exec)
+// must never "join" an inherited authority object as though it were a
+// same-process sibling -- it is a genuinely different process from the
+// kernel's (and flock()'s) own perspective the moment fork() returns,
+// so any AssetCache it constructs afterward independently re-acquires
+// (and, ordinarily, correctly fails to acquire, exactly like any other
+// unrelated second process racing the still-live parent) rather than
+// silently reusing parent-only mutex/counter state that is unsafe to
+// share across a fork boundary at all. If a NEW root's lock cannot be
+// acquired for ANY reason -- a different process already holds it, or
+// any other failure -- that instance runs memory-only, with disk
+// persistence disabled for its entire lifetime exactly as if disk I/O
+// were unavailable for any other reason (m_diskCacheDisabled): it never
+// reads, writes, deletes, reaps, or otherwise touches this directory. A
+// contended or otherwise unprovable lock therefore can never mint a
+// durable disk-cache result, and at any moment at most one live PROCESS
+// ever has disk authority over a given cache root -- eliminating the
+// entire class of cross-process races described above by construction,
+// rather than trying to make them individually safe.
 class AssetCache {
 public:
   struct Config {
@@ -394,6 +416,36 @@ public:
   [[nodiscard]] bool isDiskCacheDisabledForTesting() const {
     return m_diskCacheDisabled;
   }
+
+  // Cumulative review (PR #18, HIGH, "same-process cache instances
+  // unsynchronized" -- "dup() fd lacks CLOEXEC; exec child retains
+  // root"): the exact fd number this instance's process-wide
+  // RootAuthority holds for this root's advisory flock(), or -1 if this
+  // instance never joined one (disk disabled / a different process
+  // already owned the root). Exists purely so a test can spawn a real
+  // child process (which, being CLOEXEC-protected, must NOT inherit
+  // this descriptor) and independently confirm the exact fd number is
+  // absent from the child's own open-file-descriptor table -- the only
+  // way to positively prove CLOEXEC actually took effect, rather than
+  // merely asserting the absence of an observable symptom.
+  [[nodiscard]] int rootLockFileDescriptorForTesting() const;
+
+  // Cumulative review (PR #18, HIGH, "same-process cache instances
+  // unsynchronized" -- "fork child inherits registry and falsely joins
+  // parent"): true iff this instance's (device, inode) currently has a
+  // LIVE entry in the process-wide root-lock registry, per the raw
+  // registry state (not this instance's own m_rootAuthorityHandle,
+  // which would trivially always be true for any instance with disk
+  // enabled). Deliberately does NOT take the registry's own mutex --
+  // see this method's .cpp implementation comment for why that is safe
+  // and specifically required here: it exists to be called from inside
+  // a just-forked child process, immediately after fork() returns,
+  // strictly BEFORE that child does anything else (including
+  // constructing any further Qt objects) -- the one moment a raw,
+  // lock-free snapshot read of already-copy-on-write-duplicated memory
+  // is unambiguously safe, and the one moment this accessor is ever
+  // used for.
+  [[nodiscard]] bool rootLockRegistryHasLiveEntryForTesting() const;
 
   // Round-7/8 item 7: the number of times invalidate() has actually run
   // since this instance was constructed. Lets a test assert a group of
@@ -713,7 +765,21 @@ private:
   std::optional<AssetError> m_configurationError;
   Config m_config;
   QString m_directory;
-  mutable QMutex m_mutex;
+  // Cumulative review (PR #18, HIGH, "same-process cache instances
+  // unsynchronized"): NEVER this instance's own private mutex when disk
+  // authority is shared with same-root siblings -- see
+  // m_rootAuthorityHandle's comment. Always non-null: defaults to
+  // pointing at m_privateMutexFallback (this instance's own storage,
+  // used whenever disk is disabled or a genuinely different process
+  // already owns the root) and is repointed, in the constructor body,
+  // at the shared per-root RootAuthority's mutex the moment this
+  // instance successfully joins one. A raw pointer (never a reference)
+  // specifically because which mutex this instance must use is only
+  // known partway through the constructor BODY (after root-fd
+  // resolution/locking), strictly after the member-initializer list
+  // (where a reference member would have to be bound) has already run.
+  mutable QMutex *m_mutex{&m_privateMutexFallback};
+  mutable QMutex m_privateMutexFallback;
   QCache<QString, CachedEntry> *m_memory;
   // Review round-3 item 9: an already-open, O_DIRECTORY|O_NOFOLLOW|
   // O_CLOEXEC descriptor for `m_directory`, opened once at construction
@@ -746,24 +812,41 @@ private:
   // documented limitation this implies on such platforms.
   mutable quint64 m_rootMountId{0};
   mutable bool m_rootHasMountId{false};
-  // Cumulative review (PR #18, HIGH): true iff this instance
-  // successfully registered itself as one of this PROCESS's (possibly
-  // several, cooperating) live owners of `m_rootDevice`/`m_rootInode`
-  // in the process-wide root-lock registry (see
-  // acquireExclusiveRootOwnershipOrFailClosed()/
-  // releaseRootOwnershipRegistration() in the .cpp) -- and therefore
-  // whether the destructor must release this instance's share of that
-  // registration. False whenever disk I/O was never enabled for this
-  // instance at all (config invalid, symlinked root, resolution
-  // failure, etc.) or a DIFFERENT process already held this exact root.
-  mutable bool m_holdsRootLockRegistration{false};
-  // Review item 11: guarded by m_mutex; recovered in the constructor (via
-  // reapAndEnforceQuota()'s directory scan) and re-validated (monotonic,
-  // never decreasing) on every subsequent reapAndEnforceQuota() call, so
-  // a fresh AssetCache instance pointed at a directory a PRIOR instance
-  // already wrote to (a real process restart) never reissues a sequence
-  // value any earlier instance already persisted.
-  quint64 m_nextAccessSequence{1};
+  // Cumulative review (PR #18, HIGH, "same-process cache instances
+  // unsynchronized"): non-null iff this instance successfully joined
+  // (or created) the process-wide RootAuthority for
+  // `m_rootDevice`/`m_rootInode` -- see
+  // acquireExclusiveRootOwnershipOrFailClosed() in the .cpp for the full
+  // rationale. Declared as an opaque std::shared_ptr<void> (the
+  // RootAuthority type itself is private to AssetCache.cpp's anonymous
+  // namespace) purely to keep this instance's OWN share of that
+  // authority alive for exactly as long as this instance exists --
+  // m_mutex and m_nextAccessSequence below point INTO the object this
+  // holds, so their validity is tied directly to this handle's
+  // lifetime, never to any separately-tracked boolean/refcount. Reset
+  // (in the destructor, implicitly, via ~AssetCache()'s default
+  // member-destruction order) the instant this instance goes away;
+  // when the LAST same-process instance sharing a given root's
+  // authority releases its handle, the authority object itself is
+  // destroyed, which is what actually closes the dup'd lock descriptor
+  // and releases the interprocess flock -- never gated by any separate
+  // manual bookkeeping that could drift out of sync with real object
+  // lifetime.
+  mutable std::shared_ptr<void> m_rootAuthorityHandle;
+  // Review item 11 / cumulative review (PR #18, HIGH, "same-process
+  // cache instances unsynchronized"): NEVER this instance's own private
+  // counter when disk authority is shared -- see
+  // m_rootAuthorityHandle's comment immediately above. Always non-null:
+  // defaults to m_privateAccessSequenceFallback and is repointed, in the
+  // constructor body, at the shared RootAuthority's own counter the
+  // moment this instance joins one, so that two simultaneously-live
+  // same-root instances can never independently mint the SAME
+  // access-sequence value (which would corrupt LRU ordering across
+  // them). Guarded by *m_mutex (now the SAME shared mutex both
+  // instances use, closing exactly that race); recovered/advanced
+  // monotonically by reapAndEnforceQuota() exactly as before.
+  quint64 *m_nextAccessSequence{&m_privateAccessSequenceFallback};
+  quint64 m_privateAccessSequenceFallback{1};
 };
 
 } // namespace Arkham

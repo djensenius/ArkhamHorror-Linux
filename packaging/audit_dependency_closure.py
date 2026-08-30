@@ -429,6 +429,7 @@ def _effective_search_dirs(
     dynamic_text: str,
     global_search_dirs: list[Path],
     lib_dir_resolved: Path,
+    inherited_rpath_chain: tuple[Path, ...] = (),
 ) -> list[Path]:
     """The ordered list of real directories a load of `requester_path`'s
     own DT_NEEDED entries would actually search, per real ld.so
@@ -449,6 +450,25 @@ def _effective_search_dirs(
     --global-search-dir). A directory named by more than one of these
     sources is only ever searched once, at its EARLIEST (highest-
     precedence) position for the kind of tag actually present.
+
+    Round-N+ review (HIGH, "inherited DT_RPATH missing ... glibc applies
+    DT_RPATH transitively when child lacks own RUNPATH/RPATH; auditor
+    may select valid global C while runtime chooses corrupt higher-
+    priority parent/private C"): unlike DT_RUNPATH (whose scope is
+    strictly local to the one object that carries it), a real glibc load
+    treats every ancestor's DT_RPATH as part of a single, cumulative,
+    TRANSITIVE search scope that keeps applying to every further
+    DT_NEEDED resolution down the whole dependency chain, for as long as
+    no intermediate object resets it with its own DT_RUNPATH (see
+    _next_inherited_rpath_chain()'s own docstring for the exact
+    propagation rule). `inherited_rpath_chain` carries this accumulated,
+    still-live ancestor RPATH context into THIS object's own resolution
+    -- it is always searched first, before even this object's own
+    DT_RPATH/DT_RUNPATH and before global_search_dirs, exactly matching
+    real ld.so behavior: an ancestor's legacy RPATH was already
+    established as part of the process-wide search scope by the time
+    this object's own dependencies are resolved, regardless of what this
+    object itself declares.
 
     Round-9+ review (HIGH, "boolean resolver permits external path"): a
     RUNPATH/RPATH entry (after $ORIGIN expansion) that resolves OUTSIDE
@@ -489,27 +509,20 @@ def _effective_search_dirs(
     (e.g. the AppDir's own usr/lib) -- see main()'s own argument help
     text -- so it is trusted as given, exactly as before.
     """
-    origin_dir = requester_path.parent.resolve()
     kind, entries = _parse_search_path_kind_and_entries(dynamic_text)
-    own_dirs: list[Path] = []
-    for entry in entries:
-        expanded = _expand_origin(entry, origin_dir)
-        if not expanded.is_relative_to(lib_dir_resolved):
-            raise ClosureAuditError(
-                f"{requester_path} carries a {'DT_RPATH' if kind == 'rpath' else 'DT_RUNPATH'} "
-                f"entry ('{entry}', resolving to {expanded}) outside the "
-                f"AppDir being audited ({lib_dir_resolved}). A real "
-                "loader on some target machine would still search this "
-                "exact external directory -- and, for a legacy RPATH, "
-                "before this project's own bundled search directories -- "
-                "so this can never be silently ignored: fix the build so "
-                "no bundled object ever records an external RPATH/RUNPATH "
-                "entry at all."
-            )
-        if expanded not in own_dirs:
-            own_dirs.append(expanded)
+    own_dirs = _own_validated_search_dirs(
+        requester_path, kind, entries, lib_dir_resolved
+    )
 
     ordered: list[Path] = []
+    # The still-live ancestor DT_RPATH scope (see this function's own
+    # docstring) is always searched first, regardless of this object's
+    # own tag -- a real ld.so already established it as part of the
+    # process-wide search scope before this object's own dependencies
+    # are ever resolved.
+    for candidate in inherited_rpath_chain:
+        if candidate not in ordered:
+            ordered.append(candidate)
     if kind == "rpath":
         # Legacy DT_RPATH: searched BEFORE LD_LIBRARY_PATH.
         for d in own_dirs:
@@ -529,6 +542,80 @@ def _effective_search_dirs(
             if d not in ordered:
                 ordered.append(d)
     return ordered
+
+
+def _own_validated_search_dirs(
+    requester_path: Path,
+    kind: str | None,
+    entries: list[str],
+    lib_dir_resolved: Path,
+) -> list[Path]:
+    """Expands and validates `requester_path`'s own RUNPATH/RPATH
+    entries (as already parsed into `kind`/`entries` by
+    _parse_search_path_kind_and_entries()), rejecting any entry that
+    resolves outside the AppDir being audited exactly as
+    _effective_search_dirs()'s own docstring describes -- extracted as
+    its own function so _next_inherited_rpath_chain() can compute the
+    exact same, already-validated set of directories a real loader would
+    propagate transitively, without silently re-deriving a subtly
+    different notion of "this object's own search directories"."""
+    origin_dir = requester_path.parent.resolve()
+    own_dirs: list[Path] = []
+    for entry in entries:
+        expanded = _expand_origin(entry, origin_dir)
+        if not expanded.is_relative_to(lib_dir_resolved):
+            raise ClosureAuditError(
+                f"{requester_path} carries a {'DT_RPATH' if kind == 'rpath' else 'DT_RUNPATH'} "
+                f"entry ('{entry}', resolving to {expanded}) outside the "
+                f"AppDir being audited ({lib_dir_resolved}). A real "
+                "loader on some target machine would still search this "
+                "exact external directory -- and, for a legacy RPATH, "
+                "before this project's own bundled search directories -- "
+                "so this can never be silently ignored: fix the build so "
+                "no bundled object ever records an external RPATH/RUNPATH "
+                "entry at all."
+            )
+        if expanded not in own_dirs:
+            own_dirs.append(expanded)
+    return own_dirs
+
+
+def _next_inherited_rpath_chain(
+    kind: str | None,
+    own_dirs: list[Path],
+    inherited_rpath_chain: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    """The inherited-RPATH-chain context to propagate to THIS object's
+    OWN dependencies, given this object's own (kind, own_dirs) and
+    whatever chain it itself inherited from further up the dependency
+    graph.
+
+    Round-N+ review (HIGH, "inherited DT_RPATH missing"): real glibc
+    dependency resolution treats legacy DT_RPATH as TRANSITIVE -- once
+    established by any object in the load chain, it keeps applying to
+    every further DT_NEEDED resolution below it -- while DT_RUNPATH is
+    strictly NON-transitive, scoped only to the one object that carries
+    it. Concretely:
+
+      - This object carries its own DT_RUNPATH: DT_RUNPATH scoping
+        specifically exists to stop exactly this kind of "spooky action
+        at a distance" -- propagation is reset to empty for everything
+        below this object, regardless of what it itself inherited.
+      - This object carries its own DT_RPATH (transitive by definition):
+        its own RPATH entries are folded into (unioned onto) whatever
+        chain it already inherited, and the combined, still-growing
+        chain continues propagating to its own dependencies.
+      - This object carries neither tag: whatever chain it inherited
+        keeps propagating to its own dependencies completely unchanged
+        -- it neither adds anything nor resets anything.
+    """
+    if kind == "runpath":
+        return ()
+    combined = list(inherited_rpath_chain)
+    for d in own_dirs:
+        if d not in combined:
+            combined.append(d)
+    return tuple(combined)
 
 
 def _file_digest(path: Path) -> str | None:
@@ -743,6 +830,25 @@ def audit_closure(
     since it is presumed loaded directly (execve()'d, or --auto-roots'
     own discovery), never resolved BY NAME through some other object's
     search path.
+
+    Round-N+ review (HIGH, "inherited DT_RPATH missing ... BFS state/
+    resolution key includes ordered inherited legacy-RPATH chain and
+    exact origins"): every queued edge additionally carries the ordered,
+    still-live ancestor DT_RPATH chain inherited from everything above it
+    in the dependency graph (see _next_inherited_rpath_chain()'s own
+    docstring for the exact propagation rule -- DT_RPATH transitive,
+    DT_RUNPATH non-transitive). The (name, requester, inherited-chain)
+    triple -- never (name, requester) alone -- is what gets
+    deduplicated: a diamond-shaped dependency graph can genuinely reach
+    the identical (name, requester) edge via two DIFFERENT accumulated
+    ancestor-RPATH contexts (e.g. two distinct parents, one carrying its
+    own DT_RPATH and one not, that both happen to require an identical
+    intermediate object which in turn requires this edge's own name) --
+    a real ld.so load resolves that edge independently under EACH
+    distinct scope it is reachable through, so collapsing them under a
+    context-blind key could silently let one (safe) context's successful
+    resolution mask a DIFFERENT context's genuinely broken, or
+    maliciously-shadowed, resolution of the exact same name.
     """
     allowlist = ABI_ALLOWLIST | extra_allowlist
     index = _index_lib_dir(lib_dir)
@@ -766,12 +872,17 @@ def audit_closure(
     bundled_closure: set[str] = set()
     missing: dict[str, list[str]] = {}
     unreachable: dict[str, list[str]] = {}
-    # Each queue entry is (name, requester_path), always a REAL, resolved
-    # requester Path: roots are seeded directly below (see process_root())
-    # rather than ever being pushed onto this queue as a bare name with no
-    # requester, so this queue exclusively models actual DT_NEEDED
-    # dependency edges (each with a concrete, known requester).
-    queue: list[tuple[str, Path]] = []
+    # Each queue entry is (name, requester_path, inherited_rpath_chain):
+    # requester_path is always a REAL, resolved requester Path (roots are
+    # seeded directly below -- see process_root() -- rather than ever
+    # being pushed onto this queue as a bare name with no requester), so
+    # this queue exclusively models actual DT_NEEDED dependency edges
+    # (each with a concrete, known requester). inherited_rpath_chain is
+    # the ordered, still-live ancestor DT_RPATH context this exact edge
+    # was reached under (see _next_inherited_rpath_chain()'s docstring);
+    # a root's own initial edges always start with an empty chain, since
+    # a root has no ancestor of its own.
+    queue: list[tuple[str, Path, tuple[Path, ...]]] = []
     # Round-9+ review (HIGH, "seen keyed only SONAME skips same dependency
     # from different requester/RPATH contexts" / "roots collapsed
     # basename"): deduplication is keyed by the EDGE -- (name, requester)
@@ -790,7 +901,14 @@ def audit_closure(
     # output cache (below) keeps this from being a real performance
     # regression: only the (cheap, in-memory) reachability check repeats
     # per distinct requester, never a redundant subprocess invocation.
-    seen_edges: set[tuple[str, str]] = set()
+    #
+    # Round-N+ review (HIGH, "inherited DT_RPATH missing ... BFS state/
+    # resolution key includes ordered inherited legacy-RPATH chain"): the
+    # key additionally includes the inherited chain itself -- see
+    # audit_closure()'s own docstring for why the SAME (name, requester)
+    # edge can genuinely need independent reachability checks under two
+    # different accumulated ancestor-RPATH contexts.
+    seen_edges: set[tuple[str, str, tuple[str, ...]]] = set()
     # Round-N+ review (HIGH, "auto roots still dict[basename,Path], losing
     # duplicates/location"): roots are deduplicated by (name, EXACT known
     # path) -- never by name alone -- so two different roots that happen
@@ -838,10 +956,26 @@ def audit_closure(
             )
         return link_target if link_target.exists() else candidate
 
-    def enqueue_dependencies_of(resolved_path: Path, requester_name: str) -> None:
+    def next_inherited_chain_for(
+        resolved_path: Path, inherited_rpath_chain: tuple[Path, ...]
+    ) -> tuple[Path, ...]:
+        kind, entries = _parse_search_path_kind_and_entries(
+            cached_dynamic_text(resolved_path)
+        )
+        own_dirs = _own_validated_search_dirs(
+            resolved_path, kind, entries, lib_dir_resolved
+        )
+        return _next_inherited_rpath_chain(kind, own_dirs, inherited_rpath_chain)
+
+    def enqueue_dependencies_of(
+        resolved_path: Path,
+        requester_name: str,
+        inherited_rpath_chain: tuple[Path, ...],
+    ) -> None:
         bundled_closure.add(requester_name)
+        next_chain = next_inherited_chain_for(resolved_path, inherited_rpath_chain)
         for needed in _parse_needed(cached_dynamic_text(resolved_path)):
-            queue.append((needed, resolved_path))
+            queue.append((needed, resolved_path, next_chain))
             if needed not in index and needed not in allowlist:
                 missing.setdefault(needed, []).append(requester_name)
 
@@ -869,14 +1003,20 @@ def audit_closure(
             resolved_path = resolve_symlink_within_appdir(
                 _select_unambiguous_occurrence(name, index[name], lib_dir), name
             )
-        enqueue_dependencies_of(resolved_path, name)
+        # A root has no ancestor of its own: it starts with an empty
+        # inherited-RPATH-chain context.
+        enqueue_dependencies_of(resolved_path, name, ())
 
     for name, known_path in normalized_roots:
         process_root(name, known_path)
 
     while queue:
-        name, requester_path = queue.pop()
-        edge_key = (name, str(requester_path))
+        name, requester_path, inherited_rpath_chain = queue.pop()
+        edge_key = (
+            name,
+            str(requester_path),
+            tuple(str(p) for p in inherited_rpath_chain),
+        )
         if edge_key in seen_edges:
             continue
         seen_edges.add(edge_key)
@@ -889,7 +1029,7 @@ def audit_closure(
         requester_dynamic_text = cached_dynamic_text(requester_path)
         effective_dirs = _effective_search_dirs(
             requester_path, requester_dynamic_text, global_search_dirs,
-            lib_dir_resolved,
+            lib_dir_resolved, inherited_rpath_chain,
         )
         # Round-N+ review (HIGH, "index/root still one path per
         # basename; reachability boolean then recursion chooses
@@ -925,19 +1065,23 @@ def audit_closure(
             # already-broken edge) so a single audit run reports every
             # real problem, not just the first one; never add it to
             # bundled_closure, since this edge was never validly
-            # resolved.
+            # resolved. The chain propagated further is the CURRENT
+            # (unresolved) edge's own inherited chain, unchanged --
+            # this representative file was never actually loaded here,
+            # so nothing about its own RUNPATH/RPATH is real in this
+            # context.
             unreachable.setdefault(name, []).append(requester_path.name)
             representative = resolve_symlink_within_appdir(
                 _select_unambiguous_occurrence(name, index[name], lib_dir), name
             )
             for needed in _parse_needed(cached_dynamic_text(representative)):
-                queue.append((needed, representative))
+                queue.append((needed, representative, inherited_rpath_chain))
             continue
 
-        enqueue_dependencies_of(resolved_path, name)
+        enqueue_dependencies_of(resolved_path, name, inherited_rpath_chain)
 
     return bundled_closure, missing, unreachable, (
-        {name for name, _ in seen_edges} | {name for name, _ in seen_roots}
+        {name for name, _, _ in seen_edges} | {name for name, _ in seen_roots}
     )
 
 

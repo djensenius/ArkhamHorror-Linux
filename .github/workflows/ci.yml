@@ -552,6 +552,25 @@ jobs:
           }
 
           sbom_path="$(pwd)/codec-notice-sbom.json"
+          # Round-N+ review (HIGH, "No basename re-discovery ... capture
+          # exact loader/copy source BEFORE packaging"): the manifest
+          # produced BEFORE packaging by build-appimage.sh's own
+          # "Capture distro provenance" step (see packaging/build-
+          # appimage.sh and packaging/audit_codec_notices.py's own
+          # capture-distro-provenance subcommand) -- classify's
+          # --require-package-provenance now REQUIRES this manifest for
+          # every real distro component (see cmd_classify()'s own
+          # docstring/comments), rather than falling back to an
+          # after-the-fact directory search once packaging is already
+          # complete.
+          distro_provenance_manifest="$(pwd)/distro-provenance-manifest.json"
+          [[ -s "$distro_provenance_manifest" ]] || {
+            echo "Expected distro-provenance manifest not found or empty:" \
+              "$distro_provenance_manifest (build-appimage.sh's own" \
+              "'Capture distro provenance' step should have produced it)." >&2
+            exit 1
+          }
+
           # --require-package-provenance (round-7 review, "missing
           # provenance passes"/"governed expectations"): this step runs
           # against the real, final, ldd-closure-resolved AppImage on
@@ -562,7 +581,9 @@ jobs:
           # problem, not a silently-tolerated gap.
           python3 packaging/audit_codec_notices.py classify "$lib_search_root" \
             --json-out "$sbom_path" --qt-reference-dir "$QT_ROOT_DIR" \
-            --require-package-provenance
+            --require-package-provenance \
+            --distro-provenance-manifest "$distro_provenance_manifest" \
+            --qt-sdk-version "$QT_VERSION"
           echo "Wrote machine-readable bundled-library SBOM to $sbom_path"
 
           python3 packaging/audit_codec_notices.py verify-notices \

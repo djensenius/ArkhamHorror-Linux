@@ -7,3 +7,5 @@ AppDir/
 .DS_Store
 __pycache__/
 *.pyc
+distro-provenance-manifest.json
+codec-notice-sbom.json

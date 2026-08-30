@@ -16,6 +16,8 @@
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,7 @@
 #include <cerrno>
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -1344,84 +1347,113 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
   if (homeComponents.isEmpty()) {
     return std::nullopt;
   }
-  const QStringList ancestorComponents =
-      homeComponents.mid(0, homeComponents.size() - 1);
-  const QString finalComponent = homeComponents.last();
-  // Every ancestor of home's own final directory is walked no-follow
-  // from "/", with FULL same-mount-throughout continuity enforced --
-  // exactly the outside-home policy, no transition permitted anywhere
-  // in this part of the walk. `allowCreateMissingComponents=false`:
-  // this application never creates any part of the user's own home
-  // directory hierarchy.
-  const std::optional<int> ancestorFd =
-      openDirectoryChainNoFollow(QStringLiteral("/"), ancestorComponents,
-                                 /*allowCreateMissingComponents=*/false);
-  if (!ancestorFd) {
+  // Cumulative review (PR #18, MEDIUM, "home mount auth wrong
+  // boundary"): a previous version of this walk hard-coded the
+  // permitted mount-transition point to home's OWN final path
+  // component (e.g. the "deck" in "/home/deck"), enforcing FULL
+  // same-mount continuity for every ancestor component (e.g. "home")
+  // via the same no-transition-permitted-anywhere policy an
+  // outside-home configured path gets. That hard-coded assumption is
+  // wrong in both directions: (1) a real, entirely legitimate topology
+  // commonly places "/home" ITSELF on its own dedicated partition
+  // separate from "/" (an ordinary distribution default, not a
+  // SteamOS-specific "/home/deck" split) -- the ancestor walk's strict
+  // same-mount requirement rejected that legitimate setup before the
+  // authenticated-transition check for the final component ever ran;
+  // and (2) the final-component exception was granted purely from
+  // `homeIsAuthenticated` (a path-STRING match against the account
+  // database) without independently confirming that a mount transition
+  // there is even the ACTUAL topology in play, rather than treating
+  // whichever single component genuinely carries the transition as the
+  // one to authenticate.
+  //
+  // The fixed policy: walk every component of home's own path from "/"
+  // in order, tracking the CURRENT mount identity as it goes (starting
+  // from "/"'s own). At most ONE mount transition is permitted across
+  // the ENTIRE walk, wherever it organically occurs (an ancestor
+  // component, the final component, or nowhere at all for a
+  // single-mount system) -- never assumed to be any particular,
+  // hard-coded position -- and ONLY when `homeIsAuthenticated`. A
+  // second transition anywhere later in the same walk (e.g. an
+  // additional, unexpected bind mount stacked beneath an already-
+  // authenticated transition) is refused outright, exactly like an
+  // unauthenticated transition would be. When home is NOT
+  // authenticated, zero transitions are permitted anywhere -- the
+  // exact same strict, no-transition policy an outside-home configured
+  // path already gets via walkOwnedSuffixNoFollowFromFd().
+  int currentFd = ::open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (currentFd < 0) {
     return std::nullopt;
   }
-  // Captured before this fd is ever closed below, regardless of which
-  // branch (authenticated-transition vs strict-same-mount) is taken.
-  const MountIdentity ancestorMount = mountIdentityForFd(*ancestorFd);
-  const QByteArray finalComponentUtf8 = finalComponent.toUtf8();
-  struct stat st {};
-  if (fstatat(*ancestorFd, finalComponentUtf8.constData(), &st,
-              AT_SYMLINK_NOFOLLOW) != 0 ||
-      !S_ISDIR(st.st_mode)) {
-    // Missing, or exists but is a symlink node/non-directory object --
-    // AT_SYMLINK_NOFOLLOW's stat reports S_ISLNK for a symlink, never
-    // S_ISDIR, so a home directory itself pre-planted as a symlink is
-    // rejected here too, before any open is even attempted.
-    ::close(*ancestorFd);
-    return std::nullopt;
-  }
-  // Round-N+ review (HIGH, "RESOLVE_NO_XDEV rejects a legitimate
-  // dedicated-/home mount before the authenticated-transition check
-  // below ever runs"): this open of home's own final path component
-  // deliberately does NOT enforce the kernel-level RESOLVE_NO_XDEV
-  // guarantee every other no-follow open in this file uses -- a real
-  // multi-mount system very commonly (and legitimately) places home on
-  // its own dedicated partition (e.g. SteamOS's "/home/deck"), and that
-  // is EXACTLY the transition `homeIsAuthenticated` exists to permit.
-  // Symlink rejection (RESOLVE_NO_SYMLINKS/O_NOFOLLOW) is still fully
-  // enforced either way; only the cross-mount refusal is deferred to
-  // the explicit, independently-sourced userspace check immediately
-  // below, which now ALWAYS uses the strict, mount-id-REQUIRED
-  // comparator (since the kernel provided no no-follow-cross-mount
-  // guarantee for this specific open, by deliberate request above).
-  const int homeFd = openDirectoryComponentNoFollow(
-      *ancestorFd, finalComponentUtf8.constData(), /*usedStrongNoXdev=*/nullptr,
-      /*confirmedCrossMountViaKernel=*/nullptr, /*allowMountTransition=*/true);
-  ::close(*ancestorFd);
-  if (homeFd < 0) {
-    return std::nullopt;
-  }
-  if (!homeIsAuthenticated) {
-    // $HOME does not independently match the account database's own
-    // record (e.g. a test harness or sandbox legitimately overriding
-    // $HOME) -- fall back to the SAME strict, no-transition-permitted-
-    // anywhere policy an outside-home configured path already gets,
-    // exactly like every other component walkOwnedSuffixNoFollowFromFd()
-    // authenticates, rather than silently granting the mount-transition
-    // exception to an unauthenticated path.
-#if defined(__linux__)
-    const bool mountOk = mountIdentityMatchesStrictRequiringMountId(
-        mountIdentityForFd(homeFd), ancestorMount);
-#else
-    const bool mountOk =
-        mountIdentityMatches(mountIdentityForFd(homeFd), ancestorMount);
-#endif
-    if (!mountOk) {
-      qWarning() << "AssetCache: refusing to treat" << home
-                 << "as a trusted home directory anchor -- it does not match "
-                    "the account database's own home-directory record for the "
-                    "current user, AND resolves onto a different mount than "
-                    "its own parent directory (unauthenticated mount-"
-                    "transition guard)";
-      ::close(homeFd);
+  MountIdentity currentMount = mountIdentityForFd(currentFd);
+  bool transitionUsed = false;
+  for (const QString &component : homeComponents) {
+    const QByteArray componentUtf8 = component.toUtf8();
+    struct stat st {};
+    if (fstatat(currentFd, componentUtf8.constData(), &st,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISDIR(st.st_mode)) {
+      // Missing, or exists but is a symlink node/non-directory object --
+      // AT_SYMLINK_NOFOLLOW's stat reports S_ISLNK for a symlink, never
+      // S_ISDIR, so any component of home's own path (including home
+      // itself) pre-planted as a symlink is rejected here, before any
+      // open is even attempted. This application never creates any
+      // part of the user's own home directory hierarchy.
+      ::close(currentFd);
       return std::nullopt;
     }
+    // A transition is only ever ATTEMPTED (i.e. the kernel-level
+    // RESOLVE_NO_XDEV guarantee is deliberately not requested for this
+    // one open) when home is authenticated AND no transition has been
+    // consumed yet; every other component is opened with the full
+    // kernel-enforced no-cross-mount guarantee exactly like an
+    // outside-home path. `usedStrongNoXdev` reports whether that
+    // kernel-level guarantee actually applied to THIS component, so the
+    // correct comparator (permissive when the kernel already proved
+    // same-mount, strict/mount-id-required when it did not) is chosen
+    // below -- exactly the fail-closed convention
+    // walkOwnedSuffixNoFollowFromFd() already applies.
+    const bool allowTransitionHere = homeIsAuthenticated && !transitionUsed;
+    bool usedStrongNoXdev = false;
+    const int nextFd = openDirectoryComponentNoFollow(
+        currentFd, componentUtf8.constData(), &usedStrongNoXdev,
+        /*confirmedCrossMountViaKernel=*/nullptr, allowTransitionHere);
+    if (nextFd < 0) {
+      ::close(currentFd);
+      return std::nullopt;
+    }
+    const MountIdentity nextMount = mountIdentityForFd(nextFd);
+    bool sameMount;
+#if defined(__linux__)
+    sameMount = usedStrongNoXdev ? true
+                                 : mountIdentityMatchesStrictRequiringMountId(
+                                       nextMount, currentMount);
+#else
+    sameMount = mountIdentityMatches(nextMount, currentMount);
+#endif
+    if (!sameMount) {
+      if (!allowTransitionHere) {
+        // Either home is not authenticated (zero transitions ever
+        // permitted), or this would be a SECOND transition in the same
+        // walk (only one is ever permitted) -- fail closed exactly like
+        // an unauthenticated/outside-home mount-transition attempt.
+        qWarning()
+            << "AssetCache: refusing to treat" << home
+            << "as a trusted home directory anchor -- component" << component
+            << "resolves onto a different mount than expected, and no "
+               "further authenticated mount transition is permitted here "
+               "(unauthenticated or repeated mount-transition guard)";
+        ::close(currentFd);
+        ::close(nextFd);
+        return std::nullopt;
+      }
+      transitionUsed = true;
+    }
+    ::close(currentFd);
+    currentFd = nextFd;
+    currentMount = nextMount;
   }
-  return std::make_pair(homeFd, mountIdentityForFd(homeFd));
+  return std::make_pair(currentFd, currentMount);
 }
 
 // Round-9+ review (HIGH, repeated across multiple prior rounds without
@@ -1742,21 +1774,65 @@ bool safeRemoveTreeRelative(int parentFd, const QString &name,
 // dup'd descriptors share the SAME underlying lock per POSIX, so this
 // registry's copy and the original both remain valid proof of the same
 // lock); every subsequent instance for that same root, in this same
-// process, simply joins the existing registration (a reference count),
-// never attempting its own competing flock() call at all.
+// process, simply joins the existing RootAuthority object.
 //
-// The registry's dup'd descriptor -- and therefore the interprocess
-// lock itself -- is closed the instant the LAST live instance for that
-// root in this process releases its registration (see
-// releaseRootOwnershipRegistration(), called from ~AssetCache()), so a
-// genuinely different process waiting on this same root is never kept
-// waiting longer than this process's own last live instance.
-// Guarded by rootLockRegistryMutex() so concurrent construction/
-// destruction of AssetCache instances across threads within this
-// process cannot race the registry itself.
-struct RootLockRegistryEntry {
-  int lockFd = -1;
-  int refCount = 0;
+// Cumulative review (PR #18, HIGH, "same-process cache instances
+// unsynchronized"): joining is NOT merely a reference count anymore --
+// RootAuthority itself owns the SHARED QMutex and SHARED LRU/
+// generation-minting access-sequence counter that every joining
+// instance's own AssetCache::m_mutex / AssetCache::m_nextAccessSequence
+// pointers are repointed at (see the constructor below). A previous
+// version of this registry tracked only the dup'd lock fd and a plain
+// refcount, while every instance kept its OWN private QMutex and OWN
+// private access-sequence counter -- meaning "cooperating" same-process
+// instances still had ZERO mutual exclusion over real disk mutations
+// (store/invalidate/reap/touch could freely interleave against the
+// same on-disk files) and could each independently mint colliding
+// LRU/generation access-sequence values. Routing every joining
+// instance's disk-mutating operations through this ONE shared object's
+// mutex and counter closes both classes of race by construction.
+//
+// The authority object -- and therefore the dup'd descriptor's
+// interprocess flock -- is destroyed (releasing the lock) the instant
+// the LAST live std::shared_ptr reference to it (held one-per-instance
+// by AssetCache::m_rootAuthorityHandle) goes away, so a genuinely
+// different process waiting on this same root is never kept waiting
+// longer than this process's own last live instance. Guarded by
+// rootLockRegistryMutex() so concurrent construction/destruction of
+// AssetCache instances across threads within this process cannot race
+// the registry itself.
+//
+// Cumulative review (PR #18, HIGH, same finding, "fork child inherits
+// registry and falsely joins parent"): a bare fork() (no exec)
+// duplicates this entire process's address space, including this
+// static registry and every live RootAuthority object's QMutex --
+// which is UNDEFINED to use post-fork in the child (POSIX: a mutex's
+// state after fork() in a child that does not immediately exec() is
+// unspecified unless the mutex is a robust/consistent one, which
+// QMutex is not) -- and, independent of that hazard, the child is a
+// genuinely DIFFERENT process from the kernel's own flock()
+// perspective the instant fork() returns, so it must never believe
+// itself a same-process "sibling" of any authority it happened to
+// inherit. registerForkSafetyOnce() below installs a pthread_atfork()
+// child-side handler that unconditionally clears this registry (NOT
+// the lock fds themselves, which the OS already does not share
+// semantics for across an unrelated new acquisition -- just this
+// process's own bookkeeping of what it believes it owns) the instant
+// this process forks, so any AssetCache constructed afterward in the
+// child always performs its own fresh, independent acquisition attempt
+// -- ordinarily correctly failing closed (memory-only) if the parent
+// still holds the real lock, exactly like any other unrelated second
+// process.
+struct RootAuthority {
+  QMutex mutex;
+  quint64 nextAccessSequence{1};
+  int lockFd{-1};
+
+  ~RootAuthority() {
+    if (lockFd >= 0) {
+      ::close(lockFd);
+    }
+  }
 };
 
 QMutex &rootLockRegistryMutex() {
@@ -1764,12 +1840,15 @@ QMutex &rootLockRegistryMutex() {
   return mutex;
 }
 
-QHash<QString, RootLockRegistryEntry> &rootLockRegistry() {
+QHash<QString, std::weak_ptr<RootAuthority>> &rootLockRegistry() {
   // Keyed by "<device>:<inode>" -- a string is a simple, adequate
   // QHash key here (this registry is touched only at AssetCache
   // construction/destruction, never on any hot path) and avoids
   // needing a custom qHash() overload for a raw (device, inode) pair.
-  static QHash<QString, RootLockRegistryEntry> registry;
+  // A weak_ptr (never a strong owning reference) so the registry itself
+  // never keeps a RootAuthority alive one moment past its last real
+  // AssetCache owner -- see the class comment above.
+  static QHash<QString, std::weak_ptr<RootAuthority>> registry;
   return registry;
 }
 
@@ -1777,7 +1856,39 @@ QString rootLockRegistryKeyFor(quint64 device, quint64 inode) {
   return QString::number(device) + QLatin1Char(':') + QString::number(inode);
 }
 
-// Returns false -- meaning the caller must disable disk persistence
+// See the class comment above ("fork child inherits registry and
+// falsely joins parent"). Installed exactly once per process, on first
+// use of this registry, via std::call_once.
+void registerForkSafetyOnce() {
+#if defined(Q_OS_UNIX)
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+    ::pthread_atfork(
+        /*prepare=*/nullptr, /*parent=*/nullptr,
+        /*child=*/[]() {
+          // Deliberately does NOT lock rootLockRegistryMutex() first:
+          // the "prepare"/"parent" handlers (which we do not install)
+          // are the correct place to do that dance for a mutex that
+          // must remain consistent WITHIN the parent across the fork;
+          // here, in the CHILD, immediately after fork() returns, this
+          // process is the only thread that exists (fork() only
+          // duplicates the calling thread), so no concurrent access to
+          // the registry is possible yet, and simply resetting it
+          // in-place is both safe and sufficient. Any RootAuthority
+          // objects an inherited (pre-fork) AssetCache instance still
+          // privately holds a shared_ptr to are left untouched here --
+          // the fix's actual, scoped contract is that a NEW AssetCache
+          // constructed after this point never joins one of those
+          // stale entries, not that pre-existing inherited C++ objects
+          // are made fork-safe in general (a far broader, unrelated
+          // concern this class's contract never claimed to cover).
+          rootLockRegistry().clear();
+        });
+  });
+#endif
+}
+
+// Returns nullptr -- meaning the caller must disable disk persistence
 // ENTIRELY for this instance, running memory-only -- for EVERY failure
 // mode: a DIFFERENT process already holds this exact root
 // (EWOULDBLOCK/EAGAIN), or any other error acquiring the underlying
@@ -1789,53 +1900,51 @@ QString rootLockRegistryKeyFor(quint64 device, quint64 inode) {
 // indeterminate-result convention already established in this file
 // (never optimistic, never "probably fine"): a contended or otherwise
 // unprovable lock must never mint a durable disk-cache result.
-bool acquireExclusiveRootOwnershipOrFailClosed(int rootFd, quint64 device,
-                                               quint64 inode) {
+std::shared_ptr<RootAuthority>
+acquireExclusiveRootOwnershipOrFailClosed(int rootFd, quint64 device,
+                                          quint64 inode) {
   if (rootFd < 0) {
-    return false;
+    return nullptr;
   }
+  registerForkSafetyOnce();
   const QString key = rootLockRegistryKeyFor(device, inode);
   QMutexLocker locker(&rootLockRegistryMutex());
-  QHash<QString, RootLockRegistryEntry> &registry = rootLockRegistry();
+  QHash<QString, std::weak_ptr<RootAuthority>> &registry = rootLockRegistry();
   auto it = registry.find(key);
   if (it != registry.end()) {
-    // Already owned by a live instance in THIS process -- join it,
-    // never a second competing flock() call for the same root.
-    ++it->refCount;
-    return true;
+    if (std::shared_ptr<RootAuthority> existing = it->lock()) {
+      // Already owned by a live instance in THIS process -- join the
+      // SAME authority object (shared mutex, shared counter), never a
+      // second competing flock() call for the same root.
+      return existing;
+    }
+    // A stale entry: the last owner has already been destroyed (its
+    // weak_ptr expired) but the map slot itself was not yet erased
+    // (can happen if erase-on-last-release raced this lookup, or after
+    // a fork-safety clear that a concurrent lookup started just
+    // before). Fall through and mint a fresh authority exactly as if
+    // this were the first instance for this root.
   }
-  const int lockFd = ::dup(rootFd);
+  // Cumulative review (PR #18, HIGH, "dup() fd lacks CLOEXEC; exec
+  // child retains root"): F_DUPFD_CLOEXEC (POSIX.1-2008), never plain
+  // dup(), so a subsequent fork()+exec() of an unrelated helper process
+  // (e.g. via QProcess) never inherits this descriptor. Plain dup()
+  // provides no way to atomically set CLOEXEC on the new descriptor --
+  // a separate fcntl(F_SETFD) call after a plain dup() would leave a
+  // real (if narrow) window where a concurrent fork() in another
+  // thread could still inherit the not-yet-flagged descriptor.
+  const int lockFd = ::fcntl(rootFd, F_DUPFD_CLOEXEC, 0);
   if (lockFd < 0) {
-    return false;
+    return nullptr;
   }
   if (::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
     ::close(lockFd);
-    return false;
+    return nullptr;
   }
-  registry.insert(key, RootLockRegistryEntry{lockFd, 1});
-  return true;
-}
-
-// Called from ~AssetCache() iff this instance's constructor previously
-// registered it (AssetCache::m_holdsRootLockRegistration) -- releases
-// this instance's share of the process-wide registration for `device`/
-// `inode`, closing the registry's own dup'd descriptor (and therefore
-// releasing the interprocess flock, letting a genuinely different,
-// waiting process finally acquire it) only once the LAST live
-// same-process instance for this root has released.
-void releaseRootOwnershipRegistration(quint64 device, quint64 inode) {
-  const QString key = rootLockRegistryKeyFor(device, inode);
-  QMutexLocker locker(&rootLockRegistryMutex());
-  QHash<QString, RootLockRegistryEntry> &registry = rootLockRegistry();
-  auto it = registry.find(key);
-  if (it == registry.end()) {
-    return;
-  }
-  if (--it->refCount > 0) {
-    return;
-  }
-  ::close(it->lockFd);
-  registry.erase(it);
+  auto authority = std::make_shared<RootAuthority>();
+  authority->lockFd = lockFd;
+  registry.insert(key, authority);
+  return authority;
 }
 
 } // namespace
@@ -1878,129 +1987,204 @@ AssetCache::AssetCache(Config config)
   // should have) already checked BEFORE ever reaching this
   // constructor -- see isValid()/configurationError()'s own comment.
   m_configurationError = validateConfiguration(m_config);
-  // Round-9+ review (MEDIUM): validated FIRST, before anything else --
-  // including the directory resolution immediately below -- so an
-  // invalid disk-quota limit can never reach reapAndEnforceQuota()'s
-  // eviction math at all. See configHasValidDiskByteLimit()'s comment.
-  if (!configHasValidDiskByteLimit(m_config)) {
-    m_diskCacheDisabled = true;
-  }
   m_memory->setMaxCost(configHasValidMemoryByteLimit(m_config)
                            ? m_config.memoryMaxCostBytes
                            : 0);
-  // Round-9+ review (HIGH): the target directory this instance will
-  // use is fixed here, BEFORE anything else touches the filesystem, but
-  // is no longer split into an opaque "trusted anchor" (opened as a
-  // single unit, its intermediate components never individually
-  // examined) plus a small fixed-length "owned suffix" -- see
-  // resolveTrustedDirectoryNoFollow()'s comment for why that split, as
-  // it stood before this round, still let a caller-supplied
-  // Config::directory's entire path (arbitrarily many components) be
-  // trusted as a single unit via one leaf-only O_NOFOLLOW open, even
-  // when an INTERMEDIATE ancestor had been replaced by an
-  // attacker-planted symlink and the final leaf happened to already
-  // exist (through that redirection). `allowCreateMissingComponents`
-  // is true ONLY for the default-location case (this application's own
-  // exclusively-owned "assets/v1" suffix beneath the OS-provided cache
-  // base may be created fresh); a caller-supplied Config::directory
-  // must already exist in full, component by component -- this
-  // application still never creates any part of a caller-supplied
-  // custom cache directory.
-  const bool usingDefaultLocation = m_config.directory.isEmpty();
-  if (usingDefaultLocation) {
-    m_directory =
-        QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
-        QStringLiteral("/assets/v1");
-  } else {
-    m_directory = m_config.directory;
-  }
-  // Review item 7: if the configured cache directory ALREADY exists as a
-  // symlink, refuse to use it at all -- never follow it (which would
-  // silently start writing at whatever it points to), and never let any
-  // later store()/lookupDisk()/reap call touch it either.
-  // QFileInfo::isSymLink() (unlike QDir::exists(), which follows) reports
-  // the entry's own type without resolving it. The memory cache still
-  // works normally -- only disk persistence is disabled for this
-  // instance's entire lifetime. This is a cheap, redundant-by-design
-  // fast path: the fd-based resolution below independently re-detects
-  // the exact same condition (and every other symlinked-ancestor
-  // variant this single leaf-only check cannot see), so this early
-  // check changes no observable behaviour, it just avoids doing any
-  // filesystem-descriptor work at all for the single most common
-  // misconfiguration case.
-  if (QFileInfo(m_directory).isSymLink()) {
+  // Cumulative review (PR #18, MEDIUM, "invalid memory config still
+  // mutates disk"): a config error of ANY kind -- an invalid
+  // memoryMaxCostBytes just as much as an invalid diskMaxBytes -- makes
+  // this instance's configuration as a whole invalid, so BOTH tiers are
+  // disabled together, and disk persistence is disabled BEFORE any of
+  // the directory-resolution/root-fd-open/lock/reap sequence below ever
+  // runs, not merely before reapAndEnforceQuota()'s eviction math. The
+  // previous version of this check only ever consulted
+  // configHasValidDiskByteLimit() here, so an instance with a perfectly
+  // valid disk limit but an invalid (e.g. negative) memory limit --
+  // already recorded as an error in m_configurationError above, and
+  // already surfaced to callers via isValid()/configurationError() --
+  // nonetheless proceeded to resolve/open/lock a real on-disk cache
+  // root and run a real eviction sweep against it. A caller is expected
+  // to check AssetCache::create()'s AssetOutcome before ever using the
+  // returned cache, but this instance-local invariant (this exact
+  // object never touches disk once ANY part of its own configuration is
+  // invalid) must hold unconditionally, independent of whether a caller
+  // bypassed create() and used the raw constructor directly (as this
+  // project's own test suite deliberately does, to exercise this exact
+  // invalid-config path).
+  if (m_configurationError.has_value()) {
     m_diskCacheDisabled = true;
   }
-#if defined(Q_OS_UNIX)
-  // Review round-3 item 9: open and retain a directory descriptor for
-  // `m_directory` NOW, at construction, and record the (device, inode)
-  // pair it names via fstat() on THIS SAME descriptor -- never a second,
-  // later path-based stat, which could observe a DIFFERENT filesystem
-  // object if the path has since been replaced. Every later
-  // disk-touching operation re-derives the CURRENT (device, inode) for
-  // this same path and compares it against these retained values
-  // (verifyRootAnchorLocked()) before proceeding, so a root directory
-  // renamed away and replaced by a new one (or an ancestor component
-  // replaced such that the same path now resolves elsewhere) is
-  // detected and disk I/O is permanently disabled rather than silently
-  // operating against a different object than the one this instance
-  // was constructed against.
   if (!m_diskCacheDisabled) {
-    // Round-9+ review: resolved by walking EVERY path component from a
-    // genuinely trusted starting point (see
-    // resolveTrustedDirectoryNoFollow()'s comment) rather than trusting
-    // an entire multi-segment configured path as one opaque unit.
-    const std::optional<int> chainFd =
-        resolveTrustedDirectoryNoFollow(m_directory, usingDefaultLocation);
-    struct stat st {};
-    if (!chainFd || ::fstat(*chainFd, &st) != 0) {
-      if (chainFd) {
-        ::close(*chainFd);
-      }
-      m_diskCacheDisabled = true;
+    // Round-9+ review (HIGH): the target directory this instance will
+    // use is fixed here, BEFORE anything else touches the filesystem,
+    // but is no longer split into an opaque "trusted anchor" (opened as
+    // a single unit, its intermediate components never individually
+    // examined) plus a small fixed-length "owned suffix" -- see
+    // resolveTrustedDirectoryNoFollow()'s comment for why that split, as
+    // it stood before this round, still let a caller-supplied
+    // Config::directory's entire path (arbitrarily many components) be
+    // trusted as a single unit via one leaf-only O_NOFOLLOW open, even
+    // when an INTERMEDIATE ancestor had been replaced by an
+    // attacker-planted symlink and the final leaf happened to already
+    // exist (through that redirection). `allowCreateMissingComponents`
+    // is true ONLY for the default-location case (this application's
+    // own exclusively-owned "assets/v1" suffix beneath the OS-provided
+    // cache base may be created fresh); a caller-supplied
+    // Config::directory must already exist in full, component by
+    // component -- this application still never creates any part of a
+    // caller-supplied custom cache directory.
+    const bool usingDefaultLocation = m_config.directory.isEmpty();
+    if (usingDefaultLocation) {
+      m_directory =
+          QStandardPaths::writableLocation(QStandardPaths::CacheLocation) +
+          QStringLiteral("/assets/v1");
     } else {
-      m_rootFd = *chainFd;
-      m_rootDevice = static_cast<quint64>(st.st_dev);
-      m_rootInode = static_cast<quint64>(st.st_ino);
-      const MountIdentity rootMount = mountIdentityForFd(m_rootFd);
-      m_rootMountId = rootMount.mountId;
-      m_rootHasMountId = rootMount.hasMountId;
-      // Cumulative review (PR #18, HIGH): a genuinely DIFFERENT process
-      // already owns this exact cache root -- see
-      // acquireExclusiveRootOwnershipOrFailClosed()'s own comment for
-      // the full rationale (a same-process sibling instance instead
-      // cooperates and shares authority, never denied here). This
-      // instance runs memory-only, NEVER touching disk, rather than
-      // risk racing the actual owning process's reap/publish/
-      // invalidate sequence.
-      if (acquireExclusiveRootOwnershipOrFailClosed(m_rootFd, m_rootDevice,
-                                                    m_rootInode)) {
-        m_holdsRootLockRegistration = true;
-      } else {
-        qWarning() << "AssetCache: a different process already holds this "
-                      "cache root's exclusive lock --"
-                   << m_directory
-                   << "-- disk persistence disabled for this instance "
-                      "(memory-only fallback)";
-        ::close(m_rootFd);
-        m_rootFd = -1;
+      m_directory = m_config.directory;
+    }
+    // Review item 7: if the configured cache directory ALREADY exists as
+    // a symlink, refuse to use it at all -- never follow it (which would
+    // silently start writing at whatever it points to), and never let
+    // any later store()/lookupDisk()/reap call touch it either.
+    // QFileInfo::isSymLink() (unlike QDir::exists(), which follows)
+    // reports the entry's own type without resolving it. The memory
+    // cache still works normally -- only disk persistence is disabled
+    // for this instance's entire lifetime. This is a cheap,
+    // redundant-by-design fast path: the fd-based resolution below
+    // independently re-detects the exact same condition (and every
+    // other symlinked-ancestor variant this single leaf-only check
+    // cannot see), so this early check changes no observable behaviour,
+    // it just avoids doing any filesystem-descriptor work at all for
+    // the single most common misconfiguration case.
+    if (QFileInfo(m_directory).isSymLink()) {
+      m_diskCacheDisabled = true;
+    }
+#if defined(Q_OS_UNIX)
+    // Review round-3 item 9: open and retain a directory descriptor for
+    // `m_directory` NOW, at construction, and record the (device,
+    // inode) pair it names via fstat() on THIS SAME descriptor -- never
+    // a second, later path-based stat, which could observe a DIFFERENT
+    // filesystem object if the path has since been replaced. Every
+    // later disk-touching operation re-derives the CURRENT (device,
+    // inode) for this same path and compares it against these retained
+    // values (verifyRootAnchorLocked()) before proceeding, so a root
+    // directory renamed away and replaced by a new one (or an ancestor
+    // component replaced such that the same path now resolves
+    // elsewhere) is detected and disk I/O is permanently disabled rather
+    // than silently operating against a different object than the one
+    // this instance was constructed against.
+    if (!m_diskCacheDisabled) {
+      // Round-9+ review: resolved by walking EVERY path component from
+      // a genuinely trusted starting point (see
+      // resolveTrustedDirectoryNoFollow()'s comment) rather than
+      // trusting an entire multi-segment configured path as one opaque
+      // unit.
+      const std::optional<int> chainFd =
+          resolveTrustedDirectoryNoFollow(m_directory, usingDefaultLocation);
+      struct stat st {};
+      if (!chainFd || ::fstat(*chainFd, &st) != 0) {
+        if (chainFd) {
+          ::close(*chainFd);
+        }
         m_diskCacheDisabled = true;
+      } else {
+        m_rootFd = *chainFd;
+        m_rootDevice = static_cast<quint64>(st.st_dev);
+        m_rootInode = static_cast<quint64>(st.st_ino);
+        const MountIdentity rootMount = mountIdentityForFd(m_rootFd);
+        m_rootMountId = rootMount.mountId;
+        m_rootHasMountId = rootMount.hasMountId;
+        // Cumulative review (PR #18, HIGH, "same-process cache
+        // instances unsynchronized"): a genuinely DIFFERENT process
+        // already owns this exact cache root -- see
+        // acquireExclusiveRootOwnershipOrFailClosed()'s own comment for
+        // the full rationale (a same-process sibling instance instead
+        // JOINS the same shared RootAuthority object below, never
+        // denied here). This instance runs memory-only, NEVER touching
+        // disk, rather than risk racing the actual owning process's
+        // reap/publish/invalidate sequence.
+        if (auto authority = acquireExclusiveRootOwnershipOrFailClosed(
+                m_rootFd, m_rootDevice, m_rootInode)) {
+          // Repoint this instance's own m_mutex/m_nextAccessSequence
+          // AT the shared authority's fields -- see m_rootAuthorityHandle's
+          // header comment. From this point on, every disk-mutating
+          // operation on THIS instance serializes through the exact
+          // same mutex, and mints access-sequence values from the
+          // exact same counter, as every other same-root sibling in
+          // this process.
+          m_mutex = &authority->mutex;
+          m_nextAccessSequence = &authority->nextAccessSequence;
+          m_rootAuthorityHandle = std::move(authority);
+        } else {
+          qWarning() << "AssetCache: a different process already holds "
+                        "this cache root's exclusive lock --"
+                     << m_directory
+                     << "-- disk persistence disabled for this instance "
+                        "(memory-only fallback)";
+          ::close(m_rootFd);
+          m_rootFd = -1;
+          m_diskCacheDisabled = true;
+        }
       }
     }
-  }
 #endif
+  }
   reapAndEnforceQuota();
 }
 
 AssetCache::~AssetCache() {
   delete m_memory;
 #if defined(Q_OS_UNIX)
-  if (m_holdsRootLockRegistration) {
-    releaseRootOwnershipRegistration(m_rootDevice, m_rootInode);
-  }
+  // m_rootAuthorityHandle's own shared_ptr destruction (implicit,
+  // default member-destruction order, happens automatically here)
+  // releases this instance's share of the process-wide RootAuthority;
+  // the authority object itself -- and therefore its dup'd lock fd --
+  // is only actually destroyed once the LAST same-process instance's
+  // handle is released, exactly mirroring the old refcounted registry's
+  // behaviour but now with genuinely shared (not merely
+  // reference-counted-alongside-private) mutex/counter state.
   if (m_rootFd >= 0) {
     ::close(m_rootFd);
   }
+#endif
+}
+
+int AssetCache::rootLockFileDescriptorForTesting() const {
+#if defined(Q_OS_UNIX)
+  if (auto *authority =
+          static_cast<RootAuthority *>(m_rootAuthorityHandle.get())) {
+    return authority->lockFd;
+  }
+#endif
+  return -1;
+}
+
+bool AssetCache::rootLockRegistryHasLiveEntryForTesting() const {
+#if defined(Q_OS_UNIX)
+  if (m_rootDevice == 0 && m_rootInode == 0) {
+    return false;
+  }
+  // Deliberately UNLOCKED -- see the header declaration's comment.
+  // This is called from exactly one place: a just-forked child
+  // process, strictly before it does anything else at all (no other
+  // thread exists yet in that child -- fork() only ever duplicates the
+  // calling thread -- so there is no concurrent writer this read could
+  // race), specifically to observe whether registerForkSafetyOnce()'s
+  // atfork child-handler (which itself already ran, synchronously,
+  // during the fork() call that produced this child, per POSIX
+  // pthread_atfork() semantics) actually cleared the registry.
+  // Acquiring rootLockRegistryMutex() here would be redundant at best
+  // (no contention is possible at this exact moment) and would risk
+  // reintroducing the very "is a bare mutex safe to use immediately
+  // post-fork" question this accessor exists specifically to avoid,
+  // for a caller that only ever needs this exact narrow snapshot.
+  const QString key = rootLockRegistryKeyFor(m_rootDevice, m_rootInode);
+  auto it = rootLockRegistry().find(key);
+  if (it == rootLockRegistry().end()) {
+    return false;
+  }
+  return !it->expired();
+#else
+  return false;
 #endif
 }
 
@@ -2045,7 +2229,7 @@ QString AssetCache::metadataPathForTesting(const QString &directory,
 
 std::optional<AssetCache::CachedEntry>
 AssetCache::lookupMemory(const QString &key) {
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   CachedEntry *entry = m_memory->object(key);
   if (!entry) {
     return std::nullopt;
@@ -2060,7 +2244,7 @@ AssetCache::lookupMemory(const QString &key) {
 }
 
 quint64 AssetCache::nextAccessSequenceLocked() {
-  return m_nextAccessSequence++;
+  return (*m_nextAccessSequence)++;
 }
 
 void AssetCache::touchAccessRecencyLocked(const QString &key) {
@@ -2784,7 +2968,7 @@ AssetCache::lookupDisk(const QString &key) {
     return std::nullopt;
   }
 
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
 
   if (!verifyRootAnchorLocked()) {
     // Review round-3 item 9: the root has been replaced/removed/mounted
@@ -2929,7 +3113,7 @@ void AssetCache::store(const QString &key, CachedEntry entry) {
           .toHex());
 
   {
-    QMutexLocker locker(&m_mutex);
+    QMutexLocker locker(m_mutex);
     auto *heapEntry = new CachedEntry(entry);
     m_memory->insert(key, heapEntry, static_cast<qsizetype>(entry.costBytes()));
 
@@ -3131,7 +3315,7 @@ void AssetCache::touchAfterNotModified(const QString &key,
     // generationMetadataPath() below -- see isValidKey()'s comment.
     return;
   }
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   if (!verifyRootAnchorLocked()) {
     return;
   }
@@ -3182,7 +3366,7 @@ void AssetCache::touchAfterNotModified(const QString &key,
 
 void AssetCache::updateMemoryDecodedImage(const QString &key,
                                           const QImage &image) {
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   CachedEntry *existing = m_memory->object(key);
   if (!existing) {
     return; // evicted since the caller's lookup; a later lookup redecodes
@@ -3209,7 +3393,7 @@ void AssetCache::promoteToMemory(const QString &key, CachedEntry entry) {
     // -- see isValidKey()'s comment.
     return;
   }
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   auto *heapEntry = new CachedEntry(std::move(entry));
   m_memory->insert(key, heapEntry,
                    static_cast<qsizetype>(heapEntry->costBytes()));
@@ -3220,7 +3404,7 @@ AssetCache::InvalidateResult AssetCache::invalidate(const QString &key) {
   if (!isValidKey(key)) {
     return InvalidateResult::DurablyInvalidated;
   }
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   m_memory->remove(key);
   const DeleteEntryOutcome outcome = deleteEntry(key);
   return outcome.manifestDurablyAbsent ? InvalidateResult::DurablyInvalidated
@@ -3233,7 +3417,7 @@ void AssetCache::reapAndEnforceQuota() {
     // enumerate, follow, or delete anything through it.
     return;
   }
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   if (!verifyRootAnchorLocked()) {
     // Review round-3 item 9: root replaced since construction -- never
     // enumerate, follow, or delete anything through it.
@@ -3491,8 +3675,8 @@ void AssetCache::reapAndEnforceQuota() {
   // recent memory-only touches whose disk bump is itself in this same
   // batch and therefore already reflected above), m_nextAccessSequence
   // must not regress.
-  m_nextAccessSequence =
-      qMax(m_nextAccessSequence, maxObservedAccessSequence + 1);
+  *m_nextAccessSequence =
+      qMax(*m_nextAccessSequence, maxObservedAccessSequence + 1);
 
   qint64 totalBytes = diskUsageBytesLocked();
   // Review round-3 item 11: the eviction-target math below is driven by
@@ -3553,12 +3737,12 @@ void AssetCache::reapAndEnforceQuota() {
 }
 
 qint64 AssetCache::memoryCostBytes() const {
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   return m_memory->totalCost();
 }
 
 qint64 AssetCache::diskUsageBytes() const {
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   // Recurses into subdirectories (see sumUsageRelative()), not a flat
   // listing -- this directory is exclusively owned by AssetCache, so a
   // stray directory (e.g. planted, or otherwise left behind) should
@@ -3577,7 +3761,7 @@ qint64 AssetCache::diskUsageBytes() const {
 }
 
 int AssetCache::diskEntryCount() const {
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   if (!verifyRootAnchorLocked()) {
     return 0;
   }
@@ -3618,7 +3802,7 @@ int AssetCache::diskEntryCount() const {
 
 std::optional<quint64>
 AssetCache::accessSequenceForTesting(const QString &key) const {
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   if (m_diskCacheDisabled || !isValidKey(key)) {
     return std::nullopt;
   }
@@ -3636,7 +3820,7 @@ AssetCache::accessSequenceForTesting(const QString &key) const {
 
 std::optional<QString>
 AssetCache::currentGenerationForTesting(const QString &key) const {
-  QMutexLocker locker(&m_mutex);
+  QMutexLocker locker(m_mutex);
   if (m_diskCacheDisabled || !isValidKey(key)) {
     return std::nullopt;
   }

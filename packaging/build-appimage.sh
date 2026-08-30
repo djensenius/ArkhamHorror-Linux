@@ -181,6 +181,50 @@ libcomerr_so="$(find_bundled_libcomerr)"
 # expectation against the real produced AppImage rather than merely
 # assuming it.
 
+# Round-N+ review (HIGH, "distro provenance post-hoc/unpinned: after
+# packaging it searches fixed system dirs by basename, not exact
+# linuxdeploy-selected pre-copy file ... capture exact loader/copy
+# source BEFORE packaging"): capture real distro-package provenance
+# (path/sha256/package/version/sourcePackage) for every dynamically
+# resolved dependency of this project's own first-party artifacts,
+# using the real dynamic loader's own resolution (`ldd`) against the
+# exact pre-packaging files -- strictly BEFORE linuxdeploy ever runs
+# and copies/patches anything -- rather than an independent, after-the-
+# fact directory search once packaging is already complete. Covers:
+#   - the main application executable itself (already installed via
+#     `cmake --install` above, but not yet touched by linuxdeploy):
+#     ldd's own flattened transitive closure picks up every ordinary
+#     ELF-linked (DT_NEEDED) dependency, including Qt/ICU and libavif's
+#     own directly-linked AV1 codec backends (dav1d/aom/etc. -- see the
+#     comment above this block).
+#   - libsecret/libgpg-error/libgcc_s/libstdc++/zlib/libcom_err: these
+#     are force-bundled via linuxdeploy's --library flag specifically
+#     BECAUSE they are otherwise invisible to ldd-based automatic
+#     bundling (dlopen()'d or default-blacklisted -- see each variable's
+#     own resolution comment above); ldd against each of these captures
+#     their own transitive closure (glib, gobject, gio, libffi,
+#     pcre2, ...) the same way.
+#   - every real ELF file under the actual Qt SDK reference tree's own
+#     plugins/ directory ($qt_reference_dir, already resolved above via
+#     `qmake -query QT_INSTALL_PREFIX`): Qt's platform/imageformat/etc.
+#     plugins are dlopen()'d by Qt's own plugin loader at runtime, never
+#     linked (DT_NEEDED) into the main executable at all, so they are
+#     otherwise entirely invisible to ldd run only against arkham-horror
+#     -- yet they are exactly where libjpeg/libpng/xcb-family distro
+#     dependencies actually come from once linuxdeploy-plugin-qt bundles
+#     them.
+distro_provenance_manifest="$repo_root/distro-provenance-manifest.json"
+mapfile -d '' -t qt_plugin_elf_files < <(
+  find "$qt_reference_dir/plugins" -type f -print0 2>/dev/null
+)
+python3 "$repo_root/packaging/audit_codec_notices.py" capture-distro-provenance \
+  "$app_dir/usr/bin/arkham-horror" \
+  "$libsecret_so" "$libgpgerror_so" "$libgccs_so" "$libstdcxx_so" \
+  "$libz_so" "$libcomerr_so" \
+  "${qt_plugin_elf_files[@]}" \
+  --output "$distro_provenance_manifest"
+echo "Wrote distro-package provenance manifest to $distro_provenance_manifest"
+
 # Package the third-party attribution files (QtKeychain's BSD-3-Clause
 # LICENSE and this project's own NOTICE.md) into the distributed AppImage
 # so end users receive accurate attribution without this unlicensed

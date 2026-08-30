@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -2961,6 +2962,139 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    authenticatedAncestorMountTransitionModellingADedicatedHomePartitionIsPermitted() {
+  // Cumulative review (PR #18, MEDIUM, "home mount auth wrong
+  // boundary"): unlike the two tests above (which bind-mount home's
+  // own FINAL component), this bind-mounts fakeHome's PARENT directory
+  // -- "actual-home" itself remains an ORDINARY subdirectory, on the
+  // SAME mount as its bind-mounted parent, with no further transition
+  // at the leaf at all. This is exactly the shape of a real, ordinary
+  // dedicated "/home" partition (as opposed to a SteamOS-style
+  // "/home/deck" split): the transition happens at an ANCESTOR of
+  // home's final component, not at home's own final component. Before
+  // this fix, resolveHomeDirectoryNoFollow()'s ancestor walk enforced
+  // FULL same-mount continuity for every ancestor component
+  // unconditionally, which would have rejected this entirely
+  // legitimate, authenticated topology outright.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString fakeHomeGrandparent =
+      m_tempDirPath + QStringLiteral("/auth-ancestor-mount-grandparent");
+  QVERIFY(QDir().mkpath(fakeHomeGrandparent));
+  const QString fakeHomeParent =
+      fakeHomeGrandparent + QStringLiteral("/mounted-ancestor");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+
+  QTemporaryDir bindSourceDir;
+  QVERIFY(bindSourceDir.isValid());
+  const QString bindSource = bindSourceDir.path();
+  QVERIFY(QDir().mkpath(bindSource + QStringLiteral("/actual-home")));
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, fakeHomeParent});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{fakeHomeParent};
+
+  // fakeHome ("<fakeHomeParent>/actual-home") itself is an ORDINARY
+  // directory living entirely ON the bind-mounted "mounted-ancestor"
+  // mount -- the transition is at the ANCESTOR, never at home's own
+  // final component.
+  const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
+  QVERIFY(QFileInfo::exists(fakeHome));
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
+#endif
+}
+
+void AssetCacheTests::
+    unauthenticatedAncestorMountTransitionModellingADedicatedHomePartitionIsRejected() {
+  // Negative control for the test above: the identical ancestor
+  // bind-mount shape, but the account database is forced to disagree
+  // this fake $HOME is the current account's own home -- the
+  // transition must be refused, exactly like every other
+  // unauthenticated mount transition regardless of where in home's
+  // path it organically falls.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString fakeHomeGrandparent =
+      m_tempDirPath + QStringLiteral("/unauth-ancestor-mount-grandparent");
+  QVERIFY(QDir().mkpath(fakeHomeGrandparent));
+  const QString fakeHomeParent =
+      fakeHomeGrandparent + QStringLiteral("/mounted-ancestor");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+
+  QTemporaryDir bindSourceDir;
+  QVERIFY(bindSourceDir.isValid());
+  const QString bindSource = bindSourceDir.path();
+  QVERIFY(QDir().mkpath(bindSource + QStringLiteral("/actual-home")));
+  {
+    QFile sentinel(bindSource + QStringLiteral("/actual-home/sentinel.bin"));
+    QVERIFY(sentinel.open(QIODevice::WriteOnly));
+    sentinel.write(QByteArrayLiteral("must-not-be-trusted"));
+  }
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, fakeHomeParent});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{fakeHomeParent};
+
+  const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
+  QVERIFY(QFileInfo::exists(fakeHome));
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  // Empty override: the account database agrees with NO path at all.
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QString());
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+#endif
+}
+
+void AssetCacheTests::
     unauthenticatedHomeWithDegradedMountIdentificationFailsClosedEvenUnmounted() {
   // An unauthenticated $HOME (account database forced to disagree)
   // whose mount-identification itself is degraded (forced via
@@ -3177,39 +3311,109 @@ void AssetCacheTests::
 
 void AssetCacheTests::
     negativeMemoryMaxCostBytesDisablesMemoryCacheRatherThanCrashing() {
-  // Companion to the disk case above: a negative memoryMaxCostBytes must
-  // never be forwarded to QCache::setMaxCost() as-is (which would evict
-  // every entry immediately, silently defeating the memory cache) --
-  // it is clamped to 0 (memory caching disabled for this instance) so
-  // the failure mode is an inert, predictable "no memory caching",
-  // never any kind of crash or destructive disk-side effect. Disk
-  // persistence, which is independently configured, remains fully
-  // functional.
+  // Companion to the disk case above. Cumulative review (PR #18,
+  // MEDIUM, "invalid memory config still mutates disk"): a previous
+  // version of this exact test asserted the WRONG behaviour --
+  // `!cache.isDiskCacheDisabledForTesting()` and a successful
+  // `cache.lookupDisk(key)` -- i.e. it actively protected an instance
+  // whose own memoryMaxCostBytes was already invalid (and whose
+  // isValid()/configurationError() already reported
+  // InvalidConfiguration) from ALSO having disk persistence disabled,
+  // even though such an instance still freely opened, locked, and
+  // reaped a real on-disk cache directory. Config validity must be
+  // all-or-nothing for BOTH tiers: an invalid memoryMaxCostBytes alone
+  // now disables disk persistence too, exactly like an invalid
+  // diskMaxBytes does in
+  // negativeDiskMaxBytesDisablesDiskCacheInsteadOfDestructivelyEvicting()
+  // above -- proven here the same way that test proves it, via a
+  // pre-seeded entry (written by a separate, validly-configured
+  // instance) that must survive completely untouched by the
+  // invalid-memory-config instance.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/negative-memory-limit.png")));
+  {
+    AssetCache seedCache(configFor(m_tempDirPath));
+    seedCache.store(key, makeEntry(QByteArray(64, 'w')));
+  }
+
   AssetCache::Config invalidConfig = configFor(m_tempDirPath);
   invalidConfig.memoryMaxCostBytes = -1;
   AssetCache cache(invalidConfig);
-  QVERIFY(!cache.isDiskCacheDisabledForTesting());
-  // Round-N+ review (MEDIUM, repeat finding): same typed-error surface
-  // as the disk-side companion above -- a negative memoryMaxCostBytes
-  // makes the WHOLE config invalid, not just the memory tier, even
-  // though disk persistence itself remains independently functional
-  // for defense-in-depth.
+  // A negative memoryMaxCostBytes must never be forwarded to
+  // QCache::setMaxCost() as-is (which would evict every entry
+  // immediately, silently defeating the memory cache) -- it is clamped
+  // to 0 (memory caching disabled for this instance) so the failure
+  // mode is an inert, predictable "no memory caching", never any kind
+  // of crash.
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
   QVERIFY(!cache.isValid());
   QVERIFY(cache.configurationError().has_value());
   QCOMPARE(cache.configurationError()->code,
            AssetErrorCode::InvalidConfiguration);
+  QVERIFY(AssetCache::validateConfiguration(invalidConfig).has_value());
   const auto factoryResult = AssetCache::create(invalidConfig);
   QVERIFY(!factoryResult);
   QCOMPARE(factoryResult.error().code, AssetErrorCode::InvalidConfiguration);
 
+  const QString otherKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/other-negative-memory.png")));
+  cache.store(otherKey, makeEntry(QByteArray(64, 'w')));
+  // Neither tier retains anything: memory is clamped to 0 cost, and
+  // disk persistence is disabled entirely for this instance.
+  QVERIFY(!cache.lookupMemory(otherKey).has_value());
+  QVERIFY(!cache.lookupDisk(otherKey).has_value());
+
+  // The pre-seeded entry on disk must be completely untouched -- the
+  // invalid-config instance never enumerated, evicted, or otherwise
+  // wrote to the directory at all.
+  AssetCache verifyCache(configFor(m_tempDirPath));
+  const auto entry = verifyCache.lookupDisk(key);
+  QVERIFY(entry.has_value());
+  QCOMPARE(entry->encodedBytes, QByteArray(64, 'w'));
+}
+
+void AssetCacheTests::
+    bothNegativeDiskAndMemoryLimitsDisableBothTiersWithZeroMutation() {
+  // Cumulative review (PR #18, MEDIUM): the two single-invalid-field
+  // tests above each independently prove that ANY invalid field alone
+  // disables both tiers with zero disk mutation; this test proves the
+  // combination -- BOTH fields invalid simultaneously -- behaves
+  // identically, never mutating the directory at all, so the fix in
+  // the constructor is genuinely an unconditional
+  // "any configuration error disables both tiers" rule rather than one
+  // that happens to work for each field checked in isolation but could
+  // still regress for their conjunction.
   const QString key = AssetCache::cacheKeyFor(
-      QUrl(QStringLiteral("https://example.com/negative-memory-limit.png")));
-  cache.store(key, makeEntry(QByteArray(64, 'w')));
-  // Disk persistence still works (this Config's diskMaxBytes is valid).
-  QVERIFY(cache.lookupDisk(key).has_value());
-  // But nothing survives in the in-process memory cache: setMaxCost(0)
-  // means QCache evicts on insertion.
-  QVERIFY(!cache.lookupMemory(key).has_value());
+      QUrl(QStringLiteral("https://example.com/both-negative-limits.png")));
+  {
+    AssetCache seedCache(configFor(m_tempDirPath));
+    seedCache.store(key, makeEntry(QByteArray(64, 'x')));
+  }
+
+  AssetCache::Config invalidConfig = configFor(m_tempDirPath);
+  invalidConfig.diskMaxBytes = -1;
+  invalidConfig.memoryMaxCostBytes = -1;
+  AssetCache cache(invalidConfig);
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+  QVERIFY(!cache.isValid());
+  QVERIFY(cache.configurationError().has_value());
+  QCOMPARE(cache.configurationError()->code,
+           AssetErrorCode::InvalidConfiguration);
+  QVERIFY(AssetCache::validateConfiguration(invalidConfig).has_value());
+  const auto factoryResult = AssetCache::create(invalidConfig);
+  QVERIFY(!factoryResult);
+  QCOMPARE(factoryResult.error().code, AssetErrorCode::InvalidConfiguration);
+
+  const QString otherKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/other-both-negative.png")));
+  cache.store(otherKey, makeEntry(QByteArray(64, 'x')));
+  QVERIFY(!cache.lookupMemory(otherKey).has_value());
+  QVERIFY(!cache.lookupDisk(otherKey).has_value());
+
+  AssetCache verifyCache(configFor(m_tempDirPath));
+  const auto entry = verifyCache.lookupDisk(key);
+  QVERIFY(entry.has_value());
+  QCOMPARE(entry->encodedBytes, QByteArray(64, 'x'));
 }
 
 void AssetCacheTests::
@@ -3646,4 +3850,161 @@ void AssetCacheTests::
   QVERIFY(!second.isDiskCacheDisabledForTesting());
   const auto hitStillFromSecond = second.lookupDisk(key);
   QVERIFY(hitStillFromSecond.has_value());
+}
+
+void AssetCacheTests::execChildProcessNeverInheritsTheRootLockFileDescriptor() {
+  // Cumulative review (PR #18, HIGH, "dup() fd lacks CLOEXEC; exec
+  // child retains root"): /proc/self/fd enumeration is Linux-specific,
+  // so this proof (the only way to POSITIVELY confirm CLOEXEC actually
+  // took effect, rather than merely the absence of an indirect
+  // symptom) is Linux-only.
+#if !defined(__linux__)
+  QSKIP("/proc/self/fd enumeration is Linux-specific; not applicable on "
+        "this platform");
+#else
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+  const int lockFd = cache.rootLockFileDescriptorForTesting();
+  QVERIFY(lockFd >= 0);
+
+  QProcess child;
+  child.start(QStringLiteral("/bin/sh"),
+              {QStringLiteral("-c"), QStringLiteral("ls -1 /proc/self/fd")});
+  QVERIFY2(child.waitForFinished(5000), "child process never exited");
+  QCOMPARE(child.exitCode(), 0);
+  const QByteArray output = child.readAllStandardOutput();
+  const QList<QByteArray> lines = output.split('\n');
+  const QByteArray lockFdText = QByteArray::number(lockFd);
+  bool inheritedFdFound = false;
+  for (const QByteArray &line : lines) {
+    if (line.trimmed() == lockFdText) {
+      inheritedFdFound = true;
+      break;
+    }
+  }
+  QVERIFY2(!inheritedFdFound,
+           "the root lock file descriptor leaked into an exec'd child "
+           "process -- CLOEXEC did not take effect");
+#endif
+}
+
+void AssetCacheTests::
+    concurrentSameProcessInstancesNeverMintCollidingAccessSequenceValues() {
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  // Alternate stores between the two LIVE, simultaneously-existing
+  // instances across many distinct keys -- under the old per-instance
+  // counter design, both instances would have recovered the SAME
+  // starting access-sequence value at construction and then minted
+  // colliding values completely independently of one another.
+  QVector<QString> keys;
+  constexpr int kKeyCount = 40;
+  for (int i = 0; i < kKeyCount; ++i) {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/lru-seq-%1.png").arg(i)));
+    keys.push_back(key);
+    AssetCache &writer = (i % 2 == 0) ? first : second;
+    writer.store(key, makeEntry(QByteArrayLiteral("lru-seq-bytes")));
+  }
+
+  QSet<quint64> seenSequences;
+  for (const QString &key : keys) {
+    const auto sequence = first.accessSequenceForTesting(key);
+    QVERIFY2(
+        sequence.has_value(),
+        qPrintable(QStringLiteral("missing access sequence for %1").arg(key)));
+    QVERIFY2(!seenSequences.contains(*sequence),
+             qPrintable(QStringLiteral("duplicate access-sequence value %1 "
+                                       "for key %2 -- two same-process "
+                                       "instances minted colliding LRU "
+                                       "sequence numbers")
+                            .arg(*sequence)
+                            .arg(key)));
+    seenSequences.insert(*sequence);
+  }
+  QCOMPARE(seenSequences.size(), kKeyCount);
+}
+
+void AssetCacheTests::
+    forkedChildProcessNeverJoinsParentsInheritedRootAuthority() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("fork() is a POSIX-specific mechanism; not applicable on this "
+        "platform");
+#else
+  // The parent constructs (and keeps alive for the duration of this
+  // test) a live AssetCache holding this root's real, cross-process
+  // flock() -- this also registers registerForkSafetyOnce()'s
+  // pthread_atfork() child-handler process-wide, BEFORE this test's own
+  // explicit fork() below ever runs.
+  AssetCache parentCache(configFor(m_tempDirPath));
+  QVERIFY(!parentCache.isDiskCacheDisabledForTesting());
+  QVERIFY(parentCache.rootLockRegistryHasLiveEntryForTesting());
+
+  // Deterministic, no-sleep synchronization: a pipe the child uses to
+  // report its single-byte verdict, read by the parent via a blocking
+  // read that unblocks the instant the child writes (or its end closes
+  // on exit, whichever happens first).
+  int pipeFds[2] = {-1, -1};
+  QVERIFY(::pipe(pipeFds) == 0);
+
+  const pid_t child = ::fork();
+  QVERIFY(child >= 0);
+  if (child == 0) {
+    // CHILD: deliberately does NOT construct any further Qt object
+    // (not even a new AssetCache) -- a live Qt/QCoreApplication process
+    // (as this test binary is) is not generally safe to fork() without
+    // an immediate exec() at all (Qt/the platform runtime may keep
+    // internal worker threads/allocator state that a bare fork() can
+    // leave inconsistent in the child), independent of anything this
+    // fix does or does not do. Rather than let that UNRELATED, general
+    // hazard make this test flaky, this test instead directly probes
+    // the exact, narrow mechanism the fix actually relies on: the
+    // registry itself, via a raw, lock-free, single-threaded-window
+    // read (see rootLockRegistryHasLiveEntryForTesting()'s own
+    // comment) using only minimal, async-signal-safe-ish work before
+    // _exit().
+    ::close(pipeFds[0]);
+    const char verdict =
+        parentCache.rootLockRegistryHasLiveEntryForTesting() ? '1' : '0';
+    ssize_t written = ::write(pipeFds[1], &verdict, 1);
+    (void)written;
+    ::close(pipeFds[1]);
+    ::_exit(0);
+  }
+
+  // PARENT:
+  ::close(pipeFds[1]);
+  char verdict = '?';
+  const ssize_t bytesRead = ::read(pipeFds[0], &verdict, 1);
+  ::close(pipeFds[0]);
+  int status = 0;
+  QVERIFY2(::waitpid(child, &status, 0) == child,
+           "waitpid() never reaped the forked child");
+  QVERIFY2(WIFEXITED(status),
+           qPrintable(QStringLiteral(
+                          "forked child did not exit normally (raw status=%1, "
+                          "WIFSIGNALED=%2, WTERMSIG=%3)")
+                          .arg(status)
+                          .arg(WIFSIGNALED(status) ? 1 : 0)
+                          .arg(WIFSIGNALED(status) ? WTERMSIG(status) : -1)));
+
+  QVERIFY2(bytesRead == 1, "forked child never reported a verdict");
+  // '0' -- the registry, from the CHILD's own post-fork perspective,
+  // must be EMPTY for this root: registerForkSafetyOnce()'s
+  // pthread_atfork() child-handler ran synchronously during the fork()
+  // call itself (before fork() ever returned to this child), clearing
+  // it -- proving the fix's actual, targeted contract: a forked child
+  // never inherits a live belief that it already owns this root's
+  // authority.
+  QCOMPARE(verdict, '0');
+
+  // The parent's own instance must remain completely unaffected --
+  // still fully enabled and still registered, exactly as before the
+  // fork.
+  QVERIFY(!parentCache.isDiskCacheDisabledForTesting());
+  QVERIFY(parentCache.rootLockRegistryHasLiveEntryForTesting());
+#endif
 }

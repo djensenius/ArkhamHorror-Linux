@@ -527,5 +527,208 @@ class DuplicateBasenameRootsTests(unittest.TestCase):
         self.assertIn("libonlyinalpha.so.1", bundled_closure)
 
 
+class InheritedRpathTransitivityTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "inherited DT_RPATH missing ... glibc
+    applies DT_RPATH transitively when child lacks own RUNPATH/RPATH;
+    auditor may select valid global C while runtime chooses corrupt
+    higher-priority parent/private C"): real glibc dependency resolution
+    treats an ancestor's legacy DT_RPATH as part of a single, cumulative
+    search scope that keeps applying to every further DT_NEEDED
+    resolution down the whole chain -- for as long as no intermediate
+    object resets it with its own DT_RUNPATH -- never just the immediate
+    requester's own tag in isolation."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lib_dir = Path(self.tmp.name).resolve()
+
+    def _write(self, rel: str) -> Path:
+        path = self.lib_dir / rel
+        _write_fake_elf(path)
+        return path
+
+    def _run_audit(self, dynamic_text: dict[Path, str], root: str = "libroot.so.1"):
+        def fake_dynamic_text(path: Path) -> str:
+            return dynamic_text[path]
+
+        with mock.patch.object(
+            audit, "_readelf_dynamic_text", side_effect=fake_dynamic_text
+        ):
+            return audit.audit_closure(self.lib_dir, [root])
+
+    def test_ancestor_rpath_reaches_a_grandchilds_own_dependency_resolution(
+        self,
+    ) -> None:
+        # A (root, DT_RPATH="$ORIGIN/zzz_private") -> B (no own tag) ->
+        # "libc.so.1", which exists at BOTH a private location (only
+        # reachable via A's inherited, transitive DT_RPATH) and a global
+        # one (reachable via global_search_dirs alone). A real ld.so
+        # load of B's own "libc.so.1" NEEDED entry searches A's still-
+        # live DT_RPATH scope FIRST (legacy DT_RPATH precedes
+        # LD_LIBRARY_PATH) -- so the REAL runtime resolves to the
+        # PRIVATE copy, never the global one, regardless of which one
+        # this audit's own global_search_dirs happens to name.
+        #
+        # The private directory is deliberately named to sort AFTER the
+        # global one (both alphabetically and in any traversal order),
+        # so this test cannot pass merely by incidental directory-name
+        # ordering luck.
+        root = self._write("libroot.so.1")
+        libb = self._write("libb.so.1")
+        libc_private = self._write("zzz_private/libc.so.1")
+        libc_global = self._write("libc.so.1")
+        private_marker = self._write("zzz_private/libprivatemarker.so.1")
+        global_marker = self._write("libglobalmarker.so.1")
+
+        dynamic_text = {
+            root: _needed_and_rpath_text(["libb.so.1"], "$ORIGIN/zzz_private"),
+            libb: _needed_and_runpath_text(["libc.so.1"], None),
+            libc_private: _needed_and_runpath_text(
+                ["libprivatemarker.so.1"], None
+            ),
+            libc_global: _needed_and_runpath_text(["libglobalmarker.so.1"], None),
+            private_marker: _needed_and_runpath_text([], None),
+            global_marker: _needed_and_runpath_text([], None),
+        }
+
+        bundled_closure, missing, unreachable, _ = self._run_audit(dynamic_text)
+
+        self.assertEqual(missing, {})
+        self.assertEqual(unreachable, {})
+        # Decisive assertion: B's own "libc.so.1" resolved to the
+        # PRIVATE copy (its own further dependency is discovered),
+        # never the global one -- matching a real loader, which
+        # searches A's inherited DT_RPATH before global_search_dirs.
+        self.assertIn("libprivatemarker.so.1", bundled_closure)
+        self.assertNotIn("libglobalmarker.so.1", bundled_closure)
+
+    def test_intermediate_runpath_stops_further_propagation_to_grandchildren(
+        self,
+    ) -> None:
+        # A (root, DT_RPATH="$ORIGIN/zzz_private") -> B (its OWN
+        # DT_RUNPATH="$ORIGIN/ownrunpath", non-transitive) -> C (no own
+        # tag) -> "libd.so.1", present at both a private location (only
+        # reachable via A's DT_RPATH) and a global one. Because B
+        # carries its own DT_RUNPATH, real glibc scoping resets: A's
+        # DT_RPATH must NOT keep propagating past B to C's own
+        # resolution of libd.so.1 -- C must resolve the GLOBAL copy,
+        # never the private one, exactly the opposite outcome from the
+        # previous test (where no DT_RUNPATH was ever in the chain).
+        root = self._write("libroot.so.1")
+        libb = self._write("libb.so.1")
+        own_runpath_dir = self.lib_dir / "ownrunpath"
+        own_runpath_dir.mkdir()
+        libc = self._write("libc.so.1")
+        libd_private = self._write("zzz_private/libd.so.1")
+        libd_global = self._write("libd.so.1")
+        private_marker = self._write("zzz_private/libdprivatemarker.so.1")
+        global_marker = self._write("libdglobalmarker.so.1")
+
+        dynamic_text = {
+            root: _needed_and_rpath_text(["libb.so.1"], "$ORIGIN/zzz_private"),
+            libb: _needed_and_runpath_text(["libc.so.1"], "$ORIGIN/ownrunpath"),
+            libc: _needed_and_runpath_text(["libd.so.1"], None),
+            libd_private: _needed_and_runpath_text(
+                ["libdprivatemarker.so.1"], None
+            ),
+            libd_global: _needed_and_runpath_text(["libdglobalmarker.so.1"], None),
+            private_marker: _needed_and_runpath_text([], None),
+            global_marker: _needed_and_runpath_text([], None),
+        }
+
+        bundled_closure, missing, unreachable, _ = self._run_audit(dynamic_text)
+
+        self.assertEqual(missing, {})
+        self.assertEqual(unreachable, {})
+        # Decisive assertion: propagation stopped at B (its own
+        # DT_RUNPATH resets inheritance for everything below it) -- C's
+        # own resolution of libd.so.1 must use the GLOBAL copy, never
+        # the private one that only A's (now-severed) DT_RPATH reached.
+        self.assertIn("libdglobalmarker.so.1", bundled_closure)
+        self.assertNotIn("libdprivatemarker.so.1", bundled_closure)
+
+    def test_same_edge_reached_via_two_different_inherited_chains_is_independently_resolved(
+        self,
+    ) -> None:
+        # Round-N+ review ("BFS state/resolution key includes ordered
+        # inherited legacy-RPATH chain"): a diamond shape where the
+        # IDENTICAL (name, requester) edge -- "leaf.so.1" needed by the
+        # single shared "libshared.so.1" file -- is reached via TWO
+        # different accumulated ancestor contexts: once via "libp.so.1"
+        # (which carries its own DT_RPATH, extending the inherited
+        # chain), and once via "libq.so.1" (which carries no tag at all,
+        # so the chain it passes through is empty). A context-blind
+        # (name, requester) key would process only whichever of these
+        # two edges the LIFO queue happens to pop first, silently
+        # masking the other context's own, genuinely different,
+        # resolution outcome.
+        root = self._write("libroot.so.1")
+        libp = self._write("libp.so.1")
+        libq = self._write("libq.so.1")
+        libshared = self._write("libshared.so.1")
+        leaf_private = self._write("zzz_p_private/leaf.so.1")
+        leaf_global = self._write("leaf.so.1")
+        private_marker = self._write("zzz_p_private/leaf_private_marker.so.1")
+        global_marker = self._write("leaf_global_marker.so.1")
+
+        dynamic_text = {
+            root: _needed_and_runpath_text(["libp.so.1", "libq.so.1"], None),
+            libp: _needed_and_rpath_text(
+                ["libshared.so.1"], "$ORIGIN/zzz_p_private"
+            ),
+            libq: _needed_and_runpath_text(["libshared.so.1"], None),
+            libshared: _needed_and_runpath_text(["leaf.so.1"], None),
+            leaf_private: _needed_and_runpath_text(
+                ["leaf_private_marker.so.1"], None
+            ),
+            leaf_global: _needed_and_runpath_text(
+                ["leaf_global_marker.so.1"], None
+            ),
+            private_marker: _needed_and_runpath_text([], None),
+            global_marker: _needed_and_runpath_text([], None),
+        }
+
+        bundled_closure, missing, unreachable, _ = self._run_audit(dynamic_text)
+
+        self.assertEqual(missing, {})
+        self.assertEqual(unreachable, {})
+        # Both contexts' own distinct resolutions of "leaf.so.1" must be
+        # independently discovered -- neither masks the other.
+        self.assertIn("leaf_private_marker.so.1", bundled_closure)
+        self.assertIn("leaf_global_marker.so.1", bundled_closure)
+
+
+class NextInheritedRpathChainUnitTests(unittest.TestCase):
+    """Direct unit coverage of _next_inherited_rpath_chain()'s exact
+    propagation rule, independent of the full BFS."""
+
+    def test_runpath_resets_propagation_to_empty(self) -> None:
+        inherited = (Path("/a"), Path("/b"))
+        result = audit._next_inherited_rpath_chain(
+            "runpath", [Path("/own")], inherited
+        )
+        self.assertEqual(result, ())
+
+    def test_rpath_extends_the_inherited_chain(self) -> None:
+        inherited = (Path("/a"),)
+        result = audit._next_inherited_rpath_chain(
+            "rpath", [Path("/own")], inherited
+        )
+        self.assertEqual(result, (Path("/a"), Path("/own")))
+
+    def test_no_tag_passes_the_inherited_chain_through_unchanged(self) -> None:
+        inherited = (Path("/a"), Path("/b"))
+        result = audit._next_inherited_rpath_chain(None, [], inherited)
+        self.assertEqual(result, inherited)
+
+    def test_duplicate_entries_are_not_repeated_when_extending(self) -> None:
+        inherited = (Path("/a"),)
+        result = audit._next_inherited_rpath_chain(
+            "rpath", [Path("/a"), Path("/new")], inherited
+        )
+        self.assertEqual(result, (Path("/a"), Path("/new")))
+
+
 if __name__ == "__main__":
     unittest.main()

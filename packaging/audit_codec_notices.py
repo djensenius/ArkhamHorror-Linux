@@ -79,6 +79,19 @@ from pathlib import Path
 _SONAME_RE = re.compile(r"\(SONAME\)\s+Library soname:\s+\[(?P<name>[^\]]+)\]")
 _BUILD_ID_RE = re.compile(r"Build ID:\s*(?P<id>[0-9a-fA-F]+)")
 
+# Round-N+ review (HIGH, "canonical ELF identity misses load security/
+# mapping ... e_entry ... pass"): parses `readelf -h`'s "Entry point
+# address:" line -- the raw virtual address execution actually starts
+# at. This is genuinely stable across a legitimate patchelf RUNPATH
+# rewrite (the entry symbol itself, and the section containing it,
+# never moves or is retargeted by that rewrite -- only `.dynstr`/
+# `.dynamic`-adjacent metadata is ever relocated -- see
+# _canonical_load_digest()'s own docstring), so silently omitting it
+# left an attacker free to redirect execution to a completely different
+# address (e.g. into attacker-controlled data treated as code) without
+# changing anything else this digest previously authenticated.
+_ENTRY_POINT_RE = re.compile(r"Entry point address:\s*(?P<address>0x[0-9a-fA-F]+)")
+
 # Round-N+ review (HIGH, "Qt authenticity accepts matching build ID
 # only; modified bytes can retain note. Build ID not signature."):
 # parses `readelf -lW`'s one-line-per-entry program header format (see
@@ -666,24 +679,48 @@ def _read_build_id(path: Path) -> str | None:
     return match.group("id").lower() if match else None
 
 
+def _read_entry_point(path: Path) -> str | None:
+    """This exact compiled object's own ELF header e_entry field (the
+    raw virtual address execution actually starts at), or None if
+    `readelf -h`'s output cannot be matched at all (never expected for a
+    real ELF object, but tolerated the same way a missing SONAME/
+    build-id is). See _ENTRY_POINT_RE's own module-level comment for why
+    this is safe to fold directly into _canonical_load_digest() without
+    any of the offset/vaddr instability concerns that apply to PT_LOAD's
+    own program-header fields."""
+    match = _ENTRY_POINT_RE.search(_readelf(path, "-h"))
+    return match.group("address").lower() if match else None
+
+
 def _read_program_headers(path: Path) -> list[dict[str, str]]:
-    """Returns every field (type, flags, filesz, memsz, align) for EVERY
-    program header entry in `path`, in on-disk program-header-table
-    order (index 0, 1, 2, ...) -- the same order readelf's own "Section
-    to Segment mapping" table numbers its entries by, which is what lets
-    _section_to_segment_load_flags() below correlate the two tables
-    positionally. `flags` is the raw three-character "R"/"W"/"E" (or
-    space) field, e.g. "R E", "RW ". Deliberately excludes `offset`/
-    `vaddr`/`paddr` (raw position/address information this project's
-    own empirical testing against a real patchelf 0.14.3 rewrite
-    confirmed can legitimately shift for segments whose content gets
-    relocated into a newly-appended segment -- see
-    _canonical_load_digest()'s own docstring) since callers that fold
-    this into a digest (see _non_load_program_header_records() below)
-    must key on content-stable identity, never raw location, exactly as
-    every other part of this digest already does. Raises
-    ElfIdentityError (via _readelf()) if readelf itself cannot parse
-    `path`'s program headers at all."""
+    """Returns every field (type, flags, filesz, memsz, align, vaddr) for
+    EVERY program header entry in `path`, in on-disk program-header-
+    table order (index 0, 1, 2, ...) -- the same order readelf's own
+    "Section to Segment mapping" table numbers its entries by, which is
+    what lets _section_to_segment_load_flags() below correlate the two
+    tables positionally. `flags` is the raw three-character "R"/"W"/"E"
+    (or space) field, e.g. "R E", "RW ". Deliberately excludes `offset`/
+    `paddr` (raw position/address information this project's own
+    empirical testing against a real patchelf 0.14.3 rewrite confirmed
+    can legitimately shift for segments whose content gets relocated
+    into a newly-appended segment -- see _canonical_load_digest()'s own
+    docstring) since callers that fold this into a digest (see
+    _non_load_program_header_records() below) must key on content-stable
+    identity, never raw location, exactly as every other part of this
+    digest already does.
+
+    Round-N+ review (HIGH, "canonical ELF identity misses load security/
+    mapping ... load addresses/ranges/order/overlap pass"): `vaddr` IS
+    now included -- unlike `offset`, it is only ever consulted by
+    _canonical_load_digest() below to establish the real, load-time
+    RELATIVE ORDER of PT_LOAD segments against one another (see
+    _ordered_load_segment_flags()'s own docstring), never hashed as a
+    raw absolute value itself, so a legitimately-shifted absolute
+    virtual address from an appended relocation segment cannot itself
+    change the digest -- only an actual reordering, insertion, removal,
+    or permission change of a PT_LOAD segment relative to its siblings
+    can. Raises ElfIdentityError (via _readelf()) if readelf itself
+    cannot parse `path`'s program headers at all."""
     return [
         {
             "type": match.group("type"),
@@ -691,9 +728,101 @@ def _read_program_headers(path: Path) -> list[dict[str, str]]:
             "filesz": match.group("filesz"),
             "memsz": match.group("memsz"),
             "align": match.group("align"),
+            "vaddr": match.group("vaddr"),
         }
         for match in _PROGRAM_HEADER_RE.finditer(_readelf(path, "-l", "-W"))
     ]
+
+
+def _ordered_load_segment_flags(path: Path) -> list[str]:
+    """Returns the R/W/E flags string (e.g. "R E", "RW ") of every
+    PT_LOAD program header in `path`, ordered by ascending virtual
+    address -- the real, load-time relative order the ELF spec itself
+    requires PT_LOAD segments to already be non-overlapping and
+    monotonic in (a well-formed object's loader silently relies on this
+    invariant; this project's own build never intentionally produces a
+    malformed one). A legitimate patchelf RUNPATH rewrite can shift
+    every ABSOLUTE virtual address once a new segment is appended (this
+    project's own empirical testing already established that for
+    `_read_program_headers()`'s own excluded offset/paddr fields), but
+    it does not insert a brand-new PT_LOAD segment ahead of or between
+    existing ones, nor does it change any EXISTING PT_LOAD segment's own
+    declared protection flags -- so this ordered, address-relative (not
+    address-absolute) sequence is safe to fold directly into
+    _canonical_load_digest(), closing the round-N+ review's "RX->RWX
+    stays true and passes ... load addresses/ranges/order/overlap pass"
+    finding at the SEGMENT granularity (in addition to the per-SECTION
+    write-bit tracking _canonical_load_digest() also now does): an
+    attacker flipping an existing PT_LOAD segment's own flags (e.g.
+    granting it write permission it never had), reordering segments, or
+    inserting/removing one entirely changes this sequence; a legitimate
+    patchelf-appended trailing segment (whose own flags this project's
+    own testing found are always a plain "RW ") does not retroactively
+    change any EARLIER segment's own position in this ordering, only
+    adds one more entry at the end."""
+    try:
+        headers = _read_program_headers(path)
+    except ElfIdentityError:
+        return []
+    loads = [header for header in headers if header["type"] == "LOAD"]
+    loads.sort(key=lambda header: int(header["vaddr"], 16))
+    return [header["flags"] for header in loads]
+
+
+# Round-N+ review (HIGH, this specific finding's follow-up regression,
+# empirically confirmed in this project's own Docker-based test run
+# against a real patchelf 0.14.3): _ordered_load_segment_flags() above
+# is a genuinely FULL, faithful record of every PT_LOAD segment -- but
+# folding that FULL list directly into _canonical_load_digest() is
+# itself unstable across the exact same legitimate patchelf rewrite
+# this module's own docstrings already document, because a real
+# patchelf run ALWAYS appends at least one brand-new trailing PT_LOAD
+# segment (confirmed, via this project's own Docker probes, even for
+# an RPATH edit so short it never needs to relocate any existing
+# section) -- changing the LIST'S OWN LENGTH, which a raw
+# list-equality/hash-of-the-list check can never tolerate no matter how
+# address-relative the ordering itself is. This function returns the
+# canonical, append-tolerant PREFIX of that list: every entry EXCEPT a
+# trailing run of segments whose flags are the EXACT "RW " triple --
+# empirically the ONLY flags value this project's own testing ever
+# observed a real patchelf-appended segment carry (see
+# _ordered_load_segment_flags()'s own docstring) -- so a genuine
+# append changes nothing here, while any actual reordering, insertion
+# of an executable/non-"RW " segment, removal, or permission change of
+# an EXISTING (non-trailing-append) segment still does.
+#
+# This does not reopen the very gap this whole mechanism exists to
+# close: every section any appended segment could plausibly carry is
+# STILL separately, individually authenticated by the main per-section
+# loop in _canonical_load_digest() (content, type, declared sh_flags,
+# and its own actual runtime executable/write bit via
+# _section_to_segment_load_flags(), keyed by name regardless of which
+# segment it ends up mapped into) -- this project's own empirical
+# testing confirmed the sections patchelf actually relocates into a
+# newly-appended segment are exclusively `.gnu.hash`/`.note.*`
+# (deliberately volatile-excluded from even the single-bit checks, for
+# the identical documented reason) or `.dynsym`/`.dynstr` (fully
+# excluded from the raw pass and instead re-authenticated via their own
+# decoded, index-independent views). A genuinely NEW, previously-absent
+# allocated section introduced by an attacker (whether or not it lands
+# inside a trailing "RW " segment) still changes the SORTED SET of
+# `loaded` section names/content the main loop hashes, so it is still
+# detected there -- this canonicalization only ever discards the
+# segment-table's own bookkeeping for a purely additive, "RW "-only
+# append, never any section's own content or permissions.
+def _canonical_load_segment_prefix(path: Path) -> list[str]:
+    """Returns `_ordered_load_segment_flags(path)` with any trailing run
+    of exactly "RW "-flagged segments removed -- the append-tolerant,
+    canonical representation actually folded into
+    _canonical_load_digest() (see this function's own preceding module
+    comment for the full rationale). `_ordered_load_segment_flags()`
+    itself is left returning the complete, unmodified list, since tests
+    (and any future caller needing the raw, undiscounted view) must
+    still be able to observe the real, full segment table."""
+    flags = list(_ordered_load_segment_flags(path))
+    while flags and flags[-1] == "RW ":
+        flags.pop()
+    return flags
 
 
 # Third-HIGH-round review ("... executable GNU_STACK, RELRO/TLS/load
@@ -869,7 +998,24 @@ def _canonical_load_digest(path: Path) -> str | None:
     documented set of sections this project's own real packaging
     pipeline (linuxdeploy's internal patchelf RUNPATH rewrite) is known
     to legitimately alter (see _CANONICAL_DIGEST_EXCLUDED_SECTIONS'
-    own docstring). Returns None if `path` cannot be parsed as an ELF
+    own docstring).
+
+    Round-N+ review (HIGH, "canonical ELF identity misses load security/
+    mapping ... RX->RWX stays true and passes; e_entry, load addresses/
+    ranges/order/overlap pass"): also authenticates, in addition to
+    every previously-covered field, (a) each retained section's own
+    runtime WRITE bit, not merely its executable bit (closing an
+    RX-segment-granted-write, i.e. "RX->RWX", downgrade that previously
+    changed nothing this digest recorded), (b) the raw ELF header
+    e_entry value (closing a redirected-execution-address tamper), and
+    (c) the ordered-by-virtual-address sequence of PT_LOAD segment
+    flags (closing a whole-segment reorder/insertion/removal/permission
+    change that the per-section checks, keyed by section name rather
+    than segment topology, cannot see) -- see
+    _ordered_load_segment_flags()'s own docstring for why this specific,
+    relative (never absolute-address) representation stays stable
+    across a legitimate patchelf-appended trailing segment. Returns None
+    if `path` cannot be parsed as an ELF
     object at all, or has no loaded section whatsoever (vanishingly rare
     for a real bundled library/plugin/executable, but not itself an
     error).
@@ -1003,13 +1149,34 @@ def _canonical_load_digest(path: Path) -> str | None:
                 # LOSING it, not just gaining a write bit), which a
                 # standalone per-file digest cannot distinguish from
                 # genuine tampering.
+                # Round-N+ review (HIGH, "canonical ELF identity misses
+                # load security/mapping ... RX->RWX stays true and
+                # passes"): the WRITE bit of the section's actual
+                # runtime (LOAD-segment) mapping is now ALSO
+                # authenticated here, not merely the executable bit --
+                # closing the exact gap the review named: an attacker
+                # granting WRITE permission to an already-executable
+                # section (turning a legitimate RX mapping into a
+                # dangerous RWX one) previously changed nothing this
+                # digest recorded at all, since only the bare executable
+                # boolean was ever folded in. `.gnu.hash`/`.note.*`
+                # remain fully excluded from BOTH bits, for the
+                # identical, already-documented reason
+                # _has_volatile_segment_executable_bit()'s own docstring
+                # gives: the same legitimate relocation that can swing
+                # their executable bit in either direction can equally
+                # swing their write bit, and neither one ever executes,
+                # so W^X is not a real security boundary for them either
+                # way.
                 if _has_volatile_segment_executable_bit(name):
                     runtime_executable = "<volatile, excluded>"
+                    runtime_writable = "<volatile, excluded>"
                 else:
                     runtime_executable = "E" in segment_flags.get(name, "")
+                    runtime_writable = "W" in segment_flags.get(name, "")
                 header = (
                     f"{name}\0{section['type']}\0{section['flags']}\0"
-                    f"{runtime_executable}\0{size}\0"
+                    f"{runtime_executable}\0{runtime_writable}\0{size}\0"
                 ).encode("utf-8")
                 digest.update(header)
                 # A SHT_NOBITS section (`.bss`/`.tbss`) is, by the ELF
@@ -1079,6 +1246,25 @@ def _canonical_load_digest(path: Path) -> str | None:
         digest.update(
             f"PHDR\0{type_}\0{flags}\0{filesz}\0{memsz}\0{align}\0".encode("utf-8")
         )
+    # Round-N+ review (HIGH, "canonical ELF identity misses load
+    # security/mapping ... e_entry ... load addresses/ranges/order/
+    # overlap pass"): the raw entry-point virtual address (stable
+    # across a legitimate patchelf rewrite -- see _read_entry_point()'s
+    # own docstring) closes a redirected-execution gap nothing else
+    # here authenticated; the canonical, append-tolerant PREFIX (see
+    # _canonical_load_segment_prefix()'s own docstring for exactly why
+    # the FULL ordered sequence is itself unstable across a real
+    # patchelf run, and why discarding only a trailing "RW "-only
+    # append reopens no coverage gap) of the ORDERED (by virtual
+    # address) sequence of PT_LOAD segment flags closes a
+    # whole-segment reorder/insertion/removal/permission-change gap the
+    # per-section write/execute-bit check above cannot, since that
+    # check is keyed by section name and says nothing about the
+    # segment TOPOLOGY itself.
+    entry_point = _read_entry_point(path)
+    digest.update(f"ENTRY\0{entry_point}\0".encode("utf-8"))
+    for flags in _canonical_load_segment_prefix(path):
+        digest.update(f"LOADSEG\0{flags}\0".encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -1385,34 +1571,62 @@ COMPONENT_EXPECTED_SOURCE_PACKAGES: dict[str, frozenset[str]] = {
 }
 
 # Round-7 review (HIGH, "package versions are mutable/unpinned...pin
-# package revision/snapshot or governed expectations"): a bare source
-# *package name* match (COMPONENT_EXPECTED_SOURCE_PACKAGES above) alone
-# cannot catch a genuine major/minor package revision drift -- e.g. this
-# project's pinned `ubuntu-22.04` CI image silently upgrading to a
-# future Ubuntu point release, or a from-source/PPA-installed component
-# masquerading with the same source-package name but an entirely
-# different, unreviewed upstream revision. This table pins an expected
-# `dpkg-query`-reported version STRING PREFIX (deliberately only the
-# leading UPSTREAM version -- i.e. everything before the LAST hyphen,
-# per Debian's own `[epoch:]upstream_version[-debian_revision]` version
-# grammar, in which only `debian_revision` itself is guaranteed
-# hyphen-free, e.g. "1.46.5" from "1.46.5-2ubuntu1.1", or "2:8.39" from
-# "2:8.39-13ubuntu0.22.04.1") so a routine point release/security
-# rebuild (a `debian_revision`-only bump, e.g. ".1" -> ".2") is
-# tolerated exactly as COMPONENT_EXPECTED_SOURCE_PACKAGES' own docstring
-# already establishes as this project's policy, while a genuine
-# upstream version bump (e.g. "1.46.5" -> "1.47.0") is a real,
-# reviewable diff that must be deliberately re-pinned here, not
-# silently absorbed.
+# package revision/snapshot or governed expectations"), and its own
+# Round-N+ follow-up (HIGH, "`startswith(expected_version_prefix)` lets
+# 1.46.50 satisfy 1.46.5; security revision drift... apt sources
+# mutable/unversioned... Pin an immutable Ubuntu snapshot plus exact
+# binary/source versions... Missing/wrong/same-name/revision drift
+# fails"): the PREVIOUS design here
+# (COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX, pinning only the leading
+# upstream-version PREFIX and matching via `str.startswith()`) had two
+# concrete, exploitable gaps this table and its equality-only comparator
+# (see validate_bundled_library_package_provenance()'s own use of
+# `==`, never `startswith()`, below) both close:
+#
+#   1. A version-prefix COLLISION: `"1.46.50-1"[:len("1.46.5")]` also
+#      equals the literal string "1.46.5", so `startswith("1.46.5")` was
+#      satisfied by an entirely different, unreviewed upstream version
+#      ("1.46.50") that merely happens to share the pinned prefix as a
+#      literal substring -- never a real point release of "1.46.5" at
+#      all. Pinning (and comparing) the COMPLETE, real
+#      `dpkg-query`-reported version string (including its own
+#      `debian_revision` suffix) makes this class of collision
+#      structurally impossible: two distinct upstream/Debian-revision
+#      combinations can never produce the identical complete string.
+#
+#   2. Silent SECURITY-REVISION DRIFT: the previous design deliberately
+#      tolerated ANY `debian_revision`-only bump (e.g. "-2ubuntu1.1" ->
+#      "-2ubuntu1.2") as "routine", which is exactly backwards for a
+#      component whose provenance is meant to be a GOVERNED, reviewed
+#      lock -- a live Ubuntu security update silently changing the
+#      exact bytes this project ships underneath an assumed-safe prefix
+#      is precisely the kind of drift a provenance pin exists to catch,
+#      not exempt. Every value below is therefore now the COMPLETE
+#      `dpkg-query --showformat='${Version}'` string, compared for
+#      EXACT equality; ANY drift at all -- upstream or Debian-revision,
+#      security patch or not -- is a real, reviewable diff that must be
+#      deliberately re-pinned here, never silently absorbed. This IS
+#      this project's own "equivalent governed lock verified before
+#      packaging" (the review's own explicitly offered alternative to
+#      an immutable archive-snapshot pin): the audit refuses to accept
+#      ANY version this table was not deliberately updated to name,
+#      regardless of which apt mirror/snapshot the installing host
+#      happened to resolve it from.
 #
 # Third-HIGH-round review ("Other distro components accept mutable
 # repo versions by source-package name ... Pin an immutable Ubuntu
 # snapshot plus exact binary/source versions ... for EVERY distro
 # input"): every entry below (not merely e2fsprogs, this table's
-# previous sole entry) was independently confirmed against a genuine,
-# unmodified `ubuntu:22.04` container -- specifically:
+# original sole entry) was independently, freshly re-confirmed against
+# a genuine, unmodified `ubuntu:22.04` container (with Jammy's
+# `universe` component enabled, matching this project's own real CI
+# `add-apt-repository universe`-equivalent package availability) --
+# specifically:
 #   docker run --rm ubuntu:22.04 bash -c '
-#     apt-get update -qq && apt-get install -y --no-install-recommends \
+#     apt-get update -qq &&
+#     apt-get install -y -qq software-properties-common &&
+#     add-apt-repository -y universe && apt-get update -qq &&
+#     apt-get install -y --no-install-recommends \
 #       <every COMPONENT_EXPECTED_SOURCE_PACKAGES binary package> &&
 #     dpkg-query --showformat="${Package}\t${Version}\t${source:Package}\n" \
 #       --show <every package>'
@@ -1426,50 +1640,51 @@ COMPONENT_EXPECTED_SOURCE_PACKAGES: dict[str, frozenset[str]] = {
 # before -- itself a deliberate, honestly-scoped no-op, never a silent
 # false negative for one this table *does* cover. Re-confirm every
 # value here the same way whenever this project's own pinned CI image
-# tag is deliberately moved to a newer Ubuntu release.
-COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX: dict[str, str] = {
-    "e2fsprogs": "1.46.5",
-    "krb5": "1.19.2",
-    "libsecret": "0.20.5",
-    "libgpg-error": "1.43",
-    "libgcrypt": "1.9.4",
-    "libffi": "3.4.2",
-    "glib": "2.72.4",
-    "zlib": "1:1.2.11.dfsg",
-    "pcre2": "10.39",
-    "util-linux": "2.37.2",
-    "libselinux": "3.3",
-    "liblzma": "5.2.5",
-    "libxau": "1:1.0.9",
-    "libxdmcp": "1:1.1.3",
-    "xcb": "1.14",
-    "xcb-util": "0.4.0",
-    "xcb-util-image": "0.4.0",
-    "xcb-util-keysyms": "0.4.0",
-    "xcb-util-renderutil": "0.3.9",
-    "xcb-util-wm": "0.4.1",
-    "xcb-util-cursor": "0.1.1",
-    "xkbcommon": "1.4.0",
-    "brotli": "1.0.9",
-    "libbsd": "0.11.5",
-    "libmd": "1.0.4",
-    "libcap": "1:2.44",
-    "dbus": "1.12.20",
-    "libkeyutils": "1.6.1",
-    "lz4": "1.9.3",
-    "pcre": "2:8.39",
-    "libpng": "1.6.37",
-    "systemd": "249.11",
-    "zstd": "1.4.8+dfsg",
-    "libjpeg": "2.1.2",
-    "bzip2": "1.0.8",
-    "libavif": "0.9.3",
-    "libaom": "3.3.0",
-    "libyuv": "0.0~git20220104.b91df1a",
-    "dav1d": "0.9.2",
-    "libgav1": "0.17.0",
-    "abseil": "0~20210324.2",
-    "gcc-runtime": "12.3.0",
+# tag is deliberately moved to a newer Ubuntu release, or whenever a
+# deliberate, reviewed security-update re-pin is required.
+COMPONENT_EXPECTED_SOURCE_VERSION: dict[str, str] = {
+    "e2fsprogs": "1.46.5-2ubuntu1.2",
+    "krb5": "1.19.2-2ubuntu0.8",
+    "libsecret": "0.20.5-2",
+    "libgpg-error": "1.43-3",
+    "libgcrypt": "1.9.4-3ubuntu3.2",
+    "libffi": "3.4.2-4",
+    "glib": "2.72.4-0ubuntu2.9",
+    "zlib": "1:1.2.11.dfsg-2ubuntu9.2",
+    "pcre2": "10.39-3ubuntu0.1",
+    "util-linux": "2.37.2-4ubuntu3.5",
+    "libselinux": "3.3-1build2",
+    "liblzma": "5.2.5-2ubuntu1.1",
+    "libxau": "1:1.0.9-1build5",
+    "libxdmcp": "1:1.1.3-0ubuntu5",
+    "xcb": "1.14-3ubuntu3",
+    "xcb-util": "0.4.0-1build2",
+    "xcb-util-image": "0.4.0-2",
+    "xcb-util-keysyms": "0.4.0-1build3",
+    "xcb-util-renderutil": "0.3.9-1build3",
+    "xcb-util-wm": "0.4.1-1.1build2",
+    "xcb-util-cursor": "0.1.1-4ubuntu1",
+    "xkbcommon": "1.4.0-1",
+    "brotli": "1.0.9-2build6",
+    "libbsd": "0.11.5-1",
+    "libmd": "1.0.4-1build1",
+    "libcap": "1:2.44-1ubuntu0.22.04.3",
+    "dbus": "1.12.20-2ubuntu4.1",
+    "libkeyutils": "1.6.1-2ubuntu3",
+    "lz4": "1.9.3-2build2",
+    "pcre": "2:8.39-13ubuntu0.22.04.1",
+    "libpng": "1.6.37-3ubuntu0.6",
+    "systemd": "249.11-0ubuntu3.22",
+    "zstd": "1.4.8+dfsg-3build1",
+    "libjpeg": "2.1.2-0ubuntu1",
+    "bzip2": "1.0.8-5build1",
+    "libavif": "0.9.3-3",
+    "libaom": "3.3.0-1ubuntu0.1",
+    "libyuv": "0.0~git20220104.b91df1a-2",
+    "dav1d": "0.9.2-1",
+    "libgav1": "0.17.0-1build1",
+    "abseil": "0~20210324.2-2ubuntu0.3",
+    "gcc-runtime": "12.3.0-1ubuntu1~22.04.3",
 }
 
 # Deliberately x86_64-only (this project's whole AppImage target ABI --
@@ -1536,7 +1751,26 @@ _SYSTEM_LIBRARY_SEARCH_DIRS: tuple[Path, ...] = (
 # genuinely obtained the file from, not merely "a same-named file some
 # host happens to have installed"), so no security coverage is lost by
 # excluding "icu" from COMPONENT_EXPECTED_SOURCE_PACKAGES above.
-_COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE: frozenset[str] = frozenset({"icu"})
+#
+# Round-N+ review ("qtSdkProvenance included only ICU, not core
+# Qt/plugins using same classification"): core Qt libraries and Qt's
+# own plugins/QML modules (classify_path()'s "qt" component) were
+# ALREADY authenticated against this exact same real Qt SDK reference
+# copy at classification time (_is_real_core_qt_library()/
+# _is_real_qt_plugin_or_qml_module(), above) -- classify_path() refuses
+# to ever return "qt" for a file that fails that proof. But that proof
+# was previously discarded immediately after use: only a bare boolean
+# ever survived past classification, never surfaced as a structured,
+# reviewable SBOM/provenance record the way "icu"'s dedicated
+# qtSdkProvenance field already was. "qt" is added here so every
+# "qt"-classified bundled file gets the identical structured
+# qtSdkProvenance record (reference path/sha256/canonical digest) "icu"
+# already did -- both are, correctly, never checked against
+# COMPONENT_EXPECTED_SOURCE_PACKAGES/dpkg (see that table's own
+# docstring: "qt" has never had an entry there either, for the same
+# underlying reason -- neither ever originates from a dpkg-owned distro
+# package in this project's real pipeline).
+_COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE: frozenset[str] = frozenset({"icu", "qt"})
 
 
 def _dpkg_owning_package(path: Path) -> str | None:
@@ -1799,6 +2033,240 @@ def bind_bundled_library_to_system_provenance(
     return {"status": "not_found"}
 
 
+# Round-N+ review (HIGH, "distro provenance post-hoc/unpinned: after
+# packaging it searches fixed system dirs by basename, not exact
+# linuxdeploy-selected pre-copy file"): _SYSTEM_LIBRARY_SEARCH_DIRS-based
+# lookup (bind_bundled_library_to_system_provenance() above) always
+# performs its own INDEPENDENT directory search, AFTER packaging has
+# already finished, picking the FIRST same-basename file it happens to
+# find across a fixed, hardcoded directory list -- on a host with more
+# than one same-named candidate (multilib, a manually installed
+# alternate, or simply a different search order than the real dynamic
+# loader/linuxdeploy itself used), this can silently authenticate
+# against a COMPLETELY DIFFERENT file than the one linuxdeploy's own
+# ldd-based dependency resolution actually copied bytes from.
+#
+# `resolve_ldd_dependencies()`/`capture_distro_source_provenance()`
+# below close this by capturing provenance the SAME way, at the SAME
+# real resolution mechanism (the actual dynamic loader, via `ldd`), and
+# at the SAME time linuxdeploy performs its own copy -- i.e. run BEFORE
+# packaging, directly against this project's own first-party, not-yet-
+# bundled executable/Qt plugins (see packaging/build-appimage.sh's own
+# "Capture distro provenance" step, which invokes the new
+# `capture-distro-provenance` CLI subcommand immediately after this
+# project's own build but strictly before linuxdeploy's first
+# invocation) -- never a basename re-discovered afterward under an
+# independently maintained, potentially stale/wrong directory list.
+def resolve_ldd_dependencies(elf_path: Path) -> dict[str, Path]:
+    """Runs the real `ldd` against a genuine, not-yet-packaged ELF
+    executable or plugin and returns {soname: resolved_absolute_path}
+    for every dynamically resolved dependency it reports -- i.e. the
+    EXACT file the real dynamic loader (never an independently
+    reimplemented directory search) selects for `elf_path`, on this
+    exact host, at this exact moment: the identical resolution
+    linuxdeploy's own automatic bundling performs internally when
+    deciding what to copy, since both consult the same `ld.so` cache/
+    search rules. Entries `ldd` reports as "not found" (a dependency
+    this exact host cannot itself resolve at all) are omitted -- a
+    caller requiring full coverage of every expected component enforces
+    that separately, exactly as every other provenance mechanism in
+    this module already does. Returns an empty dict (never raises) if
+    `ldd` is not installed, `elf_path` cannot be inspected as a real
+    ELF at all, or a subprocess-level error occurs invoking it."""
+    if shutil.which("ldd") is None:
+        return {}
+    try:
+        result = subprocess.run(
+            ["ldd", str(elf_path)], capture_output=True, text=True
+        )
+    except OSError:
+        return {}
+    resolved: dict[str, Path] = {}
+    for line in result.stdout.splitlines():
+        match = _LDD_DEPENDENCY_LINE_RE.match(line)
+        if not match:
+            continue
+        target = match.group("target")
+        if target is None or target == "not found":
+            continue
+        # Deliberately NOT canonicalized via Path.resolve(): `target` is
+        # already the exact path the real dynamic loader itself
+        # resolved this soname to (the identical resolution linuxdeploy
+        # performs) -- further canonicalizing it here could silently
+        # substitute a DIFFERENT (if content-identical) path on a
+        # merged-/usr host where e.g. /lib is itself a directory
+        # symlink to /usr/lib, which would make this capture no longer
+        # describe the literal path the loader/linuxdeploy actually
+        # used.
+        resolved[match.group("soname")] = Path(target)
+    return resolved
+
+
+# `ldd` prints one line per dependency in one of two shapes:
+#   "\tlibfoo.so.1 => /lib/x86_64-linux-gnu/libfoo.so.1 (0x00007f...)"
+#   "\tlinux-vdso.so.1 (0x00007ffee...)"                 (no "=>" target
+#                                                          -- the kernel
+#                                                          VDSO, never a
+#                                                          real file)
+#   "\tlibbar.so => not found"
+# Only the first shape (a real "=>" resolution to an actual path) is
+# useful here; the regex's own `target` group is optional so lines
+# without one (the VDSO shape) simply fail to match `resolve_ldd_
+# dependencies()`'s own filter above, exactly like an explicit "not
+# found" target does.
+_LDD_DEPENDENCY_LINE_RE = re.compile(
+    r"^\s*(?P<soname>\S+)\s+=>\s+(?P<target>\S+|not found)(?:\s+\(0x[0-9a-fA-F]+\))?\s*$"
+)
+
+
+def capture_distro_source_provenance(
+    resolved_dependencies: dict[str, Path],
+) -> dict[str, dict[str, str]]:
+    """For every {soname: resolved_absolute_path} pair (as returned by
+    resolve_ldd_dependencies(), ideally merged across every first-party
+    executable/Qt plugin/QML module this project's build is about to
+    bundle FROM), returns {soname: {"path", "sha256", "package",
+    "version", "sourcePackage"}} -- capturing each library's real
+    identity at the EXACT moment and EXACT path the real loader (and
+    therefore linuxdeploy) will actually copy it from, never a basename
+    re-discovered in a fixed, hardcoded directory list after packaging
+    has already finished (see this function's own preceding module
+    comment). An soname whose dpkg ownership/version cannot be
+    determined at all (dpkg missing, the resolved path no longer exists,
+    or the file genuinely is not dpkg-owned -- e.g. a project-vendored
+    library `ldd` also happens to resolve) is simply omitted from the
+    result, exactly the same honest, non-fatal degrade every other
+    provenance mechanism in this module already uses; a caller that
+    requires full coverage enforces that itself (see
+    cmd_capture_distro_provenance()'s own reporting)."""
+    captured: dict[str, dict[str, str]] = {}
+    for soname, resolved_path in resolved_dependencies.items():
+        if not resolved_path.is_file():
+            continue
+        package = _dpkg_owning_package(resolved_path)
+        if package is None:
+            continue
+        metadata = _dpkg_package_metadata(package)
+        if metadata is None:
+            continue
+        version, source_package = metadata
+        captured[soname] = {
+            "path": str(resolved_path),
+            "sha256": _sha256(resolved_path),
+            "package": package,
+            "version": version,
+            "sourcePackage": source_package,
+        }
+    return captured
+
+
+def bind_bundled_library_to_captured_provenance(
+    bundled_path: Path, manifest: dict[str, dict[str, str]]
+) -> dict[str, object]:
+    """The capture-before-packaging replacement for
+    bind_bundled_library_to_system_provenance() above (see this
+    function's own preceding module comment for the full "searches
+    fixed system dirs by basename, not exact linuxdeploy-selected
+    pre-copy file" rationale): `manifest` is the exact {soname:
+    {"path","sha256","package","version","sourcePackage"}} JSON object
+    captured BEFORE packaging by capture_distro_source_provenance() (see
+    packaging/build-appimage.sh's own "Capture distro provenance" step
+    and the `capture-distro-provenance` CLI subcommand below). This
+    function performs NO independent system search of its own at all --
+    it looks `bundled_path.name` up directly in `manifest` (the real
+    SONAME the actual dynamic loader itself resolved for this exact
+    dependency, at the exact moment of packaging).
+
+    Returns a dict with the same "status" contract as
+    bind_bundled_library_to_system_provenance() ("matched"/
+    "content_mismatch"/"not_found"; there is no "dpkg_unavailable"/
+    "not_dpkg_owned" distinction here since the manifest itself is only
+    ever produced on a real, dpkg-equipped build host -- an
+    empty/absent manifest entry means capture itself could not prove
+    anything about this component, which every caller already treats
+    identically to "not found" either way).
+
+    Round-N+ review ("changed file after capture"): "content_mismatch"
+    additionally proves the captured system file has not silently
+    changed on disk BETWEEN provenance-capture time and this classify
+    invocation, by re-hashing the manifest's own captured "path" right
+    now and comparing it against its own recorded "sha256" -- a TOCTOU
+    window between capturing provenance and actually packaging the file
+    must never be silently trusted -- in addition to the existing
+    bundled-vs-captured-system _canonical_load_digest() comparison
+    (which alone would not catch a same-digest-but-differently-signed
+    substitution occurring entirely within that window, since it only
+    ever inspects `bundled_path`/the CURRENT captured-path contents, not
+    what was true at the instant of capture)."""
+    entry = manifest.get(bundled_path.name)
+    if entry is None:
+        return {"status": "not_found"}
+    captured_path = Path(entry["path"])
+    if not captured_path.is_file():
+        return {"status": "not_found"}
+    current_sha256 = _sha256(captured_path)
+    if current_sha256 != entry["sha256"]:
+        return {
+            "status": "content_mismatch",
+            "package": entry["package"],
+            "version": entry["version"],
+            "sourcePackage": entry["sourcePackage"],
+            "systemPath": str(captured_path),
+            "systemSha256": current_sha256,
+            "systemCanonicalLoadDigest": _canonical_load_digest(captured_path),
+            "problem": (
+                "the captured system file's own bytes changed on disk "
+                "between provenance-capture time and this classify "
+                "invocation (recorded sha256 "
+                f"{entry['sha256']!r}, now {current_sha256!r})"
+            ),
+        }
+    bundled_digest = _canonical_load_digest(bundled_path)
+    system_digest = _canonical_load_digest(captured_path)
+    if (
+        bundled_digest is None
+        or system_digest is None
+        or bundled_digest != system_digest
+    ):
+        return {
+            "status": "content_mismatch",
+            "package": entry["package"],
+            "version": entry["version"],
+            "sourcePackage": entry["sourcePackage"],
+            "systemPath": str(captured_path),
+            "systemSha256": current_sha256,
+            "systemCanonicalLoadDigest": system_digest,
+        }
+    return {
+        "status": "matched",
+        "package": entry["package"],
+        "version": entry["version"],
+        "sourcePackage": entry["sourcePackage"],
+        "systemPath": str(captured_path),
+        "systemSha256": current_sha256,
+        "bundledCanonicalLoadDigest": bundled_digest,
+    }
+
+
+def load_distro_provenance_manifest(path: Path) -> dict[str, dict[str, str]]:
+    """Loads a JSON manifest written by cmd_capture_distro_provenance()
+    (or capture_distro_source_provenance() directly), validating that
+    it is a JSON object whose every value is itself an object -- raises
+    ValueError with a descriptive message on any structural problem
+    (missing file, invalid JSON, or a value shaped unlike a real capture
+    record), so a caller that requires a manifest (--require-package-
+    provenance without a real, honest capture) fails loudly and
+    immediately rather than silently treating a corrupt/truncated
+    manifest as "nothing captured"."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read distro provenance manifest {path}: {error}") from error
+    if not isinstance(raw, dict) or not all(isinstance(value, dict) for value in raw.values()):
+        raise ValueError(f"malformed distro provenance manifest {path}: expected a JSON object of objects")
+    return raw
+
+
 def validate_bundled_library_package_provenance(
     component: str, binding: dict[str, object], require_provenance: bool = False
 ) -> str | None:
@@ -1881,25 +2349,38 @@ def validate_bundled_library_package_provenance(
     name_problem = validate_component_package_provenance(component, binding)  # type: ignore[arg-type]
     if name_problem is not None:
         return name_problem
-    expected_version_prefix = COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX.get(component)
-    if expected_version_prefix is not None:
+    # Round-N+ review (HIGH, "`startswith(expected_version_prefix)` lets
+    # 1.46.50 satisfy 1.46.5; security revision drift"): EXACT equality
+    # against the COMPLETE, real `dpkg-query`-reported version string --
+    # see COMPONENT_EXPECTED_SOURCE_VERSION's own docstring for exactly
+    # why a prefix/`startswith()` comparison is structurally unsound
+    # (both the literal-substring collision and the silently-tolerated
+    # security-revision-drift gap it names). Any drift at all --
+    # upstream or Debian-revision, security patch or not -- is now a
+    # real, reported failure that must be deliberately reviewed and
+    # re-pinned here, never silently absorbed.
+    expected_version = COMPONENT_EXPECTED_SOURCE_VERSION.get(component)
+    if expected_version is not None:
         actual_version = str(binding["version"])
-        if not actual_version.startswith(expected_version_prefix):
+        if actual_version != expected_version:
             return (
                 f"component {component!r} expects its pinned "
-                f"{binding['sourcePackage']!r} version to start with "
-                f"{expected_version_prefix!r} (a routine point-release "
-                "bump is tolerated by this prefix; a genuine major/minor "
-                "upstream revision is not), but the real installed system "
-                f"package version is {actual_version!r} -- a package "
-                "revision drift that must be deliberately reviewed and "
-                "re-pinned in COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX"
+                f"{binding['sourcePackage']!r} version to be EXACTLY "
+                f"{expected_version!r}, but the real installed system "
+                f"package version is {actual_version!r} -- ANY drift "
+                "(a genuine upstream revision, a routine point release, "
+                "or a security-update Debian-revision bump alike) must "
+                "be deliberately reviewed and re-pinned in "
+                "COMPONENT_EXPECTED_SOURCE_VERSION, never silently "
+                "absorbed"
             )
     return None
 
 
 def bind_bundled_library_to_qt_sdk_provenance(
-    bundled_path: Path, qt_reference_dir: Path | None
+    bundled_path: Path,
+    qt_reference_dir: Path | None,
+    sdk_version: str | None = None,
 ) -> dict[str, object]:
     """Companion to bind_bundled_library_to_system_provenance() for
     components in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE (see that
@@ -1907,10 +2388,38 @@ def bind_bundled_library_to_qt_sdk_provenance(
     this project's actual pipeline is the Qt SDK's own bundled copy --
     never a dpkg-owned distro package. Proves `bundled_path` is the
     exact same compiled object as the real Qt SDK's own file at the
-    identical `lib/<basename>` relative path, using the identical
+    identical relative path resolved by
+    _resolve_qt_sdk_reference_candidate() (plugin subdirectory, "qml"
+    sub-path, or the `lib/<basename>` fallback used by core Qt
+    libraries and ICU alike), using the identical
     _is_same_compiled_object_or_unwritten() check this module already
     uses for core Qt libraries (_is_real_core_qt_library()) and Qt's own
     plugins/QML modules (_is_real_qt_plugin_or_qml_module()).
+
+    Round-N+ review ("Qt SDK binding only status/referencePath; no SDK
+    version/archive identity/reference SHA/canonical digest/transform
+    evidence"): a "matched" or "content_mismatch" result now ALSO
+    records the reference copy's own sha256 and
+    _canonical_load_digest() (computed once, from the exact same read
+    already required to answer "matched" at all -- no separate re-hash
+    is ever performed later for the SBOM), plus the bundled file's own
+    sha256/canonical digest for independent, non-repudiable
+    reconstruction by an external auditor with no access to either file
+    -- mirroring bind_bundled_library_to_system_provenance()'s own
+    "systemSha256"/"bundledCanonicalLoadDigest" fields for distro
+    components. `sdk_version` -- this project's own pinned Qt release
+    (e.g. "6.11.1", the exact `$QT_VERSION` this build's
+    jurplel/install-qt-action step installed; see
+    .github/workflows/ci.yml) -- is recorded verbatim as "sdkVersion"
+    when supplied, honestly documenting the exact upstream SDK release
+    this reference copy came from. NOTE: this project's build pipeline
+    has no access to the upstream Qt SDK *archive's own* published
+    checksum/identity (jurplel/install-qt-action, backed by aqtinstall,
+    exposes no such value as an action output) -- "sdkVersion" is
+    therefore the most precise upstream-release identity this
+    mechanism can honestly claim; the reference COPY's own content is
+    what is actually cryptographically authenticated here, exactly as
+    for every other component in this module.
 
     Returns a dict with a "status" key, one of:
       - "qt_reference_dir_unavailable": no --qt-reference-dir was
@@ -1919,10 +2428,10 @@ def bind_bundled_library_to_qt_sdk_provenance(
         bind_bundled_library_to_system_provenance()'s own
         "dpkg_unavailable" status.
       - "not_found": a qt_reference_dir WAS supplied, but no file exists
-        at the identical `lib/<basename>` relative path under it -- on
-        a host where this check IS performable, an expected
-        Qt-SDK-bundled component with no findable reference copy is
-        itself a real problem, never silently accepted.
+        at the identical relative path under it -- on a host where this
+        check IS performable, an expected Qt-SDK-bundled component with
+        no findable reference copy is itself a real problem, never
+        silently accepted.
       - "content_mismatch": a reference copy was found at that path,
         but it is not proven identical to `bundled_path` -- the exact
         "substituted/tampered bundled file" scenario this check exists
@@ -1932,13 +2441,48 @@ def bind_bundled_library_to_qt_sdk_provenance(
         compiled object as `bundled_path`."""
     if qt_reference_dir is None:
         return {"status": "qt_reference_dir_unavailable"}
-    candidate = qt_reference_dir / "lib" / bundled_path.name
+    candidate = _resolve_qt_sdk_reference_candidate(bundled_path, qt_reference_dir)
     reference_path = str(candidate)
     if not candidate.is_file():
-        return {"status": "not_found", "referencePath": reference_path}
-    if not _is_same_compiled_object_or_unwritten(candidate, bundled_path):
-        return {"status": "content_mismatch", "referencePath": reference_path}
-    return {"status": "matched", "referencePath": reference_path}
+        result: dict[str, object] = {"status": "not_found", "referencePath": reference_path}
+        if sdk_version is not None:
+            result["sdkVersion"] = sdk_version
+        return result
+    # Each digest below is computed exactly once, here, and reused both
+    # to derive "matched"/"content_mismatch" AND as this result's own
+    # recorded evidence -- deliberately never re-hashing the same file
+    # a second time the way calling the separate, boolean-only
+    # _is_same_compiled_object_or_unwritten() helper here (in addition
+    # to recording these fields) would have required.
+    reference_sha256 = _sha256(candidate)
+    reference_digest = _canonical_load_digest(candidate)
+    result: dict[str, object] = {
+        "referencePath": reference_path,
+        "referenceSha256": reference_sha256,
+        "referenceCanonicalLoadDigest": reference_digest,
+    }
+    if not bundled_path.is_file():
+        # Mirrors _is_same_compiled_object_or_unwritten()'s own
+        # "unwritten bundled file" allowance -- see that helper's
+        # docstring for why this is not a security-relevant weakening
+        # of the real, on-disk code path (find_bundled_libraries()
+        # always yields a real, existing file in production; only this
+        # module's own pure path-resolution unit tests exercise a
+        # bundled_path that was never materialized on disk).
+        matched = True
+    else:
+        bundled_sha256 = _sha256(bundled_path)
+        bundled_digest = _canonical_load_digest(bundled_path)
+        result["bundledSha256"] = bundled_sha256
+        result["bundledCanonicalLoadDigest"] = bundled_digest
+        if reference_digest is not None and bundled_digest is not None:
+            matched = reference_digest == bundled_digest
+        else:
+            matched = reference_sha256 == bundled_sha256
+    result["status"] = "matched" if matched else "content_mismatch"
+    if sdk_version is not None:
+        result["sdkVersion"] = sdk_version
+    return result
 
 
 def validate_bundled_library_qt_sdk_provenance(
@@ -1981,6 +2525,53 @@ def validate_bundled_library_qt_sdk_provenance(
             "output at all"
         )
     return None
+
+
+def compute_qt_sdk_bindings(
+    by_component: dict[str, list[Path]],
+    qt_reference_dir: Path | None,
+    sdk_version: str | None = None,
+) -> dict[Path, dict[str, object]]:
+    """Computes bind_bundled_library_to_qt_sdk_provenance() EXACTLY ONCE
+    per bundled file in `by_component` whose component is in
+    _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE ("icu" and "qt"),
+    returning a dict keyed by each file's own Path.
+
+    Round-N+ review ("build_sbom_inventory binds separately before
+    cmd_classify later rebind/validate, so serialized object not
+    necessarily exact validated proof" / "produce ONE immutable
+    validation-binding object per artifact used both for acceptance and
+    SBOM ... Remove second lookup/rebind ... Ensure reference mutation/
+    race impossible (open descriptor/hash once or verify identity)"):
+    prior to this, build_sbom_inventory() and cmd_classify()'s own
+    provenance-validation loop each independently called
+    bind_bundled_library_to_qt_sdk_provenance() a SECOND time for every
+    qt/icu file -- meaning the object actually serialized into the SBOM
+    was never provably the exact same computation cmd_classify() used
+    to decide pass/fail; a change to either the bundled file or the
+    real Qt SDK reference tree occurring between those two independent
+    calls (however narrow a window) could make the SBOM's own recorded
+    "qtSdkProvenance" diverge from what was actually validated.
+
+    cmd_classify() calls this function exactly once, immediately after
+    classify_all(), and passes the SAME resulting dict into BOTH
+    build_sbom_inventory() (to populate each entry's "qtSdkProvenance"
+    field) and its own provenance-validation loop -- so both the
+    accepted/rejected decision and the serialized SBOM record are
+    provably the one and only binding ever computed for that file this
+    invocation, closing the reference-mutation/race window entirely (a
+    file changing after this function returns can no longer affect
+    validation OR the SBOM differently, since both already read from
+    the same already-computed dict)."""
+    bindings: dict[Path, dict[str, object]] = {}
+    for component, paths in by_component.items():
+        if component not in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
+            continue
+        for path in paths:
+            bindings[path] = bind_bundled_library_to_qt_sdk_provenance(
+                path, qt_reference_dir, sdk_version
+            )
+    return bindings
 
 
 # Qt ships its own plugins (image format decoders, platform integrations,
@@ -2067,6 +2658,46 @@ def classify(basename: str) -> str | None:
     return None
 
 
+def _resolve_qt_sdk_reference_candidate(path: Path, qt_reference_dir: Path) -> Path:
+    """Single, shared implementation of "where would the real Qt SDK's
+    own copy of this exact bundled file live" -- used by BOTH
+    classification (_is_real_qt_plugin_or_qml_module()/
+    _is_real_core_qt_library(), via classify_path()) AND
+    bind_bundled_library_to_qt_sdk_provenance() (the richer SBOM/
+    provenance binding consumed by cmd_classify()/build_sbom_inventory()).
+
+    Round-N+ review ("qtSdkProvenance included only ICU, not core
+    Qt/plugins using same classification"): prior to this,
+    bind_bundled_library_to_qt_sdk_provenance() unconditionally assumed
+    the ICU-only `lib/<basename>` shape, which is wrong for a real Qt
+    plugin (`plugins/<subdir>/<basename>`) or QML module (anywhere
+    beneath a literal `qml` path component) -- extending qtSdkProvenance
+    to those components required a single, correct, shape-aware
+    resolver reused everywhere, rather than duplicating (and risking
+    divergence between) this logic across classification and provenance
+    binding.
+
+    Three shapes, identical to classify_path()'s own directory-based
+    dispatch:
+      - a Qt plugin (path's immediate parent directory name is one of
+        QT_PLUGIN_DIRECTORIES): qt_reference_dir/plugins/<dirname>/<basename>
+      - a Qt QML module (a literal "qml" path component appears
+        anywhere in path's parts): qt_reference_dir/qml/<sub-path
+        beneath that "qml" component>
+      - otherwise (a core Qt library such as libQt6Core.so.6, OR ICU,
+        which Qt's own SDK bundles directly alongside its core
+        libraries -- see _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE's
+        own docstring): qt_reference_dir/lib/<basename>, the original,
+        still-correct fallback shape for both of those cases."""
+    if path.parent.name in QT_PLUGIN_DIRECTORIES:
+        return qt_reference_dir / "plugins" / path.parent.name / path.name
+    if QT_QML_ROOT_DIRNAME in path.parts:
+        qml_index = path.parts.index(QT_QML_ROOT_DIRNAME)
+        sub_path = Path(*path.parts[qml_index + 1 :])
+        return qt_reference_dir / QT_QML_ROOT_DIRNAME / sub_path
+    return qt_reference_dir / "lib" / path.name
+
+
 def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool:
     """Returns True only if a file with the SAME relative sub-path (plugin
     subdirectory + basename, or the full path beneath the "qml" root)
@@ -2122,14 +2753,9 @@ def _is_real_qt_plugin_or_qml_module(path: Path, qt_reference_dir: Path) -> bool
     first place -- there is nothing for a content check to meaningfully
     protect against for a file that was never written -- so this is not
     a security-relevant weakening of the real, on-disk code path."""
-    if path.parent.name in QT_PLUGIN_DIRECTORIES:
-        candidate = qt_reference_dir / "plugins" / path.parent.name / path.name
-    elif QT_QML_ROOT_DIRNAME in path.parts:
-        qml_index = path.parts.index(QT_QML_ROOT_DIRNAME)
-        sub_path = Path(*path.parts[qml_index + 1 :])
-        candidate = qt_reference_dir / QT_QML_ROOT_DIRNAME / sub_path
-    else:
+    if path.parent.name not in QT_PLUGIN_DIRECTORIES and QT_QML_ROOT_DIRNAME not in path.parts:
         return False
+    candidate = _resolve_qt_sdk_reference_candidate(path, qt_reference_dir)
     return _is_same_compiled_object_or_unwritten(candidate, path)
 
 
@@ -2181,7 +2807,7 @@ def _is_real_core_qt_library(path: Path, qt_reference_dir: Path) -> bool:
     build-id/patchelf rationale, which applies identically here."""
     if not _CORE_QT_LIBRARY_RE.match(path.name):
         return False
-    candidate = qt_reference_dir / "lib" / path.name
+    candidate = _resolve_qt_sdk_reference_candidate(path, qt_reference_dir)
     return _is_same_compiled_object_or_unwritten(candidate, path)
 
 
@@ -2347,6 +2973,9 @@ def classify_all(
 def build_sbom_inventory(
     lib_dir: Path,
     qt_reference_dir: Path | None = None,
+    distro_provenance_manifest: dict[str, dict[str, str]] | None = None,
+    qt_sdk_bindings: dict[Path, dict[str, object]] | None = None,
+    qt_sdk_version: str | None = None,
 ) -> list[dict[str, object]]:
     """Every real bundled ELF found under lib_dir, with NO exclusions --
     unlike classify_all() above (whose whole purpose is deciding what
@@ -2397,7 +3026,42 @@ def build_sbom_inventory(
     represented as merely "packageProvenance: null" with no explanation
     -- every final bundled ELF, fully identified, with an explicit,
     reviewable disposition; nothing bundled is ever left out of this
-    list."""
+    list.
+
+    Round-N+ review (HIGH, "distro provenance post-hoc/unpinned ...
+    capture exact loader/copy source BEFORE packaging ... No basename
+    re-discovery"): when `distro_provenance_manifest` is supplied (the
+    JSON object produced by capture_distro_source_provenance() BEFORE
+    packaging -- see packaging/build-appimage.sh's own "Capture distro
+    provenance" step), packageProvenance is populated via
+    bind_bundled_library_to_captured_provenance() instead -- which
+    performs NO independent system search of its own at all, only a
+    direct manifest lookup -- so a real, governed build/CI invocation
+    never falls back to the older, basename-search-based
+    bind_bundled_library_to_system_provenance(). Omitting it (the
+    default) preserves that older, best-effort behavior for a
+    non-governed/local/partial-host invocation that has no manifest to
+    supply at all.
+
+    Round-N+ review ("qtSdkProvenance included only ICU, not core
+    Qt/plugins using same classification" / "Remove second lookup/
+    rebind ... Ensure reference mutation/race impossible"): when
+    `qt_sdk_bindings` is supplied (the dict produced by
+    compute_qt_sdk_bindings(), computed ONCE by cmd_classify()
+    immediately after classify_all() and shared with its own
+    provenance-validation loop), each qt/icu entry's "qtSdkProvenance"
+    is looked up directly from it -- never recomputed here -- so the
+    exact object serialized into the SBOM is provably the same one
+    cmd_classify() itself validated, not a second, independent,
+    possibly time-of-check/time-of-use-divergent computation. Omitting
+    it (the default, e.g. this module's own direct unit-test callers)
+    falls back to computing it inline via
+    bind_bundled_library_to_qt_sdk_provenance() for backward
+    compatibility with callers that only ever need the SBOM in
+    isolation. `qt_sdk_version` is forwarded to that inline fallback
+    call only (bindings already present in a supplied `qt_sdk_bindings`
+    dict already carry whatever "sdkVersion" compute_qt_sdk_bindings()
+    was invoked with)."""
     entries: list[dict[str, object]] = []
     for path in find_bundled_libraries(lib_dir):
         basename = path.name
@@ -2415,14 +3079,67 @@ def build_sbom_inventory(
             "classification": classification,
         }
         entry.update(elf_identity(path))
-        entry["packageProvenance"] = bind_bundled_library_to_system_provenance(path)
-        if classification in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
-            entry["qtSdkProvenance"] = bind_bundled_library_to_qt_sdk_provenance(
-                path, qt_reference_dir
+        if distro_provenance_manifest is not None:
+            entry["packageProvenance"] = bind_bundled_library_to_captured_provenance(
+                path, distro_provenance_manifest
             )
+        else:
+            entry["packageProvenance"] = bind_bundled_library_to_system_provenance(path)
+        if classification in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
+            if qt_sdk_bindings is not None and path in qt_sdk_bindings:
+                entry["qtSdkProvenance"] = qt_sdk_bindings[path]
+            else:
+                entry["qtSdkProvenance"] = bind_bundled_library_to_qt_sdk_provenance(
+                    path, qt_reference_dir, qt_sdk_version
+                )
         entries.append(entry)
     entries.sort(key=lambda e: str(e["path"]))
     return entries
+
+
+def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
+    """Handler for the `capture-distro-provenance` CLI subcommand: runs
+    resolve_ldd_dependencies() against every ELF path in args.elf_paths
+    (this project's own pre-packaging, first-party executable and/or Qt
+    plugins), merges the results (a later path's resolution for a given
+    soname wins, since every genuine first-party binary in this
+    project's own build resolves each real distro soname to the same
+    real system file on a given host anyway), captures full provenance
+    for the merged set via capture_distro_source_provenance(), and
+    writes the result as JSON to args.output -- the manifest later
+    consumed by `classify --distro-provenance-manifest`."""
+    merged_dependencies: dict[str, Path] = {}
+    missing_inputs: list[Path] = []
+    for elf_path in args.elf_paths:
+        if not elf_path.is_file():
+            missing_inputs.append(elf_path)
+            continue
+        merged_dependencies.update(resolve_ldd_dependencies(elf_path))
+    if missing_inputs:
+        print(
+            "audit_codec_notices: capture-distro-provenance input(s) not "
+            f"found: {[str(p) for p in missing_inputs]!r}",
+            file=sys.stderr,
+        )
+        return 2
+    if not merged_dependencies:
+        print(
+            "audit_codec_notices: capture-distro-provenance resolved zero "
+            "dependencies across all given ELF path(s) -- is `ldd` "
+            "installed, and are the given paths real, dynamically linked "
+            "ELF files?",
+            file=sys.stderr,
+        )
+        return 1
+    captured = capture_distro_source_provenance(merged_dependencies)
+    args.output.write_text(json.dumps(captured, indent=2, sort_keys=True) + "\n")
+    print(
+        f"audit_codec_notices: captured distro provenance for "
+        f"{len(captured)}/{len(merged_dependencies)} resolved "
+        f"dependenc{'y' if len(merged_dependencies) == 1 else 'ies'} to "
+        f"{args.output}"
+    )
+    return 0
 
 
 def cmd_classify(args: argparse.Namespace) -> int:
@@ -2435,7 +3152,36 @@ def cmd_classify(args: argparse.Namespace) -> int:
         print(f"Not a directory: {qt_reference_dir}", file=sys.stderr)
         return 2
 
+    require_package_provenance: bool = getattr(
+        args, "require_package_provenance", False
+    )
+    distro_provenance_manifest_path: Path | None = getattr(
+        args, "distro_provenance_manifest", None
+    )
+    distro_provenance_manifest: dict[str, dict[str, str]] | None = None
+    if distro_provenance_manifest_path is not None:
+        try:
+            distro_provenance_manifest = load_distro_provenance_manifest(
+                distro_provenance_manifest_path
+            )
+        except ValueError as error:
+            print(f"audit_codec_notices: {error}", file=sys.stderr)
+            return 2
+    qt_sdk_version: str | None = getattr(args, "qt_sdk_version", None)
+
     by_component, unmapped = classify_all(lib_dir, qt_reference_dir)
+
+    # Round-N+ review ("build_sbom_inventory binds separately before
+    # cmd_classify later rebind/validate ... Remove second lookup/
+    # rebind"): compute every qt/icu file's Qt-SDK-provenance binding
+    # EXACTLY ONCE here, immediately after classify_all(), then share
+    # this SAME dict with both build_sbom_inventory() (for the "inventory"
+    # JSON output below) and this function's own provenance-validation
+    # loop further down -- see compute_qt_sdk_bindings()'s own docstring
+    # for why this closes the reference-mutation/race window a second,
+    # independent recomputation in each of those two places previously
+    # left open.
+    qt_sdk_bindings = compute_qt_sdk_bindings(by_component, qt_reference_dir, qt_sdk_version)
 
     if args.json_out is not None:
         manifest = {
@@ -2453,7 +3199,12 @@ def cmd_classify(args: argparse.Namespace) -> int:
             # per review directive: a true SBOM must let a consumer
             # answer "what, exactly, did we ship" for every single
             # bundled file, not only the subset requiring a notice.
-            "inventory": build_sbom_inventory(lib_dir, qt_reference_dir),
+            "inventory": build_sbom_inventory(
+                lib_dir,
+                qt_reference_dir,
+                distro_provenance_manifest,
+                qt_sdk_bindings,
+            ),
         }
         args.json_out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
@@ -2507,26 +3258,72 @@ def cmd_classify(args: argparse.Namespace) -> int:
     # it remains a harmless, skipped no-op on a merely dpkg-equipped but
     # incomplete host (a partial local dev container, or this file's own
     # basename-only classification unit tests).
-    require_package_provenance: bool = getattr(
-        args, "require_package_provenance", False
-    )
+    #
+    # Round-N+ review (HIGH, "No basename re-discovery"): when a real
+    # distro_provenance_manifest was captured BEFORE packaging (see
+    # this function's own earlier --require-package-provenance/
+    # --distro-provenance-manifest handling above), every distro
+    # component's binding below is looked up directly in that manifest
+    # via bind_bundled_library_to_captured_provenance() -- never
+    # re-discovered afterward by an independent basename search.
+    #
+    # When require_package_provenance is set but no manifest was
+    # supplied, an authoritative check would otherwise silently fall
+    # back to the after-the-fact basename search below for any REAL
+    # distro-packaged component present (never for Qt-SDK-provenance
+    # components such as "icu", which never go through that fallback at
+    # all) -- reopening exactly the defect the manifest mechanism
+    # exists to close. Fail closed with an explicit configuration error
+    # instead, but only when a real distro component that would
+    # actually need it is present at all, so --require-package-
+    # provenance remains usable on its own for an icu-only/Qt-SDK-only
+    # classification.
+    if require_package_provenance and distro_provenance_manifest is None:
+        distro_components_present = sorted(
+            component
+            for component in by_component
+            if component not in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE
+        )
+        if distro_components_present:
+            print(
+                "audit_codec_notices: --require-package-provenance requires "
+                "--distro-provenance-manifest (a manifest captured BEFORE "
+                "packaging via the capture-distro-provenance subcommand) "
+                f"for real distro component(s) {distro_components_present!r} "
+                "-- falling back to an after-the-fact basename search is "
+                "exactly the defect this flag combination exists to "
+                "prevent.",
+                file=sys.stderr,
+            )
+            return 2
+
     provenance_problems: list[str] = []
     for component, paths in sorted(by_component.items()):
         for path in paths:
             # New review item ("ICU library package-provenance
             # mismatch"): components in
-            # _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE (currently only
-            # "icu") never originate from a dpkg-owned distro package in
+            # _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE ("icu" and
+            # "qt") never originate from a dpkg-owned distro package in
             # this project's actual pipeline -- see that constant's own
             # docstring -- so their provenance is authenticated against
             # the real Qt SDK reference copy instead of the host's dpkg
-            # database.
+            # database. Round-N+ review ("Remove second lookup/
+            # rebind"): reuses the SAME qt_sdk_bindings dict computed
+            # once above (via compute_qt_sdk_bindings(), immediately
+            # after classify_all()) rather than calling
+            # bind_bundled_library_to_qt_sdk_provenance() again here --
+            # see compute_qt_sdk_bindings()'s own docstring.
             if component in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
-                qt_sdk_binding = bind_bundled_library_to_qt_sdk_provenance(
-                    path, qt_reference_dir
-                )
+                qt_sdk_binding = qt_sdk_bindings[path]
                 problem = validate_bundled_library_qt_sdk_provenance(
                     component, qt_sdk_binding, require_package_provenance
+                )
+            elif distro_provenance_manifest is not None:
+                binding = bind_bundled_library_to_captured_provenance(
+                    path, distro_provenance_manifest
+                )
+                problem = validate_bundled_library_package_provenance(
+                    component, binding, require_package_provenance
                 )
             else:
                 binding = bind_bundled_library_to_system_provenance(path)
@@ -2675,10 +3472,71 @@ def main(argv: list[str]) -> int:
             "host where every expected distro library's system "
             "counterpart is genuinely guaranteed to be installed (this "
             "project's own pinned ubuntu-22.04 appimage-smoke CI job in "
-            "particular); never pass this on a partial/incomplete host."
+            "particular); never pass this on a partial/incomplete host. "
+            "Requires --distro-provenance-manifest (see its own help) -- "
+            "an after-the-fact basename search is never accepted as "
+            "authoritative provenance."
+        ),
+    )
+    classify_parser.add_argument(
+        "--distro-provenance-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Round-N+ review (HIGH, \"distro provenance post-hoc/"
+            "unpinned ... capture exact loader/copy source BEFORE "
+            "packaging ... No basename re-discovery\"): path to the JSON "
+            "manifest produced by the capture-distro-provenance "
+            "subcommand BEFORE packaging (see packaging/build-"
+            "appimage.sh's own \"Capture distro provenance\" step). When "
+            "supplied, every distro component's package provenance is "
+            "looked up directly in this manifest (bind_bundled_library_"
+            "to_captured_provenance()) instead of an independent, "
+            "after-the-fact basename search across fixed system "
+            "directories."
+        ),
+    )
+    classify_parser.add_argument(
+        "--qt-sdk-version",
+        type=str,
+        default=None,
+        help=(
+            "Round-N+ review (\"include exact Qt SDK release/archive/"
+            "checksum\"): this project's own pinned Qt release (e.g. "
+            "the exact $QT_VERSION jurplel/install-qt-action installed "
+            "-- see .github/workflows/ci.yml), recorded verbatim as "
+            "\"sdkVersion\" in every qt/icu inventory entry's "
+            "qtSdkProvenance -- see "
+            "bind_bundled_library_to_qt_sdk_provenance()'s own docstring "
+            "for why this is the most precise upstream-SDK-release "
+            "identity this mechanism can honestly claim."
         ),
     )
     classify_parser.set_defaults(func=cmd_classify)
+
+    capture_provenance_parser = subparsers.add_parser(
+        "capture-distro-provenance",
+        help=(
+            "Captures real distro-package provenance (path/sha256/"
+            "package/version/sourcePackage) for every dynamically "
+            "resolved dependency of one or more pre-packaging, "
+            "first-party ELF files (this project's own compiled "
+            "executable and/or Qt plugins BEFORE linuxdeploy copies/"
+            "patches anything), using the real dynamic loader's own "
+            "resolution (via `ldd`) -- never an independent post-hoc "
+            "directory search. Must be run BEFORE packaging; see "
+            "packaging/build-appimage.sh's own \"Capture distro "
+            "provenance\" step."
+        ),
+    )
+    capture_provenance_parser.add_argument(
+        "elf_paths",
+        type=Path,
+        nargs="+",
+        help="One or more pre-packaging, first-party ELF executables/plugins to resolve dependencies from.",
+    )
+    capture_provenance_parser.add_argument("--output", type=Path, required=True)
+    capture_provenance_parser.set_defaults(func=cmd_capture_distro_provenance)
 
     verify_parser = subparsers.add_parser("verify-notices")
     verify_parser.add_argument("lib_dir", type=Path)
