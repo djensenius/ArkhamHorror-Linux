@@ -1416,6 +1416,48 @@ const QSet<QString> &trustedLocalMountFilesystemTypes() {
   return types;
 }
 
+// Reads an ENTIRE procfs-style pseudo-file via raw POSIX read(), never
+// trusting fstat()'s reported size (which the kernel deliberately
+// reports as 0 for /proc/self/mountinfo and most other procfs entries
+// -- their real content only exists once actually read). This is a
+// genuine, previously undiagnosed root cause: QFile's buffered
+// QIODevice::atEnd()/bytesAvailable() machinery for a "random access"
+// (non-sequential) device is itself derived from that same stat()
+// size, so QFile::atEnd() reports true IMMEDIATELY after opening such a
+// file, before a single byte is ever read -- silently turning the
+// mountinfo parse loop below into a permanent, unconditional zero-line
+// no-op on every real Linux system, regardless of the file's actual
+// (non-empty) content. Reading directly via a raw fd and a read()
+// loop -- exactly like the rest of this file's own filesystem
+// primitives already do -- has no such dependency: it keeps reading
+// until the kernel itself reports a genuine end-of-file (a `read()`
+// returning 0), which is the only correct definition of EOF for a
+// pseudo-file like this one.
+std::optional<QByteArray> readEntireProcFileRaw(const char *path) {
+  const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  QByteArray content;
+  char chunk[4096];
+  for (;;) {
+    const ssize_t bytesRead = ::read(fd, chunk, sizeof(chunk));
+    if (bytesRead < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      ::close(fd);
+      return std::nullopt;
+    }
+    if (bytesRead == 0) {
+      break;
+    }
+    content.append(chunk, static_cast<int>(bytesRead));
+  }
+  ::close(fd);
+  return content;
+}
+
 // True iff /proc/self/mountinfo records `canonicalMountPoint` (which
 // MUST already be an absolute, kernel-canonicalized path -- see this
 // function's own call site, which derives it from
@@ -1436,9 +1478,10 @@ bool mountPointHasTrustedLocalFilesystemType(
     return g_forceMountTransitionPolicyOverrideValueForTesting.load(
         std::memory_order_acquire);
   }
-  QFile mountinfo(QStringLiteral("/proc/self/mountinfo"));
-  if (!mountinfo.open(QIODevice::ReadOnly | QIODevice::Text)) {
-    qWarning() << "AssetCache: could not open /proc/self/mountinfo to "
+  const std::optional<QByteArray> mountinfoContent =
+      readEntireProcFileRaw("/proc/self/mountinfo");
+  if (!mountinfoContent.has_value()) {
+    qWarning() << "AssetCache: could not read /proc/self/mountinfo to "
                   "authenticate mount point"
                << canonicalMountPoint;
     return false;
@@ -1450,8 +1493,12 @@ bool mountPointHasTrustedLocalFilesystemType(
   QStringList mostRecentMountPoints;
   const QString leafComponent =
       canonicalMountPoint.section(QLatin1Char('/'), -1);
-  while (!mountinfo.atEnd()) {
-    const QString line = QString::fromUtf8(mountinfo.readLine());
+  const QList<QByteArray> rawLines = mountinfoContent->split('\n');
+  for (const QByteArray &rawLine : rawLines) {
+    if (rawLine.isEmpty()) {
+      continue;
+    }
+    const QString line = QString::fromUtf8(rawLine);
     const int dashIndex = line.indexOf(QStringLiteral(" - "));
     if (dashIndex < 0) {
       continue;
@@ -4429,6 +4476,42 @@ bool AssetCache::mountIdentificationSupportedForTesting(const QString &path) {
 #else
   Q_UNUSED(path);
   return false;
+#endif
+}
+
+std::optional<int> AssetCache::mountinfoParsedEntryCountForTesting() {
+#if defined(__linux__)
+  const std::optional<QByteArray> content =
+      readEntireProcFileRaw("/proc/self/mountinfo");
+  if (!content.has_value()) {
+    return 0;
+  }
+  int parsedEntries = 0;
+  const QList<QByteArray> rawLines = content->split('\n');
+  for (const QByteArray &rawLine : rawLines) {
+    if (rawLine.isEmpty()) {
+      continue;
+    }
+    const QString line = QString::fromUtf8(rawLine);
+    const int dashIndex = line.indexOf(QStringLiteral(" - "));
+    if (dashIndex < 0) {
+      continue;
+    }
+    const QStringList beforeDash =
+        line.left(dashIndex).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    if (beforeDash.size() < 5) {
+      continue;
+    }
+    const QStringList afterDash =
+        line.mid(dashIndex + 3).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    if (afterDash.isEmpty()) {
+      continue;
+    }
+    ++parsedEntries;
+  }
+  return parsedEntries;
+#else
+  return std::nullopt;
 #endif
 }
 

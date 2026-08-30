@@ -629,6 +629,21 @@ public:
   [[nodiscard]] static bool
   mountIdentificationSupportedForTesting(const QString &path);
 
+  // Test-only, UNPRIVILEGED regression witness for the "QFile::atEnd()
+  // silently truncates every /proc/self/mountinfo read to zero lines"
+  // defect (see readEntireProcFileRaw()'s own comment in AssetCache.cpp
+  // for the full mechanism): calls the SAME raw-read primitive
+  // mountPointHasTrustedLocalFilesystemType() uses in production and
+  // reports how many syntactically valid ("... - fstype ...") mount
+  // entries it actually parsed. On any real Linux system this is always
+  // > 0 (a process always has at least its own root mount) -- the
+  // exact, deterministic, unprivileged, always-reproducible assertion
+  // that would have failed under the pre-fix QFile-based
+  // implementation (which always parsed exactly 0 entries, regardless
+  // of the real mount table's contents) and now passes. Returns
+  // std::nullopt on any non-Linux platform.
+  [[nodiscard]] static std::optional<int> mountinfoParsedEntryCountForTesting();
+
   // Test-only, deterministic, UNPRIVILEGED injection of the two
   // degradations a legacy kernel (older than 5.6/5.8, or one built
   // without openat2()/STATX_MNT_ID support) would actually present --

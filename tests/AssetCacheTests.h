@@ -110,6 +110,7 @@ private slots:
   void ownedSuffixOfPlainDirectoriesUnderTrustedAnchorResolvesSuccessfully();
   void crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted();
   void mountIdentificationIsActuallySupportedOnThisLinuxBuildUnprivileged();
+  void mountinfoRawReadParsesAtLeastOneEntryOnThisLinuxBuildUnprivileged();
 
   // Round-7/8 item 2/5: path-based QDir::mkpath() is entirely removed
   // from the constructor -- owned-suffix components are now created

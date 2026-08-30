@@ -2238,6 +2238,43 @@ void AssetCacheTests::
 #endif
 }
 
+void AssetCacheTests::
+    mountinfoRawReadParsesAtLeastOneEntryOnThisLinuxBuildUnprivileged() {
+  // Regression for the actual root cause behind all 3 real bind-mount
+  // "transition is permitted" tests above failing on real CI, entirely
+  // independent of the mount transition itself: reading
+  // /proc/self/mountinfo via QFile's buffered QIODevice::atEnd()
+  // machinery silently parsed EXACTLY ZERO lines on every real Linux
+  // system, always -- fstat() reports a procfs pseudo-file's size as 0,
+  // and QFile derives a random-access (non-sequential) device's
+  // bytesAvailable()/atEnd() from that same stale size, so atEnd()
+  // reported true immediately after open(), before a single byte was
+  // ever actually read. This silently turned
+  // mountPointHasTrustedLocalFilesystemType()'s real production check
+  // into an unconditional "no entry found" no-op -- exactly why every
+  // one of the 3 tests above that depends on it (not merely the
+  // ownership/mode half of the check) could never pass on any real
+  // Linux system, bind mount or not.
+  //
+  // This assertion needs no privilege and no bind mount at all: a
+  // process ALWAYS has at least one real mountinfo entry (its own root
+  // mount), so mountinfoParsedEntryCountForTesting() -- which exercises
+  // the exact same raw-read-and-parse code path
+  // mountPointHasTrustedLocalFilesystemType() itself uses in production
+  // -- must report a strictly positive count on every real Linux
+  // kernel. Under the pre-fix QFile-based implementation this would
+  // deterministically have reported exactly 0 instead.
+#if !defined(__linux__)
+  QSKIP("/proc/self/mountinfo is a Linux-specific concept; not "
+        "applicable on this platform");
+#else
+  const std::optional<int> parsedEntries =
+      AssetCache::mountinfoParsedEntryCountForTesting();
+  QVERIFY(parsedEntries.has_value());
+  QVERIFY(*parsedEntries > 0);
+#endif
+}
+
 namespace {
 // RAII guard around AssetCache::setMountIdentificationDegradedForTesting()
 // -- guarantees the process-wide override is always reset back to false
