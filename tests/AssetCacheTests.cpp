@@ -1776,6 +1776,166 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    ownedSuffixMissingComponentsAreCreatedViaMkdiratNeverPathBasedMkpath() {
+  // Round-7/8 item 2/5 (HIGH): the constructor no longer calls
+  // QDir::mkpath() at all -- openDirectoryChainNoFollow() itself must
+  // now create any MISSING owned-suffix component, via mkdirat()
+  // relative to an already-open, already no-follow-verified parent
+  // descriptor. Prove this directly against the exact function under
+  // test: neither "assets" nor "v1" exist under `anchorDir` beforehand
+  // (unlike
+  // ownedSuffixOfPlainDirectoriesUnderTrustedAnchorResolvesSuccessfully()'s
+  // negative control, which pre-creates them with QDir::mkpath() itself
+  // purely as harness setup), yet resolution still succeeds and leaves
+  // genuine, non-symlink directories behind on disk.
+  const QString anchorDir = m_tempDirPath + QStringLiteral("/anchor3");
+  QVERIFY(QDir().mkpath(anchorDir));
+  QVERIFY(!QFileInfo::exists(anchorDir + QStringLiteral("/assets")));
+
+  QVERIFY(AssetCache::directoryChainResolvesNoFollowForTesting(
+      anchorDir, {QStringLiteral("assets"), QStringLiteral("v1")}));
+
+  QVERIFY(QFileInfo(anchorDir + QStringLiteral("/assets")).isDir());
+  QVERIFY(!QFileInfo(anchorDir + QStringLiteral("/assets")).isSymLink());
+  QVERIFY(QFileInfo(anchorDir + QStringLiteral("/assets/v1")).isDir());
+  QVERIFY(!QFileInfo(anchorDir + QStringLiteral("/assets/v1")).isSymLink());
+
+  // Idempotent: resolving again against the now-already-existing chain
+  // must still succeed (mkdirat()'s EEXIST is treated as success, not a
+  // failure), matching mkdir -p's own "already there is fine" semantics
+  // without ever falling back to a path-based call to get it.
+  QVERIFY(AssetCache::directoryChainResolvesNoFollowForTesting(
+      anchorDir, {QStringLiteral("assets"), QStringLiteral("v1")}));
+}
+
+void AssetCacheTests::
+    constructingWithIntermediateConfiguredDirectorySymlinkNeverAutoCreatesOrRecoversForeignDirectory() {
+  // Round-7/8 item 2 (HIGH): previously, QDir::mkpath(m_directory) ran
+  // UNCONDITIONALLY before any fd-based validation, and -- being a
+  // plain path-based `mkdir -p` with no symlink-awareness -- would
+  // silently create the configured leaf directory THROUGH an
+  // attacker-planted symlink for an INTERMEDIATE ancestor (one the
+  // single leaf-only QFileInfo::isSymLink() check could never see),
+  // "destructively recovering" a directory at wherever that symlink
+  // happened to point. Construct with Config::directory pointing at a
+  // NOT-YET-EXISTING leaf, one of whose ANCESTORS is a symlink to a
+  // completely separate external sentinel location, and prove: (a) the
+  // cache disables disk I/O entirely, (b) NOTHING is ever created at
+  // the configured path or anywhere beneath the symlink target, and (c)
+  // the sentinel directory the symlink points at is left with exactly
+  // its own pre-existing contents, untouched.
+  const QString sentinelDir =
+      m_tempDirPath + QStringLiteral("/intermediate-sentinel");
+  QVERIFY(QDir(m_tempDirPath).mkpath(QStringLiteral("intermediate-sentinel")));
+  const QString sentinelFile =
+      sentinelDir + QStringLiteral("/pre-existing.txt");
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(QByteArrayLiteral("must-not-be-touched"));
+  }
+
+  // `configured-symlink-ancestor` is a symlink to the sentinel; the
+  // actual configured cache directory is a LEAF underneath it
+  // ("cache-leaf") that does not exist yet on either side.
+  const QString symlinkAncestor =
+      m_tempDirPath + QStringLiteral("/configured-symlink-ancestor");
+  QVERIFY(QFile::link(sentinelDir, symlinkAncestor));
+  QVERIFY(QFileInfo(symlinkAncestor).isSymLink());
+  const QString configuredDirectory =
+      symlinkAncestor + QStringLiteral("/cache-leaf");
+  // Confirm the leaf genuinely does not exist through EITHER path
+  // before construction -- otherwise this test would not actually
+  // exercise the "must never be auto-created" guarantee at all.
+  QVERIFY(!QFileInfo::exists(configuredDirectory));
+  QVERIFY(!QFileInfo::exists(sentinelDir + QStringLiteral("/cache-leaf")));
+
+  AssetCache cache(configFor(configuredDirectory));
+  QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+  // Neither side of the symlink ever gained a "cache-leaf" directory:
+  // no directory creation ever happened at all, through the symlink or
+  // otherwise.
+  QVERIFY(!QFileInfo::exists(configuredDirectory));
+  QVERIFY(!QFileInfo::exists(sentinelDir + QStringLiteral("/cache-leaf")));
+
+  // The memory cache still works; only disk persistence is disabled.
+  const QString key = QString::fromLatin1(
+      QCryptographicHash::hash(
+          QByteArrayLiteral("intermediate-symlink-ancestor-key"),
+          QCryptographicHash::Sha256)
+          .toHex());
+  cache.store(key, makeEntry(QByteArrayLiteral("payload-bytes")));
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.diskUsageBytes(), qint64(0));
+
+  cache.reapAndEnforceQuota();
+
+  // The sentinel's own pre-existing file must still be exactly what it
+  // was -- nothing was ever written into, through, or alongside it.
+  QVERIFY(QFileInfo::exists(sentinelFile));
+  {
+    QFile file(sentinelFile);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), QByteArrayLiteral("must-not-be-touched"));
+  }
+  QDir sentinelListing(sentinelDir);
+  QCOMPARE(sentinelListing.entryList(QDir::Files | QDir::Dirs |
+                                     QDir::NoDotAndDotDot),
+           QStringList{"pre-existing.txt"});
+}
+
+void AssetCacheTests::
+    bindMountOverOwnedSuffixComponentIsRejectedDuringChainResolution() {
+  // Round-7/8 item 2 (HIGH), construction-time half of the round-6
+  // cleanup-time bind-mount guard above: openDirectoryChainNoFollow()'s
+  // per-step walk must now ALSO reject an owned-suffix component that
+  // resolves onto a different mount than its trusted anchor -- not just
+  // detect it later, after the fact, during a cleanup sweep. Exercises
+  // the exact same mountIdentityMatches()-based guard added to the
+  // walk's loop this round, directly against
+  // directoryChainResolvesNoFollowForTesting() rather than a full
+  // AssetCache (which would require redirecting the real
+  // QStandardPaths::CacheLocation, an unrelated and riskier harness
+  // change) -- fails closed (QSKIP) wherever passwordless bind-mount
+  // privilege is unavailable, exactly like the pre-existing cleanup-
+  // time test above.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString anchorDir = m_tempDirPath + QStringLiteral("/anchor4");
+  QVERIFY(QDir().mkpath(anchorDir + QStringLiteral("/assets")));
+
+  QTemporaryDir bindSourceDir;
+  QVERIFY(bindSourceDir.isValid());
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSourceDir.path(),
+                   anchorDir + QStringLiteral("/assets")});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{anchorDir + QStringLiteral("/assets")};
+
+  QVERIFY(!AssetCache::directoryChainResolvesNoFollowForTesting(
+      anchorDir, {QStringLiteral("assets"), QStringLiteral("v1")}));
+#endif
+}
+
+void AssetCacheTests::
     invalidateReportsPersistenceFailedWhenManifestUnlinkFails() {
   // Round-6 item 6: invalidate()'s durable-tombstone guarantee is only
   // meaningful if a genuine failure to commit it is actually reported,
@@ -1805,4 +1965,82 @@ void AssetCacheTests::
   AssetCache cache(configFor(m_tempDirPath));
   QCOMPARE(cache.invalidate(key),
            AssetCache::InvalidateResult::PersistenceFailed);
+}
+
+void AssetCacheTests::
+    deleteEntryUnlinksManifestDurablyEvenWhenPrefixEnumerationCannotBeCompleted() {
+  // Round-7/8 item 6 (MEDIUM): previously, deleteEntry() only unlinked
+  // the manifest when its OWN prefix-enumeration listing happened to
+  // include it -- so a directory whose contents cannot currently be
+  // LISTED at all (unlinkat/openat/fstatat on an individually-named
+  // file needs only search ('x') and write ('w') permission on the
+  // containing directory; readdir()'s enumeration additionally needs
+  // read ('r') permission -- POSIX directory permissions genuinely
+  // separate these) previously reported the manifest as "durably
+  // absent" without ever actually attempting to unlink it, letting the
+  // OLD entry silently revive once the transient listing failure
+  // cleared (a restart, or an expired negative-cache TTL). Revoke read
+  // permission (keep write+exec) on the cache directory -- this is
+  // deterministically verified below to break enumeration while still
+  // allowing a BY-NAME unlink of the manifest to succeed -- and prove
+  // invalidate() (which surfaces deleteEntry()'s manifestDurablyAbsent
+  // outcome) still reports a genuine, durable removal, with the
+  // manifest file actually gone from disk afterward.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/enum-blocked.png")));
+  // Constructed and populated BEFORE any permission change below: this
+  // instance's retained root directory descriptor (m_rootFd) is opened
+  // now, while ordinary permissions still apply. Every later fd-relative
+  // operation against that SAME already-open descriptor (fstatat/
+  // openat/unlinkat for an individually-named entry) is governed by the
+  // directory's CURRENT permission bits at syscall time, never by
+  // whatever permission happened to apply when the descriptor was first
+  // opened -- so this one instance is deliberately reused below, rather
+  // than constructing a fresh AssetCache after permissions are revoked
+  // (which would fail to even open the root descriptor at all, since
+  // opening a directory for reading genuinely does require read
+  // permission, unlike operating on an already-open one).
+  AssetCache cache(configFor(m_tempDirPath));
+  cache.store(key, makeEntry(QByteArray(64, 'y')));
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
+  QVERIFY(QFileInfo::exists(manifestPath));
+
+  struct ScopedDirectoryPermissionLock {
+    QString path;
+    ~ScopedDirectoryPermissionLock() {
+      QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner |
+                                      QFile::ExeOwner);
+    }
+  } permissionGuard{m_tempDirPath};
+  // -wx: write + execute, but deliberately NO read -- blocks
+  // opendir()/readdir() enumeration while still permitting an unlinkat()
+  // of an individually-named entry, via the already-open descriptor
+  // above, to succeed.
+  QVERIFY(QFile::setPermissions(m_tempDirPath,
+                                QFile::WriteOwner | QFile::ExeOwner));
+  // Sanity-check the fault this test actually depends on: without read
+  // permission, QDir's own (path-based) listing of this directory must
+  // already come back empty, proving the permission change genuinely
+  // breaks enumeration on this platform/filesystem and this test is not
+  // vacuously passing for an unrelated reason.
+  QVERIFY(QDir(m_tempDirPath).entryList(QDir::NoDotAndDotDot).isEmpty());
+
+  QCOMPARE(cache.invalidate(key),
+           AssetCache::InvalidateResult::DurablyInvalidated);
+
+  // Restore permissions now so the assertions below (and the guard's
+  // own destructor, which would otherwise be redundant but harmless)
+  // can freely read/enumerate the directory again.
+  QVERIFY(QFile::setPermissions(
+      m_tempDirPath, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+
+  // The manifest must be genuinely, physically gone -- not merely
+  // reported as gone -- and a brand-new AssetCache instance constructed
+  // fresh over the same directory must never see this key again: no
+  // revival, whether from an in-process restart or (as here) an
+  // entirely new instance.
+  QVERIFY(!QFileInfo::exists(manifestPath));
+  AssetCache freshCache(configFor(m_tempDirPath));
+  QVERIFY(!freshCache.lookupDisk(key).has_value());
 }

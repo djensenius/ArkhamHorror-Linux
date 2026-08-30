@@ -89,10 +89,30 @@ private slots:
   void crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted();
   void mountIdentificationIsActuallySupportedOnThisLinuxBuildUnprivileged();
 
+  // Round-7/8 item 2/5: path-based QDir::mkpath() is entirely removed
+  // from the constructor -- owned-suffix components are now created
+  // (never merely verified) directly by openDirectoryChainNoFollow()
+  // itself, via mkdirat() relative to an already-open parent
+  // descriptor, and every step of that walk must also be
+  // mount-identity-continuous with the trusted anchor above it.
+  void ownedSuffixMissingComponentsAreCreatedViaMkdiratNeverPathBasedMkpath();
+  void
+  constructingWithIntermediateConfiguredDirectorySymlinkNeverAutoCreatesOrRecoversForeignDirectory();
+  void bindMountOverOwnedSuffixComponentIsRejectedDuringChainResolution();
+
   // Round-6 item 6: invalidate() must report a typed failure -- rather
   // than silently succeeding -- when the manifest unlink it depends on
   // for a durable tombstone genuinely cannot be committed.
   void invalidateReportsPersistenceFailedWhenManifestUnlinkFails();
+
+  // Round-7/8 item 6: deleteEntry()'s manifest unlink must never be
+  // gated on a prefix enumeration that could itself fail -- and the
+  // manifest's removal must be crash-durable (fsync'd) even when that
+  // enumeration cannot be completed at all, so the entry can never
+  // revive after a restart or an expired negative-cache TTL purely
+  // because a transient, unrelated directory-listing failure occurred.
+  void
+  deleteEntryUnlinksManifestDurablyEvenWhenPrefixEnumerationCannotBeCompleted();
 
 private:
   QString m_tempDirPath;

@@ -102,6 +102,19 @@ private slots:
   // failed to remove resurface.
   void
   failedDurableInvalidationOnDefinitive404NeverRecordsNegativeAndFailsClosed();
+  // Round-7/8 item 6 ("cache-hit read/decode occurs before operation
+  // coalescing"): a burst of simultaneous requests for DIFFERENT logical
+  // AssetKeys resolving to the same candidate/cache key must share one
+  // decode, never one per request, for both a memory hit and a disk hit;
+  // a quarantine-worthy decode failure shared by the whole group must
+  // invalidate exactly once and let each waiter independently (but
+  // network-coalesced) refetch; and a waiter cancelled before the shared
+  // decode is delivered must never affect any surviving sibling waiter.
+  void concurrentAliasedMemoryHitRequestsCoalesceIntoASingleDecode();
+  void concurrentAliasedDiskHitRequestsCoalesceIntoASingleDecode();
+  void
+  corruptCoalescedCacheHitInvalidatesExactlyOnceAndEachWaiterIndependentlyRefetches();
+  void cancellingOneWaiterInACoalescedCacheDecodeGroupNeverAffectsAnother();
 
 private:
   QString m_tempDirPath;

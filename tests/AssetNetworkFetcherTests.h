@@ -53,6 +53,13 @@ private slots:
   void pngWithTrailingBytesAfterIendIsRejected();
   void pngWithMultipleIhdrChunksIsRejected();
   void pngWithNonConsecutiveIdatChunksIsRejected();
+  void pngWithCompressedAncillaryChunkIsRejected_data();
+  void pngWithCompressedAncillaryChunkIsRejected();
+  void pngWithUncompressedTextChunksIsStillAccepted();
+  void pngWithTrailingBytesAfterValidIdatZlibStreamIsRejected();
+  void pngWithTruncatedIdatZlibStreamAtVaryingCutPointsAllRejected_data();
+  void pngWithTruncatedIdatZlibStreamAtVaryingCutPointsAllRejected();
+  void pngWithInterlacedIhdrIsRejected();
   void avifRealFixtureAlwaysDecodesViaLibavif();
   void avifImageSequenceIsRejectedAsMalformedImage();
   void avifMalformedContainerIsReportedAsMalformedImage();

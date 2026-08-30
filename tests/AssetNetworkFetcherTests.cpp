@@ -22,6 +22,7 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <zlib.h>
 
 using namespace Arkham;
 
@@ -328,6 +329,101 @@ fetchAndWait(AssetNetworkFetcher &fetcher, const QUrl &url, AssetFormat format,
            timeoutMs);
   }
   return result;
+}
+
+// Cumulative-review finding (PR #18, exact head 4a47ea34): shared PNG
+// chunk-construction helpers for the new zTXt/iCCP/iTXt-metadata-bomb and
+// IDAT-exact-zlib-consumption regression tests below. Deliberately a
+// second, independent implementation of the same CRC-32 algorithm as
+// pngCrc32() in src/AssetPngValidator.cpp (mirroring this test file's own
+// pre-existing local per-test lambdas of the identical algorithm, e.g.
+// pngWithApngAnimationChunksIsRejected()/pngWithNonConsecutiveIdatChunksIsRejected()
+// above) -- a bug in the production CRC-32 table would then be equally
+// likely to appear in both the code under test and this fixture-building
+// helper, which would be worthless; keeping this test-side implementation
+// independent (typed out separately, not calling into
+// src/AssetPngValidator.cpp at all) is what makes a fixture actually
+// prove the production validator's OWN CRC checking is correct.
+quint32 pngCrc32ForTests(const QByteArray &bytes) {
+  static const auto table = [] {
+    std::array<quint32, 256> t{};
+    for (quint32 n = 0; n < 256; ++n) {
+      quint32 c = n;
+      for (int k = 0; k < 8; ++k) {
+        c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      }
+      t[n] = c;
+    }
+    return t;
+  }();
+  quint32 crc = 0xFFFFFFFFu;
+  for (unsigned char byte : bytes) {
+    crc = table[(crc ^ byte) & 0xFFu] ^ (crc >> 8);
+  }
+  return crc ^ 0xFFFFFFFFu;
+}
+
+void appendPngChunkForTests(QByteArray &out, const QByteArray &type,
+                            const QByteArray &data) {
+  const quint32 length = static_cast<quint32>(data.size());
+  out.append(static_cast<char>((length >> 24) & 0xFF));
+  out.append(static_cast<char>((length >> 16) & 0xFF));
+  out.append(static_cast<char>((length >> 8) & 0xFF));
+  out.append(static_cast<char>(length & 0xFF));
+  out.append(type);
+  out.append(data);
+  const quint32 crc = pngCrc32ForTests(type + data);
+  out.append(static_cast<char>((crc >> 24) & 0xFF));
+  out.append(static_cast<char>((crc >> 16) & 0xFF));
+  out.append(static_cast<char>((crc >> 8) & 0xFF));
+  out.append(static_cast<char>(crc & 0xFF));
+}
+
+// Splits a valid, freshly-encoded PNG fixture (as produced by
+// encodeImage(w, h, "png")) into its IHDR-and-before prefix, the exact
+// concatenated data bytes of every IDAT chunk (in file order), and its
+// IEND-and-after suffix -- letting a test rebuild the same image with a
+// deliberately modified IDAT run while keeping IHDR/IEND byte-for-byte
+// identical to the known-good original (so any rejection observed is
+// attributable only to the IDAT modification).
+struct SplitPngForTests {
+  QByteArray beforeIdat; // signature + IHDR chunk, verbatim
+  QByteArray idatData;   // every IDAT chunk's data, concatenated
+  QByteArray fromIend;   // IEND chunk (and, for a valid fixture, nothing
+                         // else), verbatim
+};
+
+SplitPngForTests splitValidPngForTests(const QByteArray &png) {
+  SplitPngForTests split;
+  const qsizetype firstIdatType = png.indexOf("IDAT");
+  if (firstIdatType < 0) {
+    qFatal("splitValidPngForTests() was given a PNG fixture with no IDAT "
+           "chunk at all");
+  }
+  split.beforeIdat = png.left(firstIdatType - 4); // exclude length field too
+
+  qsizetype pos = firstIdatType - 4;
+  while (true) {
+    const quint32 length =
+        (static_cast<unsigned char>(png[static_cast<int>(pos)]) << 24) |
+        (static_cast<unsigned char>(png[static_cast<int>(pos + 1)]) << 16) |
+        (static_cast<unsigned char>(png[static_cast<int>(pos + 2)]) << 8) |
+        static_cast<unsigned char>(png[static_cast<int>(pos + 3)]);
+    const QByteArray type = png.mid(pos + 4, 4);
+    const qsizetype dataStart = pos + 8;
+    if (type == "IDAT") {
+      split.idatData += png.mid(dataStart, static_cast<qsizetype>(length));
+    } else if (type == "IEND") {
+      split.fromIend = png.mid(pos);
+      break;
+    }
+    pos = dataStart + static_cast<qsizetype>(length) + 4; // + CRC
+    if (pos >= png.size()) {
+      qFatal("splitValidPngForTests() walked off the end of the fixture "
+             "without finding IEND");
+    }
+  }
+  return split;
 }
 
 } // namespace
@@ -1370,6 +1466,298 @@ void AssetNetworkFetcherTests::pngWithNonConsecutiveIdatChunksIsRejected() {
   // structure and not some incidental difference introduced by rebuilding
   // the byte sequence chunk-by-chunk.
   QVERIFY(Arkham::pngChunksAreStrictlyValid(originalPng));
+}
+
+void AssetNetworkFetcherTests::
+    pngWithCompressedAncillaryChunkIsRejected_data() {
+  QTest::addColumn<QByteArray>("chunkType");
+  QTest::newRow("zTXt") << QByteArray("zTXt");
+  QTest::newRow("iCCP") << QByteArray("iCCP");
+  QTest::newRow("iTXt-compressed") << QByteArray("iTXt");
+}
+
+void AssetNetworkFetcherTests::pngWithCompressedAncillaryChunkIsRejected() {
+  // Cumulative-review finding (PR #18, prior head 4a47ea34): a PNG can
+  // carry a zTXt/iCCP/compressed-iTXt chunk whose OWN independently
+  // zlib-compressed payload QImageReader's underlying libpng would
+  // decompress during header parsing (png_read_info()) -- entirely
+  // independent of the image's declared dimensions/pixel budget, and
+  // strictly before this project's own dimension/pixel-budget checks
+  // would otherwise run. This proves such a chunk is rejected purely
+  // STRUCTURALLY (by chunk TYPE alone, never by inspecting its payload)
+  // -- including when the payload is a genuine "metadata bomb" shape (a
+  // tiny compressed blob that would decompress to many megabytes), built
+  // here via a real zlib deflate of a large, highly-repetitive buffer so
+  // the fixture itself stays small while still being a faithful bomb
+  // shape. Rejecting by TYPE alone, before ever touching the payload
+  // bytes, is what keeps this bounded: this project never allocates or
+  // runs an inflate() proportional to the bomb's declared/decompressed
+  // size at all.
+  QFETCH(QByteArray, chunkType);
+
+  constexpr int kBombDecompressedSize = 8 * 1024 * 1024;
+  const QByteArray bombSource(kBombDecompressedSize, '\0');
+  uLongf compressedBound = compressBound(static_cast<uLong>(bombSource.size()));
+  QByteArray compressed(static_cast<qsizetype>(compressedBound),
+                        Qt::Uninitialized);
+  uLongf actualCompressedSize = compressedBound;
+  const int compressResult = compress2(
+      reinterpret_cast<Bytef *>(compressed.data()), &actualCompressedSize,
+      reinterpret_cast<const Bytef *>(bombSource.constData()),
+      static_cast<uLong>(bombSource.size()), Z_BEST_COMPRESSION);
+  QCOMPARE(compressResult, Z_OK);
+  compressed.resize(static_cast<qsizetype>(actualCompressedSize));
+  // Stays tiny in the fixture despite representing an 8 MiB payload --
+  // proving this is a faithful "small on the wire, huge if decompressed"
+  // bomb shape (an all-zero 8 MiB buffer compresses to roughly 8 KiB
+  // under zlib's own maximum window/block-size limits, verified via
+  // zlib's compress2()/Z_BEST_COMPRESSION directly).
+  QVERIFY(compressed.size() < 16384);
+
+  QByteArray chunkData;
+  if (chunkType == "zTXt") {
+    // zTXt: Keyword\0 Compression-method(1 byte, must be 0) then the
+    // compressed text.
+    chunkData = QByteArrayLiteral("Bomb") + QByteArray(1, '\0') +
+                QByteArray(1, '\0') + compressed;
+  } else if (chunkType == "iCCP") {
+    // iCCP: Profile-name\0 Compression-method(1 byte, must be 0) then
+    // the compressed ICC profile.
+    chunkData = QByteArrayLiteral("Bomb") + QByteArray(1, '\0') +
+                QByteArray(1, '\0') + compressed;
+  } else {
+    // iTXt: Keyword\0 Compression-flag(1, nonzero=compressed)
+    // Compression-method(1, must be 0 when flag set) Language-tag\0
+    // Translated-keyword\0 then the (compressed) text.
+    chunkData = QByteArrayLiteral("Bomb") + QByteArray(1, '\0') +
+                QByteArray(1, '\x01') + QByteArray(1, '\0') +
+                QByteArray(1, '\0') + QByteArray(1, '\0') + compressed;
+  }
+
+  QByteArray body = encodeImage(16, 16, "png");
+  const qsizetype ihdrTypeOffset = body.indexOf("IHDR");
+  QVERIFY(ihdrTypeOffset > 4);
+  const qsizetype insertPos = ihdrTypeOffset + 4 + 13 + 4; // past IHDR + CRC
+  QVERIFY(insertPos <= body.size());
+  QByteArray chunk;
+  appendPngChunkForTests(chunk, chunkType, chunkData);
+  body.insert(insertPos, chunk);
+
+  // Prove the rejection is structural/immediate, calling the validator
+  // directly (never through QImageReader/network at all) -- the
+  // "before QImageReader" and "bounded memory" proof: a real 8 MiB bomb
+  // payload is rejected without this project's own code ever attempting
+  // to decompress it.
+  QVERIFY(!Arkham::pngChunksAreStrictlyValid(body));
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = body;
+  server.setResponse(QStringLiteral("/metadata-bomb.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/metadata-bomb.png")),
+      AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+}
+
+void AssetNetworkFetcherTests::pngWithUncompressedTextChunksIsStillAccepted() {
+  // Control for pngWithCompressedAncillaryChunkIsRejected(): a plain
+  // uncompressed tEXt chunk, and an iTXt chunk with its compression flag
+  // explicitly clear, pose no decompression risk at all and must still
+  // be accepted -- proving the rejection above is specific to actual
+  // compression being in play, not "any text/metadata chunk of any
+  // kind."
+  QByteArray body = encodeImage(16, 16, "png");
+  const qsizetype ihdrTypeOffset = body.indexOf("IHDR");
+  QVERIFY(ihdrTypeOffset > 4);
+  const qsizetype insertPos = ihdrTypeOffset + 4 + 13 + 4;
+  QVERIFY(insertPos <= body.size());
+
+  QByteArray chunks;
+  appendPngChunkForTests(chunks, QByteArrayLiteral("tEXt"),
+                         QByteArrayLiteral("Comment") + QByteArray(1, '\0') +
+                             QByteArrayLiteral("hello"));
+  appendPngChunkForTests(
+      chunks, QByteArrayLiteral("iTXt"),
+      QByteArrayLiteral("Comment") + QByteArray(1, '\0') +
+          QByteArray(1, '\0') /* compression flag = 0 */ +
+          QByteArray(1, '\0') /* compression method */ +
+          QByteArray(1, '\0') /* empty language tag */ +
+          QByteArray(1, '\0') /* empty translated keyword */ +
+          QByteArrayLiteral("hello"));
+  body.insert(insertPos, chunks);
+
+  QVERIFY(Arkham::pngChunksAreStrictlyValid(body));
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = body;
+  server.setResponse(QStringLiteral("/uncompressed-text.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/uncompressed-text.png")),
+      AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+}
+
+void AssetNetworkFetcherTests::
+    pngWithTrailingBytesAfterValidIdatZlibStreamIsRejected() {
+  // Cumulative-review finding (PR #18, prior head 4a47ea34): a CRC-valid
+  // IDAT run whose zlib stream is a complete, valid image encoding
+  // followed by extra bytes (or an entirely separate second zlib
+  // stream) is exactly what libpng/QImageReader tolerates (with at most
+  // a swallowed warning) -- this project must reject it instead.
+  const QByteArray originalPng = encodeImage(16, 16, "png");
+  const SplitPngForTests split = splitValidPngForTests(originalPng);
+
+  // Case 1: arbitrary trailing garbage bytes after the legitimate stream.
+  const QByteArray withGarbage =
+      split.idatData + QByteArrayLiteral("EXTRA-DATA-AFTER-VALID-STREAM");
+
+  // Case 2: an entirely separate second, independently-valid zlib stream
+  // appended after the first.
+  QByteArray secondStream;
+  {
+    const unsigned char raw[4] = {1, 2, 3, 4};
+    uLongf bound = compressBound(sizeof(raw));
+    QByteArray compressed(static_cast<qsizetype>(bound), Qt::Uninitialized);
+    uLongf actualSize = bound;
+    const int rc = compress2(reinterpret_cast<Bytef *>(compressed.data()),
+                             &actualSize, raw, sizeof(raw), Z_BEST_COMPRESSION);
+    QCOMPARE(rc, Z_OK);
+    compressed.resize(static_cast<qsizetype>(actualSize));
+    secondStream = compressed;
+  }
+  const QByteArray withSecondStream = split.idatData + secondStream;
+
+  for (const QByteArray &tamperedIdat : {withGarbage, withSecondStream}) {
+    QByteArray body = split.beforeIdat;
+    appendPngChunkForTests(body, QByteArrayLiteral("IDAT"), tamperedIdat);
+    body += split.fromIend;
+
+    // Structural chunk validity (CRC, ordering, etc.) is unaffected --
+    // the IDAT chunk itself is perfectly well-formed; only its zlib
+    // stream's CONTENT is tampered with.
+    PngStructuralInfo info;
+    QVERIFY(Arkham::pngChunksAreStrictlyValid(body, &info));
+    QVERIFY(!Arkham::pngIdatDecompressesToExactExpectedSize(
+        info.idatPayload, info.width, info.height, info.bitDepth,
+        info.colorType));
+
+    MockHttpServer server;
+    MockHttpServer::Response response;
+    response.contentType = "image/png";
+    response.body = body;
+    server.setResponse(QStringLiteral("/idat-trailing.png"), response);
+
+    QNetworkAccessManager nam;
+    AssetNetworkFetcher fetcher(nam);
+    const auto result = fetchAndWait(
+        fetcher, server.baseUrlFor(QStringLiteral("/idat-trailing.png")),
+        AssetFormat::Png);
+
+    QVERIFY(result.has_value());
+    QVERIFY(!bool(*result));
+    QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+  }
+
+  // Control: the untouched original stream must still pass both checks.
+  PngStructuralInfo originalInfo;
+  QVERIFY(Arkham::pngChunksAreStrictlyValid(originalPng, &originalInfo));
+  QVERIFY(Arkham::pngIdatDecompressesToExactExpectedSize(
+      originalInfo.idatPayload, originalInfo.width, originalInfo.height,
+      originalInfo.bitDepth, originalInfo.colorType));
+}
+
+void AssetNetworkFetcherTests::
+    pngWithTruncatedIdatZlibStreamAtVaryingCutPointsAllRejected_data() {
+  QTest::addColumn<int>("truncatedLength");
+  const QByteArray originalPng = encodeImage(16, 16, "png");
+  const SplitPngForTests split = splitValidPngForTests(originalPng);
+  for (int len = 0; len < static_cast<int>(split.idatData.size()); ++len) {
+    QTest::addRow("truncated-to-%d-of-%d-bytes", len,
+                  static_cast<int>(split.idatData.size()))
+        << len;
+  }
+}
+
+void AssetNetworkFetcherTests::
+    pngWithTruncatedIdatZlibStreamAtVaryingCutPointsAllRejected() {
+  // Cumulative-review finding (PR #18, prior head 4a47ea34): "Tests ...
+  // every truncation" -- every possible truncation point of a
+  // legitimate IDAT zlib stream, short of the full/complete stream, must
+  // be rejected: a partial zlib stream can never validly reach
+  // Z_STREAM_END, so pngIdatDecompressesToExactExpectedSize() must
+  // reject every one of them. This is a pure structural/unit-level test
+  // (no network round trip) so exhaustively covering every cut point of
+  // this fixture's (small) IDAT payload stays fast.
+  QFETCH(int, truncatedLength);
+
+  const QByteArray originalPng = encodeImage(16, 16, "png");
+  const SplitPngForTests split = splitValidPngForTests(originalPng);
+  QVERIFY(truncatedLength < static_cast<int>(split.idatData.size()));
+  const QByteArray truncatedIdat = split.idatData.left(truncatedLength);
+
+  QByteArray body = split.beforeIdat;
+  appendPngChunkForTests(body, QByteArrayLiteral("IDAT"), truncatedIdat);
+  body += split.fromIend;
+
+  PngStructuralInfo info;
+  QVERIFY(Arkham::pngChunksAreStrictlyValid(body, &info));
+  QVERIFY(!Arkham::pngIdatDecompressesToExactExpectedSize(
+      info.idatPayload, info.width, info.height, info.bitDepth,
+      info.colorType));
+}
+
+void AssetNetworkFetcherTests::pngWithInterlacedIhdrIsRejected() {
+  // Cumulative-review finding (PR #18, prior head 4a47ea34): Adam7
+  // interlacing (IHDR interlace method 1) is rejected outright -- see
+  // AssetPngValidator.h's doc comment for why.
+  QByteArray body = encodeImage(16, 16, "png");
+  const qsizetype ihdrTypeOffset = body.indexOf("IHDR");
+  QVERIFY(ihdrTypeOffset > 4);
+  const qsizetype ihdrDataStart = ihdrTypeOffset + 4;
+  const qsizetype interlaceMethodOffset = ihdrDataStart + 12; // last IHDR byte
+  QVERIFY(interlaceMethodOffset < body.size());
+  body[static_cast<int>(interlaceMethodOffset)] = 1;
+  // Recompute IHDR's CRC over its (now-modified) type+data.
+  const qsizetype crcOffset = ihdrDataStart + 13;
+  const QByteArray typeAndData = body.mid(ihdrTypeOffset, 4 + 13);
+  const quint32 crc = pngCrc32ForTests(typeAndData);
+  body[static_cast<int>(crcOffset)] = static_cast<char>((crc >> 24) & 0xFF);
+  body[static_cast<int>(crcOffset + 1)] = static_cast<char>((crc >> 16) & 0xFF);
+  body[static_cast<int>(crcOffset + 2)] = static_cast<char>((crc >> 8) & 0xFF);
+  body[static_cast<int>(crcOffset + 3)] = static_cast<char>(crc & 0xFF);
+
+  QVERIFY(!Arkham::pngChunksAreStrictlyValid(body));
+
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = body;
+  server.setResponse(QStringLiteral("/interlaced.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/interlaced.png")),
+      AssetFormat::Png);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
 }
 
 void AssetNetworkFetcherTests::avifRealFixtureAlwaysDecodesViaLibavif() {
