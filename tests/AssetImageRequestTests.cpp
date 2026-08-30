@@ -459,3 +459,177 @@ void AssetImageRequestTests::
       5000));
   QVERIFY(!request.image().isNull());
 }
+
+void AssetImageRequestTests::
+    reentrantLoadFromWithinProgressChangedLeavesOnlyInnerRequestSurvives() {
+  // Review round-N+ finding #6 (AssetImageRequest.cpp): load() emits its
+  // Loading-state NOTIFY signals BEFORE registering its own coordinator
+  // request. A directly-connected observer that reentrantly calls
+  // load() again from inside one of THOSE signal emissions runs the
+  // INNER load() to completion -- including registering ITS OWN
+  // coordinator handle -- before the OUTER load() call resumes and
+  // (without the fix) would unconditionally overwrite m_handle with its
+  // own, permanently orphaning the inner one. This forces that exact
+  // reentrancy via a REAL, synchronous, direct-connection signal
+  // handler (not a queued/event-loop simulation).
+  MockHttpServer server;
+  MockHttpServer::Response outerResponse;
+  outerResponse.contentType = "image/png";
+  outerResponse.body = encodePng(16, 16);
+  server.setResponse(QStringLiteral("/img/arkham/sets/outer01.png"),
+                     outerResponse);
+
+  MockHttpServer::Response innerResponse;
+  innerResponse.contentType = "image/png";
+  innerResponse.body = encodePng(32, 32);
+  server.setResponse(QStringLiteral("/img/arkham/sets/inner01.png"),
+                     innerResponse);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  AssetImageRequest request(coordinator);
+
+  bool reentered = false;
+  QObject::connect(
+      &request, &AssetImageRequest::progressChanged, &request,
+      [&]() {
+        if (reentered) {
+          return; // the INNER load()'s own progressChanged(): do not recurse
+        }
+        reentered = true;
+        request.load(
+            makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                    QStringLiteral("inner01")));
+      },
+      Qt::DirectConnection);
+
+  request.load(makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()),
+                       QStringLiteral("outer01")));
+
+  QVERIFY(reentered);
+  QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
+
+  // Coordinator-level assertion, checked IMMEDIATELY after the two fully
+  // synchronous, nested load() calls above returned -- before the event
+  // loop has run at all, so neither fetch could possibly have completed
+  // on its own yet: exactly the survivor (inner) operation remains
+  // in-flight. Without the fix, the outer registration is never
+  // explicitly cancelled when it discovers it is stale, so BOTH
+  // operations would still be in-flight here -- a real, observable
+  // resource leak (an abandoned coordinator Operation/fetch that nothing
+  // will ever cancel), not merely a discrepancy in this object's own
+  // eventually-published image.
+  QCOMPARE(coordinator.inFlightOperationCountForTesting(), 1);
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return request.status() == AssetImageRequest::Status::Ready; },
+      5000));
+  QCOMPARE(request.status(), AssetImageRequest::Status::Ready);
+  // The INNER (reentrant) load must be the one that ultimately wins and
+  // publishes -- its distinct 32x32 image, never the outer 16x16 one.
+  QCOMPARE(request.image().width(), 32);
+  QCOMPARE(request.image().height(), 32);
+
+  // Give the (now-cancelled, orphan-free) OUTER fetch plenty of time to
+  // have delivered a stale completion if it were (incorrectly) still
+  // tracked/published.
+  QSignalSpy imageSpy(&request, &AssetImageRequest::imageChanged);
+  QSignalSpy statusSpy(&request, &AssetImageRequest::statusChanged);
+  QTest::qWait(300);
+  QCOMPARE(imageSpy.count(), 0);         // no further, stale publication
+  QCOMPARE(statusSpy.count(), 0);        // no further, stale transition
+  QCOMPARE(request.image().width(), 32); // still the inner result, unclobbered
+  QCOMPARE(request.status(), AssetImageRequest::Status::Ready);
+}
+
+void AssetImageRequestTests::
+    synchronousDestructionDuringLoadSignalNeverContinuesAfterDestruction() {
+  // Review round-N+ finding #6: a directly-connected observer that
+  // destroys this AssetImageRequest synchronously from inside one of
+  // load()'s own NOTIFY emissions must not leave load()'s remaining body
+  // (further member writes/emits, then coordinator registration) running
+  // against the now-destroyed object.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(16, 16);
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  auto request = std::make_unique<AssetImageRequest>(coordinator);
+  QObject::connect(
+      request.get(), &AssetImageRequest::progressChanged, request.get(),
+      [&]() { request.reset(); }, Qt::DirectConnection);
+
+  request->load(
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  // Reaching here at all (rather than crashing/UB-sanitizer-tripping
+  // inside load()'s own remaining body) is the primary assertion.
+  QVERIFY(request == nullptr);
+
+  QTest::qWait(200); // long enough for any leaked/still-registered fetch
+                     // to otherwise have delivered a stale completion
+                     // into now-freed memory.
+  QVERIFY(true);
+}
+
+void AssetImageRequestTests::
+    reentrantCancelFromWithinCancelSignalNeverDoubleCorruptsState() {
+  // Companion coverage for cancel() itself (load() calls cancel() first,
+  // so this exercises the exact same synchronous-reentrancy hazard one
+  // level lower): a directly-connected observer that reentrantly calls
+  // cancel() again from inside cancel()'s OWN statusChanged()/
+  // progressChanged() emission must not corrupt state or double-emit.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/png";
+  response.body = encodePng(200, 200);
+  response.slowDrip = true;
+  response.chunkSize = 16;
+  response.chunkDelayMs = 60;
+  server.setResponse(QStringLiteral("/img/arkham/sets/valid01.png"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  AssetRequestCoordinator coordinator(cache, fetcher);
+  AssetImageRequest request(coordinator);
+
+  request.load(
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port())));
+  QCOMPARE(request.status(), AssetImageRequest::Status::Loading);
+
+  int reentrantCancelCount = 0;
+  QObject::connect(
+      &request, &AssetImageRequest::progressChanged, &request,
+      [&]() {
+        if (reentrantCancelCount > 0) {
+          return; // the reentrant cancel()'s own progressChanged(): stop
+        }
+        ++reentrantCancelCount;
+        request.cancel();
+      },
+      Qt::DirectConnection);
+
+  request.cancel();
+  QCOMPARE(request.status(), AssetImageRequest::Status::Idle);
+  QCOMPARE(reentrantCancelCount, 1);
+
+  QSignalSpy statusSpy(&request, &AssetImageRequest::statusChanged);
+  QTest::qWait(300); // long enough for the (cancelled) slow-drip fetch to
+                     // otherwise have delivered a stale completion
+  QCOMPARE(request.status(), AssetImageRequest::Status::Idle);
+  QCOMPARE(statusSpy.count(), 0);
+}

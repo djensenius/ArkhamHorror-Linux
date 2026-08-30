@@ -2,9 +2,11 @@
 
 #include "AssetCache.h"
 
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -15,7 +17,11 @@
 #include <QTest>
 
 #if defined(Q_OS_UNIX)
+#include <cstring>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 using namespace Arkham;
@@ -819,6 +825,87 @@ void AssetCacheTests::identicalPayloadReplacementMintsANewGenerationEachTime() {
   QCOMPARE(hit->encodedBytes, bytes);
 }
 
+namespace {
+// RAII guard for AssetCache::setListAllEntriesRelativeForcedFailureForTesting()
+// -- mirrors MountIdentificationDegradationGuard's own pattern so a test
+// can never accidentally leave this process-wide override active for a
+// later, unrelated test even if an assertion fails partway through.
+struct ListAllEntriesRelativeFailureGuard {
+  explicit ListAllEntriesRelativeFailureGuard(bool active) {
+    AssetCache::setListAllEntriesRelativeForcedFailureForTesting(active);
+  }
+  ListAllEntriesRelativeFailureGuard(
+      const ListAllEntriesRelativeFailureGuard &) = delete;
+  ListAllEntriesRelativeFailureGuard &
+  operator=(const ListAllEntriesRelativeFailureGuard &) = delete;
+  ~ListAllEntriesRelativeFailureGuard() {
+    AssetCache::setListAllEntriesRelativeForcedFailureForTesting(false);
+  }
+};
+} // namespace
+
+void AssetCacheTests::
+    reapSweepAbortsAllMutationWhenDirectoryListingIsIndeterminate() {
+  AssetCache cache(configFor(m_tempDirPath));
+
+  // A perfectly valid, live entry -- must survive untouched regardless
+  // of what happens below.
+  const QString liveKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/still-live.png")));
+  cache.store(liveKey, makeEntry(QByteArrayLiteral("still-live-bytes")));
+  const auto liveGeneration = cache.currentGenerationForTesting(liveKey);
+  QVERIFY(liveGeneration.has_value());
+  const QString livePayloadPath = AssetCache::payloadPathForTesting(
+      m_tempDirPath, liveKey, *liveGeneration);
+  const QString liveMetadataPath = AssetCache::metadataPathForTesting(
+      m_tempDirPath, liveKey, *liveGeneration);
+  const QString liveManifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, liveKey);
+  QVERIFY(QFile::exists(livePayloadPath));
+  QVERIFY(QFile::exists(liveMetadataPath));
+  QVERIFY(QFile::exists(liveManifestPath));
+
+  // A stray file that an ordinary, un-degraded sweep WOULD remove --
+  // included so this test also proves the injected fault is genuinely
+  // gating something real, not merely a no-op every sweep would have
+  // been anyway.
+  const QString strayPath =
+      m_tempDirPath + QStringLiteral("/not-a-valid-key-indeterminate.tmp");
+  {
+    QFile stray(strayPath);
+    QVERIFY(stray.open(QIODevice::WriteOnly));
+    stray.write("leftover");
+  }
+
+  {
+    ListAllEntriesRelativeFailureGuard guard(true);
+    cache.reapAndEnforceQuota();
+  }
+
+  // While the directory listing was forced INDETERMINATE, the sweep
+  // must have aborted before touching anything at all -- the live
+  // entry's files are untouched, AND the stray file (which a healthy
+  // sweep would have deleted) is STILL there, proving zero mutation
+  // happened rather than merely "the live entry got lucky".
+  QVERIFY(QFile::exists(livePayloadPath));
+  QVERIFY(QFile::exists(liveMetadataPath));
+  QVERIFY(QFile::exists(liveManifestPath));
+  QVERIFY(QFile::exists(strayPath));
+  const auto liveHit = cache.lookupDisk(liveKey);
+  QVERIFY(liveHit.has_value());
+  QCOMPARE(liveHit->encodedBytes, QByteArrayLiteral("still-live-bytes"));
+
+  // Positive control: with the fault no longer injected, an ordinary
+  // sweep still behaves exactly as before -- the stray file is finally
+  // removed, and the live entry remains live -- proving the guard
+  // above was genuinely gating this behavior, not permanently broken.
+  cache.reapAndEnforceQuota();
+  QVERIFY(!QFile::exists(strayPath));
+  QVERIFY(QFile::exists(livePayloadPath));
+  QVERIFY(QFile::exists(liveMetadataPath));
+  QVERIFY(QFile::exists(liveManifestPath));
+}
+
 void AssetCacheTests::strayFileNotMatchingKeyShapeIsRemoved() {
   const QString strayPath =
       m_tempDirPath + QStringLiteral("/not-a-valid-key.tmp");
@@ -1293,6 +1380,234 @@ void AssetCacheTests::oversizedMetadataFileIsRejectedWithoutUnboundedReadAll() {
   QVERIFY(!cache.lookupDisk(key).has_value());
   QVERIFY(!QFile::exists(payloadPath));
   QVERIFY(!QFile::exists(metadataPath));
+}
+
+#if defined(Q_OS_UNIX)
+namespace {
+// Creates a FIFO (named pipe) special file at `path` via mkfifo(2) --
+// opening it O_RDONLY with a plain blocking open() (the pre-fix
+// behaviour openRegularNoFollowRelative() used) blocks until some OTHER
+// process opens the same path for writing, which never happens in
+// these tests -- proving the fix (O_NONBLOCK) is what stands between a
+// passing test and one that hangs until QtTest's own global watchdog
+// kills the whole binary.
+void createFifoForTesting(const QString &path) {
+  const QByteArray pathUtf8 = QFile::encodeName(path);
+  QCOMPARE(::mkfifo(pathUtf8.constData(), 0600), 0);
+}
+} // namespace
+#endif
+
+void AssetCacheTests::manifestPlantedAsFifoNeverBlocksConstructionOrLookup() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("FIFOs are a POSIX-specific concept; not applicable on this "
+        "platform");
+#else
+  // Cumulative review (PR #18, MEDIUM): a FIFO planted at a MANIFEST
+  // filename must be rejected -- both during the constructor's own
+  // startup reap sweep (reapAndEnforceQuota() itself reads every
+  // manifest it finds) and during an explicit lookupDisk() call --
+  // WITHOUT ever blocking, in bounded, real wall-clock time. There is
+  // no legitimate reader/writer for this FIFO anywhere in this test, so
+  // a plain blocking open() would hang until QtTest's own global
+  // watchdog eventually aborts the entire test binary -- there is no
+  // "wait a little and see" available here; only O_NONBLOCK prevents
+  // the hang from ever starting at all.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/manifest-fifo.png")));
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
+  createFifoForTesting(manifestPath);
+  QVERIFY(QFileInfo(manifestPath).isFile() == false);
+
+  QElapsedTimer timer;
+  timer.start();
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.lookupDisk(key).has_value());
+  // A generous, but still tightly bounded, upper limit -- construction
+  // plus one lookup here involves nothing but a handful of syscalls; if
+  // the fix ever regressed back to a blocking open(), this would hang
+  // indefinitely rather than merely running slowly, so ANY finite bound
+  // well under QtTest's own multi-minute default timeout reliably
+  // distinguishes fixed from broken.
+  QVERIFY(timer.elapsed() < 5000);
+#endif
+}
+
+void AssetCacheTests::metadataPlantedAsFifoNeverBlocksConstructionOrLookup() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("FIFOs are a POSIX-specific concept; not applicable on this "
+        "platform");
+#else
+  // A real manifest names a generation whose METADATA file is instead a
+  // FIFO -- readMetadata() must reject it (via the same
+  // openRegularNoFollowRelative()) without ever blocking, and the
+  // repair sweep must treat this exactly like any other corrupt/
+  // orphaned generation.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/metadata-fifo.png")));
+  const QByteArray payloadBytes = QByteArrayLiteral("metadata-fifo-payload");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(payloadBytes, QCryptographicHash::Sha256)
+          .toHex());
+  const QString payloadPath =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation);
+  const QString metadataPath =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation);
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
+  {
+    QFile payload(payloadPath);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(payloadBytes);
+  }
+  createFifoForTesting(metadataPath);
+  {
+    QJsonObject manifestObj;
+    manifestObj[QStringLiteral("formatVersion")] = 1;
+    manifestObj[QStringLiteral("key")] = key;
+    manifestObj[QStringLiteral("generation")] = generation;
+    QFile manifest(manifestPath);
+    QVERIFY(manifest.open(QIODevice::WriteOnly));
+    manifest.write(QJsonDocument(manifestObj).toJson(QJsonDocument::Compact));
+  }
+
+  QElapsedTimer timer;
+  timer.start();
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.lookupDisk(key).has_value());
+  QVERIFY(timer.elapsed() < 5000);
+#endif
+}
+
+void AssetCacheTests::payloadPlantedAsFifoNeverBlocksConstructionOrLookup() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("FIFOs are a POSIX-specific concept; not applicable on this "
+        "platform");
+#else
+  // A fully self-consistent manifest+metadata pair naming a generation
+  // whose PAYLOAD file is instead a FIFO -- readExactSizeVerifiedRelative()
+  // must reject it without ever blocking.
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/payload-fifo.png")));
+  const QByteArray payloadBytes = QByteArrayLiteral("payload-fifo-bytes");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(payloadBytes, QCryptographicHash::Sha256)
+          .toHex());
+  const QString payloadPath =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation);
+  const QString metadataPath =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation);
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
+  createFifoForTesting(payloadPath);
+  writeRawMetadataForTesting(metadataPath, key, generation,
+                             payloadBytes.size());
+  {
+    QJsonObject manifestObj;
+    manifestObj[QStringLiteral("formatVersion")] = 1;
+    manifestObj[QStringLiteral("key")] = key;
+    manifestObj[QStringLiteral("generation")] = generation;
+    QFile manifest(manifestPath);
+    QVERIFY(manifest.open(QIODevice::WriteOnly));
+    manifest.write(QJsonDocument(manifestObj).toJson(QJsonDocument::Compact));
+  }
+
+  QElapsedTimer timer;
+  timer.start();
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.lookupDisk(key).has_value());
+  QVERIFY(timer.elapsed() < 5000);
+#endif
+}
+
+void AssetCacheTests::
+    metadataPlantedAsUnixSocketNeverBlocksConstructionOrLookup() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("UNIX domain sockets are a POSIX-specific concept; not "
+        "applicable on this platform");
+#else
+  // "socket too": a UNIX domain socket special file (created via
+  // socket()+bind(), fully unprivileged) planted at a metadata filename
+  // must be rejected identically to a FIFO -- S_ISREG is false for a
+  // socket node exactly as it is for a FIFO, and a blocking open() of a
+  // socket special file with AF_UNIX semantics behaves like opening any
+  // other non-regular file (it does not itself block the way a FIFO
+  // does on most platforms, but must still be rejected as non-regular,
+  // never silently accepted).
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/metadata-socket.png")));
+  const QByteArray payloadBytes = QByteArrayLiteral("metadata-socket-payload");
+  const QString generation = QString::fromLatin1(
+      QCryptographicHash::hash(payloadBytes, QCryptographicHash::Sha256)
+          .toHex());
+  const QString payloadPath =
+      AssetCache::payloadPathForTesting(m_tempDirPath, key, generation);
+  const QString metadataPath =
+      AssetCache::metadataPathForTesting(m_tempDirPath, key, generation);
+  const QString manifestPath =
+      AssetCache::manifestPathForTesting(m_tempDirPath, key);
+  {
+    QFile payload(payloadPath);
+    QVERIFY(payload.open(QIODevice::WriteOnly));
+    payload.write(payloadBytes);
+  }
+  {
+    const int sockFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    QVERIFY(sockFd >= 0);
+    // sockaddr_un::sun_path is a short fixed-size buffer (108 bytes on
+    // Linux, 104 on macOS/BSD), too short even for just this cache's own
+    // <64-hex-key>.<64-hex-generation>.meta.json LEAF filename alone
+    // (139 bytes), let alone the full path under this test's own
+    // deliberately home-anchored, multi-component m_tempDirPath (see
+    // init()'s comment for why every test constructs its temp directory
+    // under QDir::homePath() rather than the OS's normal, much shorter
+    // temp location). bind() is therefore done against a SHORT
+    // temporary relative name in the metadata file's own parent
+    // directory (chdir()'d into first, so bind()'s own path length
+    // limit never applies at all), then the resulting socket special
+    // file is renamed onto the real, long metadata leaf name -- a plain
+    // filesystem rename() has no such length restriction; only the
+    // kernel's bind(2) does.
+    const QByteArray originalCwd = QDir::currentPath().toUtf8();
+    const QFileInfo metadataInfo(metadataPath);
+    QVERIFY(QDir::setCurrent(metadataInfo.absolutePath()));
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    const QByteArray shortTempNameUtf8 =
+        QByteArrayLiteral(".socket-tmp-for-testing");
+    std::memcpy(addr.sun_path, shortTempNameUtf8.constData(),
+                static_cast<size_t>(shortTempNameUtf8.size()));
+    const int bindResult = ::bind(
+        sockFd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
+    int renameResult = -1;
+    if (bindResult == 0) {
+      renameResult =
+          ::rename(shortTempNameUtf8.constData(),
+                   QFile::encodeName(metadataInfo.fileName()).constData());
+    }
+    QVERIFY(QDir::setCurrent(QString::fromUtf8(originalCwd)));
+    QCOMPARE(bindResult, 0);
+    QCOMPARE(renameResult, 0);
+    ::close(sockFd);
+  }
+  QVERIFY(QFileInfo(metadataPath).isFile() == false);
+  {
+    QJsonObject manifestObj;
+    manifestObj[QStringLiteral("formatVersion")] = 1;
+    manifestObj[QStringLiteral("key")] = key;
+    manifestObj[QStringLiteral("generation")] = generation;
+    QFile manifest(manifestPath);
+    QVERIFY(manifest.open(QIODevice::WriteOnly));
+    manifest.write(QJsonDocument(manifestObj).toJson(QJsonDocument::Compact));
+  }
+
+  QElapsedTimer timer;
+  timer.start();
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.lookupDisk(key).has_value());
+  QVERIFY(timer.elapsed() < 5000);
+#endif
 }
 
 void AssetCacheTests::
@@ -2500,6 +2815,183 @@ void AssetCacheTests::
   QVERIFY(!QFileInfo(configuredUnderFakeHome).isSymLink());
 }
 
+namespace {
+// RAII guard around
+// AssetCache::setAuthoritativeAccountHomeDirectoryOverrideForTesting() --
+// guarantees the process-wide override is always reset back to
+// inactive even when a QVERIFY inside the test body triggers an early
+// return, so this never leaks into an unrelated, later test.
+struct AuthoritativeAccountHomeOverrideGuard {
+  explicit AuthoritativeAccountHomeOverrideGuard(const QString &value) {
+    AssetCache::setAuthoritativeAccountHomeDirectoryOverrideForTesting(
+        /*active=*/true, value);
+  }
+  AuthoritativeAccountHomeOverrideGuard(
+      const AuthoritativeAccountHomeOverrideGuard &) = delete;
+  AuthoritativeAccountHomeOverrideGuard &
+  operator=(const AuthoritativeAccountHomeOverrideGuard &) = delete;
+  ~AuthoritativeAccountHomeOverrideGuard() {
+    AssetCache::setAuthoritativeAccountHomeDirectoryOverrideForTesting(
+        /*active=*/false);
+  }
+};
+} // namespace
+
+void AssetCacheTests::
+    unauthenticatedHomeMountTransitionOntoADifferentMountIsRejected() {
+  // Cumulative review (PR #18, MEDIUM, "arbitrary mount exactly on
+  // /home/deck is accepted without independent identity"): before this
+  // fix, resolveHomeDirectoryNoFollow() permitted a mount transition
+  // landing on home's own final component UNCONDITIONALLY -- an
+  // attacker (or a hostile/misconfigured mount namespace) arranging a
+  // foreign mount to sit at exactly whatever path $HOME names would
+  // have been silently trusted. This test forces the account-database
+  // override to report NO match for the fake $HOME below (simulating
+  // "this is not really the current account's registered home"), then
+  // bind-mounts a completely separate source directory exactly onto
+  // the fake home's own final path component, and proves the resolver
+  // now refuses it -- exactly the strict same-mount policy an
+  // outside-home configured path already gets.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString fakeHomeParent =
+      m_tempDirPath + QStringLiteral("/unauth-mount-home-parent");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+  const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+
+  QTemporaryDir bindSourceDir;
+  QVERIFY(bindSourceDir.isValid());
+  const QString bindSource = bindSourceDir.path();
+  {
+    QFile sentinel(bindSource + QStringLiteral("/sentinel.bin"));
+    QVERIFY(sentinel.open(QIODevice::WriteOnly));
+    sentinel.write(QByteArrayLiteral("must-not-be-trusted"));
+  }
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, fakeHome});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{fakeHome};
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  // Empty override value: the account database is forced to agree with
+  // NO path at all, i.e. this fake $HOME can never be authenticated.
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QString());
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+#endif
+}
+
+void AssetCacheTests::
+    authenticatedHomeMountTransitionOntoADifferentMountIsPermitted() {
+  // Positive control for the test above: the IDENTICAL bind-mount
+  // shape, but the account-database override now agrees this exact
+  // fake $HOME path IS the current account's own registered home --
+  // modelling a real SteamOS-style dedicated "/home/deck" mount, which
+  // must keep working (disk cache not silently disabled) exactly as it
+  // did before this fix.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString fakeHomeParent =
+      m_tempDirPath + QStringLiteral("/auth-mount-home-parent");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+  const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+
+  QTemporaryDir bindSourceDir;
+  QVERIFY(bindSourceDir.isValid());
+  const QString bindSource = bindSourceDir.path();
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, fakeHome});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{fakeHome};
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  // Override value EXACTLY matches the fake $HOME: the account
+  // database is forced to agree this is genuinely the current
+  // account's own home, authenticating the mount transition.
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
+#endif
+}
+
+void AssetCacheTests::
+    unauthenticatedHomeWithDegradedMountIdentificationFailsClosedEvenUnmounted() {
+  // An unauthenticated $HOME (account database forced to disagree)
+  // whose mount-identification itself is degraded (forced via
+  // setMountIdentificationDegradedForTesting(), no privilege required)
+  // must fail closed exactly like an outside-home configured path
+  // already does when mount identity can't be proven -- even against a
+  // perfectly ordinary, unprivileged, entirely UNMOUNTED fake home, so
+  // this runs deterministically on every CI runner without needing
+  // passwordless sudo.
+#if !defined(__linux__)
+  QSKIP("mount-identity hardening is a Linux-specific concept; not "
+        "applicable on this platform");
+#else
+  const QString fakeHome =
+      m_tempDirPath + QStringLiteral("/degraded-mount-home-parent/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QString());
+  MountIdentificationDegradationGuard mountGuard(
+      /*forceOpenat2Unavailable=*/true, /*forceMountIdUnavailable=*/true);
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+#endif
+}
+
 void AssetCacheTests::
     configuredDirectoryWithMissingLeafUnderHomeIsNeverAutoCreated() {
   // Round-9+ review: the new home-anchored walker must preserve the
@@ -3028,4 +3520,130 @@ void AssetCacheTests::
   QVERIFY(!cache.isDiskCacheDisabledForTesting());
   QCOMPARE(cache.diskUsageBytes(), qint64(0));
   QVERIFY(cache.isDiskCacheDisabledForTesting());
+}
+
+namespace {
+// Locates tests/helpers/AssetCacheLockHolderMain.cpp's built binary --
+// a sibling executable in the same build output directory as THIS test
+// binary (see CMakeLists.txt: both `arkham-asset-tests` and
+// `arkham-asset-cache-lock-holder` are ordinary qt_add_executable()
+// targets configured into the same build tree, never installed
+// side-by-side by coincidence).
+QString lockHolderHelperPath() {
+  QDir dir(QCoreApplication::applicationDirPath());
+#if defined(Q_OS_WIN)
+  const QString name = QStringLiteral("arkham-asset-cache-lock-holder.exe");
+#else
+  const QString name = QStringLiteral("arkham-asset-cache-lock-holder");
+#endif
+  return dir.filePath(name);
+}
+} // namespace
+
+void AssetCacheTests::
+    secondProcessHoldingRootLockForcesThisProcessMemoryOnlyUntilReleased() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("flock()-based cross-process root locking is a POSIX-specific "
+        "mechanism; not applicable on this platform");
+#else
+  const QString helperPath = lockHolderHelperPath();
+  QVERIFY2(QFile::exists(helperPath),
+           qPrintable(QStringLiteral("lock-holder helper not found at %1")
+                          .arg(helperPath)));
+
+  QProcess holder;
+  holder.setProgram(helperPath);
+  holder.setArguments({m_tempDirPath});
+  holder.start();
+  QVERIFY2(holder.waitForStarted(5000), "lock-holder helper failed to start");
+
+  // Deterministically wait for the helper's own explicit readiness
+  // line -- never a sleep -- so this test never races the helper's own
+  // AssetCache construction (and therefore its flock() acquisition).
+  QByteArray readyLine;
+  QVERIFY2(QTest::qWaitFor(
+               [&]() {
+                 holder.waitForReadyRead(50);
+                 readyLine += holder.readAllStandardOutput();
+                 return readyLine.contains('\n');
+               },
+               10000),
+           "lock-holder helper never produced a readiness line");
+  QVERIFY2(readyLine.contains("LOCK-HOLDER-READY"),
+           qPrintable(QStringLiteral("lock-holder helper reported: %1")
+                          .arg(QString::fromUtf8(readyLine))));
+
+  // The REAL second process now holds this exact root's exclusive
+  // cross-process lock. This process's own AssetCache instance over
+  // the same root must be denied disk authority entirely.
+  {
+    AssetCache cache(configFor(m_tempDirPath));
+    QVERIFY(cache.isDiskCacheDisabledForTesting());
+
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/denied-process.png")));
+    cache.store(key, makeEntry(QByteArrayLiteral("memory-only-bytes")));
+    // Memory-tier behaviour is unaffected -- only disk is denied.
+    QVERIFY(cache.lookupMemory(key).has_value());
+    // Zero disk mutation: nothing was ever written to the root the
+    // other process still owns.
+    QCOMPARE(QDir(m_tempDirPath)
+                 .entryList(QDir::NoDotAndDotDot | QDir::AllEntries)
+                 .size(),
+             0);
+  }
+
+  // Release the helper process's lock deterministically (write a line
+  // to its stdin, then wait for real process exit -- never a sleep).
+  holder.write("release\n");
+  QVERIFY2(holder.waitForFinished(5000),
+           "lock-holder helper never exited after being signalled");
+  QCOMPARE(holder.exitCode(), 0);
+
+  // Now that the OTHER process has genuinely released the lock, THIS
+  // process can acquire it normally.
+  AssetCache cacheAfterRelease(configFor(m_tempDirPath));
+  QVERIFY(!cacheAfterRelease.isDiskCacheDisabledForTesting());
+  const QString keyAfter = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/after-release.png")));
+  cacheAfterRelease.store(keyAfter,
+                          makeEntry(QByteArrayLiteral("disk-now-ok-bytes")));
+  QVERIFY(cacheAfterRelease.lookupDisk(keyAfter).has_value());
+#endif
+}
+
+void AssetCacheTests::
+    sameProcessMultipleInstancesOverSameRootAllCooperateWithFullDiskAuthority() {
+  // Positive control: two LIVE, simultaneously-existing AssetCache
+  // instances in THIS SAME process, both over the exact same root --
+  // this must keep working exactly as it always has (several existing
+  // tests in this file already rely on overlapping/sequential
+  // same-process instances); the process-wide root lock registry must
+  // never treat a same-process sibling as a competing owner.
+  AssetCache first(configFor(m_tempDirPath));
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+
+  AssetCache second(configFor(m_tempDirPath));
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/cooperating-instances.png")));
+  first.store(key, makeEntry(QByteArrayLiteral("cooperating-bytes")));
+  // The second, sibling instance can see what the first durably wrote
+  // to disk (its own memory tier is naturally separate/cold).
+  const auto hitFromSecond = second.lookupDisk(key);
+  QVERIFY(hitFromSecond.has_value());
+  QCOMPARE(hitFromSecond->encodedBytes, QByteArrayLiteral("cooperating-bytes"));
+
+  // Destroying ONE sibling must not revoke the other's still-live disk
+  // authority (the registry's reference count, not an unconditional
+  // release, gates when the underlying lock is actually released).
+  {
+    AssetCache third(configFor(m_tempDirPath));
+    QVERIFY(!third.isDiskCacheDisabledForTesting());
+  }
+  QVERIFY(!first.isDiskCacheDisabledForTesting());
+  QVERIFY(!second.isDiskCacheDisabledForTesting());
+  const auto hitStillFromSecond = second.lookupDisk(key);
+  QVERIFY(hitStillFromSecond.has_value());
 }

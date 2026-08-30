@@ -370,6 +370,21 @@ if(BUILD_TESTING)
     )
     add_test(NAME asset COMMAND arkham-asset-tests)
 
+    # Minimal, non-QtTest standalone helper process spawned as a REAL
+    # separate OS process by AssetCacheTests' cross-process root-lock
+    # tests (see AssetCacheLockHolderMain.cpp's own comment) -- a
+    # same-process second AssetCache instance always cooperates with a
+    # live sibling over the same root by design, so only an actual
+    # second process can prove the cross-process denial path. Not a
+    # CTest target itself; AssetCacheTests locates and launches its
+    # binary directly via QCoreApplication::applicationDirPath().
+    qt_add_executable(arkham-asset-cache-lock-holder
+        tests/helpers/AssetCacheLockHolderMain.cpp
+    )
+    target_link_libraries(arkham-asset-cache-lock-holder PRIVATE
+        arkham_foundation
+    )
+
     qt_add_executable(arkham-semantic-command-tests
         tests/SemanticCommandTests.cpp
     )

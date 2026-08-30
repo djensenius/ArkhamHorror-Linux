@@ -564,7 +564,7 @@ jobs:
           python3 packaging/audit_codec_notices.py verify-notices \
             "$lib_search_root" third_party "$doc_root" --qt-reference-dir "$QT_ROOT_DIR"
       - name: Upload bundled-library SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: codec-notice-sbom
           path: codec-notice-sbom.json

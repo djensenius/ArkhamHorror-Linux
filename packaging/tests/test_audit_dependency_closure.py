@@ -411,5 +411,121 @@ class ExactReachablePathIsUsedForRecursionTests(unittest.TestCase):
         self.assertNotIn("libphantom-never-bundled.so.1", unreachable)
 
 
+class DuplicateBasenameRootsTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "auto roots still dict[basename,Path],
+    losing duplicates/location"): --auto-roots must preserve EVERY
+    discovered root's own exact, distinct path -- never collapse two
+    different ELF files that happen to share a bare basename (in
+    different real directories) down to a single "first match wins"
+    entry, which would silently drop the second one's own dependency
+    edges from the audit entirely."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lib_dir = Path(self.tmp.name).resolve()
+
+        # Two DIFFERENT real files, deliberately sharing the exact same
+        # basename ("libplugin.so.1"), in two different directories --
+        # each with ITS OWN, different, real dependency reachable only
+        # from ITS OWN directory's $ORIGIN.
+        self.dir_alpha = self.lib_dir / "dir_alpha"
+        self.dir_zeta = self.lib_dir / "dir_zeta"
+        self.plugin_in_alpha = self.dir_alpha / "libplugin.so.1"
+        self.plugin_in_zeta = self.dir_zeta / "libplugin.so.1"
+        _write_fake_elf(self.plugin_in_alpha)
+        _write_fake_elf(self.plugin_in_zeta)
+
+        self.leaf_in_alpha = self.dir_alpha / "libonlyinalpha.so.1"
+        self.leaf_in_zeta = self.dir_zeta / "libonlyinzeta.so.1"
+        _write_fake_elf(self.leaf_in_alpha)
+        _write_fake_elf(self.leaf_in_zeta)
+
+        self.dynamic_text = {
+            self.plugin_in_alpha: _needed_and_runpath_text(
+                ["libonlyinalpha.so.1"], "$ORIGIN"
+            ),
+            self.plugin_in_zeta: _needed_and_runpath_text(
+                ["libonlyinzeta.so.1"], "$ORIGIN"
+            ),
+            self.leaf_in_alpha: _needed_and_runpath_text([], None),
+            self.leaf_in_zeta: _needed_and_runpath_text([], None),
+        }
+
+    def _run_audit_with_both_roots_as_tuples(self):
+        def fake_dynamic_text(path: Path) -> str:
+            return self.dynamic_text[path]
+
+        with mock.patch.object(
+            audit, "_readelf_dynamic_text", side_effect=fake_dynamic_text
+        ):
+            return audit.audit_closure(
+                self.lib_dir,
+                [
+                    ("libplugin.so.1", self.plugin_in_alpha),
+                    ("libplugin.so.1", self.plugin_in_zeta),
+                ],
+            )
+
+    def test_both_same_basename_roots_are_independently_audited(self) -> None:
+        # Without the fix, only ONE of these two same-named roots would
+        # ever be processed (whichever the flat index happened to
+        # remember), silently dropping the other's own real dependency
+        # edge from the audit -- this would show up as bundled_closure
+        # missing one of the two leaf libraries even though both are
+        # genuinely present and reachable.
+        bundled_closure, missing, unreachable, _ = (
+            self._run_audit_with_both_roots_as_tuples()
+        )
+        self.assertEqual(missing, {})
+        self.assertEqual(unreachable, {})
+        self.assertIn("libonlyinalpha.so.1", bundled_closure)
+        self.assertIn("libonlyinzeta.so.1", bundled_closure)
+
+    def test_discover_elf_roots_preserves_every_distinct_path_regardless_of_name_order(
+        self,
+    ) -> None:
+        # Round-N+ review ("reverse names mutation still catches broken
+        # copy"): must not depend on alphabetical/traversal-order luck.
+        # Rename the two directories so the SECOND one alphabetically
+        # ("dir_zzz_first_alphabetically" isn't right -- construct
+        # explicit reversed names) still must not lose either path.
+        reversed_root = Path(self.tmp.name) / "reversed_order_check"
+        dir_first = reversed_root / "aaa_dir"
+        dir_second = reversed_root / "zzz_dir"
+        plugin_first = dir_first / "libsameorder.so.1"
+        plugin_second = dir_second / "libsameorder.so.1"
+        _write_fake_elf(plugin_first)
+        _write_fake_elf(plugin_second)
+
+        discovered = audit._discover_elf_roots(reversed_root)
+        discovered_paths = {p.resolve() for p in discovered}
+        self.assertIn(plugin_first.resolve(), discovered_paths)
+        self.assertIn(plugin_second.resolve(), discovered_paths)
+        self.assertEqual(
+            len([p for p in discovered if p.name == "libsameorder.so.1"]), 2
+        )
+
+    def test_bare_string_root_still_resolves_via_flat_index_for_backward_compat(
+        self,
+    ) -> None:
+        # A plain str entry (the pre-existing --root convention, still
+        # used by every hand-picked --root caller) must keep resolving
+        # via the flat, name-only index exactly as before -- this is the
+        # deliberately-narrower fallback path for callers that never
+        # claimed to know any particular root's real location.
+        def fake_dynamic_text(path: Path) -> str:
+            return self.dynamic_text[path]
+
+        with mock.patch.object(
+            audit, "_readelf_dynamic_text", side_effect=fake_dynamic_text
+        ):
+            bundled_closure, missing, unreachable, _ = audit.audit_closure(
+                self.lib_dir, ["libonlyinalpha.so.1"]
+            )
+        self.assertEqual(missing, {})
+        self.assertIn("libonlyinalpha.so.1", bundled_closure)
+
+
 if __name__ == "__main__":
     unittest.main()

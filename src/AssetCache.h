@@ -126,6 +126,50 @@ namespace Arkham {
 // the original listing nor a symlink substituted in afterwards (a
 // rename/replace race) can ever cause a deletion to escape outside this
 // cache's own real files and directories.
+//
+// Cross-process authority (cumulative review, PR #18, HIGH,
+// "disk-generation/invalidation serialization is instance-local QMutex;
+// two cache instances/processes can reap each other's in-progress
+// generations or delayed 200 can revive a newer definitive 404"):
+// `m_mutex` above only ever serializes threads WITHIN one process --
+// it provides no protection at all against a second, genuinely separate
+// PROCESS concurrently mutating the exact same on-disk directory: one
+// process's reap sweep could delete files a second process's
+// in-progress store()/invalidate() transaction still depends on, or a
+// slow, already-in-flight revalidation in one process could durably
+// resurrect a generation a second process has since authoritatively
+// invalidated. Rather than attempt to make two independent processes
+// safely cooperate as optimistic-CAS peers over the same directory (an
+// approach that would require a durable, globally-ordered mutation
+// journal covering every one of store/invalidate/touch/recover/evict,
+// fsync'd and interpreted identically by every participant), this
+// class instead establishes exactly ONE process-wide coordinator per
+// canonical cache root (identified by (device, inode)) at a time -- see
+// acquireExclusiveRootOwnershipOrFailClosed()/
+// releaseRootOwnershipRegistration() in the .cpp for the full
+// mechanism: the first AssetCache instance for a given root in this
+// process takes an exclusive, advisory lock (flock(LOCK_EX | LOCK_NB)
+// on a dup() of the root directory descriptor) the instant the root is
+// opened; every OTHER instance for that SAME root, in this SAME
+// process, cooperates by joining that same registration (a reference
+// count) rather than competing for it -- multiple same-process
+// instances over one root remain fully supported, exactly as before.
+// Only a genuinely DIFFERENT process is ever denied. The underlying
+// lock is released the instant the LAST live same-process instance for
+// that root is destroyed (or, on a hard crash, by the kernel's own
+// process-exit fd cleanup, so a crashed owner can never leave a stale
+// lock behind for another process to wait on indefinitely). If a NEW
+// root's lock cannot be acquired for ANY reason -- a different process
+// already holds it, or any other failure -- that instance runs
+// memory-only, with disk persistence disabled for its entire lifetime
+// exactly as if disk I/O were unavailable for any other reason
+// (m_diskCacheDisabled): it never reads, writes, deletes, reaps, or
+// otherwise touches this directory. A contended or otherwise unprovable
+// lock therefore can never mint a durable disk-cache result, and at any
+// moment at most one live PROCESS ever has disk authority over a given
+// cache root -- eliminating the entire class of cross-process races
+// described above by construction, rather than trying to make them
+// individually safe.
 class AssetCache {
 public:
   struct Config {
@@ -462,6 +506,41 @@ public:
   setMountIdentificationDegradedForTesting(bool forceOpenat2Unavailable,
                                            bool forceMountIdUnavailable);
 
+  // Test-only, deterministic override of authoritativeAccountHomeDirectory()
+  // (AssetCache.cpp) -- the independent OS/account-database source
+  // resolveHomeDirectoryNoFollow() consults to decide whether $HOME's own
+  // mount-transition exception may be trusted (see that function's
+  // comment). There is no portable, unprivileged way to make the real
+  // getpwuid() return an arbitrary path for the current process's real
+  // UID, so this lets a test force either answer against ordinary,
+  // unprivileged fixtures: `active=true, value=<some path>` makes the
+  // override behave as if the account database's home were exactly
+  // `value` (empty `value` simulates "no account-database home matches,
+  // ever" -- i.e. forces the strict fallback path unconditionally).
+  // `active=false` (the default, and what a test MUST reset back to
+  // before returning, ideally via an RAII scope guard) restores the
+  // real getpwuid() lookup; production code paths never depend on this
+  // outside of a test binary calling this setter.
+  static void setAuthoritativeAccountHomeDirectoryOverrideForTesting(
+      bool active, const QString &value = QString());
+
+  // Test-only, deterministic, UNPRIVILEGED injection of an INDETERMINATE
+  // (never partial) directory-listing failure -- see
+  // listAllEntriesRelativeOnce()/listAllEntriesRelative()'s own comments
+  // in AssetCache.cpp for the std::nullopt contract this exercises.
+  // While active, every call to listAllEntriesRelative() (both attempts
+  // of its own single retry, so the fault is never silently masked)
+  // fails with std::nullopt, regardless of the real directory's actual
+  // contents -- letting a test prove reapAndEnforceQuota() (this
+  // function's sole mutating caller) aborts its ENTIRE sweep with zero
+  // mutations when the listing it would act on cannot be trusted,
+  // rather than proceeding against a partial/empty view. Defaults to
+  // false (ordinary behaviour) when never called; a test MUST reset it
+  // back to false before returning (ideally via an RAII scope guard) so
+  // this process-wide override never leaks into an unrelated, later
+  // test.
+  static void setListAllEntriesRelativeForcedFailureForTesting(bool active);
+
 private:
   struct DiskMetadata {
     QString key;
@@ -667,6 +746,17 @@ private:
   // documented limitation this implies on such platforms.
   mutable quint64 m_rootMountId{0};
   mutable bool m_rootHasMountId{false};
+  // Cumulative review (PR #18, HIGH): true iff this instance
+  // successfully registered itself as one of this PROCESS's (possibly
+  // several, cooperating) live owners of `m_rootDevice`/`m_rootInode`
+  // in the process-wide root-lock registry (see
+  // acquireExclusiveRootOwnershipOrFailClosed()/
+  // releaseRootOwnershipRegistration() in the .cpp) -- and therefore
+  // whether the destructor must release this instance's share of that
+  // registration. False whenever disk I/O was never enabled for this
+  // instance at all (config invalid, symlinked root, resolution
+  // failure, etc.) or a DIFFERENT process already held this exact root.
+  mutable bool m_holdsRootLockRegistration{false};
   // Review item 11: guarded by m_mutex; recovered in the constructor (via
   // reapAndEnforceQuota()'s directory scan) and re-validated (monotonic,
   // never decreasing) on every subsequent reapAndEnforceQuota() call, so

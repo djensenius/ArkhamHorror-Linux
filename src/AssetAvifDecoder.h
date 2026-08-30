@@ -23,24 +23,45 @@ namespace Arkham {
 // magic-byte-sniffed and Content-Type-checked by the caller -- see
 // AssetNetworkFetcher::decodeAndValidate()) into a QImage.
 //
-// Dimension/pixel-budget limits are enforced by this function explicitly
-// re-checking `decoder->image->width/height` against the caller-supplied
-// `maxDimensionPixels`/`maxTotalPixels` limits immediately after a
-// successful avifDecoderParse() call -- which only reads container-level
-// metadata (an ISOBMFF `ispe` box), never decodes or allocates any AV1
-// pixel data -- and strictly BEFORE ever calling avifDecoderNextImage()
-// (which performs the actual AV1 decode and full-resolution pixel-buffer
-// allocation). A hostile AVIF that declares a huge width/height in its
-// container metadata therefore never reaches pixel decode/allocation at
-// all, regardless of how small its actual (possibly absent or degenerate)
-// AV1 payload is. libavif's own built-in `imageDimensionLimit`/
-// `imageSizeLimit` defaults (32768 per side / 16384*16384 total) are left
-// untouched as a coarse backstop against libavif's own internal arithmetic
-// during Parse -- deliberately NOT tightened to this project's own
-// (smaller, configurable) limits, since doing so would make
-// avifDecoderParse() itself fail with a generic, untyped parse error for
-// an image this function's own explicit check is designed to reject with
-// a precise, typed AssetErrorCode::DimensionTooLarge/PixelBudgetExceeded.
+// Dimension/pixel-budget defense is layered THREE ways (cumulative review,
+// PR #18):
+//
+// 1. Before avifDecoderParse() is ever called, decoder->imageCountLimit is
+//    tightened to 1 (this project only ever serves/decodes a single still
+//    image) and decoder->imageSizeLimit is tightened to the caller's own
+//    `maxTotalPixels` (rather than left at libavif's much looser built-in
+//    defaults of ~2.59M images / 268,435,456 pixels). This makes libavif
+//    itself abort early -- during Parse's own sample-table/item
+//    enumeration -- against a hostile container that merely *declares* an
+//    enormous image/sample count, bounding Parse's own internal cost
+//    rather than only rejecting the result afterward. For codec backends
+//    that honor it (confirmed empirically for this project's exact
+//    pinned libavif 0.9.3 + dav1d on Ubuntu 22.04), imageSizeLimit is ALSO
+//    enforced against the actual decoded AV1 frame's own internal
+//    dimensions, before any post-decode rescale back to a
+//    container-declared size -- see point 3 below for why this matters.
+// 2. Immediately after a successful avifDecoderParse() -- which only ever
+//    reads container-level metadata (an ISOBMFF `ispe` box), never
+//    decodes or allocates any AV1 pixel data -- this function explicitly
+//    re-checks decoder->image->width/height/totalPixels against
+//    `maxDimensionPixels`/`maxTotalPixels` and returns BEFORE ever calling
+//    avifDecoderNextImage() (which performs the actual AV1 decode and
+//    full-resolution pixel-buffer allocation) if they are exceeded.
+// 3. Immediately AFTER avifDecoderNextImage() succeeds, the identical
+//    check is repeated against decoder->image's (now actually-decoded)
+//    dimensions, strictly before any RGB conversion buffer is sized from
+//    them. This closes a real TOCTOU gap point 2 alone cannot: a hostile
+//    AVIF can declare a tiny `ispe` (passing the point-2 check trivially)
+//    while its embedded AV1 bitstream itself encodes a far larger frame --
+//    the underlying codec must fully allocate/decode that oversized
+//    internal frame before any rescale back to the small declared size,
+//    by which point the resource cost has already been paid regardless of
+//    what the container claimed. Point 1's imageSizeLimit is the
+//    mechanism that actually prevents the codec from doing this in the
+//    first place (for backends that honor it); point 3 is a
+//    codec-independent backstop that re-validates whatever dimensions the
+//    decode actually produced, regardless of which backend served it or
+//    whether it honors imageSizeLimit internally.
 //
 // `maxDimensionPixels` and `maxTotalPixels` mirror
 // AssetNetworkFetcher::Limits' fields of the same name and are applied

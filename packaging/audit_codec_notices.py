@@ -290,22 +290,45 @@ _DYNAMIC_TAG_RE = re.compile(
 # even though the pointed-to section's own CONTENT never changed at
 # all. A bare raw-address comparison would therefore false-positive on
 # an entirely legitimate repack. _resolve_dynamic_tag_value() below
-# solves this the same way _canonical_load_digest() itself does for
-# section content: by keying on the STABLE, content-addressed identity
-# (here, the target SECTION'S NAME, which is invariant across
-# relocation) rather than the volatile raw address.
+# solves this the same way _resolve_symbol_address() already does for
+# symbol table entries (see that function's own docstring): by keying
+# on the STABLE, content-addressed identity of the target SECTION'S
+# NAME (invariant across relocation) PLUS the offset WITHIN that
+# section (also invariant across relocation of the whole section --
+# only the section's own base address moves, never a fixed value's
+# position relative to it), rather than the volatile raw address.
+#
+# Third-HIGH-round review ("canonical ELF digest ... collapses dynamic
+# pointer tags to section name, ignoring section-relative offset ...
+# DT_INIT/FINI/INIT_ARRAY pointer changes within same section ... can
+# pass with retained build ID"): the PREVIOUS version of this function
+# returned only "-> <section name>", discarding the offset entirely.
+# DT_INIT/DT_FINI point at a specific function's entry address, and
+# DT_INIT_ARRAY/DT_FINI_ARRAY/DT_PREINIT_ARRAY point at the START of
+# their respective array -- an attacker retargeting any of these to a
+# DIFFERENT address that still happens to fall within the SAME section
+# (e.g. redirecting DT_INIT a few bytes further into `.init`, or into
+# attacker-controlled bytes elsewhere in `.text`) would previously have
+# resolved to the identical "-> .init"/"-> .text" string and gone
+# completely undetected. Preserving the offset closes this gap while
+# remaining exactly as tolerant of legitimate section relocation as
+# before, since the offset of a fixed logical target relative to its
+# OWN section's start does not change merely because the whole section
+# moves to a different base address.
 _BARE_HEX_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]+$")
 
 
 def _resolve_dynamic_tag_value(value: str, sections: list[dict[str, str]]) -> str:
     """If `value` is a bare hex address (readelf's rendering for an
-    address-valued dynamic tag), resolves it to the name of whichever
-    section's [addr, addr + size) range contains it, returning
-    "-> <section name>" (or "-> <unmapped address>" if no section
-    claims it, itself a meaningful, detectable difference) instead of
-    the raw, potentially-legitimately-shifting address. Any other,
-    already-symbolic value (a library name, a flag word, a byte count)
-    is returned completely unchanged."""
+    address-valued dynamic tag), resolves it to
+    "-> <section name>+0x<offset>" using whichever section's own
+    [addr, addr + size) range contains it (or "-> <unmapped address>"
+    if no section claims it, itself a meaningful, detectable
+    difference) instead of the raw, potentially-legitimately-shifting
+    address -- see this module's own comment above for why BOTH the
+    section identity and the offset within it must be preserved. Any
+    other, already-symbolic value (a library name, a flag word, a byte
+    count) is returned completely unchanged."""
     if not _BARE_HEX_ADDRESS_RE.match(value):
         return value
     address = int(value, 16)
@@ -315,7 +338,7 @@ def _resolve_dynamic_tag_value(value: str, sections: list[dict[str, str]]) -> st
         start = int(section["addr"], 16)
         size = int(section["size"], 16)
         if size and start <= address < start + size:
-            return f"-> {section['name']}"
+            return f"-> {section['name']}+0x{address - start:x}"
     return "-> <unmapped address>"
 
 
@@ -643,19 +666,106 @@ def _read_build_id(path: Path) -> str | None:
     return match.group("id").lower() if match else None
 
 
-def _read_program_headers(path: Path) -> list[tuple[str, str]]:
-    """Returns (type, flags) for EVERY program header entry in `path`, in
-    on-disk program-header-table order (index 0, 1, 2, ...) -- the same
-    order readelf's own "Section to Segment mapping" table numbers its
-    entries by, which is what lets _section_to_segment_load_flags() below
-    correlate the two tables positionally. `flags` is the raw
-    three-character "R"/"W"/"E" (or space) field, e.g. "R E", "RW ".
-    Raises ElfIdentityError (via _readelf()) if readelf itself cannot
-    parse `path`'s program headers at all."""
+def _read_program_headers(path: Path) -> list[dict[str, str]]:
+    """Returns every field (type, flags, filesz, memsz, align) for EVERY
+    program header entry in `path`, in on-disk program-header-table
+    order (index 0, 1, 2, ...) -- the same order readelf's own "Section
+    to Segment mapping" table numbers its entries by, which is what lets
+    _section_to_segment_load_flags() below correlate the two tables
+    positionally. `flags` is the raw three-character "R"/"W"/"E" (or
+    space) field, e.g. "R E", "RW ". Deliberately excludes `offset`/
+    `vaddr`/`paddr` (raw position/address information this project's
+    own empirical testing against a real patchelf 0.14.3 rewrite
+    confirmed can legitimately shift for segments whose content gets
+    relocated into a newly-appended segment -- see
+    _canonical_load_digest()'s own docstring) since callers that fold
+    this into a digest (see _non_load_program_header_records() below)
+    must key on content-stable identity, never raw location, exactly as
+    every other part of this digest already does. Raises
+    ElfIdentityError (via _readelf()) if readelf itself cannot parse
+    `path`'s program headers at all."""
     return [
-        (match.group("type"), match.group("flags"))
+        {
+            "type": match.group("type"),
+            "flags": match.group("flags"),
+            "filesz": match.group("filesz"),
+            "memsz": match.group("memsz"),
+            "align": match.group("align"),
+        }
         for match in _PROGRAM_HEADER_RE.finditer(_readelf(path, "-l", "-W"))
     ]
+
+
+# Third-HIGH-round review ("... executable GNU_STACK, RELRO/TLS/load
+# offsets/sizes can pass with retained build ID"): PT_GNU_STACK (whose
+# own FLAGS field is the sole authoritative record of whether the
+# process stack is mapped executable -- a real, security-relevant
+# hardening toggle with no corresponding section at all),
+# PT_GNU_RELRO (the byte range the dynamic loader mprotects read-only
+# after relocation processing -- stripping or shrinking it is a real
+# hardening downgrade), and PT_TLS (the thread-local-storage template's
+# own size/alignment) are program-header-only state: none of them is
+# correlated to any section by _section_to_segment_load_flags() (that
+# function only ever looks at PT_LOAD entries), so NONE of their own
+# flags/filesz/memsz/align were previously folded into
+# _canonical_load_digest() at all -- an attacker could flip PT_GNU_STACK
+# executable, shrink/delete PT_GNU_RELRO, or alter PT_TLS's own
+# template size, and the previous digest would not change one bit.
+#
+# PT_LOAD and PT_DYNAMIC are both deliberately excluded here, for two
+# DIFFERENT documented-legitimate-repack reasons empirically confirmed
+# against a real patchelf 0.14.3 RUNPATH rewrite (this project's own
+# testing, see this module's cumulative-review test suite): PT_LOAD's
+# own per-segment filesz/memsz are NOT stable (moving
+# `.gnu.hash`/`.note.*`/`.dynstr` out of an existing LOAD segment into
+# a brand-new one legitimately shrinks the original segment's own
+# filesz/memsz) -- that segment class is already correctly
+# authenticated via the per-SECTION abstraction
+# (_section_to_segment_load_flags() + per-section content hashing)
+# rather than via any raw segment-level record, and must stay that way.
+# PT_DYNAMIC's own filesz/memsz are ALSO not stable (a longer RPATH
+# string can change the total number of Elf64_Dyn entries actually
+# emitted, e.g. via padding/alignment, changing PT_DYNAMIC's own
+# declared size by a whole entry even though every INDIVIDUAL decoded
+# tag this project cares about is unchanged) -- `.dynamic`'s own
+# decoded tag content is already fully authenticated via
+# _read_dynamic_tags()'s own decoded, layout-independent view, so
+# PT_DYNAMIC's raw program-header size is pure redundant bookkeeping
+# for already-covered data, not an independent authentication gap.
+#
+# Entries are returned SORTED by (type, flags, filesz, memsz, align)
+# rather than raw on-disk program-header-table order: this project's
+# own empirical testing found that a real patchelf 0.14.3 RUNPATH
+# rewrite can legitimately REORDER the program-header table itself
+# (e.g. swapping which of two NOTE segments appears first) with no
+# security consequence at all, since the loader consults each entry by
+# its own TYPE/semantics, never by table position. Sorting by full
+# content tuple (rather than raw index) produces a canonical,
+# order-independent representation of the exact same multiset of
+# entries, so a genuine reorder cannot change the digest while any
+# actual value change (flags/filesz/memsz/align) still does.
+def _non_load_program_header_records(path: Path) -> list[tuple[str, str, str, str, str]]:
+    """Returns (type, flags, filesz, memsz, align) for every program
+    header entry in `path` whose type is neither "LOAD" nor "DYNAMIC",
+    sorted into a canonical, table-position-independent order (stable
+    even across duplicate types, e.g. multiple NOTE segments, and
+    across a legitimate patchelf reordering of the table itself) -- see
+    this function's own preceding module comment for exactly which
+    security-relevant segments this closes (PT_GNU_STACK/PT_GNU_RELRO/
+    PT_TLS) and why PT_LOAD/PT_DYNAMIC are both deliberately excluded.
+    Returns an empty list, never raises, if `path`'s program headers
+    cannot be parsed at all (callers already tolerate this the same way
+    they tolerate a missing SONAME/build-id)."""
+    try:
+        headers = _read_program_headers(path)
+    except ElfIdentityError:
+        return []
+    return sorted(
+        (header["type"], header["flags"], header["filesz"], header["memsz"], header["align"])
+        for header in headers
+        if header["type"] not in ("LOAD", "DYNAMIC")
+    )
+
 
 
 def _read_section_headers(path: Path) -> list[dict[str, str]]:
@@ -707,7 +817,7 @@ def _section_to_segment_load_flags(path: Path) -> dict[str, str]:
         index = int(match.group("index"))
         if index >= len(headers):
             continue
-        header_type, header_flags = headers[index]
+        header_type, header_flags = headers[index]["type"], headers[index]["flags"]
         if header_type != "LOAD":
             continue
         for name in match.group("names").split():
@@ -804,7 +914,21 @@ def _canonical_load_digest(path: Path) -> str | None:
     `.bss`-skipping `if` below for the full explanation); only its
     header identity (name/type/flags/effective runtime executable-bit/
     declared size) is authenticated, exactly as for every other
-    section."""
+    section.
+
+    Every dynamic-tag pointer value resolved by
+    _resolve_dynamic_tag_value() (folded in below) preserves the
+    OFFSET within its target section, not merely the section's own
+    name -- see that function's own docstring for why a
+    section-name-only resolution would miss a DT_INIT/DT_FINI/
+    DT_INIT_ARRAY retarget that stays within the same section. Every
+    non-LOAD program header (PT_GNU_STACK's own executable-stack
+    permission, PT_GNU_RELRO's own protected-range size, PT_TLS's own
+    template size/alignment, and so on -- see
+    _non_load_program_header_records()'s own preceding module comment)
+    is likewise folded in below, since none of these carries a
+    corresponding section at all and was therefore previously
+    completely unauthenticated."""
     try:
         sections = _read_section_headers(path)
     except ElfIdentityError:
@@ -910,6 +1034,18 @@ def _canonical_load_digest(path: Path) -> str | None:
         digest.update(("DYNSYM\0" + "\0".join(symbol) + "\0").encode("utf-8"))
     for symbol in sorted(_read_symtab_symbols(path, sections)):
         digest.update(("SYMTAB\0" + "\0".join(symbol) + "\0").encode("utf-8"))
+    # Third-HIGH-round review ("... executable GNU_STACK, RELRO/TLS/
+    # load offsets/sizes can pass with retained build ID"): every
+    # non-LOAD program header (PT_GNU_STACK's own executable-stack
+    # flag, PT_GNU_RELRO's own protected range size, PT_TLS's own
+    # template size/alignment, and so on) is folded in here -- see
+    # _non_load_program_header_records()'s own preceding module comment
+    # for exactly why PT_LOAD itself must stay excluded from this raw
+    # record while every OTHER segment type must not.
+    for type_, flags, filesz, memsz, align in _non_load_program_header_records(path):
+        digest.update(
+            f"PHDR\0{type_}\0{flags}\0{filesz}\0{memsz}\0{align}\0".encode("utf-8")
+        )
     return digest.hexdigest()
 
 
@@ -1223,29 +1359,84 @@ COMPONENT_EXPECTED_SOURCE_PACKAGES: dict[str, frozenset[str]] = {
 # future Ubuntu point release, or a from-source/PPA-installed component
 # masquerading with the same source-package name but an entirely
 # different, unreviewed upstream revision. This table pins an expected
-# `dpkg-query`-reported version STRING PREFIX (deliberately only a
-# leading `major.minor[.patch]` prefix, e.g. "1.46.5", never the full
-# Debian revision suffix such as "-2ubuntu1.1") so a routine point
-# release (".1" -> ".2") is tolerated exactly as
-# COMPONENT_EXPECTED_SOURCE_PACKAGES' own docstring already establishes
-# as this project's policy, while a genuine upstream version bump (e.g.
-# "1.46.5" -> "1.47.0") is a real, reviewable diff that must be
-# deliberately re-pinned here, not silently absorbed.
+# `dpkg-query`-reported version STRING PREFIX (deliberately only the
+# leading UPSTREAM version -- i.e. everything before the LAST hyphen,
+# per Debian's own `[epoch:]upstream_version[-debian_revision]` version
+# grammar, in which only `debian_revision` itself is guaranteed
+# hyphen-free, e.g. "1.46.5" from "1.46.5-2ubuntu1.1", or "2:8.39" from
+# "2:8.39-13ubuntu0.22.04.1") so a routine point release/security
+# rebuild (a `debian_revision`-only bump, e.g. ".1" -> ".2") is
+# tolerated exactly as COMPONENT_EXPECTED_SOURCE_PACKAGES' own docstring
+# already establishes as this project's policy, while a genuine
+# upstream version bump (e.g. "1.46.5" -> "1.47.0") is a real,
+# reviewable diff that must be deliberately re-pinned here, not
+# silently absorbed.
 #
-# Deliberately populated only for the component the original review
-# finding named explicitly (e2fsprogs/libcom_err, previously
-# misattributed to krb5) rather than every entry in
-# COMPONENT_EXPECTED_SOURCE_PACKAGES: adding a new pin here requires
-# independently confirming the real installed version against a genuine
-# `ubuntu:22.04` container first (exactly as that table's own docstring
-# already requires for source-package names), so entries are added
-# deliberately, one reviewed component at a time, not speculatively for
-# every component at once. A component with no entry here is validated
-# only by source-package name (COMPONENT_EXPECTED_SOURCE_PACKAGES), as
+# Third-HIGH-round review ("Other distro components accept mutable
+# repo versions by source-package name ... Pin an immutable Ubuntu
+# snapshot plus exact binary/source versions ... for EVERY distro
+# input"): every entry below (not merely e2fsprogs, this table's
+# previous sole entry) was independently confirmed against a genuine,
+# unmodified `ubuntu:22.04` container -- specifically:
+#   docker run --rm ubuntu:22.04 bash -c '
+#     apt-get update -qq && apt-get install -y --no-install-recommends \
+#       <every COMPONENT_EXPECTED_SOURCE_PACKAGES binary package> &&
+#     dpkg-query --showformat="${Package}\t${Version}\t${source:Package}\n" \
+#       --show <every package>'
+# -- the exact same base image this project's own real CI (see
+# .github/workflows/ci.yml's `apt-get install ... libavif-dev
+# libjpeg-turbo8-dev ...` steps, which install straight from Jammy's
+# default `main`/`universe` archive with no PPA/backport of any kind)
+# resolves these binary packages from. A component with no entry here
+# (there are none remaining after this round) would be validated only
+# by source-package name (COMPONENT_EXPECTED_SOURCE_PACKAGES), as
 # before -- itself a deliberate, honestly-scoped no-op, never a silent
-# false negative for one this table *does* cover.
+# false negative for one this table *does* cover. Re-confirm every
+# value here the same way whenever this project's own pinned CI image
+# tag is deliberately moved to a newer Ubuntu release.
 COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX: dict[str, str] = {
     "e2fsprogs": "1.46.5",
+    "krb5": "1.19.2",
+    "libsecret": "0.20.5",
+    "libgpg-error": "1.43",
+    "libgcrypt": "1.9.4",
+    "libffi": "3.4.2",
+    "glib": "2.72.4",
+    "zlib": "1:1.2.11.dfsg",
+    "pcre2": "10.39",
+    "util-linux": "2.37.2",
+    "libselinux": "3.3",
+    "liblzma": "5.2.5",
+    "libxau": "1:1.0.9",
+    "libxdmcp": "1:1.1.3",
+    "xcb": "1.14",
+    "xcb-util": "0.4.0",
+    "xcb-util-image": "0.4.0",
+    "xcb-util-keysyms": "0.4.0",
+    "xcb-util-renderutil": "0.3.9",
+    "xcb-util-wm": "0.4.1",
+    "xcb-util-cursor": "0.1.1",
+    "xkbcommon": "1.4.0",
+    "brotli": "1.0.9",
+    "libbsd": "0.11.5",
+    "libmd": "1.0.4",
+    "libcap": "1:2.44",
+    "dbus": "1.12.20",
+    "libkeyutils": "1.6.1",
+    "lz4": "1.9.3",
+    "pcre": "2:8.39",
+    "libpng": "1.6.37",
+    "systemd": "249.11",
+    "zstd": "1.4.8+dfsg",
+    "libjpeg": "2.1.2",
+    "bzip2": "1.0.8",
+    "libavif": "0.9.3",
+    "libaom": "3.3.0",
+    "libyuv": "0.0~git20220104.b91df1a",
+    "dav1d": "0.9.2",
+    "libgav1": "0.17.0",
+    "abseil": "0~20210324.2",
+    "gcc-runtime": "12.3.0",
 }
 
 # Deliberately x86_64-only (this project's whole AppImage target ABI --
@@ -1490,13 +1681,24 @@ def bind_bundled_library_to_system_provenance(
         `bundled_path`'s own -- the bundled file cannot be proven to
         actually be that package's own build output at all (this is the
         exact "unrelated host file"/substitution scenario the review
-        finding is about).
+        finding is about). Carries "systemPath"/"systemSha256"/
+        "systemCanonicalLoadDigest" alongside "package"/"version"/
+        "sourcePackage" so the exact disagreement is independently
+        reconstructable from the SBOM alone, without re-deriving
+        anything by basename after the fact (Third-HIGH-round review,
+        "Generated SBOM must allow independent reconstruction; do not
+        re-look up by basename after validation").
       - "matched": a same-basename, dpkg-owned system file was found
         AND its content is cryptographically proven identical (modulo
         only patchelf's documented RUNPATH-adjacent rewrites) to
         `bundled_path` -- "package"/"version"/"sourcePackage" keys are
         present, exactly as capture_package_provenance() itself
-        returns, so this dict can be passed directly to
+        returns, plus "systemPath"/"systemSha256"/
+        "bundledCanonicalLoadDigest" (the exact validated input
+        identity: the real system file this bundled copy was proven to
+        match, its whole-file sha256, and the shared canonical load
+        digest both files agree on) -- again for full independent SBOM
+        reconstruction -- so this dict can be passed directly to
         validate_component_package_provenance() for the source-package
         name check."""
     if shutil.which("dpkg") is None or shutil.which("dpkg-query") is None:
@@ -1541,12 +1743,17 @@ def bind_bundled_library_to_system_provenance(
                 "version": version,
                 "sourcePackage": source_package,
                 "systemPath": str(resolved),
+                "systemSha256": _sha256(resolved),
+                "systemCanonicalLoadDigest": system_digest,
             }
         return {
             "status": "matched",
             "package": package,
             "version": version,
             "sourcePackage": source_package,
+            "systemPath": str(resolved),
+            "systemSha256": _sha256(resolved),
+            "bundledCanonicalLoadDigest": bundled_digest,
         }
     if found_any_dpkg_owned_copy:
         # Unreachable in practice (a dpkg-owned copy found by the loop
@@ -2125,12 +2332,32 @@ def build_sbom_inventory(
     ("allowlisted", "first-party", a COMPONENT_PATTERNS/Qt component
     name, or "unmapped"), elf_identity()'s sha256/buildId/
     canonicalLoadDigest/soname fields, packageProvenance (see
-    capture_package_provenance()'s own docstring; None whenever no real
-    dpkg-owned system copy of this basename can be found in the current
-    environment, never itself an error), and -- for classification in
-    _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE (currently only "icu",
-    which never has a dpkg-owned system counterpart in this project's
-    pipeline at all; see that constant's own docstring) -- a
+    bind_bundled_library_to_system_provenance()'s own docstring --
+    Third-HIGH-round review, "SBOM calls legacy basename capture
+    instead of validated binding": this field used to be populated via
+    the older capture_package_provenance(basename), which -- exactly as
+    that function's own docstring already warns -- only ever proves a
+    claim about *some same-basename file the current host happens to
+    have installed*, never actually inspecting `path` (the real bundled
+    file THIS entry describes) at all; a substituted/downgraded bundled
+    library could therefore have "matched" a same-named-but-unrelated
+    system file with no real cryptographic connection between the two
+    whatsoever. Using the full, content-bound
+    bind_bundled_library_to_system_provenance() binding here instead
+    means the SBOM's own packageProvenance field for every entry is
+    ALREADY the validated result -- "status": "matched" (with
+    "package"/"version"/"sourcePackage"/"systemPath"/"systemSha256"/
+    "bundledCanonicalLoadDigest"), "content_mismatch" (a same-basename
+    system file exists but is cryptographically proven to be a
+    DIFFERENT build than this bundled file, plus its own
+    "systemPath"/"systemSha256"/"systemCanonicalLoadDigest" for
+    independent reconstruction), "not_dpkg_owned", "not_found", or
+    "dpkg_unavailable") -- never a bare, unvalidated basename re-lookup
+    a consumer would have to independently re-verify), and -- for
+    classification in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE
+    (currently only "icu", which never has a dpkg-owned system
+    counterpart in this project's pipeline at all; see that constant's
+    own docstring) -- a
     qtSdkProvenance field recording
     bind_bundled_library_to_qt_sdk_provenance()'s own result instead, so
     this entry's real, verifiable upstream origin is never silently
@@ -2155,7 +2382,7 @@ def build_sbom_inventory(
             "classification": classification,
         }
         entry.update(elf_identity(path))
-        entry["packageProvenance"] = capture_package_provenance(basename)
+        entry["packageProvenance"] = bind_bundled_library_to_system_provenance(path)
         if classification in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
             entry["qtSdkProvenance"] = bind_bundled_library_to_qt_sdk_provenance(
                 path, qt_reference_dir

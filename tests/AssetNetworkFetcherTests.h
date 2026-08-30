@@ -62,8 +62,13 @@ private slots:
   void pngWithInterlacedIhdrIsRejected();
   void avifRealFixtureAlwaysDecodesViaLibavif();
   void avifImageSequenceIsRejectedAsMalformedImage();
+  void
+  avifImageSequenceWithManyDeclaredFramesFailsFastAtParseNotPostParseCount();
   void avifMalformedContainerIsReportedAsMalformedImage();
   void avifDimensionBombIsRejectedBeforeAnyPixelDecodeOrAllocation();
+  void avifInnerAv1PayloadLargerThanDeclaredIspeIsRejectedByCodecSizeLimit();
+  void
+  avifGridCompositeDimensionsDivergingFromDeclaredIspeAreRejectedPostDecode();
   void avifFtypBoxSizeZeroExtendsToEndOfBufferPerIsobmff();
   void avifFtypMinorVersionIsNeverMisreadAsCompatibleBrand();
   void avifFtypTruncatedBoxSizeNeverReadsPastDeclaredBoundary();

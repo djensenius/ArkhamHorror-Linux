@@ -1005,6 +1005,102 @@ class SbomInventoryTests(unittest.TestCase):
         for entry in manifest["inventory"]:
             self.assertIsNotNone(entry["sha256"])
 
+    def test_package_provenance_uses_the_content_bound_binding_not_bare_basename_lookup(
+        self,
+    ) -> None:
+        # Finding #9 (distro provenance pinning, "SBOM calls legacy
+        # basename capture instead of validated binding"): before this
+        # fix, build_sbom_inventory() populated packageProvenance via
+        # capture_package_provenance(basename) -- a lookup that never
+        # actually inspects the real bundled file's own content at all,
+        # so a substituted/downgraded bundled library could "match" an
+        # unrelated same-named system file. This test proves the SBOM
+        # path now calls the content-bound
+        # bind_bundled_library_to_system_provenance(path) instead: it
+        # mocks the two functions to return distinguishable sentinel
+        # shapes and asserts the SBOM entry's packageProvenance is
+        # EXACTLY the content-bound sentinel, never the basename-only
+        # one, and that the basename-only function is never even
+        # invoked by this code path.
+        (self.lib_dir / "libavif.so.16.0.0").write_bytes(
+            audit._ELF_MAGIC + b"fake libavif bytes"
+        )
+        content_bound_sentinel = {
+            "status": "matched",
+            "package": "libavif13",
+            "version": "0.11.1-1",
+            "sourcePackage": "libavif",
+            "systemPath": "/usr/lib/x86_64-linux-gnu/libavif.so.16.0.0",
+            "systemSha256": "content-bound-sentinel-sha",
+            "bundledCanonicalLoadDigest": "content-bound-sentinel-digest",
+        }
+        with mock.patch.object(
+            audit,
+            "bind_bundled_library_to_system_provenance",
+            return_value=content_bound_sentinel,
+        ) as bound_mock, mock.patch.object(
+            audit,
+            "capture_package_provenance",
+            return_value={
+                "package": "unrelated-basename-only-package",
+                "version": "0.0.0-basename-only",
+                "sourcePackage": "unrelated-basename-only-source",
+            },
+        ) as basename_mock:
+            inventory = audit.build_sbom_inventory(self.lib_dir)
+        by_path = {entry["path"]: entry for entry in inventory}
+        self.assertEqual(
+            by_path["libavif.so.16.0.0"]["packageProvenance"],
+            content_bound_sentinel,
+        )
+        bound_mock.assert_called_once_with(self.lib_dir / "libavif.so.16.0.0")
+        basename_mock.assert_not_called()
+
+    def test_package_provenance_surfaces_a_real_content_mismatch_in_the_sbom(
+        self,
+    ) -> None:
+        # Companion to the mock-based test above, proving the actual
+        # end-to-end behavior a real substituted bundled library would
+        # produce in the SBOM: a same-basename "system" file exists and
+        # IS dpkg-owned, but its content provably differs from the
+        # bundled file -- the SBOM entry's packageProvenance must
+        # honestly record "content_mismatch" (not silently "matched"),
+        # with the exact system-side identity fields needed for
+        # independent reconstruction.
+        bundled_lib = self.lib_dir / "libavif.so.16.0.0"
+        bundled_lib.write_bytes(audit._ELF_MAGIC + b"bundled bytes")
+        system_dir = Path(self._tmp.name) / "system"
+        system_dir.mkdir()
+        system_copy = system_dir / "libavif.so.16.0.0"
+        system_copy.write_bytes(audit._ELF_MAGIC + b"DIFFERENT system bytes")
+        with mock.patch.object(
+            audit, "_SYSTEM_LIBRARY_SEARCH_DIRS", (system_dir,)
+        ), mock.patch.object(
+            shutil, "which", return_value="/usr/bin/dpkg"
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="libavif13"
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("0.11.1-1", "libavif"),
+        ), mock.patch.object(
+            audit,
+            "_canonical_load_digest",
+            side_effect=lambda p: "digest-bundled"
+            if p == bundled_lib
+            else "digest-system",
+        ):
+            inventory = audit.build_sbom_inventory(self.lib_dir)
+        by_path = {entry["path"]: entry for entry in inventory}
+        provenance = by_path["libavif.so.16.0.0"]["packageProvenance"]
+        self.assertEqual(provenance["status"], "content_mismatch")
+        self.assertEqual(provenance["sourcePackage"], "libavif")
+        self.assertEqual(provenance["systemPath"], str(system_copy.resolve()))
+        self.assertEqual(
+            provenance["systemSha256"], audit._sha256(system_copy)
+        )
+        self.assertEqual(provenance["systemCanonicalLoadDigest"], "digest-system")
+
 
 def _compile_shared_object(cc_bin: str, source: str, output: Path) -> None:
     source_path = output.with_suffix(".c")
@@ -1093,6 +1189,83 @@ def _test_flip_first_non_executable_load_segment(path: Path) -> None:
         path.write_bytes(bytes(data))
         return
     raise AssertionError(f"{path} has no non-executable PT_LOAD segment to mutate")
+
+
+# Well-known ELF64 program-header p_type values (from <elf.h>) needed by
+# the raw program-header patchers below -- deliberately hand-copied
+# constants, not imported from production code, for the same
+# independent-parser-integrity reason _TEST_LOAD_HEADER_RE is its own
+# regex (see the module comment above it).
+_PT_TLS = 7
+_PT_GNU_STACK = 0x6474E551
+_PT_GNU_RELRO = 0x6474E552
+_DT_INIT_ARRAY = 25
+
+
+def _test_find_program_header_by_type(data: bytearray, p_type_wanted: int) -> int | None:
+    """Returns the raw file offset of the FIRST Elf64_Phdr entry whose
+    own p_type matches `p_type_wanted`, or None if no such entry exists
+    -- parsed directly from the ELF header/program-header table,
+    independent of readelf/production code, exactly as
+    _test_flip_first_non_executable_load_segment() already does for
+    PT_LOAD."""
+    e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+    for index in range(e_phnum):
+        entry_off = e_phoff + index * e_phentsize
+        p_type = struct.unpack_from("<I", data, entry_off)[0]
+        if p_type == p_type_wanted:
+            return entry_off
+    return None
+
+
+def _test_find_dynamic_tag_entry_offset(data: bytearray, tag_wanted: int) -> int | None:
+    """Returns the raw file offset of the FIRST Elf64_Dyn entry (16
+    bytes: an 8-byte little-endian d_tag followed by an 8-byte
+    little-endian d_val/d_ptr union) inside the PT_DYNAMIC segment
+    whose own d_tag matches `tag_wanted`, or None if PT_DYNAMIC is
+    absent or has no such entry -- parsed directly from the ELF
+    program-header table and raw `.dynamic` bytes, independent of
+    readelf/production code."""
+    PT_DYNAMIC = 2
+    dynamic_off = _test_find_program_header_by_type(data, PT_DYNAMIC)
+    if dynamic_off is None:
+        return None
+    p_offset = struct.unpack_from("<Q", data, dynamic_off + 8)[0]
+    p_filesz = struct.unpack_from("<Q", data, dynamic_off + 32)[0]
+    entry_off = p_offset
+    end = p_offset + p_filesz
+    while entry_off + 16 <= end:
+        d_tag = struct.unpack_from("<q", data, entry_off)[0]
+        if d_tag == tag_wanted:
+            return entry_off
+        if d_tag == 0:  # DT_NULL terminator
+            break
+        entry_off += 16
+    return None
+
+
+def _test_section_virtual_range(path: Path, section_name: str) -> tuple[int, int]:
+    """Returns (virtual_address, size) of the named section, parsed via
+    `readelf -SW` independently of production code (see the module
+    comment above `_TEST_LOAD_HEADER_RE`)."""
+    output = subprocess.run(
+        ["readelf", "-SW", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    pattern = re.compile(
+        r"\[\s*\d+\]\s+"
+        + re.escape(section_name)
+        + r"[ \t]+\S+[ \t]+(?P<addr>[0-9a-fA-F]+)[ \t]+[0-9a-fA-F]+[ \t]+"
+        r"(?P<size>[0-9a-fA-F]+)[ \t]"
+    )
+    match = pattern.search(output)
+    if not match:
+        raise AssertionError(f"section {section_name!r} not found in {path}")
+    return int(match.group("addr"), 16), int(match.group("size"), 16)
 
 
 @unittest.skipUnless(
@@ -1548,6 +1721,185 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
             audit._canonical_load_digest(mutated),
         )
 
+    def _build_shared_object_with_two_constructors_and_tls(self, output: Path) -> None:
+        """A variant of _build_rich_shared_object() with TWO
+        `__attribute__((constructor))` functions (guaranteeing
+        `.init_array` has at least two 8-byte pointer slots, needed by
+        test_canonical_load_digest_detects_dynamic_tag_retarget_within_
+        same_section below) and a real thread-local variable
+        (guaranteeing a genuine PT_TLS program header, needed by
+        test_canonical_load_digest_detects_tls_template_size_mutation
+        below)."""
+        source = (
+            "#include <stdlib.h>\n"
+            'static const char message[] = "canonical-load-digest-fixture-2";\n'
+            "static char scratch_buffer[4096];\n"
+            "__thread int tls_scratch = 7;\n"
+            "__attribute__((constructor)) static void init_one(void) {\n"
+            "    void *p = malloc(16);\n"
+            "    scratch_buffer[0] = (char)(size_t)p;\n"
+            "    free(p);\n"
+            "}\n"
+            "__attribute__((constructor)) static void init_two(void) {\n"
+            "    scratch_buffer[1] = (char)tls_scratch;\n"
+            "}\n"
+            "const char *test_plugin_entry(void) { return message; }\n"
+        )
+        _compile_shared_object(self.cc_bin, source, output)
+
+    def test_canonical_load_digest_detects_dynamic_tag_retarget_within_same_section(
+        self,
+    ) -> None:
+        # Third-HIGH-round review ("canonical ELF digest ... collapses
+        # dynamic pointer tags to section name, ignoring
+        # section-relative offset ... DT_INIT/FINI/INIT_ARRAY pointer
+        # changes within same section ... can pass with retained build
+        # id"): this test constructs the EXACT attack described --
+        # DT_INIT_ARRAY's own raw pointer value is retargeted from its
+        # first `.init_array` slot to its SECOND slot. Both slots
+        # already legitimately exist with real, unmutated content (two
+        # real constructors), so NO section's own bytes change at all
+        # -- only the `.dynamic` table's own DT_INIT_ARRAY entry does.
+        # A section-name-only resolution (the previous, buggy
+        # behavior) would see "-> .init_array" both before and after
+        # and wrongly treat this as unchanged; only preserving the
+        # offset within the section catches it.
+        reference = self.root / "dtinitarray_ref.so"
+        self._build_shared_object_with_two_constructors_and_tls(reference)
+        mutated = self.root / "dtinitarray_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+
+        section_addr, section_size = _test_section_virtual_range(
+            reference, ".init_array"
+        )
+        self.assertGreaterEqual(
+            section_size, 16, "fixture must have >= 2 init_array slots"
+        )
+        data = bytearray(mutated.read_bytes())
+        entry_off = _test_find_dynamic_tag_entry_offset(data, _DT_INIT_ARRAY)
+        self.assertIsNotNone(
+            entry_off, "fixture's .dynamic table has no DT_INIT_ARRAY entry"
+        )
+        d_ptr = struct.unpack_from("<Q", data, entry_off + 8)[0]
+        self.assertEqual(
+            d_ptr, section_addr, "DT_INIT_ARRAY should point at the section start"
+        )
+        # Retarget 8 bytes later -- still squarely inside the SAME
+        # `.init_array` section (asserted above to be >= 16 bytes/2
+        # slots), so a section-name-only resolution sees no change.
+        struct.pack_into("<Q", data, entry_off + 8, d_ptr + 8)
+        mutated.write_bytes(bytes(data))
+
+        # Sanity: no section's own content moved; only the `.dynamic`
+        # table's own decoded DT_INIT_ARRAY value did.
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        reference_tags = dict(audit._read_dynamic_tags(reference))
+        mutated_tags = dict(audit._read_dynamic_tags(mutated))
+        self.assertNotEqual(
+            reference_tags.get("INIT_ARRAY"), mutated_tags.get("INIT_ARRAY")
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_gnu_stack_executable_flag_mutation(
+        self,
+    ) -> None:
+        # Third-HIGH-round review ("... executable GNU_STACK ... can
+        # pass with retained build id"): PT_GNU_STACK's own FLAGS field
+        # is the sole authoritative record of whether the process stack
+        # is mapped executable; it has no corresponding section at all,
+        # so only direct program-header-table authentication (added by
+        # this round's fix) can catch this flip.
+        reference = self.root / "gnustack_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "gnustack_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        entry_off = _test_find_program_header_by_type(data, _PT_GNU_STACK)
+        self.assertIsNotNone(
+            entry_off, "fixture has no PT_GNU_STACK program header"
+        )
+        flags_off = entry_off + 4
+        p_flags = struct.unpack_from("<I", data, flags_off)[0]
+        PF_X = 1
+        self.assertEqual(
+            p_flags & PF_X, 0, "fixture's stack should not already be executable"
+        )
+        struct.pack_into("<I", data, flags_off, p_flags | PF_X)
+        mutated.write_bytes(bytes(data))
+
+        # Sanity: no section table or section content moved at all.
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_gnu_relro_shrink_mutation(self) -> None:
+        # Third-HIGH-round review ("... RELRO ... can pass with
+        # retained build id"): PT_GNU_RELRO's own MemSiz is the
+        # authoritative record of how many bytes the dynamic loader
+        # will mprotect read-only after relocation processing; shrinking
+        # it (a real hardening downgrade) touches no section's own
+        # content or declared sh_flags at all.
+        reference = self.root / "relro_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "relro_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        entry_off = _test_find_program_header_by_type(data, _PT_GNU_RELRO)
+        self.assertIsNotNone(
+            entry_off, "fixture has no PT_GNU_RELRO program header"
+        )
+        memsz_off = entry_off + 40
+        memsz = struct.unpack_from("<Q", data, memsz_off)[0]
+        self.assertGreater(memsz, 8, "fixture's RELRO range should be shrinkable")
+        struct.pack_into("<Q", data, memsz_off, memsz - 8)
+        mutated.write_bytes(bytes(data))
+
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_tls_template_size_mutation(self) -> None:
+        # Third-HIGH-round review ("... TLS ... can pass with retained
+        # build id"): PT_TLS's own MemSiz is the thread-local-storage
+        # template's declared size; an attacker growing it (e.g. to
+        # reserve extra, attacker-usable per-thread storage) changes no
+        # section's own content or declared sh_flags at all.
+        reference = self.root / "tls_ref.so"
+        self._build_shared_object_with_two_constructors_and_tls(reference)
+        mutated = self.root / "tls_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        entry_off = _test_find_program_header_by_type(data, _PT_TLS)
+        self.assertIsNotNone(entry_off, "fixture has no PT_TLS program header")
+        memsz_off = entry_off + 40
+        memsz = struct.unpack_from("<Q", data, memsz_off)[0]
+        struct.pack_into("<Q", data, memsz_off, memsz + 8)
+        mutated.write_bytes(bytes(data))
+
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
 
 
 class PackageProvenanceTests(unittest.TestCase):
@@ -1860,6 +2212,9 @@ class PackageProvenanceTests(unittest.TestCase):
                 "package": "libfoo1",
                 "version": "1.2.3-1ubuntu1",
                 "sourcePackage": "foosource",
+                "systemPath": str((system_dir / "libfoo.so.1").resolve()),
+                "systemSha256": audit._sha256(system_dir / "libfoo.so.1"),
+                "bundledCanonicalLoadDigest": "same-digest",
             },
         )
 
@@ -2322,6 +2677,122 @@ class RealSystemPackageProvenanceTests(unittest.TestCase):
             problems,
             [],
             f"COMPONENT_EXPECTED_SOURCE_PACKAGES disagreed with "
+            f"{len(problems)} real, currently-installed system "
+            f"package(s) (checked {checked} matched libraries): "
+            + "; ".join(problems),
+        )
+
+    def test_every_expected_version_prefix_agrees_with_whatever_is_really_installed(
+        self,
+    ) -> None:
+        """Finding #9 (distro provenance pinning): now that
+        COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX has a real,
+        Docker-derived entry for all 39 COMPONENT_EXPECTED_SOURCE_PACKAGES
+        components (not merely e2fsprogs), this test proves every one of
+        those prefixes actually agrees with whatever real dpkg-owned
+        system copy happens to be installed on THIS host -- the exact
+        same "checked for real, never merely hand-typed" guarantee
+        test_every_expected_source_package_agrees_with_whatever_is_really_
+        installed above already gives the source-package NAME mapping.
+
+        bind_bundled_library_to_system_provenance() only ever reaches
+        its version-prefix check on a "matched" (content-identical)
+        binding -- by design, so a version claim can never be pinned to
+        an unrelated same-basename file (see that function's own
+        docstring). This test satisfies that honestly, without faking
+        content equality: for every real system library under
+        _SYSTEM_LIBRARY_SEARCH_DIRS that COMPONENT_PATTERNS classifies
+        into a component with both an expected source package AND an
+        expected version prefix, it copies that exact real file's bytes
+        into a scratch "bundled" location under the same basename, then
+        calls the real, unmocked bind_bundled_library_to_system_provenance()
+        against the copy. Because the copy's bytes -- and therefore its
+        _canonical_load_digest() -- are byte-for-byte identical to the
+        real system original it was copied from, this genuinely reaches
+        "matched" and exercises the real version-prefix comparison
+        against this host's real installed version, with zero mocking of
+        dpkg, digests, or metadata anywhere in the chain."""
+        problems: list[str] = []
+        checked = 0
+        seen_paths: set[Path] = set()
+        candidate_ordinal = 0
+        with tempfile.TemporaryDirectory() as scratch_dir_name:
+            scratch_dir = Path(scratch_dir_name)
+            for search_dir in audit._SYSTEM_LIBRARY_SEARCH_DIRS:
+                if not search_dir.is_dir():
+                    continue
+                try:
+                    entries = list(search_dir.iterdir())
+                except OSError:
+                    continue
+                for entry in entries:
+                    try:
+                        resolved = entry.resolve()
+                    except OSError:
+                        continue
+                    if not resolved.is_file() or resolved in seen_paths:
+                        continue
+                    basename = entry.name
+                    component = None
+                    for pattern, pattern_component in audit.COMPONENT_PATTERNS:
+                        if pattern.match(basename):
+                            component = pattern_component
+                            break
+                    if component is None:
+                        continue
+                    if component not in audit.COMPONENT_EXPECTED_SOURCE_PACKAGES:
+                        continue
+                    if (
+                        component
+                        not in audit.COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX
+                    ):
+                        continue
+                    seen_paths.add(resolved)
+                    try:
+                        original_bytes = resolved.read_bytes()
+                    except OSError:
+                        continue
+                    # bind_bundled_library_to_system_provenance() looks
+                    # up the real system candidate by
+                    # `bundled_path.name` alone, so the scratch copy
+                    # MUST keep the exact same basename as the real
+                    # file it was copied from (never a disambiguated
+                    # name) -- give each candidate its own subdirectory
+                    # instead to avoid basename collisions between
+                    # distinct search_dir entries sharing a basename.
+                    candidate_ordinal += 1
+                    candidate_dir = scratch_dir / str(candidate_ordinal)
+                    candidate_dir.mkdir()
+                    bundled_copy = candidate_dir / basename
+                    bundled_copy.write_bytes(original_bytes)
+                    binding = audit.bind_bundled_library_to_system_provenance(
+                        bundled_copy
+                    )
+                    if binding["status"] != "matched":
+                        # A real but currently-uninstalled/undiscoverable
+                        # counterpart (or one whose digest genuinely could
+                        # not be computed, e.g. readelf missing) is not a
+                        # version-prefix disagreement -- only "matched"
+                        # bindings are ever version-checked at all, by
+                        # design (see this function's own docstring).
+                        continue
+                    checked += 1
+                    problem = audit.validate_bundled_library_package_provenance(
+                        component, binding
+                    )
+                    if problem is not None:
+                        problems.append(problem)
+        if checked == 0:
+            self.skipTest(
+                "no real system library on this host both matched a "
+                "COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX entry and could "
+                "be content-bound as its own scratch copy -- nothing to "
+                "cross-check here"
+            )
+        self.assertEqual(
+            problems,
+            [],
+            f"COMPONENT_EXPECTED_SOURCE_VERSION_PREFIX disagreed with "
             f"{len(problems)} real, currently-installed system "
             f"package(s) (checked {checked} matched libraries): "
             + "; ".join(problems),

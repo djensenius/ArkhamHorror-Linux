@@ -23,6 +23,8 @@
 #include <cerrno>
 #include <dirent.h>
 #include <fcntl.h>
+#include <pwd.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -268,6 +270,35 @@ struct MountIdentity {
 // depend on these outside of a test binary calling the setter below.
 std::atomic<bool> g_forceOpenat2UnavailableForTesting{false};
 std::atomic<bool> g_forceMountIdUnavailableForTesting{false};
+
+// Round-N+ review (MEDIUM, "arbitrary mount exactly on home is accepted
+// without independent identity"): authoritativeAccountHomeDirectory()'s
+// real implementation reads the platform's actual OS/account database
+// (getpwuid(getuid())), which this project has no way to substitute in
+// an unprivileged test -- there is no portable, unprivileged way to
+// make getpwuid() return an arbitrary path for the current real UID.
+// This process-wide, test-only override lets a test deterministically
+// force EITHER answer (an explicit "this exact path is the account
+// database's own home" for the authenticated-transition path, or "no
+// account database home matches" for the strict fallback path) against
+// perfectly ordinary, unprivileged test fixtures. `g_..Active` false
+// (the default) means "use the real getpwuid() lookup, unmodified";
+// production code paths never depend on this outside of a test binary
+// calling the setter below. Release/acquire ordering ensures a test's
+// own write of the value happens-before any later read once the active
+// flag itself is observed true.
+std::atomic<bool> g_authoritativeAccountHomeOverrideActiveForTesting{false};
+QString g_authoritativeAccountHomeOverrideValueForTesting;
+
+// Test-only, deterministic, UNPRIVILEGED injection of an INDETERMINATE
+// directory-listing failure -- see
+// AssetCache::setListAllEntriesRelativeForcedFailureForTesting()'s own
+// comment in AssetCache.h. Checked by listAllEntriesRelativeOnce()
+// itself, so it applies to BOTH attempts of listAllEntriesRelative()'s
+// single retry, never just the first -- a test proving "the fault
+// persists past the retry, so the caller must abort entirely" would
+// otherwise be defeated by the retry silently succeeding on its own.
+std::atomic<bool> g_forceListAllEntriesRelativeFailureForTesting{false};
 
 #if defined(__linux__) && defined(STATX_MNT_ID)
 std::optional<quint64> mountIdViaStatx(int dirFd, const char *name,
@@ -573,16 +604,46 @@ int openSubdirectoryNoFollowMountChecked(int dirFd, const char *name,
 // (ELOOP) rather than silently followed; the mount check rejects a
 // child that resolves onto a different mounted filesystem than the
 // cache root itself. Returns -1 (with no fd left open) on any failure.
+//
+// Cumulative review (PR #18, MEDIUM, "planted FIFO under a known
+// manifest/metadata filename hangs forever before S_ISREG"): a plain
+// blocking `open(O_RDONLY)` of a FIFO (named pipe) node BLOCKS until
+// some other process opens the SAME path for writing -- entirely BEFORE
+// this function ever gets to fstat() the result and notice it isn't a
+// regular file at all. An attacker (or simply a hostile/broken
+// concurrent process) able to plant a FIFO at any manifest/metadata/
+// payload filename this cache reads could therefore hang this thread
+// indefinitely with no timeout, well before any type check runs.
+// `O_NONBLOCK` is added to the open itself specifically to close this:
+// POSIX guarantees `open(O_RDONLY | O_NONBLOCK)` of a FIFO returns
+// IMMEDIATELY regardless of whether a writer exists, so the fstat()
+// check below always runs promptly and rejects it via `!S_ISREG`
+// exactly like any other non-regular node already was. (A character/
+// block device could also, in principle, block on open() in some
+// driver-specific way; O_NONBLOCK's documented effect there is
+// implementation-defined, but it is guaranteed to at least never make
+// a device block open the case it wouldn't already, and this function
+// rejects any non-regular result regardless.) O_NONBLOCK is explicitly
+// cleared via fcntl() below once the result is confirmed to be a
+// regular file -- POSIX defines it as inert for regular-file reads, but
+// clearing it keeps the returned descriptor indistinguishable from what
+// a plain blocking open() of a real regular file would have produced,
+// so no caller downstream needs to reason about O_NONBLOCK at all.
 int openRegularNoFollowRelative(int dirFd, const QByteArray &nameUtf8,
                                 const MountIdentity &expectedMount) {
-  const int fd =
-      openat(dirFd, nameUtf8.constData(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const int fd = openat(dirFd, nameUtf8.constData(),
+                        O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
     return -1;
   }
   struct stat st {};
   if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
       !mountIdentityMatches(mountIdentityForFd(fd), expectedMount)) {
+    ::close(fd);
+    return -1;
+  }
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  if (flags == -1 || ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
     ::close(fd);
     return -1;
   }
@@ -813,16 +874,42 @@ struct RelativeDirEntry {
 // classifying each one with fstatat(..., AT_SYMLINK_NOFOLLOW). Replaces
 // reapAndEnforceQuota()'s former QDir::entryList() listing, which
 // re-resolved `m_directory` by path for every call.
-std::vector<RelativeDirEntry> listAllEntriesRelative(int dirFd) {
+//
+// Cumulative review (PR #18, MEDIUM, "listAllEntriesRelative returns
+// partial vector on traversal errors; reapAndEnforceQuota mutates based
+// on it and may delete valid generation whose manifest was omitted"):
+// this now mirrors sumUsageRelative()'s own already-hardened contract
+// exactly (see that function's comment for the full rationale) --
+// returns std::nullopt, an INDETERMINATE result, never a partial
+// vector, the instant ANY step cannot be completed with full
+// confidence: the fresh-handle open failing, fdopendir() failing, an
+// individual entry's fstatat() failing, or readdir() itself failing
+// (distinguished from genuine end-of-directory via `errno` after the
+// loop, exactly like sumUsageRelative() already does). A prior version
+// of this function silently treated every one of these as "this entry,
+// or every remaining entry, simply doesn't exist" -- reapAndEnforceQuota()
+// (this function's sole MUTATING caller) previously could then delete a
+// perfectly valid generation whose manifest was merely omitted from an
+// incomplete listing, discovering the underlying fault only when a
+// LATER quota computation separately failed, by which point the
+// mutation had already happened. Every caller must now abort its own
+// sweep/mutation entirely on std::nullopt rather than ever acting on a
+// partial view -- see reapAndEnforceQuota()'s own updated comment.
+std::optional<std::vector<RelativeDirEntry>>
+listAllEntriesRelativeOnce(int dirFd) {
+  if (g_forceListAllEntriesRelativeFailureForTesting.load(
+          std::memory_order_relaxed)) {
+    return std::nullopt;
+  }
   std::vector<RelativeDirEntry> entries;
   const int freshFd = openFreshHandleToSameDirectory(dirFd);
   if (freshFd < 0) {
-    return entries;
+    return std::nullopt;
   }
   DIR *dirStream = fdopendir(freshFd);
   if (!dirStream) {
     ::close(freshFd);
-    return entries;
+    return std::nullopt;
   }
   errno = 0;
   while (struct dirent *de = readdir(dirStream)) {
@@ -831,18 +918,51 @@ std::vector<RelativeDirEntry> listAllEntriesRelative(int dirFd) {
       continue;
     }
     struct stat st {};
-    if (fstatat(dirFd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
-      RelativeDirEntry entry;
-      entry.name = QString::fromUtf8(de->d_name);
-      entry.isSymlinkNode = S_ISLNK(st.st_mode);
-      entry.isDirectory = S_ISDIR(st.st_mode);
-      entry.sizeBytes = static_cast<qint64>(st.st_size);
-      entries.push_back(std::move(entry));
+    if (fstatat(dirFd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      closedir(dirStream);
+      return std::nullopt;
     }
+    RelativeDirEntry entry;
+    entry.name = QString::fromUtf8(de->d_name);
+    entry.isSymlinkNode = S_ISLNK(st.st_mode);
+    entry.isDirectory = S_ISDIR(st.st_mode);
+    entry.sizeBytes = static_cast<qint64>(st.st_size);
+    entries.push_back(std::move(entry));
     errno = 0;
   }
+  const int readdirErrno = errno;
   closedir(dirStream); // also closes freshFd
+  if (readdirErrno != 0) {
+    // readdir() itself failed (as opposed to a genuine, error-free
+    // end-of-directory) -- the listing this vector was built from may
+    // be incomplete.
+    return std::nullopt;
+  }
   return entries;
+}
+
+// A single transient failure (e.g. a momentary EMFILE from unrelated fd
+// pressure elsewhere in this process, or a one-off readdir() hiccup --
+// including a benign ENOENT for an entry legitimately removed between
+// readdir() and fstatat() by this SAME process's own concurrent
+// activity) is retried once, as a full fresh scan, before this is ever
+// treated as a hard failure this function's sole mutating caller must
+// abort on -- see listAllEntriesRelativeOnce()'s own comment for why
+// ANY failure remaining after that retry must never be treated as an
+// authoritative "these are all the entries", partial or otherwise.
+// This project's cache root is exclusively owned by, and mutated only
+// from, a single AssetCache instance's own mutex-serialized calls (see
+// the class comment's cross-process authority discussion for why a
+// SECOND process's concurrent mutation is out of scope for this
+// in-process retry and is instead prevented at a different layer
+// entirely) -- so a transient failure here is expected to be rare and
+// self-resolving, never a symptom this retry should paper over
+// silently forever.
+std::optional<std::vector<RelativeDirEntry>> listAllEntriesRelative(int dirFd) {
+  if (auto first = listAllEntriesRelativeOnce(dirFd)) {
+    return first;
+  }
+  return listAllEntriesRelativeOnce(dirFd);
 }
 #endif // Q_OS_UNIX
 
@@ -1096,28 +1216,94 @@ openDirectoryChainNoFollow(const QString &trustedAnchorPath,
 // descriptor-relative validation ever began).
 //
 // Every component of home's own path is walked no-follow from the
-// filesystem root "/" -- exactly like an outside-home configured path
-// -- with ONE deliberate, explicitly-authenticated exception: a mount
-// TRANSITION is permitted (recorded, never silently assumed) at the
-// single point where the walk lands on the home directory itself. Home
-// commonly sits on its own separate partition/mount from "/" on a real
-// multi-mount system (e.g. a dedicated "/home" mount) -- that is
-// ordinary, expected configuration, not an attack -- but no OTHER mount
-// transition is permitted anywhere else in home's own ancestor path
-// (walked with the same full same-mount-throughout policy
-// openDirectoryChainNoFollow() already applies to an outside-home
-// path), nor, via the mount identity this function returns becoming the
-// new trusted anchor for whatever the caller walks BENEATH home, in the
-// caller's own owned suffix either.
+// filesystem root "/" -- exactly like an outside-home configured path.
+// A mount TRANSITION at the single point where the walk lands on the
+// home directory itself is permitted ONLY when an INDEPENDENT OS source
+// -- the account database (getpwuid(getuid()), see
+// authoritativeAccountHomeDirectory() below), never the $HOME
+// environment variable QDir::homePath() itself ultimately reads --
+// agrees that this exact path is the current real UID's own registered
+// home directory. Home commonly sits on its own separate partition/
+// mount from "/" on a real multi-mount system (e.g. SteamOS's
+// "/home/deck") -- that is ordinary, expected configuration, not an
+// attack -- but this project cannot otherwise distinguish that
+// legitimate case from a hostile/misconfigured mount an attacker
+// arranged to sit at exactly whatever path $HOME happens to name (an
+// unprivileged process can still often influence $HOME, e.g. via a
+// wrapper/sandboxing layer). Cumulative review (PR #18): pinning the
+// permitted transition to independent account-database confirmation
+// closes exactly that gap -- when $HOME does NOT match the account
+// database's own record (e.g. a test harness or sandbox that
+// legitimately overrides $HOME), this falls back to the SAME strict,
+// no-transition-permitted-anywhere policy an outside-home configured
+// path already gets, rather than silently granting the mount-transition
+// exception to an unauthenticated path. No OTHER mount transition is
+// permitted anywhere else in home's own ancestor path (walked with the
+// same full same-mount-throughout policy openDirectoryChainNoFollow()
+// already applies to an outside-home path), nor, via the mount identity
+// this function returns becoming the new trusted anchor for whatever
+// the caller walks BENEATH home, in the caller's own owned suffix
+// either.
+
+// Returns the OS/account database's own authoritative home directory
+// path for the CURRENT real user id -- getpwuid(getuid()), which reads
+// directly from the platform's user database (e.g. /etc/passwd or an
+// NSS-backed equivalent on a real deployment) -- completely independent
+// of $HOME/QDir::homePath(), which this application otherwise uses to
+// LOCATE the cache. Used ONLY to decide whether
+// resolveHomeDirectoryNoFollow()'s one permitted mount transition may
+// be trusted; never to relocate the cache itself. getpwuid() is
+// documented to use process-wide, non-thread-safe static storage for
+// its result, but this project never calls it concurrently with itself
+// (this whole no-follow-walk family of functions is already only ever
+// invoked from AssetCache construction/recovery, serialized by the
+// caller) -- see this function's own single call site.
+std::optional<QString> authoritativeAccountHomeDirectory() {
+  if (g_authoritativeAccountHomeOverrideActiveForTesting.load(
+          std::memory_order_acquire)) {
+    // Test override active: g_authoritativeAccountHomeOverrideValueForTesting
+    // was written before the active flag itself was stored (release, in the
+    // setter below), so this acquire-ordered load makes that write visible
+    // here. An empty override value means "the account database has no
+    // matching home for this test" (i.e. forces the strict fallback path),
+    // exactly like a real getpwuid() failure would.
+    if (g_authoritativeAccountHomeOverrideValueForTesting.isEmpty()) {
+      return std::nullopt;
+    }
+    return g_authoritativeAccountHomeOverrideValueForTesting;
+  }
+#if defined(Q_OS_UNIX)
+  errno = 0;
+  const struct passwd *pw = ::getpwuid(::getuid());
+  if (pw == nullptr || pw->pw_dir == nullptr || pw->pw_dir[0] == '\0') {
+    return std::nullopt;
+  }
+  return QDir::cleanPath(QString::fromLocal8Bit(pw->pw_dir));
+#else
+  return std::nullopt;
+#endif
+}
+
 std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
   const QString home = QDir::cleanPath(QDir::homePath());
   if (home.isEmpty() || !home.startsWith(QLatin1Char('/'))) {
     return std::nullopt;
   }
+  // Cumulative review (PR #18): the mount-transition exception below is
+  // permitted ONLY when $HOME independently matches the account
+  // database's own record for the current real UID -- see
+  // authoritativeAccountHomeDirectory()'s comment. `homeIsAuthenticated`
+  // is computed once, up front, from a source entirely independent of
+  // the path-walk logic that follows.
+  const std::optional<QString> authoritativeHome =
+      authoritativeAccountHomeDirectory();
+  const bool homeIsAuthenticated =
+      authoritativeHome.has_value() && *authoritativeHome == home;
   if (home == QStringLiteral("/")) {
     // Degenerate (home IS the filesystem root, e.g. a minimal container
     // with no dedicated home directory at all) -- "/" can never itself
-    // be a symlink, so it needs no component walk of its own.
+    // be a symlink, so it needs no component walk of its own, and there
+    // is no ancestor/transition distinction to authenticate either way.
     const int fd = ::open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
       return std::nullopt;
@@ -1144,6 +1330,9 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
   if (!ancestorFd) {
     return std::nullopt;
   }
+  // Captured before this fd is ever closed below, regardless of which
+  // branch (authenticated-transition vs strict-same-mount) is taken.
+  const MountIdentity ancestorMount = mountIdentityForFd(*ancestorFd);
   const QByteArray finalComponentUtf8 = finalComponent.toUtf8();
   struct stat st {};
   if (fstatat(*ancestorFd, finalComponentUtf8.constData(), &st,
@@ -1156,25 +1345,42 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
     ::close(*ancestorFd);
     return std::nullopt;
   }
-  const int homeFd = openat(*ancestorFd, finalComponentUtf8.constData(),
-                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  bool usedStrongNoXdev = false;
+  const int homeFd = openDirectoryComponentNoFollow(
+      *ancestorFd, finalComponentUtf8.constData(), &usedStrongNoXdev);
   ::close(*ancestorFd);
   if (homeFd < 0) {
     return std::nullopt;
   }
-  struct stat openedSt {};
-  if (::fstat(homeFd, &openedSt) != 0 || !S_ISDIR(openedSt.st_mode)) {
-    // TOCTOU re-check on the actual opened descriptor: refuses a
-    // replace-with-symlink race between the fstatat() above and this
-    // open, exactly like every other no-follow walk step in this file.
-    ::close(homeFd);
-    return std::nullopt;
+  if (!homeIsAuthenticated) {
+    // $HOME does not independently match the account database's own
+    // record (e.g. a test harness or sandbox legitimately overriding
+    // $HOME) -- fall back to the SAME strict, no-transition-permitted-
+    // anywhere policy an outside-home configured path already gets,
+    // exactly like every other component walkOwnedSuffixNoFollowFromFd()
+    // authenticates, rather than silently granting the mount-transition
+    // exception to an unauthenticated path.
+    bool mountOk;
+#if defined(__linux__)
+    mountOk =
+        usedStrongNoXdev
+            ? mountIdentityMatches(mountIdentityForFd(homeFd), ancestorMount)
+            : mountIdentityMatchesStrictRequiringMountId(
+                  mountIdentityForFd(homeFd), ancestorMount);
+#else
+    mountOk = mountIdentityMatches(mountIdentityForFd(homeFd), ancestorMount);
+#endif
+    if (!mountOk) {
+      qWarning() << "AssetCache: refusing to treat" << home
+                 << "as a trusted home directory anchor -- it does not match "
+                    "the account database's own home-directory record for the "
+                    "current user, AND resolves onto a different mount than "
+                    "its own parent directory (unauthenticated mount-"
+                    "transition guard)";
+      ::close(homeFd);
+      return std::nullopt;
+    }
   }
-  // The mount transition landing on home itself is explicitly permitted
-  // and recorded here -- deliberately NOT compared against ancestorFd's
-  // mount -- see this function's own comment for why that is the one
-  // authenticated exception to this project's otherwise-strict
-  // same-mount-throughout policy.
   return std::make_pair(homeFd, mountIdentityForFd(homeFd));
 }
 
@@ -1463,6 +1669,135 @@ bool safeRemoveTreeRelative(int parentFd, const QString &name,
 // directory cleanup) resolves a subdirectory only relative to the
 // already-anchored `m_rootFd`, never by re-deriving a path string.)
 
+// Cumulative review (PR #18, HIGH, "disk-generation/invalidation
+// serialization is instance-local QMutex; two cache instances/processes
+// can reap each other's in-progress generations or delayed 200 can
+// revive a newer definitive 404"): see this class's own header comment
+// (search "Cross-process authority") for the full model this
+// establishes -- ONE process-wide coordinator per canonical cache root
+// (identified by (device, inode), exactly like `m_rootDevice`/
+// `m_rootInode` elsewhere in this file), rather than per-instance
+// state.
+//
+// Every AssetCache instance in THIS process that resolves to the SAME
+// root cooperates and shares disk authority (this is the ordinary,
+// fully-supported case -- e.g. a short-lived verification instance
+// constructed alongside one still-live "production" instance in the
+// same test or the same process); only a genuinely DIFFERENT process
+// is ever denied. This distinction matters because flock(2)'s lock is
+// associated with the OPEN FILE DESCRIPTION, not the calling process:
+// "if a process uses open(2) (or similar) to obtain more than one file
+// descriptor for the same file, these file descriptors are treated
+// independently by flock()... An attempt to lock the file using one of
+// these file descriptors may be denied by a lock that the calling
+// process has already placed via another file descriptor" -- so
+// calling flock() independently from EVERY instance's own separately-
+// opened root descriptor would incorrectly deny a second, perfectly
+// legitimate same-process instance exactly as it denies a different
+// process. Instead, this registry ensures at most ONE flock() call
+// (and therefore at most one dup'd, independently-owned descriptor) is
+// ever made per process per canonical root: the first instance for a
+// given root that reaches this code performs the actual flock() (on a
+// dup() of its own already-resolved, already-trusted `m_rootFd` --
+// dup'd descriptors share the SAME underlying lock per POSIX, so this
+// registry's copy and the original both remain valid proof of the same
+// lock); every subsequent instance for that same root, in this same
+// process, simply joins the existing registration (a reference count),
+// never attempting its own competing flock() call at all.
+//
+// The registry's dup'd descriptor -- and therefore the interprocess
+// lock itself -- is closed the instant the LAST live instance for that
+// root in this process releases its registration (see
+// releaseRootOwnershipRegistration(), called from ~AssetCache()), so a
+// genuinely different process waiting on this same root is never kept
+// waiting longer than this process's own last live instance.
+// Guarded by rootLockRegistryMutex() so concurrent construction/
+// destruction of AssetCache instances across threads within this
+// process cannot race the registry itself.
+struct RootLockRegistryEntry {
+  int lockFd = -1;
+  int refCount = 0;
+};
+
+QMutex &rootLockRegistryMutex() {
+  static QMutex mutex;
+  return mutex;
+}
+
+QHash<QString, RootLockRegistryEntry> &rootLockRegistry() {
+  // Keyed by "<device>:<inode>" -- a string is a simple, adequate
+  // QHash key here (this registry is touched only at AssetCache
+  // construction/destruction, never on any hot path) and avoids
+  // needing a custom qHash() overload for a raw (device, inode) pair.
+  static QHash<QString, RootLockRegistryEntry> registry;
+  return registry;
+}
+
+QString rootLockRegistryKeyFor(quint64 device, quint64 inode) {
+  return QString::number(device) + QLatin1Char(':') + QString::number(inode);
+}
+
+// Returns false -- meaning the caller must disable disk persistence
+// ENTIRELY for this instance, running memory-only -- for EVERY failure
+// mode: a DIFFERENT process already holds this exact root
+// (EWOULDBLOCK/EAGAIN), or any other error acquiring the underlying
+// lock (a filesystem that does not support flock() at all, e.g. some
+// network filesystem configurations, dup() failure, etc.). None of
+// these can be distinguished from "another process currently owns this
+// exact root and may be actively mutating it" with the confidence
+// disk-tier authority requires -- this matches every other fail-closed,
+// indeterminate-result convention already established in this file
+// (never optimistic, never "probably fine"): a contended or otherwise
+// unprovable lock must never mint a durable disk-cache result.
+bool acquireExclusiveRootOwnershipOrFailClosed(int rootFd, quint64 device,
+                                               quint64 inode) {
+  if (rootFd < 0) {
+    return false;
+  }
+  const QString key = rootLockRegistryKeyFor(device, inode);
+  QMutexLocker locker(&rootLockRegistryMutex());
+  QHash<QString, RootLockRegistryEntry> &registry = rootLockRegistry();
+  auto it = registry.find(key);
+  if (it != registry.end()) {
+    // Already owned by a live instance in THIS process -- join it,
+    // never a second competing flock() call for the same root.
+    ++it->refCount;
+    return true;
+  }
+  const int lockFd = ::dup(rootFd);
+  if (lockFd < 0) {
+    return false;
+  }
+  if (::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+    ::close(lockFd);
+    return false;
+  }
+  registry.insert(key, RootLockRegistryEntry{lockFd, 1});
+  return true;
+}
+
+// Called from ~AssetCache() iff this instance's constructor previously
+// registered it (AssetCache::m_holdsRootLockRegistration) -- releases
+// this instance's share of the process-wide registration for `device`/
+// `inode`, closing the registry's own dup'd descriptor (and therefore
+// releasing the interprocess flock, letting a genuinely different,
+// waiting process finally acquire it) only once the LAST live
+// same-process instance for this root has released.
+void releaseRootOwnershipRegistration(quint64 device, quint64 inode) {
+  const QString key = rootLockRegistryKeyFor(device, inode);
+  QMutexLocker locker(&rootLockRegistryMutex());
+  QHash<QString, RootLockRegistryEntry> &registry = rootLockRegistry();
+  auto it = registry.find(key);
+  if (it == registry.end()) {
+    return;
+  }
+  if (--it->refCount > 0) {
+    return;
+  }
+  ::close(it->lockFd);
+  registry.erase(it);
+}
+
 } // namespace
 
 std::optional<AssetError>
@@ -1590,6 +1925,27 @@ AssetCache::AssetCache(Config config)
       const MountIdentity rootMount = mountIdentityForFd(m_rootFd);
       m_rootMountId = rootMount.mountId;
       m_rootHasMountId = rootMount.hasMountId;
+      // Cumulative review (PR #18, HIGH): a genuinely DIFFERENT process
+      // already owns this exact cache root -- see
+      // acquireExclusiveRootOwnershipOrFailClosed()'s own comment for
+      // the full rationale (a same-process sibling instance instead
+      // cooperates and shares authority, never denied here). This
+      // instance runs memory-only, NEVER touching disk, rather than
+      // risk racing the actual owning process's reap/publish/
+      // invalidate sequence.
+      if (acquireExclusiveRootOwnershipOrFailClosed(m_rootFd, m_rootDevice,
+                                                    m_rootInode)) {
+        m_holdsRootLockRegistration = true;
+      } else {
+        qWarning() << "AssetCache: a different process already holds this "
+                      "cache root's exclusive lock --"
+                   << m_directory
+                   << "-- disk persistence disabled for this instance "
+                      "(memory-only fallback)";
+        ::close(m_rootFd);
+        m_rootFd = -1;
+        m_diskCacheDisabled = true;
+      }
     }
   }
 #endif
@@ -1599,6 +1955,9 @@ AssetCache::AssetCache(Config config)
 AssetCache::~AssetCache() {
   delete m_memory;
 #if defined(Q_OS_UNIX)
+  if (m_holdsRootLockRegistration) {
+    releaseRootOwnershipRegistration(m_rootDevice, m_rootInode);
+  }
   if (m_rootFd >= 0) {
     ::close(m_rootFd);
   }
@@ -2853,8 +3212,24 @@ void AssetCache::reapAndEnforceQuota() {
   // on-disk type without ever resolving through it; a stray directory or
   // hidden dotfile is exactly as much of a leftover as a stray file, and
   // must not be invisible to this repair sweep.
-  const std::vector<RelativeDirEntry> allEntries =
+  //
+  // Cumulative review (PR #18, MEDIUM, "listAllEntriesRelative returns
+  // partial vector on traversal errors ... may delete valid generation
+  // whose manifest was omitted"): the listing itself must now be
+  // COMPLETE or this entire sweep aborts before touching anything --
+  // see listAllEntriesRelative()'s own comment. A std::nullopt here
+  // means the traversal is INDETERMINATE, not "the directory is empty";
+  // proceeding with mutation/deletion decisions built on an
+  // incomplete/possibly-wrong inventory is exactly the bug this closes.
+  const std::optional<std::vector<RelativeDirEntry>> allEntriesResult =
       listAllEntriesRelative(m_rootFd);
+  if (!allEntriesResult) {
+    qWarning() << "AssetCache: aborting reap/quota sweep -- directory "
+                  "listing could not be completed with full confidence "
+                  "(never mutating based on a partial inventory)";
+    return;
+  }
+  const std::vector<RelativeDirEntry> &allEntries = *allEntriesResult;
   QStringList allFiles;
   allFiles.reserve(static_cast<qsizetype>(allEntries.size()));
   for (const RelativeDirEntry &entry : allEntries) {
@@ -3172,8 +3547,19 @@ int AssetCache::diskEntryCount() const {
   }
   int count = 0;
   // Round-4/5 review item 3: enumerated relative to `m_rootFd`, never a
-  // QDir re-resolving `m_directory` by path.
-  for (const RelativeDirEntry &entry : listAllEntriesRelative(m_rootFd)) {
+  // QDir re-resolving `m_directory` by path. Round-N+ review: a
+  // std::nullopt (indeterminate) listing reports 0 rather than ever
+  // guessing from a partial view -- this is a read-only, informational
+  // count (never a basis for mutation), so failing to a safe,
+  // explicitly-INDETERMINATE-flagged 0 here is sufficient; see
+  // listAllEntriesRelative()'s comment for the full rationale shared
+  // with reapAndEnforceQuota()'s stricter (mutation-gating) use.
+  const std::optional<std::vector<RelativeDirEntry>> allEntries =
+      listAllEntriesRelative(m_rootFd);
+  if (!allEntries) {
+    return 0;
+  }
+  for (const RelativeDirEntry &entry : *allEntries) {
     // One manifest file exists per live entry (review item 8) -- this is
     // a more accurate "how many entries does this cache have" count than
     // counting generation-scoped metadata files, which can transiently
@@ -3273,6 +3659,22 @@ void AssetCache::setMountIdentificationDegradedForTesting(
                                             std::memory_order_relaxed);
   g_forceMountIdUnavailableForTesting.store(forceMountIdUnavailable,
                                             std::memory_order_relaxed);
+}
+
+void AssetCache::setAuthoritativeAccountHomeDirectoryOverrideForTesting(
+    bool active, const QString &value) {
+  // Value is stored BEFORE the active flag (release ordering); the
+  // reader in authoritativeAccountHomeDirectory() checks the flag first
+  // with acquire ordering, guaranteeing it observes this exact value
+  // whenever it sees the override active.
+  g_authoritativeAccountHomeOverrideValueForTesting = value;
+  g_authoritativeAccountHomeOverrideActiveForTesting.store(
+      active, std::memory_order_release);
+}
+
+void AssetCache::setListAllEntriesRelativeForcedFailureForTesting(bool active) {
+  g_forceListAllEntriesRelativeFailureForTesting.store(
+      active, std::memory_order_relaxed);
 }
 
 } // namespace Arkham

@@ -2,6 +2,9 @@
 
 #include <avif/avif.h>
 
+#include <algorithm>
+#include <limits>
+
 namespace Arkham {
 
 namespace {
@@ -26,6 +29,45 @@ AssetErrorCode errorCodeForAvifResult(avifResult result) {
   }
 }
 
+// Validates a candidate width/height pair against the caller's configured
+// caps, returning the (already-overflow-safe) total pixel count on
+// success or a typed AssetError on the first violated rule. Shared by
+// BOTH the pre-decode (container-metadata-only) check and the post-decode
+// (actual-decoded-buffer) recheck below, so the two call sites can never
+// silently drift apart (e.g. one gaining a rule the other lacks).
+AssetOutcome<qint64> validateAvifDimensions(uint32_t width, uint32_t height,
+                                            int maxDimensionPixels,
+                                            qint64 maxTotalPixels) {
+  if (width == 0 || height == 0) {
+    return AssetOutcome<qint64>(AssetError{
+        AssetErrorCode::MalformedImage,
+        QStringLiteral("AVIF container declares a non-positive dimension")});
+  }
+  if (width > static_cast<uint32_t>(maxDimensionPixels) ||
+      height > static_cast<uint32_t>(maxDimensionPixels)) {
+    return AssetOutcome<qint64>(AssetError{
+        AssetErrorCode::DimensionTooLarge,
+        QStringLiteral("AVIF dimension %1x%2 exceeds the configured cap of "
+                       "%3 pixels per side")
+            .arg(width)
+            .arg(height)
+            .arg(maxDimensionPixels)});
+  }
+  // Both operands are already bounded above by maxDimensionPixels (a
+  // configurable but always-small int), so this can never overflow.
+  const qint64 totalPixels =
+      static_cast<qint64>(width) * static_cast<qint64>(height);
+  if (totalPixels > maxTotalPixels) {
+    return AssetOutcome<qint64>(AssetError{
+        AssetErrorCode::PixelBudgetExceeded,
+        QStringLiteral("AVIF totals %1 pixels, exceeding the configured cap "
+                       "of %2")
+            .arg(totalPixels)
+            .arg(maxTotalPixels)});
+  }
+  return AssetOutcome<qint64>(totalPixels);
+}
+
 } // namespace
 
 AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
@@ -42,21 +84,52 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   // a resource-exhaustion bound independent of the dimension/pixel-count
   // checks below.
   decoder->maxThreads = 1;
-  // Deliberately leave decoder->imageDimensionLimit/imageSizeLimit at
-  // libavif's own built-in defaults (32768 per side / 16384*16384 total)
-  // here, rather than tightening them to this project's own (much
-  // smaller, e.g. 8192/32-megapixel) configured limits: avifDecoderParse()
-  // only ever reads container metadata (it never allocates a
-  // full-resolution pixel buffer), so libavif's generous defaults are
-  // already a sufficient backstop against a truly pathological declared
-  // size overflowing libavif's own internal arithmetic during Parse.
-  // Reusing this project's tighter, *configurable* limit for libavif's
-  // own field instead would make avifDecoderParse() itself reject a
-  // too-large-for-us-but-fine-for-libavif image with a generic,
-  // untyped parse-failure result -- pre-empting this function's own
-  // explicit post-Parse check just below, which is what actually
-  // produces the precise, typed AssetErrorCode::DimensionTooLarge /
-  // PixelBudgetExceeded this project's callers depend on.
+
+  // Cumulative review (PR #18): this project only ever serves/decodes a
+  // single still AVIF image, never a sequence/animation. Setting
+  // imageCountLimit=1 BEFORE avifDecoderParse() (rather than only
+  // discovering decoder->imageCount != 1 AFTER Parse has already fully
+  // walked and allocated structures for every declared sample/item) makes
+  // libavif itself abort enumerating a hostile container's sample table /
+  // item list the moment a second image is discovered, bounding Parse's
+  // own internal cost against a declared-count DoS (a container claiming
+  // millions of images) rather than only rejecting the *result* after
+  // libavif already paid to process all of them. Confirmed empirically
+  // against this project's exact pinned libavif 0.9.3 (Ubuntu 22.04):
+  // Parse() itself now fails with AVIF_RESULT_BMFF_PARSE_FAILED for any
+  // container declaring more than one image, and decoder->imageCount is
+  // never populated in that case -- see the imageCount!=1 handling below,
+  // which is retained as a secondary, defense-in-depth guard for any
+  // structural variant (if one exists) where libavif's own
+  // imageCountLimit enforcement does not apply but Parse still succeeds
+  // with imageCount>1.
+  decoder->imageCountLimit = 1;
+
+  // Cumulative review (PR #18): imageSizeLimit is libavif's OWN total
+  // (width*height) pixel budget, enforced not only against
+  // container-declared (ispe) metadata during Parse, but -- for codec
+  // backends that support it (confirmed empirically for this project's
+  // exact bundled/pinned dav1d backend against libavif 0.9.3) -- also
+  // against the ACTUAL decoded AV1 frame's own internal dimensions
+  // *before* any post-decode rescale to the container-declared size. This
+  // closes a real gap this project's own post-Parse dimension check
+  // (below) cannot see: a hostile AVIF can declare a tiny `ispe` (passing
+  // that check trivially) while its embedded AV1 bitstream itself encodes
+  // a far larger frame -- the underlying codec must otherwise fully
+  // allocate/decode that oversized internal frame before
+  // avifDecoderNextImage() ever rescales the result back down to the
+  // small declared size, by which point the resource cost has already
+  // been paid and this function's own post-decode dimensions would appear
+  // deceptively small. Setting imageSizeLimit to this project's own
+  // configured maxTotalPixels cap (rather than leaving libavif's much
+  // looser built-in default of 268,435,456) means the codec itself
+  // refuses to decode that oversized internal frame at all. 0 is
+  // libavif's own documented "reserved" (invalid) sentinel for this
+  // field, so the clamp below never produces it.
+  const uint32_t clampedImageSizeLimit =
+      static_cast<uint32_t>(std::clamp<qint64>(
+          maxTotalPixels, 1, std::numeric_limits<uint32_t>::max()));
+  decoder->imageSizeLimit = clampedImageSizeLimit;
 
   const auto *data =
       reinterpret_cast<const uint8_t *>(encodedBytes.constData());
@@ -104,6 +177,16 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   // UnsupportedCodec is reserved for a genuine, permanent, build-wide
   // decoder-absence outcome that quarantining a specific cached entry
   // could never resolve by retrying.
+  //
+  // In practice, decoder->imageCountLimit=1 (set above) now makes
+  // avifDecoderParse() itself fail with AVIF_RESULT_BMFF_PARSE_FAILED for
+  // any container declaring more than one image -- decoder->imageCount is
+  // never populated to a value other than 0 or 1 in that case, so this
+  // block is unreachable via that path (Parse's own error branch above
+  // already returned). It is retained as a secondary, defense-in-depth
+  // guard in case any future libavif version or structural container
+  // variant ever lets Parse succeed with imageCount>1 despite
+  // imageCountLimit=1.
   if (decoder->imageCount != 1) {
     const int imageCount = decoder->imageCount;
     avifDecoderDestroy(decoder);
@@ -121,42 +204,22 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   // allocated, at this point. See the header comment: this check runs
   // BEFORE avifDecoderNextImage() below, which is what actually performs
   // the AV1 decode and allocates the full pixel buffer.
-  const uint32_t width = decoder->image->width;
-  const uint32_t height = decoder->image->height;
-  if (width == 0 || height == 0) {
+  const AssetOutcome<qint64> preDecodeValidation =
+      validateAvifDimensions(decoder->image->width, decoder->image->height,
+                             maxDimensionPixels, maxTotalPixels);
+  if (!preDecodeValidation) {
+    const AssetError error = preDecodeValidation.error();
     avifDecoderDestroy(decoder);
-    return AssetOutcome<QImage>(AssetError{
-        AssetErrorCode::MalformedImage,
-        QStringLiteral("AVIF container declares a non-positive dimension")});
-  }
-  if (width > static_cast<uint32_t>(maxDimensionPixels) ||
-      height > static_cast<uint32_t>(maxDimensionPixels)) {
-    avifDecoderDestroy(decoder);
-    return AssetOutcome<QImage>(AssetError{
-        AssetErrorCode::DimensionTooLarge,
-        QStringLiteral("AVIF dimension %1x%2 exceeds the configured cap of "
-                       "%3 pixels per side")
-            .arg(width)
-            .arg(height)
-            .arg(maxDimensionPixels)});
-  }
-  // Both operands are already bounded above by maxDimensionPixels (a
-  // configurable but always-small int), so this can never overflow.
-  const qint64 totalPixels =
-      static_cast<qint64>(width) * static_cast<qint64>(height);
-  if (totalPixels > maxTotalPixels) {
-    avifDecoderDestroy(decoder);
-    return AssetOutcome<QImage>(AssetError{
-        AssetErrorCode::PixelBudgetExceeded,
-        QStringLiteral("AVIF totals %1 pixels, exceeding the configured cap "
-                       "of %2")
-            .arg(totalPixels)
-            .arg(maxTotalPixels)});
+    return AssetOutcome<QImage>(error);
   }
 
-  // Only now -- strictly after both dimension checks above have already
-  // passed -- does the real AV1 decode (and its full-resolution pixel
-  // buffer allocation) happen.
+  // Only now -- strictly after the pre-decode dimension check above has
+  // already passed -- does the real AV1 decode (and its full-resolution
+  // pixel buffer allocation) happen. imageSizeLimit (set above, before
+  // Parse) already bounds the codec's own internal frame allocation for
+  // backends that honor it; the re-validation immediately below closes
+  // the remainder of that gap for this function's own downstream RGB
+  // buffer regardless of codec-specific behavior.
   result = avifDecoderNextImage(decoder);
   if (result != AVIF_RESULT_OK) {
     const AssetErrorCode code = errorCodeForAvifResult(result);
@@ -164,6 +227,28 @@ AssetOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
     return AssetOutcome<QImage>(AssetError{
         code, QStringLiteral("libavif failed to decode the AVIF image: %1")
                   .arg(QString::fromLatin1(avifResultToString(result)))});
+  }
+
+  // Cumulative review (PR #18): re-validate decoder->image->width/height
+  // AGAIN here, immediately after avifDecoderNextImage() and strictly
+  // before avifRGBImageSetDefaults()/avifRGBImageAllocatePixels() below
+  // ever size an RGB conversion buffer from it. The pre-decode check above
+  // only ever examined container-declared (ispe) metadata; the actual AV1
+  // decode this project's own libavif backend just performed could, in
+  // principle -- for a structural variant this function's author has not
+  // enumerated, or a future libavif/codec-backend behavior change --
+  // produce a decoder->image whose final dimensions differ from what was
+  // checked pre-decode (e.g. a derived "grid" image's composite size, or
+  // any codec path that does not rescale back to the declared size). This
+  // is intentionally the exact same shared validateAvifDimensions() rule
+  // as the pre-decode check, so the two can never silently drift apart.
+  const AssetOutcome<qint64> postDecodeValidation =
+      validateAvifDimensions(decoder->image->width, decoder->image->height,
+                             maxDimensionPixels, maxTotalPixels);
+  if (!postDecodeValidation) {
+    const AssetError error = postDecodeValidation.error();
+    avifDecoderDestroy(decoder);
+    return AssetOutcome<QImage>(error);
   }
 
   avifRGBImage rgb;

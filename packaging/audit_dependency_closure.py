@@ -52,9 +52,14 @@ transitively reachable from libsecret-1.so.0 or libqt6keychain.so at all)
 requiring something that was never bundled. --auto-roots recursively
 scans a given directory for every real ELF file (detected by its own
 magic bytes, "\x7fELF", never by trusting a file extension or directory
-name) and adds each one's basename as an additional root, so the walk is
-rooted at literally everything the AppImage will ever actually try to
-load, not only the two libraries one prior incident happened to name.
+name) and adds each one's own exact, real discovered path as an
+additional root, so the walk is rooted at literally everything the
+AppImage will ever actually try to load, not only the two libraries one
+prior incident happened to name. Two different discovered files sharing
+the same bare basename (e.g. two independently-built same-named plugins
+in different directories) are both preserved as distinct roots, each
+audited via its own real RUNPATH/RPATH/$ORIGIN context -- never collapsed
+to a single "first match wins" entry per name.
 
 X11 desktop-stack note (--allow-x11-desktop-stack): a separate,
 explicitly-opt-in allowlist (X11_DESKTOP_ABI_ALLOWLIST) for base X11/xcb/
@@ -649,32 +654,37 @@ def _is_elf_file(path: Path) -> bool:
         return False
 
 
-def _discover_elf_roots(search_dir: Path) -> dict[str, Path]:
-    """Recursively finds every real ELF file under search_dir (the app's own
-    executable, every Qt plugin, every QML module's native library, and
-    every already-bundled library alike) and returns a mapping of each
-    one's basename to its real discovered path (first match wins,
-    deterministically, for a rare same-basename duplicate -- rglob's own
-    traversal order -- exactly as the pre-existing bundled-library index
-    already tolerates harmless byte-identical duplicates elsewhere in this
-    script). This is what lets --auto-roots prove closure completeness
-    against literally everything the packaged AppImage might ever try to
-    load, not only a hand-picked subset some prior incident happened to
-    name -- and, crucially, what lets each auto-discovered root's OWN
-    real location be used to compute ITS OWN effective RUNPATH/RPATH
-    search context for its own dependency edges (see
-    _effective_search_dirs()), rather than only ever knowing it by a bare
-    name divorced from where it actually lives in the tree."""
-    discovered: dict[str, Path] = {}
+def _discover_elf_roots(search_dir: Path) -> list[Path]:
+    """Recursively finds EVERY real ELF file under search_dir (the app's
+    own executable, every Qt plugin, every QML module's native library,
+    and every already-bundled library alike) and returns each one's real,
+    exact, distinct path -- never collapsed by basename.
+
+    Round-N+ review (HIGH, "auto roots still dict[basename,Path], losing
+    duplicates/location"): a real AppDir tree can legitimately contain two
+    *different* ELF files sharing the same basename in different
+    directories (a plugin's own private copy of a helper, or two
+    independently-built variants of the same-named tool) -- collapsing
+    them to a single "first match wins" Path per basename silently drops
+    the second one from the audit's own root set entirely, meaning its
+    real dependency edges (resolved via ITS OWN, different, real
+    location's RUNPATH/RPATH/$ORIGIN context -- see
+    _effective_search_dirs()) are never audited at all. Returning every
+    discovered path, keyed by nothing, is what lets audit_closure() (see
+    its own "process_root" step) treat each one as an independent root
+    with its own known, exact, already-resolved location -- never
+    re-derived via a name-only flat-index lookup that could not tell
+    these apart either."""
+    discovered: list[Path] = []
     for entry in sorted(search_dir.rglob("*")):
-        if _is_elf_file(entry) and entry.name not in discovered:
-            discovered[entry.name] = entry
+        if _is_elf_file(entry):
+            discovered.append(entry)
     return discovered
 
 
 def audit_closure(
     lib_dir: Path,
-    roots: list[str],
+    roots: list[str | tuple[str, Path]],
     extra_allowlist: frozenset[str] = frozenset(),
     global_search_dirs: list[Path] | None = None,
 ) -> tuple[set[str], dict[str, list[str]], dict[str, list[str]], set[str]]:
@@ -714,18 +724,25 @@ def audit_closure(
       itself so a caller auditing e.g. the narrow libsecret closure never
       unintentionally also trusts the X11/GL desktop-stack assumption.
 
-    Every entry in `roots` itself (requester is None below) is never
-    subjected to the reachability check: it is presumed to be loaded by
-    its own real, already-known path (execve()'d directly for the app's
-    own executable/plugins discovered by --auto-roots, or --root's
-    documented convention of naming something expected to live directly
-    in lib_dir), never resolved BY NAME through some other object's own
-    search path in the first place -- only an actual DT_NEEDED dependency
-    EDGE (which always has a concrete, known requester: the object whose
-    own dynamic section named it) is ever reachability-checked. Once a
-    root's own resolved path is known (from the bundled-library index),
-    that path becomes the requester for ITS OWN dependency edges exactly
-    like any other object's.
+    Round-N+ review (HIGH, "auto roots still dict[basename,Path], losing
+    duplicates/location ... traversal omits inherited legacy DT_RPATH
+    context"): each entry of `roots` may be either a bare name (str --
+    the pre-existing --root convention: "the name as found anywhere in
+    the indexed tree", never claiming any particular real location) or a
+    (name, Path) tuple carrying that root's own already-known, exact,
+    real discovered location (--auto-roots' own per-file discovery; see
+    _discover_elf_roots()). Two *different* roots that happen to share a
+    bare basename (a genuine, if rare, real-world AppDir shape) are
+    THEREFORE both preserved and independently processed here -- each via
+    its own real path, its own real RUNPATH/RPATH, its own real $ORIGIN --
+    never collapsed to a single flat-index lookup that could not tell
+    them apart. A root's own resolved path becomes the requester for ITS
+    OWN dependency edges exactly like any other object; only an actual
+    DT_NEEDED dependency EDGE (which always has a concrete, known
+    requester) is ever reachability-checked -- a root itself never is,
+    since it is presumed loaded directly (execve()'d, or --auto-roots'
+    own discovery), never resolved BY NAME through some other object's
+    search path.
     """
     allowlist = ABI_ALLOWLIST | extra_allowlist
     index = _index_lib_dir(lib_dir)
@@ -735,12 +752,26 @@ def audit_closure(
     else:
         global_search_dirs = [d.resolve() for d in global_search_dirs]
 
+    # Normalize every root entry to (name, known_path | None): a bare str
+    # keeps the pre-existing "resolve by name in the flat index" behavior
+    # (--root's documented convention); a (name, Path) tuple carries an
+    # already-known, exact, real location (--auto-roots' own discovery)
+    # that must be used AS-IS, never re-derived from the flat index (see
+    # this function's own docstring).
+    normalized_roots: list[tuple[str, Path | None]] = [
+        (root, None) if isinstance(root, str) else (root[0], root[1])
+        for root in roots
+    ]
+
     bundled_closure: set[str] = set()
     missing: dict[str, list[str]] = {}
     unreachable: dict[str, list[str]] = {}
-    # Each queue entry is (name, requester_path); requester_path is None
-    # only for an initial root (see the reachability-exemption note above).
-    queue: list[tuple[str, Path | None]] = [(name, None) for name in roots]
+    # Each queue entry is (name, requester_path), always a REAL, resolved
+    # requester Path: roots are seeded directly below (see process_root())
+    # rather than ever being pushed onto this queue as a bare name with no
+    # requester, so this queue exclusively models actual DT_NEEDED
+    # dependency edges (each with a concrete, known requester).
+    queue: list[tuple[str, Path]] = []
     # Round-9+ review (HIGH, "seen keyed only SONAME skips same dependency
     # from different requester/RPATH contexts" / "roots collapsed
     # basename"): deduplication is keyed by the EDGE -- (name, requester)
@@ -759,7 +790,14 @@ def audit_closure(
     # output cache (below) keeps this from being a real performance
     # regression: only the (cheap, in-memory) reachability check repeats
     # per distinct requester, never a redundant subprocess invocation.
-    seen_edges: set[tuple[str, str | None]] = set()
+    seen_edges: set[tuple[str, str]] = set()
+    # Round-N+ review (HIGH, "auto roots still dict[basename,Path], losing
+    # duplicates/location"): roots are deduplicated by (name, EXACT known
+    # path) -- never by name alone -- so two different roots that happen
+    # to share a bare basename (e.g. two distinct plugin copies discovered
+    # by --auto-roots at different real locations) are both independently
+    # processed, each via its own real path/RUNPATH/$ORIGIN context.
+    seen_roots: set[tuple[str, str | None]] = set()
     dynamic_text_cache: dict[Path, str] = {}
 
     def cached_dynamic_text(path: Path) -> str:
@@ -800,9 +838,45 @@ def audit_closure(
             )
         return link_target if link_target.exists() else candidate
 
+    def enqueue_dependencies_of(resolved_path: Path, requester_name: str) -> None:
+        bundled_closure.add(requester_name)
+        for needed in _parse_needed(cached_dynamic_text(resolved_path)):
+            queue.append((needed, resolved_path))
+            if needed not in index and needed not in allowlist:
+                missing.setdefault(needed, []).append(requester_name)
+
+    def process_root(name: str, known_path: Path | None) -> None:
+        """A root is never subjected to the reachability check: it is
+        presumed loaded by its own real, already-known path (execve()'d
+        directly for the app's own executable/plugins discovered by
+        --auto-roots, or --root's documented convention of naming
+        something expected to live directly in lib_dir), never resolved
+        BY NAME through some other object's own search path in the first
+        place. Once its own resolved path is known, that path becomes the
+        requester for ITS OWN dependency edges exactly like any other
+        object's."""
+        root_key = (name, str(known_path) if known_path is not None else None)
+        if root_key in seen_roots:
+            return
+        seen_roots.add(root_key)
+        if known_path is not None:
+            resolved_path = resolve_symlink_within_appdir(known_path, name)
+        else:
+            if name not in index:
+                if name not in allowlist:
+                    missing.setdefault(name, [])
+                return
+            resolved_path = resolve_symlink_within_appdir(
+                _select_unambiguous_occurrence(name, index[name], lib_dir), name
+            )
+        enqueue_dependencies_of(resolved_path, name)
+
+    for name, known_path in normalized_roots:
+        process_root(name, known_path)
+
     while queue:
         name, requester_path = queue.pop()
-        edge_key = (name, str(requester_path) if requester_path is not None else None)
+        edge_key = (name, str(requester_path))
         if edge_key in seen_edges:
             continue
         seen_edges.add(edge_key)
@@ -812,72 +886,59 @@ def audit_closure(
                 missing.setdefault(name, [])
             continue
 
-        if requester_path is not None:
-            requester_dynamic_text = cached_dynamic_text(requester_path)
-            effective_dirs = _effective_search_dirs(
-                requester_path, requester_dynamic_text, global_search_dirs,
-                lib_dir_resolved,
-            )
-            # Round-N+ review (HIGH, "index/root still one path per
-            # basename; reachability boolean then recursion chooses
-            # index[name], not loader-selected duplicate"): when the same
-            # basename exists at more than one path in the tree (e.g. two
-            # copies of a plugin's private dependency, one genuinely
-            # reachable via this requester's own RUNPATH, one that only
-            # happens to sit elsewhere), the file that gets explored for
-            # FURTHER dependencies must be the EXACT path a real loader
-            # would actually select for THIS requester -- never whichever
-            # single occurrence `index[name]` happens to remember (which
-            # reflects only rglob's own traversal order, not real loader
-            # precedence, and previously could silently substitute an
-            # entirely unrelated copy's own DT_NEEDED/RUNPATH into this
-            # requester's closure). Resolve the exact reachable file
-            # directly from `effective_dirs`, in real search-order
-            # precedence, rather than ever falling back to the flat index
-            # for a requester-specific edge.
-            resolved_path: Path | None = None
-            for search_dir in effective_dirs:
-                candidate = search_dir / name
-                if _is_elf_file(candidate):
-                    resolved_path = resolve_symlink_within_appdir(candidate, name)
-                    break
-            if resolved_path is None:
-                # Bundled somewhere in the tree, but not anywhere a real
-                # load of `requester_path` would actually search for it --
-                # exactly as fatal as a genuinely missing dependency (see
-                # this function's own docstring). Still recurse into its
-                # own further DT_NEEDED entries below (using SOME
-                # occurrence, purely so a single audit run can still
-                # surface other real problems transitively below an
-                # already-broken edge) so a single audit run reports every
-                # real problem, not just the first one; never add it to
-                # bundled_closure, since this edge was never validly
-                # resolved.
-                unreachable.setdefault(name, []).append(requester_path.name)
-                representative = resolve_symlink_within_appdir(
-                    _select_unambiguous_occurrence(name, index[name], lib_dir), name
-                )
-                for needed in _parse_needed(cached_dynamic_text(representative)):
-                    queue.append((needed, representative))
-                continue
-        else:
-            # A root, exempt from reachability (see this function's own
-            # docstring): resolved by the pre-existing --root convention
-            # of "the name as found anywhere in the indexed tree" (roots
-            # are either --auto-roots' own real discovered path, passed
-            # through unchanged below by main(), or a bare --root NAME
-            # expected to be found directly in lib_dir).
-            resolved_path = resolve_symlink_within_appdir(
+        requester_dynamic_text = cached_dynamic_text(requester_path)
+        effective_dirs = _effective_search_dirs(
+            requester_path, requester_dynamic_text, global_search_dirs,
+            lib_dir_resolved,
+        )
+        # Round-N+ review (HIGH, "index/root still one path per
+        # basename; reachability boolean then recursion chooses
+        # index[name], not loader-selected duplicate"): when the same
+        # basename exists at more than one path in the tree (e.g. two
+        # copies of a plugin's private dependency, one genuinely
+        # reachable via this requester's own RUNPATH, one that only
+        # happens to sit elsewhere), the file that gets explored for
+        # FURTHER dependencies must be the EXACT path a real loader
+        # would actually select for THIS requester -- never whichever
+        # single occurrence `index[name]` happens to remember (which
+        # reflects only rglob's own traversal order, not real loader
+        # precedence, and previously could silently substitute an
+        # entirely unrelated copy's own DT_NEEDED/RUNPATH into this
+        # requester's closure). Resolve the exact reachable file
+        # directly from `effective_dirs`, in real search-order
+        # precedence, rather than ever falling back to the flat index
+        # for a requester-specific edge.
+        resolved_path: Path | None = None
+        for search_dir in effective_dirs:
+            candidate = search_dir / name
+            if _is_elf_file(candidate):
+                resolved_path = resolve_symlink_within_appdir(candidate, name)
+                break
+        if resolved_path is None:
+            # Bundled somewhere in the tree, but not anywhere a real
+            # load of `requester_path` would actually search for it --
+            # exactly as fatal as a genuinely missing dependency (see
+            # this function's own docstring). Still recurse into its
+            # own further DT_NEEDED entries below (using SOME
+            # occurrence, purely so a single audit run can still
+            # surface other real problems transitively below an
+            # already-broken edge) so a single audit run reports every
+            # real problem, not just the first one; never add it to
+            # bundled_closure, since this edge was never validly
+            # resolved.
+            unreachable.setdefault(name, []).append(requester_path.name)
+            representative = resolve_symlink_within_appdir(
                 _select_unambiguous_occurrence(name, index[name], lib_dir), name
             )
+            for needed in _parse_needed(cached_dynamic_text(representative)):
+                queue.append((needed, representative))
+            continue
 
-        bundled_closure.add(name)
-        for needed in _parse_needed(cached_dynamic_text(resolved_path)):
-            queue.append((needed, resolved_path))
-            if needed not in index and needed not in allowlist:
-                missing.setdefault(needed, []).append(name)
+        enqueue_dependencies_of(resolved_path, name)
 
-    return bundled_closure, missing, unreachable, {name for name, _ in seen_edges}
+    return bundled_closure, missing, unreachable, (
+        {name for name, _ in seen_edges} | {name for name, _ in seen_roots}
+    )
 
 
 
@@ -962,7 +1023,7 @@ def main(argv: list[str]) -> int:
         print(f"Not a directory: {args.lib_dir}", file=sys.stderr)
         return 2
 
-    auto_roots: dict[str, Path] = {}
+    auto_roots: list[Path] = []
     if args.auto_roots is not None:
         if not args.auto_roots.is_dir():
             print(f"Not a directory: {args.auto_roots}", file=sys.stderr)
@@ -976,14 +1037,32 @@ def main(argv: list[str]) -> int:
             )
             return 2
 
-    explicit_roots = args.roots or ([] if auto_roots else ["libsecret-1.so.0"])
-    # Deduplicate while keeping output deterministic (auto-discovered roots
-    # are already sorted; explicit roots are appended after, then the whole
-    # list is de-duplicated by insertion order).
-    roots: list[str] = []
-    for root in [*sorted(auto_roots), *explicit_roots]:
-        if root not in roots:
-            roots.append(root)
+    explicit_root_names = args.roots or ([] if auto_roots else ["libsecret-1.so.0"])
+    # Round-N+ review (HIGH, "auto roots still dict[basename,Path], losing
+    # duplicates/location"): every auto-discovered root keeps its own
+    # exact, real Path (never collapsed to a single "first match wins"
+    # entry per basename -- see _discover_elf_roots()'s own docstring), so
+    # two different roots that happen to share a bare basename are BOTH
+    # preserved and independently audited via their own real location.
+    # Deduplicated by the full (name, path) identity -- auto-discovered
+    # roots are already sorted by real path; explicit --root names (which
+    # carry no known path of their own) are appended after, deduplicated
+    # only against an identical bare-name entry.
+    roots: list[str | tuple[str, Path]] = []
+    seen_root_identities: set[tuple[str, str | None]] = set()
+    for path in auto_roots:
+        identity = (path.name, str(path))
+        if identity not in seen_root_identities:
+            seen_root_identities.add(identity)
+            roots.append((path.name, path))
+    for name in explicit_root_names:
+        identity = (name, None)
+        if identity not in seen_root_identities:
+            seen_root_identities.add(identity)
+            roots.append(name)
+    root_names_for_display = [
+        root if isinstance(root, str) else root[0] for root in roots
+    ]
 
     extra_allowlist = frozenset().union(
         X11_DESKTOP_ABI_ALLOWLIST if args.allow_x11_desktop_stack else frozenset(),
@@ -993,10 +1072,14 @@ def main(argv: list[str]) -> int:
 
     try:
         index = _index_lib_dir(args.lib_dir)
-        for root in roots:
-            if root not in index:
+        # Only a bare --root NAME (no already-known path of its own) needs
+        # this existence check: an --auto-roots-discovered root's exact
+        # path was already proven to exist (and to be a real ELF file) by
+        # _discover_elf_roots()'s own rglob/_is_elf_file() sniff.
+        for name in explicit_root_names:
+            if name not in index:
                 print(
-                    f"Root library '{root}' was not found in {args.lib_dir} at all "
+                    f"Root library '{name}' was not found in {args.lib_dir} at all "
                     "-- nothing to audit.",
                     file=sys.stderr,
                 )
@@ -1010,7 +1093,7 @@ def main(argv: list[str]) -> int:
         # in a possibly-ambiguous tree is "the" executable to inspect.
         interp_problems = [
             problem
-            for path in auto_roots.values()
+            for path in auto_roots
             if (problem := validate_interp(path, allowlist)) is not None
         ]
         if interp_problems:
@@ -1038,7 +1121,7 @@ def main(argv: list[str]) -> int:
     required_bundled = bundled_closure - allowlist
 
     if not args.list_only:
-        print(f"Resolved {len(required_bundled)} required bundled librar{'y' if len(required_bundled) == 1 else 'ies'} in the closure of {roots}:")
+        print(f"Resolved {len(required_bundled)} required bundled librar{'y' if len(required_bundled) == 1 else 'ies'} in the closure of {root_names_for_display}:")
         for name in sorted(required_bundled):
             print(f"  {name}")
 

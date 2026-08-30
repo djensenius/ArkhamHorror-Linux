@@ -237,26 +237,41 @@ QByteArray encodeAvifSequenceFixture(int frameCount) {
 }
 
 // Returns a copy of `original` (a real, validly-encoded AVIF produced by
-// encodeAvifFixture()) with its ISOBMFF `ispe` ("Image Spatial Extents")
-// box's declared width/height fields overwritten to `width`/`height`,
-// leaving the actual (still-tiny) AV1 pixel payload completely
-// untouched. This lets a test assert that a declared-dimension check
-// runs (and rejects the input) BEFORE any real pixel decode/allocation
-// is attempted -- see AssetAvifDecoder.cpp's decodeAvifImage(), which
-// checks decoder->image->width/height immediately after
-// avifDecoderParse() (metadata only) and before ever calling
-// avifDecoderNextImage() (full AV1 decode + pixel buffer allocation) --
-// without needing to actually encode a real multi-billion-pixel image.
-// The `ispe` box layout (ISO/IEC 14496-12 + ISO/IEC 23008-12 Annex B):
-// size(4) + "ispe"(4) + version_and_flags(4) + width(4) + height(4), all
-// big-endian.
+// encodeAvifFixture()) with its `occurrenceIndex`-th (0-based, in
+// byte-offset order) ISOBMFF `ispe` ("Image Spatial Extents") box's
+// declared width/height fields overwritten to `width`/`height`, leaving
+// the actual pixel payload(s) completely untouched. This lets a test
+// assert that a declared-dimension check runs (and rejects the input)
+// BEFORE any real pixel decode/allocation is attempted -- see
+// AssetAvifDecoder.cpp's decodeAvifImage(), which checks
+// decoder->image->width/height immediately after avifDecoderParse()
+// (metadata only) and before ever calling avifDecoderNextImage() (full
+// AV1 decode + pixel buffer allocation) -- without needing to actually
+// encode a real multi-billion-pixel image. The `ispe` box layout
+// (ISO/IEC 14496-12 + ISO/IEC 23008-12 Annex B): size(4) + "ispe"(4) +
+// version_and_flags(4) + width(4) + height(4), all big-endian.
+//
+// `occurrenceIndex` defaults to 0 (the first `ispe` box) for every
+// existing single-image-fixture call site. A genuine grid AVIF (see
+// encodeAvifGridFixture() below) declares MULTIPLE distinct `ispe`
+// boxes -- one for the derived "grid" composite item (found first, by
+// byte offset, since libavif always emits the grid item's own
+// properties before any constituent cell's) and (at least) one shared
+// by its constituent cells -- so a grid-specific test passes a nonzero
+// index to target exactly one of them without disturbing the others.
 QByteArray patchAvifIspeBoxDimensions(const QByteArray &original, quint32 width,
-                                      quint32 height) {
+                                      quint32 height, int occurrenceIndex = 0) {
   const char *needle = "ispe";
-  const int needleIndex = original.indexOf(needle);
-  if (needleIndex < 0) {
-    qFatal("patchAvifIspeBoxDimensions() could not find an 'ispe' box in "
-           "the supplied fixture bytes");
+  int needleIndex = -1;
+  int searchFrom = 0;
+  for (int occurrence = 0; occurrence <= occurrenceIndex; ++occurrence) {
+    needleIndex = original.indexOf(needle, searchFrom);
+    if (needleIndex < 0) {
+      qFatal("patchAvifIspeBoxDimensions() could not find occurrence %d of "
+             "an 'ispe' box in the supplied fixture bytes",
+             occurrence);
+    }
+    searchFrom = needleIndex + 1;
   }
   QByteArray patched = original;
   const int widthOffset = needleIndex + 4 /* "ispe" */ + 4 /* version+flags */;
@@ -274,6 +289,95 @@ QByteArray patchAvifIspeBoxDimensions(const QByteArray &original, quint32 width,
   writeBigEndianU32(widthOffset, width);
   writeBigEndianU32(heightOffset, height);
   return patched;
+}
+
+// Encodes a genuine, real (never-shipped) AVIF image GRID -- a
+// `gridCols` x `gridRows` array of independently-encoded `cellW` x
+// `cellH` AV1 cells, composited by libavif itself (via
+// avifEncoderAddImageGrid()) into a single derived image item whose own
+// declared composite dimensions are `gridCols*cellW` x `gridRows*cellH`.
+// Per the AVIF/HEIF grid spec, each cell must be at least 64x64.
+//
+// This exists specifically to reproduce, with genuinely-encoded (never
+// hand-crafted) bytes, a real divergence between a container's declared
+// per-item `ispe` metadata and the FINAL avifDecoderNextImage()-produced
+// decoder->image dimensions: empirically confirmed (against both this
+// project's pinned CI libavif 0.9.3 on Ubuntu 22.04 and the locally
+// available libavif) that patching JUST the grid item's own composite
+// `ispe` box (occurrence 0) down to a small declared size, while leaving
+// the (real, larger) per-cell `ispe` untouched, makes avifDecoderParse()
+// report the small PATCHED size (decoder->image->width/height read from
+// the grid item's own ispe alone) -- but avifDecoderNextImage() still
+// assembles the REAL, full-size composite from the genuinely-decoded
+// cells and overwrites decoder->image->width/height with the actual
+// (larger) assembled size, with no error and no re-validation of its
+// own. This is the concrete, real-decoder-path proof that
+// AssetAvifDecoder.cpp's post-decode re-validation (added alongside
+// this test, cumulative review PR #18) is not a theoretical concern:
+// without it, a hostile server could declare an innocuous-looking small
+// grid composite size while silently returning a full-size decoded
+// image that bypasses the pre-decode dimension/pixel-budget check
+// entirely.
+QByteArray encodeAvifGridFixture(int gridCols, int gridRows, int cellW,
+                                 int cellH) {
+  std::vector<avifImage *> cells;
+  cells.reserve(static_cast<size_t>(gridCols) * static_cast<size_t>(gridRows));
+  for (int i = 0; i < gridCols * gridRows; ++i) {
+    avifImage *cell = avifImageCreate(static_cast<uint32_t>(cellW),
+                                      static_cast<uint32_t>(cellH),
+                                      /*depth=*/8, AVIF_PIXEL_FORMAT_YUV420);
+    if (cell == nullptr) {
+      qFatal("encodeAvifGridFixture() failed to allocate a cell avifImage");
+    }
+    avifRGBImage rgb;
+    avifRGBImageSetDefaults(&rgb, cell);
+    rgb.format = AVIF_RGB_FORMAT_RGBA;
+    (void)avifRGBImageAllocatePixels(&rgb);
+    if (rgb.pixels == nullptr) {
+      qFatal("encodeAvifGridFixture() failed to allocate cell RGB pixels");
+    }
+    // Distinct fill per cell so a visual/pixel-content bug (as opposed to
+    // a pure metadata one) would be independently spottable if this
+    // fixture is ever repurposed for a decode-content assertion.
+    memset(rgb.pixels, 32 + i * 40,
+           static_cast<size_t>(rgb.rowBytes) * rgb.height);
+    const avifResult toYuvResult = avifImageRGBToYUV(cell, &rgb);
+    avifRGBImageFreePixels(&rgb);
+    if (toYuvResult != AVIF_RESULT_OK) {
+      qFatal("encodeAvifGridFixture() failed to convert a cell to YUV: %s",
+             avifResultToString(toYuvResult));
+    }
+    cells.push_back(cell);
+  }
+
+  avifEncoder *encoder = avifEncoderCreate();
+  if (!encoder) {
+    qFatal("encodeAvifGridFixture() failed to allocate an avifEncoder");
+  }
+  encoder->speed = AVIF_SPEED_FASTEST;
+  const avifResult addResult = avifEncoderAddImageGrid(
+      encoder, static_cast<uint32_t>(gridCols), static_cast<uint32_t>(gridRows),
+      cells.data(), AVIF_ADD_IMAGE_FLAG_SINGLE);
+  if (addResult != AVIF_RESULT_OK) {
+    qFatal("encodeAvifGridFixture() failed to add the grid: %s",
+           avifResultToString(addResult));
+  }
+
+  avifRWData output = AVIF_DATA_EMPTY;
+  const avifResult finishResult = avifEncoderFinish(encoder, &output);
+  if (finishResult != AVIF_RESULT_OK) {
+    qFatal("encodeAvifGridFixture() failed to finish: %s",
+           avifResultToString(finishResult));
+  }
+  QByteArray bytes(reinterpret_cast<const char *>(output.data),
+                   static_cast<int>(output.size));
+
+  avifRWDataFree(&output);
+  avifEncoderDestroy(encoder);
+  for (avifImage *cell : cells) {
+    avifImageDestroy(cell);
+  }
+  return bytes;
 }
 
 // Review round-4 item 1: every direct fetch() call site in this file must
@@ -1801,17 +1905,39 @@ void AssetNetworkFetcherTests::avifImageSequenceIsRejectedAsMalformedImage() {
   // image SEQUENCE (decoder->imageCount > 1, i.e. an "avis"-brand
   // animation) must be rejected outright rather than silently decoding
   // only its first frame -- this project only ever serves/consumes a
-  // single still image per asset candidate. Classified as
-  // MalformedImage, NOT UnsupportedCodec: this build's libavif backend
-  // fully supports decoding this exact bytestream -- the multi-image
-  // structure itself violates this project's single-still-image
-  // contract, an integrity/content-policy failure rather than a genuine
-  // codec-support gap. AssetRequestCoordinator's quarantine logic (review
-  // item 9) treats the two completely differently: MalformedImage
-  // quarantines a disk hit and retries the SAME candidate as a network
-  // miss, whereas UnsupportedCodec never does, because reserving it for
-  // multi-image AVIF would let a permanently-multi-image resource poison
-  // a disk entry forever with no way to ever resolve it by quarantining.
+  // single still image per asset candidate.
+  //
+  // Cumulative review (PR #18): AssetAvifDecoder.cpp now sets
+  // decoder->imageCountLimit=1 BEFORE avifDecoderParse() (rather than
+  // only discovering decoder->imageCount != 1 AFTER Parse already fully
+  // walked the sample table for every declared frame) so that libavif
+  // itself aborts parsing the moment a second image is discovered,
+  // instead of only rejecting the *result* afterward -- confirmed
+  // empirically (against both this project's exact pinned libavif 0.9.3
+  // on Ubuntu 22.04 and the locally available libavif) that Parse()
+  // itself now fails with AVIF_RESULT_BMFF_PARSE_FAILED for this exact
+  // 3-frame fixture, and decoder->imageCount is never populated to 3 --
+  // so this test now asserts on AssetAvifDecoder.cpp's Parse-failure
+  // error message, not a post-Parse imageCount readout. The now-dead (in
+  // practice, for any realistically-encodable fixture) "imageCount != 1"
+  // branch is retained in production code purely as defense-in-depth for
+  // any future libavif/container variant where Parse might still succeed
+  // with imageCount>1 despite imageCountLimit=1; its own
+  // read-decoder-fields-before-destroy ordering is unchanged from the
+  // prior, actually-exercised use-after-free fix, so the regression fix
+  // itself is preserved even though no current fixture can reach that
+  // branch to exercise it directly.
+  // Classified as MalformedImage, NOT UnsupportedCodec: this build's
+  // libavif backend is fully capable of decoding this bytestream -- the
+  // multi-image structure itself violates this project's
+  // single-still-image contract, an integrity/content-policy failure
+  // rather than a genuine codec-support gap. AssetRequestCoordinator's
+  // quarantine logic (review item 9) treats the two completely
+  // differently: MalformedImage quarantines a disk hit and retries the
+  // SAME candidate as a network miss, whereas UnsupportedCodec never
+  // does, because reserving it for multi-image AVIF would let a
+  // permanently-multi-image resource poison a disk entry forever with no
+  // way to ever resolve it by quarantining.
   MockHttpServer server;
   MockHttpServer::Response response;
   response.contentType = "image/avif";
@@ -1827,18 +1953,43 @@ void AssetNetworkFetcherTests::avifImageSequenceIsRejectedAsMalformedImage() {
   QVERIFY(result.has_value());
   QVERIFY(!bool(*result));
   QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
-  // Regression for a use-after-free: AssetAvifDecoder.cpp used to call
-  // avifDecoderDestroy(decoder) and THEN read decoder->imageCount to
-  // format this message, reading already-freed memory. A plain (non-ASan)
-  // build can appear to "work" by accident depending on allocator reuse
-  // timing, so this asserts the exact expected count is present in the
-  // message (proving the read observed real, not clobbered/reused,
-  // memory) rather than merely checking the error code. Built and run
-  // once locally under `-fsanitize=address` against a deliberately
-  // reintroduced pre-fix version of this function to confirm ASan
-  // reports a heap-use-after-free at this exact call site, and reports
-  // none after the fix.
-  QVERIFY2(result->error().message.contains(QStringLiteral("imageCount=3")),
+  QVERIFY2(result->error().message.contains(
+               QStringLiteral("failed to parse the AVIF container")),
+           qPrintable(result->error().message));
+}
+
+void AssetNetworkFetcherTests::
+    avifImageSequenceWithManyDeclaredFramesFailsFastAtParseNotPostParseCount() {
+  // Cumulative review (PR #18), "huge declared sample/image count" test:
+  // a genuine, validly-encoded AVIF sequence declaring FAR more frames
+  // (50) than the earlier 3-frame regression test must be rejected the
+  // exact same way -- proving decoder->imageCountLimit=1 (set before
+  // Parse) rejects ANY declared count above 1, not merely small ones a
+  // post-Parse imageCount readout might have happened to already bound
+  // cheaply. A hostile container claiming millions of frames would, pre-
+  // fix, force avifDecoderParse() to fully walk/allocate structures for
+  // every one of them before this project's own post-Parse imageCount
+  // check ever ran; 50 is already enough to prove the SAME
+  // AVIF_RESULT_BMFF_PARSE_FAILED short-circuit fires regardless of the
+  // declared count's magnitude, without this test itself taking
+  // pathologically long to encode.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  response.body = encodeAvifSequenceFixture(50);
+  server.setResponse(QStringLiteral("/many-frames.avif"), response);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/many-frames.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+  QVERIFY2(result->error().message.contains(
+               QStringLiteral("failed to parse the AVIF container")),
            qPrintable(result->error().message));
 }
 
@@ -1910,6 +2061,110 @@ void AssetNetworkFetcherTests::
   QVERIFY(result.has_value());
   QVERIFY(!bool(*result));
   QCOMPARE(result->error().code, AssetErrorCode::DimensionTooLarge);
+}
+
+void AssetNetworkFetcherTests::
+    avifInnerAv1PayloadLargerThanDeclaredIspeIsRejectedByCodecSizeLimit() {
+  // Cumulative review (PR #18) item 1: the INVERSE of the dimension-bomb
+  // test above -- a genuine, validly-encoded (real) 64x64 AVIF whose
+  // `ispe` box has been byte-patched DOWN to a tiny declared 4x4, while
+  // its actual embedded AV1 payload remains genuinely 64x64. Unlike the
+  // dimension-bomb case, this project's OWN pre-decode check (based
+  // purely on the patched, tiny declared `ispe`) trivially PASSES here --
+  // the attack is precisely that the declared size lies about being
+  // small. What must reject this is decoder->imageSizeLimit (tightened
+  // to this test's configured maxTotalPixels, set BEFORE
+  // avifDecoderParse(), per AssetAvifDecoder.cpp), which this project's
+  // exact linked libavif+dav1d backend enforces against the REAL AV1
+  // frame's own internal dimensions during avifDecoderNextImage() --
+  // confirmed empirically (both against this project's exact pinned CI
+  // libavif 0.9.3 on Ubuntu 22.04, and the locally available libavif) to
+  // make the underlying codec itself refuse to decode the oversized
+  // frame ("Decoding of color planes failed"), rather than silently
+  // decoding it and only rejecting after the fact. Configured
+  // maxTotalPixels (1000) sits strictly between the patched declared
+  // total (16) and the real payload's actual total (4096), so this can
+  // only be caught by a check that sees the REAL AV1 frame, never one
+  // that only ever examines declared container metadata.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  response.body =
+      patchAvifIspeBoxDimensions(encodeAvifFixture(64, 64), /*width=*/4,
+                                 /*height=*/4);
+  server.setResponse(QStringLiteral("/inner-payload-too-large.avif"), response);
+
+  AssetNetworkFetcher::Limits limits;
+  limits.maxDimensionPixels = 8192;
+  limits.maxTotalPixels = 1000;
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam, limits);
+  const auto result = fetchAndWait(
+      fetcher,
+      server.baseUrlFor(QStringLiteral("/inner-payload-too-large.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::MalformedImage);
+  QVERIFY2(result->error().message.contains(
+               QStringLiteral("failed to decode the AVIF image")),
+           qPrintable(result->error().message));
+}
+
+void AssetNetworkFetcherTests::
+    avifGridCompositeDimensionsDivergingFromDeclaredIspeAreRejectedPostDecode() {
+  // Cumulative review (PR #18) item 1, the concrete "changed post-decode
+  // dimensions" test: a genuine, validly-encoded (real, via libavif's own
+  // avifEncoderAddImageGrid()) 2x1 grid of 64x64 cells -- a real
+  // composite of 128x64 -- whose GRID ITEM's own composite `ispe` box
+  // (occurrence 0; see encodeAvifGridFixture()'s comment for why this
+  // specific box diverges from the actual assembled result) has been
+  // byte-patched down to a tiny declared 4x4, while the per-cell `ispe`
+  // and the actual encoded cell payloads remain genuinely 64x64 each.
+  //
+  // Empirically confirmed (both against this project's exact pinned CI
+  // libavif 0.9.3 on Ubuntu 22.04, and the locally available libavif):
+  // avifDecoderParse() reports decoder->image->width/height as the
+  // PATCHED 4x4 (read from the grid item's own declared ispe alone), but
+  // avifDecoderNextImage() still assembles the REAL cells and overwrites
+  // decoder->image->width/height with the actual 128x64 composite, with
+  // no error of its own. maxTotalPixels is set generously (100,000, far
+  // above the real 128x64=8,192 composite and each real 64x64=4,096
+  // cell) so decoder->imageSizeLimit itself never interferes at
+  // Parse/decode time -- isolating this test to specifically prove the
+  // NECESSITY of AssetAvifDecoder.cpp's post-avifDecoderNextImage()
+  // re-validation. maxDimensionPixels is tightened to 100 (below the
+  // real composite's 128-pixel width, but above the patched declared
+  // 4-pixel width) so: the PRE-decode check (seeing only the patched
+  // 4x4) passes trivially, while the POST-decode check (seeing the REAL
+  // 128x64) must reject it -- proving this project's own re-validation
+  // code, not merely libavif/the codec, is what catches this. The
+  // asserted error message reports the REAL 128, never the patched 4,
+  // confirming the rejection observed the actual decoded buffer.
+  MockHttpServer server;
+  MockHttpServer::Response response;
+  response.contentType = "image/avif";
+  response.body =
+      patchAvifIspeBoxDimensions(encodeAvifGridFixture(2, 1, 64, 64),
+                                 /*width=*/4, /*height=*/4,
+                                 /*occurrenceIndex=*/0);
+  server.setResponse(QStringLiteral("/grid-mismatch.avif"), response);
+
+  AssetNetworkFetcher::Limits limits;
+  limits.maxDimensionPixels = 100;
+  limits.maxTotalPixels = 100'000;
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam, limits);
+  const auto result = fetchAndWait(
+      fetcher, server.baseUrlFor(QStringLiteral("/grid-mismatch.avif")),
+      AssetFormat::Avif);
+
+  QVERIFY(result.has_value());
+  QVERIFY(!bool(*result));
+  QCOMPARE(result->error().code, AssetErrorCode::DimensionTooLarge);
+  QVERIFY2(result->error().message.contains(QStringLiteral("128")),
+           qPrintable(result->error().message));
 }
 
 void AssetNetworkFetcherTests::

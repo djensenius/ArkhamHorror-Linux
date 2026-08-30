@@ -40,6 +40,28 @@ private slots:
   void storeRejectsPayloadBeyondAbsoluteCapWithoutTouchingDisk();
   void metadataWriteFailureAfterPayloadCommitCleansUpOrphanPayload();
   void oversizedMetadataFileIsRejectedWithoutUnboundedReadAll();
+  // Cumulative review (PR #18, MEDIUM, "planted FIFO under a known
+  // manifest/metadata filename hangs forever before S_ISREG"): a
+  // hostile/broken concurrent process (or attacker) planting a FIFO
+  // (named pipe) at a manifest/metadata/payload filename must never
+  // block construction/lookup indefinitely -- a blocking open() of a
+  // FIFO with no writer hangs forever, well before any type check ever
+  // runs. Each covers a DIFFERENT one of the three read call sites,
+  // all funnelling through the same openRegularNoFollowRelative().
+  void manifestPlantedAsFifoNeverBlocksConstructionOrLookup();
+  void metadataPlantedAsFifoNeverBlocksConstructionOrLookup();
+  void payloadPlantedAsFifoNeverBlocksConstructionOrLookup();
+  // "socket too" -- a UNIX domain socket special file planted at a
+  // metadata filename must be rejected identically (never blocks,
+  // never mistaken for a regular file).
+  void metadataPlantedAsUnixSocketNeverBlocksConstructionOrLookup();
+  // Cumulative review (PR #18, MEDIUM, "listAllEntriesRelative returns
+  // partial vector on traversal errors ... reapAndEnforceQuota mutates
+  // based on it and may delete a valid generation whose manifest was
+  // omitted"): proves the entire repair/quota sweep aborts with ZERO
+  // mutations when the directory listing it would act on cannot be
+  // trusted, rather than proceeding against a partial/empty view.
+  void reapSweepAbortsAllMutationWhenDirectoryListingIsIndeterminate();
   void malformedKeyWithPathTraversalNeverTouchesFilesystemOutsideCacheDir();
   void promoteToMemoryRejectsMalformedKeyWithoutInserting();
 
@@ -152,6 +174,30 @@ private slots:
   // process's own real home.
   void ordinaryMultiComponentHomePathWithNoSymlinksResolvesSuccessfully();
 
+  // Cumulative review (PR #18, MEDIUM): an UNAUTHENTICATED mount
+  // transition landing exactly on a fake $HOME (i.e. the account
+  // database, forced via the test-only override, does NOT agree this
+  // is the current user's real home) that resolves onto a genuinely
+  // DIFFERENT mount than its own parent directory must be rejected --
+  // exactly the same strict same-mount-throughout policy an
+  // outside-home configured path already gets. Requires a real bind
+  // mount (root-privileged); QSKIP when unavailable.
+  void unauthenticatedHomeMountTransitionOntoADifferentMountIsRejected();
+  // Positive control for the test above: the SAME bind-mount shape,
+  // but with the account database (forced via the test-only override)
+  // agreeing this exact fake $HOME is the current user's own real
+  // home -- the mount transition MUST be permitted, exactly modelling
+  // a real SteamOS-style dedicated "/home/deck" mount. Requires a real
+  // bind mount (root-privileged); QSKIP when unavailable.
+  void authenticatedHomeMountTransitionOntoADifferentMountIsPermitted();
+  // An unauthenticated $HOME whose mount-identification itself is
+  // degraded (forced via setMountIdentificationDegradedForTesting(),
+  // no privilege required) must fail closed exactly like an
+  // outside-home configured path already does -- never silently fall
+  // back to treating an unproven mount boundary as safe.
+  void
+  unauthenticatedHomeWithDegradedMountIdentificationFailsClosedEvenUnmounted();
+
   // Round-9+ review: for a caller-supplied Config::directory, this
   // resolver must still never auto-create ANY missing component, even
   // when every component up to the last is already present -- exactly
@@ -247,6 +293,28 @@ private slots:
   // is specific to the forced degradation, not a general regression.
   void
   cleanupAndQuotaDescentSucceedNormallyWhenMountIdentificationIsFullyAvailable();
+
+  // Cumulative review (PR #18, HIGH, "disk-generation/invalidation
+  // serialization is instance-local QMutex; two cache instances/
+  // processes can reap each other's in-progress generations or delayed
+  // 200 can revive a newer definitive 404"): a REAL, separate OS
+  // process (see tests/helpers/AssetCacheLockHolderMain.cpp) is
+  // spawned first and holds the cache root's exclusive cross-process
+  // lock; this test process's OWN AssetCache instance over the exact
+  // same root must be denied disk authority and run memory-only --
+  // proving the cross-PROCESS denial path this class's header comment
+  // ("Cross-process authority") describes actually holds against a
+  // genuine second process, not merely a simulated/in-process stand-in.
+  void secondProcessHoldingRootLockForcesThisProcessMemoryOnlyUntilReleased();
+  // Same-process instances over the SAME root must instead cooperate
+  // (never be denied by each other) -- the positive-control companion
+  // to the test above, proving the denial above really is specific to
+  // a genuinely different process, not an overzealous lock that would
+  // also break ordinary same-process usage (multiple live AssetCache
+  // instances over one root within a single process, exactly like
+  // several existing tests in this very file already rely on).
+  void
+  sameProcessMultipleInstancesOverSameRootAllCooperateWithFullDiskAuthority();
 
 private:
   QString m_tempDirPath;

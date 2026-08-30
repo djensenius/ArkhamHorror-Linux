@@ -78,6 +78,19 @@ AssetImageRequest::~AssetImageRequest() {
 
 void AssetImageRequest::load(const AssetKey &key,
                              const QString &callerAccessibleDescription) {
+  // Round-N+ review ("load emits direct signals before registering
+  // request; a directly-connected observer that reentrantly calls
+  // load()/cancel() again -- or that destroys this object outright --
+  // from inside one of THIS call's own synchronous NOTIFY emissions can
+  // leave a coordinator handle unreachable, or run this function's
+  // remaining body against an already-destroyed object"): every
+  // synchronous emission below (including the ones inside cancel(),
+  // which this function calls first) is followed by a QPointer liveness
+  // check before this function touches `this` again. `guard` is
+  // deliberately the SAME kind of QPointer used for the async callback
+  // below (see its own comment) -- both defend against exactly the same
+  // hazard, just at different points in this object's lifetime.
+  QPointer<AssetImageRequest> guard(this);
   // cancel() already bumps m_generation unconditionally (invalidating any
   // in-flight callback tied to the previous generation, whether or not a
   // handle was actually live). A second bump here would be redundant --
@@ -85,6 +98,9 @@ void AssetImageRequest::load(const AssetKey &key,
   // whatever generation preceded it, which cancel()'s bump already
   // guarantees.
   cancel();
+  if (!guard) {
+    return; // destroyed synchronously by a signal cancel() emitted above
+  }
   const quint64 generation = m_generation;
   const QString base =
       baseAccessibleDescriptionFor(key, callerAccessibleDescription);
@@ -129,17 +145,32 @@ void AssetImageRequest::load(const AssetKey &key,
   }
 
   emit progressChanged();
+  if (!guard) {
+    return; // destroyed synchronously by a progressChanged() observer
+  }
   if (descriptionChangedFlag) {
     emit accessibleDescriptionChanged();
+    if (!guard) {
+      return;
+    }
   }
   if (errorChangedFlag) {
     emit errorChanged();
+    if (!guard) {
+      return;
+    }
   }
   if (imageChangedFlag) {
     emit imageChanged();
+    if (!guard) {
+      return;
+    }
   }
   if (statusChangedFlag) {
     emit statusChanged();
+    if (!guard) {
+      return;
+    }
   }
 
   // The coordinator retains this callback (via std::function, possibly
@@ -148,8 +179,15 @@ void AssetImageRequest::load(const AssetKey &key,
   // this consumer). A raw `this` capture would be a use-after-free once
   // that queued delivery runs after this object is destroyed, so every
   // member access below is guarded by a QPointer liveness check first.
-  QPointer<AssetImageRequest> self(this);
-  m_handle = m_coordinator.request(
+  // `self` and `guard` alias the exact same object -- kept as two named
+  // QPointers only because they answer two different questions: `guard`
+  // (checked synchronously, right here, right now) asks "is this object
+  // still alive after the signals THIS call just emitted?"; `self`
+  // (captured into the callback, checked whenever the coordinator
+  // eventually invokes it -- possibly much later, possibly never) asks
+  // the same question at a completely different point in time.
+  QPointer<AssetImageRequest> self(guard);
+  AssetRequestCoordinator::RequestHandle handle = m_coordinator.request(
       key,
       [self, generation, base](AssetOutcome<AssetCache::CachedEntry> result) {
         if (!self) {
@@ -180,9 +218,21 @@ void AssetImageRequest::load(const AssetKey &key,
           self->m_progress = 1.0;
           self->setAccessibleDescription(
               QStringLiteral("Failed to load %1: %2").arg(base, error.message));
+          if (!self) {
+            return; // destroyed synchronously by accessibleDescriptionChanged()
+          }
           emit self->errorChanged();
+          if (!self) {
+            return;
+          }
           emit self->imageChanged();
+          if (!self) {
+            return;
+          }
           emit self->progressChanged();
+          if (!self) {
+            return;
+          }
           emit self->statusChanged();
           return;
         }
@@ -191,13 +241,51 @@ void AssetImageRequest::load(const AssetKey &key,
         self->m_status = Status::Ready;
         self->m_progress = 1.0;
         self->setAccessibleDescription(base);
+        if (!self) {
+          return; // destroyed synchronously by accessibleDescriptionChanged()
+        }
         emit self->imageChanged();
+        if (!self) {
+          return;
+        }
         emit self->progressChanged();
+        if (!self) {
+          return;
+        }
         emit self->statusChanged();
       });
+  // Round-N+ review (HIGH, "reentrant signal handler load(B) registers,
+  // then outer load(A) overwrites m_handle; B unreachable, stale A
+  // consumer/network/cache publication lives"): a directly-connected
+  // observer reacting to one of THIS call's own signal emissions above
+  // may have reentrantly called load() (or cancel()) again on this exact
+  // object -- which runs to completion, including registering ITS OWN
+  // handle into m_handle -- before this call resumes here. Unconditionally
+  // assigning `m_handle = handle` in that case would silently clobber the
+  // newer, currently-current registration, permanently orphaning it (never
+  // cancelled, never tracked, its underlying fetch/decode left running
+  // forever). `generation` was captured before any of this call's own
+  // signals were emitted, so if it no longer matches `m_generation`, some
+  // reentrant load()/cancel() has already superseded this call entirely:
+  // this registration is already stale and must be cancelled immediately
+  // instead of installed.
+  if (!guard) {
+    // Destroyed synchronously by the coordinator's own bookkeeping is not
+    // expected (request() never emits into this object), but if some
+    // future change ever made that possible, the newly-minted handle
+    // would otherwise leak with no owner left to cancel it.
+    m_coordinator.cancel(handle);
+    return;
+  }
+  if (generation == m_generation) {
+    m_handle = handle;
+  } else {
+    m_coordinator.cancel(handle);
+  }
 }
 
 void AssetImageRequest::cancel() {
+  QPointer<AssetImageRequest> guard(this);
   ++m_generation;
   if (m_handle.isValid()) {
     m_coordinator.cancel(m_handle);
@@ -215,8 +303,14 @@ void AssetImageRequest::cancel() {
     const bool descriptionChangedFlag = !m_accessibleDescription.isEmpty();
     m_accessibleDescription.clear();
     emit progressChanged();
+    if (!guard) {
+      return; // destroyed synchronously by a progressChanged() observer
+    }
     if (descriptionChangedFlag) {
       emit accessibleDescriptionChanged();
+      if (!guard) {
+        return;
+      }
     }
     emit statusChanged();
   }

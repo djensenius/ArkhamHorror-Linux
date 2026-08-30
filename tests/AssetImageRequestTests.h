@@ -32,6 +32,9 @@ private slots:
   void reloadingWithNewKeyClearsPreviousImageDuringLoading();
   void reloadingAfterErrorEmitsErrorChangedWhenClearingStaleError();
   void statusChangedObserverSeesFullyConsistentPropertySnapshot();
+  void reentrantLoadFromWithinProgressChangedLeavesOnlyInnerRequestSurvives();
+  void synchronousDestructionDuringLoadSignalNeverContinuesAfterDestruction();
+  void reentrantCancelFromWithinCancelSignalNeverDoubleCorruptsState();
 
 private:
   QString m_tempDirPath;
