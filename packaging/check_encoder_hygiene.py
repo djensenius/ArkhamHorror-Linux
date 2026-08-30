@@ -1368,17 +1368,17 @@ def _alias_reexported_encoders(
         _Exposure(member, alias_cursor, "public/protected type alias")
         for member in _record_member_candidates(clang, target_decl)
     ]
-    for inherited in _inherited_and_reexported_encoders(clang, target_decl):
-        exposed.append(
-            _Exposure(
-                inherited.source_cursor,
-                alias_cursor,
-                f"type alias of {inherited.reason}",
-            )
-        )
 
     primary = clang.lib.clang_getSpecializedCursorTemplate(target_decl)
     if clang.lib.clang_getCursorKind(primary) != _CXCursor_ClassTemplate:
+        for inherited in _inherited_and_reexported_encoders(clang, target_decl):
+            exposed.append(
+                _Exposure(
+                    inherited.source_cursor,
+                    alias_cursor,
+                    f"type alias of {inherited.reason}",
+                )
+            )
         return exposed
 
     argument_count = clang.lib.clang_Type_getNumTemplateArguments(alias_type)
@@ -1440,9 +1440,12 @@ def _alias_reexported_encoders(
                 clang.lib.clang_getCanonicalType(arguments[index])
             )
         else:
-            base_decl = clang.lib.clang_getTypeDeclaration(
-                clang.lib.clang_getCursorType(base)
-            )
+            # Concrete implementation bases of a class-template
+            # specialization (e.g. libstdc++ shared_ptr internals) do not
+            # receive one of this alias's type arguments directly. Walking
+            # their unspecialized members would misattribute unrelated
+            # dependent APIs to the alias.
+            continue
         if clang.lib.clang_getCursorKind(base_decl) in (0, _CXCursor_NoDeclFound):
             exposed.append(
                 _Exposure(
