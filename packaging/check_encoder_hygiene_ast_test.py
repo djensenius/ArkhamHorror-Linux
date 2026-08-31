@@ -532,7 +532,24 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "#define INSTANTIATE_CLASS(T) template class MacroClass<T>;\n"
             "#define INSTANTIATE_MEMBER(T) template int MacroMember<T>::run();\n"
             "#define DECLARE_EXTERN(T) extern template int macroExtern<T>();\n"
-            "#define INSTANTIATE_SAFE(T) template int macroSafe<T>();\n",
+            "#define INSTANTIATE_SAFE(T) template int macroSafe<T>();\n"
+            "template<class T> WireAlias hiddenReturn() { return {}; }\n"
+            "template<class T> WireAlias hiddenExtern() { return {}; }\n"
+            "template<class T> struct HiddenField { QJsonObject value; };\n"
+            "struct WireBase { QJsonObject value; };\n"
+            "template<class T> struct HiddenBase : WireBase {};\n"
+            "template<class T> struct HiddenConversions {\n"
+            "  HiddenConversions(QJsonObject) {}\n"
+            "  operator QJsonObject() const { return {}; }\n"
+            "};\n"
+            "template<class T> struct HiddenMember {\n"
+            "  QJsonObject result() { return {}; }\n"
+            "};\n"
+            "template<class T> int hiddenBody() {\n"
+            "  QJsonObject value;\n"
+            "  return sizeof(T) + sizeof(value);\n"
+            "}\n"
+            "template<class T> struct HiddenSafe { T value; };\n",
         )
         source = self._write(
             "ExternalInstantiations.cpp",
@@ -559,7 +576,15 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             ")\n"
             "INSTANTIATE_MEMBER(QJsonObject)\n"
             "DECLARE_EXTERN(QJsonObject)\n"
-            "INSTANTIATE_SAFE(Safe)\n",
+            "INSTANTIATE_SAFE(Safe)\n"
+            "template WireAlias hiddenReturn<int>();\n"
+            "extern template WireAlias hiddenExtern<int>();\n"
+            "template class HiddenField<int>;\n"
+            "template class HiddenBase<int>;\n"
+            "template class HiddenConversions<int>;\n"
+            "template QJsonObject HiddenMember<int>::result();\n"
+            "template int hiddenBody<int>();\n"
+            "template class HiddenSafe<int>;\n",
         )
         violations, findings = self._scan_source_fixture(
             source,
@@ -590,10 +615,12 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             )
         )
         self.assertFalse(
-            any(finding.line in {14, 15, 16, 24} for finding in explicit)
+            any(finding.line in {14, 15, 16, 24, 32} for finding in explicit)
         )
         macro_expansions = [
-            finding for finding in explicit if finding.line >= 17
+            finding
+            for finding in explicit
+            if 17 <= finding.line < 25
         ]
         self.assertEqual(
             {finding.line for finding in macro_expansions},
@@ -608,6 +635,83 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
                 for finding in macro_expansions
             )
         )
+        self.assertEqual(
+            {
+                finding.line
+                for finding in explicit
+                if 25 <= finding.line <= 31
+            },
+            {25, 26, 27, 28, 29, 30, 31},
+        )
+
+    def test_header_macro_explicit_instantiations_preserve_both_locations(
+        self,
+    ) -> None:
+        system_header = self._write(
+            "system/HeaderMacroTemplates.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "struct Safe {};\n"
+            "template<class T> int headerFunction() { return sizeof(T); }\n"
+            "template<class T> int headerNested() { return sizeof(T); }\n"
+            "template<class T> struct HeaderClass { T value; };\n"
+            "template<class T> struct HeaderMember {\n"
+            "  static int run() { return sizeof(T); }\n"
+            "};\n"
+            "template<class T> int headerExtern() { return sizeof(T); }\n"
+            "template<class T> int headerSafe() { return sizeof(T); }\n"
+            "#define HEADER_FUNCTION(T) template int headerFunction<T>();\n"
+            "#define HEADER_ARGUMENT(T) T\n"
+            "#define HEADER_NESTED(T) template int headerNested<HEADER_ARGUMENT(T)>();\n"
+            "#define HEADER_CLASS(T) template class HeaderClass<T>;\n"
+            "#define HEADER_MEMBER(T) template int HeaderMember<T>::run();\n"
+            "#define HEADER_EXTERN(T) extern template int headerExtern<T>();\n"
+            "#define HEADER_SAFE(T) template int headerSafe<T>();\n",
+        )
+        header = self._write(
+            "HeaderMacroInstantiations.h",
+            "#include <HeaderMacroTemplates.h>\n"
+            "HEADER_FUNCTION(QJsonObject)\n"
+            "HEADER_CLASS(QJsonObject)\n"
+            "HEADER_MEMBER(\n"
+            "  QJsonObject\n"
+            ")\n"
+            "HEADER_EXTERN(QJsonObject)\n"
+            "HEADER_NESTED(QJsonObject)\n"
+            "HEADER_SAFE(Safe)\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header,
+            frozenset({header.resolve()}),
+            external_roots=frozenset({system_header.parent.resolve()}),
+            arguments=(
+                "-std=c++23",
+                "-isystem",
+                str(system_header.parent),
+            ),
+        )
+        self.assertEqual(violations, [])
+        explicit = [
+            finding
+            for finding in findings
+            if "kind=explicit-template-instantiation"
+            in finding.canonical_return_type
+        ]
+        self.assertEqual(
+            {finding.line for finding in explicit},
+            {2, 3, 4, 7, 8},
+        )
+        self.assertTrue(
+            all(
+                finding.file == "HeaderMacroInstantiations.h"
+                and finding.spelling_file.endswith(
+                    "system/HeaderMacroTemplates.h"
+                )
+                and finding.spelling_offset != finding.offset
+                for finding in explicit
+            )
+        )
+        self.assertFalse(any(finding.line == 9 for finding in explicit))
 
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
         source = self._write(
@@ -2277,7 +2381,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "target_link_libraries(exclude_provider INTERFACE direct_provider)\n"
             + 'set_property(TARGET exclude_provider PROPERTY INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE "$<$<BOOL:$<TARGET_PROPERTY:DISABLE_DIRECT>>:ImportedDirectPlugin>")\n'
             + "add_executable(consumer_excluded src/ConsumerExcluded.cpp)\n"
-            + "target_link_libraries(consumer_excluded PRIVATE exclude_provider)\n"
+            + "target_link_libraries(consumer_excluded PRIVATE ImportedDirectPlugin exclude_provider)\n"
             + "set_property(TARGET consumer_excluded PROPERTY ENABLE_DIRECT TRUE)\n"
             + "set_property(TARGET consumer_excluded PROPERTY ENABLE_PLUGIN_WIRE TRUE)\n"
             + "set_property(TARGET consumer_excluded PROPERTY DISABLE_DIRECT TRUE)\n"

@@ -171,7 +171,11 @@ an ever-growing fragment of C++ parsing by hand:
     libclang emits no project-owned cursor for the instantiation spelling.
     Source TUs are tokenized after preprocessing, so nested/argument macro
     expansions retain both their production invocation and macro-definition
-    spelling locations.
+    spelling locations; governed headers/fragments receive the identical
+    per-context treatment. Matching specialization nodes are then traversed
+    through their complete instantiated signature, body declarations,
+    fields, bases, constructors, conversions, aliases, and members rather
+    than accepting a safe-looking template argument list alone.
     Every numeric cursor kind used here is checked against the installed
     libclang's own clang_getCursorKindSpelling result at startup.
   - A declaration is a *violation* if any semantic type component is in
@@ -1671,6 +1675,9 @@ _EXPLICIT_TEMPLATE_START = _re.compile(
     r"(?m)^[ \t]*(?:extern[ \t]+template(?![ \t]*<)[ \t]+|"
     r"template[ \t]*<[ \t]*>|template(?![ \t]*<)[ \t]+)"
 )
+_EXPLICIT_INSTANTIATION_START = _re.compile(
+    r"(?m)^[ \t]*(?:extern[ \t]+)?template(?![ \t]*<)[ \t]+"
+)
 
 
 def _split_template_arguments(value: str) -> tuple[str, ...]:
@@ -1733,6 +1740,7 @@ def _explicit_template_candidates(
                 compiler,
                 *arguments,
                 "-E",
+                "-fkeep-system-includes",
                 "-x",
                 "c++",
                 str(path),
@@ -1759,7 +1767,12 @@ def _explicit_template_candidates(
                 continue
             if active_file == path.resolve():
                 active_text.append(output_line)
-        if _EXPLICIT_TEMPLATE_START.search("\n".join(active_text)) is None:
+        if (
+            _EXPLICIT_INSTANTIATION_START.search(
+                "\n".join(active_text)
+            )
+            is None
+        ):
             return []
     token_command = [
         compiler,
@@ -1958,8 +1971,12 @@ def _collect_explicit_template_findings(
             f"Compiler returned malformed AST JSON for {path}: {exc}"
         ) from exc
 
-    specializations: dict[str, list[tuple[tuple[str, ...], tuple[str, ...]]]] = {}
+    specializations: dict[
+        str,
+        list[tuple[tuple[str, ...], tuple[str, ...], dict]],
+    ] = {}
     type_aliases: dict[str, str] = {}
+    record_nodes: dict[str, list[dict]] = {}
 
     def visit(node: object) -> None:
         if not isinstance(node, dict):
@@ -1967,6 +1984,17 @@ def _collect_explicit_template_findings(
         name = node.get("name")
         inner = node.get("inner")
         type_info = node.get("type")
+        if (
+            node.get("kind")
+            in {
+                "CXXRecordDecl",
+                "RecordDecl",
+                "ClassTemplateSpecializationDecl",
+                "ClassTemplatePartialSpecializationDecl",
+            }
+            and isinstance(name, str)
+        ):
+            record_nodes.setdefault(name, []).append(node)
         if (
             node.get("kind") in {"TypeAliasDecl", "TypedefDecl"}
             and isinstance(name, str)
@@ -1993,26 +2021,88 @@ def _collect_explicit_template_findings(
                     canonical_found.append(canonical)
             if arguments_found:
                 specializations.setdefault(name, []).append(
-                    (tuple(arguments_found), tuple(canonical_found))
+                    (
+                        tuple(arguments_found),
+                        tuple(canonical_found),
+                        node,
+                    )
                 )
         if isinstance(inner, list):
             for child in inner:
                 visit(child)
 
     visit(root)
+
+    def instantiated_surfaces(
+        node: dict,
+        visited: frozenset[str] = frozenset(),
+        depth: int = 0,
+    ) -> set[str]:
+        if depth > _MAX_TYPE_DEPTH:
+            raise EncoderHygieneError(
+                "Explicit specialization AST graph exceeded the configured "
+                f"{_MAX_TYPE_DEPTH}-level complexity bound in {path}"
+            )
+        node_id = str(node.get("id", id(node)))
+        if node_id in visited:
+            return set()
+        nested_visited = visited | {node_id}
+        forbidden: set[str] = set()
+
+        def inspect_type(type_info: object) -> None:
+            if not isinstance(type_info, dict):
+                return
+            spellings = {
+                value
+                for key in ("qualType", "desugaredQualType")
+                if isinstance((value := type_info.get(key)), str)
+            }
+            for spelling in spellings:
+                if _is_qjson_family(spelling):
+                    forbidden.add(spelling)
+                for referenced_name in _re.findall(
+                    r"[A-Za-z_]\w*", spelling
+                ):
+                    alias_target = type_aliases.get(referenced_name)
+                    if (
+                        alias_target is not None
+                        and _is_qjson_family(alias_target)
+                    ):
+                        forbidden.add(alias_target)
+                    for record in record_nodes.get(referenced_name, ()):
+                        forbidden.update(
+                            instantiated_surfaces(
+                                record,
+                                nested_visited,
+                                depth + 1,
+                            )
+                        )
+
+        def inspect(value: object) -> None:
+            if isinstance(value, dict):
+                inspect_type(value.get("type"))
+                for nested in value.values():
+                    inspect(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    inspect(nested)
+
+        inspect(node)
+        return forbidden
+
     findings: list[Finding] = []
     try:
         relative = path.resolve().relative_to(repo_root).as_posix()
     except ValueError:
         relative = path.resolve().as_posix()
     for candidate in candidates:
-        matches: list[tuple[str, tuple[str, ...]]] = []
+        matches: list[tuple[str, tuple[str, ...], dict]] = []
         for name, provided_arguments in candidate.names_and_args:
             normalized_provided = tuple(
                 _normalized_template_spelling(argument)
                 for argument in provided_arguments
             )
-            for written, canonical in specializations.get(name, ()):
+            for written, canonical, node in specializations.get(name, ()):
                 if len(written) < len(normalized_provided):
                     continue
                 if all(
@@ -2031,7 +2121,7 @@ def _collect_explicit_template_findings(
                     }
                     for index, expected in enumerate(normalized_provided)
                 ):
-                    matches.append((name, canonical))
+                    matches.append((name, canonical, node))
         if not matches:
             raise EncoderHygieneError(
                 f"Compiler AST did not expose the explicit template "
@@ -2040,10 +2130,15 @@ def _collect_explicit_template_findings(
             )
         forbidden = [
             f"{name}:{argument}"
-            for name, arguments_found in matches
+            for name, arguments_found, _node in matches
             for argument in arguments_found
             if _is_qjson_family(argument)
         ]
+        forbidden.extend(
+            f"{name}:instantiated-surface:{surface}"
+            for name, _arguments_found, node in matches
+            for surface in instantiated_surfaces(node)
+        )
         if not forbidden:
             continue
         identity = ",".join(sorted(set(forbidden)))
@@ -3813,9 +3908,13 @@ def _load_evaluated_link_contexts(
         )
         effective_direct -= excluded
         link_usage = transitive_usage(graph, effective_direct)
+        compile_only_roots = (
+            set(graph[consumer]["compile_links"])
+            - set(graph[consumer]["links"])
+        )
         compile_usage = transitive_usage(
             graph,
-            effective_direct | set(graph[consumer]["compile_links"]),
+            effective_direct | compile_only_roots,
             "compile_interface",
         )
         return link_usage | compile_usage
@@ -4763,6 +4862,7 @@ def _scan_headers(
                     context.directory,
                     repo_root,
                     active_observation_context,
+                    always_tokenize=True,
                 ):
                     explicit_key = (
                         active_observation_context,
