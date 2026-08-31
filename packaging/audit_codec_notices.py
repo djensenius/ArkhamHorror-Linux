@@ -63,10 +63,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import functools
 import hashlib
 import json
 import os
+import platform
+import posixpath
 import re
 import shutil
 import subprocess
@@ -408,6 +411,23 @@ def _read_dynamic_tags(path: Path) -> list[tuple[str, str]]:
 # but not itself a parse error) rather than requiring at least one
 # character the way _SONAME_RE does.
 _BRACKETED_TAG_VALUE_RE = re.compile(r"\[(?P<value>[^\]]*)\]")
+_DYNAMIC_NEEDED_VALUE_RE = re.compile(r"Shared library:\s+\[(?P<name>[^\]]+)\]")
+_LDCONFIG_DEPENDENCY_LINE_RE = re.compile(
+    r"^\s*(?P<soname>\S+)\s+\([^)]+\)\s+=>\s+(?P<path>\S+)\s*$"
+)
+_APT_CONTROL_FIELD_RE = re.compile(r"^(?P<key>[A-Za-z0-9-]+):\s*(?P<value>.*)$")
+_DEFAULT_DYNAMIC_LOADER_SEARCH_DIRS: tuple[Path, ...] = (
+    Path("/lib64"),
+    Path("/usr/lib/x86_64-linux-gnu"),
+    Path("/lib/x86_64-linux-gnu"),
+    Path("/usr/lib64"),
+    Path("/lib"),
+    Path("/usr/lib"),
+)
+_DYNAMIC_LOADER_PLATFORM_TOKEN = platform.machine() or "unknown"
+_DYNAMIC_LOADER_LIB_TOKEN = (
+    "lib64" if _DYNAMIC_LOADER_PLATFORM_TOKEN in {"x86_64", "amd64"} else "lib"
+)
 
 
 def _observed_rpath_or_runpath(path: Path) -> str | None:
@@ -437,6 +457,410 @@ def _observed_rpath_or_runpath(path: Path) -> str | None:
         if match:
             return match.group("value")
     return None
+
+
+def _parse_needed_from_dynamic_tags(dynamic_tags: list[tuple[str, str]]) -> list[str]:
+    """Every DT_NEEDED soname declared by a requester's own `.dynamic`
+    section, in declaration order, parsed from _read_dynamic_tags()'s
+    already-decoded output."""
+    needed: list[str] = []
+    for tag_name, tag_value in dynamic_tags:
+        if tag_name != "NEEDED":
+            continue
+        match = _DYNAMIC_NEEDED_VALUE_RE.search(tag_value)
+        if match is not None:
+            needed.append(match.group("name"))
+    return needed
+
+
+def _parse_search_path_kind_and_entries_from_dynamic_tags(
+    dynamic_tags: list[tuple[str, str]],
+) -> tuple[str | None, list[str]]:
+    """Returns (`runpath`/`rpath`/None, [entries...]) for one requester's
+    own dynamic tags. DT_RUNPATH, when present, completely replaces
+    DT_RPATH for that requester's own direct dependency resolution."""
+    tags = dict(dynamic_tags)
+    for tag_name, kind in (("RUNPATH", "runpath"), ("RPATH", "rpath")):
+        raw_value = tags.get(tag_name)
+        if raw_value is None:
+            continue
+        match = _BRACKETED_TAG_VALUE_RE.search(raw_value)
+        if match is None:
+            return kind, []
+        return kind, [entry for entry in match.group("value").split(":") if entry]
+    return None, []
+
+
+def _expand_dynamic_loader_search_path_entry(entry: str, origin_dir: Path) -> Path:
+    """Expands a DT_RUNPATH/DT_RPATH search entry the way a real glibc
+    loader does for the tokens this project's actual dependency graph
+    can carry: $ORIGIN/${ORIGIN}, plus glibc's standard $LIB/$PLATFORM
+    substitutions. Relative entries are interpreted relative to the
+    requesting object's own directory."""
+    expanded = (
+        entry.replace("${ORIGIN}", str(origin_dir))
+        .replace("$ORIGIN", str(origin_dir))
+        .replace("${LIB}", _DYNAMIC_LOADER_LIB_TOKEN)
+        .replace("$LIB", _DYNAMIC_LOADER_LIB_TOKEN)
+        .replace("${PLATFORM}", _DYNAMIC_LOADER_PLATFORM_TOKEN)
+        .replace("$PLATFORM", _DYNAMIC_LOADER_PLATFORM_TOKEN)
+    )
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
+        candidate = origin_dir / candidate
+    return candidate.resolve()
+
+
+def _parse_ld_library_path_entries(
+    ld_library_path: str | None = None,
+) -> tuple[Path, ...]:
+    """Ordered absolute directories from LD_LIBRARY_PATH, deduplicated
+    but otherwise preserved exactly as a real loader would search them."""
+    value = os.environ.get("LD_LIBRARY_PATH", "") if ld_library_path is None else ld_library_path
+    entries: list[Path] = []
+    for raw_entry in value.split(":"):
+        if not raw_entry:
+            continue
+        candidate = Path(raw_entry)
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        if candidate not in entries:
+            entries.append(candidate)
+    return tuple(entries)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_ldconfig_library_cache() -> dict[str, tuple[Path, ...]]:
+    """Best-effort parse of `ldconfig -p`, keyed by SONAME, preserving
+    the cache's own preference order within each SONAME."""
+    ldconfig = shutil.which("ldconfig")
+    if ldconfig is None:
+        return {}
+    try:
+        result = subprocess.run(
+            [ldconfig, "-p"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return {}
+    if result.returncode != 0:
+        return {}
+    grouped: dict[str, list[Path]] = {}
+    for line in result.stdout.splitlines():
+        match = _LDCONFIG_DEPENDENCY_LINE_RE.match(line)
+        if match is None:
+            continue
+        soname = match.group("soname")
+        candidate = Path(match.group("path"))
+        grouped.setdefault(soname, [])
+        if candidate not in grouped[soname]:
+            grouped[soname].append(candidate)
+    return {soname: tuple(paths) for soname, paths in grouped.items()}
+
+
+def _ordered_dynamic_loader_search_dirs(
+    requester_search_kind: str | None,
+    requester_own_search_dirs: list[Path],
+    ld_library_path_dirs: tuple[Path, ...],
+    inherited_rpath_chain: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    """The ordered directories a real glibc loader would consult for one
+    requester's own direct DT_NEEDED resolution."""
+    ordered: list[Path] = []
+    if requester_search_kind == "rpath":
+        candidates = (
+            *requester_own_search_dirs,
+            *inherited_rpath_chain,
+            *ld_library_path_dirs,
+        )
+    else:
+        candidates = (
+            *inherited_rpath_chain,
+            *ld_library_path_dirs,
+            *requester_own_search_dirs,
+        )
+    for candidate in candidates:
+        if candidate not in ordered:
+            ordered.append(candidate)
+    return tuple(ordered)
+
+
+def _next_inherited_rpath_chain_for_requester(
+    requester_search_kind: str | None,
+    requester_own_search_dirs: list[Path],
+    inherited_rpath_chain: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    """The still-live legacy DT_RPATH context a child dependency of this
+    requester inherits. DT_RUNPATH resets transitive inheritance;
+    DT_RPATH accumulates nearest-to-ancestor order."""
+    if requester_search_kind == "runpath":
+        return ()
+    combined = list(requester_own_search_dirs)
+    for candidate in inherited_rpath_chain:
+        if candidate not in combined:
+            combined.append(candidate)
+    return tuple(combined)
+
+
+def _resolve_dt_needed_path(
+    requester_path: Path,
+    needed_soname: str,
+    requester_search_dirs: tuple[Path, ...],
+    ldconfig_cache: dict[str, tuple[Path, ...]],
+    default_search_dirs: tuple[Path, ...] = _DEFAULT_DYNAMIC_LOADER_SEARCH_DIRS,
+) -> Path | None:
+    """Resolves one requester's one DT_NEEDED entry using the real
+    loader's search precedence for that exact requester."""
+    if "/" in needed_soname:
+        candidate = Path(needed_soname)
+        if not candidate.is_absolute():
+            candidate = requester_path.parent.resolve() / candidate
+        return candidate if candidate.is_file() else None
+    for search_dir in requester_search_dirs:
+        candidate = search_dir / needed_soname
+        if candidate.is_file():
+            return candidate
+    for candidate in ldconfig_cache.get(needed_soname, ()):
+        if candidate.is_file():
+            return candidate
+    for search_dir in default_search_dirs:
+        candidate = search_dir / needed_soname
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_requester_needed_edges(
+    requester_path: Path,
+    ld_library_path: str | None = None,
+    ldconfig_cache: dict[str, tuple[Path, ...]] | None = None,
+    default_search_dirs: tuple[Path, ...] = _DEFAULT_DYNAMIC_LOADER_SEARCH_DIRS,
+    inherited_rpath_chain: tuple[Path, ...] = (),
+) -> tuple[list[tuple[str, Path]], tuple[Path, ...]]:
+    """Direct DT_NEEDED edges for one requester, plus the legacy RPATH
+    context its resolved children inherit."""
+    try:
+        dynamic_tags = _read_dynamic_tags(requester_path)
+    except ElfIdentityError:
+        return [], ()
+    needed_names = _parse_needed_from_dynamic_tags(dynamic_tags)
+    requester_search_kind, requester_search_entries = (
+        _parse_search_path_kind_and_entries_from_dynamic_tags(dynamic_tags)
+    )
+    origin_dir = requester_path.parent.resolve()
+    requester_own_search_dirs: list[Path] = []
+    for entry in requester_search_entries:
+        expanded = _expand_dynamic_loader_search_path_entry(entry, origin_dir)
+        if expanded not in requester_own_search_dirs:
+            requester_own_search_dirs.append(expanded)
+    ordered_search_dirs = _ordered_dynamic_loader_search_dirs(
+        requester_search_kind,
+        requester_own_search_dirs,
+        _parse_ld_library_path_entries(ld_library_path),
+        inherited_rpath_chain,
+    )
+    child_inherited_rpath_chain = _next_inherited_rpath_chain_for_requester(
+        requester_search_kind,
+        requester_own_search_dirs,
+        inherited_rpath_chain,
+    )
+    cache = _load_ldconfig_library_cache() if ldconfig_cache is None else ldconfig_cache
+    resolved_edges: list[tuple[str, Path]] = []
+    for needed_soname in needed_names:
+        resolved_path = _resolve_dt_needed_path(
+            requester_path,
+            needed_soname,
+            ordered_search_dirs,
+            cache,
+            default_search_dirs,
+        )
+        if resolved_path is not None:
+            resolved_edges.append((needed_soname, resolved_path))
+    return resolved_edges, child_inherited_rpath_chain
+
+
+def resolve_dt_needed_dependency_graph(
+    elf_paths: list[Path] | tuple[Path, ...],
+    ld_library_path: str | None = None,
+) -> list[tuple[Path, str, Path]]:
+    """Walks the exact requester-specific DT_NEEDED dependency graph for
+    every root in `elf_paths`, preserving every (requester, needed,
+    resolved_path) edge and recursively traversing the resolved closure.
+
+    Distinct requesters that resolve the same SONAME to different real
+    files are preserved as distinct edges; a dependency reached through
+    two different live legacy-RPATH contexts is also rescanned under
+    each context, matching real loader semantics."""
+    dependency_edges: list[tuple[Path, str, Path]] = []
+    seen_edges: set[tuple[str, str, str]] = set()
+    seen_requester_contexts: set[tuple[str, tuple[str, ...]]] = set()
+    requesters = collections.deque(
+        (elf_path, ()) for elf_path in elf_paths if elf_path.is_file()
+    )
+    ldconfig_cache = _load_ldconfig_library_cache()
+    while requesters:
+        requester_path, inherited_rpath_chain = requesters.popleft()
+        try:
+            requester_real_path = requester_path.resolve(strict=True)
+        except OSError:
+            requester_real_path = requester_path
+        requester_key = (
+            str(requester_real_path),
+            tuple(str(path) for path in inherited_rpath_chain),
+        )
+        if requester_key in seen_requester_contexts:
+            continue
+        seen_requester_contexts.add(requester_key)
+        direct_edges, child_inherited_rpath_chain = _resolve_requester_needed_edges(
+            requester_path,
+            ld_library_path=ld_library_path,
+            ldconfig_cache=ldconfig_cache,
+            inherited_rpath_chain=inherited_rpath_chain,
+        )
+        for needed_soname, resolved_path in direct_edges:
+            try:
+                resolved_real_path = resolved_path.resolve(strict=True)
+            except OSError:
+                resolved_real_path = resolved_path
+            edge_key = (
+                str(requester_real_path),
+                needed_soname,
+                str(resolved_real_path),
+            )
+            if edge_key not in seen_edges:
+                dependency_edges.append((requester_path, needed_soname, resolved_path))
+                seen_edges.add(edge_key)
+            child_requester_key = (
+                str(resolved_real_path),
+                tuple(str(path) for path in child_inherited_rpath_chain),
+            )
+            if child_requester_key not in seen_requester_contexts:
+                requesters.append((resolved_path, child_inherited_rpath_chain))
+    return dependency_edges
+
+
+# Round-N+ review (HIGH, "replay derives final_rpath from candidate,
+# authenticating attacker-selected behavior"): the PRIOR version of
+# replay_strip_and_rpath_transform() read the rpath/runpath VALUE it
+# fed into its own replay `patchelf --set-rpath <value>` invocation
+# straight off of `final_path` -- the exact, still-unauthenticated
+# candidate file the whole replay exists to authenticate in the first
+# place. An attacker who controls `final_path`'s bytes therefore also
+# controls the one input that determines what the replay reproduces:
+# choosing ANY rpath string at all and writing it into a tampered
+# `final_path` made the replay dutifully reproduce that SAME
+# attacker-chosen string onto its own scratch copy of a genuine
+# reference file, which then (trivially, by construction) byte-matched
+# `final_path` again -- "matched": True for literally any payload, as
+# long as the rest of the file was otherwise a faithful strip+patchelf
+# output. Reading the value to replay from the very thing being
+# authenticated can never be decisive evidence about that same thing.
+#
+# The fix: the ONLY rpath/runpath value any correctly functioning
+# linuxdeploy(-plugin-qt) packaging run could ever legitimately need to
+# write for a file destined for a given AppDir-relative destination is
+# fully determined by that destination's OWN position in this
+# project's OWN, self-controlled AppDir layout (every bundled
+# dependency -- distro, Qt core, Qt plugin, or QML module alike -- is
+# placed at a `bundled_relative_path` this project's OWN staging code
+# already fixed BEFORE the final file was ever produced; see
+# _bundled_library_destination_path()/build_distro_provenance_
+# manifest()'s own "bundledPath" keys and _resolve_qt_sdk_reference_
+# candidate()'s three destination shapes): specifically, an
+# "$ORIGIN"-relative path from that destination's own directory back
+# to the single shared "usr/lib" directory every bundled dependency
+# ultimately needs to resolve its own further dependencies from. This
+# is a TRUSTED, pre-mutation-known value -- computed purely from a path
+# STRING this project's OWN code chose, never by inspecting any byte
+# of the untrusted candidate file itself -- exactly the "fixed
+# destination policy" review finding #4 requires.
+def _expected_rpath_for_appdir_relative_path(bundled_relative_path: str) -> str:
+    """Returns the single, trusted, pre-mutation-known "$ORIGIN"-relative
+    rpath/runpath value the file destined for `bundled_relative_path`
+    (an AppDir-relative POSIX path such as "usr/lib/libfoo.so.1",
+    "usr/bin/arkham-horror", "usr/plugins/platforms/libqxcb.so", or
+    "usr/qml/QtQuick/Controls/libqtquickcontrols2plugin.so") is the ONLY
+    one any correctly functioning linuxdeploy(-plugin-qt) packaging run
+    could legitimately need to set, so that the bundled file can still
+    resolve its own further Qt/system dependencies purely from within
+    the AppImage's own "usr/lib" directory at runtime, with no host
+    library search at all. Never raises; always returns a well-formed
+    "$ORIGIN"[/relative-path[:$ORIGIN]] string for any relative path
+    string.
+
+    This project's own real, empirically observed linuxdeploy-plugin-qt
+    output (every "Setting rpath in ELF file ..." log line across a
+    real build) shows THREE distinct destination shapes, never just
+    one:
+      - a file placed directly in "usr/lib" itself needs only
+        "$ORIGIN" (it already shares a directory with every other
+        bundled library);
+      - the "usr/bin" launcher executable needs only a single
+        "$ORIGIN/../lib"-shaped entry back to "usr/lib" (an executable
+        never needs to find OTHER executables via rpath, so no second
+        entry is ever added);
+      - every OTHER bundled destination -- every Qt plugin
+        ("usr/plugins/**") and every QML module ("usr/qml/**") alike,
+        regardless of nesting depth -- always gets a TWO-entry rpath:
+        the same "$ORIGIN/<relative-path-to-usr/lib>" entry, PLUS a
+        literal, unqualified "$ORIGIN" appended after it (so a plugin
+        can still dlopen/load sibling plugins or helper modules that
+        live in its OWN directory, e.g. a QML style plugin depending on
+        another plugin file in the same style directory). An earlier
+        version of this function only ever returned the first entry,
+        which -- while a plausible-looking single "$ORIGIN"-relative
+        path -- never matched the real linuxdeploy-plugin-qt output for
+        any plugin/QML destination, making every single real Qt
+        plugin/QML module fail replay_strip_and_rpath_transform()'s
+        replay-based authentication on every real build (the exact
+        "Qt plugin byte-mismatch" failure category this fixes)."""
+    directory = posixpath.dirname(posixpath.normpath(bundled_relative_path))
+    lib_target = "usr/lib"
+    bin_target = "usr/bin"
+    if directory in ("", ".", lib_target):
+        return "$ORIGIN"
+    relative = posixpath.relpath(lib_target, directory)
+    base = "$ORIGIN" if relative == "." else f"$ORIGIN/{relative}"
+    if directory == bin_target:
+        return base
+    return f"{base}:$ORIGIN"
+
+
+def _expected_rpath_for_bundled_path(
+    bundled_path: Path, bundled_relative_path: str | None = None
+) -> str | None:
+    """Companion to _expected_rpath_for_appdir_relative_path() for
+    callers (bind_bundled_library_to_system_provenance()) that do not
+    already carry an explicit, manifest-derived
+    `bundled_relative_path` string: derives the identical trusted
+    "usr/..."-relative destination string directly from `bundled_path`'s
+    own DIRECTORY structure -- the placement decision this project's
+    OWN staging code made, never anything read from the file's own
+    content/bytes -- by locating the last "usr" path component (this
+    project's own AppDir always nests bundled content under exactly one
+    "usr" subtree; the LAST occurrence is used so an incidental "usr"
+    earlier in an unrelated ancestor directory, e.g. "/usr/src/build/...",
+    is never mistaken for the AppDir's own).
+
+    Returns None (never raises) if `bundled_path` contains no "usr"
+    component at all -- an unrecognized/non-AppDir destination shape
+    this policy cannot authenticate a value for, which callers must
+    then treat as "no trusted expected rpath available" (a hard
+    replay failure), never a silent skip."""
+    if bundled_relative_path is not None:
+        return _expected_rpath_for_appdir_relative_path(bundled_relative_path)
+    parts = bundled_path.parts
+    usr_indices = [index for index, part in enumerate(parts) if part == "usr"]
+    if not usr_indices:
+        return None
+    relative_parts = parts[usr_indices[-1] :-1]
+    relative_directory = posixpath.join(*relative_parts) if relative_parts else ""
+    return _expected_rpath_for_appdir_relative_path(
+        posixpath.join(relative_directory, bundled_path.name)
+    )
 
 
 # readelf --dyn-syms -W's one-line-per-entry decoded dynamic symbol
@@ -2291,6 +2715,81 @@ def _dpkg_package_metadata(package: str) -> tuple[str, str] | None:
     return version, source_package
 
 
+def _parse_deb822_stanzas(text: str) -> list[dict[str, str]]:
+    """Parses the simple RFC822/Deb822 control-file shape `apt-cache
+    show` emits into one dict per stanza."""
+    stanzas: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    current_key: str | None = None
+    for line in text.splitlines():
+        if not line.strip():
+            if current:
+                stanzas.append(current)
+                current = {}
+                current_key = None
+            continue
+        if line[:1].isspace() and current_key is not None:
+            current[current_key] += "\n" + line[1:]
+            continue
+        match = _APT_CONTROL_FIELD_RE.match(line)
+        if match is None:
+            continue
+        current_key = match.group("key")
+        current[current_key] = match.group("value")
+    if current:
+        stanzas.append(current)
+    return stanzas
+
+
+@functools.lru_cache(maxsize=512)
+def _apt_cache_package_record(package: str, version: str) -> dict[str, str] | None:
+    """Best-effort metadata for the exact installed binary package build
+    `package=version` from the local APT package indexes, including the
+    `.deb` archive SHA256."""
+    apt_cache = shutil.which("apt-cache")
+    if apt_cache is None:
+        return None
+    try:
+        result = subprocess.run(
+            [apt_cache, "show", f"{package}={version}"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    matching_records: list[dict[str, str]] = []
+    for stanza in _parse_deb822_stanzas(result.stdout):
+        if stanza.get("Package") != package or stanza.get("Version") != version:
+            continue
+        architecture = stanza.get("Architecture")
+        deb_sha256 = stanza.get("SHA256")
+        if not architecture or not deb_sha256:
+            continue
+        record = {
+            "architecture": architecture,
+            "debSha256": deb_sha256.lower(),
+        }
+        source_field = stanza.get("Source")
+        if source_field:
+            record["sourcePackage"] = source_field.split(" ", 1)[0]
+        filename = stanza.get("Filename")
+        if filename:
+            record["debFilename"] = filename
+        matching_records.append(record)
+    if not matching_records:
+        return None
+    first = matching_records[0]
+    for record in matching_records[1:]:
+        if (
+            record["architecture"] != first["architecture"]
+            or record["debSha256"] != first["debSha256"]
+        ):
+            return None
+    return first
+
+
 def _dpkg_package_architecture(package: str) -> str | None:
     """Round-N+ review (HIGH, "distro provenance collapses identity ...
     arch stripped"): the dpkg-recorded Debian architecture (e.g.
@@ -2331,6 +2830,60 @@ def _dpkg_package_architecture(package: str) -> str | None:
 # host), never a legitimate variant this project's own pipeline could
 # knowingly produce.
 EXPECTED_DISTRO_PACKAGE_ARCHITECTURE: str = "amd64"
+
+_DISTRO_PACKAGE_LOCK_PATH: Path = Path(__file__).with_name("distro_package_lock.json")
+
+
+@functools.lru_cache(maxsize=1)
+def _load_distro_package_lock() -> dict[str, object]:
+    """Loads the checked-in distro package lock that pins the exact
+    binary-package version/architecture/archive digest this repository
+    accepts for governed distro inputs."""
+    try:
+        raw = json.loads(_DISTRO_PACKAGE_LOCK_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"cannot read distro package lock {_DISTRO_PACKAGE_LOCK_PATH}: {error}"
+        ) from error
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"malformed distro package lock {_DISTRO_PACKAGE_LOCK_PATH}: expected a JSON object"
+        )
+    distribution = raw.get("distribution")
+    packages = raw.get("packages")
+    if not isinstance(distribution, str) or not distribution:
+        raise ValueError(
+            f"malformed distro package lock {_DISTRO_PACKAGE_LOCK_PATH}: expected a non-empty 'distribution' string"
+        )
+    if not isinstance(packages, dict):
+        raise ValueError(
+            f"malformed distro package lock {_DISTRO_PACKAGE_LOCK_PATH}: expected a 'packages' object keyed by binary package name"
+        )
+    normalized_packages: dict[str, dict[str, str]] = {}
+    for package_name, entry in packages.items():
+        if not isinstance(package_name, str) or not package_name:
+            raise ValueError(
+                f"malformed distro package lock {_DISTRO_PACKAGE_LOCK_PATH}: package keys must be non-empty strings"
+            )
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"malformed distro package lock {_DISTRO_PACKAGE_LOCK_PATH}: package {package_name!r} must map to an object"
+            )
+        expected_keys = {"architecture", "version", "debSha256"}
+        if set(entry) != expected_keys or not all(
+            isinstance(entry.get(key), str) and str(entry[key]).strip()
+            for key in expected_keys
+        ):
+            raise ValueError(
+                f"malformed distro package lock {_DISTRO_PACKAGE_LOCK_PATH}: package "
+                f"{package_name!r} must contain exactly {sorted(expected_keys)!r}"
+            )
+        normalized_packages[package_name] = {
+            "architecture": str(entry["architecture"]),
+            "version": str(entry["version"]),
+            "debSha256": str(entry["debSha256"]).lower(),
+        }
+    return {"distribution": distribution, "packages": normalized_packages}
 
 
 # Debian/Ubuntu top-level directories that "usrmerge" replaces with a
@@ -2489,6 +3042,11 @@ def _dpkg_full_provenance_record(path: Path) -> dict[str, str] | None:
     architecture = _dpkg_package_architecture(package)
     if architecture is not None:
         record["architecture"] = architecture
+    apt_record = _apt_cache_package_record(package, version)
+    if apt_record is not None:
+        record["debSha256"] = apt_record["debSha256"]
+        if "debFilename" in apt_record:
+            record["debFilename"] = apt_record["debFilename"]
     recorded_md5 = _dpkg_recorded_file_md5(package, path)
     if recorded_md5 is None:
         record["dpkgFileIntegrity"] = "unavailable"
@@ -2510,19 +3068,19 @@ def capture_package_provenance(basename: str) -> dict[str, str] | None:
     """Round-N+ review (MEDIUM, package provenance): finds the real,
     currently-installed system copy of a library sharing `basename`
     (searched across _SYSTEM_LIBRARY_SEARCH_DIRS, symlinks resolved) and
-    returns its dpkg-derived {"package", "version", "sourcePackage"}
-    identity, or None the moment any step of that is unavailable --
-    dpkg not installed, no real system library of this basename exists
-    on the current host at all (a genuinely project-vendored/
-    self-built codec library, or simply a non-Debian development
-    machine), or the found file is not actually dpkg-owned. None is
-    never itself an error here: it is the correct, honest answer
-    whenever this specific, real-system cross-check cannot meaningfully
-    be performed in the current environment, and every caller (both the
-    CLI's provenance validation and the SBOM inventory below) treats it
-    as such -- only a REAL, resolved provenance record that disagrees
-    with COMPONENT_EXPECTED_SOURCE_PACKAGES is ever treated as a
-    failure."""
+    returns its shared dpkg/APT-derived identity ({package, version,
+    sourcePackage, architecture, debSha256, ...}), or None the moment
+    any step of that is unavailable -- dpkg not installed, no real
+    system library of this basename exists on the current host at all
+    (a genuinely project-vendored/self-built codec library, or simply a
+    non-Debian development machine), or the found file is not actually
+    dpkg-owned. None is never itself an error here: it is the correct,
+    honest answer whenever this specific, real-system cross-check
+    cannot meaningfully be performed in the current environment, and
+    every caller (both the CLI's provenance validation and the SBOM
+    inventory below) treats it as such -- only a REAL, resolved
+    provenance record that disagrees with the governed expectations is
+    ever treated as a failure."""
     for search_dir in _SYSTEM_LIBRARY_SEARCH_DIRS:
         candidate = search_dir / basename
         if not candidate.exists():
@@ -2532,6 +3090,17 @@ def capture_package_provenance(basename: str) -> dict[str, str] | None:
         if record is None:
             continue
         return record
+    return None
+
+
+def _component_for_bundled_basename(basename: str) -> str | None:
+    """The COMPONENT_PATTERNS classification for a plain bundled
+    basename, or None for allowlisted/unmapped names."""
+    if basename in ABI_ALLOWLIST:
+        return None
+    for pattern, component in COMPONENT_PATTERNS:
+        if pattern.match(basename):
+            return component
     return None
 
 
@@ -2666,7 +3235,10 @@ def bind_bundled_library_to_system_provenance(
         found_any_dpkg_owned_copy = True
         if replay_toolset is not None and bundled_path.is_file():
             receipt = replay_strip_and_rpath_transform(
-                resolved, bundled_path, replay_toolset
+                resolved,
+                bundled_path,
+                replay_toolset,
+                _expected_rpath_for_bundled_path(bundled_path),
             )
             matched = bool(receipt["matched"])
             result: dict[str, object] = {
@@ -2733,77 +3305,28 @@ def bind_bundled_library_to_system_provenance(
 # against a COMPLETELY DIFFERENT file than the one linuxdeploy's own
 # ldd-based dependency resolution actually copied bytes from.
 #
-# `resolve_ldd_dependencies()`/`capture_distro_source_provenance()`
-# below close this by capturing provenance the SAME way, at the SAME
-# real resolution mechanism (the actual dynamic loader, via `ldd`), and
-# at the SAME time linuxdeploy performs its own copy -- i.e. run BEFORE
-# packaging, directly against this project's own first-party, not-yet-
-# bundled executable/Qt plugins (see packaging/build-appimage.sh's own
-# "Capture distro provenance" step, which invokes the new
-# `capture-distro-provenance` CLI subcommand immediately after this
-# project's own build but strictly before linuxdeploy's first
-# invocation) -- never a basename re-discovered afterward under an
-# independently maintained, potentially stale/wrong directory list.
+# `resolve_dt_needed_dependency_graph()`/`capture_distro_source_provenance()`
+# below close this by capturing provenance BEFORE packaging, from the
+# SAME requester-specific DT_NEEDED/RPATH/RUNPATH/ld.so.cache/default-
+# path loader graph linuxdeploy will later reopen, directly against this
+# project's own first-party, not-yet-bundled executable/Qt plugins (see
+# packaging/build-appimage.sh's own "Capture distro provenance" step,
+# which invokes the new `capture-distro-provenance` CLI subcommand
+# immediately after this project's own build but strictly before
+# linuxdeploy's first invocation) -- never a basename re-discovered
+# afterward under an independently maintained, potentially stale/wrong
+# directory list.
 def resolve_ldd_dependencies(elf_path: Path) -> dict[str, Path]:
-    """Runs the real `ldd` against a genuine, not-yet-packaged ELF
-    executable or plugin and returns {soname: resolved_absolute_path}
-    for every dynamically resolved dependency it reports -- i.e. the
-    EXACT file the real dynamic loader (never an independently
-    reimplemented directory search) selects for `elf_path`, on this
-    exact host, at this exact moment: the identical resolution
-    linuxdeploy's own automatic bundling performs internally when
-    deciding what to copy, since both consult the same `ld.so` cache/
-    search rules. Entries `ldd` reports as "not found" (a dependency
-    this exact host cannot itself resolve at all) are omitted -- a
-    caller requiring full coverage of every expected component enforces
-    that separately, exactly as every other provenance mechanism in
-    this module already does. Returns an empty dict (never raises) if
-    `ldd` is not installed, `elf_path` cannot be inspected as a real
-    ELF at all, or a subprocess-level error occurs invoking it."""
-    if shutil.which("ldd") is None:
-        return {}
-    try:
-        result = subprocess.run(
-            ["ldd", str(elf_path)], capture_output=True, text=True
-        )
-    except OSError:
-        return {}
-    resolved: dict[str, Path] = {}
-    for line in result.stdout.splitlines():
-        match = _LDD_DEPENDENCY_LINE_RE.match(line)
-        if not match:
-            continue
-        target = match.group("target")
-        if target is None or target == "not found":
-            continue
-        # Deliberately NOT canonicalized via Path.resolve(): `target` is
-        # already the exact path the real dynamic loader itself
-        # resolved this soname to (the identical resolution linuxdeploy
-        # performs) -- further canonicalizing it here could silently
-        # substitute a DIFFERENT (if content-identical) path on a
-        # merged-/usr host where e.g. /lib is itself a directory
-        # symlink to /usr/lib, which would make this capture no longer
-        # describe the literal path the loader/linuxdeploy actually
-        # used.
-        resolved[match.group("soname")] = Path(target)
-    return resolved
-
-
-# `ldd` prints one line per dependency in one of two shapes:
-#   "\tlibfoo.so.1 => /lib/x86_64-linux-gnu/libfoo.so.1 (0x00007f...)"
-#   "\tlinux-vdso.so.1 (0x00007ffee...)"                 (no "=>" target
-#                                                          -- the kernel
-#                                                          VDSO, never a
-#                                                          real file)
-#   "\tlibbar.so => not found"
-# Only the first shape (a real "=>" resolution to an actual path) is
-# useful here; the regex's own `target` group is optional so lines
-# without one (the VDSO shape) simply fail to match `resolve_ldd_
-# dependencies()`'s own filter above, exactly like an explicit "not
-# found" target does.
-_LDD_DEPENDENCY_LINE_RE = re.compile(
-    r"^\s*(?P<soname>\S+)\s+=>\s+(?P<target>\S+|not found)(?:\s+\(0x[0-9a-fA-F]+\))?\s*$"
-)
+    """Direct dependencies of one requester, resolved via that
+    requester's own DT_NEEDED + DT_RPATH/RUNPATH/LD_LIBRARY_PATH/
+    ld.so.cache/default-path context rather than a flattened `ldd`
+    transcript. Kept as a compatibility wrapper for existing callers;
+    the authoritative recursive, edge-preserving API is
+    resolve_dt_needed_dependency_graph()."""
+    return {
+        needed_soname: resolved_path
+        for needed_soname, resolved_path in _resolve_requester_needed_edges(elf_path)[0]
+    }
 
 
 def capture_distro_source_provenance(
@@ -2838,10 +3361,11 @@ def capture_distro_source_provenance(
     step downstream can honestly check the bundled file against ALL of
     them.
 
-    An soname/path whose dpkg ownership/version cannot be determined at
+    A soname/path whose dpkg ownership/version cannot be determined at
     all (dpkg missing, the resolved path no longer exists, or the file
     genuinely is not dpkg-owned -- e.g. a project-vendored library
-    `ldd` also happens to resolve) is simply omitted from that soname's
+    the same DT_NEEDED walk also happens to resolve) is simply omitted
+    from that soname's
     candidate list, exactly the same honest, non-fatal degrade every
     other provenance mechanism in this module already uses; a caller
     that requires full coverage enforces that itself (see
@@ -3001,7 +3525,10 @@ def _replay_toolset_from_manifest(
 
 
 def replay_strip_and_rpath_transform(
-    reference_path: Path, final_path: Path, toolset: dict[str, str]
+    reference_path: Path,
+    final_path: Path,
+    toolset: dict[str, str],
+    expected_rpath: str | None,
 ) -> dict[str, object]:
     """Replays linuxdeploy's own real, empirically observed
     strip-then-patchelf transformation (see the module comment
@@ -3012,17 +3539,38 @@ def replay_strip_and_rpath_transform(
     _replay_toolset_from_manifest()), then byte-compares the replayed
     result to `final_path`.
 
+    Round-N+ review (HIGH, "replay derives final_rpath from candidate,
+    authenticating attacker-selected behavior"): `expected_rpath` MUST
+    be the single, trusted, pre-mutation-known rpath value this exact
+    bundled destination could ever legitimately carry -- see
+    _expected_rpath_for_appdir_relative_path()/_expected_rpath_for_
+    bundled_path() above, both of which derive it purely from this
+    project's OWN staging/destination-path policy, never from
+    `final_path`'s own bytes. This function itself never reads
+    `final_path`'s own observed rpath to decide what to replay; it only
+    reads it (as "finalObservedRpath", for the receipt/diagnostics) to
+    compare against `expected_rpath` as a fast, decisive precondition.
+    Passing `expected_rpath=None` (no trusted value could be derived
+    for this destination at all) is itself always
+    `content_mismatch`/`matched: False` -- a hard failure, never a
+    silent skip back to the old, untrusted candidate-derived behavior.
+
     Returns a "transformation receipt" dict recording every input to
     the replay (the toolset's own pinned identity/hashes, the
     reference's own real path/sha256, its own observed pre-existing
-    rpath, whether strip was applied, the final file's own observed
-    rpath, whether patchelf --set-rpath was applied, the final file's
-    own sha256) and its outcome (the replayed scratch file's own
-    sha256, and a "matched" boolean) -- this receipt is the complete,
-    independently-reconstructable evidence bind_bundled_library_to_
-    captured_provenance()/bind_bundled_library_to_qt_sdk_provenance()
-    below serialize unchanged into the SBOM as each binding's own
-    "transformationReceipt".
+    rpath, whether strip was applied, the trusted expected rpath this
+    replay actually used, the final file's own observed rpath, whether
+    patchelf --set-rpath was applied, the final file's own sha256) and
+    its outcome (the replayed scratch file's own sha256, and a
+    "matched" boolean) -- this receipt is the complete, independently-
+    reconstructable evidence bind_bundled_library_to_captured_
+    provenance()/bind_bundled_library_to_qt_sdk_provenance() below
+    serialize unchanged into the SBOM as each binding's own
+    "transformationReceipt". A "matched": True receipt whose bundled
+    file was never actually transformed at all also carries
+    "untouchedByPackaging": True (see the byte-identity short-circuit
+    below) so this distinct, legitimate outcome is never confused with
+    one that underwent and passed a real strip+patchelf replay.
 
     Never raises: a subprocess failure (a corrupt/incompatible tool
     binary, an unexpected non-ELF input, ...) is recorded as
@@ -3036,14 +3584,50 @@ def replay_strip_and_rpath_transform(
         "referenceRealPath": str(reference_path),
         "referenceSha256": _sha256(reference_path),
         "finalSha256": _sha256(final_path),
+        "expectedRpath": expected_rpath,
     }
+    if receipt["finalSha256"] == receipt["referenceSha256"]:
+        # Round-N+ discovery (genuine, previously-untested edge case:
+        # linuxdeploy-plugin-qt does NOT unconditionally strip+patchelf
+        # every single plugin/QML module -- a file whose ALREADY-
+        # bundled rpath (as originally built by the Qt SDK itself) is
+        # already sufficient for its AppDir destination is copied over
+        # completely untouched, byte-for-byte identical to the SDK's
+        # own reference copy, with no "Setting rpath in ELF file ..."
+        # log line at all; empirically observed for
+        # "plugins/platformthemes/libqxdgdesktopportal.so"). Bytewise
+        # identity to the SAME pinned, hash-verified Qt SDK reference
+        # this function already resolved is UNCONDITIONALLY the
+        # strongest possible proof of authenticity available -- an
+        # attacker would need to already possess the genuine SDK's own
+        # exact bytes to produce it -- so this is decided before, and
+        # entirely independently of, the expected-rpath precondition
+        # below (which only applies to a file that WAS actually
+        # transformed).
+        receipt["referenceObservedRpath"] = _observed_rpath_or_runpath(reference_path)
+        receipt["finalObservedRpath"] = _observed_rpath_or_runpath(final_path)
+        receipt["stripApplied"] = False
+        receipt["patchelfSetRpathApplied"] = False
+        receipt["matched"] = True
+        receipt["replayedSha256"] = receipt["finalSha256"]
+        receipt["untouchedByPackaging"] = True
+        return receipt
     reference_rpath = _observed_rpath_or_runpath(reference_path)
-    final_rpath = _observed_rpath_or_runpath(final_path)
+    final_observed_rpath = _observed_rpath_or_runpath(final_path)
     receipt["referenceObservedRpath"] = reference_rpath
-    receipt["finalObservedRpath"] = final_rpath
+    receipt["finalObservedRpath"] = final_observed_rpath
     skip_strip = reference_rpath is not None and reference_rpath.startswith("$")
     receipt["stripApplied"] = not skip_strip
-    receipt["patchelfSetRpathApplied"] = final_rpath is not None
+    receipt["patchelfSetRpathApplied"] = expected_rpath is not None
+    if expected_rpath is None or final_observed_rpath != expected_rpath:
+        # Either no trusted policy value exists for this destination at
+        # all, or the candidate's own observed rpath already disagrees
+        # with the ONLY value any legitimate packaging run could ever
+        # have produced for it -- decisive on its own, and (critically)
+        # decided WITHOUT ever feeding anything derived from
+        # `final_path` into the replay itself.
+        receipt["matched"] = False
+        return receipt
     try:
         with tempfile.TemporaryDirectory(prefix="assetcache-elf-replay-") as workdir:
             scratch_path = Path(workdir) / f"replay--{final_path.name}"
@@ -3055,17 +3639,16 @@ def replay_strip_and_rpath_transform(
                     check=True,
                     capture_output=True,
                 )
-            if final_rpath is not None:
-                subprocess.run(
-                    [
-                        toolset["patchelfPath"],
-                        "--set-rpath",
-                        final_rpath,
-                        str(scratch_path),
-                    ],
-                    check=True,
-                    capture_output=True,
-                )
+            subprocess.run(
+                [
+                    toolset["patchelfPath"],
+                    "--set-rpath",
+                    expected_rpath,
+                    str(scratch_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
             replayed_sha256 = _sha256(scratch_path)
     except (OSError, subprocess.CalledProcessError) as error:
         receipt["replayError"] = str(error)
@@ -3147,8 +3730,9 @@ def _capture_distro_manifest_entry(
     loader_path: Path, bundled_path: str, requester: Path, needed: str, staging_dir: Path
 ) -> dict[str, object] | None:
     """Captures one exact requester+DT_NEEDED edge's immutable distro
-    provenance record. `loader_path` is the literal path ldd reported
-    for that edge; `bundled_path` is the exact AppDir-relative
+    provenance record. `loader_path` is the literal real file path this
+    requester's DT_NEEDED resolution selected for that edge;
+    `bundled_path` is the exact AppDir-relative
     destination linuxdeploy will copy it to (`usr/lib/<basename>` in
     this project's own real packaging pipeline)."""
     staged = _capture_immutable_staged_file(loader_path, staging_dir)
@@ -3176,9 +3760,17 @@ def _capture_distro_manifest_entry(
             {"requester": str(requester), "needed": needed, "loaderPath": str(loader_path)}
         ],
     }
+    component = _component_for_bundled_basename(Path(bundled_path).name)
+    if component is not None:
+        entry["component"] = component
     architecture = _dpkg_package_architecture(package)
     if architecture is not None:
         entry["architecture"] = architecture
+    apt_record = _apt_cache_package_record(package, version)
+    if apt_record is not None:
+        entry["debSha256"] = apt_record["debSha256"]
+        if "debFilename" in apt_record:
+            entry["debFilename"] = apt_record["debFilename"]
     recorded_md5 = _dpkg_recorded_file_md5(package, source_real_path)
     if recorded_md5 is None:
         entry["dpkgFileIntegrity"] = "unavailable"
@@ -3419,7 +4011,12 @@ def bind_bundled_library_to_captured_provenance(
             ),
         }
     if replay_toolset is not None and bundled_path.is_file():
-        receipt = replay_strip_and_rpath_transform(staged_path, bundled_path, replay_toolset)
+        receipt = replay_strip_and_rpath_transform(
+            staged_path,
+            bundled_path,
+            replay_toolset,
+            _expected_rpath_for_appdir_relative_path(manifest_key),
+        )
         matched = bool(receipt["matched"])
         result: dict[str, object] = {
             "status": "matched" if matched else "content_mismatch",
@@ -3644,6 +4241,84 @@ def validate_bundled_library_package_provenance(
     name_problem = validate_component_package_provenance(component, binding)  # type: ignore[arg-type]
     if name_problem is not None:
         return name_problem
+    try:
+        distro_package_lock = _load_distro_package_lock()
+    except ValueError as error:
+        if require_provenance:
+            return str(error)
+        distro_package_lock = None
+    if distro_package_lock is not None:
+        packages = distro_package_lock["packages"]
+        assert isinstance(packages, dict)
+        package_name = binding.get("package")
+        if not isinstance(package_name, str) or not package_name:
+            if require_provenance:
+                return (
+                    f"component {component!r} matched real distro provenance, "
+                    "but no binary package name was captured to check against "
+                    "packaging/distro_package_lock.json"
+                )
+        else:
+            locked_entry = packages.get(package_name)
+            if not isinstance(locked_entry, dict):
+                if require_provenance:
+                    return (
+                        f"component {component!r}'s real binary package "
+                        f"{package_name!r} has no pinned entry in "
+                        "packaging/distro_package_lock.json -- "
+                        "--require-package-provenance demands an immutable "
+                        "checked-in package lock for every governed distro input"
+                    )
+            else:
+                actual_architecture = binding.get("architecture")
+                if not isinstance(actual_architecture, str) or not actual_architecture:
+                    if require_provenance:
+                        return (
+                            f"component {component!r}'s real binary package "
+                            f"{package_name!r} did not capture a Debian "
+                            "architecture to compare against packaging/"
+                            "distro_package_lock.json"
+                        )
+                elif actual_architecture != locked_entry["architecture"]:
+                    return (
+                        f"component {component!r}'s real binary package "
+                        f"{package_name!r} is architecture {actual_architecture!r}, "
+                        "but packaging/distro_package_lock.json pins "
+                        f"{locked_entry['architecture']!r}"
+                    )
+                actual_version = binding.get("version")
+                if not isinstance(actual_version, str) or not actual_version:
+                    if require_provenance:
+                        return (
+                            f"component {component!r}'s real binary package "
+                            f"{package_name!r} did not capture an exact package "
+                            "version to compare against packaging/"
+                            "distro_package_lock.json"
+                        )
+                elif actual_version != locked_entry["version"]:
+                    return (
+                        f"component {component!r}'s real binary package "
+                        f"{package_name!r} is version {actual_version!r}, but "
+                        "packaging/distro_package_lock.json pins "
+                        f"{locked_entry['version']!r}"
+                    )
+                actual_deb_sha256 = binding.get("debSha256")
+                if not isinstance(actual_deb_sha256, str) or not actual_deb_sha256:
+                    if require_provenance:
+                        return (
+                            f"component {component!r}'s real binary package "
+                            f"{package_name!r} did not capture an exact .deb "
+                            "archive SHA256 from the local APT package indexes, "
+                            "so packaging/distro_package_lock.json cannot prove "
+                            "the immutable package snapshot identity"
+                        )
+                elif actual_deb_sha256.lower() != locked_entry["debSha256"]:
+                    return (
+                        f"component {component!r}'s real binary package "
+                        f"{package_name!r} came from .deb SHA256 "
+                        f"{actual_deb_sha256!r}, but packaging/distro_package_lock.json "
+                        f"pins {locked_entry['debSha256']!r}"
+                    )
     # Round-N+ review (HIGH, "`startswith(expected_version_prefix)` lets
     # 1.46.50 satisfy 1.46.5; security revision drift"): EXACT equality
     # against the COMPLETE, real `dpkg-query`-reported version string --
@@ -3685,37 +4360,183 @@ _QT_SDK_LOCK_PATH: Path = Path(__file__).with_name("qt_sdk_lock.json")
 def _load_qt_sdk_lock() -> dict[str, str]:
     """Loads the checked-in Qt SDK lock file governing this repository's
     accepted Qt toolchain identity. A malformed/missing lock file is a
-    real configuration error, never silently treated as "no pin"."""
+    real configuration error, never silently treated as "no pin".
+
+    Round-N+ review (HIGH, "Qt/ICU provenance is version-only/self-
+    attested ... Updates.xml hash is disconnected from independently
+    cached install-qt SDK ... does not authenticate installed SDK
+    tree"): `updatesXmlSha256` alone only proves the upstream INSTALLER
+    METADATA hasn't drifted -- it says nothing about the actual
+    installed `lib/`, `plugins/`, `qml/` tree a cache hit (or a
+    compromised GitHub Actions cache entry) restores. `installedTreeContentSha256`
+    closes that gap: it pins the SAME aggregate digest
+    compute_qt_sdk_tree_content_digest() computes over every real,
+    non-symlink file beneath the actually-installed SDK's `lib/`,
+    `plugins/`, and `qml/` directories, keyed by installed-relative path
+    -- so a same-version but substituted/tampered/stale-cached SDK tree
+    is provably distinguishable from the genuine one this repository's
+    maintainers pinned, entirely offline (no live archive-server fetch
+    needed, unlike updatesXmlSha256's own verify_qt_sdk_lock())."""
     try:
         raw = json.loads(_QT_SDK_LOCK_PATH.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"cannot read Qt SDK lock {_QT_SDK_LOCK_PATH}: {error}") from error
-    expected_keys = {"sdkVersion", "updatesXmlUrl", "updatesXmlSha256"}
+    expected_keys = {
+        "sdkVersion",
+        "updatesXmlUrl",
+        "updatesXmlSha256",
+        "installedTreeContentSha256",
+    }
     if not isinstance(raw, dict) or set(raw) != expected_keys or not all(
         isinstance(raw[key], str) and raw[key] for key in expected_keys
     ):
         raise ValueError(
             f"malformed Qt SDK lock {_QT_SDK_LOCK_PATH}: expected exactly "
-            "{'sdkVersion','updatesXmlUrl','updatesXmlSha256'} string keys"
+            "{'sdkVersion','updatesXmlUrl','updatesXmlSha256',"
+            "'installedTreeContentSha256'} string keys"
         )
     return {
         "sdkVersion": raw["sdkVersion"],
         "updatesXmlUrl": raw["updatesXmlUrl"],
         "updatesXmlSha256": raw["updatesXmlSha256"],
+        "installedTreeContentSha256": raw["installedTreeContentSha256"],
     }
 
 
-def _qt_sdk_source_provenance() -> dict[str, str]:
+# The exact subset of an installed Qt SDK prefix (e.g. $QT_ROOT_DIR)
+# compute_qt_sdk_tree_content_digest() below binds: the three
+# directories that actually ship the compiled artifacts this module's
+# own bundled-library provenance checks (bind_bundled_library_to_qt_sdk_provenance(),
+# _resolve_qt_sdk_reference_candidate()) ever authenticate a bundled
+# file against. Headers/docs/mkspecs/translations are deliberately
+# excluded: they are never bundled into an AppImage or used as a
+# provenance reference by this module, so binding them would only make
+# the pin needlessly brittle against upstream changes this project
+# never actually depends on.
+_QT_SDK_TREE_DIGEST_SUBDIRS: tuple[str, ...] = ("lib", "plugins", "qml")
+
+
+def _qt_sdk_tree_content_files(qt_reference_dir: Path) -> list[Path]:
+    """Returns every REGULAR (non-symlink, non-directory) file beneath
+    `qt_reference_dir`'s lib/plugins/qml subdirectories, sorted by their
+    POSIX-style path relative to `qt_reference_dir` -- the exact,
+    deterministic file set compute_qt_sdk_tree_content_digest() below
+    binds.
+
+    Symlinks (Qt's own SONAME-versioned "libFoo.so -> libFoo.so.6 ->
+    libFoo.so.6.11.1" convention, and plugin-directory convenience
+    links alike) are deliberately excluded: they carry no independent
+    content of their own to authenticate -- their target file is
+    already included and hashed directly -- and including them would
+    make this digest sensitive to symlink-vs-hardlink/relative-vs-
+    absolute-target packaging differences that carry no real security
+    meaning and could vary harmlessly between two genuinely identical
+    installations."""
+    files: list[Path] = []
+    for subdir in _QT_SDK_TREE_DIGEST_SUBDIRS:
+        root = qt_reference_dir / subdir
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            files.append(path)
+    return sorted(files, key=lambda path: path.relative_to(qt_reference_dir).as_posix())
+
+
+def compute_qt_sdk_tree_content_digest(qt_reference_dir: Path) -> str:
+    """Computes a single, deterministic sha256 digest over the ENTIRE
+    real content of an installed Qt SDK prefix's lib/plugins/qml
+    directories (see _qt_sdk_tree_content_files()'s own docstring for
+    the exact file set), by hashing each file's own bytes and folding
+    every (relative_path, sha256) pair -- sorted, NUL/newline-delimited
+    so no ambiguous concatenation boundary exists between entries --
+    into one running hash.
+
+    This is the "verify the full installed tree" half of the Round-N+
+    review's Qt/ICU provenance finding: unlike updatesXmlSha256 (which
+    only proves the upstream INSTALLER's own metadata file matches),
+    this proves the ACTUALLY-INSTALLED, ACTUALLY-USED compiled tree
+    matches a maintainer-established, checked-in expectation --
+    entirely from local files already present after
+    jurplel/install-qt-action (or an equivalent aqtinstall/cache
+    restore) runs, with no further network access required at
+    verification time. A same-version SDK substituted from a
+    compromised cache, or any single altered file within it, changes
+    this digest."""
+    hasher = hashlib.sha256()
+    for path in _qt_sdk_tree_content_files(qt_reference_dir):
+        relative = path.relative_to(qt_reference_dir).as_posix()
+        hasher.update(relative.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(_sha256(path).encode("utf-8"))
+        hasher.update(b"\n")
+    return hasher.hexdigest()
+
+
+def verify_installed_qt_sdk_tree(
+    qt_reference_dir: Path, qt_sdk_lock: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Compares the ACTUALLY-installed Qt SDK tree at `qt_reference_dir`
+    against this repository's checked-in `installedTreeContentSha256`
+    pin. Intended for CI use immediately after install-qt-action (or
+    any other SDK-restoring step) runs, BEFORE any build or reference
+    use of that tree -- see .github/workflows/ci.yml's "Verify
+    installed Qt SDK tree matches pinned lock" step, added alongside
+    each job's existing pre-install "Verify pinned Qt SDK metadata
+    lock" (verify_qt_sdk_lock()) step."""
+    lock = qt_sdk_lock or _load_qt_sdk_lock()
+    actual = compute_qt_sdk_tree_content_digest(qt_reference_dir)
+    expected = lock["installedTreeContentSha256"]
+    return {
+        "sdkVersion": lock["sdkVersion"],
+        "qtReferenceDir": str(qt_reference_dir),
+        "expectedInstalledTreeContentSha256": expected,
+        "actualInstalledTreeContentSha256": actual,
+        "status": "matched" if actual == expected else "content_mismatch",
+    }
+
+
+def _qt_sdk_source_provenance(qt_reference_dir: Path | None = None) -> dict[str, object]:
     """Stable, serializable sub-object shared by every Qt/ICU provenance
     binding, recording the checked-in upstream Qt SDK identity this
-    repository actually governs."""
+    repository actually governs.
+
+    Round-N+ review (HIGH, "construct ONE immutable provenance-binding
+    object per artifact ... validate that same object and serialize it
+    unchanged for EVERY Qt lib/plugin/QML module/ICU lib. Missing/
+    mismatched evidence fails"): when `qt_reference_dir` is supplied
+    (every real production call site -- compute_qt_sdk_bindings() --
+    always has one available, since it is the same directory every
+    individual binding's own reference-file lookup already requires),
+    this object ALSO carries `installedTreeVerificationStatus` (and,
+    when computable, the actual digest observed) -- proving the WHOLE
+    installed tree this artifact was drawn from, not merely this one
+    file's own bytes, was authenticated. Every Qt/ICU-bound artifact
+    this run produces shares this exact same sub-object (computed
+    ONCE by compute_qt_sdk_bindings(), never per-file), so a tampered
+    tree fails EVERY artifact's binding uniformly -- see
+    validate_bundled_library_qt_sdk_provenance()'s own hard-failure
+    check on `installedTreeVerificationStatus == "content_mismatch"`,
+    which fires regardless of whether that one individual file's own
+    digest/replay comparison happened to still match."""
     lock = _load_qt_sdk_lock()
-    return {
+    provenance: dict[str, object] = {
         "sdkVersion": lock["sdkVersion"],
         "updatesXmlUrl": lock["updatesXmlUrl"],
         "updatesXmlSha256": lock["updatesXmlSha256"],
+        "installedTreeContentSha256": lock["installedTreeContentSha256"],
         "verification": "sha256(Updates.xml) pinned in packaging/qt_sdk_lock.json",
     }
+    if qt_reference_dir is None:
+        provenance["installedTreeVerificationStatus"] = "qt_reference_dir_unavailable"
+        return provenance
+    tree_result = verify_installed_qt_sdk_tree(qt_reference_dir, lock)
+    provenance["installedTreeVerificationStatus"] = tree_result["status"]
+    provenance["actualInstalledTreeContentSha256"] = tree_result[
+        "actualInstalledTreeContentSha256"
+    ]
+    return provenance
 
 
 # Kept as a small convenience alias for existing callers/tests and for
@@ -3814,7 +4635,20 @@ def bind_bundled_library_to_qt_sdk_provenance(
     "evidenceStrength" ("replay_byte_identical"/"replay_mismatch").
     Omitting `replay_toolset` preserves the prior heuristic-only
     behavior, marked "evidenceStrength": "canonical_digest_heuristic"."""
-    sdk_source_provenance = sdk_source_provenance or _qt_sdk_source_provenance()
+    # Round-N+ review (HIGH, "Qt/ICU provenance ... verify full
+    # installed tree ... before any build/reference use"): threads THIS
+    # call's own `qt_reference_dir` into the default -- never
+    # `_qt_sdk_source_provenance()`'s own no-argument default -- so any
+    # caller of this function (direct or via compute_qt_sdk_bindings())
+    # that does not explicitly precompute/share `sdk_source_provenance`
+    # itself still gets a real installed-tree verification against the
+    # SAME reference directory this binding's own file lookup already
+    # uses, rather than silently defaulting to
+    # "qt_reference_dir_unavailable" (which would make an entirely
+    # fabricated `qt_reference_dir` pass as readily as a genuine one).
+    sdk_source_provenance = sdk_source_provenance or _qt_sdk_source_provenance(
+        qt_reference_dir
+    )
     allowed_transform = (
         "patchelf RUNPATH/RPATH rewrite only (see _canonical_load_digest()"
         " for the exact set of fields this tolerates)"
@@ -3863,7 +4697,12 @@ def bind_bundled_library_to_qt_sdk_provenance(
         matched = True
         result["evidenceStrength"] = "canonical_digest_heuristic"
     elif replay_toolset is not None:
-        receipt = replay_strip_and_rpath_transform(candidate, bundled_path, replay_toolset)
+        receipt = replay_strip_and_rpath_transform(
+            candidate,
+            bundled_path,
+            replay_toolset,
+            _expected_rpath_for_bundled_path(bundled_path),
+        )
         matched = bool(receipt["matched"])
         result["transformationReceipt"] = receipt
         result["evidenceStrength"] = (
@@ -3890,7 +4729,10 @@ def bind_bundled_library_to_qt_sdk_provenance(
 
 
 def validate_bundled_library_qt_sdk_provenance(
-    component: str, binding: dict[str, object], require_provenance: bool = False
+    component: str,
+    binding: dict[str, object],
+    require_provenance: bool = False,
+    qt_reference_dir: Path | None = None,
 ) -> str | None:
     """Companion to validate_bundled_library_package_provenance() for
     components authenticated via
@@ -3956,8 +4798,43 @@ def validate_bundled_library_qt_sdk_provenance(
             "file cannot be proven to actually be that SDK's own build "
             "output at all"
         )
-    expected_sdk_source_provenance = _qt_sdk_source_provenance()
     actual_sdk_source_provenance = binding.get("sdkSourceProvenance")
+    installed_tree_status = (actual_sdk_source_provenance or {}).get(
+        "installedTreeVerificationStatus"
+    )
+    # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/self-
+    # attested ... verify full installed tree ... before any build/
+    # reference use"): this fires REGARDLESS of this one file's own
+    # "matched" status above -- an unauthenticated/tampered/substituted
+    # installed SDK tree makes every individual file's own digest/
+    # replay comparison meaningless, since that comparison only proves
+    # "this file matches SOME reference tree", never "the reference
+    # tree itself is the genuine, pinned one". A single content-
+    # mismatched tree therefore fails EVERY Qt/ICU-bound artifact drawn
+    # from it uniformly, never merely the files that happen to also
+    # differ individually.
+    if installed_tree_status == "content_mismatch":
+        return (
+            f"component {component!r}'s Qt SDK provenance binding reports "
+            "installedTreeVerificationStatus == 'content_mismatch' -- the "
+            "REAL installed Qt SDK tree this file was drawn from does not "
+            "match this repository's checked-in installedTreeContentSha256 "
+            "pin in packaging/qt_sdk_lock.json, so this file's own "
+            "individual digest/replay match (if any) proves nothing: a "
+            "same-version but substituted/tampered/stale-cached SDK tree "
+            "cannot be trusted merely because one file within it still "
+            "happens to match"
+        )
+    # Note: a "qt_reference_dir_unavailable" installedTreeVerificationStatus
+    # can never actually reach this point in a real production binding:
+    # bind_bundled_library_to_qt_sdk_provenance() only ever produces
+    # "matched" (the sole status remaining once the three early-return
+    # branches above have all been ruled out) when it was itself called
+    # with a real, non-None qt_reference_dir -- and compute_qt_sdk_bindings()
+    # always derives `sdk_source_provenance` from that SAME qt_reference_dir
+    # (see its own docstring), so "matched" and "qt_reference_dir_unavailable"
+    # can never coexist on a genuinely produced binding.
+    expected_sdk_source_provenance = _qt_sdk_source_provenance(qt_reference_dir)
     if actual_sdk_source_provenance is None:
         if require_provenance:
             return (
@@ -4063,7 +4940,7 @@ def compute_qt_sdk_bindings(
     validation OR the SBOM differently, since both already read from
     the same already-computed dict)."""
     bindings: dict[Path, dict[str, object]] = {}
-    sdk_source_provenance = _qt_sdk_source_provenance()
+    sdk_source_provenance = _qt_sdk_source_provenance(qt_reference_dir)
     for component, paths in by_component.items():
         if component not in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
             continue
@@ -4585,10 +5462,39 @@ def build_sbom_inventory(
         }
         entry.update(elf_identity(path))
         if distro_provenance_manifest is not None:
+            # This segment's own real end-to-end AppImage build (never
+            # previously run to completion against a real produced
+            # manifest) discovered a genuine key-shape mismatch here:
+            # `relative_path` is `path` relative to `lib_dir` (the
+            # `usr/` directory classify() is invoked against -- see
+            # build-appimage.sh's own `bundled_search_root="$app_dir/
+            # usr"`), so it is missing the leading "usr/" segment (e.g.
+            # "lib/libz.so.1"), while every manifest key
+            # build_distro_provenance_manifest() ever writes is an
+            # AppDir-ROOT-relative destination produced by
+            # _bundled_library_destination_path() (e.g.
+            # "usr/lib/libz.so.1" -- always a flat "usr/lib/<basename>"
+            # shape, which is correct for every entry a distro
+            # provenance manifest can ever contain: only real
+            # transitive SYSTEM/distro dependencies are captured this
+            # way, and linuxdeploy's own automatic bundling always
+            # places those flat in "usr/lib/", never inside "usr/
+            # plugins/"/"usr/qml/" -- Qt's own plugins/QML modules are
+            # authenticated via qtSdkProvenance instead, never via this
+            # manifest at all). Passing the mismatched `relative_path`
+            # made EVERY real distro-manifest lookup silently miss,
+            # degrading `--require-package-provenance` into an
+            # unconditional hard failure for every single distro
+            # component on any real build. Passing None here lets
+            # bind_bundled_library_to_captured_provenance() fall back to
+            # computing the SAME `_bundled_library_destination_path(
+            # bundled_path.name)` key the manifest itself was built
+            # with, restoring an exact, guaranteed-consistent-by-
+            # construction match.
             entry["packageProvenance"] = bind_bundled_library_to_captured_provenance(
                 path,
                 distro_provenance_manifest,
-                relative_path,
+                None,
                 replay_toolset=distro_replay_toolset,
             )
         else:
@@ -4609,19 +5515,15 @@ def build_sbom_inventory(
 
 def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
     """Handler for the `capture-distro-provenance` CLI subcommand: runs
-    resolve_ldd_dependencies() against every ELF path in args.elf_paths
-    (this project's own pre-packaging, first-party executable and/or Qt
-    plugins), collects EVERY distinct real resolved path any requester
-    reports for a given soname (Round-N+ review, HIGH, "distro
-    provenance collapses identity ... keyed SONAME/basename overwrites
-    different requester resolutions": two different first-party
-    requesters CAN legitimately resolve the same soname to two
-    DIFFERENT real files -- a private/conflicting RPATH, or a force-
-    bundled explicit input whose own real identity differs from what an
-    unrelated requester's dependency resolution reports -- so this no
-    longer collapses to a single "winner" the way a plain dict merge
-    would), captures full provenance for every distinct candidate via
-    capture_distro_source_provenance(), and writes the result as JSON to
+    resolve_dt_needed_dependency_graph() against every ELF path in
+    args.elf_paths (this project's own pre-packaging, first-party
+    executable and/or Qt plugins), preserving EVERY exact
+    (requester_path, needed_soname, resolved_loader_path) edge the real
+    loader walk discovers rather than flattening those into one
+    `ldd`-style transitive dict that discards which requester actually
+    required which dependency. build_distro_provenance_manifest() then
+    captures immutable staged provenance for every distinct bundled
+    destination implied by those edges and writes the result as JSON to
     args.output -- the manifest later consumed by `classify
     --distro-provenance-manifest`.
 
@@ -4669,9 +5571,6 @@ def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
     for elf_path in args.elf_paths:
         if not elf_path.is_file():
             missing_inputs.append(elf_path)
-            continue
-        for soname, resolved_path in resolve_ldd_dependencies(elf_path).items():
-            dependency_edges.append((elf_path, soname, resolved_path))
     if missing_inputs:
         print(
             "audit_codec_notices: capture-distro-provenance input(s) not "
@@ -4679,20 +5578,21 @@ def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    dependency_edges.extend(resolve_dt_needed_dependency_graph(tuple(args.elf_paths)))
     if not dependency_edges:
         print(
             "audit_codec_notices: capture-distro-provenance resolved zero "
-            "dependencies across all given ELF path(s) -- is `ldd` "
-            "installed, and are the given paths real, dynamically linked "
-            "ELF files?",
+            "dependencies across all given ELF path(s) -- are `readelf` "
+            "and `ldconfig` available, and are the given paths real, "
+            "dynamically linked ELF files?",
             file=sys.stderr,
         )
         return 1
     # Applied AFTER (and deliberately not counted towards) the "resolved
-    # zero dependencies" `ldd`-sanity check above -- that check exists to
-    # catch a broken/missing `ldd` or non-dynamic inputs, which self-
-    # entries (always present for any real, existing elf_path) would
-    # otherwise permanently mask.
+    # zero dependencies" DT_NEEDED-walk sanity check above -- that
+    # check exists to catch broken/missing readelf/ldconfig plumbing or
+    # non-dynamic inputs, which self-entries (always present for any
+    # real, existing elf_path) would otherwise permanently mask.
     for elf_path in args.elf_paths:
         dependency_edges.append((elf_path, elf_path.name, elf_path))
     staging_dir = getattr(args, "staging_dir", None) or (
@@ -4976,13 +5876,31 @@ def cmd_classify(args: argparse.Namespace) -> int:
             if component in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
                 qt_sdk_binding = qt_sdk_bindings[path]
                 problem = validate_bundled_library_qt_sdk_provenance(
-                    component, qt_sdk_binding, require_package_provenance
+                    component,
+                    qt_sdk_binding,
+                    require_package_provenance,
+                    qt_reference_dir,
                 )
             elif distro_provenance_manifest is not None:
+                # Same real key-shape bug this segment's own real
+                # end-to-end build discovered and fixed in
+                # build_sbom_inventory() above (see that call site's
+                # own comment for the full root-cause explanation):
+                # `path.relative_to(lib_dir)` is missing the leading
+                # "usr/" segment every real manifest key actually has,
+                # since `lib_dir` here (cmd_classify()'s own
+                # positional argument, "$app_dir/usr" in real
+                # build-appimage.sh/CI usage) is the "usr/" directory
+                # itself. This second, independent call site was not
+                # covered by that earlier fix at all -- passing None
+                # lets bind_bundled_library_to_captured_provenance()
+                # fall back to the same correct
+                # _bundled_library_destination_path(bundled_path.name)
+                # key the manifest itself was always built with.
                 binding = bind_bundled_library_to_captured_provenance(
                     path,
                     distro_provenance_manifest,
-                    str(path.relative_to(lib_dir)),
+                    None,
                     replay_toolset=distro_replay_toolset,
                 )
                 problem = validate_bundled_library_package_provenance(
@@ -5127,6 +6045,48 @@ def cmd_verify_qt_sdk_lock(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_qt_sdk_installed_tree(args: argparse.Namespace) -> int:
+    """Round-N+ review (HIGH, "Qt/ICU provenance ... does not
+    authenticate installed SDK tree ... same-version substituted cache
+    must fail"): unlike cmd_verify_qt_sdk_lock() above (which only
+    fetches and checksums upstream Updates.xml BEFORE install-qt-action
+    runs), this verifies the ACTUALLY-restored `--qt-reference-dir` tree
+    itself -- exactly what a same-version-but-substituted/tampered
+    GitHub Actions cache entry would still leave unauthenticated -- via
+    verify_installed_qt_sdk_tree()/compute_qt_sdk_tree_content_digest().
+    Intended to run immediately after install-qt-action (or any other
+    SDK-restoring step), BEFORE any build or reference use of that
+    tree; see .github/workflows/ci.yml's "Verify installed Qt SDK tree
+    matches pinned lock" step in every job."""
+    try:
+        result = verify_installed_qt_sdk_tree(args.qt_reference_dir)
+    except Exception as error:
+        print(
+            f"audit_codec_notices: failed to verify installed Qt SDK tree: {error}",
+            file=sys.stderr,
+        )
+        return 1
+    if result["status"] != "matched":
+        print(
+            "audit_codec_notices: installed Qt SDK tree at "
+            f"{result['qtReferenceDir']} does not match this repository's "
+            "checked-in installedTreeContentSha256 pin (packaging/"
+            f"qt_sdk_lock.json): expected "
+            f"{result['expectedInstalledTreeContentSha256']!r} but got "
+            f"{result['actualInstalledTreeContentSha256']!r} -- a "
+            "same-version but substituted/tampered/stale-cached SDK "
+            "tree is never accepted",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "audit_codec_notices: verified installed Qt SDK tree at "
+        f"{result['qtReferenceDir']} "
+        f"sha256={result['actualInstalledTreeContentSha256']}"
+    )
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -5204,15 +6164,17 @@ def main(argv: list[str]) -> int:
         "capture-distro-provenance",
         help=(
             "Captures real distro-package provenance (path/sha256/"
-            "package/version/sourcePackage) for every dynamically "
+            "package/version/sourcePackage/architecture/.deb-sha256) for "
+            "every dynamically "
             "resolved dependency of one or more pre-packaging, "
             "first-party ELF files (this project's own compiled "
             "executable and/or Qt plugins BEFORE linuxdeploy copies/"
-            "patches anything), using the real dynamic loader's own "
-            "resolution (via `ldd`) -- never an independent post-hoc "
-            "directory search. Must be run BEFORE packaging; see "
-            "packaging/build-appimage.sh's own \"Capture distro "
-            "provenance\" step."
+            "patches anything), using each requester's own DT_NEEDED + "
+            "DT_RPATH/RUNPATH/LD_LIBRARY_PATH/ld.so.cache/default-path "
+            "resolution -- never a flattened `ldd` transcript or an "
+            "independent post-hoc directory search. Must be run BEFORE "
+            "packaging; see packaging/build-appimage.sh's own \"Capture "
+            "distro provenance\" step."
         ),
     )
     capture_provenance_parser.add_argument(
@@ -5291,6 +6253,23 @@ def main(argv: list[str]) -> int:
         ),
     )
     verify_qt_sdk_lock_parser.set_defaults(func=cmd_verify_qt_sdk_lock)
+
+    verify_qt_sdk_installed_tree_parser = subparsers.add_parser(
+        "verify-qt-sdk-installed-tree",
+        help=(
+            "Computes a deterministic content digest over the ACTUALLY-"
+            "installed --qt-reference-dir Qt SDK tree's lib/plugins/qml "
+            "directories and compares it against packaging/qt_sdk_lock.json's "
+            "checked-in installedTreeContentSha256 pin. Unlike "
+            "verify-qt-sdk-lock (which only checksums upstream Updates.xml "
+            "BEFORE install-qt-action runs), this authenticates the tree "
+            "actually restored afterward -- including from a GitHub Actions "
+            "cache hit -- catching a same-version but substituted/tampered/"
+            "stale-cached SDK install that verify-qt-sdk-lock alone cannot."
+        ),
+    )
+    verify_qt_sdk_installed_tree_parser.add_argument("qt_reference_dir", type=Path)
+    verify_qt_sdk_installed_tree_parser.set_defaults(func=cmd_verify_qt_sdk_installed_tree)
 
     verify_parser = subparsers.add_parser("verify-notices")
     verify_parser.add_argument("lib_dir", type=Path)

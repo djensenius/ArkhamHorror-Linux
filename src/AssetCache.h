@@ -1275,6 +1275,29 @@ private:
   // hold m_mutex. A key never yet published or invalidated implicitly
   // starts at generation 0.
   [[nodiscard]] quint64 currentKeyGenerationLocked(const QString &key) const;
+  // Independent cumulative re-review (HIGH, "tryApply compares highest
+  // APPLIED, not latest issued... Gen1 404 after Gen2 issuance is
+  // accepted and can install tombstone/advance fallback"): the highest
+  // token currently OUTSTANDING (issued via issueKeyGenerationLocked()/
+  // snapshotAndIssueGeneration() but not yet released via
+  // releaseKeyGenerationLocked()) for `key`, or 0 if none is. This is
+  // DELIBERATELY distinct from "the highest token ever issued"
+  // (m_keyIssuedGeneration, a monotonic counter that never shrinks even
+  // after its token is released) -- comparing against THAT instead, as
+  // an earlier attempt at this exact fix did, reintroduces the
+  // LIVELOCK tryApplyKeyGenerationLocked()'s own comment used to warn
+  // against: a rejected, retried operation that mints a fresh token on
+  // every retry would otherwise ratchet the "ever issued" watermark up
+  // forever, with no way for that counter to ever come back down even
+  // once every real rival has long since finished. This set-based
+  // ceiling, by contrast, shrinks back down the instant a blocking
+  // token is released (regardless of whether it ever applied), so a
+  // rejected caller only ever has to wait for whatever is GENUINELY
+  // still in flight for `key` right now, never for a phantom ceiling
+  // inflated by its own past retries. Callers must already hold
+  // m_mutex.
+  [[nodiscard]] quint64
+  highestOutstandingGenerationLocked(const QString &key) const;
   // The single CAS gate every one of store()/touchAfterNotModified()/
   // promoteToMemory()/updateMemoryDecodedImage()'s actual mutations goes
   // through: kUnconditionalGeneration always succeeds (and, matching its
@@ -1283,11 +1306,19 @@ private:
   // entirely, not merely providing a bypass value that would otherwise
   // corrupt real participants' own bookkeeping); any other value
   // succeeds -- applying it as `key`'s new watermark and returning true
-  // -- iff it is not strictly less than `key`'s CURRENT watermark
-  // (i.e. no invalidate() or newer-issued, already-applied publish has
-  // moved past it yet); otherwise returns false, and the caller must
-  // apply NONE of its intended mutation. Callers must already hold
-  // m_mutex.
+  // -- iff it is STRICTLY neither less than `key`'s CURRENT applied
+  // watermark (i.e. no invalidate() or newer-issued, already-applied
+  // publish has moved past it yet) NOR less than the highest token
+  // CURRENTLY OUTSTANDING for `key` other than itself (see
+  // highestOutstandingGenerationLocked()'s own comment: a strictly
+  // newer, still-unresolved sibling operation for this exact key must
+  // never have its eventual right to publish preempted by an older
+  // one that merely happens to finish first) -- otherwise returns
+  // false, and the caller must apply NONE of its intended mutation, and
+  // must treat this exact result as "some other operation for this key
+  // is more authoritative than mine; resnapshot and defer to it,
+  // never deliver my own now-superseded result." Callers must already
+  // hold m_mutex.
   [[nodiscard]] bool tryApplyKeyGenerationLocked(const QString &key,
                                                  quint64 issuedGeneration);
   // Cumulative review (independent re-review, HIGH, "shared root

@@ -661,6 +661,78 @@ private slots:
   // set instead.
   void
   outstandingTokenKeepsCasWatermarkAliveAcrossAggressivePruningUntilReleased();
+  // Independent cumulative re-review (HIGH, repeat finding, "tryApply
+  // compares highest APPLIED, not latest issued... Gen1 404 after Gen2
+  // issuance is accepted and can install tombstone/advance fallback"):
+  // an older token's store() must be rejected -- never wrongly
+  // succeed -- while a strictly newer token for the same key is still
+  // OUTSTANDING (issued, not yet applied, not yet released), even
+  // though the applied watermark itself has not moved at all (still
+  // its 0 default). This exact scenario passed against the pre-fix
+  // code (which compared ONLY against the applied watermark) and must
+  // fail once tryApplyKeyGenerationLocked() also consults the
+  // outstanding-token ceiling.
+  void
+  oldTokenStoreCannotApplyWhileANewerTokenForTheSameKeyIsStillOutstanding();
+  // Independent cumulative re-review (HIGH, repeat finding, exact
+  // scenario named by the review, "Gen1 404 after Gen2 issuance is
+  // accepted and can install tombstone/advance fallback"): a
+  // NEGATIVE-404 tombstone attempt using an older, still-unresolved
+  // token must never become authoritative while a strictly newer
+  // token for the same key is still outstanding -- a subsequent
+  // authoritativeness check must observe no tombstone at all, proving
+  // no fallback-advancing decision could have been made from it.
+  void
+  oldTokenNegative404CannotBecomeAuthoritativeWhileANewerTokenIsStillOutstanding();
+  // Independent cumulative re-review (HIGH, repeat finding, "Cover
+  // old-404-first, both completion orders, third request..."): drives
+  // BOTH adversarial completion orders end-to-end against one shared
+  // key using the real coordinator-facing primitives
+  // (recordNegative404()/store()), then proves a THIRD, entirely
+  // independent reader (a fresh snapshotAndIssueGeneration() call,
+  // modelling a concurrent third request arriving in the exact race
+  // window) never observes the superseded verdict in either order --
+  // only ever the genuinely newer, still-current one.
+  void
+  bothOld404FirstAndOldSuccessFirstOrdersLeaveOnlyTheNewerTokenVisibleToAThirdReader();
+  // Independent cumulative re-review (HIGH, repeat finding): proves
+  // the fix does not reintroduce the historical livelock the removed
+  // "compare against highest EVER issued" over-correction caused --
+  // once the blocking newer token is genuinely released (never
+  // applied at all, e.g. its own operation was itself cancelled), the
+  // older token's later retry must succeed normally, because the
+  // outstanding-token ceiling this fix consults is a live, shrinking
+  // set (never a monotonic, ever-growing "highest ever issued"
+  // watermark).
+  void
+  oldTokenStoreSucceedsAfterTheBlockingNewerTokenIsReleasedWithoutEverApplying();
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // does not prune... remains unbounded if no later activity"):
+  // touchAndPruneKeyGenerationMapsLocked() was previously invoked ONLY
+  // from issueKeyGenerationLocked()/advanceKeyGenerationPastAllIssuedLocked(),
+  // never from releaseKeyGenerationLocked() -- meaning if traffic for
+  // every tracked key simply STOPS forever right after each key's own
+  // final outstanding token is released, no future call could ever
+  // trigger a sweep to reclaim them. This test issues and releases
+  // (never applies) tokens for more keys than the tracked-entry cap
+  // allows, then -- with NO further issuance for ANY key at all --
+  // proves the tracked-entry count is bounded, failing against the
+  // pre-fix code (which left every entry behind forever) and passing
+  // once release() itself can also trigger the bounded sweep.
+  void
+  releasingTheLastOutstandingTokenForAKeyMakesItPrunableWithNoFurtherActivity();
+  // Independent cumulative re-review (MEDIUM, repeat finding, "remove
+  // pathname fallback when STATX_MNT_ID unavailable; fail closed"):
+  // an ordinary, otherwise perfectly owned/moded local directory must
+  // be REFUSED as a qualified mount transition once this descriptor's
+  // own STATX_MNT_ID is forced unavailable
+  // (MountIdentificationDegradationGuard), never silently degrade to the
+  // removed pathname-based mountinfo correlation. This exact fixture passed
+  // under the pre-fix fallback (a genuine local directory, on this
+  // environment's own real, trusted local filesystem) and must fail closed
+  // post-fix.
+  void
+  mountTransitionFailsClosedWhenMountIdentificationIsUnavailableEvenWithOrdinaryOwnershipAndModeOnARealLocalMount();
 
 private:
   QString m_tempDirPath;

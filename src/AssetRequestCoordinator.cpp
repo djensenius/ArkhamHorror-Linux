@@ -658,13 +658,43 @@ AssetRequestCoordinator::registerCacheHitCompletion(
   auto pendingIt = m_pendingCacheDecodes.find(decodeKey);
   if (pendingIt != m_pendingCacheDecodes.end()) {
     if (pendingIt->entry.encodedBytes == entry.encodedBytes) {
+      // Independent cumulative re-review (HIGH, repeat finding, "root
+      // authority... coalesced observers do not issue"): this joining
+      // waiter already minted its OWN AssetCache-level token
+      // (`assetCacheGeneration`, above, at its own earlier snapshot
+      // moment) before discovering a group to join -- but every waiter
+      // in this group is about to republish the SAME already-verified-
+      // identical bytes (the encodedBytes comparison just above), never
+      // conflicting content, so holding this waiter's own token
+      // outstanding for the group's entire remaining lifetime serves no
+      // purpose other than to let two purely COOPERATIVE siblings
+      // spuriously outrank one another the instant
+      // AssetCache::tryApplyKeyGenerationLocked() also has to reject an
+      // older token whenever a genuinely DIFFERENT, still-outstanding
+      // sibling token exists for the same key (see that method's own
+      // comment) -- exactly the false-positive rejection that would
+      // otherwise split one coalesced decode back into several
+      // independent ones. Release this now-redundant token immediately
+      // and have this waiter ride on the GROUP LEADER's own token (the
+      // very first one minted for this decodeKey) instead: it already
+      // represents a claim of "no write has raced since a moment no
+      // later than this joiner's own snapshot" (the leader's snapshot
+      // necessarily preceded or coincided with this joiner's, since the
+      // leader created this group first), so it remains at least as
+      // conservative a supersession check for this joiner as its own
+      // now-discarded token would have been, while collapsing the
+      // group down to the single outstanding token
+      // highestOutstandingGenerationLocked() is meant to reason about.
+      m_cache.releaseKeyGeneration(cacheKey, assetCacheGeneration);
+      const quint64 leaderAssetCacheGeneration =
+          pendingIt->waiters.constFirst().assetCacheGeneration;
       // A leader is already registered for the identical cached bytes:
       // attach as an additional waiter. No second queued decode is
       // scheduled -- the leader's own already-queued
       // completeCoalescedCacheDecode() call delivers to every waiter,
       // including this one, once it runs.
-      pendingIt->waiters.append(
-          GroupWaiter{operationId, expectedGeneration, assetCacheGeneration});
+      pendingIt->waiters.append(GroupWaiter{operationId, expectedGeneration,
+                                            leaderAssetCacheGeneration});
       return RequestHandle{handleId};
     }
     // Defensive only: the cache's live bytes for this exact key changed

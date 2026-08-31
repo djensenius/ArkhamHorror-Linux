@@ -1,5 +1,6 @@
 {
   "sdkVersion": "6.11.1",
   "updatesXmlUrl": "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6111/qt6_6111/Updates.xml",
-  "updatesXmlSha256": "11f54104964c285164d58f791266991399538d5c3c3e28a938566b9277bae583"
+  "updatesXmlSha256": "11f54104964c285164d58f791266991399538d5c3c3e28a938566b9277bae583",
+  "installedTreeContentSha256": "68ce029027c5b0cd3ba36a721db07ae89d3c649041f32a39a76a82770966d480"
 }

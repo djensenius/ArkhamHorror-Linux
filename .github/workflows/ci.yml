@@ -57,6 +57,21 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
           cache: true
           cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
       - name: Install formatter
         run: sudo apt-get update && sudo apt-get install -y clang-format
       - run: mise run format:check
@@ -78,6 +93,21 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
           cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
       - name: Install QtKeychain, libavif and libjpeg build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev # libavif-dev/libjpeg-turbo8-dev/zlib1g-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)/find_package(ZLIB REQUIRED) need these even for the configure-only lint job.
       - run: mise run lint
@@ -99,6 +129,21 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. AVIF card art is decoded directly against libavif's own C API (see src/AssetAvifDecoder.cpp), and JPEG is decoded directly against libjpeg's own C API (see src/AssetJpegDecoder.cpp), neither through Qt's plugin registry -- Qt has no official AVIF plugin at all (upstream qtimageformats does not include one) -- so the codec-support tests exercise the real libavif/libjpeg-backed decode paths unconditionally rather than branching on QImageReader::supportedImageFormats().
           cache: true
           cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
       - name: Install QtKeychain, D-Bus, libavif, libjpeg and clang-format build dependencies
         run: |
           sudo apt-get update
@@ -170,6 +215,21 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
           cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
       - name: Install QtKeychain and libavif build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - run: mise run build
@@ -191,6 +251,21 @@ jobs:
           modules: qtwebsockets
           cache: true
           cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
       - name: Install QtKeychain, libavif, libjpeg and zlib build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - name: Configure with ARKHAM_ENABLE_UBSAN in an optimized build
@@ -244,6 +319,21 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; AVIF is decoded directly against a bundled libavif (see src/AssetAvifDecoder.cpp) rather than through any Qt image-format plugin, so no Qt AVIF module is needed here either.
           cache: true
           cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
       - name: Install QtKeychain and libavif build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - name: Test libsecret discovery fallback logic

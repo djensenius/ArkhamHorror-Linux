@@ -1704,10 +1704,12 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
     matchedFstype = afterDash.at(0);
     trusted = trustedLocalMountFilesystemTypes().contains(matchedFstype);
     // Mount ids are unique at any given moment -- exactly one line can
-    // ever match, so this loop could break here; kept scanning to the
-    // end anyway (mirrors mountPointHasTrustedLocalFilesystemTypeByPath()'s
-    // own "last matching line is authoritative" style) is unnecessary
-    // for a unique key, but harmless.
+    // ever match, so breaking here is safe (there is no "last matching
+    // line wins" ambiguity possible for a genuinely unique key, unlike
+    // a mount-point path string, which a stacked mount could make
+    // ambiguous -- exactly why this numeric correlation is used
+    // instead of any path-based fallback at all; see
+    // mountTransitionIsIndependentlyPolicyQualified()'s own comment).
     break;
   }
   if (!found) {
@@ -1721,116 +1723,6 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
                << "has filesystem type" << matchedFstype
                << "which is not in the trusted-local allowlist (diagnostic "
                   "only -- see mountIdHasTrustedLocalFilesystemType())";
-  }
-  return found && trusted;
-}
-
-// True iff /proc/self/mountinfo records `canonicalMountPoint` (which
-// MUST already be an absolute, kernel-canonicalized path -- see this
-// function's own call site, which derives it from
-// /proc/self/fd/<already-open-directory-fd> via readlink(), never from
-// any caller-supplied or re-resolved path string) as an ACTUAL mount
-// point whose filesystem type is in the trusted-local allowlist above.
-// mountinfo's documented format is
-// "id parentId major:minor root mountPoint options [tags] - fstype
-// source superOptions"; when the SAME mount point appears more than
-// once (a later mount stacked directly on top of an earlier one at the
-// identical path -- ordinary, valid mount-table behaviour), the LAST
-// matching line is authoritative, matching the kernel's own current
-// view exactly. FALLBACK ONLY: used exclusively when this descriptor's
-// own STATX_MNT_ID is unavailable (older kernel/glibc, or a non-Linux
-// platform) -- see mountIdHasTrustedLocalFilesystemType()'s own comment
-// for why the numeric mount-id correlation is strictly preferred
-// whenever it is available at all.
-bool mountPointHasTrustedLocalFilesystemTypeByPath(
-    const QString &canonicalMountPoint) {
-  if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
-          std::memory_order_acquire)) {
-    return g_forceMountTransitionPolicyOverrideValueForTesting.load(
-        std::memory_order_acquire);
-  }
-  const std::optional<QByteArray> mountinfoContent =
-      readEntireProcFileRaw("/proc/self/mountinfo");
-  if (!mountinfoContent.has_value()) {
-    qWarning() << "AssetCache: could not read /proc/self/mountinfo to "
-                  "authenticate mount point"
-               << canonicalMountPoint;
-    return false;
-  }
-  bool found = false;
-  bool trusted = false;
-  QString matchedFstype;
-  QStringList nearMissCandidates;
-  QStringList mostRecentMountPoints;
-  const QString leafComponent =
-      canonicalMountPoint.section(QLatin1Char('/'), -1);
-  const QList<QByteArray> rawLines = mountinfoContent->split('\n');
-  for (const QByteArray &rawLine : rawLines) {
-    if (rawLine.isEmpty()) {
-      continue;
-    }
-    const QString line = QString::fromUtf8(rawLine);
-    const int dashIndex = line.indexOf(QStringLiteral(" - "));
-    if (dashIndex < 0) {
-      continue;
-    }
-    const QStringList beforeDash =
-        line.left(dashIndex).split(QLatin1Char(' '), Qt::SkipEmptyParts);
-    // Fields, in order: 0 mount-id, 1 parent-id, 2 major:minor, 3 root,
-    // 4 mount point, then options/optional tags -- only field 4 is
-    // needed here.
-    if (beforeDash.size() < 5) {
-      continue;
-    }
-    // Diagnostic only (does not affect the actual verdict): mountinfo
-    // lines are emitted in mount-table order, which places the most
-    // recently created mounts last -- since the mount this policy check
-    // is trying to authenticate was (per the caller) JUST created, it
-    // should be among the LAST few lines if it is present under ANY
-    // path at all. Bracketed for exact whitespace/escaping visibility.
-    if (mostRecentMountPoints.size() >= 6) {
-      mostRecentMountPoints.removeFirst();
-    }
-    mostRecentMountPoints << QStringLiteral("[%1]").arg(beforeDash.at(4));
-    if (beforeDash.at(4) != canonicalMountPoint) {
-      // Diagnostic only (does not affect the actual verdict): a line
-      // whose mount-point field merely ENDS with this path's own final
-      // component, captured verbatim (bracketed, so any escaping/
-      // whitespace/prefix discrepancy is directly visible) to help
-      // root-cause a real "expected an exact match but found none" case
-      // without needing another CI round-trip per hypothesis.
-      if (!leafComponent.isEmpty() &&
-          beforeDash.at(4).endsWith(leafComponent) &&
-          nearMissCandidates.size() < 4) {
-        nearMissCandidates << beforeDash.at(4);
-      }
-      continue;
-    }
-    const QStringList afterDash =
-        line.mid(dashIndex + 3).split(QLatin1Char(' '), Qt::SkipEmptyParts);
-    if (afterDash.isEmpty()) {
-      continue;
-    }
-    found = true;
-    matchedFstype = afterDash.at(0);
-    trusted = trustedLocalMountFilesystemTypes().contains(matchedFstype);
-  }
-  if (!found) {
-    qWarning() << "AssetCache: no /proc/self/mountinfo entry's mount-point "
-                  "field exactly matched"
-               << QStringLiteral("[%1]").arg(canonicalMountPoint)
-               << "-- near-miss candidates ending in the same final component:"
-               << nearMissCandidates
-               << "-- most recent mountinfo entries overall:"
-               << mostRecentMountPoints
-               << "(diagnostic only -- see "
-                  "mountPointHasTrustedLocalFilesystemTypeByPath())";
-  } else if (!trusted) {
-    qWarning()
-        << "AssetCache: /proc/self/mountinfo reports mount point"
-        << canonicalMountPoint << "has filesystem type" << matchedFstype
-        << "which is not in the trusted-local allowlist (diagnostic "
-           "only -- see mountPointHasTrustedLocalFilesystemTypeByPath())";
   }
   return found && trusted;
 }
@@ -1891,25 +1783,35 @@ bool mountTransitionIsIndependentlyPolicyQualified(
     return mountIdHasTrustedLocalFilesystemType(identity.mountId,
                                                 identity.device);
   }
-  // FALLBACK ONLY: this descriptor's own STATX_MNT_ID is unavailable
-  // (older kernel/glibc) -- degrade to the strictly weaker, pre-
-  // existing path-string correlation rather than refusing every
-  // transition outright.
-  char procFdPath[64];
-  std::snprintf(procFdPath, sizeof(procFdPath), "/proc/self/fd/%d", fd);
-  char resolved[PATH_MAX];
-  const ssize_t resolvedLen =
-      ::readlink(procFdPath, resolved, sizeof(resolved) - 1);
-  if (resolvedLen <= 0) {
-    qWarning() << "AssetCache: mount transition destination's canonical "
-                  "path could not be resolved via"
-               << procFdPath << "(errno" << errno
-               << QString::fromLocal8Bit(strerror(errno)) << ")";
-    return false;
-  }
-  resolved[resolvedLen] = '\0';
-  const QString canonicalMountPoint = QString::fromLocal8Bit(resolved);
-  return mountPointHasTrustedLocalFilesystemTypeByPath(canonicalMountPoint);
+  // Independent cumulative re-review (repeat finding, MEDIUM/HIGH
+  // across several rounds, "remove pathname fallback when
+  // STATX_MNT_ID unavailable; fail closed"): this descriptor's own
+  // STATX_MNT_ID is unavailable (older kernel/glibc lacking
+  // statx(2)'s STATX_MNT_ID support, or the syscall otherwise
+  // failing) -- FAIL CLOSED here rather than degrading to a
+  // pathname-based correlation (re-resolving this fd's path via
+  // /proc/self/fd and re-searching /proc/self/mountinfo by STRING,
+  // the now-removed mountPointHasTrustedLocalFilesystemTypeByPath()).
+  // That fallback was itself the defect: unlike the numeric mount-id
+  // correlation above (which binds THIS EXACT descriptor, opened
+  // moments ago with O_NOFOLLOW, to THIS EXACT mount instance the
+  // kernel actually resolved it against), a re-resolved path string
+  // can be raced by an attacker-controlled mount/rename/symlink swap
+  // performed between this descriptor's own open() and the fallback's
+  // later readlink()/mountinfo re-scan, and offers no protection at
+  // all against two distinct mounts that happen to share the same
+  // path (a later mount stacked directly on top of an earlier one,
+  // which mountinfo itself always resolves by last-line-wins, not by
+  // descriptor identity). A production build's kernel/glibc pairing
+  // that lacks STATX_MNT_ID entirely gets NO independent mount-origin
+  // evidence for this transition at all under either scheme; refusing
+  // outright is the only choice that cannot be spoofed by exactly the
+  // race this policy exists to prevent.
+  qWarning() << "AssetCache: mount transition destination has no "
+                "STATX_MNT_ID available (older kernel/glibc) -- failing "
+                "closed rather than degrading to a spoofable "
+                "pathname-based mount correlation";
+  return false;
 #else
   if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
           std::memory_order_acquire)) {
@@ -3262,6 +3164,24 @@ void AssetCache::releaseKeyGenerationLocked(const QString &key,
   if (it->isEmpty()) {
     m_keyOutstandingGeneration->erase(it);
   }
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // does not prune... remains unbounded if no later activity"):
+  // touchAndPruneKeyGenerationMapsLocked() was previously invoked ONLY
+  // from issueKeyGenerationLocked() and
+  // advanceKeyGenerationPastAllIssuedLocked() -- both of which require
+  // FUTURE traffic for this (or some other) key to ever run again. If
+  // traffic for every key simply STOPS forever right after the very
+  // last outstanding token for each is released (a key's token count
+  // can only ever shrink via release, never via a later issue/
+  // invalidate that never comes), the tracked maps would keep every
+  // entry forever with no future call ever eligible to sweep them.
+  // Calling it here too closes that gap: a release is exactly the
+  // event that can newly make `key` eviction-eligible (its outstanding
+  // set may have just become empty), so it must itself be able to
+  // trigger the bounded sweep, not merely rely on some hypothetical
+  // later call that this very release might have been the last ever
+  // needed for `key`.
+  touchAndPruneKeyGenerationMapsLocked(key);
 }
 
 void AssetCache::releaseKeyGeneration(const QString &key,
@@ -3413,6 +3333,19 @@ quint64 AssetCache::currentKeyGenerationLocked(const QString &key) const {
   return m_keyAppliedGeneration->value(key, 0);
 }
 
+quint64
+AssetCache::highestOutstandingGenerationLocked(const QString &key) const {
+  const auto it = m_keyOutstandingGeneration->constFind(key);
+  if (it == m_keyOutstandingGeneration->constEnd() || it->isEmpty()) {
+    return 0;
+  }
+  quint64 highest = 0;
+  for (const quint64 token : *it) {
+    highest = (std::max)(highest, token);
+  }
+  return highest;
+}
+
 bool AssetCache::tryApplyKeyGenerationLocked(const QString &key,
                                              quint64 issuedGeneration) {
   if (issuedGeneration == kUnconditionalGeneration) {
@@ -3422,53 +3355,46 @@ bool AssetCache::tryApplyKeyGenerationLocked(const QString &key,
     // participant might still legitimately need to satisfy.
     return true;
   }
-  // Independent cumulative re-review (HIGH, "root authority... compare
-  // to highest ISSUED, not applied"): a literal "reject whenever ANY
-  // strictly newer token has ever been issued, regardless of whether it
-  // has applied (or even will ever apply)" reading was implemented and
-  // then measured against production-seam tests: it reintroduces a
-  // LIVELOCK for perfectly legitimate, non-conflicting concurrency --
-  // two independent operations that both legitimately resolve to the
-  // SAME cache key (e.g. two AssetKeys differing only by locale, both
-  // falling back to the same underlying candidate URL; see
-  // AssetRequestCoordinatorTests::
-  // keysDifferingOnlyByHostileLocaleContentNeverCoalesce(), which
-  // regressed under that reading) can each keep re-minting a fresh
-  // "highest issued" token that invalidates the other's still entirely
-  // legitimate, non-superseding fetch, forever, since re-minting a token
-  // is itself a side effect of this very rejection (see
-  // dispatchCandidateFetchResult()'s/dispatchRevalidationResult()'s
-  // staleRetryNeeded handling, which resnapshots -- and thus reissues --
-  // on rejection). A token being "issued" only records that SOME
-  // operation for `key` STARTED; it makes no claim about whether that
-  // operation will ever actually decide anything, so gating on it
-  // conflates "someone else is also looking at this key" with "someone
-  // else has superseded me," which are not the same thing.
+  // Independent cumulative re-review (HIGH, repeat finding, "tryApply
+  // compares highest APPLIED, not latest issued... Gen1 404 after Gen2
+  // issuance is accepted and can install tombstone/advance fallback"):
+  // comparing ONLY against the previously-APPLIED watermark (this
+  // method's entire prior behavior, restored from an even earlier
+  // over-correction that compared against "highest EVER issued" and
+  // reintroduced a livelock -- see highestOutstandingGenerationLocked()'s
+  // own comment for exactly why that reading was wrong) is insufficient
+  // on its own: it leaves a real window, between two genuinely
+  // concurrent operations for the SAME key (e.g. a conditional
+  // revalidation of an already-cached candidate racing a fresh,
+  // unconditional fetch for that same candidate resolved via a
+  // DIFFERENT logical AssetKey -- these legitimately use different
+  // CandidateAttempt identities and so are never coalesced onto one
+  // HTTP request, see AssetRequestCoordinator::candidateAttemptKey()'s
+  // own comment), in which the OLDER token (Gen1) can still
+  // successfully publish (install a negative-404 tombstone, or store a
+  // body) simply because NEITHER token has applied yet, even though a
+  // strictly NEWER token (Gen2) is already outstanding and about to
+  // decide something more authoritative. A third reader arriving in
+  // that exact window would observe Gen1's now-superseded verdict as
+  // if it were final.
   //
-  // Comparing against the previously-APPLIED watermark instead -- this
-  // method's entire prior, and now restored, behavior -- is the
-  // textbook version-stamped optimistic-concurrency invariant: every
-  // successful apply strictly monotonically advances
-  // `m_keyAppliedGeneration[key]`, and EVERY subsequent apply attempt
-  // (regardless of arrival order) is compared against whatever that
-  // watermark holds AT THE MOMENT OF ITS OWN ATTEMPT, under this same
-  // mutex. This already gives exactly the property the review is
-  // actually chasing -- "an older, since-superseded result can never
-  // clobber something a newer operation already established" -- because
-  // any token that has already lost a race to apply first necessarily
-  // leaves a HIGHER watermark behind for every later token to be
-  // compared against; a token can only ever succeed by being
-  // numerically >= whatever has actually been durably decided so far,
-  // never merely by being un-preceded by a rival's mere issuance. The
-  // three concrete defects this review's "compare to issued" framing was
-  // actually describing -- an ungated clearNegative404() call preceding
-  // store()'s own CAS, and dispatch delivering/advancing on a result its
-  // OWN CAS had already rejected as SkippedStaleGeneration -- are fixed
-  // directly at their call sites (see store()'s and
-  // dispatch{CandidateFetchResult,RevalidationResult}()'s own comments)
-  // and do not require (and are actively undermined by) this comparison
-  // itself becoming issued-based.
-  if (issuedGeneration < currentKeyGenerationLocked(key)) {
+  // Additionally requiring `issuedGeneration` to be no less than the
+  // highest token CURRENTLY OUTSTANDING for `key` closes this window
+  // without reintroducing the livelock the ever-issued reading caused
+  // -- see highestOutstandingGenerationLocked()'s own comment for the
+  // full argument for why this ceiling, unlike "ever issued", cannot
+  // grow without bound. `issuedGeneration` itself is always still a
+  // member of the outstanding set at the moment this very call runs
+  // (releaseKeyGenerationLocked() for THIS token has not yet been
+  // called -- every caller releases exactly once, always strictly
+  // after its own store()/invalidateAndRecordNegative404()/etc. call
+  // returns), so this added condition can only ever reject on account
+  // of a DIFFERENT, strictly greater outstanding token -- never on
+  // account of itself.
+  const quint64 appliedWatermark = currentKeyGenerationLocked(key);
+  const quint64 outstandingCeiling = highestOutstandingGenerationLocked(key);
+  if (issuedGeneration < appliedWatermark ||
+      issuedGeneration < outstandingCeiling) {
     return false;
   }
   (*m_keyAppliedGeneration)[key] = issuedGeneration;
@@ -5503,8 +5429,7 @@ void AssetCache::setAuthoritativeAccountHomeDirectoryOverrideForTesting(
 void AssetCache::setMountTransitionPolicyQualificationOverrideForTesting(
     bool active, bool qualified) {
   // Value is stored BEFORE the active flag (release ordering); every
-  // reader (mountIdHasTrustedLocalFilesystemType() and
-  // mountPointHasTrustedLocalFilesystemTypeByPath() on Linux,
+  // reader (mountIdHasTrustedLocalFilesystemType() on Linux,
   // mountTransitionIsIndependentlyPolicyQualified()'s non-Linux branch
   // otherwise) checks the flag first with acquire ordering, guaranteeing
   // it observes this exact value whenever it sees the override active.

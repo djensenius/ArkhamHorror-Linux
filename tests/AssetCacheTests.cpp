@@ -5617,3 +5617,323 @@ void AssetCacheTests::
 
   QCOMPARE(cache.issueKeyGeneration(key), quint64{1});
 }
+
+void AssetCacheTests::
+    oldTokenStoreCannotApplyWhileANewerTokenForTheSameKeyIsStillOutstanding() {
+  // Independent cumulative re-review (HIGH, repeat finding, "tryApply
+  // compares highest APPLIED, not latest issued"): this exact
+  // scenario -- an older token attempting store() while a strictly
+  // newer token for the same key is still outstanding, BEFORE either
+  // has applied anything -- passed (wrongly) against the pre-fix code,
+  // since it compared `issuedGeneration` only against the applied
+  // watermark (still 0 here), never against what else was currently
+  // outstanding.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/old-outstanding-race.png")));
+
+  const quint64 olderToken = cache.issueKeyGeneration(key);
+  const quint64 newerToken = cache.issueKeyGeneration(key);
+  QVERIFY2(newerToken > olderToken,
+           "a later issuance must strictly exceed an earlier one");
+
+  // Neither token has been released or applied anything yet -- both are
+  // genuinely, currently outstanding for `key`.
+  const AssetCache::MutationOutcome outcome = cache.store(
+      key, makeEntry(QByteArrayLiteral("stale-older-bytes")), olderToken);
+  QCOMPARE(outcome, AssetCache::MutationOutcome::SkippedStaleGeneration);
+  QVERIFY2(!cache.lookupMemory(key).has_value(),
+           "the rejected older token's store() must never have published "
+           "anything at all -- not even transiently");
+
+  // The newer token, still outstanding, must remain free to publish
+  // normally afterward -- the older token's rejected attempt must never
+  // have poisoned it.
+  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("genuine-newer-bytes")),
+                       newerToken),
+           AssetCache::MutationOutcome::Applied);
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("genuine-newer-bytes"));
+
+  cache.releaseKeyGeneration(key, olderToken);
+  cache.releaseKeyGeneration(key, newerToken);
+}
+
+void AssetCacheTests::
+    oldTokenNegative404CannotBecomeAuthoritativeWhileANewerTokenIsStillOutstanding() {
+  // Independent cumulative re-review (HIGH, repeat finding, exact
+  // scenario named by the review: "Gen1 404 after Gen2 issuance is
+  // accepted and can install tombstone/advance fallback"). Unlike
+  // oldIssuedNegative404CannotClobberNewerAppliedSuccess() above (which
+  // only proves the tombstone is rejected AFTER the newer generation
+  // has already APPLIED a success), this proves the tombstone is
+  // rejected even BEFORE the newer token has done anything at all --
+  // purely because it is still outstanding. A tombstone that briefly
+  // became authoritative here could have driven a real caller's
+  // fallback-advance decision (localized -> English -> alternate
+  // front) on stale information, even though it is corrected moments
+  // later once the newer token's own real outcome is known.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/old-404-outstanding-race.png")));
+
+  const quint64 olderToken = cache.issueKeyGeneration(key);
+  const quint64 newerToken = cache.issueKeyGeneration(key);
+  QVERIFY2(newerToken > olderToken,
+           "a later issuance must strictly exceed an earlier one");
+
+  cache.recordNegative404(key, olderToken, /*nowMonotonicMs=*/1'000,
+                          /*ttlMs=*/60'000);
+  QVERIFY2(!cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/1'000),
+           "an older token's negative-404 attempt must never become "
+           "authoritative while a strictly newer token for the same key "
+           "is still outstanding, even though neither has applied "
+           "anything yet");
+  QCOMPARE(cache.negative404RecordCountForTesting(), 0);
+
+  const AssetCache::KeyGenerationSnapshot snapshot =
+      cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/1'000);
+  QVERIFY2(!snapshot.authoritativeNegative404,
+           "a third, concurrently-arriving reader must never observe the "
+           "rejected tombstone as authoritative either");
+  cache.releaseKeyGeneration(key, snapshot.issuedGeneration);
+  cache.releaseKeyGeneration(key, olderToken);
+  cache.releaseKeyGeneration(key, newerToken);
+}
+
+void AssetCacheTests::
+    bothOld404FirstAndOldSuccessFirstOrdersLeaveOnlyTheNewerTokenVisibleToAThirdReader() {
+  // Independent cumulative re-review (HIGH, repeat finding: "Cover
+  // old-404-first, both completion orders, third request..."). Two
+  // independent keys, each modelling one of the two adversarial
+  // completion orders end-to-end, with a genuine THIRD reader
+  // (snapshotAndIssueGeneration()) checked immediately after each --
+  // exactly modelling a concurrent request arriving in the exact race
+  // window this finding describes.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  // Order A: the OLDER token's 404 is attempted FIRST (while the newer
+  // token is still outstanding, having decided nothing yet), then the
+  // newer token's success applies afterward.
+  {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/order-a-404-then-200.png")));
+    const quint64 olderToken = cache.issueKeyGeneration(key);
+    const quint64 newerToken = cache.issueKeyGeneration(key);
+    QVERIFY(newerToken > olderToken);
+
+    cache.recordNegative404(key, olderToken, /*nowMonotonicMs=*/2'000,
+                            /*ttlMs=*/60'000);
+    QVERIFY(!cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/2'000));
+
+    QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("order-a-success")),
+                         newerToken),
+             AssetCache::MutationOutcome::Applied);
+
+    const AssetCache::KeyGenerationSnapshot thirdReader =
+        cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/2'000);
+    QVERIFY2(!thirdReader.authoritativeNegative404,
+             "order A: a third reader must never observe the rejected, "
+             "superseded tombstone");
+    QVERIFY2(thirdReader.hit.has_value(),
+             "order A: a third reader must observe the genuine success");
+    QCOMPARE(thirdReader.hit->encodedBytes,
+             QByteArrayLiteral("order-a-success"));
+    cache.releaseKeyGeneration(key, thirdReader.issuedGeneration);
+    cache.releaseKeyGeneration(key, olderToken);
+    cache.releaseKeyGeneration(key, newerToken);
+  }
+
+  // Order B: the OLDER token's SUCCESS is attempted first (while the
+  // newer token is still outstanding), then the newer token's own
+  // definitive 404 applies afterward.
+  {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/order-b-200-then-404.png")));
+    const quint64 olderToken = cache.issueKeyGeneration(key);
+    const quint64 newerToken = cache.issueKeyGeneration(key);
+    QVERIFY(newerToken > olderToken);
+
+    QCOMPARE(cache.store(key,
+                         makeEntry(QByteArrayLiteral("order-b-stale-success")),
+                         olderToken),
+             AssetCache::MutationOutcome::SkippedStaleGeneration);
+    QVERIFY2(!cache.lookupMemory(key).has_value(),
+             "order B: the older token's stale success must never have "
+             "published anything");
+
+    cache.recordNegative404(key, newerToken, /*nowMonotonicMs=*/2'000,
+                            /*ttlMs=*/60'000);
+    QVERIFY2(
+        cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/2'000),
+        "order B: the newer token's genuine 404 must become authoritative");
+
+    const AssetCache::KeyGenerationSnapshot thirdReader =
+        cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/2'000);
+    QVERIFY2(thirdReader.authoritativeNegative404,
+             "order B: a third reader must observe the genuine, current "
+             "absence");
+    QVERIFY(!thirdReader.hit.has_value());
+    cache.releaseKeyGeneration(key, thirdReader.issuedGeneration);
+    cache.releaseKeyGeneration(key, olderToken);
+    cache.releaseKeyGeneration(key, newerToken);
+  }
+}
+
+void AssetCacheTests::
+    oldTokenStoreSucceedsAfterTheBlockingNewerTokenIsReleasedWithoutEverApplying() {
+  // Independent cumulative re-review (HIGH, repeat finding): proves the
+  // fix does not reintroduce the historical livelock the removed
+  // "compare against highest EVER issued" over-correction caused (see
+  // highestOutstandingGenerationLocked()'s own comment in
+  // AssetCache.cpp). The outstanding-token ceiling this fix consults
+  // is a LIVE set that shrinks the instant a blocking token is
+  // released, never a monotonic "highest ever issued" watermark that
+  // can only ever grow -- so once the newer token's own operation is
+  // abandoned (e.g. cancelled) without ever applying anything, the
+  // older token's own later retry must succeed normally.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/release-then-retry.png")));
+
+  const quint64 olderToken = cache.issueKeyGeneration(key);
+  const quint64 newerToken = cache.issueKeyGeneration(key);
+  QVERIFY(newerToken > olderToken);
+
+  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("first-attempt")),
+                       olderToken),
+           AssetCache::MutationOutcome::SkippedStaleGeneration);
+  QVERIFY(!cache.lookupMemory(key).has_value());
+
+  // The newer token's own operation is abandoned entirely -- released
+  // without ever calling store()/recordNegative404()/etc.
+  cache.releaseKeyGeneration(key, newerToken);
+
+  // The older token's retry (a fresh, real caller mints a NEW token
+  // rather than reusing a rejected one in production -- see
+  // dispatchCandidateFetchResult()'s staleRetryNeeded handling -- but
+  // this test proves the underlying ceiling itself has genuinely
+  // shrunk, independent of that retry convention) must now succeed:
+  // the blocking token is gone, never merely "still counted forever".
+  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("retry-succeeds")),
+                       olderToken),
+           AssetCache::MutationOutcome::Applied);
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("retry-succeeds"));
+
+  cache.releaseKeyGeneration(key, olderToken);
+}
+
+void AssetCacheTests::
+    releasingTheLastOutstandingTokenForAKeyMakesItPrunableWithNoFurtherActivity() {
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // does not prune... remains unbounded if no later activity"). Forces
+  // eviction eligibility deterministically (zero idle threshold, see
+  // setKeyGenerationIdleEvictionThresholdMsForTesting()'s own comment)
+  // and issues tokens for MORE distinct keys than the tracked-entry cap
+  // allows, keeping every one of them genuinely outstanding (never
+  // released) throughout the whole issuance phase -- this is
+  // deliberate: touchAndPruneKeyGenerationMapsLocked() already runs
+  // once per issueKeyGenerationLocked() call even against the pre-fix
+  // code, so if any token were released before the LAST issuance, that
+  // later issuance's own sweep would immediately reclaim it, masking
+  // the exact defect this test targets (a sweep that can ONLY ever be
+  // triggered by a FUTURE issuance/invalidate for some key, never by a
+  // release). Only once every token has been issued does this test
+  // release them all -- with NO further issuance for ANY key
+  // afterward -- and then proves the tracked map is bounded purely as
+  // a consequence of release() itself. Fails against the pre-fix code
+  // (which leaves the tracked map stuck at its peak size forever, since
+  // nothing else could ever trigger another sweep); passes once
+  // release() can also trigger the bounded sweep.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  cache.setMaxTrackedKeyGenerationEntriesForTesting(4);
+  cache.setKeyGenerationIdleEvictionThresholdMsForTesting(0);
+
+  constexpr int kKeyCount = 16;
+  QVector<QString> keys;
+  QVector<quint64> tokens;
+  keys.reserve(kKeyCount);
+  tokens.reserve(kKeyCount);
+  for (int i = 0; i < kKeyCount; ++i) {
+    const QString key = AssetCache::cacheKeyFor(QUrl(
+        QStringLiteral("https://example.com/prune-on-release-%1.png").arg(i)));
+    keys.append(key);
+    // Every earlier key's own token is still genuinely outstanding at
+    // the moment each subsequent one is issued -- so none of THEIR
+    // own issuance-triggered sweeps can evict anything yet, exactly
+    // modelling every token still being genuinely in flight.
+    tokens.append(cache.issueKeyGeneration(key));
+  }
+  QVERIFY2(cache.trackedKeyGenerationEntryCountForTesting() >= kKeyCount,
+           "every one of these tokens must still be tracked while "
+           "genuinely outstanding, regardless of the cap");
+
+  for (int i = 0; i < kKeyCount; ++i) {
+    cache.releaseKeyGeneration(keys[i], tokens[i]);
+  }
+
+  // No further issueKeyGeneration()/invalidate() call for ANY key
+  // happens after this point -- the releases above are the only
+  // events left that could possibly trigger a sweep.
+  QVERIFY2(cache.trackedKeyGenerationEntryCountForTesting() <= 4,
+           "the tracked key-generation map must remain bounded purely as "
+           "a consequence of release() itself being able to trigger the "
+           "bounded sweep -- no further issuance for any key ever "
+           "occurred after the last of these releases");
+}
+
+void AssetCacheTests::
+    mountTransitionFailsClosedWhenMountIdentificationIsUnavailableEvenWithOrdinaryOwnershipAndModeOnARealLocalMount() {
+  // Independent cumulative re-review (MEDIUM, repeat finding, "remove
+  // pathname fallback when STATX_MNT_ID unavailable; fail closed").
+#if !defined(Q_OS_UNIX)
+  QSKIP("this policy is POSIX-specific; not applicable on this platform");
+#elif !defined(__linux__)
+  QSKIP("STATX_MNT_ID is a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString dirPath =
+      m_tempDirPath + QStringLiteral("/mount-id-unavailable-fail-closed");
+  QVERIFY(QDir().mkpath(dirPath));
+  // QDir::mkpath() already creates directories owned by this very
+  // process's own real uid and neither group- nor world-writable --
+  // ownership/mode are PERFECT here; only mount-id evidence is
+  // withheld, exactly like
+  // mountTransitionPolicyAcceptsOwnedNonWritableDestinationWhenFilesystemTypeQualifies()
+  // above (whose otherwise-identical fixture correctly QUALIFIES with
+  // mount-id evidence available), proving this refusal comes entirely
+  // from the missing mount-id evidence, never from ownership/mode.
+  QVERIFY(::chmod(QFile::encodeName(dirPath).constData(), S_IRWXU) == 0);
+
+  // Force this descriptor's own STATX_MNT_ID to be reported
+  // unavailable (openat2() itself remains available -- only mount-id
+  // resolution is degraded) without needing any real legacy
+  // kernel/glibc pairing.
+  MountIdentificationDegradationGuard mountIdGuard(
+      /*forceOpenat2Unavailable=*/false, /*forceMountIdUnavailable=*/true);
+
+  const std::optional<bool> verdict =
+      AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
+          dirPath, /*isFinalAccountHomeTransition=*/true);
+  QVERIFY(verdict.has_value());
+  QVERIFY2(!*verdict,
+           "a mount transition destination whose own STATX_MNT_ID is "
+           "unavailable must fail closed -- never silently degrade to a "
+           "spoofable pathname-based mountinfo correlation, even when "
+           "this is a perfectly ordinary, correctly-owned real local "
+           "directory on this environment's own genuinely trusted "
+           "filesystem");
+#endif
+}

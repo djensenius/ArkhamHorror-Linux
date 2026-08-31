@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import os
 import re
 import shutil
 import struct
@@ -1114,6 +1115,50 @@ def _compile_shared_object(cc_bin: str, source: str, output: Path) -> None:
         check=True,
         capture_output=True,
     )
+
+
+def _compile_c_binary(
+    cc_bin: str,
+    source: str,
+    output: Path,
+    *,
+    shared: bool = False,
+    soname: str | None = None,
+    library_dirs: tuple[Path, ...] = (),
+    libraries: tuple[str, ...] = (),
+    rpath_entries: tuple[str, ...] = (),
+) -> None:
+    """Small real-ELF fixture builder for dependency-graph tests."""
+    source_path = output.with_suffix(".c")
+    source_path.write_text(source)
+    command = [cc_bin]
+    if shared:
+        command.extend(["-shared", "-fPIC"])
+    command.extend(["-o", str(output), str(source_path), "-Wl,--no-as-needed"])
+    if soname is not None:
+        command.append(f"-Wl,-soname,{soname}")
+    for library_dir in library_dirs:
+        command.extend(["-L", str(library_dir)])
+    if rpath_entries:
+        command.append("-Wl,-rpath," + ":".join(rpath_entries))
+    for library in libraries:
+        command.append(f"-l{library}")
+    subprocess.run(command, check=True, capture_output=True)
+
+
+def _make_linker_name(versioned_library: Path) -> Path:
+    """Creates/returns the unversioned libfoo.so symlink the linker
+    expects for -lfoo against a versioned libfoo.so.N fixture."""
+    versioned_name = versioned_library.name
+    if ".so" not in versioned_name:
+        raise AssertionError(f"{versioned_name!r} is not a shared-object name")
+    linker_name = versioned_library.with_name(versioned_name.split(".so", 1)[0] + ".so")
+    try:
+        linker_name.unlink()
+    except FileNotFoundError:
+        pass
+    linker_name.symlink_to(versioned_library.name)
+    return linker_name
 
 
 # Deliberately its own tiny, independently-reviewable `readelf -lW`
@@ -2465,7 +2510,10 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
         }
 
         def fake_replay(
-            reference_path: Path, final_path: Path, toolset: dict[str, str]
+            reference_path: Path,
+            final_path: Path,
+            toolset: dict[str, str],
+            expected_rpath: str | None,
         ) -> dict[str, object]:
             return {
                 "toolLabel": toolset["toolLabel"],
@@ -3552,6 +3600,65 @@ class PackageProvenanceTests(unittest.TestCase):
             )
         )
 
+    def test_validate_bundled_provenance_requires_a_pinned_lock_entry_when_provenance_is_required(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={"distribution": "ubuntu-22.04", "packages": {}},
+        ):
+            problem = audit.validate_bundled_library_package_provenance(
+                "zlib",
+                {
+                    "status": "matched",
+                    "package": "zlib1g",
+                    "version": "1:1.2.11.dfsg-2ubuntu9.2",
+                    "sourcePackage": "zlib",
+                    "architecture": "amd64",
+                    "debSha256": "abc123",
+                    "evidenceStrength": "replay_byte_identical",
+                },
+                require_provenance=True,
+            )
+        self.assertIsNotNone(problem)
+        self.assertIn("distro_package_lock.json", problem)
+        self.assertIn("zlib1g", problem)
+
+    def test_validate_bundled_provenance_rejects_a_locked_deb_sha256_mismatch(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={
+                "distribution": "ubuntu-22.04",
+                "packages": {
+                    "zlib1g": {
+                        "architecture": "amd64",
+                        "version": "1:1.2.11.dfsg-2ubuntu9.2",
+                        "debSha256": "expected-lock-sha",
+                    }
+                },
+            },
+        ):
+            problem = audit.validate_bundled_library_package_provenance(
+                "zlib",
+                {
+                    "status": "matched",
+                    "package": "zlib1g",
+                    "version": "1:1.2.11.dfsg-2ubuntu9.2",
+                    "sourcePackage": "zlib",
+                    "architecture": "amd64",
+                    "debSha256": "different-live-sha",
+                    "evidenceStrength": "replay_byte_identical",
+                },
+                require_provenance=True,
+            )
+        self.assertIsNotNone(problem)
+        self.assertIn("different-live-sha", problem)
+        self.assertIn("expected-lock-sha", problem)
+
 
 class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
     """Round-N+ review (HIGH, "distro provenance post-hoc/unpinned:
@@ -3560,85 +3667,89 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
     copy source BEFORE packaging ... No basename re-discovery. Apply
     every distro component. Tests must substitute a same-basename
     library and reject absent/wrong/revision-drift provenance"):
-    portable (no real dpkg/ldd needed -- resolve_ldd_dependencies()'s
-    own subprocess call and _dpkg_owning_package()/_dpkg_package_
-    metadata() are mocked directly) tests of resolve_ldd_dependencies(),
-    capture_distro_source_provenance(), bind_bundled_library_to_
-    captured_provenance(), and load_distro_provenance_manifest()."""
+    portable (no real dpkg/readelf/apt needed -- the DT_NEEDED parser,
+    ld.so-cache lookup, and dpkg/APT metadata lookups are mocked
+    directly) tests of resolve_ldd_dependencies()'s compatibility
+    wrapper, resolve_dt_needed_dependency_graph(), capture_distro_
+    source_provenance(), bind_bundled_library_to_captured_provenance(),
+    and load_distro_provenance_manifest()."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp_path = Path(self._tmp.name)
 
-    def _fake_ldd_completed_process(
-        self, stdout: str, returncode: int = 0
-    ) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(
-            args=["ldd"], returncode=returncode, stdout=stdout, stderr=""
-        )
-
-    def test_resolve_ldd_dependencies_returns_empty_when_ldd_not_installed(
+    def test_resolve_ldd_dependencies_returns_empty_when_readelf_cannot_inspect_the_requester(
         self,
     ) -> None:
         elf_path = self.tmp_path / "app"
         elf_path.write_bytes(b"\x7fELF")
-        with mock.patch.object(shutil, "which", return_value=None):
+        with mock.patch.object(
+            audit, "_read_dynamic_tags", side_effect=audit.ElfIdentityError("boom")
+        ):
             self.assertEqual(audit.resolve_ldd_dependencies(elf_path), {})
 
-    def test_resolve_ldd_dependencies_parses_real_ldd_output_shape(self) -> None:
-        # A representative, realistic `ldd` transcript: a real
-        # resolved dependency, the kernel VDSO (no "=>" target at all),
-        # and an explicit "not found" -- only the first shape must ever
-        # be returned.
+    def test_resolve_ldd_dependencies_resolves_dt_needed_entries_via_ldconfig_cache(
+        self,
+    ) -> None:
         elf_path = self.tmp_path / "app"
         elf_path.write_bytes(b"\x7fELF")
-        ldd_stdout = (
-            "\tlinux-vdso.so.1 (0x00007ffee6bd0000)\n"
-            "\tlibfoo.so.1 => /lib/x86_64-linux-gnu/libfoo.so.1 (0x00007f000)\n"
-            "\tlibbar.so => not found\n"
-            "\t/lib64/ld-linux-x86-64.so.2 (0x00007f100000)\n"
-        )
+        resolved_path = self.tmp_path / "system" / "libfoo.so.1"
+        resolved_path.parent.mkdir()
+        resolved_path.write_bytes(b"\x00")
         with mock.patch.object(
-            shutil, "which", return_value="/usr/bin/ldd"
+            audit,
+            "_read_dynamic_tags",
+            return_value=[("NEEDED", "Shared library: [libfoo.so.1]")],
         ), mock.patch.object(
-            subprocess,
-            "run",
-            return_value=self._fake_ldd_completed_process(ldd_stdout),
+            audit,
+            "_load_ldconfig_library_cache",
+            return_value={"libfoo.so.1": (resolved_path,)},
+        ):
+            resolved = audit.resolve_ldd_dependencies(elf_path)
+        self.assertEqual(resolved, {"libfoo.so.1": resolved_path})
+
+    def test_resolve_ldd_dependencies_prefers_requesters_runpath_before_ldconfig_cache(
+        self,
+    ) -> None:
+        requester_dir = self.tmp_path / "requester"
+        private_dir = requester_dir / "private"
+        private_dir.mkdir(parents=True)
+        cached_dir = self.tmp_path / "cached"
+        cached_dir.mkdir()
+        elf_path = requester_dir / "app"
+        elf_path.write_bytes(b"\x7fELF")
+        runpath_candidate = private_dir / "libfoo.so.1"
+        runpath_candidate.write_bytes(b"runpath")
+        cached_candidate = cached_dir / "libfoo.so.1"
+        cached_candidate.write_bytes(b"cached")
+        with mock.patch.object(
+            audit,
+            "_read_dynamic_tags",
+            return_value=[
+                ("NEEDED", "Shared library: [libfoo.so.1]"),
+                ("RUNPATH", "Library runpath: [$ORIGIN/private]"),
+            ],
+        ), mock.patch.object(
+            audit,
+            "_load_ldconfig_library_cache",
+            return_value={"libfoo.so.1": (cached_candidate,)},
         ):
             resolved = audit.resolve_ldd_dependencies(elf_path)
         self.assertEqual(
-            resolved, {"libfoo.so.1": Path("/lib/x86_64-linux-gnu/libfoo.so.1")}
+            resolved["libfoo.so.1"].resolve(), runpath_candidate.resolve()
         )
 
-    def test_resolve_ldd_dependencies_tolerates_ldd_exit_code_one(self) -> None:
-        # `ldd` legitimately exits 1 for some real, non-error inputs
-        # (e.g. certain non-dynamic executables) while still printing
-        # useful dependency lines for others invoked in the same batch
-        # -- this must not be treated as an unconditional hard failure.
-        elf_path = self.tmp_path / "app"
-        elf_path.write_bytes(b"\x7fELF")
-        ldd_stdout = "\tlibfoo.so.1 => /lib/x86_64-linux-gnu/libfoo.so.1 (0x00007f000)\n"
-        with mock.patch.object(
-            shutil, "which", return_value="/usr/bin/ldd"
-        ), mock.patch.object(
-            subprocess,
-            "run",
-            return_value=self._fake_ldd_completed_process(ldd_stdout, returncode=1),
-        ):
-            resolved = audit.resolve_ldd_dependencies(elf_path)
-        self.assertEqual(
-            resolved, {"libfoo.so.1": Path("/lib/x86_64-linux-gnu/libfoo.so.1")}
-        )
-
-    def test_resolve_ldd_dependencies_returns_empty_on_subprocess_error(
+    def test_resolve_ldd_dependencies_returns_empty_when_no_needed_entry_resolves(
         self,
     ) -> None:
         elf_path = self.tmp_path / "app"
         elf_path.write_bytes(b"\x7fELF")
         with mock.patch.object(
-            shutil, "which", return_value="/usr/bin/ldd"
-        ), mock.patch.object(subprocess, "run", side_effect=OSError("boom")):
+            audit,
+            "_read_dynamic_tags",
+            return_value=[("NEEDED", "Shared library: [libmissing.so.1]")],
+        ), mock.patch.object(audit, "_load_ldconfig_library_cache", return_value={}):
             self.assertEqual(audit.resolve_ldd_dependencies(elf_path), {})
 
     def test_capture_distro_source_provenance_captures_full_identity(self) -> None:
@@ -3831,6 +3942,55 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         self.assertEqual(binding["status"], "content_mismatch")
         self.assertEqual(binding["sourcePackage"], "foosource")
 
+    def test_bind_to_captured_provenance_rejects_a_same_soname_replacement_even_when_the_manifest_pins_the_legitimate_basename(
+        self,
+    ) -> None:
+        # Finding #18's explicit "same SONAME replacement" scenario:
+        # the authoritative manifest proves usr/lib/libfoo.so.1 came
+        # from one exact staged object, but the final bundled path now
+        # carries bytes from a DIFFERENT libfoo.so.1 sharing the same
+        # basename/SONAME. Exact-destination binding must reject this,
+        # never silently accept it as "same name, close enough".
+        staged_legitimate = self.tmp_path / "stage" / "aaaa--libfoo.so.1"
+        staged_legitimate.parent.mkdir(parents=True)
+        staged_legitimate.write_bytes(b"legitimate-libfoo")
+        same_soname_replacement = self.tmp_path / "replacement" / "libfoo.so.1"
+        same_soname_replacement.parent.mkdir()
+        same_soname_replacement.write_bytes(b"replacement-with-same-soname")
+        manifest = {
+            "formatVersion": 2,
+            "bundledPaths": {
+                "usr/lib/libfoo.so.1": {
+                    "bundledPath": "usr/lib/libfoo.so.1",
+                    "stagedPath": str(staged_legitimate),
+                    "sourceRealPath": "/lib/x86_64-linux-gnu/libfoo.so.1",
+                    "sha256": audit._sha256(staged_legitimate),
+                    "package": "libfoo1",
+                    "version": "1.2.3-1ubuntu1",
+                    "sourcePackage": "foosource",
+                }
+            },
+        }
+        bundled_lib = self.tmp_path / "AppDir" / "usr" / "lib" / "libfoo.so.1"
+        bundled_lib.parent.mkdir(parents=True)
+        bundled_lib.write_bytes(same_soname_replacement.read_bytes())
+        with mock.patch.object(
+            audit,
+            "_canonical_load_digest",
+            side_effect=lambda path: (
+                "digest-legitimate"
+                if path == staged_legitimate
+                else "digest-replacement"
+                if path == bundled_lib
+                else None
+            ),
+        ):
+            binding = audit.bind_bundled_library_to_captured_provenance(
+                bundled_lib, manifest, "usr/lib/libfoo.so.1"
+            )
+        self.assertEqual(binding["status"], "content_mismatch")
+        self.assertEqual(binding["systemPath"], "/lib/x86_64-linux-gnu/libfoo.so.1")
+
     def test_bind_to_captured_provenance_matches_when_content_digests_agree(
         self,
     ) -> None:
@@ -4003,6 +4163,159 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             audit._sha256(Path(str(binding["stagedPath"]))),
         )
 
+    def test_build_sbom_inventory_matches_real_distro_manifest_against_real_appdir_layout(
+        self,
+    ) -> None:
+        # This segment's own real end-to-end build-appimage.sh run (the
+        # first time any segment actually ran the full pipeline against
+        # a real, produced distro-provenance-manifest.json instead of a
+        # hand-keyed test fixture) discovered that EVERY real distro
+        # component failed classify() with "not_found", despite the
+        # manifest genuinely containing a fully-populated matching
+        # entry. Root cause: build_sbom_inventory()'s manifest lookup
+        # was keyed by `relative_path` -- the bundled path relative to
+        # `lib_dir` -- while build-appimage.sh's own real invocation
+        # passes `lib_dir="$app_dir/usr"` (see `bundled_search_root=
+        # "$app_dir/usr"`), so `relative_path` for
+        # "$app_dir/usr/lib/libfoo.so.1" is "lib/libfoo.so.1" -- missing
+        # the leading "usr/" segment every real manifest key
+        # (build_distro_provenance_manifest() always writes AppDir-ROOT-
+        # relative "usr/lib/<basename>" keys) actually has. No prior
+        # test exercised this exact production seam: every existing
+        # manifest-binding test called
+        # bind_bundled_library_to_captured_provenance() directly with a
+        # hand-supplied (and coincidentally already-correct) key, and
+        # every build_sbom_inventory()+distro_provenance_manifest test
+        # used a `lib_dir` that was already the bundled file's own
+        # immediate parent (so the missing "usr/" prefix never
+        # surfaced). This test instead drives the REAL production shape
+        # end-to-end: a real manifest built via
+        # build_distro_provenance_manifest(), a real AppDir layout with
+        # `usr/lib/`, and build_sbom_inventory() invoked with
+        # `lib_dir=appdir/"usr"` exactly as cmd_classify() is invoked in
+        # real CI/build-appimage.sh.
+        requester = self.tmp_path / "requester"
+        requester.write_bytes(_FAKE_ELF_BYTES)
+        source_path = self.tmp_path / "system" / "libfoo.so.1"
+        source_path.parent.mkdir()
+        source_path.write_bytes(_FAKE_ELF_BYTES + b"-system-bytes")
+
+        with mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="libfoo1"
+        ), mock.patch.object(
+            audit, "_dpkg_package_metadata", return_value=("1.2.3-1ubuntu1", "foosource")
+        ):
+            manifest, conflicts = audit.build_distro_provenance_manifest(
+                [(requester, "libfoo.so.1", source_path)],
+                self.tmp_path / "stage",
+            )
+        self.assertEqual(conflicts, [])
+
+        appdir = self.tmp_path / "AppDir"
+        bundled_lib = appdir / "usr" / "lib" / "libfoo.so.1"
+        bundled_lib.parent.mkdir(parents=True)
+        bundled_lib.write_bytes(_FAKE_ELF_BYTES + b"-system-bytes")
+
+        inventory = audit.build_sbom_inventory(
+            appdir / "usr", distro_provenance_manifest=manifest
+        )
+        entry = next(e for e in inventory if e["basename"] == "libfoo.so.1")
+        self.assertEqual(
+            entry["packageProvenance"]["status"],
+            "matched",
+            entry["packageProvenance"],
+        )
+
+    def test_cmd_classify_end_to_end_matches_real_distro_manifest_against_real_appdir_layout(
+        self,
+    ) -> None:
+        # Companion to the build_sbom_inventory() test above, proving
+        # cmd_classify()'s OWN, independent provenance-validation loop
+        # (a SECOND call site to
+        # bind_bundled_library_to_captured_provenance() that carried the
+        # exact same `path.relative_to(lib_dir)` key-shape bug, entirely
+        # unaffected by the build_sbom_inventory() fix since it is a
+        # separate code path) drives `main(["classify", ...])`
+        # end-to-end with --require-package-provenance and a REAL
+        # manifest exactly the way build-appimage.sh's own line-441
+        # invocation does, and the real distro component's binding is
+        # actually FOUND and content-matched (no false "not_found")
+        # instead of failing every real distro component the way the
+        # key-shape bug did.
+        #
+        # This test deliberately does not supply real linuxdeploy
+        # patchelf/strip replay tooling, so --require-package-
+        # provenance's SEPARATE, correctly-functioning "governed final
+        # hash cannot be self-attested" replay-evidence-strength gate
+        # (see validate_bundled_library_package_provenance()'s
+        # evidenceStrength check) still legitimately fails here -- that
+        # gate is unrelated to this bug and is exercised by this
+        # project's own existing replay-evidence tests elsewhere. The
+        # assertion below is therefore scoped precisely to the bug this
+        # fix addresses: the false "not_found"/"none exists" text (the
+        # symptom of the key-shape mismatch) must never appear, proving
+        # the manifest lookup itself now succeeds.
+        requester = self.tmp_path / "requester"
+        requester.write_bytes(_FAKE_ELF_BYTES)
+        zlib_source = self.tmp_path / "system" / "libz.so.1"
+        zlib_source.parent.mkdir()
+        zlib_source.write_bytes(_FAKE_ELF_BYTES + b"-zlib-system-bytes")
+        avif_source = self.tmp_path / "system" / "libavif.so.13"
+        avif_source.write_bytes(_FAKE_ELF_BYTES + b"-avif-system-bytes")
+
+        def fake_owner(path: Path) -> str | None:
+            return {
+                zlib_source.resolve(): "zlib1g",
+                avif_source.resolve(): "libavif13",
+            }.get(path)
+
+        def fake_metadata(package: str) -> tuple[str, str]:
+            return {
+                "zlib1g": ("1:1.2.11-1", "zlib"),
+                "libavif13": ("0.11.1-1", "libavif"),
+            }[package]
+
+        with mock.patch.object(
+            audit, "_dpkg_owning_package", side_effect=fake_owner
+        ), mock.patch.object(
+            audit, "_dpkg_package_metadata", side_effect=fake_metadata
+        ):
+            manifest, conflicts = audit.build_distro_provenance_manifest(
+                [
+                    (requester, "libz.so.1", zlib_source),
+                    (requester, "libavif.so.13", avif_source),
+                ],
+                self.tmp_path / "stage",
+            )
+        self.assertEqual(conflicts, [])
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest))
+
+        appdir = self.tmp_path / "AppDir"
+        usr_lib = appdir / "usr" / "lib"
+        usr_lib.mkdir(parents=True)
+        (usr_lib / "libz.so.1").write_bytes(_FAKE_ELF_BYTES + b"-zlib-system-bytes")
+        # MANDATORY_COMPONENTS requires "libavif" to be present at all,
+        # independent of this test's own zlib/distro-manifest focus.
+        (usr_lib / "libavif.so.13").write_bytes(_FAKE_ELF_BYTES + b"-avif-system-bytes")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            audit.main(
+                [
+                    "classify",
+                    str(appdir / "usr"),
+                    "--require-package-provenance",
+                    "--distro-provenance-manifest",
+                    str(manifest_path),
+                ]
+            )
+        stderr_text = stderr.getvalue()
+        self.assertNotIn("none exists", stderr_text, stderr_text)
+        self.assertNotIn(
+            "findable under _SYSTEM_LIBRARY_SEARCH_DIRS", stderr_text, stderr_text
+        )
+
     def test_load_distro_provenance_manifest_round_trips_format_version_two_json(
         self,
     ) -> None:
@@ -4165,10 +4478,13 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         libc_path.write_bytes(_FAKE_ELF_BYTES)
         output_path = self.tmp_path / "manifest.json"
 
-        def fake_resolve_ldd_dependencies(elf_path: Path) -> dict[str, Path]:
-            if elf_path == executable:
-                return {"libc.so.6": libc_path}
-            return {}
+        def fake_resolve_dt_needed_dependency_graph(
+            elf_paths: list[Path] | tuple[Path, ...],
+            ld_library_path: str | None = None,
+        ) -> list[tuple[Path, str, Path]]:
+            del ld_library_path
+            self.assertEqual(tuple(elf_paths), (executable, libsecret_input))
+            return [(executable, "libc.so.6", libc_path)]
 
         def fake_dpkg_owning_package(path: Path) -> str | None:
             return {
@@ -4183,7 +4499,9 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             }[package]
 
         with mock.patch.object(
-            audit, "resolve_ldd_dependencies", side_effect=fake_resolve_ldd_dependencies
+            audit,
+            "resolve_dt_needed_dependency_graph",
+            side_effect=fake_resolve_dt_needed_dependency_graph,
         ), mock.patch.object(
             audit, "_dpkg_owning_package", side_effect=fake_dpkg_owning_package
         ), mock.patch.object(
@@ -4227,7 +4545,7 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         first_party_input.write_bytes(_FAKE_ELF_BYTES)
         output_path = self.tmp_path / "manifest.json"
         with mock.patch.object(
-            audit, "resolve_ldd_dependencies", return_value={}
+            audit, "resolve_dt_needed_dependency_graph", return_value=[]
         ), mock.patch.object(audit, "_dpkg_owning_package", return_value=None):
             exit_code = audit.main(
                 [
@@ -4258,9 +4576,11 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         output_path = self.tmp_path / "manifest.json"
         with mock.patch.object(
             audit,
-            "resolve_ldd_dependencies",
-            side_effect=lambda elf_path: (
-                {"libz.so.1": libz_input} if elf_path == qt_plugin else {}
+            "resolve_dt_needed_dependency_graph",
+            side_effect=lambda elf_paths, ld_library_path=None: (
+                [(qt_plugin, "libz.so.1", libz_input)]
+                if tuple(elf_paths) == (qt_plugin, libz_input)
+                else []
             ),
         ), mock.patch.object(
             audit, "_dpkg_owning_package", return_value="zlib1g"
@@ -4303,9 +4623,11 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
 
         with mock.patch.object(
             audit,
-            "resolve_ldd_dependencies",
-            side_effect=lambda elf_path: (
-                {"libz.so.1": resolved_input} if elf_path == executable else {}
+            "resolve_dt_needed_dependency_graph",
+            side_effect=lambda elf_paths, ld_library_path=None: (
+                [(executable, "libz.so.1", resolved_input)]
+                if tuple(elf_paths) == (executable, explicit_input)
+                else []
             ),
         ), mock.patch.object(
             audit, "_dpkg_owning_package", return_value="zlib1g"
@@ -4345,6 +4667,23 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
+        # This class's own fixtures are lightweight synthetic
+        # directories, never byte-real copies of the actual installed
+        # Qt SDK -- exactly like every other fixture in this module's
+        # own _canonical_load_digest mocking convention. Default every
+        # test in this class to a "matched" installed-tree
+        # verification so existing digest/replay-focused assertions
+        # are unaffected by Finding #6's new installed-tree check;
+        # RealInstalledQtSdkTreeContentDigestTests below covers the
+        # digest/verification functions themselves directly, with real
+        # content (never mocked).
+        patcher = mock.patch.object(
+            audit,
+            "compute_qt_sdk_tree_content_digest",
+            return_value=audit._load_qt_sdk_lock()["installedTreeContentSha256"],
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_icu_is_not_in_component_expected_source_packages(self) -> None:
         # "icu" must never be validated via the dpkg cross-check
@@ -4728,11 +5067,16 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
                 "package": "libavif16",
                 "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["libavif"],
                 "sourcePackage": "libavif",
+                "architecture": "amd64",
+                "debSha256": "locked-libavif16-sha",
                 "evidenceStrength": "replay_byte_identical",
             }
 
         def fake_replay(
-            reference_path: Path, final_path: Path, toolset: dict[str, str]
+            reference_path: Path,
+            final_path: Path,
+            toolset: dict[str, str],
+            expected_rpath: str | None,
         ) -> dict[str, object]:
             return {
                 "toolLabel": toolset["toolLabel"],
@@ -4754,6 +5098,19 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
             audit,
             "bind_bundled_library_to_captured_provenance",
             side_effect=fail_if_called_for_icu,
+        ), mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={
+                "distribution": "ubuntu-22.04",
+                "packages": {
+                    "libavif16": {
+                        "architecture": "amd64",
+                        "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["libavif"],
+                        "debSha256": "locked-libavif16-sha",
+                    }
+                },
+            },
         ), mock.patch.object(
             audit, "_canonical_load_digest", return_value="same-digest"
         ), mock.patch.object(
@@ -5019,6 +5376,267 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
         self.assertEqual(binding["status"], "content_mismatch")
 
 
+def _real_qt_sdk_reference_dir() -> Path | None:
+    """Locates a genuinely-installed Qt SDK prefix (containing at least
+    a `lib/` directory) usable to prove
+    packaging/qt_sdk_lock.json's checked-in `installedTreeContentSha256`
+    pin against real content, never a synthetic fixture. Checks
+    $QT_ROOT_DIR first (exported by jurplel/install-qt-action in the
+    real CI environment this project's own pinned jobs run in), then
+    falls back to this repository's own local dev/CI container
+    convention (`/opt/qt/<version>/<arch>`, matching this module's own
+    pinned `sdkVersion`) so the same real-tree proof also runs inside
+    the `arkham-linux-test` development container without requiring
+    $QT_ROOT_DIR to be manually exported there. Returns None (test
+    skipped, never a false pass) when no real installation is found."""
+    env_dir = os.environ.get("QT_ROOT_DIR")
+    if env_dir and (Path(env_dir) / "lib").is_dir():
+        return Path(env_dir)
+    sdk_version = audit._load_qt_sdk_lock()["sdkVersion"]
+    for candidate in sorted(Path("/opt/qt").glob(f"{sdk_version}/*")):
+        if (candidate / "lib").is_dir():
+            return candidate
+    return None
+
+
+class QtSdkInstalledTreeProvenanceTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "Qt/ICU provenance is version-only/self-
+    attested ... Updates.xml hash is disconnected from independently
+    cached install-qt SDK ... does not authenticate installed SDK tree
+    ... same-version substituted cache must fail"): covers
+    compute_qt_sdk_tree_content_digest()/verify_installed_qt_sdk_tree()/
+    the tree-aware _qt_sdk_source_provenance()/
+    validate_bundled_library_qt_sdk_provenance() wiring directly.
+    Deliberately does NOT inherit QtSdkBundledProvenanceTests'/
+    UnifiedQtSdkBindingTests' own class-level
+    compute_qt_sdk_tree_content_digest mock -- this class exists
+    specifically to exercise the REAL function against real (if
+    synthetic) file content."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _make_sdk_tree(self, root: Path) -> None:
+        (root / "lib").mkdir(parents=True)
+        (root / "lib" / "libQt6Core.so.6").write_bytes(b"core-content")
+        (root / "plugins" / "imageformats").mkdir(parents=True)
+        (root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(b"jpeg-plugin")
+        (root / "qml" / "QtQuick").mkdir(parents=True)
+        (root / "qml" / "QtQuick" / "libqtquick2plugin.so").write_bytes(b"qml-module")
+        # A SONAME-style symlink, exactly like Qt's own real packaging
+        # convention -- must never affect the digest (see
+        # _qt_sdk_tree_content_files()'s own docstring for why).
+        (root / "lib" / "libQt6Core.so").symlink_to("libQt6Core.so.6")
+
+    def test_compute_qt_sdk_tree_content_digest_is_deterministic(self) -> None:
+        self._make_sdk_tree(self.root)
+        first = audit.compute_qt_sdk_tree_content_digest(self.root)
+        second = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 64)
+
+    def test_compute_qt_sdk_tree_content_digest_ignores_symlinks(self) -> None:
+        self._make_sdk_tree(self.root)
+        with_symlink = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "lib" / "libQt6Core.so").unlink()
+        without_symlink = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertEqual(with_symlink, without_symlink)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_a_single_byte_change_anywhere(
+        self,
+    ) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        # Mutate ONLY the QML module -- deliberately not the core
+        # library or the plugin -- proving the digest binds the WHOLE
+        # tree, not merely core Qt libraries.
+        (self.root / "qml" / "QtQuick" / "libqtquick2plugin.so").write_bytes(
+            b"qml-module-tampered"
+        )
+        tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, tampered)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_an_added_or_removed_file(
+        self,
+    ) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "plugins" / "imageformats" / "libqwebp.so").write_bytes(b"new")
+        added = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, added)
+
+    def test_verify_installed_qt_sdk_tree_accepts_matching_pin(self) -> None:
+        self._make_sdk_tree(self.root)
+        pinned = dict(audit._load_qt_sdk_lock())
+        pinned["installedTreeContentSha256"] = audit.compute_qt_sdk_tree_content_digest(
+            self.root
+        )
+        result = audit.verify_installed_qt_sdk_tree(self.root, pinned)
+        self.assertEqual(result["status"], "matched")
+
+    def test_verify_installed_qt_sdk_tree_rejects_tampered_tree(self) -> None:
+        self._make_sdk_tree(self.root)
+        pinned = dict(audit._load_qt_sdk_lock())
+        pinned["installedTreeContentSha256"] = audit.compute_qt_sdk_tree_content_digest(
+            self.root
+        )
+        # A same-version cache substitution: the tree still "looks"
+        # like a genuine Qt SDK install (same directory layout, same
+        # file count/names), but one file's real bytes differ.
+        (self.root / "lib" / "libQt6Core.so.6").write_bytes(b"substituted-core-content")
+        result = audit.verify_installed_qt_sdk_tree(self.root, pinned)
+        self.assertEqual(result["status"], "content_mismatch")
+        self.assertNotEqual(
+            result["actualInstalledTreeContentSha256"],
+            result["expectedInstalledTreeContentSha256"],
+        )
+
+    def test_qt_sdk_source_provenance_carries_qt_reference_dir_unavailable_without_a_dir(
+        self,
+    ) -> None:
+        provenance = audit._qt_sdk_source_provenance()
+        self.assertEqual(
+            provenance["installedTreeVerificationStatus"], "qt_reference_dir_unavailable"
+        )
+        self.assertNotIn("actualInstalledTreeContentSha256", provenance)
+
+    def test_qt_sdk_source_provenance_reports_content_mismatch_for_a_tampered_tree(
+        self,
+    ) -> None:
+        self._make_sdk_tree(self.root)
+        with mock.patch.object(
+            audit,
+            "_load_qt_sdk_lock",
+            return_value={
+                **audit._load_qt_sdk_lock(),
+                "installedTreeContentSha256": "0" * 64,
+            },
+        ):
+            provenance = audit._qt_sdk_source_provenance(self.root)
+        self.assertEqual(provenance["installedTreeVerificationStatus"], "content_mismatch")
+
+    def test_validate_qt_sdk_provenance_rejects_matched_file_inside_a_content_mismatched_tree(
+        self,
+    ) -> None:
+        # The exact scenario this finding exists to close: this ONE
+        # file's own per-file digest/replay comparison legitimately
+        # says "matched" (e.g. it happens to be byte-identical to
+        # SOME reference copy), but the sdkSourceProvenance sub-object
+        # shared by every artifact this run produced reports the WHOLE
+        # installed tree as content-mismatched -- proving the reference
+        # tree itself is not the genuine, pinned one. This must be
+        # rejected regardless, never accepted merely because this one
+        # file happened to still match.
+        binding = {
+            "status": "matched",
+            "referencePath": "/qt/lib/libicudata.so.73",
+            "sdkVersion": audit.EXPECTED_QT_SDK_VERSION,
+            "sdkSourceProvenance": {
+                **audit._qt_sdk_source_provenance(),
+                "installedTreeVerificationStatus": "content_mismatch",
+                "actualInstalledTreeContentSha256": "1" * 64,
+            },
+            "evidenceStrength": "replay_byte_identical",
+        }
+        problem = audit.validate_bundled_library_qt_sdk_provenance(
+            "icu", binding, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("content_mismatch", problem)
+
+    def test_validate_qt_sdk_provenance_accepts_matched_file_inside_a_matched_tree(
+        self,
+    ) -> None:
+        # The companion "new-pass" half of the test directly above: an
+        # otherwise-identical binding whose tree verification legitimately
+        # reports "matched" (against the SAME qt_reference_dir the
+        # binding itself, and this validate() call, both use) must
+        # still be accepted -- proving the new check is decisive in
+        # BOTH directions, never merely a blanket failure.
+        self._make_sdk_tree(self.root)
+        pinned_lock = {
+            **audit._load_qt_sdk_lock(),
+            "installedTreeContentSha256": audit.compute_qt_sdk_tree_content_digest(
+                self.root
+            ),
+        }
+        with mock.patch.object(audit, "_load_qt_sdk_lock", return_value=pinned_lock):
+            binding = {
+                "status": "matched",
+                "referencePath": "/qt/lib/libicudata.so.73",
+                "sdkVersion": audit.EXPECTED_QT_SDK_VERSION,
+                "sdkSourceProvenance": audit._qt_sdk_source_provenance(self.root),
+                "evidenceStrength": "replay_byte_identical",
+            }
+            self.assertEqual(
+                binding["sdkSourceProvenance"]["installedTreeVerificationStatus"],
+                "matched",
+            )
+            self.assertIsNone(
+                audit.validate_bundled_library_qt_sdk_provenance(
+                    "icu",
+                    binding,
+                    require_provenance=True,
+                    qt_reference_dir=self.root,
+                )
+            )
+
+    def test_end_to_end_substituted_cache_tree_fails_even_when_the_specific_file_still_matches(
+        self,
+    ) -> None:
+        # Full production seam: compute_qt_sdk_bindings() ->
+        # validate_bundled_library_qt_sdk_provenance(), exactly as
+        # cmd_classify() itself calls them, with a REAL qt_reference_dir
+        # fixture whose overall tree content does NOT match the pinned
+        # lock (an unrelated file differs -- simulating a same-version
+        # cache substitution) even though the ONE bundled file actually
+        # under validation is untouched and still byte-identical to its
+        # own reference copy.
+        self._make_sdk_tree(self.root)
+        # Add one more file so the fixture's aggregate digest can never
+        # accidentally coincide with the real checked-in
+        # installedTreeContentSha256 pin (an astronomically unlikely
+        # sha256 collision aside).
+        (self.root / "lib" / "libQt6Network.so.6").write_bytes(b"unrelated-substituted")
+        bundled_dir = self.root / "bundled"
+        bundled_dir.mkdir()
+        bundled = bundled_dir / "libQt6Core.so.6"
+        bundled.write_bytes(b"core-content")  # byte-identical to the reference copy
+
+        by_component = {"qt": [bundled]}
+        with mock.patch.object(audit, "_canonical_load_digest", return_value=None):
+            bindings = audit.compute_qt_sdk_bindings(
+                by_component, self.root, audit.EXPECTED_QT_SDK_VERSION
+            )
+        binding = bindings[bundled]
+        # The per-file comparison alone would say "matched" (identical
+        # bytes) -- but the overall binding must still be rejected once
+        # the tree itself cannot be authenticated.
+        self.assertEqual(binding["status"], "matched")
+        problem = audit.validate_bundled_library_qt_sdk_provenance(
+            "qt", binding, require_provenance=True, qt_reference_dir=self.root
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("content_mismatch", problem)
+
+    @unittest.skipUnless(
+        _real_qt_sdk_reference_dir() is not None,
+        "requires a real, genuinely-installed Qt SDK ($QT_ROOT_DIR or "
+        "/opt/qt/<sdkVersion>/<arch>) to prove the checked-in "
+        "installedTreeContentSha256 pin against actual content, never a "
+        "synthetic fixture",
+    )
+    def test_checked_in_lock_pin_matches_a_real_genuinely_installed_qt_sdk_tree(
+        self,
+    ) -> None:
+        real_qt_dir = _real_qt_sdk_reference_dir()
+        assert real_qt_dir is not None
+        result = audit.verify_installed_qt_sdk_tree(real_qt_dir)
+        self.assertEqual(result["status"], "matched", result)
+
+
 class UnifiedQtSdkBindingTests(unittest.TestCase):
     """Round-N+ review ("build_sbom_inventory binds separately before
     cmd_classify later rebind/validate, so serialized object not
@@ -5035,6 +5653,17 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
+        # See QtSdkBundledProvenanceTests.setUp()'s identical patch for
+        # why this class's own lightweight synthetic qt_reference_dir
+        # fixtures need a default "matched" installed-tree
+        # verification.
+        patcher = mock.patch.object(
+            audit,
+            "compute_qt_sdk_tree_content_digest",
+            return_value=audit._load_qt_sdk_lock()["installedTreeContentSha256"],
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _make_matched_pair(self, relative: str) -> tuple[Path, Path]:
         qt_reference_dir = self.root / "qtsdk"
@@ -5187,7 +5816,10 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
             return real_bind(*args, **kwargs)  # type: ignore[arg-type]
 
         def fake_replay(
-            reference_path: Path, final_path: Path, toolset: dict[str, str]
+            reference_path: Path,
+            final_path: Path,
+            toolset: dict[str, str],
+            expected_rpath: str | None,
         ) -> dict[str, object]:
             return {
                 "toolLabel": toolset["toolLabel"],
@@ -5215,7 +5847,22 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
                 "package": "libavif16",
                 "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["libavif"],
                 "sourcePackage": "libavif",
+                "architecture": "amd64",
+                "debSha256": "locked-libavif16-sha",
                 "evidenceStrength": "replay_byte_identical",
+            },
+        ), mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={
+                "distribution": "ubuntu-22.04",
+                "packages": {
+                    "libavif16": {
+                        "architecture": "amd64",
+                        "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["libavif"],
+                        "debSha256": "locked-libavif16-sha",
+                    }
+                },
             },
         ), mock.patch.object(
             audit, "_canonical_load_digest", return_value="same-digest"
@@ -5335,7 +5982,7 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
             }
         }
         self.assertEqual(len(interesting), 4)
-        expected_source = audit._qt_sdk_source_provenance()
+        expected_source = audit._qt_sdk_source_provenance(qt_reference_dir)
         for binding in interesting.values():
             self.assertEqual(binding["status"], "matched")
             self.assertEqual(binding["sdkSourceProvenance"], expected_source)
@@ -5814,19 +6461,20 @@ class DpkgRecordedFileMd5UsrMergePathFormTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    shutil.which("dpkg") and shutil.which("dpkg-query") and shutil.which("ldd"),
-    "requires a real Debian/Ubuntu dpkg database and ldd to authenticate a "
-    "genuine system dependency",
+    shutil.which("dpkg") and shutil.which("dpkg-query") and shutil.which("readelf"),
+    "requires a real Debian/Ubuntu dpkg database and readelf to authenticate "
+    "a genuine system dependency",
 )
 class RealCaptureDistroSourceProvenancePathFormTests(unittest.TestCase):
     """Companion to DpkgOwningPackageUsrMergePathFormTests above, proven
-    against a REAL dpkg database/`ldd` rather than mocks: resolves the
+    against a REAL dpkg database/readelf-backed DT_NEEDED walk rather than mocks: resolves the
     real `dpkg` binary's own real dynamic dependencies (guaranteed to
     exist and be dynamically linked on any real Debian/Ubuntu host) and
-    asserts every soname `ldd` resolves to a real, existing, dpkg-owned
+    asserts every soname this resolver resolves to a real, existing, dpkg-owned
     file is actually captured by capture_distro_source_provenance() --
     i.e. it does not silently drop a real, dpkg-owned dependency because
-    of a path-form mismatch between what `ldd` reports and what dpkg's
+    of a path-form mismatch between what the loader cache/search rules
+    resolve and what dpkg's
     database recognizes, regardless of which real libraries happen to
     be installed on whatever host runs this test."""
 
@@ -5837,7 +6485,7 @@ class RealCaptureDistroSourceProvenancePathFormTests(unittest.TestCase):
         resolved = audit.resolve_ldd_dependencies(Path(dpkg_path))
         if not resolved:
             self.skipTest(
-                "ldd resolved zero dependencies for the real dpkg binary"
+                "the DT_NEEDED resolver found zero dependencies for the real dpkg binary"
             )
         captured = audit.capture_distro_source_provenance(
             {soname: [path] for soname, path in resolved.items()}
@@ -5861,6 +6509,186 @@ class RealCaptureDistroSourceProvenancePathFormTests(unittest.TestCase):
                 f"it IS really dpkg-owned -- this is exactly the "
                 f"path-form regression this test class guards against",
             )
+
+
+@unittest.skipUnless(
+    shutil.which("cc") is not None and shutil.which("readelf") is not None,
+    "requires a real C toolchain and readelf to build requester-specific "
+    "DT_NEEDED graph fixtures",
+)
+class RealDtNeededDependencyGraphWalkTests(unittest.TestCase):
+    """Real-ELF regression tests for finding #18's core architectural fix:
+    requester-specific DT_NEEDED graph walking, never a flattened `ldd`
+    closure that discards which exact requester resolved which exact
+    SONAME/path edge."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.cc_bin = shutil.which("cc")
+        if self.cc_bin is None:
+            self.skipTest("cc not available on this host")
+
+    def _build_shared(
+        self,
+        relative_dir: str,
+        soname: str,
+        source: str,
+        *,
+        library_dirs: tuple[Path, ...] = (),
+        libraries: tuple[str, ...] = (),
+        rpath_entries: tuple[str, ...] = (),
+    ) -> Path:
+        output_dir = self.root / relative_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / soname
+        _compile_c_binary(
+            self.cc_bin,
+            source,
+            output_path,
+            shared=True,
+            soname=soname,
+            library_dirs=library_dirs,
+            libraries=libraries,
+            rpath_entries=rpath_entries,
+        )
+        _make_linker_name(output_path)
+        return output_path
+
+    def _build_executable(
+        self,
+        relative_path: str,
+        source: str,
+        *,
+        library_dirs: tuple[Path, ...] = (),
+        libraries: tuple[str, ...] = (),
+        rpath_entries: tuple[str, ...] = (),
+    ) -> Path:
+        output_path = self.root / relative_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _compile_c_binary(
+            self.cc_bin,
+            source,
+            output_path,
+            library_dirs=library_dirs,
+            libraries=libraries,
+            rpath_entries=rpath_entries,
+        )
+        return output_path
+
+    def test_resolve_dt_needed_dependency_graph_records_the_actual_requester_per_edge(
+        self,
+    ) -> None:
+        child = self._build_shared(
+            "child",
+            "libchild.so.1",
+            "int child_value(void) { return 7; }\n",
+        )
+        parent = self._build_shared(
+            "parent",
+            "libparent.so.1",
+            "extern int child_value(void);\n"
+            "int parent_value(void) { return child_value(); }\n",
+            library_dirs=(child.parent,),
+            libraries=("child",),
+            rpath_entries=("$ORIGIN/../child",),
+        )
+        executable = self._build_executable(
+            "bin/app",
+            "extern int parent_value(void);\n"
+            "int main(void) { return parent_value(); }\n",
+            library_dirs=(parent.parent,),
+            libraries=("parent",),
+            rpath_entries=("$ORIGIN/../parent",),
+        )
+
+        edges = audit.resolve_dt_needed_dependency_graph([executable])
+        self.assertIn((executable, "libparent.so.1", parent), edges)
+        self.assertIn((parent, "libchild.so.1", child), edges)
+        self.assertNotIn((executable, "libchild.so.1", child), edges)
+
+    def test_resolve_dt_needed_dependency_graph_preserves_two_distinct_same_soname_resolutions_from_two_requesters(
+        self,
+    ) -> None:
+        shared_a = self._build_shared(
+            "a",
+            "libshared.so.1",
+            "int shared_value(void) { return 1; }\n",
+        )
+        shared_b = self._build_shared(
+            "b",
+            "libshared.so.1",
+            "int shared_value(void) { return 2; }\n",
+        )
+        requester_a = self._build_shared(
+            "req-a",
+            "librequester_a.so.1",
+            "extern int shared_value(void);\n"
+            "int requester_a(void) { return shared_value(); }\n",
+            library_dirs=(shared_a.parent,),
+            libraries=("shared",),
+            rpath_entries=("$ORIGIN/../a",),
+        )
+        requester_b = self._build_shared(
+            "req-b",
+            "librequester_b.so.1",
+            "extern int shared_value(void);\n"
+            "int requester_b(void) { return shared_value(); }\n",
+            library_dirs=(shared_b.parent,),
+            libraries=("shared",),
+            rpath_entries=("$ORIGIN/../b",),
+        )
+
+        edges = audit.resolve_dt_needed_dependency_graph([requester_a, requester_b])
+        shared_edges = [edge for edge in edges if edge[1] == "libshared.so.1"]
+        self.assertCountEqual(
+            shared_edges,
+            [
+                (requester_a, "libshared.so.1", shared_a),
+                (requester_b, "libshared.so.1", shared_b),
+            ],
+        )
+
+    def test_resolve_dt_needed_dependency_graph_walks_a_transitive_two_hop_chain(
+        self,
+    ) -> None:
+        leaf = self._build_shared(
+            "leaf",
+            "libleaf.so.1",
+            "int leaf_value(void) { return 11; }\n",
+        )
+        middle = self._build_shared(
+            "middle",
+            "libmiddle.so.1",
+            "extern int leaf_value(void);\n"
+            "int middle_value(void) { return leaf_value(); }\n",
+            library_dirs=(leaf.parent,),
+            libraries=("leaf",),
+            rpath_entries=("$ORIGIN/../leaf",),
+        )
+        root = self._build_shared(
+            "root",
+            "libroot.so.1",
+            "extern int middle_value(void);\n"
+            "int root_value(void) { return middle_value(); }\n",
+            library_dirs=(middle.parent,),
+            libraries=("middle",),
+            rpath_entries=("$ORIGIN/../middle",),
+        )
+
+        edges = audit.resolve_dt_needed_dependency_graph([root])
+        self.assertEqual(
+            {
+                (requester.name, needed, resolved.name)
+                for requester, needed, resolved in edges
+                if needed in {"libmiddle.so.1", "libleaf.so.1"}
+            },
+            {
+                ("libroot.so.1", "libmiddle.so.1", "libmiddle.so.1"),
+                ("libmiddle.so.1", "libleaf.so.1", "libleaf.so.1"),
+            },
+        )
 
 
 @unittest.skipUnless(
@@ -5902,6 +6730,53 @@ class RealDpkgArchitectureAndFileIntegrityTests(unittest.TestCase):
         # below -- this test only proves the raw dpkg-query plumbing
         # itself returns a real, non-degenerate value.
         self.assertTrue(architecture)
+
+    def test_dpkg_full_provenance_record_includes_a_real_package_archive_sha256(
+        self,
+    ) -> None:
+        libz_path = self._real_libz_path()
+        if libz_path is None:
+            self.skipTest("no real libz.so.1 system copy found on this host")
+        package = audit._dpkg_owning_package(libz_path)
+        if package is None:
+            self.skipTest("real libz.so.1 copy is not dpkg-owned on this host")
+        metadata = audit._dpkg_package_metadata(package)
+        if metadata is None:
+            self.skipTest(f"no package metadata available for {package!r}")
+        version, _source_package = metadata
+        apt_show = subprocess.run(
+            ["apt-cache", "show", f"{package}={version}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if apt_show.returncode != 0:
+            self.skipTest(
+                f"apt-cache could not describe the installed {package!r} package"
+            )
+        expected_sha = None
+        for stanza in apt_show.stdout.split("\n\n"):
+            fields: dict[str, str] = {}
+            for line in stanza.splitlines():
+                if ": " not in line:
+                    continue
+                key, value = line.split(": ", 1)
+                fields[key] = value
+            if fields.get("Package") == package and fields.get("Version") == version:
+                expected_sha = fields.get("SHA256")
+                break
+        if not expected_sha:
+            self.skipTest(
+                "local APT package indexes do not expose a SHA256 for the "
+                "installed libz package on this host"
+            )
+        record = audit._dpkg_full_provenance_record(libz_path)
+        if record is None:
+            self.skipTest("real libz.so.1 copy is not dpkg-owned on this host")
+        deb_sha256 = record.get("debSha256")
+        self.assertRegex(str(deb_sha256), r"^[0-9a-f]{64}$")
+        self.assertEqual(deb_sha256, expected_sha)
 
     def test_dpkg_recorded_file_md5_matches_a_real_unmodified_system_file(
         self,
@@ -6014,54 +6889,142 @@ class RealReplayStripAndRpathTransformTests(unittest.TestCase):
         )
         return reference
 
+    def _bundled_destination(self, *relative_parts: str) -> Path:
+        # Realistic AppDir-rooted destination, so
+        # _expected_rpath_for_bundled_path()'s own "usr"-anchored
+        # derivation applies exactly as it does in production --
+        # never a flat, non-AppDir-shaped temp filename.
+        destination = self.root / "AppDir" / Path(*relative_parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
     def test_replay_reproduces_a_genuine_short_inplace_rpath_edit(self) -> None:
         reference = self._build_reference()
-        final = self.root / "final_short.so"
+        final = self._bundled_destination("usr", "lib", "final_short.so")
         final.write_bytes(reference.read_bytes())
         final.chmod(0o755)
+        expected_rpath = audit._expected_rpath_for_bundled_path(final)
+        self.assertEqual(expected_rpath, "$ORIGIN")
         subprocess.run(
             ["strip", "--strip-unneeded", str(final)],
             check=True,
             capture_output=True,
         )
         subprocess.run(
-            ["patchelf", "--set-rpath", "$ORIGIN/../lib", str(final)],
+            ["patchelf", "--set-rpath", expected_rpath, str(final)],
             check=True,
             capture_output=True,
         )
         self.assertNotEqual(audit._sha256(reference), audit._sha256(final))
 
         receipt = audit.replay_strip_and_rpath_transform(
-            reference, final, self.toolset
+            reference, final, self.toolset, expected_rpath
         )
         self.assertTrue(receipt["matched"], receipt)
         self.assertEqual(receipt["replayedSha256"], receipt["finalSha256"])
-        self.assertTrue(receipt["stripApplied"])
-        self.assertTrue(receipt["patchelfSetRpathApplied"])
+
+    def test_replay_accepts_a_genuine_file_linuxdeploy_left_completely_untouched(
+        self,
+    ) -> None:
+        # Regression test for a genuine, previously-undetected bug (NOT
+        # one of the numbered review findings): linuxdeploy-plugin-qt
+        # does NOT unconditionally strip+patchelf EVERY bundled plugin/
+        # QML module -- empirically, a file whose already-built-in
+        # rpath is already sufficient for its AppDir destination is
+        # copied over completely untouched (no "Setting rpath in ELF
+        # file ..." log line at all; real-world example: "plugins/
+        # platformthemes/libqxdgdesktopportal.so", copied byte-for-byte
+        # identical to its Qt SDK reference copy, its rpath left as
+        # whatever the SDK itself originally built in). The pre-fix
+        # replay_strip_and_rpath_transform() only ever accepted a file
+        # whose OBSERVED rpath exactly matched this project's own
+        # derived `expected_rpath` -- rejecting this genuine,
+        # completely-untouched file as "content_mismatch" purely
+        # because ITS rpath (never rewritten by any packaging step at
+        # all) does not happen to equal the value a REWRITE would have
+        # produced. A bundled file whose bytes are bit-for-bit
+        # identical to the pinned, hash-verified Qt SDK's own reference
+        # copy is unconditionally the strongest possible proof of
+        # authenticity regardless of its own (possibly untouched)
+        # rpath, and must be accepted -- decided BEFORE, and
+        # independently of, the expected-rpath precondition, which only
+        # ever applies to a file that a packaging step actually
+        # rewrote.
+        reference = self._build_reference()
+        # A destination shape whose derived `expected_rpath` a real
+        # rewrite WOULD have produced, deliberately never applied here
+        # -- reproducing "copied verbatim, no patchelf/strip step ran
+        # at all" exactly as the real untouched linuxdeploy-plugin-qt
+        # output does.
+        final = self._bundled_destination(
+            "usr", "plugins", "platformthemes", "final_untouched.so"
+        )
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        self.assertEqual(audit._sha256(reference), audit._sha256(final))
+        expected_rpath = audit._expected_rpath_for_bundled_path(final)
+        self.assertEqual(expected_rpath, "$ORIGIN/../../lib:$ORIGIN")
+        # `final`'s own real, unmodified rpath (whatever the fixture
+        # compiler produced, almost certainly NOT the two-entry
+        # `expected_rpath` value) must still not matter at all.
+        self.assertNotEqual(
+            audit._observed_rpath_or_runpath(final) or "", expected_rpath
+        )
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset, expected_rpath
+        )
+        self.assertTrue(receipt["matched"], receipt)
+        self.assertTrue(receipt.get("untouchedByPackaging"))
+        self.assertFalse(receipt["stripApplied"])
+        self.assertFalse(receipt["patchelfSetRpathApplied"])
+        self.assertEqual(receipt["replayedSha256"], receipt["finalSha256"])
 
     def test_replay_reproduces_a_genuine_long_relocating_rpath_edit(self) -> None:
         reference = self._build_reference()
-        final = self.root / "final_long.so"
+        # A deeply nested, but entirely LEGITIMATE, QML-module-shaped
+        # destination naturally derives a long "$ORIGIN/../../.../lib"
+        # expected rpath (forcing patchelf to physically relocate
+        # PT_DYNAMIC/.dynstr into a freshly appended trailing LOAD
+        # segment) -- never an attacker-chosen arbitrary string the way
+        # the pre-fix version of this test used.
+        final = self._bundled_destination(
+            "usr",
+            "qml",
+            "Deeply",
+            "Nested",
+            "Module",
+            "Tree",
+            "With",
+            "Many",
+            "Levels",
+            "final_long.so",
+        )
         final.write_bytes(reference.read_bytes())
         final.chmod(0o755)
+        expected_rpath = audit._expected_rpath_for_bundled_path(final)
+        # A QML module destination always gets a real linuxdeploy-
+        # plugin-qt "<relative-to-usr/lib>:$ORIGIN" TWO-entry rpath --
+        # the trailing bare "$ORIGIN" lets a module still load sibling
+        # helper plugins from its own directory -- never just the
+        # first entry alone.
+        self.assertEqual(
+            expected_rpath, "$ORIGIN/../../../../../../../../lib:$ORIGIN"
+        )
         subprocess.run(
             ["strip", "--strip-unneeded", str(final)],
             check=True,
             capture_output=True,
         )
-        # A long RPATH forces patchelf to physically relocate
-        # PT_DYNAMIC/the .dynstr content into a freshly appended
-        # trailing LOAD segment rather than editing in place.
-        long_rpath = "/".join(["deliberately-very-long-rpath-component"] * 40)
         subprocess.run(
-            ["patchelf", "--set-rpath", long_rpath, str(final)],
+            ["patchelf", "--set-rpath", expected_rpath, str(final)],
             check=True,
             capture_output=True,
         )
         self.assertNotEqual(audit._sha256(reference), audit._sha256(final))
 
         receipt = audit.replay_strip_and_rpath_transform(
-            reference, final, self.toolset
+            reference, final, self.toolset, expected_rpath
         )
         self.assertTrue(receipt["matched"], receipt)
         self.assertEqual(receipt["replayedSha256"], receipt["finalSha256"])
@@ -6070,21 +7033,22 @@ class RealReplayStripAndRpathTransformTests(unittest.TestCase):
         self,
     ) -> None:
         reference = self._build_reference()
-        final = self.root / "final_tampered.so"
+        final = self._bundled_destination("usr", "lib", "final_tampered.so")
         final.write_bytes(reference.read_bytes())
         final.chmod(0o755)
+        expected_rpath = audit._expected_rpath_for_bundled_path(final)
         subprocess.run(
             ["strip", "--strip-unneeded", str(final)],
             check=True,
             capture_output=True,
         )
         subprocess.run(
-            ["patchelf", "--set-rpath", "$ORIGIN/../lib", str(final)],
+            ["patchelf", "--set-rpath", expected_rpath, str(final)],
             check=True,
             capture_output=True,
         )
         genuine_receipt = audit.replay_strip_and_rpath_transform(
-            reference, final, self.toolset
+            reference, final, self.toolset, expected_rpath
         )
         self.assertTrue(genuine_receipt["matched"], genuine_receipt)
 
@@ -6094,7 +7058,7 @@ class RealReplayStripAndRpathTransformTests(unittest.TestCase):
         final.write_bytes(bytes(tampered_bytes))
 
         receipt = audit.replay_strip_and_rpath_transform(
-            reference, final, self.toolset
+            reference, final, self.toolset, expected_rpath
         )
         self.assertFalse(receipt["matched"])
         self.assertNotEqual(receipt["replayedSha256"], receipt["finalSha256"])
@@ -6118,22 +7082,210 @@ class RealReplayStripAndRpathTransformTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
-        final = self.root / "final_dollar.so"
+        final = self._bundled_destination(
+            "usr", "plugins", "platforms", "final_dollar.so"
+        )
         final.write_bytes(reference.read_bytes())
         final.chmod(0o755)
+        expected_rpath = audit._expected_rpath_for_bundled_path(final)
+        # Real production Qt plugin destination shape ("usr/plugins/
+        # <subdir>/<file>", a SIBLING of "usr/lib" -- never nested
+        # beneath it): a two-entry rpath, "$ORIGIN/../../lib" back to
+        # the shared library directory PLUS a trailing bare "$ORIGIN"
+        # for same-directory sibling plugins, matching linuxdeploy-
+        # plugin-qt's own real, observed output exactly.
+        self.assertEqual(expected_rpath, "$ORIGIN/../../lib:$ORIGIN")
         subprocess.run(
-            ["patchelf", "--set-rpath", "$ORIGIN/../lib2", str(final)],
+            ["patchelf", "--set-rpath", expected_rpath, str(final)],
             check=True,
             capture_output=True,
         )
         self.assertNotEqual(audit._sha256(reference), audit._sha256(final))
 
         receipt = audit.replay_strip_and_rpath_transform(
-            reference, final, self.toolset
+            reference, final, self.toolset, expected_rpath
         )
         self.assertTrue(receipt["matched"], receipt)
         self.assertFalse(receipt["stripApplied"])
         self.assertTrue(receipt["patchelfSetRpathApplied"])
+
+    def test_replay_rejects_an_attacker_chosen_rpath_that_disagrees_with_the_trusted_destination_policy(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "replay derives final_rpath from
+        # candidate, authenticating attacker-selected behavior"): this
+        # is the direct reversal of the pre-fix behavior, which read
+        # whatever rpath `final` itself carried and replayed exactly
+        # that value -- trivially "matching" any payload an attacker
+        # chose, as long as the rest of a genuine strip+patchelf output
+        # was otherwise reproduced. A `final` file destined for
+        # "usr/lib/..." can only ever legitimately carry "$ORIGIN"; one
+        # carrying a completely different, attacker-chosen rpath string
+        # must now be rejected even though the rest of the transform
+        # (strip + a real patchelf --set-rpath rewrite) is byte-for-byte
+        # exactly what a genuine linuxdeploy run would also produce for
+        # THAT (wrong) value.
+        reference = self._build_reference()
+        final = self._bundled_destination("usr", "lib", "final_attacker.so")
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        expected_rpath = audit._expected_rpath_for_bundled_path(final)
+        self.assertEqual(expected_rpath, "$ORIGIN")
+        subprocess.run(
+            ["strip", "--strip-unneeded", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        attacker_rpath = "/tmp/attacker-controlled-search-path"
+        subprocess.run(
+            ["patchelf", "--set-rpath", attacker_rpath, str(final)],
+            check=True,
+            capture_output=True,
+        )
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset, expected_rpath
+        )
+        self.assertFalse(receipt["matched"], receipt)
+        self.assertEqual(receipt["finalObservedRpath"], attacker_rpath)
+        self.assertEqual(receipt["expectedRpath"], "$ORIGIN")
+        # The replay must never have even ATTEMPTED to reproduce the
+        # attacker's own value -- no "replayedSha256" key at all, since
+        # the mismatch is decided before ever invoking patchelf/strip a
+        # second time.
+        self.assertNotIn("replayedSha256", receipt)
+
+    def test_replay_rejects_a_final_file_carrying_a_neighboring_destinations_correct_rpath(
+        self,
+    ) -> None:
+        # Order/precedence coverage: a value that IS a genuine,
+        # correctly-derived expected rpath for SOME real destination
+        # shape (a Qt plugin one level under "usr/lib/plugins/<dir>")
+        # is still wrong -- and must still be rejected -- when it
+        # appears on a file actually destined for a DIFFERENT depth
+        # (plain "usr/lib/"), proving the policy is bound to each
+        # artifact's own exact destination, never merely "some
+        # plausible-looking Qt-shaped value".
+        reference = self._build_reference()
+        final = self._bundled_destination("usr", "lib", "final_wrong_depth.so")
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        own_expected_rpath = audit._expected_rpath_for_bundled_path(final)
+        self.assertEqual(own_expected_rpath, "$ORIGIN")
+        neighbor_expected_rpath = audit._expected_rpath_for_appdir_relative_path(
+            "usr/plugins/platforms/libqxcb.so"
+        )
+        self.assertEqual(neighbor_expected_rpath, "$ORIGIN/../../lib:$ORIGIN")
+        self.assertNotEqual(own_expected_rpath, neighbor_expected_rpath)
+        subprocess.run(
+            ["strip", "--strip-unneeded", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["patchelf", "--set-rpath", neighbor_expected_rpath, str(final)],
+            check=True,
+            capture_output=True,
+        )
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset, own_expected_rpath
+        )
+        self.assertFalse(receipt["matched"], receipt)
+
+    def test_replay_rejects_when_no_trusted_expected_rpath_can_be_derived(
+        self,
+    ) -> None:
+        # A destination outside any recognizable "usr/..." AppDir
+        # shape has no trusted policy value at all
+        # (_expected_rpath_for_bundled_path() returns None) --
+        # replay_strip_and_rpath_transform() must treat that as a hard
+        # failure, never silently falling back to trusting whatever
+        # rpath the candidate happens to carry.
+        reference = self._build_reference()
+        final = self.root / "not_an_appdir_shape.so"
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        subprocess.run(
+            ["patchelf", "--set-rpath", "$ORIGIN", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertIsNone(audit._expected_rpath_for_bundled_path(final))
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset, None
+        )
+        self.assertFalse(receipt["matched"], receipt)
+
+    def test_bind_qt_sdk_provenance_via_replay_matches_a_genuine_qt_plugin_destination(
+        self,
+    ) -> None:
+        # Regression test for a genuine, previously-undetected bug (NOT
+        # one of the numbered review findings): a real
+        # linuxdeploy-plugin-qt run ALWAYS writes a TWO-entry rpath for
+        # every Qt plugin/QML module destination -- the usual
+        # "$ORIGIN/<relative-path-to-usr/lib>" entry, PLUS a trailing
+        # bare "$ORIGIN" so the module can still load sibling plugins
+        # from its own directory (empirically confirmed against real
+        # `packaging/build-appimage.sh` "Setting rpath in ELF file ..."
+        # log output for every "usr/plugins/**"/"usr/qml/**"
+        # destination). The pre-fix _expected_rpath_for_appdir_
+        # relative_path() only ever returned the FIRST entry, so
+        # bind_bundled_library_to_qt_sdk_provenance() -- when given a
+        # real replay_toolset, exactly as cmd_classify() always
+        # supplies in production -- rejected EVERY real Qt plugin/QML
+        # module as "content_mismatch" even though the bundled file was
+        # byte-for-byte the genuine, untampered linuxdeploy-plugin-qt
+        # output. This is the real, root cause of the "Qt plugin
+        # byte-mismatch" failure category `build-appimage.sh` produced
+        # on every single real end-to-end run before this fix -- fixed
+        # in `_expected_rpath_for_appdir_relative_path()` itself, proven
+        # here through the SAME `bind_bundled_library_to_qt_sdk_
+        # provenance()` entry point cmd_classify() actually calls,
+        # never merely a lower-level unit test of the rpath string
+        # alone.
+        qt_reference_dir = self.root / "qtsdk"
+        reference = qt_reference_dir / "plugins" / "imageformats" / "libqgif.so"
+        reference.parent.mkdir(parents=True)
+        _compile_shared_object(
+            self.cc_bin,
+            "int qt_plugin_fixture_entry(void) { return 1; }\n",
+            reference,
+        )
+
+        bundled = self._bundled_destination(
+            "usr", "plugins", "imageformats", "libqgif.so"
+        )
+        bundled.write_bytes(reference.read_bytes())
+        bundled.chmod(0o755)
+        subprocess.run(
+            ["strip", "--strip-unneeded", str(bundled)],
+            check=True,
+            capture_output=True,
+        )
+        # The exact real, two-entry rpath linuxdeploy-plugin-qt writes
+        # for this exact destination depth -- a literal, independently
+        # hardcoded ground-truth value (matching real observed build
+        # log output), never derived by calling the function under
+        # test.
+        real_linuxdeploy_rpath = "$ORIGIN/../../lib:$ORIGIN"
+        subprocess.run(
+            ["patchelf", "--set-rpath", real_linuxdeploy_rpath, str(bundled)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(bundled))
+
+        binding = audit.bind_bundled_library_to_qt_sdk_provenance(
+            bundled, qt_reference_dir, replay_toolset=self.toolset
+        )
+        self.assertEqual(binding["status"], "matched", binding)
+        self.assertEqual(binding["evidenceStrength"], "replay_byte_identical")
+        self.assertTrue(binding["transformationReceipt"]["matched"])
+        self.assertEqual(
+            binding["transformationReceipt"]["expectedRpath"], real_linuxdeploy_rpath
+        )
 
     def test_replay_toolset_from_manifest_rejects_a_tampered_tool_binary(
         self,

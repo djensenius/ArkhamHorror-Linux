@@ -66,6 +66,11 @@ qt_reference_dir="$("$qmake_bin" -query QT_INSTALL_PREFIX)"
     "'$qt_reference_dir'" >&2
   exit 2
 }
+qt_sdk_version="$("$qmake_bin" -query QT_VERSION)"
+[[ -n "$qt_sdk_version" ]] || {
+  echo "qmake -query QT_VERSION returned an empty value." >&2
+  exit 2
+}
 
 # QtKeychain's Secret Service backend loads libsecret-1 at runtime via
 # QLibrary (dlopen), not as a linked (DT_NEEDED) dependency of
@@ -187,13 +192,15 @@ libcomerr_so="$(find_bundled_libcomerr)"
 # source BEFORE packaging"): capture real distro-package provenance
 # (path/sha256/package/version/sourcePackage) for every dynamically
 # resolved dependency of this project's own first-party artifacts,
-# using the real dynamic loader's own resolution (`ldd`) against the
+# using this repository's own requester-specific DT_NEEDED walk
+# (`readelf -d -W` + the real loader's DT_RPATH/DT_RUNPATH/
+# LD_LIBRARY_PATH/ld.so.cache/default-path precedence) against the
 # exact pre-packaging files -- strictly BEFORE linuxdeploy ever runs
 # and copies/patches anything -- rather than an independent, after-the-
 # fact directory search once packaging is already complete. Covers:
 #   - the main application executable itself (already installed via
 #     `cmake --install` above, but not yet touched by linuxdeploy):
-#     ldd's own flattened transitive closure picks up every ordinary
+#     the recursive requester-specific walk picks up every ordinary
 #     ELF-linked (DT_NEEDED) dependency, including Qt/ICU and libavif's
 #     own directly-linked AV1 codec backends (dav1d/aom/etc. -- see the
 #     comment above this block).
@@ -201,16 +208,16 @@ libcomerr_so="$(find_bundled_libcomerr)"
 #     are force-bundled via linuxdeploy's --library flag specifically
 #     BECAUSE they are otherwise invisible to ldd-based automatic
 #     bundling (dlopen()'d or default-blacklisted -- see each variable's
-#     own resolution comment above); ldd against each of these captures
-#     their own transitive closure (glib, gobject, gio, libffi,
-#     pcre2, ...) the same way.
+#     own resolution comment above); the same recursive DT_NEEDED walk
+#     captures their own transitive closure (glib, gobject, gio,
+#     libffi, pcre2, ...) before packaging too.
 #   - every real ELF file under the actual Qt SDK reference tree's own
 #     plugins/ directory ($qt_reference_dir, already resolved above via
 #     `qmake -query QT_INSTALL_PREFIX`): Qt's platform/imageformat/etc.
 #     plugins are dlopen()'d by Qt's own plugin loader at runtime, never
 #     linked (DT_NEEDED) into the main executable at all, so they are
-#     otherwise entirely invisible to ldd run only against arkham-horror
-#     -- yet they are exactly where libjpeg/libpng/xcb-family distro
+#     otherwise entirely invisible if you only scan arkham-horror --
+#     yet they are exactly where libjpeg/libpng/xcb-family distro
 #     dependencies actually come from once linuxdeploy-plugin-qt bundles
 #     them.
 distro_provenance_manifest="$repo_root/distro-provenance-manifest.json"
@@ -279,70 +286,72 @@ python3 "$repo_root/packaging/audit_codec_notices.py" capture-distro-provenance 
 echo "Wrote distro-package provenance manifest to $distro_provenance_manifest"
 
 # Round-N+ review (HIGH, "staged capture exists, but linuxdeploy still
-# consumes original host paths"): for the six libraries this script
-# force-bundles by exact path (as opposed to the automatic ldd-based
-# closure linuxdeploy resolves on its own against arkham-horror/Qt's own
-# plugins, which is a much larger and less tractable surface to safely
-# redirect without a real Linux/linuxdeploy environment to validate
-# against), there is no reason to ever hand linuxdeploy the live host
-# path again once capture-distro-provenance above has already opened it
-# with O_NOFOLLOW, hashed it, and copied those exact bytes into the
-# immutable, read-only staging object above -- doing so would leave a
-# real TOCTOU window open between that capture and whenever linuxdeploy
-# itself gets around to reading the same host path a second time to
-# perform its own copy. Resolving each of these six libraries' bundled
-# destination ("usr/lib/<basename>") back to its manifest entry's own
-# "stagedPath" and handing linuxdeploy a same-basename symlink onto that
-# exact staged (sha256-prefixed, 0444, never-reopened-by-name) object
-# instead closes that window completely: what linuxdeploy actually
-# copies into the AppImage is now provably byte-identical to what was
-# captured, not merely "the same path, read again, hopefully unchanged".
-# A symlink (rather than the raw "<sha256>--<basename>" staged filename
-# itself) is required here because linuxdeploy's own --library flag
-# names the bundled copy after the basename of the path it is given,
-# and that bundled basename must exactly match the real SONAME
-# (libsecret-1.so.0, etc.) for the dynamic loader/dlopen() to find it at
-# runtime. (cmd_classify's own post-packaging bind_bundled_library_to_
-# captured_provenance() independently re-hashes the ACTUAL bundled
-# output and compares it to this same staged snapshot regardless, so a
-# mismatch here would already fail the build loudly -- this substitution
-# instead prevents the mismatch from being possible in the first place,
-# rather than merely detecting it after the fact.)
-staged_library_for_basename() {
-  python3 -c '
-import json, sys
-manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-key = f"usr/lib/{sys.argv[2]}"
-entry = manifest.get("bundledPaths", {}).get(key)
-if not entry:
-    sys.exit(f"no captured distro provenance manifest entry for {key!r}")
-print(entry["stagedPath"])
-' "$distro_provenance_manifest" "$1"
-}
+# consumes original host paths"): every CAPTURED, GOVERNED distro
+# component this repository actually intends to bundle (i.e. a manifest
+# entry whose basename audit_codec_notices.py itself classifies to a
+# concrete third-party component, not a host-only ABI_ALLOWLIST library
+# or an unmapped straggler that the later classify hard gate would fail
+# anyway) is redirected back to its immutable staged snapshot here, not
+# just the previous hard-coded six. That closes the architecture hole:
+# once capture-distro-provenance above has nofollow-opened, hashed, and
+# staged the exact bytes a real loader resolved for each requester edge,
+# linuxdeploy never needs the mutable host pathname again. A same-
+# basename symlink is still required because linuxdeploy's --library flag
+# names the bundled copy after the basename of the path it is given, and
+# that basename must stay the real SONAME.
 staged_library_symlink_dir="$distro_provenance_stage_dir/for-linuxdeploy"
 mkdir -p "$staged_library_symlink_dir"
-staged_library_symlink_for() {
-  local original_path="$1"
-  local basename_of_original
-  basename_of_original="$(basename -- "$original_path")"
-  local staged_path
-  staged_path="$(staged_library_for_basename "$basename_of_original")"
-  [[ -n "$staged_path" && -f "$staged_path" ]] || {
-    echo "Could not resolve a captured immutable staged copy for" \
-      "'$basename_of_original' -- capture-distro-provenance above should" \
-      "have produced one." >&2
+mapfile -t linuxdeploy_staged_libraries < <(
+  python3 - "$distro_provenance_manifest" "$staged_library_symlink_dir" <<'PY'
+import json
+import os
+from pathlib import Path, PurePosixPath
+import sys
+
+manifest_path = Path(sys.argv[1])
+symlink_dir = Path(sys.argv[2])
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+bundled_paths = manifest.get("bundledPaths")
+if not isinstance(bundled_paths, dict):
+    raise SystemExit(
+        f"{manifest_path} is missing the expected bundledPaths object"
+    )
+printed_any = False
+for bundled_path, entry in sorted(bundled_paths.items()):
+    if not isinstance(entry, dict):
+        continue
+    component = entry.get("component")
+    staged_path = entry.get("stagedPath")
+    if not isinstance(component, str) or not component:
+        continue
+    if not isinstance(staged_path, str) or not Path(staged_path).is_file():
+        raise SystemExit(
+            f"{manifest_path}: bundled path {bundled_path!r} is missing a real stagedPath"
+        )
+    basename = PurePosixPath(bundled_path).name
+    symlink_path = symlink_dir / basename
+    try:
+        symlink_path.unlink()
+    except FileNotFoundError:
+        pass
+    os.symlink(staged_path, symlink_path)
+    print(symlink_path)
+    printed_any = True
+if not printed_any:
+    raise SystemExit(
+        f"{manifest_path}: no governed staged libraries were found to redirect"
+    )
+PY
+)
+linuxdeploy_library_args=()
+for staged_library in "${linuxdeploy_staged_libraries[@]}"; do
+  [[ -L "$staged_library" ]] || {
+    echo "Expected $staged_library to be a symlink onto a staged immutable" \
+      "library snapshot." >&2
     exit 2
   }
-  local symlink_path="$staged_library_symlink_dir/$basename_of_original"
-  ln -sf -- "$staged_path" "$symlink_path"
-  printf '%s' "$symlink_path"
-}
-libsecret_so_staged="$(staged_library_symlink_for "$libsecret_so")"
-libgpgerror_so_staged="$(staged_library_symlink_for "$libgpgerror_so")"
-libgccs_so_staged="$(staged_library_symlink_for "$libgccs_so")"
-libstdcxx_so_staged="$(staged_library_symlink_for "$libstdcxx_so")"
-libz_so_staged="$(staged_library_symlink_for "$libz_so")"
-libcomerr_so_staged="$(staged_library_symlink_for "$libcomerr_so")"
+  linuxdeploy_library_args+=(--library "$staged_library")
+done
 
 # Package the third-party attribution files (QtKeychain's BSD-3-Clause
 # LICENSE and this project's own NOTICE.md) into the distributed AppImage
@@ -379,12 +388,7 @@ export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
   --appdir "$app_dir" \
   --desktop-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.desktop" \
   --icon-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.svg" \
-  --library "$libsecret_so_staged" \
-  --library "$libgpgerror_so_staged" \
-  --library "$libgccs_so_staged" \
-  --library "$libstdcxx_so_staged" \
-  --library "$libz_so_staged" \
-  --library "$libcomerr_so_staged" \
+  "${linuxdeploy_library_args[@]}" \
   --plugin qt
 
 bundled_search_root="$app_dir/usr"
@@ -392,6 +396,32 @@ bundled_search_root="$app_dir/usr"
   echo "linuxdeploy did not populate the expected $bundled_search_root." >&2
   exit 2
 }
+python3 - "$distro_provenance_manifest" "$app_dir" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+app_dir = Path(sys.argv[2])
+bundled_paths = manifest.get("bundledPaths")
+if not isinstance(bundled_paths, dict):
+    raise SystemExit("distro provenance manifest is missing bundledPaths")
+missing = []
+for bundled_path, entry in sorted(bundled_paths.items()):
+    if not isinstance(entry, dict):
+        continue
+    component = entry.get("component")
+    if not isinstance(component, str) or not component:
+        continue
+    final_path = app_dir / bundled_path
+    if not final_path.is_file():
+        missing.append(bundled_path)
+if missing:
+    raise SystemExit(
+        "linuxdeploy failed to materialize redirected governed bundled path(s): "
+        + ", ".join(missing)
+    )
+PY
 bundle_codec_notices "$bundled_search_root" "$repo_root/third_party" "$doc_dir" \
   "$qt_reference_dir" || {
   echo "Failed to bundle required codec library license/notice text --" \
@@ -400,5 +430,18 @@ bundle_codec_notices "$bundled_search_root" "$repo_root/third_party" "$doc_dir" 
     "attribution." >&2
   exit 2
 }
+
+# Hard-gate the final pre-AppImage AppDir on the same provenance proof
+# cmd_classify later enforces in CI after extraction: every governed
+# bundled library's FINAL bytes must bind either to the immutable staged
+# distro snapshot captured above or to the real Qt SDK reference tree's
+# own copy, with replay evidence where available. This way packaging
+# cannot quietly proceed to the final .AppImage step with an unproven
+# bundled dependency even if linuxdeploy itself found some new host path.
+python3 "$repo_root/packaging/audit_codec_notices.py" classify "$bundled_search_root" \
+  --qt-reference-dir "$qt_reference_dir" \
+  --require-package-provenance \
+  --distro-provenance-manifest "$distro_provenance_manifest" \
+  --qt-sdk-version "$qt_sdk_version"
 
 "$linuxdeploy" --appdir "$app_dir" --output appimage
