@@ -37,7 +37,9 @@ INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE precedence, and rejects any
 unevaluated or unclassified result rather than guessing target names from
 generator-expression text. A second structurally normalized compile graph
 preserves nested COMPILE_ONLY payloads which intentionally disappear from
-link-context evaluation.
+link-context evaluation. Its traversal starts from the final post-DIRECT,
+post-DIRECT_EXCLUDE dependency set as well as genuine compile-only roots, so
+an injected plugin's own compile-only usage cannot disappear by composition.
 
 Both header sets are audited by this ONE script/policy, not just the
 domain one: a review round demonstrated that scoping the AST scan to
@@ -167,6 +169,9 @@ an ever-growing fragment of C++ parsing by hand:
     tokenized and matched to Clang's canonical specialization AST, even when
     the primary template is declared in an external/system header and
     libclang emits no project-owned cursor for the instantiation spelling.
+    Source TUs are tokenized after preprocessing, so nested/argument macro
+    expansions retain both their production invocation and macro-definition
+    spelling locations.
     Every numeric cursor kind used here is checked against the installed
     libclang's own clang_getCursorKindSpelling result at startup.
   - A declaration is a *violation* if any semantic type component is in
@@ -1656,6 +1661,8 @@ def _cursor_template_argument_fingerprint(
 class _ExplicitTemplateCandidate:
     line: int
     offset: int
+    spelling_file: Path
+    spelling_offset: int
     statement: str
     names_and_args: tuple[tuple[str, tuple[str, ...]], ...]
 
@@ -1714,17 +1721,52 @@ def _explicit_template_candidates(
     path: Path,
     arguments: Sequence[str],
     directory: Path,
+    always_tokenize: bool,
 ) -> list[_ExplicitTemplateCandidate]:
     text = path.read_text(encoding="utf-8")
-    if _EXPLICIT_TEMPLATE_START.search(text) is None:
-        return []
     compiler = os.environ.get("ARKHAM_CLANGXX", "clang++")
+    if _EXPLICIT_TEMPLATE_START.search(text) is None:
+        if not always_tokenize:
+            return []
+        preprocess_result = subprocess.run(
+            [
+                compiler,
+                *arguments,
+                "-E",
+                "-x",
+                "c++",
+                str(path),
+            ],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+        )
+        if preprocess_result.returncode != 0:
+            raise EncoderHygieneError(
+                f"Compiler preprocessing failed while discovering macro "
+                f"template instantiations in {path}:\n"
+                f"{preprocess_result.stderr}"
+            )
+        active_file: Path | None = None
+        active_text: list[str] = []
+        for output_line in preprocess_result.stdout.splitlines():
+            marker = _re.fullmatch(r'#\s+\d+\s+"([^"]+)".*', output_line)
+            if marker:
+                marker_path = Path(marker.group(1))
+                if not marker_path.is_absolute():
+                    marker_path = directory / marker_path
+                active_file = marker_path.resolve()
+                continue
+            if active_file == path.resolve():
+                active_text.append(output_line)
+        if _EXPLICIT_TEMPLATE_START.search("\n".join(active_text)) is None:
+            return []
     token_command = [
         compiler,
         *arguments,
+        "-E",
         "-Xclang",
         "-dump-tokens",
-        "-fsyntax-only",
         "-x",
         "c++",
         str(path),
@@ -1740,9 +1782,13 @@ def _explicit_template_candidates(
             f"Compiler tokenization failed while resolving explicit template "
             f"instantiations in {path}:\n{token_result.stderr}"
         )
-    tokens: list[tuple[str, int, int]] = []
+    tokens: list[tuple[str, int, int, Path, int, int]] = []
     for output_line in token_result.stderr.splitlines():
-        location_match = _re.search(r"Loc=<(.+):(\d+):(\d+)>$", output_line)
+        location_match = _re.search(
+            r"Loc=<(.+?):(\d+):(\d+)"
+            r"(?: <Spelling=(.+?):(\d+):(\d+)>)?>$",
+            output_line,
+        )
         first_quote = output_line.find("'")
         second_quote = output_line.find("'", first_quote + 1)
         if (
@@ -1756,11 +1802,21 @@ def _explicit_template_candidates(
             location_path = directory / location_path
         if location_path.resolve() != path.resolve():
             continue
+        spelling_path = (
+            Path(location_match.group(4))
+            if location_match.group(4)
+            else location_path
+        )
+        if not spelling_path.is_absolute():
+            spelling_path = directory / spelling_path
         tokens.append(
             (
                 output_line[first_quote + 1 : second_quote],
                 int(location_match.group(2)),
                 int(location_match.group(3)),
+                spelling_path.resolve(),
+                int(location_match.group(5) or location_match.group(2)),
+                int(location_match.group(6) or location_match.group(3)),
             )
         )
 
@@ -1768,7 +1824,14 @@ def _explicit_template_candidates(
     for match in _re.finditer("\n", text):
         line_starts.append(match.end())
     candidates: list[_ExplicitTemplateCandidate] = []
-    for token_index, (token, line, column) in enumerate(tokens):
+    for token_index, (
+        token,
+        line,
+        column,
+        spelling_path,
+        spelling_line,
+        spelling_column,
+    ) in enumerate(tokens):
         if token != "template":
             continue
         next_index = token_index + 1
@@ -1783,7 +1846,14 @@ def _explicit_template_candidates(
         statement_tokens: list[str] = []
         angle_depth = 0
         paren_depth = 0
-        for current, _token_line, _token_column in tokens[token_index:]:
+        for (
+            current,
+            _token_line,
+            _token_column,
+            _spelling_path,
+            _spelling_line,
+            _spelling_column,
+        ) in tokens[token_index:]:
             statement_tokens.append(current)
             if current == "<":
                 angle_depth += 1
@@ -1804,10 +1874,35 @@ def _explicit_template_candidates(
             )
         character_offset = line_starts[line - 1] + column - 1
         byte_offset = len(text[:character_offset].encode("utf-8"))
+        if spelling_path.is_file():
+            spelling_text = spelling_path.read_text(encoding="utf-8")
+            spelling_line_starts = [0]
+            for spelling_match in _re.finditer("\n", spelling_text):
+                spelling_line_starts.append(spelling_match.end())
+            if spelling_line > len(spelling_line_starts):
+                raise EncoderHygieneError(
+                    f"Compiler reported invalid macro spelling line "
+                    f"{spelling_path}:{spelling_line}"
+                )
+            spelling_character_offset = (
+                spelling_line_starts[spelling_line - 1]
+                + spelling_column
+                - 1
+            )
+            spelling_byte_offset = len(
+                spelling_text[:spelling_character_offset].encode("utf-8")
+            )
+        else:
+            # Command-line/builtin macro spellings have no physical file.
+            # Preserve their compiler-reported line/column as a stable packed
+            # identity rather than dropping the spelling side.
+            spelling_byte_offset = (spelling_line << 32) | spelling_column
         candidates.append(
             _ExplicitTemplateCandidate(
                 line=line,
                 offset=byte_offset,
+                spelling_file=spelling_path,
+                spelling_offset=spelling_byte_offset,
                 statement=statement,
                 names_and_args=names_and_args,
             )
@@ -1827,8 +1922,11 @@ def _collect_explicit_template_findings(
     directory: Path,
     repo_root: Path,
     observation_context: str,
+    always_tokenize: bool = False,
 ) -> list[Finding]:
-    candidates = _explicit_template_candidates(path, arguments, directory)
+    candidates = _explicit_template_candidates(
+        path, arguments, directory, always_tokenize
+    )
     if not candidates:
         return []
     compiler = os.environ.get("ARKHAM_CLANGXX", "clang++")
@@ -1949,6 +2047,12 @@ def _collect_explicit_template_findings(
         if not forbidden:
             continue
         identity = ",".join(sorted(set(forbidden)))
+        try:
+            spelling_file = candidate.spelling_file.relative_to(
+                repo_root
+            ).as_posix()
+        except ValueError:
+            spelling_file = candidate.spelling_file.as_posix()
         findings.append(
             Finding(
                 file=relative,
@@ -1965,8 +2069,8 @@ def _collect_explicit_template_findings(
                 access=_CX_CXXInvalidAccessSpecifier,
                 linkage=_CXLinkage_External,
                 offset=candidate.offset,
-                spelling_file=relative,
-                spelling_offset=candidate.offset,
+                spelling_file=spelling_file,
+                spelling_offset=candidate.spelling_offset,
                 observation_context=observation_context,
                 body_surface=False,
             )
@@ -3711,7 +3815,7 @@ def _load_evaluated_link_contexts(
         link_usage = transitive_usage(graph, effective_direct)
         compile_usage = transitive_usage(
             graph,
-            set(graph[consumer]["compile_links"]),
+            effective_direct | set(graph[consumer]["compile_links"]),
             "compile_interface",
         )
         return link_usage | compile_usage
@@ -5185,6 +5289,7 @@ def _scan_sources(
                     context.directory,
                     repo_root,
                     active_observation_context,
+                    always_tokenize=True,
                 ):
                     explicit_key = (
                         active_observation_context,

@@ -637,15 +637,29 @@ function(arkham_write_encoder_hygiene_target_universe)
                 ${_arkham_ehu_discovery_target} LINK_LIBRARIES)
             get_target_property(_arkham_ehu_discovery_interface_links
                 ${_arkham_ehu_discovery_target} INTERFACE_LINK_LIBRARIES)
+            get_target_property(_arkham_ehu_discovery_direct
+                ${_arkham_ehu_discovery_target}
+                INTERFACE_LINK_LIBRARIES_DIRECT)
+            get_target_property(_arkham_ehu_discovery_exclude
+                ${_arkham_ehu_discovery_target}
+                INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE)
             if(NOT _arkham_ehu_discovery_links)
                 set(_arkham_ehu_discovery_links "")
             endif()
             if(NOT _arkham_ehu_discovery_interface_links)
                 set(_arkham_ehu_discovery_interface_links "")
             endif()
+            if(NOT _arkham_ehu_discovery_direct)
+                set(_arkham_ehu_discovery_direct "")
+            endif()
+            if(NOT _arkham_ehu_discovery_exclude)
+                set(_arkham_ehu_discovery_exclude "")
+            endif()
             foreach(_arkham_ehu_discovery_edge IN LISTS
                     _arkham_ehu_discovery_links
-                    _arkham_ehu_discovery_interface_links)
+                    _arkham_ehu_discovery_interface_links
+                    _arkham_ehu_discovery_direct
+                    _arkham_ehu_discovery_exclude)
                 string(REGEX MATCHALL
                     "[A-Za-z_][A-Za-z0-9_.+-]*(::[A-Za-z_][A-Za-z0-9_.+-]*)*"
                     _arkham_ehu_discovery_tokens
@@ -719,11 +733,22 @@ function(arkham_write_encoder_hygiene_target_universe)
             ${_arkham_ehu_graph_target} LINK_LIBRARIES)
         get_target_property(_arkham_ehu_graph_interface_links
             ${_arkham_ehu_graph_target} INTERFACE_LINK_LIBRARIES)
+        get_target_property(_arkham_ehu_graph_direct
+            ${_arkham_ehu_graph_target} INTERFACE_LINK_LIBRARIES_DIRECT)
+        get_target_property(_arkham_ehu_graph_exclude
+            ${_arkham_ehu_graph_target}
+            INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE)
         if(NOT _arkham_ehu_graph_links)
             set(_arkham_ehu_graph_links "")
         endif()
         if(NOT _arkham_ehu_graph_interface_links)
             set(_arkham_ehu_graph_interface_links "")
+        endif()
+        if(NOT _arkham_ehu_graph_direct)
+            set(_arkham_ehu_graph_direct "")
+        endif()
+        if(NOT _arkham_ehu_graph_exclude)
+            set(_arkham_ehu_graph_exclude "")
         endif()
         # TARGET_GENEX_EVAL evaluates link properties in link context, where
         # COMPILE_ONLY intentionally disappears. Emit a second, structurally
@@ -750,7 +775,10 @@ function(arkham_write_encoder_hygiene_target_universe)
             ARKHAM_ENCODER_HYGIENE_COMPILE_INTERFACE_LINKS
             "${_arkham_ehu_graph_compile_interface_links}")
         foreach(_arkham_ehu_raw_edge IN LISTS
-                _arkham_ehu_graph_links _arkham_ehu_graph_interface_links)
+                _arkham_ehu_graph_links
+                _arkham_ehu_graph_interface_links
+                _arkham_ehu_graph_direct
+                _arkham_ehu_graph_exclude)
             if(_arkham_ehu_raw_edge MATCHES "[|\n\r]")
                 message(FATAL_ERROR
                     "Encoder-hygiene link edge contains an unsupported metadata "

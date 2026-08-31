@@ -517,7 +517,22 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "};\n"
             "template<class T> int externalSpecialization() { return sizeof(T); }\n"
             "template<class T> int externalAlias() { return sizeof(T); }\n"
-            "template<class T> int externalSafe() { return sizeof(T); }\n",
+            "template<class T> int externalSafe() { return sizeof(T); }\n"
+            "template<class T> int macroFunction() { return sizeof(T); }\n"
+            "template<class T> int macroNested() { return sizeof(T); }\n"
+            "template<class T> struct MacroClass { T value; };\n"
+            "template<class T> struct MacroMember {\n"
+            "  static int run() { return sizeof(T); }\n"
+            "};\n"
+            "template<class T> int macroExtern() { return sizeof(T); }\n"
+            "template<class T> int macroSafe() { return sizeof(T); }\n"
+            "#define INSTANTIATE_FUNCTION(T) template int macroFunction<T>();\n"
+            "#define EXPAND_TYPE(T) T\n"
+            "#define INSTANTIATE_NESTED(T) template int macroNested<EXPAND_TYPE(T)>();\n"
+            "#define INSTANTIATE_CLASS(T) template class MacroClass<T>;\n"
+            "#define INSTANTIATE_MEMBER(T) template int MacroMember<T>::run();\n"
+            "#define DECLARE_EXTERN(T) extern template int macroExtern<T>();\n"
+            "#define INSTANTIATE_SAFE(T) template int macroSafe<T>();\n",
         )
         source = self._write(
             "ExternalInstantiations.cpp",
@@ -536,7 +551,15 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "template int externalFunction<int>();\n"
             "template int externalSafe<Safe>();\n"
             "// template int externalAlias<QJsonObject>();\n"
-            'static const char *text = R"(template int externalAlias<QJsonObject>();)";\n',
+            'static const char *text = R"(template int externalAlias<QJsonObject>();)";\n'
+            "INSTANTIATE_FUNCTION(QJsonObject)\n"
+            "INSTANTIATE_NESTED(QJsonObject)\n"
+            "INSTANTIATE_CLASS(\n"
+            "  QJsonObject\n"
+            ")\n"
+            "INSTANTIATE_MEMBER(QJsonObject)\n"
+            "DECLARE_EXTERN(QJsonObject)\n"
+            "INSTANTIATE_SAFE(Safe)\n",
         )
         violations, findings = self._scan_source_fixture(
             source,
@@ -556,7 +579,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             in finding.canonical_return_type
         ]
         self.assertEqual(
-            {finding.line for finding in explicit},
+            {finding.line for finding in explicit if finding.line < 17},
             {2, 3, 4, 5, 8, 9, 12, 13},
         )
         self.assertTrue(
@@ -567,7 +590,23 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             )
         )
         self.assertFalse(
-            any(finding.line in {14, 15, 16} for finding in explicit)
+            any(finding.line in {14, 15, 16, 24} for finding in explicit)
+        )
+        macro_expansions = [
+            finding for finding in explicit if finding.line >= 17
+        ]
+        self.assertEqual(
+            {finding.line for finding in macro_expansions},
+            {17, 18, 19, 22, 23},
+        )
+        self.assertTrue(
+            all(
+                finding.spelling_file.endswith(
+                    "system/ExternalTemplates.h"
+                )
+                and finding.spelling_offset != finding.offset
+                for finding in macro_expansions
+            )
         )
 
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
@@ -2164,8 +2203,20 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         )
         self._write("src/ConsumerOne.cpp", "int main() { return 0; }\n")
         self._write("src/ConsumerTwo.cpp", "int main() { return 0; }\n")
-        self._write("src/ConsumerDirect.cpp", "int main() { return 0; }\n")
-        self._write("src/ConsumerExcluded.cpp", "int main() { return 0; }\n")
+        self._write(
+            "src/ConsumerDirect.cpp",
+            "#ifndef COMPILE_CONTEXT_ENCODER\n"
+            '#error "DIRECT-injected plugin lost nested COMPILE_ONLY usage"\n'
+            "#endif\n"
+            "int main() { return 0; }\n",
+        )
+        self._write(
+            "src/ConsumerExcluded.cpp",
+            "#ifdef COMPILE_CONTEXT_ENCODER\n"
+            '#error "DIRECT_EXCLUDE did not remove injected compile usage"\n'
+            "#endif\n"
+            "int main() { return 0; }\n",
+        )
         self._write(
             "src/ConsumerCompile.cpp",
             "#ifndef COMPILE_CONTEXT_ENCODER\n"
@@ -2211,20 +2262,24 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_executable(consumer_two src/ConsumerTwo.cpp)\n"
             + "target_link_libraries(consumer_two PRIVATE wire_interface)\n"
             + "target_compile_definitions(consumer_two PRIVATE CONSUMER_TWO_ENCODER)\n"
+            + "add_library(ImportedDirectPlugin INTERFACE IMPORTED)\n"
+            + 'set_property(TARGET ImportedDirectPlugin PROPERTY INTERFACE_LINK_LIBRARIES "$<$<BOOL:$<TARGET_PROPERTY:ENABLE_PLUGIN_WIRE>>:$<COMPILE_ONLY:wire_interface>>")\n'
             + "add_library(direct_provider INTERFACE)\n"
-            + 'set_property(TARGET direct_provider PROPERTY INTERFACE_LINK_LIBRARIES_DIRECT "$<$<BOOL:$<TARGET_PROPERTY:ENABLE_DIRECT>>:wire_interface>")\n'
+            + 'set_property(TARGET direct_provider PROPERTY INTERFACE_LINK_LIBRARIES_DIRECT "$<$<BOOL:$<TARGET_PROPERTY:ENABLE_DIRECT>>:ImportedDirectPlugin>")\n'
             + "add_library(direct_bridge INTERFACE)\n"
             + "target_link_libraries(direct_bridge INTERFACE direct_provider)\n"
             + "add_executable(consumer_direct src/ConsumerDirect.cpp)\n"
             + "target_link_libraries(consumer_direct PRIVATE direct_bridge)\n"
             + "set_property(TARGET consumer_direct PROPERTY ENABLE_DIRECT TRUE)\n"
+            + "set_property(TARGET consumer_direct PROPERTY ENABLE_PLUGIN_WIRE TRUE)\n"
             + "target_compile_definitions(consumer_direct PRIVATE DIRECT_ENCODER)\n"
             + "add_library(exclude_provider INTERFACE)\n"
             + "target_link_libraries(exclude_provider INTERFACE direct_provider)\n"
-            + 'set_property(TARGET exclude_provider PROPERTY INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE "$<$<BOOL:$<TARGET_PROPERTY:DISABLE_DIRECT>>:wire_interface>")\n'
+            + 'set_property(TARGET exclude_provider PROPERTY INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE "$<$<BOOL:$<TARGET_PROPERTY:DISABLE_DIRECT>>:ImportedDirectPlugin>")\n'
             + "add_executable(consumer_excluded src/ConsumerExcluded.cpp)\n"
             + "target_link_libraries(consumer_excluded PRIVATE exclude_provider)\n"
             + "set_property(TARGET consumer_excluded PROPERTY ENABLE_DIRECT TRUE)\n"
+            + "set_property(TARGET consumer_excluded PROPERTY ENABLE_PLUGIN_WIRE TRUE)\n"
             + "set_property(TARGET consumer_excluded PROPERTY DISABLE_DIRECT TRUE)\n"
             + "target_compile_definitions(consumer_excluded PRIVATE EXCLUDED_ENCODER)\n"
             + "add_library(compile_provider INTERFACE)\n"
@@ -2343,6 +2398,12 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         safe_contexts = ceh._compile_contexts_for_source(
             commands, self.root / "src/ConsumerCompileSafe.cpp"
         )
+        direct_contexts = ceh._compile_contexts_for_source(
+            commands, self.root / "src/ConsumerDirect.cpp"
+        )
+        excluded_contexts = ceh._compile_contexts_for_source(
+            commands, self.root / "src/ConsumerExcluded.cpp"
+        )
         self.assertTrue(
             all(
                 "-DCOMPILE_CONTEXT_ENCODER" in context.arguments
@@ -2353,6 +2414,18 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             all(
                 "-DCOMPILE_CONTEXT_ENCODER" not in context.arguments
                 for context in safe_contexts
+            )
+        )
+        self.assertTrue(
+            all(
+                "-DCOMPILE_CONTEXT_ENCODER" in context.arguments
+                for context in direct_contexts
+            )
+        )
+        self.assertTrue(
+            all(
+                "-DCOMPILE_CONTEXT_ENCODER" not in context.arguments
+                for context in excluded_contexts
             )
         )
         stale = (
