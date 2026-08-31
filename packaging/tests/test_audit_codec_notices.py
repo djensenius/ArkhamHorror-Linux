@@ -3785,7 +3785,15 @@ class RealArchiveDownloadAndExtractionTests(unittest.TestCase):
         return None
 
     def test_download_and_hash_returns_none_when_apt_get_missing(self) -> None:
-        with mock.patch.object(audit.shutil, "which", return_value=None):
+        # apt-get missing AND the Launchpad snapshot fallback (see
+        # LaunchpadArchiveFallbackTests below) also honestly cannot
+        # verify here (mocked so this test never depends on real
+        # network availability) -- overall result must be None.
+        with mock.patch.object(
+            audit.shutil, "which", return_value=None
+        ), mock.patch.object(
+            audit, "_download_and_hash_deb_archive_via_launchpad", return_value=None
+        ):
             self.assertIsNone(
                 audit._download_and_hash_deb_archive.__wrapped__(
                     "zlib1g", "1:1.2.11-1", "amd64"
@@ -3801,6 +3809,8 @@ class RealArchiveDownloadAndExtractionTests(unittest.TestCase):
             return_value=subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr="404 Not Found"
             ),
+        ), mock.patch.object(
+            audit, "_download_and_hash_deb_archive_via_launchpad", return_value=None
         ):
             self.assertIsNone(
                 audit._download_and_hash_deb_archive.__wrapped__(
@@ -3822,12 +3832,57 @@ class RealArchiveDownloadAndExtractionTests(unittest.TestCase):
 
         with mock.patch.object(
             audit.shutil, "which", return_value="/usr/bin/apt-get"
-        ), mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+        ), mock.patch.object(
+            audit.subprocess, "run", side_effect=fake_run
+        ), mock.patch.object(
+            audit, "_download_and_hash_deb_archive_via_launchpad", return_value=None
+        ):
             self.assertIsNone(
                 audit._download_and_hash_deb_archive.__wrapped__(
                     "zlib1g", "1:1.2.11-1", "amd64"
                 )
             )
+
+    def test_download_and_hash_falls_back_to_launchpad_when_apt_get_download_fails(
+        self,
+    ) -> None:
+        # Round-N+ review ("no signed snapshot ... locked .deb SHA is
+        # copied from apt metadata"): reproduces the real production
+        # failure this project's own CI hit -- the live apt mirror no
+        # longer serves the exact pre-installed version (superseded by
+        # a newer security upload) -- and proves the Launchpad snapshot
+        # fallback is actually exercised and its result is what gets
+        # returned, not silently ignored.
+        fake_deb_path = Path(tempfile.mkdtemp()) / "libblkid1_2.37.2-4ubuntu3.5_amd64.deb"
+        fake_deb_path.write_bytes(b"real-launchpad-archive-bytes")
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/apt-get"
+        ), mock.patch.object(
+            audit.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="404  Not Found"
+            ),
+        ), mock.patch.object(
+            audit,
+            "_download_and_hash_deb_archive_via_launchpad",
+            return_value=(
+                fake_deb_path,
+                hashlib.sha256(b"real-launchpad-archive-bytes").hexdigest(),
+            ),
+        ) as fake_launchpad:
+            result = audit._download_and_hash_deb_archive.__wrapped__(
+                "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
+            )
+        fake_launchpad.assert_called_once_with(
+            "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
+        )
+        self.assertIsNotNone(result)
+        deb_path, deb_sha256 = result
+        self.assertEqual(deb_path, fake_deb_path)
+        self.assertEqual(
+            deb_sha256, hashlib.sha256(b"real-launchpad-archive-bytes").hexdigest()
+        )
 
     def test_download_and_hash_returns_our_own_sha256_of_downloaded_bytes(
         self,
@@ -4056,6 +4111,209 @@ class RealArchiveDownloadAndExtractionTests(unittest.TestCase):
             hashlib.sha256(extracted).hexdigest(),
             hashlib.sha256(libz_path.read_bytes()).hexdigest(),
         )
+
+
+class LaunchpadArchiveFallbackTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "distro provenance ... no signed
+    snapshot"): a real, currently-enabled apt mirror only ever serves
+    whatever exact version is its CURRENT candidate -- Ubuntu's own
+    archive routinely supersedes and prunes an older patch version's
+    real `.deb` within roughly a day of a newer security upload, even
+    though that older version is very often still the one actually
+    pre-installed on a not-yet-refreshed CI runner image. This project's
+    own real CI hit exactly that race for libblkid1/libmount1/libuuid1
+    (all from source package util-linux): Launchpad's own publishing
+    history confirmed those exact binaries were marked "Superseded"
+    mere hours before the run. _download_and_hash_deb_archive_via_
+    launchpad() is the pinned, queryable snapshot fallback for that gap
+    -- these tests cover its mocked API/build/file-download plumbing
+    end-to-end (deterministic, no network dependency), plus one real
+    network smoke test proving the real API actually resolves this
+    project's own pinned libblkid1 version to the identical bytes
+    packaging/distro_package_lock.json already governs."""
+
+    class _JsonResponse:
+        def __init__(self, payload: object) -> None:
+            self._body = json.dumps(payload).encode()
+
+        def __enter__(self) -> "LaunchpadArchiveFallbackTests._JsonResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self._body
+
+    class _BytesResponse:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self) -> "LaunchpadArchiveFallbackTests._BytesResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self._body
+
+    def _fake_urlopen_for(self, deb_bytes: bytes):
+        api_prefix = "https://api.launchpad.net/1.0/ubuntu/+archive/primary?"
+        build_link = "https://api.launchpad.net/1.0/~ubuntu-security/+build/1"
+        build_web_link = "https://launchpad.net/~ubuntu-security/+build/1"
+
+        def fake_urlopen(url: str, timeout: float | None = None):
+            if url.startswith(api_prefix):
+                return self._JsonResponse(
+                    {
+                        "entries": [
+                            {
+                                "distro_arch_series_link": "https://api.launchpad.net/1.0/ubuntu/jammy/s390x",
+                                "build_link": "https://api.launchpad.net/1.0/~ubuntu-security/+build/wrong-arch",
+                            },
+                            {
+                                "distro_arch_series_link": "https://api.launchpad.net/1.0/ubuntu/jammy/amd64",
+                                "build_link": build_link,
+                            },
+                        ]
+                    }
+                )
+            if url == build_link:
+                return self._JsonResponse({"web_link": build_web_link})
+            if url == f"{build_web_link}/+files/libblkid1_2.37.2-4ubuntu3.5_amd64.deb":
+                return self._BytesResponse(deb_bytes)
+            raise AssertionError(f"unexpected urlopen({url!r})")
+
+        return fake_urlopen
+
+    def test_returns_none_for_a_distribution_with_no_series_mapping(self) -> None:
+        with mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={"distribution": "debian-99", "packages": {}},
+        ):
+            self.assertIsNone(
+                audit._launchpad_series_for_distro_package_lock()
+            )
+        with mock.patch.object(
+            audit,
+            "_launchpad_series_for_distro_package_lock",
+            return_value=None,
+        ):
+            self.assertIsNone(
+                audit._download_and_hash_deb_archive_via_launchpad.__wrapped__(
+                    "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
+                )
+            )
+
+    def test_maps_the_pinned_lock_distribution_to_its_launchpad_series(self) -> None:
+        self.assertEqual(
+            audit._launchpad_series_for_distro_package_lock(), "jammy"
+        )
+
+    def test_finds_the_matching_architecture_build_and_downloads_the_real_bytes(
+        self,
+    ) -> None:
+        deb_bytes = b"real-immutable-launchpad-archive-bytes"
+        with mock.patch.object(
+            audit, "_launchpad_series_for_distro_package_lock", return_value="jammy"
+        ), mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            side_effect=self._fake_urlopen_for(deb_bytes),
+        ):
+            result = audit._download_and_hash_deb_archive_via_launchpad.__wrapped__(
+                "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
+            )
+        self.assertIsNotNone(result)
+        deb_path, deb_sha256 = result
+        self.assertEqual(deb_path.read_bytes(), deb_bytes)
+        self.assertEqual(deb_sha256, hashlib.sha256(deb_bytes).hexdigest())
+
+    def test_returns_none_when_no_entry_matches_the_requested_architecture(
+        self,
+    ) -> None:
+        def fake_urlopen(url: str, timeout: float | None = None):
+            return self._JsonResponse(
+                {
+                    "entries": [
+                        {
+                            "distro_arch_series_link": "https://api.launchpad.net/1.0/ubuntu/jammy/s390x",
+                            "build_link": "https://api.launchpad.net/1.0/~x/+build/1",
+                        }
+                    ]
+                }
+            )
+
+        with mock.patch.object(
+            audit, "_launchpad_series_for_distro_package_lock", return_value="jammy"
+        ), mock.patch.object(
+            audit.urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            self.assertIsNone(
+                audit._download_and_hash_deb_archive_via_launchpad.__wrapped__(
+                    "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
+                )
+            )
+
+    def test_returns_none_on_any_network_failure(self) -> None:
+        with mock.patch.object(
+            audit, "_launchpad_series_for_distro_package_lock", return_value="jammy"
+        ), mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            side_effect=OSError("network unreachable"),
+        ):
+            self.assertIsNone(
+                audit._download_and_hash_deb_archive_via_launchpad.__wrapped__(
+                    "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
+                )
+            )
+
+    def test_returns_none_on_malformed_json_response(self) -> None:
+        class _BadResponse:
+            def __enter__(self) -> "_BadResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"not-json"
+
+        with mock.patch.object(
+            audit, "_launchpad_series_for_distro_package_lock", return_value="jammy"
+        ), mock.patch.object(
+            audit.urllib.request, "urlopen", return_value=_BadResponse()
+        ):
+            self.assertIsNone(
+                audit._download_and_hash_deb_archive_via_launchpad.__wrapped__(
+                    "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
+                )
+            )
+
+    def test_real_network_finds_the_exact_pinned_libblkid1_bytes(self) -> None:
+        # Real end-to-end proof (no mocks): resolves this project's own
+        # already-pinned libblkid1 version against the REAL Launchpad
+        # API and confirms the downloaded archive's sha256 matches
+        # packaging/distro_package_lock.json's own governed pin --
+        # gracefully skipped without network egress, matching this
+        # module's own established convention for real-network tests.
+        lock = audit._load_distro_package_lock()
+        locked_entry = lock["packages"].get("libblkid1")
+        if not isinstance(locked_entry, dict):
+            self.skipTest("no pinned libblkid1 entry in distro_package_lock.json")
+        result = audit._download_and_hash_deb_archive_via_launchpad(
+            "libblkid1", locked_entry["version"], locked_entry["architecture"]
+        )
+        if result is None:
+            self.skipTest(
+                "real Launchpad API/download did not succeed in this "
+                "environment (offline sandbox/no network egress)"
+            )
+        _deb_path, deb_sha256 = result
+        self.assertEqual(deb_sha256, locked_entry["debSha256"])
 
 
 class CaptureBeforePackagingProvenanceTests(unittest.TestCase):

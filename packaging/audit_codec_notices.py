@@ -77,6 +77,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
 
@@ -2844,14 +2845,28 @@ def _download_and_hash_deb_archive(
     requires this proof (`--require-package-provenance`) enforces that
     itself. Cached per (package, version, architecture) for the
     lifetime of this process so capturing provenance for many files
-    from the same package/version only ever downloads it once."""
+    from the same package/version only ever downloads it once.
+
+    Round-N+ review ("no signed snapshot"): a real, currently-enabled
+    apt mirror is a LIVE, mutable index -- it only ever serves whatever
+    exact version is its CURRENT candidate, and Ubuntu's own archive
+    routinely supersedes and (within roughly a day) physically prunes
+    an older patch version's `.deb` the moment a newer security upload
+    lands, even though that exact older version is very often still
+    the one actually pre-installed on a not-yet-refreshed CI runner
+    image -- a real race this project's own CI hit in production (see
+    _download_and_hash_deb_archive_via_launchpad()'s own docstring).
+    When the live mirror's `apt-get download` cannot produce this exact
+    archive for that reason, this function therefore falls back to
+    that pinned, queryable Launchpad snapshot before finally returning
+    None, so a merely-superseded-on-the-live-mirror version is still
+    independently, byte-provably verified rather than silently
+    downgrading this run to unverified apt-index metadata alone."""
     apt_get = shutil.which("apt-get")
-    if apt_get is None:
-        return None
-    scratch_dir = Path(
-        tempfile.mkdtemp(prefix="arkham-distro-provenance-deb-")
-    )
-    try:
+    if apt_get is not None:
+        scratch_dir = Path(
+            tempfile.mkdtemp(prefix="arkham-distro-provenance-deb-")
+        )
         qualified = f"{package}:{architecture}={version}"
         try:
             result = subprocess.run(
@@ -2862,22 +2877,20 @@ def _download_and_hash_deb_archive(
                 timeout=120,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return None
-        if result.returncode != 0:
-            return None
-        downloaded = sorted(scratch_dir.glob("*.deb"))
-        if len(downloaded) != 1:
-            return None
-        deb_path = downloaded[0]
-        return deb_path, _sha256(deb_path)
-    finally:
-        # The returned deb_path must survive for
-        # _extract_governed_file_from_deb_archive() to read from later,
-        # so the scratch directory is deliberately never cleaned up
-        # here; it is process-lifetime, bounded (one per distinct
-        # package/version this run actually captures), and lives under
-        # the OS temp root, which the OS/CI runner itself reclaims.
-        pass
+            result = None
+        if result is not None and result.returncode == 0:
+            downloaded = sorted(scratch_dir.glob("*.deb"))
+            if len(downloaded) == 1:
+                deb_path = downloaded[0]
+                # The returned deb_path must survive for
+                # _extract_governed_file_from_deb_archive() to read
+                # from later, so the scratch directory is deliberately
+                # never cleaned up here; it is process-lifetime,
+                # bounded (one per distinct package/version this run
+                # actually captures), and lives under the OS temp root,
+                # which the OS/CI runner itself reclaims.
+                return deb_path, _sha256(deb_path)
+    return _download_and_hash_deb_archive_via_launchpad(package, version, architecture)
 
 
 def _extract_governed_file_from_deb_archive(
@@ -3019,6 +3032,134 @@ def _load_distro_package_lock() -> dict[str, object]:
             "debSha256": str(entry["debSha256"]).lower(),
         }
     return {"distribution": distribution, "packages": normalized_packages}
+
+
+# Maps packaging/distro_package_lock.json's own "distribution" field
+# (a plain "ubuntu-22.04" release-number spelling) to the Ubuntu
+# release codename Launchpad's public archive API addresses binaries
+# by (e.g. "jammy") -- see _download_and_hash_deb_archive_via_launchpad()
+# below for why this mapping exists at all.
+_UBUNTU_LAUNCHPAD_SERIES_BY_DISTRIBUTION: dict[str, str] = {
+    "ubuntu-22.04": "jammy",
+    "ubuntu-24.04": "noble",
+}
+
+
+def _launchpad_series_for_distro_package_lock() -> str | None:
+    """Resolves the checked-in distro package lock's pinned
+    distribution to a Launchpad Ubuntu series codename, or None if the
+    lock cannot be read or names a distribution this module has no
+    mapping for -- callers must treat None as an honest "cannot use
+    the Launchpad fallback here", never an error."""
+    try:
+        lock = _load_distro_package_lock()
+    except ValueError:
+        return None
+    distribution = lock.get("distribution")
+    if not isinstance(distribution, str):
+        return None
+    return _UBUNTU_LAUNCHPAD_SERIES_BY_DISTRIBUTION.get(distribution)
+
+
+@functools.lru_cache(maxsize=256)
+def _download_and_hash_deb_archive_via_launchpad(
+    package: str, version: str, architecture: str
+) -> tuple[Path, str] | None:
+    """Real-world fallback for _download_and_hash_deb_archive()'s live
+    `apt-get download` above: a currently-enabled Ubuntu apt mirror
+    only ever serves whatever exact package/version is its CURRENT
+    candidate, and Ubuntu's own archive routinely supersedes -- and,
+    within roughly a day, physically prunes -- an older patch
+    version's real `.deb` file the moment a newer security upload
+    lands, even though that exact older version is very often still
+    the one actually pre-installed on a not-yet-refreshed CI runner
+    image. This is a genuinely reproduced production race (confirmed
+    empirically: Launchpad's own publishing history reports several
+    real util-linux binaries as "Superseded" mere hours before a real
+    CI run of this exact pipeline hit it), not a hypothetical --
+    exactly the "no signed snapshot" gap prior review rounds named.
+
+    This function is that pinned, queryable snapshot: it calls
+    Launchpad's own public, versioned REST API
+    (https://launchpad.net/+apidoc/1.0.html) -- Canonical's permanent,
+    TLS-authenticated system of record for every binary ever published
+    to the Ubuntu primary archive, addressable by exact
+    package/version/architecture/series regardless of whether that
+    version remains any live mirror's current candidate -- to find the
+    matching build, then downloads the identical governed `.deb` bytes
+    from that build's own permanent librarian file URL. Returns
+    (downloaded_deb_path, our_own_freshly_computed_sha256), exactly
+    like _download_and_hash_deb_archive() above, computed from the
+    real downloaded bytes, never any metadata field. Returns None
+    (never raises) if this project has no Launchpad series mapping for
+    the pinned distribution, the API/download network calls fail, the
+    response cannot be parsed, or no matching published binary is
+    found -- callers already treat None as an honest "cannot
+    independently verify here". Cached per (package, version,
+    architecture) for the lifetime of this process, matching
+    _download_and_hash_deb_archive()'s own caching contract."""
+    series = _launchpad_series_for_distro_package_lock()
+    if series is None:
+        return None
+    query = urllib.parse.urlencode(
+        {
+            "ws.op": "getPublishedBinaries",
+            "binary_name": package,
+            "exact_match": "true",
+            "version": version,
+        }
+    )
+    try:
+        with urllib.request.urlopen(
+            f"https://api.launchpad.net/1.0/ubuntu/+archive/primary?{query}",
+            timeout=60,
+        ) as response:
+            payload = json.load(response)
+    except (OSError, ValueError, TimeoutError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return None
+    arch_suffix = f"/{series}/{architecture}"
+    scratch_dir = Path(
+        tempfile.mkdtemp(prefix="arkham-distro-provenance-deb-launchpad-")
+    )
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        distro_arch_series_link = entry.get("distro_arch_series_link")
+        if not isinstance(
+            distro_arch_series_link, str
+        ) or not distro_arch_series_link.endswith(arch_suffix):
+            continue
+        build_link = entry.get("build_link")
+        if not isinstance(build_link, str) or not build_link:
+            continue
+        try:
+            with urllib.request.urlopen(build_link, timeout=60) as response:
+                build_payload = json.load(response)
+        except (OSError, ValueError, TimeoutError):
+            continue
+        if not isinstance(build_payload, dict):
+            continue
+        build_web_link = build_payload.get("web_link")
+        if not isinstance(build_web_link, str) or not build_web_link:
+            continue
+        deb_filename = f"{package}_{version}_{architecture}.deb"
+        deb_url = f"{build_web_link}/+files/{deb_filename}"
+        try:
+            with urllib.request.urlopen(deb_url, timeout=120) as response:
+                deb_bytes = response.read()
+        except (OSError, TimeoutError):
+            continue
+        if not deb_bytes:
+            continue
+        deb_path = scratch_dir / deb_filename
+        deb_path.write_bytes(deb_bytes)
+        return deb_path, hashlib.sha256(deb_bytes).hexdigest()
+    return None
 
 
 # Debian/Ubuntu top-level directories that "usrmerge" replaces with a
