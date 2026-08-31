@@ -549,7 +549,18 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "  QJsonObject value;\n"
             "  return sizeof(T) + sizeof(value);\n"
             "}\n"
-            "template<class T> struct HiddenSafe { T value; };\n",
+            "template<class T> struct HiddenSafe { T value; };\n"
+            "template<class T> int macroSpecialFunction() { return sizeof(T); }\n"
+            "template<class T> int macroSpecialNested() { return sizeof(T); }\n"
+            "template<class T> struct MacroSpecialClass { T value; };\n"
+            "template<class T> struct MacroSpecialMember { static int run(); };\n"
+            "template<class T> struct MacroSpecialSafe { T value; };\n"
+            "#define SPECIALIZE_FUNCTION(T) template <> int macroSpecialFunction<T>() { return 0; }\n"
+            "#define SPECIALIZE_ARGUMENT(T) T\n"
+            "#define SPECIALIZE_NESTED(T) template <> int macroSpecialNested<SPECIALIZE_ARGUMENT(T)>() { return 0; }\n"
+            "#define SPECIALIZE_CLASS(T) template <> struct MacroSpecialClass<T> { T value; };\n"
+            "#define SPECIALIZE_MEMBER(T) template <> int MacroSpecialMember<T>::run() { return 0; }\n"
+            "#define SPECIALIZE_SAFE(T) template <> struct MacroSpecialSafe<T> { T value; };\n",
         )
         source = self._write(
             "ExternalInstantiations.cpp",
@@ -584,7 +595,14 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "template class HiddenConversions<int>;\n"
             "template QJsonObject HiddenMember<int>::result();\n"
             "template int hiddenBody<int>();\n"
-            "template class HiddenSafe<int>;\n",
+            "template class HiddenSafe<int>;\n"
+            "SPECIALIZE_FUNCTION(QJsonObject)\n"
+            "SPECIALIZE_CLASS(QJsonObject)\n"
+            "SPECIALIZE_MEMBER(\n"
+            "  QJsonObject\n"
+            ")\n"
+            "SPECIALIZE_NESTED(QJsonObject)\n"
+            "SPECIALIZE_SAFE(Safe)\n",
         )
         violations, findings = self._scan_source_fixture(
             source,
@@ -643,6 +661,15 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             },
             {25, 26, 27, 28, 29, 30, 31},
         )
+        self.assertEqual(
+            {
+                finding.line
+                for finding in explicit
+                if 33 <= finding.line <= 38
+            },
+            {33, 34, 35, 38},
+        )
+        self.assertFalse(any(finding.line == 39 for finding in explicit))
 
     def test_header_macro_explicit_instantiations_preserve_both_locations(
         self,
@@ -666,7 +693,15 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "#define HEADER_CLASS(T) template class HeaderClass<T>;\n"
             "#define HEADER_MEMBER(T) template int HeaderMember<T>::run();\n"
             "#define HEADER_EXTERN(T) extern template int headerExtern<T>();\n"
-            "#define HEADER_SAFE(T) template int headerSafe<T>();\n",
+            "#define HEADER_SAFE(T) template int headerSafe<T>();\n"
+            "template<class T> int headerSpecialFunction() { return sizeof(T); }\n"
+            "template<class T> struct HeaderSpecialClass { T value; };\n"
+            "template<class T> struct HeaderSpecialMember { static int run(); };\n"
+            "template<class T> struct HeaderSpecialSafe { T value; };\n"
+            "#define HEADER_SPECIAL_FUNCTION(T) template <> int headerSpecialFunction<T>() { return 0; }\n"
+            "#define HEADER_SPECIAL_CLASS(T) template <> struct HeaderSpecialClass<T> { T value; };\n"
+            "#define HEADER_SPECIAL_MEMBER(T) template <> int HeaderSpecialMember<T>::run() { return 0; }\n"
+            "#define HEADER_SPECIAL_SAFE(T) template <> struct HeaderSpecialSafe<T> { T value; };\n",
         )
         header = self._write(
             "HeaderMacroInstantiations.h",
@@ -678,7 +713,13 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             ")\n"
             "HEADER_EXTERN(QJsonObject)\n"
             "HEADER_NESTED(QJsonObject)\n"
-            "HEADER_SAFE(Safe)\n",
+            "HEADER_SAFE(Safe)\n"
+            "HEADER_SPECIAL_FUNCTION(QJsonObject)\n"
+            "HEADER_SPECIAL_CLASS(QJsonObject)\n"
+            "HEADER_SPECIAL_MEMBER(\n"
+            "  QJsonObject\n"
+            ")\n"
+            "HEADER_SPECIAL_SAFE(Safe)\n",
         )
         findings, violations = self._scan_header_fixture(
             header,
@@ -699,7 +740,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         ]
         self.assertEqual(
             {finding.line for finding in explicit},
-            {2, 3, 4, 7, 8},
+            {2, 3, 4, 7, 8, 10, 11, 12},
         )
         self.assertTrue(
             all(
@@ -711,7 +752,135 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
                 for finding in explicit
             )
         )
-        self.assertFalse(any(finding.line == 9 for finding in explicit))
+        self.assertFalse(
+            any(finding.line in {9, 15} for finding in explicit)
+        )
+
+    def test_specialization_identity_is_qualified_across_same_named_records(
+        self,
+    ) -> None:
+        system_header = self._write(
+            "system/QualifiedTemplates.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "namespace safe {\n"
+            "template<class T> struct Box { T value; };\n"
+            "template<class T> int function() { return sizeof(T); }\n"
+            "using Wire = long;\n"
+            "template<class T> struct AliasBox { T value; };\n"
+            "}\n"
+            "namespace dangerous {\n"
+            "struct WireBase { QJsonObject value; };\n"
+            "template<class T> struct Box : WireBase {};\n"
+            "template<class T> QJsonObject function() { return {}; }\n"
+            "using Wire = QJsonObject;\n"
+            "template<class T> struct AliasBox { T value; };\n"
+            "}\n"
+            "namespace nested { struct Outer {\n"
+            "  template<class T> struct Box { QJsonObject value; };\n"
+            "}; }\n",
+        )
+        source = self._write(
+            "QualifiedInstantiations.cpp",
+            "#include <QualifiedTemplates.h>\n"
+            "template class safe::Box<int>;\n"
+            "template class dangerous::Box<int>;\n"
+            "template class nested::Outer::Box<int>;\n"
+            "template int safe::function<long>();\n"
+            "template QJsonObject dangerous::function<long>();\n"
+            "template class safe::AliasBox<safe::Wire>;\n"
+            "template class dangerous::AliasBox<dangerous::Wire>;\n",
+        )
+        violations, findings = self._scan_source_fixture(
+            source,
+            frozenset(),
+            arguments=(
+                "-std=c++23",
+                "-isystem",
+                str(system_header.parent),
+            ),
+            external_roots=frozenset({system_header.parent.resolve()}),
+        )
+        self.assertEqual(violations, [])
+        explicit = [
+            finding
+            for finding in findings
+            if "kind=explicit-template-instantiation"
+            in finding.canonical_return_type
+        ]
+        self.assertEqual(
+            {finding.line for finding in explicit},
+            {3, 4, 6, 8},
+            [(finding.line, finding.canonical_return_type) for finding in explicit],
+        )
+        self.assertFalse(
+            any(finding.line in {2, 5, 7} for finding in explicit)
+        )
+        by_line = {finding.line: finding for finding in explicit}
+        self.assertIn("dangerous::Box", by_line[3].canonical_return_type)
+        self.assertIn(
+            "nested::Outer::Box", by_line[4].canonical_return_type
+        )
+        self.assertIn(
+            "_ZN9dangerous8function", by_line[6].canonical_return_type
+        )
+        self.assertIn(
+            "dangerous::AliasBox", by_line[8].canonical_return_type
+        )
+
+    def test_owned_generated_fragment_macro_specializations_are_audited(
+        self,
+    ) -> None:
+        system_header = self._write(
+            "system/GeneratedTemplateMacros.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "struct Safe {};\n"
+            "template<class T> int generatedFunction() { return sizeof(T); }\n"
+            "template<class T> struct GeneratedClass { T value; };\n"
+            "template<class T> struct GeneratedSafe { T value; };\n"
+            "#define GENERATED_FUNCTION(T) template <> int generatedFunction<T>() { return 0; }\n"
+            "#define GENERATED_CLASS(T) template <> struct GeneratedClass<T> { T value; };\n"
+            "#define GENERATED_SAFE(T) template <> struct GeneratedSafe<T> { T value; };\n",
+        )
+        fragment = self._write(
+            "generated/Owned.moc",
+            "#include <GeneratedTemplateMacros.h>\n"
+            "GENERATED_FUNCTION(QJsonObject)\n"
+            "GENERATED_CLASS(QJsonObject)\n"
+            "GENERATED_SAFE(Safe)\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            fragment,
+            frozenset({fragment.resolve()}),
+            external_roots=frozenset({system_header.parent.resolve()}),
+            arguments=(
+                "-std=c++23",
+                "-isystem",
+                str(system_header.parent),
+            ),
+        )
+        self.assertEqual(violations, [])
+        explicit = [
+            finding
+            for finding in findings
+            if "kind=explicit-template-instantiation"
+            in finding.canonical_return_type
+        ]
+        self.assertEqual(
+            {finding.line for finding in explicit},
+            {2, 3},
+        )
+        self.assertFalse(any(finding.line == 4 for finding in explicit))
+        self.assertTrue(
+            all(
+                finding.file == "generated/Owned.moc"
+                and finding.spelling_file.endswith(
+                    "system/GeneratedTemplateMacros.h"
+                )
+                for finding in explicit
+            )
+        )
 
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
         source = self._write(

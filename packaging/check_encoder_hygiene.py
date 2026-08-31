@@ -175,7 +175,11 @@ an ever-growing fragment of C++ parsing by hand:
     per-context treatment. Matching specialization nodes are then traversed
     through their complete instantiated signature, body declarations,
     fields, bases, constructors, conversions, aliases, and members rather
-    than accepting a safe-looking template argument list alone.
+    than accepting a safe-looking template argument list alone. Matching and
+    recursive record resolution use Clang's mangled/canonical node identity
+    plus fully qualified semantic declaration contexts, so same-named
+    templates or aliases in different namespaces cannot contaminate one
+    another.
     Every numeric cursor kind used here is checked against the installed
     libclang's own clang_getCursorKindSpelling result at startup.
   - A declaration is a *violation* if any semantic type component is in
@@ -1675,11 +1679,6 @@ _EXPLICIT_TEMPLATE_START = _re.compile(
     r"(?m)^[ \t]*(?:extern[ \t]+template(?![ \t]*<)[ \t]+|"
     r"template[ \t]*<[ \t]*>|template(?![ \t]*<)[ \t]+)"
 )
-_EXPLICIT_INSTANTIATION_START = _re.compile(
-    r"(?m)^[ \t]*(?:extern[ \t]+)?template(?![ \t]*<)[ \t]+"
-)
-
-
 def _split_template_arguments(value: str) -> tuple[str, ...]:
     arguments: list[str] = []
     start = 0
@@ -1700,7 +1699,10 @@ def _template_names_and_arguments(
     statement: str,
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     result: list[tuple[str, tuple[str, ...]]] = []
-    for match in _re.finditer(r"([A-Za-z_]\w*)[ \t]*<", statement):
+    for match in _re.finditer(
+        r"((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)[ \t]*<",
+        statement,
+    ):
         name = match.group(1)
         if name == "template":
             continue
@@ -1768,7 +1770,7 @@ def _explicit_template_candidates(
             if active_file == path.resolve():
                 active_text.append(output_line)
         if (
-            _EXPLICIT_INSTANTIATION_START.search(
+            _EXPLICIT_TEMPLATE_START.search(
                 "\n".join(active_text)
             )
             is None
@@ -1878,7 +1880,9 @@ def _explicit_template_candidates(
                 paren_depth -= 1
             elif current in {";", "{"} and angle_depth == 0 and paren_depth == 0:
                 break
-        statement = " ".join(statement_tokens)
+        statement = _re.sub(
+            r"\s*::\s*", "::", " ".join(statement_tokens)
+        )
         names_and_args = _template_names_and_arguments(statement)
         if not names_and_args:
             raise EncoderHygieneError(
@@ -1943,98 +1947,306 @@ def _collect_explicit_template_findings(
     if not candidates:
         return []
     compiler = os.environ.get("ARKHAM_CLANGXX", "clang++")
-    command = [
-        compiler,
-        *arguments,
-        "-Xclang",
-        "-ast-dump=json",
-        "-fsyntax-only",
-        "-x",
-        "c++",
-        str(path),
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=directory,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        raise EncoderHygieneError(
-            f"Compiler AST dump failed while resolving explicit template "
-            f"instantiations in {path}:\n{completed.stderr}"
+    ignored_type_names = {
+        "auto",
+        "bool",
+        "char",
+        "const",
+        "double",
+        "float",
+        "int",
+        "long",
+        "short",
+        "signed",
+        "unsigned",
+        "void",
+        "volatile",
+    }
+    root_filters = {
+        name
+        for candidate in candidates
+        for name, _arguments in candidate.names_and_args
+    }
+    pending_filters = list(root_filters)
+    argument_filters: set[str] = set()
+    for candidate in candidates:
+        for _name, provided_arguments in candidate.names_and_args:
+            for argument in provided_arguments:
+                for referenced_name in _re.findall(
+                    r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
+                    argument,
+                ):
+                    if (
+                        referenced_name not in ignored_type_names
+                        and not referenced_name.startswith(
+                            ("QJson", "QVariant", "std::")
+                        )
+                    ):
+                        pending_filters.append(referenced_name)
+                        argument_filters.add(referenced_name)
+    seen_filters: set[str] = set()
+    ast_roots: list[dict] = []
+    decoder = json.JSONDecoder()
+    while pending_filters:
+        filter_name = pending_filters.pop()
+        if filter_name in seen_filters:
+            continue
+        seen_filters.add(filter_name)
+        if len(seen_filters) > _MAX_TYPE_DEPTH:
+            raise EncoderHygieneError(
+                "Explicit specialization declaration graph exceeded the "
+                f"{_MAX_TYPE_DEPTH}-identity complexity bound in {path}; "
+                f"recent identities={sorted(seen_filters)[-20:]}"
+            )
+        completed = subprocess.run(
+            [
+                compiler,
+                *arguments,
+                "-Xclang",
+                "-ast-dump=json",
+                "-Xclang",
+                "-ast-dump-filter",
+                "-Xclang",
+                filter_name,
+                "-fsyntax-only",
+                "-x",
+                "c++",
+                str(path),
+            ],
+            cwd=directory,
+            capture_output=True,
+            text=True,
         )
-    try:
-        root = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise EncoderHygieneError(
-            f"Compiler returned malformed AST JSON for {path}: {exc}"
-        ) from exc
+        if completed.returncode != 0:
+            raise EncoderHygieneError(
+                f"Compiler AST dump failed while resolving explicit template "
+                f"identity {filter_name!r} in {path}:\n{completed.stderr}"
+            )
+        index = 0
+        decoded: list[dict] = []
+        while index < len(completed.stdout):
+            while (
+                index < len(completed.stdout)
+                and completed.stdout[index].isspace()
+            ):
+                index += 1
+            if index == len(completed.stdout):
+                break
+            try:
+                value, index = decoder.raw_decode(completed.stdout, index)
+            except json.JSONDecodeError as exc:
+                raise EncoderHygieneError(
+                    f"Compiler returned malformed filtered AST JSON for "
+                    f"{path} identity {filter_name!r}: {exc}"
+                ) from exc
+            if isinstance(value, dict):
+                value["_arkham_scope"] = filter_name.split("::")[:-1]
+                decoded.append(value)
+        ast_roots.extend(decoded)
+        # Q_ENUM/Q_GADGET expand a project invocation into the verified Qt
+        # QMetaTypeId adapter. Its filtered specialization node remains in
+        # ast_roots and is inspected completely below, including every direct
+        # forbidden type. Do not recursively explode from that adapter into
+        # every unrelated Qt metadata implementation record.
+        if (
+            filter_name in argument_filters
+            and filter_name not in root_filters
+        ) or filter_name == "QMetaTypeId":
+            continue
+
+        referenced_names: set[str] = set()
+
+        def collect_type_names(value: object) -> None:
+            if isinstance(value, dict):
+                type_info = value.get("type")
+                if isinstance(type_info, dict):
+                    for key in ("qualType", "desugaredQualType"):
+                        spelling = type_info.get(key)
+                        if not isinstance(spelling, str):
+                            continue
+                        referenced_names.update(
+                            _re.findall(
+                                r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
+                                spelling,
+                            )
+                        )
+                for nested in value.values():
+                    collect_type_names(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect_type_names(nested)
+
+        for value in decoded:
+            collect_type_names(value)
+        filter_scope = filter_name.split("::")[:-1]
+        for referenced_name in referenced_names:
+            if (
+                referenced_name in ignored_type_names
+                or referenced_name.startswith("std::")
+                or (
+                    len(referenced_name) == 1
+                    and referenced_name.isupper()
+                )
+                or referenced_name == filter_name
+            ):
+                continue
+            pending_filters.append(
+                referenced_name
+                if "::" in referenced_name or not filter_scope
+                else "::".join((*filter_scope, referenced_name))
+            )
+    root: dict = {"kind": "TranslationUnitDecl", "inner": ast_roots}
 
     specializations: dict[
         str,
-        list[tuple[tuple[str, ...], tuple[str, ...], dict]],
+        list[
+            tuple[
+                str,
+                tuple[str, ...],
+                tuple[str, ...],
+                dict,
+                tuple[str, ...],
+            ]
+        ],
     ] = {}
     type_aliases: dict[str, str] = {}
-    record_nodes: dict[str, list[dict]] = {}
+    record_nodes: dict[str, list[tuple[dict, tuple[str, ...]]]] = {}
 
-    def visit(node: object) -> None:
+    record_kinds = {
+        "CXXRecordDecl",
+        "RecordDecl",
+        "ClassTemplateSpecializationDecl",
+        "ClassTemplatePartialSpecializationDecl",
+    }
+    context_names_by_id: dict[str, tuple[str, ...]] = {}
+
+    def index_contexts(
+        node: object, scope: tuple[str, ...] = ()
+    ) -> None:
         if not isinstance(node, dict):
             return
+        annotated_scope = node.get("_arkham_scope")
+        if isinstance(annotated_scope, list) and all(
+            isinstance(part, str) for part in annotated_scope
+        ):
+            scope = tuple(annotated_scope)
+        kind = node.get("kind")
+        name = node.get("name")
+        child_scope = scope
+        if (
+            kind == "NamespaceDecl"
+            or (kind in record_kinds and not node.get("isImplicit"))
+        ) and isinstance(name, str) and name:
+            child_scope = (*scope, name)
+            if isinstance(node.get("id"), str):
+                context_names_by_id[node["id"]] = child_scope
+        inner = node.get("inner")
+        if isinstance(inner, list):
+            for child in inner:
+                index_contexts(child, child_scope)
+
+    index_contexts(root)
+
+    def visit(node: object, scope: tuple[str, ...] = ()) -> None:
+        if not isinstance(node, dict):
+            return
+        annotated_scope = node.get("_arkham_scope")
+        if isinstance(annotated_scope, list) and all(
+            isinstance(part, str) for part in annotated_scope
+        ):
+            scope = tuple(annotated_scope)
+        kind = node.get("kind")
         name = node.get("name")
         inner = node.get("inner")
         type_info = node.get("type")
+        parent_context = node.get("parentDeclContextId")
+        semantic_scope = (
+            context_names_by_id[parent_context]
+            if isinstance(parent_context, str)
+            and parent_context in context_names_by_id
+            else scope
+        )
+        qualified_name = (
+            "::".join((*semantic_scope, name))
+            if isinstance(name, str) and name
+            else ""
+        )
+        arguments_found: list[str] = []
+        canonical_found: list[str] = []
+        if isinstance(inner, list):
+            for child in inner:
+                if (
+                    not isinstance(child, dict)
+                    or child.get("kind") != "TemplateArgument"
+                ):
+                    continue
+                argument_type = child.get("type")
+                if not isinstance(argument_type, dict):
+                    continue
+                written = argument_type.get("qualType")
+                canonical = argument_type.get(
+                    "desugaredQualType", written
+                )
+                if isinstance(written, str) and isinstance(canonical, str):
+                    arguments_found.append(written)
+                    canonical_found.append(canonical)
         if (
-            node.get("kind")
-            in {
-                "CXXRecordDecl",
-                "RecordDecl",
-                "ClassTemplateSpecializationDecl",
-                "ClassTemplatePartialSpecializationDecl",
-            }
-            and isinstance(name, str)
+            kind in record_kinds
+            and qualified_name
+            and not node.get("isImplicit")
         ):
-            record_nodes.setdefault(name, []).append(node)
+            record_identity = qualified_name
+            if canonical_found:
+                record_identity += (
+                    "<" + ",".join(canonical_found) + ">"
+                )
+            record_nodes.setdefault(
+                _normalized_template_spelling(record_identity), []
+            ).append((node, semantic_scope))
         if (
-            node.get("kind") in {"TypeAliasDecl", "TypedefDecl"}
-            and isinstance(name, str)
+            kind in {"TypeAliasDecl", "TypedefDecl"}
+            and qualified_name
             and isinstance(type_info, dict)
         ):
             canonical_alias = type_info.get(
                 "desugaredQualType", type_info.get("qualType")
             )
             if isinstance(canonical_alias, str):
-                type_aliases[name] = canonical_alias
-        if isinstance(name, str) and isinstance(inner, list):
-            arguments_found: list[str] = []
-            canonical_found: list[str] = []
-            for child in inner:
-                if not isinstance(child, dict) or child.get("kind") != "TemplateArgument":
-                    continue
-                type_info = child.get("type")
-                if not isinstance(type_info, dict):
-                    continue
-                written = type_info.get("qualType")
-                canonical = type_info.get("desugaredQualType", written)
-                if isinstance(written, str) and isinstance(canonical, str):
-                    arguments_found.append(written)
-                    canonical_found.append(canonical)
-            if arguments_found:
-                specializations.setdefault(name, []).append(
-                    (
-                        tuple(arguments_found),
-                        tuple(canonical_found),
-                        node,
-                    )
+                type_aliases[qualified_name] = canonical_alias
+        if qualified_name and arguments_found:
+            canonical_identity = (
+                node.get("mangledName")
+                if isinstance(node.get("mangledName"), str)
+                else (
+                    f"{kind}:{qualified_name}<"
+                    + ",".join(canonical_found)
+                    + ">"
                 )
+            )
+            specializations.setdefault(qualified_name, []).append(
+                (
+                    canonical_identity,
+                    tuple(arguments_found),
+                    tuple(canonical_found),
+                    node,
+                    semantic_scope,
+                )
+            )
+        child_scope = semantic_scope
+        if (
+            kind == "NamespaceDecl"
+            or (kind in record_kinds and not node.get("isImplicit"))
+        ) and isinstance(name, str) and name:
+            child_scope = (*semantic_scope, name)
         if isinstance(inner, list):
             for child in inner:
-                visit(child)
+                visit(child, child_scope)
 
     visit(root)
 
     def instantiated_surfaces(
         node: dict,
+        scope: tuple[str, ...],
         visited: frozenset[str] = frozenset(),
         depth: int = 0,
     ) -> set[str]:
@@ -2060,19 +2272,37 @@ def _collect_explicit_template_findings(
             for spelling in spellings:
                 if _is_qjson_family(spelling):
                     forbidden.add(spelling)
-                for referenced_name in _re.findall(
-                    r"[A-Za-z_]\w*", spelling
-                ):
-                    alias_target = type_aliases.get(referenced_name)
+                normalized_spelling = _normalized_template_spelling(
+                    spelling
+                )
+                qualified_spelling = _normalized_template_spelling(
+                    "::".join((*scope, spelling)) if scope else spelling
+                )
+                identity_spellings = {
+                    normalized_spelling,
+                    qualified_spelling,
+                }
+                for alias_identity, alias_target in type_aliases.items():
                     if (
-                        alias_target is not None
+                        any(
+                            _normalized_template_spelling(alias_identity)
+                            in identity_spelling
+                            for identity_spelling in identity_spellings
+                        )
                         and _is_qjson_family(alias_target)
                     ):
                         forbidden.add(alias_target)
-                    for record in record_nodes.get(referenced_name, ()):
+                for record_identity, records in record_nodes.items():
+                    if not any(
+                        record_identity in identity_spelling
+                        for identity_spelling in identity_spellings
+                    ):
+                        continue
+                    for record, record_scope in records:
                         forbidden.update(
                             instantiated_surfaces(
                                 record,
+                                record_scope,
                                 nested_visited,
                                 depth + 1,
                             )
@@ -2095,49 +2325,113 @@ def _collect_explicit_template_findings(
         relative = path.resolve().relative_to(repo_root).as_posix()
     except ValueError:
         relative = path.resolve().as_posix()
+
+    def resolve_candidate_alias(argument: str) -> str:
+        normalized_argument = _normalized_template_spelling(argument)
+        aliases = [
+            target
+            for identity, target in type_aliases.items()
+            if _normalized_template_spelling(identity)
+            == normalized_argument
+            or (
+                "::" not in normalized_argument
+                and _normalized_template_spelling(identity).endswith(
+                    f"::{normalized_argument}"
+                )
+            )
+        ]
+        return aliases[0] if len(set(aliases)) == 1 else argument
+
     for candidate in candidates:
-        matches: list[tuple[str, tuple[str, ...], dict]] = []
+        matches: list[
+            tuple[str, str, tuple[str, ...], dict, tuple[str, ...]]
+        ] = []
         for name, provided_arguments in candidate.names_and_args:
             normalized_provided = tuple(
                 _normalized_template_spelling(argument)
                 for argument in provided_arguments
             )
-            for written, canonical, node in specializations.get(name, ()):
-                if len(written) < len(normalized_provided):
-                    continue
-                if all(
-                    {
-                        expected,
-                        _normalized_template_spelling(
-                            type_aliases.get(
-                                provided_arguments[index].split("::")[-1],
-                                provided_arguments[index],
+            candidate_identities = (
+                (name,)
+                if "::" in name
+                else tuple(
+                    identity
+                    for identity in specializations
+                    if identity == name or identity.endswith(f"::{name}")
+                )
+            )
+            for specialization_identity in candidate_identities:
+                for (
+                    canonical_identity,
+                    written,
+                    canonical,
+                    node,
+                    scope,
+                ) in specializations.get(specialization_identity, ()):
+                    if len(written) < len(normalized_provided):
+                        continue
+                    if all(
+                        {
+                            expected,
+                            _normalized_template_spelling(
+                                resolve_candidate_alias(
+                                    provided_arguments[index]
+                                )
+                            ),
+                        }
+                        & {
+                            _normalized_template_spelling(written[index]),
+                            _normalized_template_spelling(canonical[index]),
+                        }
+                        for index, expected in enumerate(normalized_provided)
+                    ):
+                        matches.append(
+                            (
+                                canonical_identity,
+                                specialization_identity,
+                                canonical,
+                                node,
+                                scope,
                             )
-                        ),
-                    }
-                    & {
-                        _normalized_template_spelling(written[index]),
-                        _normalized_template_spelling(canonical[index]),
-                    }
-                    for index, expected in enumerate(normalized_provided)
-                ):
-                    matches.append((name, canonical, node))
+                        )
         if not matches:
+            candidate_specializations = [
+                (identity, written, canonical)
+                for identity, written, canonical, _node, _scope
+                in specializations.get(
+                    candidate.names_and_args[0][0], ()
+                )
+            ]
             raise EncoderHygieneError(
                 f"Compiler AST did not expose the explicit template "
                 f"specialization spelled at {path}:{candidate.line}: "
-                f"{candidate.statement}"
+                f"{candidate.statement}; available identities="
+                f"{sorted(specializations)}; aliases={type_aliases}; "
+                f"candidate specializations="
+                f"{candidate_specializations}"
             )
         forbidden = [
-            f"{name}:{argument}"
-            for name, arguments_found, _node in matches
+            f"{canonical_identity}:{argument}"
+            for (
+                canonical_identity,
+                _qualified_name,
+                arguments_found,
+                _node,
+                _scope,
+            ) in matches
             for argument in arguments_found
             if _is_qjson_family(argument)
         ]
         forbidden.extend(
-            f"{name}:instantiated-surface:{surface}"
-            for name, _arguments_found, node in matches
-            for surface in instantiated_surfaces(node)
+            f"{canonical_identity}:instantiated-surface:{surface}"
+            for (
+                canonical_identity,
+                _qualified_name,
+                _arguments_found,
+                node,
+                scope,
+            ) in matches
+            for surface in instantiated_surfaces(node, scope)
         )
         if not forbidden:
             continue
