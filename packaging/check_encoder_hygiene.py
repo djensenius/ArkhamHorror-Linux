@@ -179,7 +179,10 @@ an ever-growing fragment of C++ parsing by hand:
     recursive record resolution use Clang's mangled/canonical node identity
     plus fully qualified semantic declaration contexts, so same-named
     templates or aliases in different namespaces cannot contaminate one
-    another.
+    another. Record edges prefer Clang declaration IDs; where JSON exposes
+    only a type spelling, lookup follows the specialization's enclosing
+    semantic scopes through global scope and applies canonical namespace
+    aliases and using targets with ambiguity rejected.
     Every numeric cursor kind used here is checked against the installed
     libclang's own clang_getCursorKindSpelling result at startup.
   - A declaration is a *violation* if any semantic type component is in
@@ -1769,11 +1772,37 @@ def _explicit_template_candidates(
                 continue
             if active_file == path.resolve():
                 active_text.append(output_line)
-        if (
-            _EXPLICIT_TEMPLATE_START.search(
-                "\n".join(active_text)
+        expanded_active_text = "\n".join(active_text)
+        expanded_starts = list(
+            _EXPLICIT_TEMPLATE_START.finditer(expanded_active_text)
+        )
+        if not expanded_starts:
+            return []
+        # Q_DECLARE_METATYPE has one exact, toolchain-owned expansion:
+        # `template<> struct QMetaTypeId<T>`. It is already a verified Qt
+        # metadata adapter, not a project-authored specialization surface.
+        # Avoid a hundreds-of-megabytes token dump for this exact safe form,
+        # but never exempt a forbidden argument or any additional explicit
+        # declaration in the same governed file.
+        def is_safe_qt_metatype_expansion(match: _re.Match[str]) -> bool:
+            end = expanded_active_text.find("{", match.start())
+            if end < 0:
+                return False
+            declaration = expanded_active_text[match.start() : end]
+            return (
+                _re.fullmatch(
+                    r"\s*template\s*<\s*>\s*struct\s+"
+                    r"QMetaTypeId\s*<.+>\s*",
+                    declaration,
+                    _re.DOTALL,
+                )
+                is not None
+                and not _is_qjson_family(declaration)
             )
-            is None
+
+        if "Q_DECLARE_METATYPE(" in text and all(
+            is_safe_qt_metatype_expansion(match)
+            for match in expanded_starts
         ):
             return []
     token_command = [
@@ -1987,6 +2016,45 @@ def _collect_explicit_template_findings(
     seen_filters: set[str] = set()
     ast_roots: list[dict] = []
     decoder = json.JSONDecoder()
+    use_complete_ast = any(
+        name != "QMetaTypeId"
+        for candidate in candidates
+        for name, _arguments in candidate.names_and_args
+    )
+    if use_complete_ast:
+        completed = subprocess.run(
+            [
+                compiler,
+                *arguments,
+                "-Xclang",
+                "-ast-dump=json",
+                "-fsyntax-only",
+                "-x",
+                "c++",
+                str(path),
+            ],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise EncoderHygieneError(
+                f"Compiler AST dump failed while resolving explicit template "
+                f"declarations in {path}:\n{completed.stderr}"
+            )
+        try:
+            complete_root = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise EncoderHygieneError(
+                f"Compiler returned malformed canonical AST JSON for "
+                f"{path}: {exc}"
+            ) from exc
+        if not isinstance(complete_root, dict):
+            raise EncoderHygieneError(
+                f"Compiler returned a non-object canonical AST for {path}"
+            )
+        ast_roots.append(complete_root)
+        pending_filters.clear()
     while pending_filters:
         filter_name = pending_filters.pop()
         if filter_name in seen_filters:
@@ -2110,7 +2178,12 @@ def _collect_explicit_template_findings(
         ],
     ] = {}
     type_aliases: dict[str, str] = {}
+    namespace_aliases: dict[str, str] = {}
+    namespace_alias_names_by_id: dict[str, tuple[str, ...]] = {}
+    using_directives: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
+    using_record_targets: dict[tuple[tuple[str, ...], str], str] = {}
     record_nodes: dict[str, list[tuple[dict, tuple[str, ...]]]] = {}
+    record_nodes_by_id: dict[str, tuple[dict, tuple[str, ...]]] = {}
 
     record_kinds = {
         "CXXRecordDecl",
@@ -2194,6 +2267,7 @@ def _collect_explicit_template_findings(
             kind in record_kinds
             and qualified_name
             and not node.get("isImplicit")
+            and node.get("completeDefinition")
         ):
             record_identity = qualified_name
             if canonical_found:
@@ -2203,6 +2277,8 @@ def _collect_explicit_template_findings(
             record_nodes.setdefault(
                 _normalized_template_spelling(record_identity), []
             ).append((node, semantic_scope))
+            if isinstance(node.get("id"), str):
+                record_nodes_by_id[node["id"]] = (node, semantic_scope)
         if (
             kind in {"TypeAliasDecl", "TypedefDecl"}
             and qualified_name
@@ -2213,6 +2289,49 @@ def _collect_explicit_template_findings(
             )
             if isinstance(canonical_alias, str):
                 type_aliases[qualified_name] = canonical_alias
+        if kind == "NamespaceAliasDecl" and qualified_name:
+            aliased_namespace = node.get("aliasedNamespace")
+            if isinstance(aliased_namespace, dict):
+                aliased_id = aliased_namespace.get("id")
+                aliased_name = (
+                    context_names_by_id.get(aliased_id)
+                    if isinstance(aliased_id, str)
+                    else None
+                )
+                if aliased_name is None and isinstance(aliased_id, str):
+                    aliased_name = namespace_alias_names_by_id.get(
+                        aliased_id
+                    )
+                if aliased_name:
+                    namespace_aliases[qualified_name] = "::".join(
+                        aliased_name
+                    )
+                    if isinstance(node.get("id"), str):
+                        namespace_alias_names_by_id[node["id"]] = aliased_name
+        if kind == "UsingDirectiveDecl":
+            nominated = node.get("nominatedNamespace")
+            if isinstance(nominated, dict):
+                nominated_id = nominated.get("id")
+                target_scope = (
+                    context_names_by_id.get(nominated_id)
+                    if isinstance(nominated_id, str)
+                    else None
+                )
+                if target_scope:
+                    using_directives.setdefault(
+                        semantic_scope, set()
+                    ).add(target_scope)
+        if kind == "UsingShadowDecl":
+            target = node.get("target")
+            if isinstance(target, dict):
+                target_id = target.get("id")
+                target_name = target.get("name")
+                if isinstance(target_id, str) and isinstance(
+                    target_name, str
+                ):
+                    using_record_targets[
+                        (semantic_scope, target_name)
+                    ] = target_id
         if qualified_name and arguments_found:
             canonical_identity = (
                 node.get("mangledName")
@@ -2272,33 +2391,150 @@ def _collect_explicit_template_findings(
             for spelling in spellings:
                 if _is_qjson_family(spelling):
                     forbidden.add(spelling)
-                normalized_spelling = _normalized_template_spelling(
-                    spelling
+                referenced_names = _re.findall(
+                    r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
+                    spelling,
                 )
-                qualified_spelling = _normalized_template_spelling(
-                    "::".join((*scope, spelling)) if scope else spelling
-                )
-                identity_spellings = {
-                    normalized_spelling,
-                    qualified_spelling,
-                }
-                for alias_identity, alias_target in type_aliases.items():
+                for referenced_name in referenced_names:
                     if (
-                        any(
-                            _normalized_template_spelling(alias_identity)
-                            in identity_spelling
-                            for identity_spelling in identity_spellings
+                        referenced_name in ignored_type_names
+                        or referenced_name.startswith(
+                            ("QJson", "QVariant", "std::")
                         )
-                        and _is_qjson_family(alias_target)
-                    ):
-                        forbidden.add(alias_target)
-                for record_identity, records in record_nodes.items():
-                    if not any(
-                        record_identity in identity_spelling
-                        for identity_spelling in identity_spellings
                     ):
                         continue
-                    for record, record_scope in records:
+                    lookup_chain = (
+                        (referenced_name,)
+                        if "::" in referenced_name
+                        else tuple(
+                            "::".join((*scope[:scope_length], referenced_name))
+                            for scope_length in range(len(scope), -1, -1)
+                        )
+                    )
+                    for lookup in lookup_chain:
+                        normalized_lookup = _normalized_template_spelling(
+                            lookup
+                        )
+                        alias_targets = {
+                            target
+                            for identity, target in type_aliases.items()
+                            if _normalized_template_spelling(identity)
+                            == normalized_lookup
+                        }
+                        if len(alias_targets) > 1:
+                            raise EncoderHygieneError(
+                                f"Compiler AST alias resolution is ambiguous "
+                                f"for {lookup} in {path}"
+                            )
+                        if alias_targets:
+                            alias_target = next(iter(alias_targets))
+                            if _is_qjson_family(alias_target):
+                                forbidden.add(alias_target)
+                            break
+                        matching_records = [
+                            records
+                            for record_identity, records in record_nodes.items()
+                            if record_identity == normalized_lookup
+                            or record_identity.startswith(
+                                f"{normalized_lookup}<"
+                            )
+                        ]
+                        if matching_records:
+                            for records in matching_records:
+                                if len(records) != 1:
+                                    raise EncoderHygieneError(
+                                        "Compiler AST record resolution is "
+                                        f"not unique for {lookup} in {path}"
+                                    )
+                                for record, record_scope in records:
+                                    forbidden.update(
+                                        instantiated_surfaces(
+                                            record,
+                                            record_scope,
+                                            nested_visited,
+                                            depth + 1,
+                                        )
+                                    )
+                            break
+                        lookup_parts = tuple(lookup.split("::"))
+                        lookup_scope = lookup_parts[:-1]
+                        unqualified_name = lookup_parts[-1]
+                        using_target_id = using_record_targets.get(
+                            (lookup_scope, unqualified_name)
+                        )
+                        if (
+                            using_target_id is not None
+                            and using_target_id in record_nodes_by_id
+                        ):
+                            record, record_scope = record_nodes_by_id[
+                                using_target_id
+                            ]
+                            forbidden.update(
+                                instantiated_surfaces(
+                                    record,
+                                    record_scope,
+                                    nested_visited,
+                                    depth + 1,
+                                )
+                            )
+                            break
+                        directive_records: dict[
+                            str, list[tuple[dict, tuple[str, ...]]]
+                        ] = {}
+                        for target_scope in using_directives.get(
+                            lookup_scope, ()
+                        ):
+                            directive_identity = (
+                                _normalized_template_spelling(
+                                    "::".join(
+                                        (*target_scope, unqualified_name)
+                                    )
+                                )
+                            )
+                            for record_identity, records in record_nodes.items():
+                                if (
+                                    record_identity == directive_identity
+                                    or record_identity.startswith(
+                                        f"{directive_identity}<"
+                                    )
+                                ):
+                                    directive_records[record_identity] = records
+                        if len(
+                            {
+                                identity.split("<", 1)[0]
+                                for identity in directive_records
+                            }
+                        ) > 1:
+                            raise EncoderHygieneError(
+                                "Compiler AST using-directive resolution is "
+                                f"ambiguous for {referenced_name} in {path}"
+                            )
+                        if not directive_records:
+                            continue
+                        for records in directive_records.values():
+                            for record, record_scope in records:
+                                forbidden.update(
+                                    instantiated_surfaces(
+                                        record,
+                                        record_scope,
+                                        nested_visited,
+                                        depth + 1,
+                                    )
+                                )
+                        break
+
+        def inspect(value: object) -> None:
+            if isinstance(value, dict):
+                declaration = value.get("decl")
+                if isinstance(declaration, dict):
+                    declaration_id = declaration.get("id")
+                    if (
+                        isinstance(declaration_id, str)
+                        and declaration_id in record_nodes_by_id
+                    ):
+                        record, record_scope = record_nodes_by_id[
+                            declaration_id
+                        ]
                         forbidden.update(
                             instantiated_surfaces(
                                 record,
@@ -2307,9 +2543,6 @@ def _collect_explicit_template_findings(
                                 depth + 1,
                             )
                         )
-
-        def inspect(value: object) -> None:
-            if isinstance(value, dict):
                 inspect_type(value.get("type"))
                 for nested in value.values():
                     inspect(nested)
@@ -2342,11 +2575,29 @@ def _collect_explicit_template_findings(
         ]
         return aliases[0] if len(set(aliases)) == 1 else argument
 
+    def resolve_namespace_alias(identity: str) -> str:
+        current = identity
+        for _ in range(_MAX_TYPE_DEPTH):
+            replacement: tuple[str, str] | None = None
+            for alias, canonical in namespace_aliases.items():
+                if current == alias or current.startswith(f"{alias}::"):
+                    if replacement is None or len(alias) > len(replacement[0]):
+                        replacement = (alias, canonical)
+            if replacement is None:
+                return current
+            alias, canonical = replacement
+            current = canonical + current[len(alias) :]
+        raise EncoderHygieneError(
+            f"Namespace alias chain exceeded {_MAX_TYPE_DEPTH} levels for "
+            f"{identity} in {path}"
+        )
+
     for candidate in candidates:
         matches: list[
             tuple[str, str, tuple[str, ...], dict, tuple[str, ...]]
         ] = []
         for name, provided_arguments in candidate.names_and_args:
+            name = resolve_namespace_alias(name)
             normalized_provided = tuple(
                 _normalized_template_spelling(argument)
                 for argument in provided_arguments
@@ -2406,7 +2657,8 @@ def _collect_explicit_template_findings(
                 f"Compiler AST did not expose the explicit template "
                 f"specialization spelled at {path}:{candidate.line}: "
                 f"{candidate.statement}; available identities="
-                f"{sorted(specializations)}; aliases={type_aliases}; "
+                f"{sorted(specializations)}; namespace aliases="
+                f"{namespace_aliases}; "
                 f"candidate specializations="
                 f"{candidate_specializations}"
             )

@@ -778,7 +778,40 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "}\n"
             "namespace nested { struct Outer {\n"
             "  template<class T> struct Box { QJsonObject value; };\n"
-            "}; }\n",
+            "}; }\n"
+            "struct GlobalWireBox { QJsonObject value; };\n"
+            "namespace sibling { struct GlobalWireBox { int value; }; }\n"
+            "namespace holder {\n"
+            "template<class T> struct GlobalHolder { GlobalWireBox value; };\n"
+            "struct Outer {\n"
+            "  struct WireBox { QJsonObject value; };\n"
+            "  template<class T> struct Holder { WireBox value; };\n"
+            "};\n"
+            "struct SafeOuter {\n"
+            "  struct WireBox { int value; };\n"
+            "  template<class T> struct Holder { WireBox value; };\n"
+            "};\n"
+            "}\n"
+            "namespace safe_types {\n"
+            "struct UsingBox { int value; };\n"
+            "struct DirectiveBox { int value; };\n"
+            "}\n"
+            "namespace dangerous_types {\n"
+            "struct UsingBox { QJsonObject value; };\n"
+            "struct DirectiveBox { QJsonObject value; };\n"
+            "}\n"
+            "namespace using_safe {\n"
+            "using safe_types::UsingBox;\n"
+            "using namespace safe_types;\n"
+            "template<class T> struct UsingHolder { UsingBox value; };\n"
+            "template<class T> struct DirectiveHolder { DirectiveBox value; };\n"
+            "}\n"
+            "namespace using_dangerous {\n"
+            "using dangerous_types::UsingBox;\n"
+            "using namespace dangerous_types;\n"
+            "template<class T> struct UsingHolder { UsingBox value; };\n"
+            "template<class T> struct DirectiveHolder { DirectiveBox value; };\n"
+            "}\n",
         )
         source = self._write(
             "QualifiedInstantiations.cpp",
@@ -789,7 +822,21 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "template int safe::function<long>();\n"
             "template QJsonObject dangerous::function<long>();\n"
             "template class safe::AliasBox<safe::Wire>;\n"
-            "template class dangerous::AliasBox<dangerous::Wire>;\n",
+            "template class dangerous::AliasBox<dangerous::Wire>;\n"
+            "namespace s = safe;\n"
+            "namespace s2 = s;\n"
+            "namespace d = dangerous;\n"
+            "template class s2::Box<short>;\n"
+            "template class d::Box<short>;\n"
+            "namespace outer { namespace s = safe; }\n"
+            "template class outer::s::Box<char>;\n"
+            "template class holder::GlobalHolder<int>;\n"
+            "template class holder::Outer::Holder<int>;\n"
+            "template class holder::SafeOuter::Holder<int>;\n"
+            "template class using_safe::UsingHolder<int>;\n"
+            "template class using_dangerous::UsingHolder<int>;\n"
+            "template class using_safe::DirectiveHolder<int>;\n"
+            "template class using_dangerous::DirectiveHolder<int>;\n",
         )
         violations, findings = self._scan_source_fixture(
             source,
@@ -810,11 +857,23 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         ]
         self.assertEqual(
             {finding.line for finding in explicit},
-            {3, 4, 6, 8},
+            {3, 4, 6, 8, 13, 16, 17, 20, 22},
             [(finding.line, finding.canonical_return_type) for finding in explicit],
         )
         self.assertFalse(
-            any(finding.line in {2, 5, 7} for finding in explicit)
+            any(
+                finding.line in {
+                    2,
+                    5,
+                    7,
+                    12,
+                    15,
+                    18,
+                    19,
+                    21,
+                }
+                for finding in explicit
+            )
         )
         by_line = {finding.line: finding for finding in explicit}
         self.assertIn("dangerous::Box", by_line[3].canonical_return_type)
@@ -826,6 +885,23 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         )
         self.assertIn(
             "dangerous::AliasBox", by_line[8].canonical_return_type
+        )
+        self.assertIn(
+            "dangerous::Box", by_line[13].canonical_return_type
+        )
+        self.assertIn(
+            "holder::GlobalHolder", by_line[16].canonical_return_type
+        )
+        self.assertIn(
+            "holder::Outer::Holder", by_line[17].canonical_return_type
+        )
+        self.assertIn(
+            "using_dangerous::UsingHolder",
+            by_line[20].canonical_return_type,
+        )
+        self.assertIn(
+            "using_dangerous::DirectiveHolder",
+            by_line[22].canonical_return_type,
         )
 
     def test_owned_generated_fragment_macro_specializations_are_audited(
@@ -880,6 +956,33 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
                 )
                 for finding in explicit
             )
+        )
+
+    def test_qt_metatype_fast_path_does_not_exempt_forbidden_arguments(
+        self,
+    ) -> None:
+        header = self._write(
+            "MetatypeSpecializations.h",
+            "struct QJsonObject {};\n"
+            "struct Safe {};\n"
+            "template<class T> struct QMetaTypeId { T value; };\n"
+            "#define Q_DECLARE_METATYPE(T) template <> struct QMetaTypeId<T> { T value; };\n"
+            "Q_DECLARE_METATYPE(Safe)\n"
+            "Q_DECLARE_METATYPE(QJsonObject)\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        explicit = [
+            finding
+            for finding in findings
+            if "kind=explicit-template-instantiation"
+            in finding.canonical_return_type
+        ]
+        self.assertEqual(
+            {finding.line for finding in explicit},
+            {6},
         )
 
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
