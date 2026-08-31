@@ -618,9 +618,57 @@ function(arkham_write_encoder_hygiene_target_universe)
     _arkham_collect_imported_targets("${CMAKE_SOURCE_DIR}" _arkham_ehu_imported_targets)
     list(SORT _arkham_ehu_targets)
     list(SORT _arkham_ehu_imported_targets)
-    set(_arkham_ehu_graph_targets
-        ${_arkham_ehu_targets} ${_arkham_ehu_imported_targets})
-    list(REMOVE_DUPLICATES _arkham_ehu_graph_targets)
+    # Seed graph-file generation with owned targets, then add only imported
+    # targets which CMake itself confirms are named by a reachable property's
+    # literal tokens. This is a generation candidate closure, not edge
+    # inference: Python accepts connectivity only from TARGET_GENEX_EVAL's
+    # per-config output below. A dynamically constructed target omitted here
+    # consequently appears as an unknown evaluated edge and fails closed.
+    set(_arkham_ehu_graph_targets ${_arkham_ehu_targets})
+    set(_arkham_ehu_graph_index_cursor 0)
+    list(LENGTH _arkham_ehu_graph_targets _arkham_ehu_graph_target_count)
+    while(_arkham_ehu_graph_index_cursor LESS _arkham_ehu_graph_target_count)
+        list(GET _arkham_ehu_graph_targets
+            ${_arkham_ehu_graph_index_cursor} _arkham_ehu_discovery_target)
+        math(EXPR _arkham_ehu_graph_index_cursor
+            "${_arkham_ehu_graph_index_cursor} + 1")
+        if(TARGET "${_arkham_ehu_discovery_target}")
+            get_target_property(_arkham_ehu_discovery_links
+                ${_arkham_ehu_discovery_target} LINK_LIBRARIES)
+            get_target_property(_arkham_ehu_discovery_interface_links
+                ${_arkham_ehu_discovery_target} INTERFACE_LINK_LIBRARIES)
+            if(NOT _arkham_ehu_discovery_links)
+                set(_arkham_ehu_discovery_links "")
+            endif()
+            if(NOT _arkham_ehu_discovery_interface_links)
+                set(_arkham_ehu_discovery_interface_links "")
+            endif()
+            foreach(_arkham_ehu_discovery_edge IN LISTS
+                    _arkham_ehu_discovery_links
+                    _arkham_ehu_discovery_interface_links)
+                string(REGEX MATCHALL
+                    "[A-Za-z_][A-Za-z0-9_.+-]*(::[A-Za-z_][A-Za-z0-9_.+-]*)*"
+                    _arkham_ehu_discovery_tokens
+                    "${_arkham_ehu_discovery_edge}")
+                foreach(_arkham_ehu_discovery_token IN LISTS
+                        _arkham_ehu_discovery_tokens)
+                    if(TARGET "${_arkham_ehu_discovery_token}")
+                        get_target_property(_arkham_ehu_discovery_alias
+                            ${_arkham_ehu_discovery_token} ALIASED_TARGET)
+                        if(_arkham_ehu_discovery_alias)
+                            set(_arkham_ehu_discovery_token
+                                "${_arkham_ehu_discovery_alias}")
+                        endif()
+                        list(APPEND _arkham_ehu_graph_targets
+                            "${_arkham_ehu_discovery_token}")
+                        list(REMOVE_DUPLICATES _arkham_ehu_graph_targets)
+                    endif()
+                endforeach()
+            endforeach()
+        endif()
+        list(LENGTH _arkham_ehu_graph_targets _arkham_ehu_graph_target_count)
+    endwhile()
+    list(SORT _arkham_ehu_graph_targets)
     set(_arkham_ehu_graph_dir
         "${CMAKE_BINARY_DIR}/generated/target_link_graph")
     set(_arkham_ehu_graph_index
@@ -629,6 +677,7 @@ function(arkham_write_encoder_hygiene_target_universe)
         "${CMAKE_BINARY_DIR}/generated/target_link_aliases.txt")
     set(_arkham_ehu_external_file
         "${CMAKE_BINARY_DIR}/generated/target_link_external_items.txt")
+    file(REMOVE_RECURSE "${_arkham_ehu_graph_dir}")
     file(MAKE_DIRECTORY "${_arkham_ehu_graph_dir}")
     file(WRITE "${_arkham_ehu_graph_index}" "")
     file(WRITE "${_arkham_ehu_alias_file}" "")
