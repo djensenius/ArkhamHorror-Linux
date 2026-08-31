@@ -4720,7 +4720,28 @@ def _qt_sdk_tree_content_files(
     etc/passwd"-style traversal), can never be a legitimate, self-
     contained Qt SDK-internal link -- both raise QtSdkTreeIntegrityError
     immediately rather than silently accepting or merely hashing
-    whatever that dangerous target currently contains."""
+    whatever that dangerous target currently contains.
+
+    IMPORTANT install-path sensitivity: several genuine, unmodified Qt
+    files this now binds -- confirmed empirically by installing the
+    exact same pinned Qt version via aqtinstall at two different
+    prefixes and diffing the resulting trees -- embed the SDK's own
+    absolute install path as literal text (e.g. every `lib/pkgconfig/
+    Qt6*.pc` file's own `prefix=` line). This is not new: those exact
+    files already lived under the previously-bound `lib/` subtree
+    before this project widened the digest to also cover bin/include/
+    mkspecs, so this project's checked-in `installedTreeContentSha256`
+    pin has ALWAYS been implicitly bound to install-qt-action's own
+    deterministic default install directory (`$GITHUB_WORKSPACE/../Qt`,
+    i.e. a fixed `/home/runner/work/<repo>/<repo>/../Qt` path for this
+    repository's own real GitHub-hosted CI runners) rather than being
+    portable to an arbitrary local install prefix. Regenerating this
+    pin (e.g. after a Qt version bump) therefore requires computing the
+    digest against a tree installed at THAT exact CI-real path -- a
+    tree installed at a differently-named local/sandbox prefix will
+    legitimately compute a different digest even when byte-identical
+    in every path-independent respect, and must not be used to author
+    the checked-in pin."""
     entries: list[tuple[Path, str, str | None]] = []
     resolved_root = qt_reference_dir.resolve()
     for subdir in _QT_SDK_TREE_DIGEST_SUBDIRS:

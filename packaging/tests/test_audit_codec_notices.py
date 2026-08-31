@@ -6100,10 +6100,38 @@ class QtSdkInstalledTreeProvenanceTests(unittest.TestCase):
     def test_checked_in_lock_pin_matches_a_real_genuinely_installed_qt_sdk_tree(
         self,
     ) -> None:
+        # Round-N+ review follow-up: confirmed empirically (installing
+        # the SAME pinned Qt version via aqtinstall at two different
+        # prefixes and diffing the resulting trees) that several
+        # genuine, unmodified files this digest now binds -- e.g. every
+        # `lib/pkgconfig/Qt6*.pc` file's own `prefix=` line -- embed the
+        # SDK's own absolute install path as literal text. The
+        # checked-in installedTreeContentSha256 pin is therefore bound
+        # to install-qt-action's own deterministic real-CI install path
+        # ($GITHUB_WORKSPACE/../Qt), which $QT_ROOT_DIR reflects exactly
+        # when this test runs for real in this project's own CI. The
+        # "/opt/qt/<sdkVersion>/<arch>" local dev-container fallback
+        # remains useful to prove the DOWNLOAD/DIGEST MACHINERY itself
+        # runs cleanly (no QtSdkTreeIntegrityError, matching sdkVersion)
+        # against real content, but -- unless that container installs
+        # Qt at the exact same absolute path CI does -- it can
+        # legitimately report content_mismatch even for a byte-identical
+        # upstream install, so this assertion only hard-requires an
+        # exact "matched" pin when $QT_ROOT_DIR (the real, CI-authentic
+        # path) is what was actually found.
         real_qt_dir = _real_qt_sdk_reference_dir()
         assert real_qt_dir is not None
         result = audit.verify_installed_qt_sdk_tree(real_qt_dir)
-        self.assertEqual(result["status"], "matched", result)
+        if os.environ.get("QT_ROOT_DIR"):
+            self.assertEqual(result["status"], "matched", result)
+        else:
+            self.assertIn(result["status"], ("matched", "content_mismatch"))
+            if result["status"] == "content_mismatch":
+                self.skipTest(
+                    "local dev-container Qt install path differs from "
+                    "install-qt-action's real CI path, so an exact pin "
+                    f"match is not expected here: {result}"
+                )
 
 
 class UnifiedQtSdkBindingTests(unittest.TestCase):
