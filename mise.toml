@@ -34,7 +34,7 @@ run = "ctest --test-dir \"$BUILD_DIR\" --output-on-failure"
 [tasks."format:check"]
 description = "Check C++ and QML formatting"
 run = '''
-find src src/domain tests tests/probes -maxdepth 1 -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
+find src tests -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
   | xargs -0 clang-format --dry-run --Werror
 for file in qml/*.qml; do
   formatted="$(mktemp)"
