@@ -587,91 +587,24 @@ function(_arkham_collect_buildsystem_targets directory out_var)
     set(${out_var} "${_arkham_cbt_all}" PARENT_SCOPE)
 endfunction()
 
-function(_arkham_target_reaches_interface current_target sought_target visited out_var)
-    if(current_target STREQUAL sought_target)
-        set(${out_var} TRUE PARENT_SCOPE)
-        return()
-    endif()
-    list(FIND visited "${current_target}" _arkham_tri_seen)
-    if(NOT _arkham_tri_seen EQUAL -1)
-        set(${out_var} FALSE PARENT_SCOPE)
-        return()
-    endif()
-    list(APPEND visited "${current_target}")
-    get_target_property(_arkham_tri_current_imported ${current_target} IMPORTED)
-    get_target_property(_arkham_tri_links ${current_target} LINK_LIBRARIES)
-    get_target_property(_arkham_tri_interface_links ${current_target} INTERFACE_LINK_LIBRARIES)
-    if(NOT _arkham_tri_links)
-        set(_arkham_tri_links "")
-    endif()
-    if(_arkham_tri_interface_links)
-        list(APPEND _arkham_tri_links ${_arkham_tri_interface_links})
-    endif()
-    foreach(_arkham_tri_link IN LISTS _arkham_tri_links)
-        if(_arkham_tri_link MATCHES "^\\$<LINK_ONLY:([^$<>]+)>$")
-            set(_arkham_tri_link "${CMAKE_MATCH_1}")
-        elseif(_arkham_tri_link MATCHES "\\$<")
-            if(_arkham_tri_current_imported)
-                # Imported packages commonly encode their interface with
-                # CONFIG/BOOL/TARGET_NAME_IF_EXISTS expressions. They are
-                # graph wrappers, not policy roots: walk every actual CMake
-                # target referenced anywhere in the expression rather than
-                # stopping at the imported node (or doing an unsafe substring
-                # match for only the final sought target).
-                string(REGEX MATCHALL
-                    "[A-Za-z_][A-Za-z0-9_.+-]*(::[A-Za-z_][A-Za-z0-9_.+-]*)*"
-                    _arkham_tri_genex_tokens "${_arkham_tri_link}")
-                foreach(_arkham_tri_candidate IN LISTS _arkham_tri_genex_tokens)
-                    if(NOT TARGET ${_arkham_tri_candidate})
-                        continue()
-                    endif()
-                    get_target_property(_arkham_tri_candidate_alias
-                        ${_arkham_tri_candidate} ALIASED_TARGET)
-                    if(_arkham_tri_candidate_alias)
-                        set(_arkham_tri_candidate "${_arkham_tri_candidate_alias}")
-                    endif()
-                    _arkham_target_reaches_interface(
-                        "${_arkham_tri_candidate}" "${sought_target}" "${visited}"
-                        _arkham_tri_genex_reaches)
-                    if(_arkham_tri_genex_reaches)
-                        set(${out_var} TRUE PARENT_SCOPE)
-                        return()
-                    endif()
-                endforeach()
-                continue()
-            endif()
-            message(FATAL_ERROR
-                "Encoder-hygiene target graph edge '${current_target}' -> "
-                "'${_arkham_tri_link}' is generator-expression encoded and cannot "
-                "be assigned a closed consumer context")
-        endif()
-        if(_arkham_tri_link MATCHES "^::@" OR
-                _arkham_tri_link MATCHES "^(debug|optimized|general)$")
-            continue()
-        endif()
-        if(TARGET ${_arkham_tri_link})
-            get_target_property(_arkham_tri_alias ${_arkham_tri_link} ALIASED_TARGET)
-            if(_arkham_tri_alias)
-                set(_arkham_tri_link "${_arkham_tri_alias}")
-            endif()
-            if(_arkham_tri_link STREQUAL sought_target)
-                set(${out_var} TRUE PARENT_SCOPE)
-                return()
-            endif()
-            _arkham_target_reaches_interface(
-                "${_arkham_tri_link}" "${sought_target}" "${visited}" _arkham_tri_reaches)
-            if(_arkham_tri_reaches)
-                set(${out_var} TRUE PARENT_SCOPE)
-                return()
-            endif()
-        endif()
+function(_arkham_collect_imported_targets directory out_var)
+    get_property(_arkham_cit_targets DIRECTORY "${directory}" PROPERTY IMPORTED_TARGETS)
+    get_property(_arkham_cit_subdirs DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+    set(_arkham_cit_all ${_arkham_cit_targets})
+    foreach(_arkham_cit_subdir IN LISTS _arkham_cit_subdirs)
+        _arkham_collect_imported_targets("${_arkham_cit_subdir}" _arkham_cit_nested)
+        list(APPEND _arkham_cit_all ${_arkham_cit_nested})
     endforeach()
-    set(${out_var} FALSE PARENT_SCOPE)
+    list(REMOVE_DUPLICATES _arkham_cit_all)
+    set(${out_var} "${_arkham_cit_all}" PARENT_SCOPE)
 endfunction()
 
 # At end-of-directory processing, prove every non-imported C++ target in
-# the complete directory tree has an explicit SCAN/EXEMPT record and emit
-# each SCAN target's own complete late/named/INTERFACE header universe.
+# the complete directory tree has an explicit SCAN/EXEMPT record, emit each
+# SCAN target's complete late/named/INTERFACE header universe, and use
+# file(GENERATE)+TARGET_GENEX_EVAL to emit the exact link graph for each build
+# configuration. Python computes consumer closure only from those evaluated
+# graph files; generator-expression source text is never treated as an edge.
 function(arkham_write_encoder_hygiene_target_universe)
     set(oneValueArgs OUTPUT_FILE HEADER_INDEX_FILE HEADER_DIR SOURCE_INDEX_FILE SOURCE_DIR)
     cmake_parse_arguments(ARG "" "${oneValueArgs}" "" ${ARGN})
@@ -682,7 +615,99 @@ function(arkham_write_encoder_hygiene_target_universe)
     file(MAKE_DIRECTORY "${ARG_HEADER_DIR}")
     file(MAKE_DIRECTORY "${ARG_SOURCE_DIR}")
     _arkham_collect_buildsystem_targets("${CMAKE_SOURCE_DIR}" _arkham_ehu_targets)
+    _arkham_collect_imported_targets("${CMAKE_SOURCE_DIR}" _arkham_ehu_imported_targets)
     list(SORT _arkham_ehu_targets)
+    list(SORT _arkham_ehu_imported_targets)
+    set(_arkham_ehu_graph_targets
+        ${_arkham_ehu_targets} ${_arkham_ehu_imported_targets})
+    list(REMOVE_DUPLICATES _arkham_ehu_graph_targets)
+    set(_arkham_ehu_graph_dir
+        "${CMAKE_BINARY_DIR}/generated/target_link_graph")
+    set(_arkham_ehu_graph_index
+        "${CMAKE_BINARY_DIR}/generated/target_link_graph_index.txt")
+    set(_arkham_ehu_alias_file
+        "${CMAKE_BINARY_DIR}/generated/target_link_aliases.txt")
+    set(_arkham_ehu_external_file
+        "${CMAKE_BINARY_DIR}/generated/target_link_external_items.txt")
+    file(MAKE_DIRECTORY "${_arkham_ehu_graph_dir}")
+    file(WRITE "${_arkham_ehu_graph_index}" "")
+    file(WRITE "${_arkham_ehu_alias_file}" "")
+    file(WRITE "${_arkham_ehu_external_file}" "")
+    foreach(_arkham_ehu_graph_target IN LISTS _arkham_ehu_graph_targets)
+        if(NOT TARGET "${_arkham_ehu_graph_target}")
+            continue()
+        endif()
+        get_target_property(_arkham_ehu_graph_type
+            ${_arkham_ehu_graph_target} TYPE)
+        if(_arkham_ehu_graph_type STREQUAL "UTILITY")
+            continue()
+        endif()
+        string(SHA256 _arkham_ehu_graph_hash "${_arkham_ehu_graph_target}")
+        file(APPEND "${_arkham_ehu_graph_index}"
+            "${_arkham_ehu_graph_target}\t${_arkham_ehu_graph_hash}.txt\n")
+        get_target_property(_arkham_ehu_graph_links
+            ${_arkham_ehu_graph_target} LINK_LIBRARIES)
+        get_target_property(_arkham_ehu_graph_interface_links
+            ${_arkham_ehu_graph_target} INTERFACE_LINK_LIBRARIES)
+        if(NOT _arkham_ehu_graph_links)
+            set(_arkham_ehu_graph_links "")
+        endif()
+        if(NOT _arkham_ehu_graph_interface_links)
+            set(_arkham_ehu_graph_interface_links "")
+        endif()
+        foreach(_arkham_ehu_raw_edge IN LISTS
+                _arkham_ehu_graph_links _arkham_ehu_graph_interface_links)
+            if(_arkham_ehu_raw_edge MATCHES "[|\n\r]")
+                message(FATAL_ERROR
+                    "Encoder-hygiene link edge contains an unsupported metadata "
+                    "delimiter: '${_arkham_ehu_raw_edge}'")
+            endif()
+            if(NOT _arkham_ehu_raw_edge MATCHES "\\$<")
+                set(_arkham_ehu_known_imported_index -1)
+                if(TARGET "${_arkham_ehu_raw_edge}")
+                    get_target_property(_arkham_ehu_edge_alias
+                        ${_arkham_ehu_raw_edge} ALIASED_TARGET)
+                    if(_arkham_ehu_edge_alias)
+                        file(APPEND "${_arkham_ehu_alias_file}"
+                            "${_arkham_ehu_raw_edge}\t${_arkham_ehu_edge_alias}\n")
+                    endif()
+                else()
+                    list(FIND _arkham_ehu_imported_targets
+                        "${_arkham_ehu_raw_edge}"
+                        _arkham_ehu_known_imported_index)
+                endif()
+                if(NOT TARGET "${_arkham_ehu_raw_edge}" AND
+                        _arkham_ehu_known_imported_index EQUAL -1 AND
+                        NOT _arkham_ehu_raw_edge MATCHES "^::@" AND
+                        NOT _arkham_ehu_raw_edge MATCHES
+                            "^(debug|optimized|general)$")
+                    file(APPEND "${_arkham_ehu_external_file}"
+                        "${_arkham_ehu_raw_edge}\n")
+                endif()
+            else()
+                # Alias discovery is identity-only, never graph inference:
+                # CMake itself must confirm each literal token is an alias.
+                string(REGEX MATCHALL
+                    "[A-Za-z_][A-Za-z0-9_.+-]*(::[A-Za-z_][A-Za-z0-9_.+-]*)*"
+                    _arkham_ehu_edge_tokens "${_arkham_ehu_raw_edge}")
+                foreach(_arkham_ehu_edge_token IN LISTS _arkham_ehu_edge_tokens)
+                    if(TARGET "${_arkham_ehu_edge_token}")
+                        get_target_property(_arkham_ehu_edge_alias
+                            ${_arkham_ehu_edge_token} ALIASED_TARGET)
+                        if(_arkham_ehu_edge_alias)
+                            file(APPEND "${_arkham_ehu_alias_file}"
+                                "${_arkham_ehu_edge_token}\t${_arkham_ehu_edge_alias}\n")
+                        endif()
+                    endif()
+                endforeach()
+            endif()
+        endforeach()
+        file(GENERATE
+            OUTPUT
+                "${_arkham_ehu_graph_dir}/$<CONFIG>/${_arkham_ehu_graph_hash}.txt"
+            CONTENT
+                "target\t${_arkham_ehu_graph_target}\nlinks\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_target},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},LINK_LIBRARIES>>,|>\ninterface\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_target},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES>>,|>\n")
+    endforeach()
     set(_arkham_ehu_universe "")
     set(_arkham_ehu_index "")
     set(_arkham_ehu_source_index "")
@@ -716,30 +741,6 @@ function(arkham_write_encoder_hygiene_target_universe)
         get_target_property(_arkham_ehu_context ${_arkham_ehu_target} ARKHAM_ENCODER_HYGIENE_CONTEXT_TARGET)
         get_target_property(_arkham_ehu_policy ${_arkham_ehu_target} ARKHAM_ENCODER_HYGIENE_POLICY)
         set(_arkham_ehu_contexts "${_arkham_ehu_context}")
-        if(_arkham_ehu_type STREQUAL "INTERFACE_LIBRARY")
-            foreach(_arkham_ehu_candidate IN LISTS _arkham_ehu_targets)
-                if(_arkham_ehu_candidate STREQUAL _arkham_ehu_target)
-                    continue()
-                endif()
-                get_target_property(_arkham_ehu_candidate_class
-                    ${_arkham_ehu_candidate} ARKHAM_ENCODER_HYGIENE_CLASSIFICATION)
-                if(NOT _arkham_ehu_candidate_class STREQUAL "SCAN")
-                    continue()
-                endif()
-                get_target_property(_arkham_ehu_candidate_type
-                    ${_arkham_ehu_candidate} TYPE)
-                if(_arkham_ehu_candidate_type STREQUAL "INTERFACE_LIBRARY")
-                    continue()
-                endif()
-                _arkham_target_reaches_interface(
-                    "${_arkham_ehu_candidate}" "${_arkham_ehu_target}" ""
-                    _arkham_ehu_reaches_interface)
-                if(_arkham_ehu_reaches_interface)
-                    list(APPEND _arkham_ehu_contexts "${_arkham_ehu_candidate}")
-                endif()
-            endforeach()
-        endif()
-        list(REMOVE_DUPLICATES _arkham_ehu_contexts)
         string(REPLACE ";" "," _arkham_ehu_contexts_serialized
             "${_arkham_ehu_contexts}")
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Prove, via real compiler-AST inspection (libclang), that no PUBLIC
-declaration in this project's production headers or compiled target TUs
-returns a QJsonObject/QJsonArray/QJsonValue-family type, except for a tiny,
-explicitly enumerated allowlist of legitimate symbols:
+"""Prove, via real compiler-AST inspection (libclang), that no declaration,
+type surface, or function-body construction in any production header/source
+context semantically references a QJsonObject/QJsonArray/QJsonValue-family
+type, except for a tiny, explicitly enumerated positive allowlist:
 
   - The domain-model header set (src/domain/CardCatalog.h, ContractPin.h,
     ContractRevision.h, Decks.h, Games.h, Identifiers.h, JsonDecode.h,
@@ -27,6 +27,11 @@ explicitly enumerated allowlist of legitimate symbols:
 Every compile-command target is reverse-inventoried against explicit CMake
 target metadata. Unknown production targets fail; external, test, and
 try-compile commands are excluded only by exact target records.
+INTERFACE header contexts are derived from a CMake-evaluated link graph
+generated separately for every audited configuration. The graph crosses
+imported and exempt wrappers, resolves nested generator expressions before
+Python reads it, and rejects any unevaluated or unclassified result rather
+than guessing target names from generator-expression text.
 
 Both header sets are audited by this ONE script/policy, not just the
 domain one: a review round demonstrated that scoping the AST scan to
@@ -150,6 +155,10 @@ an ever-growing fragment of C++ parsing by hand:
     casts, initializers, and materialized temporaries. A void-returning
     submit function therefore cannot hide a QJsonDocument or QJsonObject
     construction merely because its outer declaration has no wire type.
+    Lambda parameters and concrete function-template TypeRef arguments are
+    independent surfaces; unresolved dependent body TypeRefs fail closed.
+    Every numeric cursor kind used here is checked against the installed
+    libclang's own clang_getCursorKindSpelling result at startup.
   - A declaration is a *violation* if any semantic type component is in
     the forbidden family and its exact file, USR, canonical semantic
     signature, access, and occurrence count are not one ALLOWLIST entry
@@ -316,7 +325,7 @@ _NAMED_ALLOWLIST_IDENTITY_SET_SHA256 = (
     "04096034a5fb3bb78d8587a5360fec919df7e2a5eaf948192b311cb94956f08d"
 )
 _LOCAL_WIRE_SURFACE_SET_SHA256 = (
-    "fee5778d943ea700e7a6b9cf61054cd40d796de237844bb405e8feebbc6a7c5b"
+    "636424def3e04237f53d8873b25675a9f9d53e7774a84f74d18f1ba08410275f"
 )
 
 
@@ -830,12 +839,62 @@ _CXCursor_TypedefDecl = 20
 _CXCursor_CXXBaseSpecifier = 44
 _CXCursor_UsingDeclaration = 35
 _CXCursor_TypeAliasDecl = 36
+_CXCursor_TypeRef = 43
 _CXCursor_OverloadedDeclRef = 49
 _CXCursor_NoDeclFound = 71
-_CXCursor_TranslationUnit = 300
+_CXCursor_CallExpr = 103
+_CXCursor_CStyleCastExpr = 117
+_CXCursor_CompoundLiteralExpr = 118
+_CXCursor_InitListExpr = 119
+_CXCursor_CXXStaticCastExpr = 124
+_CXCursor_CXXDynamicCastExpr = 125
+_CXCursor_CXXReinterpretCastExpr = 126
+_CXCursor_CXXConstCastExpr = 127
+_CXCursor_CXXFunctionalCastExpr = 128
+_CXCursor_CXXNewExpr = 134
+_CXCursor_LambdaExpr = 144
+_CXCursor_ObjCBoolLiteralExpr = 145
+_CXCursor_TranslationUnit = 350
 _CXCursor_FriendDecl = 603
 _CXCursor_TemplateTypeParameter = 27
-_CXCursor_LambdaExpr = 145
+
+_EXPECTED_CURSOR_KIND_SPELLINGS = {
+    _CXCursor_StructDecl: "StructDecl",
+    _CXCursor_UnionDecl: "UnionDecl",
+    _CXCursor_ClassDecl: "ClassDecl",
+    _CXCursor_FieldDecl: "FieldDecl",
+    _CXCursor_FunctionDecl: "FunctionDecl",
+    _CXCursor_VarDecl: "VarDecl",
+    _CXCursor_ParmDecl: "ParmDecl",
+    _CXCursor_TypedefDecl: "TypedefDecl",
+    _CXCursor_CXXMethod: "CXXMethod",
+    _CXCursor_Namespace: "Namespace",
+    _CXCursor_Constructor: "CXXConstructor",
+    _CXCursor_ConversionFunction: "CXXConversion",
+    _CXCursor_TemplateTypeParameter: "TemplateTypeParameter",
+    _CXCursor_FunctionTemplate: "FunctionTemplate",
+    _CXCursor_ClassTemplate: "ClassTemplate",
+    _CXCursor_UsingDeclaration: "UsingDeclaration",
+    _CXCursor_TypeAliasDecl: "TypeAliasDecl",
+    _CXCursor_TypeRef: "TypeRef",
+    _CXCursor_CXXBaseSpecifier: "C++ base class specifier",
+    _CXCursor_OverloadedDeclRef: "OverloadedDeclRef",
+    _CXCursor_NoDeclFound: "NoDeclFound",
+    _CXCursor_CallExpr: "CallExpr",
+    _CXCursor_CStyleCastExpr: "CStyleCastExpr",
+    _CXCursor_CompoundLiteralExpr: "CompoundLiteralExpr",
+    _CXCursor_InitListExpr: "InitListExpr",
+    _CXCursor_CXXStaticCastExpr: "CXXStaticCastExpr",
+    _CXCursor_CXXDynamicCastExpr: "CXXDynamicCastExpr",
+    _CXCursor_CXXReinterpretCastExpr: "CXXReinterpretCastExpr",
+    _CXCursor_CXXConstCastExpr: "CXXConstCastExpr",
+    _CXCursor_CXXFunctionalCastExpr: "CXXFunctionalCastExpr",
+    _CXCursor_CXXNewExpr: "CXXNewExpr",
+    _CXCursor_LambdaExpr: "LambdaExpr",
+    _CXCursor_ObjCBoolLiteralExpr: "ObjCBoolLiteralExpr",
+    _CXCursor_TranslationUnit: "TranslationUnit",
+    _CXCursor_FriendDecl: "FriendDecl",
+}
 
 # The "shape-eligible" record/class-template kinds this script walks for
 # base-specifier/using-declaration inheritance exposure (see
@@ -880,6 +939,8 @@ _TYPE_SURFACE_KINDS = frozenset(
         _CXCursor_CXXBaseSpecifier,
         _CXCursor_FieldDecl,
         _CXCursor_VarDecl,
+        _CXCursor_ParmDecl,
+        _CXCursor_TypeRef,
     }
 )
 # Expression kinds that can introduce a typed construction independently of a
@@ -890,16 +951,16 @@ _TYPE_SURFACE_KINDS = frozenset(
 # temporaries may have no declaration at all.
 _EXPRESSION_SURFACE_KINDS = frozenset(
     {
-        103,  # CXCursor_CallExpr
-        117,  # CXCursor_CStyleCastExpr
-        118,  # CXCursor_CompoundLiteralExpr
-        119,  # CXCursor_InitListExpr
-        124,  # CXCursor_CXXStaticCastExpr
-        125,  # CXCursor_CXXDynamicCastExpr
-        126,  # CXCursor_CXXReinterpretCastExpr
-        127,  # CXCursor_CXXConstCastExpr
-        128,  # CXCursor_CXXFunctionalCastExpr
-        134,  # CXCursor_CXXNewExpr
+        _CXCursor_CallExpr,
+        _CXCursor_CStyleCastExpr,
+        _CXCursor_CompoundLiteralExpr,
+        _CXCursor_InitListExpr,
+        _CXCursor_CXXStaticCastExpr,
+        _CXCursor_CXXDynamicCastExpr,
+        _CXCursor_CXXReinterpretCastExpr,
+        _CXCursor_CXXConstCastExpr,
+        _CXCursor_CXXFunctionalCastExpr,
+        _CXCursor_CXXNewExpr,
         _CXCursor_LambdaExpr,
     }
 )
@@ -1064,6 +1125,15 @@ class _LibClang:
         lib.clang_getCString.restype = ctypes.c_char_p
         lib.clang_getCString.argtypes = [_CXString]
         lib.clang_disposeString.argtypes = [_CXString]
+        try:
+            lib.clang_getCursorKindSpelling.restype = _CXString
+            lib.clang_getCursorKindSpelling.argtypes = [ctypes.c_uint]
+        except AttributeError as exc:
+            raise EncoderHygieneError(
+                "Installed libclang does not expose "
+                "clang_getCursorKindSpelling; cursor-kind policy cannot be "
+                "verified and therefore fails closed"
+            ) from exc
 
         lib.clang_createIndex.restype = ctypes.c_void_p
         lib.clang_createIndex.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -1208,6 +1278,15 @@ class _LibClang:
         lib.clang_getCursorDisplayName.argtypes = [_CXCursor]
         lib.clang_getCursorUSR.restype = _CXString
         lib.clang_getCursorUSR.argtypes = [_CXCursor]
+        lib.clang_getCursorReferenced.restype = _CXCursor
+        lib.clang_getCursorReferenced.argtypes = [_CXCursor]
+        lib.clang_Cursor_getNumTemplateArguments.restype = ctypes.c_int
+        lib.clang_Cursor_getNumTemplateArguments.argtypes = [_CXCursor]
+        lib.clang_Cursor_getTemplateArgumentType.restype = _CXType
+        lib.clang_Cursor_getTemplateArgumentType.argtypes = [
+            _CXCursor,
+            ctypes.c_uint,
+        ]
         lib.clang_getCursorSemanticParent.restype = _CXCursor
         lib.clang_getCursorSemanticParent.argtypes = [_CXCursor]
         lib.clang_getCXXAccessSpecifier.restype = ctypes.c_int
@@ -1316,6 +1395,25 @@ class _LibClang:
 
         lib.clang_disposeTranslationUnit.argtypes = [ctypes.c_void_p]
         lib.clang_disposeIndex.argtypes = [ctypes.c_void_p]
+        self._verify_cursor_kind_constants()
+
+    def _verify_cursor_kind_constants(self) -> None:
+        mismatches: list[str] = []
+        for value, expected in _EXPECTED_CURSOR_KIND_SPELLINGS.items():
+            actual = self.to_str(
+                self.lib.clang_getCursorKindSpelling(value)
+            )
+            if actual != expected:
+                mismatches.append(
+                    f"{value}: expected {expected!r}, installed libclang "
+                    f"reports {actual!r}"
+                )
+        if mismatches:
+            raise EncoderHygieneError(
+                "Installed libclang cursor-kind ABI does not match the "
+                "closed policy inventory:\n"
+                + "\n".join(f"  {mismatch}" for mismatch in mismatches)
+            )
 
     def to_str(self, cxstr: _CXString) -> str:
         raw = self.lib.clang_getCString(cxstr)
@@ -1450,6 +1548,62 @@ def _cursor_is_function_local(
     return False
 
 
+def _type_surface_is_body(
+    clang: "_LibClang",
+    cursor: "_CXCursor",
+    kind: int,
+    parent: "_CXCursor",
+) -> bool:
+    if kind in _EXPRESSION_SURFACE_KINDS:
+        return True
+    parent_kind = clang.lib.clang_getCursorKind(parent)
+    if kind == _CXCursor_ParmDecl:
+        owner = clang.lib.clang_getCursorSemanticParent(cursor)
+        return (
+            parent_kind == _CXCursor_LambdaExpr
+            or _cursor_is_function_local(clang, owner)
+        )
+    if kind == _CXCursor_TypeRef and parent_kind == _CXCursor_ParmDecl:
+        owner = clang.lib.clang_getCursorSemanticParent(parent)
+        return _cursor_is_function_local(clang, owner)
+    return (
+        parent_kind == _CXCursor_LambdaExpr
+        or _cursor_is_function_local(clang, parent)
+        or _cursor_is_function_local(clang, cursor)
+    )
+
+
+def _is_unresolved_dependent_type_ref(
+    clang: "_LibClang", cursor: "_CXCursor", kind: int
+) -> bool:
+    if kind != _CXCursor_TypeRef:
+        return False
+    referenced = clang.lib.clang_getCursorReferenced(cursor)
+    return (
+        clang.lib.clang_getCursorKind(referenced)
+        == _CXCursor_TemplateTypeParameter
+    )
+
+
+def _cursor_template_argument_fingerprint(
+    clang: "_LibClang", cursor: "_CXCursor", kind: int
+) -> str | None:
+    if kind != _CXCursor_CallExpr:
+        return None
+    referenced = clang.lib.clang_getCursorReferenced(cursor)
+    count = clang.lib.clang_Cursor_getNumTemplateArguments(referenced)
+    for index in range(max(count, 0)):
+        argument = clang.lib.clang_Cursor_getTemplateArgumentType(
+            referenced, index
+        )
+        if argument.kind == 0:
+            continue
+        forbidden = _forbidden_type_fingerprint(clang, argument)
+        if forbidden:
+            return f"template-arg[{index}]:{forbidden}"
+    return None
+
+
 def _is_qjson_family(canonical_type_spelling: str) -> bool:
     return any(family in canonical_type_spelling for family in _QJSON_FAMILY) or _is_qvariant_json_container(
         canonical_type_spelling
@@ -1511,6 +1665,11 @@ def _stable_type_spelling(clang: "_LibClang", value_type: "_CXType") -> str:
     )
     spelling = spelling.replace("std::__1::", "std::").replace(
         "std::__cxx11::", "std::"
+    )
+    spelling = _re.sub(
+        r"\(lambda at (?:.*[/\\])?([^/\\():]+:\d+:\d+)\)",
+        r"(lambda at \1)",
+        spelling,
     )
     return " ".join(spelling.split())
 
@@ -2870,12 +3029,268 @@ def _load_target_policies(clang_build_dir: Path) -> dict[str, TargetPolicy]:
     return policies
 
 
+def _load_evaluated_link_contexts(
+    clang_build_dir: Path,
+    policies: dict[str, TargetPolicy],
+    contexts_by_target: dict[str, list[CompileContext]],
+    audited_configs: Sequence[str],
+) -> dict[str, tuple[tuple[str, str], ...]]:
+    generated = clang_build_dir / "generated"
+    graph_root = generated / "target_link_graph"
+    graph_index_path = generated / "target_link_graph_index.txt"
+    alias_path = generated / "target_link_aliases.txt"
+    external_path = generated / "target_link_external_items.txt"
+    if (
+        not graph_root.is_dir()
+        or not graph_index_path.is_file()
+        or not alias_path.is_file()
+        or not external_path.is_file()
+    ):
+        raise EncoderHygieneError(
+            "Per-configuration CMake-evaluated target link graph metadata "
+            "is missing"
+        )
+    indexed_files: dict[str, str] = {}
+    for line_number, line in enumerate(
+        graph_index_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        fields = line.split("\t")
+        if (
+            len(fields) != 2
+            or not all(fields)
+            or fields[0] in indexed_files
+            or not _re.fullmatch(r"[0-9a-f]{64}\.txt", fields[1])
+        ):
+            raise EncoderHygieneError(
+                f"{graph_index_path}:{line_number}: malformed/duplicate "
+                "evaluated graph index record"
+            )
+        indexed_files[fields[0]] = fields[1]
+    if not indexed_files:
+        raise EncoderHygieneError(
+            f"Evaluated target graph index is empty: {graph_index_path}"
+        )
+    actual_configs = {
+        path.name for path in graph_root.iterdir() if path.is_dir()
+    }
+    if actual_configs != set(audited_configs):
+        raise EncoderHygieneError(
+            "Evaluated link graph configuration set differs from audited "
+            f"configurations: graph={sorted(actual_configs)}, "
+            f"audited={sorted(audited_configs)}"
+        )
+
+    aliases: dict[str, str] = {}
+    for line_number, line in enumerate(
+        alias_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != 2 or not all(fields):
+            raise EncoderHygieneError(
+                f"{alias_path}:{line_number}: malformed target alias"
+            )
+        alias, canonical = fields
+        previous = aliases.setdefault(alias, canonical)
+        if previous != canonical:
+            raise EncoderHygieneError(
+                f"{alias_path}:{line_number}: ambiguous target alias {alias}"
+            )
+    external_items = {
+        line
+        for line in external_path.read_text(encoding="utf-8").splitlines()
+        if line
+    }
+
+    raw_graphs: dict[str, dict[str, tuple[str, ...]]] = {}
+    expected_nodes: set[str] | None = None
+    for configuration in audited_configs:
+        config_dir = graph_root / configuration
+        graph: dict[str, tuple[str, ...]] = {}
+        actual_files = {path.name for path in config_dir.glob("*.txt")}
+        if actual_files != set(indexed_files.values()):
+            raise EncoderHygieneError(
+                f"Evaluated link graph files for {configuration} differ from "
+                f"the exact index: missing="
+                f"{sorted(set(indexed_files.values()) - actual_files)}, "
+                f"extra={sorted(actual_files - set(indexed_files.values()))}"
+            )
+        for indexed_target, filename in sorted(indexed_files.items()):
+            path = config_dir / filename
+            fields: dict[str, str] = {}
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                key, separator, value = line.partition("\t")
+                if (
+                    not separator
+                    or key not in {"target", "links", "interface"}
+                    or key in fields
+                ):
+                    raise EncoderHygieneError(
+                        f"{path}:{line_number}: malformed evaluated link record"
+                    )
+                fields[key] = value
+            if set(fields) != {"target", "links", "interface"}:
+                raise EncoderHygieneError(
+                    f"{path}: incomplete evaluated link record"
+                )
+            target = fields["target"]
+            if (
+                not target
+                or target != indexed_target
+                or target in graph
+            ):
+                raise EncoderHygieneError(
+                    f"{path}: mismatched/duplicate evaluated target identity"
+                )
+            edges = tuple(
+                edge
+                for value in (fields["links"], fields["interface"])
+                for edge in value.split("|")
+                if edge
+            )
+            graph[target] = edges
+        if not graph:
+            raise EncoderHygieneError(
+                f"Evaluated link graph is empty for {configuration}"
+            )
+        if expected_nodes is None:
+            expected_nodes = set(graph)
+        elif set(graph) != expected_nodes:
+            raise EncoderHygieneError(
+                "Evaluated link graph target universe differs by "
+                f"configuration {configuration}: expected="
+                f"{sorted(expected_nodes)}, actual={sorted(graph)}"
+            )
+        raw_graphs[configuration] = graph
+
+    if expected_nodes is None:
+        raise EncoderHygieneError(
+            "Evaluated link graph has no target universe"
+        )
+    if not set(policies).issubset(expected_nodes):
+        raise EncoderHygieneError(
+            "Evaluated link graph omits classified targets: "
+            f"{sorted(set(policies) - expected_nodes)}"
+        )
+    for alias, canonical in aliases.items():
+        if canonical not in expected_nodes or alias in expected_nodes:
+            raise EncoderHygieneError(
+                f"Invalid evaluated target alias {alias} -> {canonical}"
+            )
+
+    graphs: dict[str, dict[str, frozenset[str]]] = {}
+    link_only = _re.compile(r"^\$<LINK_ONLY:([^$<>]+)>$")
+    for configuration, raw_graph in raw_graphs.items():
+        graph: dict[str, frozenset[str]] = {}
+        for target, raw_edges in raw_graph.items():
+            resolved: set[str] = set()
+            for raw_edge in raw_edges:
+                edge = raw_edge
+                if edge.startswith("::@") or edge in {
+                    "debug",
+                    "optimized",
+                    "general",
+                }:
+                    continue
+                match = link_only.fullmatch(edge)
+                if match:
+                    edge = match.group(1)
+                if "$<" in edge:
+                    raise EncoderHygieneError(
+                        f"Target {target} configuration {configuration} has "
+                        f"an unevaluated link edge: {edge}"
+                    )
+                edge = aliases.get(edge, edge)
+                if edge in expected_nodes:
+                    resolved.add(edge)
+                elif edge not in external_items:
+                    raise EncoderHygieneError(
+                        f"Target {target} configuration {configuration} has "
+                        "an unclassified evaluated link edge (generator "
+                        f"expression result is not enumerable): {edge}"
+                    )
+            graph[target] = frozenset(resolved)
+        graphs[configuration] = graph
+
+    def reaches(
+        graph: dict[str, frozenset[str]],
+        current: str,
+        sought: str,
+        visited: frozenset[str] = frozenset(),
+    ) -> bool:
+        if current == sought:
+            return True
+        if current in visited:
+            return False
+        return any(
+            reaches(graph, edge, sought, visited | {current})
+            for edge in graph[current]
+        )
+
+    compile_config_by_audited = {
+        configuration: (
+            configuration if len(audited_configs) > 1 else ""
+        )
+        for configuration in audited_configs
+    }
+    result: dict[str, tuple[tuple[str, str], ...]] = {}
+    compiled_roots = [
+        target
+        for target, policy in policies.items()
+        if policy.classification == "SCAN"
+        and policy.target_type != "INTERFACE_LIBRARY"
+    ]
+    for target, policy in policies.items():
+        if policy.classification != "SCAN":
+            continue
+        refs: set[tuple[str, str]] = set()
+        for configuration in audited_configs:
+            compile_configuration = compile_config_by_audited[configuration]
+            graph = graphs[configuration]
+            for root in compiled_roots:
+                if not any(
+                    context.configuration == compile_configuration
+                    for context in contexts_by_target.get(root, ())
+                ):
+                    continue
+                if (
+                    policy.target_type != "INTERFACE_LIBRARY"
+                    and root == target
+                ) or (
+                    policy.target_type == "INTERFACE_LIBRARY"
+                    and reaches(graph, root, target)
+                ):
+                    refs.add((root, compile_configuration))
+            if policy.target_type == "INTERFACE_LIBRARY" and (
+                policy.context_target,
+                compile_configuration,
+            ) not in refs:
+                raise EncoderHygieneError(
+                    f"Interface target {target} context "
+                    f"{policy.context_target} does not consume it in evaluated "
+                    f"configuration {configuration}"
+                )
+        if not refs:
+            raise EncoderHygieneError(
+                f"SCAN target {target} has no evaluated compile contexts"
+            )
+        result[target] = tuple(sorted(refs))
+    return result
+
+
 def _load_target_header_manifests(
     repo_root: Path,
     clang_build_dir: Path,
     policies: dict[str, TargetPolicy],
     contexts: Sequence[CompileContext],
-) -> tuple[dict[str, list[Path]], dict[str, tuple[str, ...]]]:
+    audited_configs: Sequence[str],
+) -> tuple[
+    dict[str, list[Path]],
+    dict[str, tuple[tuple[str, str], ...]],
+]:
     universe_path = clang_build_dir / "generated" / "target_universe.txt"
     index_path = clang_build_dir / "generated" / "target_header_index.txt"
     if not universe_path.is_file() or not index_path.is_file():
@@ -2910,9 +3325,15 @@ def _load_target_header_manifests(
     contexts_by_target: dict[str, list[CompileContext]] = {}
     for context in contexts:
         contexts_by_target.setdefault(context.target, []).append(context)
+    evaluated_contexts = _load_evaluated_link_contexts(
+        clang_build_dir,
+        policies,
+        contexts_by_target,
+        audited_configs,
+    )
 
     manifests: dict[str, list[Path]] = {}
-    manifest_contexts: dict[str, tuple[str, ...]] = {}
+    manifest_contexts: dict[str, tuple[tuple[str, str], ...]] = {}
     for line_number, line in enumerate(
         index_path.read_text(encoding="utf-8").splitlines(), start=1
     ):
@@ -2924,7 +3345,7 @@ def _load_target_header_manifests(
                 f"{index_path}:{line_number}: malformed header index record"
             )
         target, policy_name, context_target, manifest_text = fields
-        context_targets = tuple(
+        declared_context_targets = tuple(
             context for context in context_target.split(",") if context
         )
         policy = policies.get(target)
@@ -2932,13 +3353,14 @@ def _load_target_header_manifests(
             policy is None
             or policy.classification != "SCAN"
             or policy.policy != policy_name
-            or policy.context_target not in context_targets
+            or declared_context_targets != (policy.context_target,)
             or target in manifests
         ):
             raise EncoderHygieneError(
                 f"{index_path}:{line_number}: mismatched/duplicate header ownership"
             )
-        for actual_context in context_targets:
+        context_refs = evaluated_contexts.get(target, ())
+        for actual_context, actual_config in context_refs:
             if actual_context not in contexts_by_target:
                 raise EncoderHygieneError(
                     f"Target {target} has no deterministic compiled header context "
@@ -2949,6 +3371,14 @@ def _load_target_header_manifests(
                 raise EncoderHygieneError(
                     f"Target {target} header context {actual_context} is not a "
                     "production SCAN target"
+                )
+            if not any(
+                context.configuration == actual_config
+                for context in contexts_by_target[actual_context]
+            ):
+                raise EncoderHygieneError(
+                    f"Target {target} has no exact {actual_config or '<single>'} "
+                    f"compile context from {actual_context}"
                 )
         entries = _read_manifest(Path(manifest_text))
         canonical: list[Path] = []
@@ -2975,7 +3405,7 @@ def _load_target_header_manifests(
             identities.add(identity)
             canonical.append(real)
         manifests[target] = canonical
-        manifest_contexts[target] = context_targets
+        manifest_contexts[target] = context_refs
 
     expected_scan = {
         target
@@ -3505,9 +3935,32 @@ def _scan_headers(
         real = Path(filename).resolve()
         if real not in allowed_closure:
             return
+        body_surface = _type_surface_is_body(
+            clang, cursor, kind, parent
+        )
+        if kind in (_CXCursor_ParmDecl, _CXCursor_TypeRef) and not body_surface:
+            # Namespace/record signatures and aliases are already audited as
+            # complete outer declarations. ParmDecl/TypeRef are independently
+            # needed only inside lambdas/local declarations/specialization
+            # uses, where no outer owned declaration carries the concrete type.
+            return
         access = clang.lib.clang_getCXXAccessSpecifier(cursor)
         cursor_type = clang.lib.clang_getCursorType(cursor)
         forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
+        if forbidden_path is None:
+            forbidden_path = _cursor_template_argument_fingerprint(
+                clang, cursor, kind
+            )
+        if (
+            forbidden_path is None
+            and body_surface
+            and _is_unresolved_dependent_type_ref(clang, cursor, kind)
+        ):
+            forbidden_path = (
+                "unresolved-dependent:"
+                f"{_stable_type_spelling(clang, cursor_type)}"
+                "=>QJsonObject"
+            )
         if forbidden_path is None:
             return
         usr = _stable_usr(
@@ -3545,10 +3998,7 @@ def _scan_headers(
                 else ""
             ),
             spelling_offset=spelling_offset,
-            body_surface=(
-                kind in _EXPRESSION_SURFACE_KINDS
-                or _cursor_is_function_local(clang, cursor)
-            ),
+            body_surface=body_surface,
         )
 
     def handle_inheritance_exposure(
@@ -3950,10 +4400,31 @@ def _scan_sources(
             real = Path(filename).resolve()
             if real not in allowed_closure and real != source_real:
                 return
+            body_surface = _type_surface_is_body(
+                clang, cursor, kind, parent
+            )
+            if kind in (_CXCursor_ParmDecl, _CXCursor_TypeRef) and not body_surface:
+                return
             access = clang.lib.clang_getCXXAccessSpecifier(cursor)
             linkage = clang.lib.clang_getCursorLinkage(cursor)
             cursor_type = clang.lib.clang_getCursorType(cursor)
             forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
+            if forbidden_path is None:
+                forbidden_path = _cursor_template_argument_fingerprint(
+                    clang, cursor, kind
+                )
+            if (
+                forbidden_path is None
+                and body_surface
+                and _is_unresolved_dependent_type_ref(
+                    clang, cursor, kind
+                )
+            ):
+                forbidden_path = (
+                    "unresolved-dependent:"
+                    f"{_stable_type_spelling(clang, cursor_type)}"
+                    "=>QJsonObject"
+                )
             if forbidden_path is None:
                 return
             usr = _stable_usr(
@@ -3996,10 +4467,7 @@ def _scan_sources(
                     ),
                     spelling_offset=spelling_offset,
                     observation_context=active_observation_context,
-                    body_surface=(
-                        kind in _EXPRESSION_SURFACE_KINDS
-                        or _cursor_is_function_local(clang, cursor)
-                    ),
+                    body_surface=body_surface,
                 )
             )
 
@@ -4439,7 +4907,11 @@ def run_check(
     external_roots = _external_roots(clang_build_dir.resolve())
     _validate_target_inventory(target_policies, all_contexts, external_roots)
     target_headers, target_header_contexts = _load_target_header_manifests(
-        repo_root, clang_build_dir, target_policies, all_contexts
+        repo_root,
+        clang_build_dir,
+        target_policies,
+        all_contexts,
+        audited_configs,
     )
     target_source_manifests = _load_target_source_manifests(
         repo_root, clang_build_dir, target_policies
@@ -4691,8 +5163,9 @@ def run_check(
             target_policy = target_policies[target]
             context_candidates = [
                 context
-                for context_target in target_header_contexts[target]
+                for context_target, context_configuration in target_header_contexts[target]
                 for context in contexts_by_target[context_target]
+                if context.configuration == context_configuration
             ]
             unique_contexts: dict[tuple, CompileContext] = {}
             for context in context_candidates:
@@ -4772,8 +5245,13 @@ def run_check(
             uncompiled_sources = manifested_code - compiled_sources
             scan_contexts = list(all_contexts)
             if uncompiled_sources:
-                for context_target in target_header_contexts[target]:
+                for (
+                    context_target,
+                    context_configuration,
+                ) in target_header_contexts[target]:
                     for fallback in contexts_by_target[context_target]:
+                        if fallback.configuration != context_configuration:
+                            continue
                         scan_contexts.extend(
                             CompileContext(
                                 source=source,
@@ -4883,8 +5361,9 @@ def run_check(
     for target, headers in target_headers.items():
         contexts = [
             context
-            for context_target in target_header_contexts[target]
+            for context_target, context_configuration in target_header_contexts[target]
             for context in contexts_by_target[context_target]
+            if context.configuration == context_configuration
         ]
         for header in headers:
             relative = (
@@ -4916,8 +5395,9 @@ def run_check(
             if not source_contexts:
                 source_contexts = [
                     context
-                    for context_target in target_header_contexts[target]
+                    for context_target, context_configuration in target_header_contexts[target]
                     for context in contexts_by_target[context_target]
+                    if context.configuration == context_configuration
                 ]
             expected_contexts_by_file.setdefault(relative, set()).update(
                 (

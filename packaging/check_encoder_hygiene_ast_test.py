@@ -186,6 +186,29 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
     actually call (internal linkage, or a private member of a
     source-only class)."""
 
+    def test_cursor_kind_abi_is_runtime_verified_and_drift_fails_closed(
+        self,
+    ) -> None:
+        self.assertEqual(ceh._CXCursor_LambdaExpr, 144)
+        self.assertEqual(ceh._CXCursor_ObjCBoolLiteralExpr, 145)
+        self.assertEqual(ceh._CXCursor_TranslationUnit, 350)
+        expected = ceh._EXPECTED_CURSOR_KIND_SPELLINGS[
+            ceh._CXCursor_LambdaExpr
+        ]
+        ceh._EXPECTED_CURSOR_KIND_SPELLINGS[
+            ceh._CXCursor_LambdaExpr
+        ] = "NotLambdaExpr"
+        try:
+            with self.assertRaisesRegex(
+                ceh.EncoderHygieneError,
+                "cursor-kind ABI does not match",
+            ):
+                self.clang._verify_cursor_kind_constants()
+        finally:
+            ceh._EXPECTED_CURSOR_KIND_SPELLINGS[
+                ceh._CXCursor_LambdaExpr
+            ] = expected
+
     def test_new_public_namespace_scope_function_with_no_header_declaration_is_flagged(self) -> None:
         # No header at all declares encodeSomethingNew(): a genuinely new,
         # source-only, externally-linked encoder.
@@ -285,6 +308,109 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
                 for finding in findings
             )
         )
+
+    def test_direct_lambda_parameters_are_audited_without_local_type_crutches(
+        self,
+    ) -> None:
+        source = self._write(
+            "LambdaCallbacks.cpp",
+            "struct QJsonObject {};\n"
+            "template<class Callback> void registerCallback(Callback) {}\n"
+            "void callbacks() {\n"
+            "  registerCallback([](QJsonObject &output) { (void)output; });\n"
+            "  registerCallback([](const QJsonObject &mutableInput) mutable {\n"
+            "    (void)mutableInput;\n"
+            "  });\n"
+            "  registerCallback([]<class T>(T &generic, QJsonObject &genericOutput) {\n"
+            "    (void)generic; (void)genericOutput;\n"
+            "  });\n"
+            "  registerCallback([](int &) {\n"
+            "    registerCallback([](QJsonObject &nested) { (void)nested; });\n"
+            "  });\n"
+            "  registerCallback([captured = QJsonObject{}]() -> QJsonObject {\n"
+            "    return captured;\n"
+            "  });\n"
+            "  registerCallback([](int &safe) { (void)safe; });\n"
+            "}\n",
+        )
+        violations, findings = self._scan_source_fixture(source, frozenset())
+        self.assertEqual(violations, [])
+        names = {finding.display_name for finding in findings}
+        self.assertTrue(
+            {"output", "mutableInput", "genericOutput", "nested"}.issubset(names)
+        )
+        self.assertNotIn("safe", names)
+        self.assertFalse(
+            any(
+                str(self.repo_root) in finding.canonical_return_type
+                for finding in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                "unresolved-dependent" in finding.canonical_return_type
+                for finding in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                finding.line in {14, 15, 16}
+                and "QJsonObject" in finding.canonical_return_type
+                for finding in findings
+            )
+        )
+        self.assertTrue(
+            all(
+                finding.body_surface
+                for finding in findings
+                if finding.display_name
+                in {"output", "mutableInput", "genericOutput", "nested"}
+            )
+        )
+
+    def test_concrete_function_template_arguments_close_dependent_bodies(
+        self,
+    ) -> None:
+        source = self._write(
+            "DependentBody.cpp",
+            "struct QJsonObject {};\n"
+            "struct QJsonDocument {\n"
+            "  template<class Value> explicit QJsonDocument(const Value &);\n"
+            "};\n"
+            "struct SafeDocument {\n"
+            "  template<class Value> explicit SafeDocument(const Value &);\n"
+            "};\n"
+            "template<class Object, class Document>\n"
+            "void encode(int) { Object body; Document doc(body); }\n"
+            "template<class Object, class Document>\n"
+            "void encode(double) { Object body; Document doc(body); }\n"
+            "template<class Object, class Document = QJsonDocument>\n"
+            "void encodeDefault() { Object body; Document doc(body); }\n"
+            "using ObjectAlias = QJsonObject;\n"
+            "void instantiate() {\n"
+            "  encode<QJsonObject, QJsonDocument>(0);\n"
+            "  encode<ObjectAlias, QJsonDocument>(0.0);\n"
+            "  encodeDefault<int>();\n"
+            "  encode<int, SafeDocument>(0);\n"
+            "}\n",
+        )
+        violations, findings = self._scan_source_fixture(source, frozenset())
+        self.assertEqual(violations, [])
+        call_lines = {16, 17, 18}
+        observed_call_lines = {
+            finding.line
+            for finding in findings
+            if finding.line in call_lines
+            and (
+                "QJsonObject" in finding.canonical_return_type
+                or "QJsonDocument" in finding.canonical_return_type
+            )
+        }
+        self.assertEqual(observed_call_lines, call_lines)
+        self.assertFalse(
+            any(finding.line == 19 for finding in findings)
+        )
+
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
         source = self._write(
             "Bar.cpp",
@@ -1851,8 +1977,14 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             "#ifdef INTERFACE_OWN_ENCODER\n"
             "QJsonObject interfaceDefinitionEncoder();\n"
             "#endif\n"
-            "#ifdef CONSUMER_ONE_ENCODER\n"
-            "QJsonObject consumerOneEncoder();\n"
+            "#ifdef CONSUMER_DEBUG_ENCODER\n"
+            "QJsonObject consumerDebugEncoder();\n"
+            "#endif\n"
+            "#ifdef CONSUMER_RELEASE_ENCODER\n"
+            "QJsonObject consumerReleaseEncoder();\n"
+            "#endif\n"
+            "#ifdef CONSUMER_RELWITH_ENCODER\n"
+            "QJsonObject consumerRelWithEncoder();\n"
             "#endif\n"
             "#ifdef CONSUMER_TWO_ENCODER\n"
             "QJsonObject consumerTwoEncoder();\n"
@@ -1882,15 +2014,15 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_library(wire_bridge INTERFACE)\n"
             + "target_link_libraries(wire_bridge INTERFACE WireAlias)\n"
             + "add_library(ImportedMid INTERFACE IMPORTED)\n"
-            + 'set_property(TARGET ImportedMid PROPERTY INTERFACE_LINK_LIBRARIES "$<TARGET_NAME_IF_EXISTS:wire_bridge>")\n'
+            + 'set_property(TARGET ImportedMid PROPERTY INTERFACE_LINK_LIBRARIES "$<IF:$<CONFIG:Debug>,$<LOWER_CASE:WIRE_INTERFACE>,$<IF:$<CONFIG:Release>,$<JOIN:wire_;interface,>,$<TARGET_NAME_IF_EXISTS:WireAlias>>>")\n'
             + "add_library(ImportedMidAlias ALIAS ImportedMid)\n"
             + "add_library(ImportedBridge INTERFACE IMPORTED)\n"
-            + 'set_property(TARGET ImportedBridge PROPERTY INTERFACE_LINK_LIBRARIES "$<$<CONFIG:Debug>:ImportedMidAlias>")\n'
+            + 'set_property(TARGET ImportedBridge PROPERTY INTERFACE_LINK_LIBRARIES "$<IF:$<BOOL:1>,$<TARGET_NAME_IF_EXISTS:ImportedMidAlias>,missing>")\n'
             + "add_library(exempt_bridge INTERFACE)\n"
             + "target_link_libraries(exempt_bridge INTERFACE ImportedBridge)\n"
             + "add_executable(consumer_one src/ConsumerOne.cpp)\n"
             + "target_link_libraries(consumer_one PRIVATE exempt_bridge)\n"
-            + "target_compile_definitions(consumer_one PRIVATE CONSUMER_ONE_ENCODER)\n"
+            + 'target_compile_definitions(consumer_one PRIVATE "$<$<CONFIG:Debug>:CONSUMER_DEBUG_ENCODER>" "$<$<CONFIG:Release>:CONSUMER_RELEASE_ENCODER>" "$<$<CONFIG:RelWithDebInfo>:CONSUMER_RELWITH_ENCODER>")\n'
             + "add_executable(consumer_two src/ConsumerTwo.cpp)\n"
             + "target_link_libraries(consumer_two PRIVATE wire_interface)\n"
             + "target_compile_definitions(consumer_two PRIVATE CONSUMER_TWO_ENCODER)\n"
@@ -1907,7 +2039,8 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         )
         self._write("CMakeLists.txt", cmake)
         self._configure_and_build(
-            ["domain", "foundation", "app", "consumer_one", "consumer_two"]
+            ["domain", "foundation", "app", "consumer_one", "consumer_two"],
+            multi_config=True,
         )
         findings = ceh.run_check(self.root, self.build, skip_configure=True)
         self.assertEqual(
@@ -1920,7 +2053,9 @@ class ProductionCMakeSeamTests(unittest.TestCase):
                 "unusedAppEncoder",
                 "interfaceOnlyEncoder",
                 "interfaceDefinitionEncoder",
-                "consumerOneEncoder",
+                "consumerDebugEncoder",
+                "consumerReleaseEncoder",
+                "consumerRelWithEncoder",
                 "consumerTwoEncoder",
                 "interfaceSourceEncoder",
                 "generatedHeaderEncoder",
@@ -1936,8 +2071,75 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             if line.startswith("wire_interface\t")
         )
         self.assertIn("__arkham_encoder_context_", wire_line)
-        self.assertIn("consumer_one", wire_line)
-        self.assertIn("consumer_two", wire_line)
+        commands = json.loads(
+            (self.build / "compile_commands.json").read_text(encoding="utf-8")
+        )
+        _, evaluated_contexts = ceh._load_target_header_manifests(
+            self.root,
+            self.build,
+            ceh._load_target_policies(self.build),
+            ceh._all_compile_contexts(commands),
+            ("Debug", "Release", "RelWithDebInfo"),
+        )
+        for configuration in ("Debug", "Release", "RelWithDebInfo"):
+            self.assertIn(
+                ("consumer_one", configuration),
+                evaluated_contexts["wire_interface"],
+            )
+            self.assertIn(
+                ("consumer_two", configuration),
+                evaluated_contexts["wire_interface"],
+            )
+        stale = (
+            self.build
+            / "generated/target_link_graph/Debug/stale.txt"
+        )
+        stale.write_text(
+            "target\tstale\nlinks\t\ninterface\t\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ceh.EncoderHygieneError,
+            "differ from the exact index",
+        ):
+            ceh._load_target_header_manifests(
+                self.root,
+                self.build,
+                ceh._load_target_policies(self.build),
+                ceh._all_compile_contexts(commands),
+                ("Debug", "Release", "RelWithDebInfo"),
+            )
+
+    def test_imported_generator_edge_with_unknown_result_fails_closed(
+        self,
+    ) -> None:
+        self._write("src/domain/Domain.h", "#pragma once\n")
+        self._write("src/domain/Domain.cpp", "int domainValue = 0;\n")
+        self._write("src/Foundation.h", "#pragma once\n")
+        self._write("src/Foundation.cpp", "int foundationValue = 0;\n")
+        self._write("src/main.cpp", "int main() { return 0; }\n")
+        cmake = (
+            "cmake_minimum_required(VERSION 3.25)\n"
+            "project(UnresolvedImportedEdge CXX)\n"
+            + self._manifest_prelude()
+            + "add_library(domain STATIC src/domain/Domain.cpp)\n"
+            'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h")\n'
+            + "add_library(foundation STATIC src/Foundation.cpp)\n"
+            'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
+            + "add_library(ImportedBridge INTERFACE IMPORTED)\n"
+            + 'set_property(TARGET ImportedBridge PROPERTY INTERFACE_LINK_LIBRARIES "$<LOWER_CASE:NOT_ENUMERATED>")\n'
+            + "add_executable(app src/main.cpp)\n"
+            + "target_link_libraries(app PRIVATE ImportedBridge)\n"
+            + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + self._register_manifests("domain", "foundation")
+        )
+        self._write("CMakeLists.txt", cmake)
+        self._configure_and_build(["domain", "foundation"])
+        with self.assertRaisesRegex(
+            ceh.EncoderHygieneError,
+            "unclassified evaluated link edge",
+        ):
+            ceh.run_check(self.root, self.build, skip_configure=True)
 
     def test_unknown_compile_target_fails_reverse_inventory(self) -> None:
         self._write("src/domain/Domain.h", "#pragma once\n")
@@ -1999,11 +2201,6 @@ class ProductionCMakeSeamTests(unittest.TestCase):
                 'target_sources(app PUBLIC FILE_SET conditional TYPE HEADERS '
                 'BASE_DIRS "${CMAKE_SOURCE_DIR}" '
                 'FILES "$<$<CONFIG:Release>:${CMAKE_SOURCE_DIR}/Lossy.h>")\n'
-            ),
-            "config-encoded-link-edge": (
-                "add_library(wire INTERFACE)\n"
-                'arkham_append_encoder_hygiene_target(TARGET wire CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
-                'target_link_libraries(app PRIVATE "$<$<CONFIG:Release>:wire>")\n'
             ),
             "unsupported-config-definition": (
                 'target_compile_definitions(app PRIVATE "$<$<CONFIG:Release>:LOSSY>")\n'
