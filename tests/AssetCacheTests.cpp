@@ -3113,6 +3113,156 @@ struct MountTransitionPolicyQualificationOverrideGuard {
 
 namespace {
 // Independent cumulative re-review (MEDIUM, repeat finding, "home
+// trust... arbitrary same-device bind mount still passes... even
+// tests arbitrary /dev/shm bind as accepted"): production code no
+// longer trusts tmpfs/overlay at all (see
+// trustedLocalMountFilesystemTypes()'s own comment in AssetCache.cpp)
+// and now additionally requires mountinfo's own "root" field to be
+// exactly "/" (see mountIdHasTrustedLocalFilesystemType()'s own
+// comment) -- a genuine dedicated partition mounts an ENTIRE
+// filesystem, never merely bind-mounts some arbitrary already-existing
+// SUBDIRECTORY of one. Every "legitimate mount transition" positive
+// control in this file therefore needs a real, disk-backed (ext4)
+// filesystem, freshly created via a loopback device and mounted
+// WHOLESALE (never bind-mounted as a subdirectory) -- `/dev/shm`
+// (tmpfs) is no longer suitable for this purpose at all, on either
+// count. Requires `mkfs.ext4`/`losetup`/passwordless sudo `mount`;
+// gracefully returns std::nullopt (never QSKIPs itself -- callers must
+// do so, exactly like every other privilege-dependent step in these
+// tests) when any step is unavailable or fails, since real CI
+// runners/dev environments are expected to have these (e2fsprogs,
+// util-linux) preinstalled, but this must never be assumed absolutely.
+// `keepAliveOut` receives ownership of the RAII cleanup object (backing
+// file, loop device, and the mount itself) so nothing is torn down out
+// from under the caller until the caller itself goes out of scope.
+struct LoopbackExt4Mount {
+  QString mountPointPath;
+  QString loopDevicePath;
+  QString backingFilePath;
+  QString mountPointDirToRemove;
+
+  LoopbackExt4Mount(const LoopbackExt4Mount &) = delete;
+  LoopbackExt4Mount &operator=(const LoopbackExt4Mount &) = delete;
+  LoopbackExt4Mount(LoopbackExt4Mount &&) = default;
+  LoopbackExt4Mount &operator=(LoopbackExt4Mount &&) = default;
+  explicit LoopbackExt4Mount(QString mountPoint, QString loopDevice,
+                             QString backingFile, QString mountPointDir)
+      : mountPointPath(std::move(mountPoint)),
+        loopDevicePath(std::move(loopDevice)),
+        backingFilePath(std::move(backingFile)),
+        mountPointDirToRemove(std::move(mountPointDir)) {}
+  ~LoopbackExt4Mount() {
+    if (!mountPointPath.isEmpty()) {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPointPath});
+    }
+    if (!loopDevicePath.isEmpty()) {
+      QProcess::execute(QStringLiteral("sudo"),
+                        {QStringLiteral("-n"), QStringLiteral("losetup"),
+                         QStringLiteral("-d"), loopDevicePath});
+    }
+    if (!mountPointDirToRemove.isEmpty()) {
+      QDir().rmdir(mountPointDirToRemove);
+    }
+    if (!backingFilePath.isEmpty()) {
+      QFile::remove(backingFilePath);
+    }
+  }
+};
+
+std::optional<QString> createLoopbackExt4BindSourceDirectory(
+    std::unique_ptr<LoopbackExt4Mount> &keepAliveOut) {
+  QTemporaryDir scratchDir;
+  if (!scratchDir.isValid()) {
+    return std::nullopt;
+  }
+  scratchDir.setAutoRemove(false);
+  const QString backingFile =
+      scratchDir.path() + QStringLiteral("/backing.img");
+  const QString mountPointDir = scratchDir.path() + QStringLiteral("/mnt");
+  if (!QDir().mkpath(mountPointDir)) {
+    return std::nullopt;
+  }
+
+  QProcess truncateProc;
+  truncateProc.start(
+      QStringLiteral("truncate"),
+      {QStringLiteral("-s"), QStringLiteral("16M"), backingFile});
+  if (!truncateProc.waitForFinished(5000) || truncateProc.exitCode() != 0) {
+    return std::nullopt;
+  }
+
+  QProcess mkfsProc;
+  mkfsProc.start(QStringLiteral("mkfs.ext4"),
+                 {QStringLiteral("-q"), QStringLiteral("-F"), backingFile});
+  if (!mkfsProc.waitForFinished(15000) || mkfsProc.exitCode() != 0) {
+    QFile::remove(backingFile);
+    return std::nullopt;
+  }
+
+  QProcess losetupProc;
+  losetupProc.start(QStringLiteral("sudo"),
+                    {QStringLiteral("-n"), QStringLiteral("losetup"),
+                     QStringLiteral("-f"), QStringLiteral("--show"),
+                     backingFile});
+  if (!losetupProc.waitForFinished(5000) || losetupProc.exitCode() != 0) {
+    QFile::remove(backingFile);
+    return std::nullopt;
+  }
+  const QString loopDevice =
+      QString::fromUtf8(losetupProc.readAllStandardOutput()).trimmed();
+  if (loopDevice.isEmpty()) {
+    QFile::remove(backingFile);
+    return std::nullopt;
+  }
+
+  // A whole-filesystem mount (never `--bind`) so mountinfo's own
+  // "root" field reads "/" -- see this function's own top comment.
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("-t"), QStringLiteral("ext4"), loopDevice,
+                   mountPointDir});
+  if (!mountProc.waitForFinished(5000) || mountProc.exitCode() != 0) {
+    QProcess::execute(QStringLiteral("sudo"),
+                      {QStringLiteral("-n"), QStringLiteral("losetup"),
+                       QStringLiteral("-d"), loopDevice});
+    QFile::remove(backingFile);
+    return std::nullopt;
+  }
+
+  // A freshly-formatted ext4 filesystem's own root directory is owned
+  // by root:root with mode 0755 by construction -- chown it to THIS
+  // (unprivileged) test process's own uid/gid, mirroring the default
+  // ownership QTemporaryDir() always had (the tmpfs-based helper this
+  // replaces). This is exactly the shape the FINAL-account-home-
+  // position tests need out of the box (current-uid ownership, see
+  // directoryDescriptorPassesOwnerAndModePolicy()); the ANCESTOR-
+  // position tests separately chown this back to root:root themselves
+  // afterward (and restore it before this helper's own destructor
+  // tries to unmount/remove it), exactly as they already did for the
+  // tmpfs-based helper.
+  QProcess chownProc;
+  chownProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("chown"),
+                   QString::number(::getuid()) + QLatin1Char(':') +
+                       QString::number(::getgid()),
+                   mountPointDir});
+  chownProc.waitForFinished(5000);
+  QProcess chmodProc;
+  chmodProc.start(QStringLiteral("chmod"),
+                  {QStringLiteral("755"), mountPointDir});
+  chmodProc.waitForFinished(5000);
+
+  keepAliveOut = std::make_unique<LoopbackExt4Mount>(
+      mountPointDir, loopDevice, backingFile, mountPointDir);
+  return mountPointDir;
+}
+} // namespace
+
+namespace {
+// Independent cumulative re-review (MEDIUM, repeat finding, "home
 // trust... arbitrary same-device bind mount still passes... Test
 // arbitrary same-device bind rejection and real expected SteamOS
 // home"): every bind-mount "legitimate mount transition" test in this
@@ -3127,14 +3277,22 @@ namespace {
 // creates all live on the exact same root filesystem device --
 // bind-mounting from there would incidentally exercise the NEW
 // same-device rejection instead of the legitimate-transition
-// acceptance path these tests actually intend to verify. `/dev/shm`
-// is a dedicated tmpfs mount present on every mainstream Linux
-// distribution and container base image this project targets,
-// guaranteeing a real, independently-provisioned distinct device
-// without requiring an actual extra disk partition to exist. Returns
-// std::nullopt (never QSKIPs itself -- callers must do so, exactly
-// like every other privilege-dependent step in these tests) when
-// `/dev/shm` is unavailable or not writable in this environment.
+// acceptance path these tests actually intend to verify.
+//
+// Independent cumulative re-review (MEDIUM, "even tests arbitrary
+// /dev/shm bind as accepted"): `/dev/shm` (tmpfs) is NO LONGER a
+// suitable distinct-device source at all -- production code trusts
+// neither tmpfs as a filesystem type, nor a bind-mounted subdirectory
+// (mountinfo root != "/") of anything, genuine partition or otherwise
+// (see createLoopbackExt4BindSourceDirectory()'s own comment just
+// above, which every "legitimate transition" positive control now uses
+// instead). This function is kept ONLY for the dedicated negative test
+// proving a tmpfs source is correctly REJECTED even when otherwise
+// fully authenticated.
+//
+// Returns std::nullopt (never QSKIPs itself -- callers must do so,
+// exactly like every other privilege-dependent step in these tests)
+// when `/dev/shm` is unavailable or not writable in this environment.
 // `keepAliveOut` receives ownership of the underlying QTemporaryDir so
 // its directory (and everything bind-mounted from it) is not removed
 // out from under the caller until the caller itself goes out of
@@ -3242,19 +3400,23 @@ void AssetCacheTests::
   QVERIFY(QDir().mkpath(fakeHome));
 
   // Independent cumulative re-review (MEDIUM, "arbitrary same-device
-  // bind mount still passes"): the bind source must live on a
-  // GENUINELY distinct device from `fakeHomeParent` -- see
-  // createDeviceDistinctBindSourceDirectory()'s own comment -- so this
+  // bind mount still passes"; MEDIUM, "even tests arbitrary /dev/shm
+  // bind as accepted"): the bind source must live on a GENUINELY
+  // distinct device from `fakeHomeParent`, AND now be a genuine,
+  // disk-backed, whole-filesystem mount (root=="/") -- see
+  // createLoopbackExt4BindSourceDirectory()'s own comment -- so this
   // positive control keeps exercising a real, legitimate DIFFERENT-
-  // mount transition rather than incidentally tripping the new
-  // same-device rejection this fix adds.
-  std::unique_ptr<QTemporaryDir> bindSourceDirKeepAlive;
+  // mount transition rather than incidentally tripping either the
+  // same-device rejection or the tmpfs/subdirectory-root rejection
+  // this fix adds.
+  std::unique_ptr<LoopbackExt4Mount> bindSourceDirKeepAlive;
   const std::optional<QString> bindSourceOpt =
-      createDeviceDistinctBindSourceDirectory(bindSourceDirKeepAlive);
+      createLoopbackExt4BindSourceDirectory(bindSourceDirKeepAlive);
   if (!bindSourceOpt.has_value()) {
-    QSKIP("/dev/shm (a distinct-device tmpfs) unavailable/not writable in "
-          "this environment; cannot model a genuinely distinct-device "
-          "mount transition without it");
+    QSKIP("a loopback ext4 filesystem (mkfs.ext4/losetup/passwordless sudo "
+          "mount) is unavailable in this environment; cannot model a "
+          "genuinely distinct-device, whole-filesystem mount transition "
+          "without it");
   }
   const QString bindSource = *bindSourceOpt;
 
@@ -3332,17 +3494,19 @@ void AssetCacheTests::
   QVERIFY(QDir().mkpath(fakeHomeParent));
 
   // Independent cumulative re-review (MEDIUM, "arbitrary same-device
-  // bind mount still passes"): see
-  // createDeviceDistinctBindSourceDirectory()'s own comment -- this
-  // positive control's bind source must live on a genuinely distinct
-  // device from `fakeHomeGrandparent`.
-  std::unique_ptr<QTemporaryDir> bindSourceDirKeepAlive;
+  // bind mount still passes"; MEDIUM, "even tests arbitrary /dev/shm
+  // bind as accepted"): see createLoopbackExt4BindSourceDirectory()'s
+  // own comment -- this positive control's bind source must live on a
+  // genuinely distinct device from `fakeHomeGrandparent`, AND now be a
+  // genuine, disk-backed, whole-filesystem mount (root=="/").
+  std::unique_ptr<LoopbackExt4Mount> bindSourceDirKeepAlive;
   const std::optional<QString> bindSourceOpt =
-      createDeviceDistinctBindSourceDirectory(bindSourceDirKeepAlive);
+      createLoopbackExt4BindSourceDirectory(bindSourceDirKeepAlive);
   if (!bindSourceOpt.has_value()) {
-    QSKIP("/dev/shm (a distinct-device tmpfs) unavailable/not writable in "
-          "this environment; cannot model a genuinely distinct-device "
-          "mount transition without it");
+    QSKIP("a loopback ext4 filesystem (mkfs.ext4/losetup/passwordless sudo "
+          "mount) is unavailable in this environment; cannot model a "
+          "genuinely distinct-device, whole-filesystem mount transition "
+          "without it");
   }
   const QString bindSource = *bindSourceOpt;
   QVERIFY(QDir().mkpath(bindSource + QStringLiteral("/actual-home")));
@@ -3510,8 +3674,8 @@ void AssetCacheTests::
   // super-options ignored... Test arbitrary bind on same ext4/btrfs
   // rejected and genuine SteamOS home accepted"): unlike every OTHER
   // "permitted" test in this file (which now deliberately bind-mounts
-  // from a genuinely distinct-device source -- see
-  // createDeviceDistinctBindSourceDirectory()'s own comment), this
+  // from a genuinely distinct-device, whole-filesystem source -- see
+  // createLoopbackExt4BindSourceDirectory()'s own comment), this
   // test's bind source is a perfectly ordinary SIBLING directory of
   // `fakeHomeGrandparent` itself, i.e. on the EXACT SAME underlying
   // device/filesystem. It is chowned to root:root and chmod'd 0755
@@ -3538,7 +3702,7 @@ void AssetCacheTests::
   // Deliberately a SIBLING of `fakeHomeGrandparent`, both directly
   // under `m_tempDirPath` -- guaranteed to be on the SAME device,
   // never bind-mounted from anywhere else, unlike every positive
-  // control test's own `/dev/shm`-backed source.
+  // control test's own loopback-ext4-backed source.
   const QString bindSource =
       m_tempDirPath + QStringLiteral("/same-device-bind-source");
   QVERIFY(QDir().mkpath(bindSource + QStringLiteral("/actual-home")));
@@ -3609,6 +3773,166 @@ void AssetCacheTests::
            "refused even when fully authenticated and ownership-qualified "
            "-- it can only be a same-device redirect of an arbitrary "
            "directory, never a genuine dedicated partition");
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+#endif
+}
+
+void AssetCacheTests::
+    authenticatedFreshTopLevelTmpfsHomeMountTransitionIsRejectedDespiteRootBeingSlash() {
+  // Independent cumulative re-review (MEDIUM, repeat finding across
+  // several rounds, "home trust... even tests arbitrary /dev/shm bind
+  // as accepted"): a genuine, freshly-created, TOP-LEVEL tmpfs mount
+  // (never a bind-mount of a subdirectory -- `mount -t tmpfs`, so
+  // mountinfo's own "root" field genuinely reads "/", isolating this
+  // test to the fstype exclusion alone) landing exactly on home's own
+  // final path component, fully authenticated against the account
+  // database and correctly owned/moded for the final-home position,
+  // must still be refused: tmpfs is no longer in
+  // trustedLocalMountFilesystemTypes() at all (see that function's own
+  // comment for why it was removed) -- this is the CONCRETE,
+  // reproducible regression this finding's every prior round pointed
+  // at, now proven to fail through the real production decision path,
+  // never merely asserted.
+#if !defined(__linux__)
+  QSKIP("mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString fakeHomeParent =
+      m_tempDirPath + QStringLiteral("/tmpfs-home-parent");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+  const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("-t"), QStringLiteral("tmpfs"),
+                   QStringLiteral("-o"), QStringLiteral("size=16m,mode=0755"),
+                   QStringLiteral("tmpfs"), fakeHome});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless tmpfs-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{fakeHome};
+
+  // The fresh tmpfs's own root is chowned to this test's own uid so
+  // the FINAL-account-home ownership policy (never overridable, see
+  // componentPassesOwnershipModePolicy()'s own comment) genuinely
+  // passes -- isolating this test to the fstype exclusion alone,
+  // exactly like the analogous same-device test isolates itself to
+  // the device check alone.
+  QProcess chownProc;
+  chownProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("chown"),
+                   QString::number(::getuid()) + QLatin1Char(':') +
+                       QString::number(::getgid()),
+                   fakeHome});
+  QVERIFY(chownProc.waitForFinished(5000));
+  QCOMPARE(chownProc.exitCode(), 0);
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  // Fully authenticated -- exactly like a genuine positive control --
+  // so the rejection below can only come from the tmpfs fstype
+  // exclusion, never from an unauthenticated $HOME.
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY2(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+               configuredUnderFakeHome, /*allowCreateMissingComponents=*/true),
+           "a genuine, top-level (root==\"/\"), fully-authenticated, "
+           "correctly-owned tmpfs mount must STILL be refused -- tmpfs is "
+           "no longer a trusted local filesystem type at all");
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+#endif
+}
+
+void AssetCacheTests::
+    authenticatedBindMountOfASubdirectoryOfATrustedFilesystemIsRejectedDespiteTrustedFstype() {
+  // Independent cumulative re-review (MEDIUM, repeat finding, "home
+  // trust... still discards mount root... authenticate exact
+  // descriptor mount id against position-specific expected... root
+  // ..."): a bind mount of an ORDINARY SUBDIRECTORY of a genuinely
+  // trusted, distinct-device ext4 loopback filesystem (never that
+  // filesystem's own root -- so this can only be explained by the
+  // mount-root check, never the fstype/device checks, which this
+  // scenario otherwise satisfies exactly like a genuine positive
+  // control) landing on home's own final component, fully
+  // authenticated and correctly owned/moded, must still be refused:
+  // mountinfo's own "root" field for such a mount is never "/",
+  // proving it is merely an arbitrary directory bind mount of SOME
+  // already-existing filesystem -- regardless of how trustworthy that
+  // filesystem's own type or device otherwise is -- never a genuine
+  // dedicated whole-partition mount.
+#if !defined(__linux__)
+  QSKIP("mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  std::unique_ptr<LoopbackExt4Mount> trustedFsKeepAlive;
+  const std::optional<QString> trustedFsOpt =
+      createLoopbackExt4BindSourceDirectory(trustedFsKeepAlive);
+  if (!trustedFsOpt.has_value()) {
+    QSKIP("a loopback ext4 filesystem (mkfs.ext4/losetup/passwordless sudo "
+          "mount) is unavailable in this environment; cannot model a "
+          "genuinely trusted-fstype source without it");
+  }
+  const QString trustedFsRoot = *trustedFsOpt;
+  // The bind SOURCE is a SUBDIRECTORY of the trusted ext4 filesystem,
+  // never its own root -- this is the entire point of this test.
+  const QString bindSource =
+      trustedFsRoot + QStringLiteral("/an-ordinary-subdirectory");
+  QVERIFY(QDir().mkpath(bindSource));
+
+  const QString fakeHomeParent =
+      m_tempDirPath + QStringLiteral("/subdir-bind-home-parent");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+  const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, fakeHome});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{fakeHome};
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY2(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+               configuredUnderFakeHome, /*allowCreateMissingComponents=*/true),
+           "a bind mount of an ordinary SUBDIRECTORY of an otherwise "
+           "trusted, distinct-device filesystem must STILL be refused -- "
+           "mountinfo's own root field for it is never \"/\"");
   QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
 #endif
 }
@@ -3837,22 +4161,24 @@ void AssetCacheTests::
   QVERIFY(QDir().mkpath(mountedAncestor));
 
   // Independent cumulative re-review (MEDIUM, "arbitrary same-device
-  // bind mount still passes"): see
-  // createDeviceDistinctBindSourceDirectory()'s own comment -- the
-  // ANCESTOR-position bind source (the first of the two transitions
-  // this test exercises) must live on a genuinely distinct device
-  // from `grandparent`. The SECOND transition (`homeBindSource` below,
-  // deliberately left as an ordinary QTemporaryDir()) then
-  // automatically also differs in device from `mountedAncestor`'s own
-  // NEW device once this first bind mount is in place, without
-  // needing the same treatment itself.
-  std::unique_ptr<QTemporaryDir> ancestorBindSourceDirKeepAlive;
+  // bind mount still passes"; MEDIUM, "even tests arbitrary /dev/shm
+  // bind as accepted"): see createLoopbackExt4BindSourceDirectory()'s
+  // own comment -- the ANCESTOR-position bind source (the first of
+  // the two transitions this test exercises) must live on a genuinely
+  // distinct device from `grandparent`, AND now be a genuine,
+  // disk-backed, whole-filesystem mount (root=="/"). The SECOND
+  // transition (`homeBindSource` below) needs the identical treatment
+  // for the exact same reason -- an ordinary QTemporaryDir() bind
+  // source is no longer sufficient at either position, since it is
+  // never itself the root of its own filesystem.
+  std::unique_ptr<LoopbackExt4Mount> ancestorBindSourceDirKeepAlive;
   const std::optional<QString> ancestorBindSourceOpt =
-      createDeviceDistinctBindSourceDirectory(ancestorBindSourceDirKeepAlive);
+      createLoopbackExt4BindSourceDirectory(ancestorBindSourceDirKeepAlive);
   if (!ancestorBindSourceOpt.has_value()) {
-    QSKIP("/dev/shm (a distinct-device tmpfs) unavailable/not writable in "
-          "this environment; cannot model a genuinely distinct-device "
-          "mount transition without it");
+    QSKIP("a loopback ext4 filesystem (mkfs.ext4/losetup/passwordless sudo "
+          "mount) is unavailable in this environment; cannot model a "
+          "genuinely distinct-device, whole-filesystem mount transition "
+          "without it");
   }
   const QString ancestorBindSource = *ancestorBindSourceOpt;
   QVERIFY(QDir().mkpath(ancestorBindSource + QStringLiteral("/actual-home")));
@@ -3932,9 +4258,21 @@ void AssetCacheTests::
   const QString fakeHome = mountedAncestor + QStringLiteral("/actual-home");
   QVERIFY(QFileInfo::exists(fakeHome));
 
-  QTemporaryDir homeBindSourceDir;
-  QVERIFY(homeBindSourceDir.isValid());
-  const QString homeBindSource = homeBindSourceDir.path();
+  // Independent cumulative re-review (MEDIUM, "even tests arbitrary
+  // /dev/shm bind as accepted"): the SECOND, final-home-position
+  // transition needs the identical genuine whole-filesystem-mount
+  // treatment as the ancestor transition above -- see
+  // createLoopbackExt4BindSourceDirectory()'s own comment.
+  std::unique_ptr<LoopbackExt4Mount> homeBindSourceDirKeepAlive;
+  const std::optional<QString> homeBindSourceOpt =
+      createLoopbackExt4BindSourceDirectory(homeBindSourceDirKeepAlive);
+  if (!homeBindSourceOpt.has_value()) {
+    QSKIP("a loopback ext4 filesystem (mkfs.ext4/losetup/passwordless sudo "
+          "mount) is unavailable in this environment; cannot model a "
+          "genuinely distinct-device, whole-filesystem mount transition "
+          "without it");
+  }
+  const QString homeBindSource = *homeBindSourceOpt;
 
   QProcess homeMountProc;
   homeMountProc.start(QStringLiteral("sudo"),

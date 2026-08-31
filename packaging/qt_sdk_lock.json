@@ -2,5 +2,30 @@
   "sdkVersion": "6.11.1",
   "updatesXmlUrl": "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/qt6_6111/qt6_6111/Updates.xml",
   "updatesXmlSha256": "11f54104964c285164d58f791266991399538d5c3c3e28a938566b9277bae583",
-  "installedTreeContentSha256": "0d4245b95dc2e2834ba30e04798af74e5c66ebc23895bbe9bc37d599d2583734"
+  "installedTreeContentSha256": "f75b27f09ffba049124c13083d4a70e2b31c89fa0ca49bf7aee2d5ab6565c494",
+  "packages": [
+    {
+      "name": "qt.qt6.6111.linux_gcc_64",
+      "version": "6.11.1-0-202605090529",
+      "sha1": "e9cc1d69efe1bf0a420d8ed59a426663579e2b8d",
+      "archives": [
+        "qtbase-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        "qtsvg-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        "qtdeclarative-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        "qtdoc-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        "qttools-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        "qttranslations-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        "qtwayland-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        "icu-linux-Rhel8.6-x86_64.7z"
+      ]
+    },
+    {
+      "name": "qt.qt6.6111.addons.qtwebsockets.linux_gcc_64",
+      "version": "6.11.1-0-202605090529",
+      "sha1": "66624adac097d3b5773e1f872787933963c1bcb4",
+      "archives": [
+        "qtwebsockets-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z"
+      ]
+    }
+  ]
 }

@@ -3684,6 +3684,33 @@ class PackageProvenanceTests(unittest.TestCase):
         self.assertIsNotNone(problem)
         self.assertIn("zlib1g", problem)
 
+    def test_validate_bundled_provenance_rejects_lock_pin_mismatch_unconditionally(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "Verify downloaded archive digest/
+        # size BEFORE any dpkg/tar parsing"): an archive whose bytes
+        # disagree with packaging/distro_package_lock.json's own
+        # checked-in pin is always a hard failure, regardless of
+        # --require-package-provenance -- this is the state
+        # _verify_deb_archive_against_lock_pin() reports, and it is
+        # reported strictly BEFORE any dpkg-deb/tarfile parsing of the
+        # untrusted bytes ever runs.
+        problem = audit.validate_bundled_library_package_provenance(
+            "zlib",
+            {
+                "status": "matched",
+                "package": "zlib1g",
+                "version": "1:1.2.11.dfsg-2ubuntu9.2",
+                "sourcePackage": "zlib",
+                "architecture": "amd64",
+                "debArchiveVerification": "lockMismatch",
+                "evidenceStrength": "replay_byte_identical",
+            },
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("zlib1g", problem)
+        self.assertIn("distro_package_lock.json", problem)
+
     def test_validate_bundled_provenance_rejects_archive_content_mismatch_unconditionally(
         self,
     ) -> None:
@@ -4065,6 +4092,187 @@ class RealArchiveDownloadAndExtractionTests(unittest.TestCase):
         self.assertEqual(record["debArchiveVerification"], "verified")
         self.assertEqual(record["debSha256"], "d" * 64)
 
+    def test_dpkg_full_provenance_record_rejects_lock_pin_mismatch_before_parsing(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "Launchpad URL/redirect bytes reach
+        # dpkg-deb/tar and packaging before lock SHA enforcement"):
+        # this is the concrete old-fail/new-pass regression proof --
+        # BEFORE this fix, a downloaded archive that disagreed with
+        # packaging/distro_package_lock.json's own pin was still
+        # handed straight to _extract_governed_file_from_deb_archive()
+        # (real dpkg-deb/tarfile parsing). Now, a lock-pin mismatch
+        # must short-circuit BEFORE that parser ever runs -- proven
+        # here by making the mocked parser raise if it is ever called
+        # at all, and by asserting the surfaced state.
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            scratch_path = Path(scratch_dir) / "libfoo.so.1"
+            scratch_path.write_bytes(b"live-file-bytes")
+            deb_path = Path(scratch_dir) / "fake.deb"
+            deb_path.write_bytes(b"\x00")
+
+            def _fail_if_called(*_args: object, **_kwargs: object) -> bytes:
+                raise AssertionError(
+                    "_extract_governed_file_from_deb_archive() must never be "
+                    "called once the archive already disagrees with the "
+                    "checked-in distro_package_lock.json pin"
+                )
+
+            with mock.patch.object(
+                audit, "_dpkg_owning_package", return_value="libfoo1"
+            ), mock.patch.object(
+                audit,
+                "_dpkg_package_metadata",
+                return_value=("1.2.3-1", "foosource"),
+            ), mock.patch.object(
+                audit, "_dpkg_package_architecture", return_value="amd64"
+            ), mock.patch.object(
+                audit,
+                "_apt_cache_package_record",
+                return_value={"architecture": "amd64", "debSha256": "e" * 64},
+            ), mock.patch.object(
+                audit,
+                "_download_and_hash_deb_archive",
+                return_value=(deb_path, "e" * 64),
+            ), mock.patch.object(
+                audit,
+                "_load_distro_package_lock",
+                return_value={
+                    "distribution": "ubuntu-22.04",
+                    "packages": {
+                        "libfoo1": {
+                            "architecture": "amd64",
+                            "version": "1.2.3-1",
+                            "debSha256": "f" * 64,
+                        }
+                    },
+                },
+            ), mock.patch.object(
+                audit,
+                "_extract_governed_file_from_deb_archive",
+                side_effect=_fail_if_called,
+            ):
+                record = audit._dpkg_full_provenance_record(scratch_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["debArchiveVerification"], "lockMismatch")
+
+    def test_dpkg_full_provenance_record_parses_once_lock_pin_agrees(
+        self,
+    ) -> None:
+        # Companion "new pass" case: once the downloaded archive's own
+        # sha256 agrees with the checked-in lock pin, parsing proceeds
+        # exactly as before and a normal verified/mismatch outcome is
+        # still reported from the real extracted bytes.
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            live_bytes = b"identical-bytes-both-places-lock-agrees"
+            scratch_path = Path(scratch_dir) / "libfoo.so.1"
+            scratch_path.write_bytes(live_bytes)
+            deb_path = Path(scratch_dir) / "fake.deb"
+            deb_path.write_bytes(b"\x00")
+            with mock.patch.object(
+                audit, "_dpkg_owning_package", return_value="libfoo1"
+            ), mock.patch.object(
+                audit,
+                "_dpkg_package_metadata",
+                return_value=("1.2.3-1", "foosource"),
+            ), mock.patch.object(
+                audit, "_dpkg_package_architecture", return_value="amd64"
+            ), mock.patch.object(
+                audit,
+                "_apt_cache_package_record",
+                return_value={"architecture": "amd64", "debSha256": "f" * 64},
+            ), mock.patch.object(
+                audit,
+                "_download_and_hash_deb_archive",
+                return_value=(deb_path, "f" * 64),
+            ), mock.patch.object(
+                audit,
+                "_load_distro_package_lock",
+                return_value={
+                    "distribution": "ubuntu-22.04",
+                    "packages": {
+                        "libfoo1": {
+                            "architecture": "amd64",
+                            "version": "1.2.3-1",
+                            "debSha256": "f" * 64,
+                        }
+                    },
+                },
+            ), mock.patch.object(
+                audit,
+                "_extract_governed_file_from_deb_archive",
+                return_value=live_bytes,
+            ):
+                record = audit._dpkg_full_provenance_record(scratch_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["debArchiveVerification"], "verified")
+
+    def test_capture_distro_manifest_entry_rejects_lock_pin_mismatch_before_parsing(
+        self,
+    ) -> None:
+        # Same production seam as _dpkg_full_provenance_record() above,
+        # but for the pre-packaging immutable-staging capture path
+        # (_capture_distro_manifest_entry()) that build-appimage.sh's
+        # own capture-distro-provenance step actually exercises before
+        # linuxdeploy ever runs.
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            loader_path = Path(scratch_dir) / "libfoo.so.1"
+            loader_path.write_bytes(b"live-file-bytes-for-staging")
+            staging_dir = Path(scratch_dir) / "stage"
+            deb_path = Path(scratch_dir) / "fake.deb"
+            deb_path.write_bytes(b"\x00")
+
+            def _fail_if_called(*_args: object, **_kwargs: object) -> bytes:
+                raise AssertionError(
+                    "_extract_governed_file_from_deb_archive() must never be "
+                    "called once the archive already disagrees with the "
+                    "checked-in distro_package_lock.json pin"
+                )
+
+            with mock.patch.object(
+                audit, "_dpkg_owning_package", return_value="libfoo1"
+            ), mock.patch.object(
+                audit,
+                "_dpkg_package_metadata",
+                return_value=("1.2.3-1", "foosource"),
+            ), mock.patch.object(
+                audit, "_dpkg_package_architecture", return_value="amd64"
+            ), mock.patch.object(
+                audit,
+                "_apt_cache_package_record",
+                return_value={"architecture": "amd64", "debSha256": "e" * 64},
+            ), mock.patch.object(
+                audit,
+                "_download_and_hash_deb_archive",
+                return_value=(deb_path, "e" * 64),
+            ), mock.patch.object(
+                audit,
+                "_load_distro_package_lock",
+                return_value={
+                    "distribution": "ubuntu-22.04",
+                    "packages": {
+                        "libfoo1": {
+                            "architecture": "amd64",
+                            "version": "1.2.3-1",
+                            "debSha256": "f" * 64,
+                        }
+                    },
+                },
+            ), mock.patch.object(
+                audit,
+                "_extract_governed_file_from_deb_archive",
+                side_effect=_fail_if_called,
+            ):
+                entry = audit._capture_distro_manifest_entry(
+                    loader_path,
+                    "usr/lib/libfoo.so.1",
+                    Path(scratch_dir) / "requester.so",
+                    "libfoo.so.1",
+                    staging_dir,
+                )
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["debArchiveVerification"], "lockMismatch")
+
     def test_real_download_and_extract_against_the_real_installed_libz_package(
         self,
     ) -> None:
@@ -4292,6 +4500,91 @@ class LaunchpadArchiveFallbackTests(unittest.TestCase):
                     "libblkid1", "2.37.2-4ubuntu3.5", "amd64"
                 )
             )
+
+    def test_debian_version_without_epoch_strips_leading_colon_prefix(self) -> None:
+        self.assertEqual(
+            audit._debian_version_without_epoch("1:2.44-1ubuntu0.22.04.3"),
+            "2.44-1ubuntu0.22.04.3",
+        )
+        self.assertEqual(
+            audit._debian_version_without_epoch("2.37.2-4ubuntu3.5"),
+            "2.37.2-4ubuntu3.5",
+        )
+
+    def test_downloaded_filename_and_url_drop_the_epoch_but_not_the_api_query(
+        self,
+    ) -> None:
+        # Round-N+ review (MEDIUM, "Launchpad fallback archive
+        # filenames retain Debian epoch and fail zlib/libcap"): a real
+        # `.deb` filename never includes the epoch even though the
+        # package's own version DOES (both the Launchpad API query
+        # above and packaging/distro_package_lock.json's own pin keep
+        # the epoch, exactly matching how apt/dpkg themselves report
+        # this package's version) -- proves the constructed file URL
+        # actually drops it, and that the byte content returned still
+        # ends up correctly hashed.
+        deb_bytes = b"real-immutable-launchpad-archive-bytes-with-epoch"
+        api_prefix = "https://api.launchpad.net/1.0/ubuntu/+archive/primary?"
+        build_link = "https://api.launchpad.net/1.0/~ubuntu-security/+build/2"
+        build_web_link = "https://launchpad.net/~ubuntu-security/+build/2"
+        expected_url = f"{build_web_link}/+files/libcap2_2.44-1ubuntu0.22.04.3_amd64.deb"
+
+        def fake_urlopen(url: str, timeout: float | None = None):
+            if url.startswith(api_prefix):
+                self.assertIn("version=1%3A2.44-1ubuntu0.22.04.3", url)
+                return self._JsonResponse(
+                    {
+                        "entries": [
+                            {
+                                "distro_arch_series_link": "https://api.launchpad.net/1.0/ubuntu/jammy/amd64",
+                                "build_link": build_link,
+                            }
+                        ]
+                    }
+                )
+            if url == build_link:
+                return self._JsonResponse({"web_link": build_web_link})
+            if url == expected_url:
+                return self._BytesResponse(deb_bytes)
+            raise AssertionError(f"unexpected urlopen({url!r})")
+
+        with mock.patch.object(
+            audit, "_launchpad_series_for_distro_package_lock", return_value="jammy"
+        ), mock.patch.object(
+            audit.urllib.request, "urlopen", side_effect=fake_urlopen
+        ):
+            result = audit._download_and_hash_deb_archive_via_launchpad.__wrapped__(
+                "libcap2", "1:2.44-1ubuntu0.22.04.3", "amd64"
+            )
+        self.assertIsNotNone(result)
+        deb_path, deb_sha256 = result
+        self.assertEqual(deb_path.name, "libcap2_2.44-1ubuntu0.22.04.3_amd64.deb")
+        self.assertEqual(deb_path.read_bytes(), deb_bytes)
+        self.assertEqual(deb_sha256, hashlib.sha256(deb_bytes).hexdigest())
+
+    def test_real_network_finds_the_exact_pinned_epoch_bearing_libcap2_bytes(
+        self,
+    ) -> None:
+        # Real end-to-end proof (no mocks) for the specific epoch-
+        # bearing regression this finding named: libcap2's own pinned
+        # version genuinely carries a "1:" epoch, and the real
+        # Launchpad file URL must still resolve once that epoch is
+        # dropped only from the filename. Gracefully skipped offline.
+        lock = audit._load_distro_package_lock()
+        locked_entry = lock["packages"].get("libcap2")
+        if not isinstance(locked_entry, dict):
+            self.skipTest("no pinned libcap2 entry in distro_package_lock.json")
+        self.assertIn(":", locked_entry["version"])
+        result = audit._download_and_hash_deb_archive_via_launchpad(
+            "libcap2", locked_entry["version"], locked_entry["architecture"]
+        )
+        if result is None:
+            self.skipTest(
+                "real Launchpad API/download did not succeed in this "
+                "environment (offline sandbox/no network egress)"
+            )
+        _deb_path, deb_sha256 = result
+        self.assertEqual(deb_sha256, locked_entry["debSha256"])
 
     def test_real_network_finds_the_exact_pinned_libblkid1_bytes(self) -> None:
         # Real end-to-end proof (no mocks): resolves this project's own
@@ -5601,6 +5894,15 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
     def test_verify_qt_sdk_lock_accepts_matching_metadata(self) -> None:
         expected = audit._load_qt_sdk_lock()
 
+        # Round-N+ review (HIGH, "qt_sdk_lock.json still lacks an
+        # exact archive manifest"): verify_qt_sdk_lock() now ALSO
+        # re-parses the fetched payload for the locked `packages`
+        # manifest -- this synthetic payload must therefore be REAL,
+        # parseable Updates.xml-shaped content describing every locked
+        # package exactly as the lock itself claims, not an arbitrary
+        # byte string.
+        synthetic_updates_xml = self._synthetic_updates_xml(expected["packages"])
+
         class _Response:
             def __enter__(self) -> "_Response":
                 return self
@@ -5609,17 +5911,38 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b"matching-updates-xml"
+                return synthetic_updates_xml
 
         matching_lock = dict(expected)
         matching_lock["updatesXmlSha256"] = hashlib.sha256(
-            b"matching-updates-xml"
+            synthetic_updates_xml
         ).hexdigest()
         with mock.patch.object(
             audit.urllib.request, "urlopen", return_value=_Response()
         ):
             result = audit.verify_qt_sdk_lock(matching_lock)
         self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["lockedPackageCount"], len(expected["packages"]))
+
+    @staticmethod
+    def _synthetic_updates_xml(packages: list[dict[str, object]]) -> bytes:
+        """Builds a minimal, real Updates.xml-shaped payload (the
+        actual upstream Qt online-installer repository schema) whose
+        `<PackageUpdate>` entries exactly describe `packages` --
+        deliberately independent of any hardcoded real-network fixture
+        so these tests never require live network egress."""
+        entries = []
+        for package in packages:
+            archives = ", ".join(package["archives"])
+            entries.append(
+                "  <PackageUpdate>\n"
+                f"    <Name>{package['name']}</Name>\n"
+                f"    <Version>{package['version']}</Version>\n"
+                f"    <DownloadableArchives>{archives}</DownloadableArchives>\n"
+                f"    <SHA1>{package['sha1']}</SHA1>\n"
+                "  </PackageUpdate>\n"
+            )
+        return ("<Updates>\n" + "".join(entries) + "</Updates>\n").encode("utf-8")
 
     def test_verify_qt_sdk_lock_rejects_metadata_digest_mismatch(self) -> None:
         lock = dict(audit._load_qt_sdk_lock())
@@ -5639,6 +5962,110 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
         ):
             result = audit.verify_qt_sdk_lock(lock)
         self.assertEqual(result["status"], "content_mismatch")
+
+    def test_verify_qt_sdk_lock_rejects_package_manifest_mismatch_even_when_hash_matches(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "qt_sdk_lock.json still lacks an
+        # exact archive manifest ... Updates.xml + observed tree
+        # digest is self-attested"): the concrete "belt and suspenders"
+        # proof this finding demands -- a lock file whose
+        # `updatesXmlSha256` genuinely agrees with the fetched payload
+        # (so the pre-existing whole-file check alone would report
+        # "matched"), but whose separate, checked-in `packages` entry
+        # has been mistakenly/maliciously edited to claim a DIFFERENT
+        # archive name than what that SAME payload actually describes,
+        # must still be caught.
+        expected = audit._load_qt_sdk_lock()
+        synthetic_updates_xml = self._synthetic_updates_xml(expected["packages"])
+        tampered_lock = dict(expected)
+        tampered_packages = [dict(package) for package in expected["packages"]]
+        tampered_packages[0] = dict(tampered_packages[0])
+        tampered_packages[0]["archives"] = ["completely-different-archive.7z"]
+        tampered_lock["packages"] = tampered_packages
+        tampered_lock["updatesXmlSha256"] = hashlib.sha256(
+            synthetic_updates_xml
+        ).hexdigest()
+
+        class _Response:
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return synthetic_updates_xml
+
+        with mock.patch.object(
+            audit.urllib.request, "urlopen", return_value=_Response()
+        ):
+            result = audit.verify_qt_sdk_lock(tampered_lock)
+        self.assertEqual(result["status"], "package_manifest_mismatch")
+
+    def test_verify_qt_sdk_lock_rejects_missing_locked_package_in_payload(
+        self,
+    ) -> None:
+        expected = audit._load_qt_sdk_lock()
+        # Only describes the FIRST locked package, omitting the
+        # second entirely -- a real upstream repository restructuring
+        # (or a hostile substituted metadata payload) severe enough to
+        # drop a package this project's own pipeline requires.
+        synthetic_updates_xml = self._synthetic_updates_xml(
+            expected["packages"][:1]
+        )
+        lock = dict(expected)
+        lock["updatesXmlSha256"] = hashlib.sha256(synthetic_updates_xml).hexdigest()
+
+        class _Response:
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return synthetic_updates_xml
+
+        with mock.patch.object(
+            audit.urllib.request, "urlopen", return_value=_Response()
+        ):
+            result = audit.verify_qt_sdk_lock(lock)
+        self.assertEqual(result["status"], "package_manifest_mismatch")
+        self.assertIn("packageManifestError", result)
+
+    def test_parse_qt_sdk_locked_packages_real_network_matches_the_checked_in_lock(
+        self,
+    ) -> None:
+        # Real end-to-end proof (no mocks): fetches the REAL, live
+        # upstream Updates.xml this project's own checked-in
+        # `updatesXmlUrl`/`updatesXmlSha256` pin already authenticates,
+        # and confirms the checked-in `packages` manifest still
+        # matches it exactly. Gracefully skipped offline.
+        lock = audit._load_qt_sdk_lock()
+        try:
+            with audit.urllib.request.urlopen(
+                lock["updatesXmlUrl"], timeout=60
+            ) as response:
+                payload = response.read()
+        except OSError:
+            self.skipTest(
+                "real network egress unavailable in this environment"
+            )
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        if actual_sha256 != lock["updatesXmlSha256"]:
+            self.skipTest(
+                "live upstream Updates.xml no longer matches this "
+                "repository's own pinned updatesXmlSha256 (expected, "
+                "unrelated drift) -- cannot prove package manifest "
+                "agreement against content this project does not "
+                "currently trust"
+            )
+        package_names = tuple(package["name"] for package in lock["packages"])
+        actual_packages = audit._parse_qt_sdk_locked_packages_from_updates_xml(
+            payload, package_names
+        )
+        self.assertEqual(actual_packages, lock["packages"])
 
     def test_cmd_classify_uses_qt_sdk_provenance_for_icu_never_dpkg(self) -> None:
         # End-to-end regression test for the actual CI failure: on a
@@ -6084,6 +6511,12 @@ class QtSdkInstalledTreeProvenanceTests(unittest.TestCase):
         (root / "qml" / "QtQuick" / "libqtquick2plugin.so").write_bytes(b"qml-module")
         (root / "bin").mkdir(parents=True)
         (root / "bin" / "moc").write_bytes(b"moc-binary")
+        (root / "libexec").mkdir(parents=True)
+        (root / "libexec" / "moc").write_bytes(b"real-linux-moc-binary")
+        (root / "libexec" / "rcc").write_bytes(b"real-linux-rcc-binary")
+        (root / "libexec" / "qt-cmake-private").write_bytes(
+            b"cmake-imported-generator-tool"
+        )
         (root / "include" / "QtCore").mkdir(parents=True)
         (root / "include" / "QtCore" / "qobject.h").write_bytes(b"header-content")
         (root / "mkspecs" / "linux-g++").mkdir(parents=True)
@@ -6123,6 +6556,50 @@ class QtSdkInstalledTreeProvenanceTests(unittest.TestCase):
         (self.root / "bin" / "moc").write_bytes(b"substituted-moc-binary")
         tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
         self.assertNotEqual(baseline, tampered)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_a_change_in_libexec_moc(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "Qt tree digest omits Linux libexec
+        # where moc/rcc/generators live"): this is the concrete real-
+        # world regression the finding named -- on Qt 6's real Linux
+        # layout, moc/rcc live under `libexec/`, not `bin/`, so a
+        # substituted `libexec/moc` must be detected exactly like a
+        # substituted `bin/moc` already is above.
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "libexec" / "moc").write_bytes(b"substituted-linux-moc-binary")
+        tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, tampered)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_a_change_in_libexec_rcc(
+        self,
+    ) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "libexec" / "rcc").write_bytes(b"substituted-linux-rcc-binary")
+        tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, tampered)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_a_change_in_a_cmake_imported_libexec_tool(
+        self,
+    ) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "libexec" / "qt-cmake-private").write_bytes(
+            b"substituted-cmake-imported-generator-tool"
+        )
+        tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, tampered)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_an_added_libexec_file(
+        self,
+    ) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "libexec" / "qmlcachegen").write_bytes(b"added-generator-tool")
+        added = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, added)
 
     def test_compute_qt_sdk_tree_content_digest_detects_a_change_in_include(self) -> None:
         self._make_sdk_tree(self.root)

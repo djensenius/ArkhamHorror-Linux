@@ -1559,12 +1559,39 @@ bool componentPassesOwnershipModePolicy(int fd,
 // behave like a normal, single-owner block/tmpfs-backed mount; anything
 // else (nfs, cifs, sshfs, any fuse.* type, 9p, etc.) is refused, no
 // matter how ownership/mode otherwise look.
+// Independent cumulative re-review (MEDIUM, repeat finding, "home
+// trust... arbitrary same-device bind mount still passes... reviewer
+// concretely disproved the claim... even tests arbitrary /dev/shm
+// bind as accepted"): `tmpfs` (and `overlay`, which is very commonly
+// backed BY a tmpfs upper/work layer, e.g. Docker's own default
+// storage driver) were previously included in this allowlist -- but
+// unlike a genuine disk-backed filesystem (which requires an actual
+// dedicated block device/partition an attacker cannot conjure without
+// already controlling the host's storage layout), ANY unprivileged,
+// non-root process can trivially create its own private tmpfs
+// instance (e.g. `/dev/shm` itself is exactly such an instance,
+// already present on every mainstream distribution) and then, with no
+// privilege beyond an ordinary user-namespace-capable bind/mount
+// operation, present it as a "genuinely distinct device" source for a
+// bind mount. Combined with the caller's own device-difference check
+// (which a tmpfs bind source trivially satisfies -- tmpfs always has
+// its own distinct device number), this made `/dev/shm` (or any other
+// tmpfs instance) pass this entire mount-trust walk as if it were a
+// real, administratively-provisioned dedicated partition, which it
+// categorically is not: its "device" is not backed by any real
+// storage the mount's actual constructor made a deliberate deployment
+// decision about, so trusting it here left exactly the "arbitrary bind
+// mount is accepted as legitimate" gap this finding repeatedly
+// reproduced. Genuine disk-backed types remain trusted: these DO
+// require an actual dedicated block device/partition (or a loopback
+// file explicitly formatted with one of these on-disk filesystem
+// formats) to exist at all, which is the real, deployment-time-fixed
+// property this project's whole "beneath home is trusted" model
+// depends on.
 const QSet<QString> &trustedLocalMountFilesystemTypes() {
   static const QSet<QString> types = {
-      QStringLiteral("ext2"),  QStringLiteral("ext3"),
-      QStringLiteral("ext4"),  QStringLiteral("xfs"),
-      QStringLiteral("btrfs"), QStringLiteral("f2fs"),
-      QStringLiteral("tmpfs"), QStringLiteral("overlay"),
+      QStringLiteral("ext2"), QStringLiteral("ext3"),  QStringLiteral("ext4"),
+      QStringLiteral("xfs"),  QStringLiteral("btrfs"), QStringLiteral("f2fs"),
   };
   return types;
 }
@@ -1707,6 +1734,34 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
     const quint64 lineParentId = beforeDash.at(1).toULongLong(&parentIdOk);
     if (!parentIdOk) {
       continue;
+    }
+    // Independent cumulative re-review (MEDIUM, repeat finding,
+    // "still discards mount root... authenticate exact descriptor
+    // mount id against position-specific expected... root..."):
+    // mountinfo field 3 is the mount's ROOT within its own underlying
+    // filesystem -- "/" for a mount of an entire filesystem/block
+    // device/partition (exactly what a genuine, administratively-
+    // provisioned dedicated "/home" partition or SteamOS-style
+    // "/home/deck" split fundamentally is), and any OTHER value for a
+    // bind mount that exposes only some SUBDIRECTORY of an already-
+    // existing filesystem. This is the precise, structural
+    // discriminator between "a real dedicated partition was mounted
+    // here" and "an arbitrary directory that merely happens to live on
+    // some filesystem was bind-mounted here" -- a distinction the
+    // device-number/fstype checks alone cannot make, since an
+    // attacker-chosen directory bind-mounted from a genuinely
+    // different, genuinely trusted-fstype device would otherwise still
+    // satisfy every other check here. Requiring root=="/" categorically
+    // refuses ANY bind-mount-of-a-subdirectory shape, regardless of
+    // which filesystem type or device backs it.
+    const QString lineRoot = beforeDash.at(3);
+    if (lineRoot != QStringLiteral("/")) {
+      qWarning() << "AssetCache: mountinfo mount id" << mountId
+                 << "has a non-root mount root" << lineRoot
+                 << "-- refusing (this can only be a bind mount of some "
+                    "SUBDIRECTORY of an existing filesystem, never a "
+                    "genuine dedicated partition/whole-filesystem mount)";
+      return false;
     }
     const QStringList majorMinor =
         beforeDash.at(2).split(QLatin1Char(':'), Qt::SkipEmptyParts);

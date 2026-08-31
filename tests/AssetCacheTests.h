@@ -246,6 +246,34 @@ private slots:
   // bind mount (root-privileged); QSKIP when unavailable.
   void
   arbitrarySameDeviceBindMountOntoAncestorPositionIsRejectedEvenWhenFullyAuthenticatedAndOwnershipQualifies();
+  // Independent cumulative re-review (MEDIUM, repeat finding, "home
+  // trust... even tests arbitrary /dev/shm bind as accepted"): a
+  // GENUINE, freshly-created, TOP-LEVEL tmpfs mount (mountinfo root
+  // == "/", so the new root-field check alone cannot explain a
+  // rejection) landing exactly on home's own final component, fully
+  // authenticated against the account database and correctly owned/
+  // moded, must STILL be refused -- tmpfs is no longer a trusted local
+  // filesystem type at all (see trustedLocalMountFilesystemTypes()'s
+  // own comment), regardless of how pristine/legitimate-shaped the
+  // mount otherwise is. Requires real tmpfs mount privilege; QSKIP
+  // when unavailable.
+  void
+  authenticatedFreshTopLevelTmpfsHomeMountTransitionIsRejectedDespiteRootBeingSlash();
+  // Independent cumulative re-review (MEDIUM, repeat finding, "home
+  // trust... still discards mount root... authenticate exact
+  // descriptor mount id against position-specific expected...
+  // root..."): a bind mount of an ORDINARY SUBDIRECTORY of an
+  // otherwise genuinely trusted, distinct-device ext4 loopback
+  // filesystem (never the filesystem's own root) landing on home's
+  // final component, fully authenticated and correctly owned/moded,
+  // must still be refused -- mountinfo's own "root" field for such a
+  // mount is never "/", proving this is merely an arbitrary directory
+  // bind mount of SOME already-existing filesystem, never a genuine
+  // dedicated whole-partition mount, regardless of the underlying
+  // filesystem type's own trust status. Requires a real loopback ext4
+  // filesystem and bind-mount privilege; QSKIP when unavailable.
+  void
+  authenticatedBindMountOfASubdirectoryOfATrustedFilesystemIsRejectedDespiteTrustedFstype();
   // An unauthenticated $HOME whose mount-identification itself is
   // degraded (forced via setMountIdentificationDegradedForTesting(),
   // no privilege required) must fail closed exactly like an

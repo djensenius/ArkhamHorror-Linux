@@ -79,6 +79,7 @@ import tarfile
 import tempfile
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 
 # (SONAME) and build-id note patterns, in the same spirit as (and
@@ -3061,6 +3062,26 @@ def _launchpad_series_for_distro_package_lock() -> str | None:
     return _UBUNTU_LAUNCHPAD_SERIES_BY_DISTRIBUTION.get(distribution)
 
 
+def _debian_version_without_epoch(version: str) -> str:
+    """Strips a Debian/Ubuntu version string's leading "N:" epoch
+    component, if present -- real `.deb` filenames never include the
+    epoch (only the "Version:" control-file field and package-manager-
+    facing identifiers like `apt-get download`'s own `pkg=version`
+    argument do), so a filename built from the raw, epoch-qualified
+    version string (e.g. "libcap2_1:2.44-1ubuntu0.22.04.3_amd64.deb")
+    can never actually exist on Launchpad (or any real Debian/Ubuntu
+    archive) for any package whose version happens to carry an epoch --
+    confirmed empirically against the real Launchpad service for
+    libcap2/zlib1g, both of which carry a "1:" epoch in this project's
+    own pinned packaging/distro_package_lock.json. The epoch is
+    preserved everywhere else (the Launchpad API query itself, this
+    project's own lock file, and every non-filename identifier) --
+    only the on-disk filename spelling drops it, exactly matching real
+    dpkg/dak tooling's own convention."""
+    _, separator, rest = version.partition(":")
+    return rest if separator else version
+
+
 @functools.lru_cache(maxsize=256)
 def _download_and_hash_deb_archive_via_launchpad(
     package: str, version: str, architecture: str
@@ -3147,8 +3168,12 @@ def _download_and_hash_deb_archive_via_launchpad(
         build_web_link = build_payload.get("web_link")
         if not isinstance(build_web_link, str) or not build_web_link:
             continue
-        deb_filename = f"{package}_{version}_{architecture}.deb"
-        deb_url = f"{build_web_link}/+files/{deb_filename}"
+        deb_filename = (
+            f"{package}_{_debian_version_without_epoch(version)}_{architecture}.deb"
+        )
+        deb_url = (
+            f"{build_web_link}/+files/{urllib.parse.quote(deb_filename, safe='')}"
+        )
         try:
             with urllib.request.urlopen(deb_url, timeout=120) as response:
                 deb_bytes = response.read()
@@ -3162,7 +3187,67 @@ def _download_and_hash_deb_archive_via_launchpad(
     return None
 
 
-# Debian/Ubuntu top-level directories that "usrmerge" replaces with a
+# Round-N+ review (HIGH, "Verify downloaded archive digest/size BEFORE
+# any dpkg/tar parsing ... Launchpad URL/redirect bytes reach dpkg-deb/
+# tar and packaging before lock SHA enforcement"): both call sites that
+# consume _download_and_hash_deb_archive()'s result (_dpkg_full_
+# provenance_record() and _capture_distro_manifest_entry()) previously
+# handed the freshly downloaded `.deb` straight to
+# _extract_governed_file_from_deb_archive() -- which invokes real
+# `dpkg-deb --fsys-tarfile` and Python's own `tarfile` reader against
+# those bytes -- BEFORE ever comparing the archive's own digest against
+# packaging/distro_package_lock.json's checked-in, human-reviewed pin.
+# That ordering meant a byte stream this module cannot yet honestly
+# trust (particularly the Launchpad fallback path above, which has no
+# equivalent to `apt-get download`'s own built-in refusal to fetch from
+# an unauthenticated/unsigned source) was still parsed by two real,
+# historically-CVE-bearing archive-format parsers before this project's
+# own governed lock pin ever got a chance to reject it.
+#
+# This module does not reimplement Debian/Ubuntu's full InRelease ->
+# Release -> Packages GPG signature chain itself: the live `apt-get
+# download` path already refuses (hard failure, not a warning) to
+# fetch any package from a source it cannot cryptographically
+# authenticate via that exact chain, using the real, already-trusted
+# apt keyring already configured on this project's own CI runners --
+# see `apt-get download`'s own documented behavior; this project never
+# passes `--allow-unauthenticated`. The Launchpad snapshot fallback has
+# no equivalent self-contained signature chain (Launchpad's librarian
+# serves bytes over TLS, not a locally re-verifiable GPG-signed
+# Packages stanza), so for THAT path specifically,
+# packaging/distro_package_lock.json's own checked-in, PR-reviewed
+# debSha256 pin is this project's explicit, honestly-documented root of
+# trust -- and this function is the single place that pin is enforced,
+# for both paths, strictly BEFORE either archive parser ever sees the
+# bytes.
+def _verify_deb_archive_against_lock_pin(package: str, deb_sha256: str) -> str | None:
+    """Returns "lockMismatch" if packaging/distro_package_lock.json pins
+    an entry for `package` and its debSha256 disagrees with the real,
+    freshly downloaded-and-hashed `deb_sha256` this run just computed --
+    or None (never raises) if the lock has no entry for this exact
+    package (an honest "this project has not yet pinned this one",
+    never silently treated as a pass) or the pin agrees. Callers MUST
+    call this before handing the downloaded archive to any dpkg-deb/
+    tarfile parsing, and must treat a non-None result as an immediate,
+    unconditional hard failure -- never merely a require_provenance-
+    gated one, exactly like the pre-existing "metadataMismatch"/
+    "mismatch" outcomes this sits alongside."""
+    try:
+        lock = _load_distro_package_lock()
+    except ValueError:
+        return None
+    locked_entry = lock["packages"].get(package)  # type: ignore[union-attr]
+    if not isinstance(locked_entry, dict):
+        return None
+    locked_sha256 = locked_entry.get("debSha256")
+    if not isinstance(locked_sha256, str) or not locked_sha256:
+        return None
+    if locked_sha256.lower() != deb_sha256.lower():
+        return "lockMismatch"
+    return None
+
+
+
 # symlink into the corresponding /usr/... directory. A real package's
 # own .md5sums payload may legitimately record either the pre-merge
 # form (most existing packages, built before their distro merged /usr)
@@ -3340,7 +3425,13 @@ def _dpkg_full_provenance_record(path: Path) -> dict[str, str] | None:
         if downloaded is not None:
             deb_path, deb_sha256 = downloaded
             record["debSha256"] = deb_sha256
-            if apt_record is not None and deb_sha256 != apt_record["debSha256"]:
+            lock_problem = _verify_deb_archive_against_lock_pin(package, deb_sha256)
+            if lock_problem is not None:
+                # Hard failure BEFORE any dpkg-deb/tarfile parsing --
+                # see _verify_deb_archive_against_lock_pin()'s own
+                # docstring.
+                record["debArchiveVerification"] = lock_problem
+            elif apt_record is not None and deb_sha256 != apt_record["debSha256"]:
                 # The real, freshly downloaded archive disagrees with
                 # what this host's own local APT index metadata
                 # claims -- never trust either value silently; a
@@ -4108,7 +4199,13 @@ def _capture_distro_manifest_entry(
         if downloaded is not None:
             deb_path, deb_sha256 = downloaded
             entry["debSha256"] = deb_sha256
-            if apt_record is not None and deb_sha256 != apt_record["debSha256"]:
+            lock_problem = _verify_deb_archive_against_lock_pin(package, deb_sha256)
+            if lock_problem is not None:
+                # Hard failure BEFORE any dpkg-deb/tarfile parsing --
+                # see _verify_deb_archive_against_lock_pin()'s own
+                # docstring.
+                entry["debArchiveVerification"] = lock_problem
+            elif apt_record is not None and deb_sha256 != apt_record["debSha256"]:
                 entry["debArchiveVerification"] = "metadataMismatch"
             else:
                 relative_candidates = _merged_usr_relative_path_candidates(
@@ -4601,6 +4698,17 @@ def validate_bundled_library_package_provenance(
     # this run cannot honestly prove the live installed file really is
     # what the real distro archive contains.
     archive_verification = binding.get("debArchiveVerification")
+    if archive_verification == "lockMismatch":
+        return (
+            f"component {component!r}'s freshly downloaded, self-hashed "
+            f".deb archive for package {binding.get('package')!r} "
+            "disagrees with packaging/distro_package_lock.json's own "
+            "checked-in, pinned debSha256 -- this project's explicit "
+            "root of trust for archive bytes it did not obtain via a "
+            "live, apt-authenticated download -- and was rejected before "
+            "any dpkg-deb/tarfile parsing of those untrusted bytes ever "
+            "occurred"
+        )
     if archive_verification == "metadataMismatch":
         return (
             f"component {component!r}'s freshly downloaded, self-hashed "
@@ -4744,8 +4852,33 @@ def validate_bundled_library_package_provenance(
 _QT_SDK_LOCK_PATH: Path = Path(__file__).with_name("qt_sdk_lock.json")
 
 
+def _validate_qt_sdk_locked_package_shape(raw_package: object, path: str) -> None:
+    """Raises ValueError if `raw_package` is not a well-formed locked
+    package entry (see _load_qt_sdk_lock()'s own docstring for the
+    exact required shape) -- called once per entry in the lock's
+    `packages` list so a malformed entry is reported with its own
+    concrete list index, never a generic top-level failure."""
+    if not isinstance(raw_package, dict):
+        raise ValueError(f"{path}: expected an object")
+    expected_keys = {"name", "version", "sha1", "archives"}
+    if set(raw_package) != expected_keys:
+        raise ValueError(
+            f"{path}: expected exactly {{'name','version','sha1','archives'}} keys"
+        )
+    for key in ("name", "version", "sha1"):
+        if not isinstance(raw_package[key], str) or not raw_package[key]:
+            raise ValueError(f"{path}.{key}: expected a non-empty string")
+    archives = raw_package["archives"]
+    if (
+        not isinstance(archives, list)
+        or not archives
+        or not all(isinstance(archive, str) and archive for archive in archives)
+    ):
+        raise ValueError(f"{path}.archives: expected a non-empty list of strings")
+
+
 @functools.lru_cache(maxsize=1)
-def _load_qt_sdk_lock() -> dict[str, str]:
+def _load_qt_sdk_lock() -> dict[str, object]:
     """Loads the checked-in Qt SDK lock file governing this repository's
     accepted Qt toolchain identity. A malformed/missing lock file is a
     real configuration error, never silently treated as "no pin".
@@ -4764,7 +4897,21 @@ def _load_qt_sdk_lock() -> dict[str, str]:
     -- so a same-version but substituted/tampered/stale-cached SDK tree
     is provably distinguishable from the genuine one this repository's
     maintainers pinned, entirely offline (no live archive-server fetch
-    needed, unlike updatesXmlSha256's own verify_qt_sdk_lock())."""
+    needed, unlike updatesXmlSha256's own verify_qt_sdk_lock()).
+
+    Round-N+ review (HIGH, "qt_sdk_lock.json still lacks an exact
+    archive manifest ... Updates.xml + observed tree digest is self-
+    attested"): `packages` is the third, independent leg -- a locked
+    list of the exact real upstream `<PackageUpdate>` entries (name,
+    version, package-level integrity sha1, and ordered `.7z` archive
+    filenames) this project's own real install-qt-action configuration
+    actually requests, extracted once from the SAME pinned
+    Updates.xml payload (see
+    _parse_qt_sdk_locked_packages_from_updates_xml()'s own docstring)
+    and re-checked on every verify_qt_sdk_lock() call -- so a lock file
+    whose `updatesXmlSha256` happens to still agree, but whose separate
+    `packages` entry was mistakenly or maliciously edited to describe a
+    DIFFERENT archive/version/hash, is independently caught."""
     try:
         raw = json.loads(_QT_SDK_LOCK_PATH.read_text())
     except (OSError, json.JSONDecodeError) as error:
@@ -4774,20 +4921,39 @@ def _load_qt_sdk_lock() -> dict[str, str]:
         "updatesXmlUrl",
         "updatesXmlSha256",
         "installedTreeContentSha256",
+        "packages",
     }
-    if not isinstance(raw, dict) or set(raw) != expected_keys or not all(
-        isinstance(raw[key], str) and raw[key] for key in expected_keys
-    ):
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
         raise ValueError(
             f"malformed Qt SDK lock {_QT_SDK_LOCK_PATH}: expected exactly "
             "{'sdkVersion','updatesXmlUrl','updatesXmlSha256',"
-            "'installedTreeContentSha256'} string keys"
+            "'installedTreeContentSha256','packages'} keys"
         )
+    for key in (
+        "sdkVersion",
+        "updatesXmlUrl",
+        "updatesXmlSha256",
+        "installedTreeContentSha256",
+    ):
+        if not isinstance(raw[key], str) or not raw[key]:
+            raise ValueError(
+                f"malformed Qt SDK lock {_QT_SDK_LOCK_PATH}: {key!r} must be a "
+                "non-empty string"
+            )
+    packages = raw["packages"]
+    if not isinstance(packages, list) or not packages:
+        raise ValueError(
+            f"malformed Qt SDK lock {_QT_SDK_LOCK_PATH}: 'packages' must be a "
+            "non-empty list"
+        )
+    for index, package in enumerate(packages):
+        _validate_qt_sdk_locked_package_shape(package, f"packages[{index}]")
     return {
         "sdkVersion": raw["sdkVersion"],
         "updatesXmlUrl": raw["updatesXmlUrl"],
         "updatesXmlSha256": raw["updatesXmlSha256"],
         "installedTreeContentSha256": raw["installedTreeContentSha256"],
+        "packages": packages,
     }
 
 
@@ -4807,8 +4973,25 @@ def _load_qt_sdk_lock() -> dict[str, str]:
 # exactly like lib/plugins/qml. Translations/docs/examples are still
 # excluded: genuinely inert at both build and runtime for this
 # project's own pipeline.
+#
+# Round-N+ review (HIGH, "Qt tree digest omits Linux libexec where moc/
+# rcc/generators live"): on Qt 6's own real Linux install layout (this
+# repository's actual, real install-qt-action-produced SDK -- verified
+# directly by installing the pinned version and inspecting the real
+# resulting tree), moc/rcc/qmlcachegen/qlalr and Qt's own internal
+# CMake-imported helper tools (e.g. qt-cmake's own generator wrapper)
+# are NOT under `bin/` at all: Linux Qt 6 splits truly end-user-facing
+# tools into `bin/` and moves the build-time code-generator tools this
+# project's own CMake actually invokes into `libexec/` (macOS/Windows
+# Qt SDKs differ and keep them under `bin/`, which is why this project's
+# own `bin/` inclusion above did not already cover this on Linux). A
+# substituted `libexec/moc` (or `libexec/rcc`, or any CMake-imported
+# generator invoked from there) changes this project's OWN generated
+# code/final binaries' behavior exactly like a substituted `bin/`
+# tool would -- so it must be bound identically.
 _QT_SDK_TREE_DIGEST_SUBDIRS: tuple[str, ...] = (
     "bin",
+    "libexec",
     "lib",
     "plugins",
     "qml",
@@ -5054,25 +5237,147 @@ def _qt_sdk_source_provenance(qt_reference_dir: Path | None = None) -> dict[str,
 EXPECTED_QT_SDK_VERSION: str = _load_qt_sdk_lock()["sdkVersion"]
 
 
+def _parse_qt_sdk_locked_packages_from_updates_xml(
+    updates_xml_payload: bytes, package_names: tuple[str, ...]
+) -> list[dict[str, object]]:
+    """Round-N+ review (HIGH, "qt_sdk_lock.json still lacks an exact
+    archive manifest ... resolve and lock exact required Qt/ICU
+    archive names, publisher URLs, strong hashes, sizes, and signature
+    chain from pinned metadata"): parses the REAL upstream Qt online-
+    installer repository metadata format (the same `<PackageUpdate>`
+    schema Qt's own installer framework/aqtinstall/install-qt-action
+    itself consumes) to extract, for each of `package_names` (in that
+    exact order), the real package-level identity Qt's own repository
+    publishes for it: `name`, `version`, the package-level integrity
+    `sha1` Qt's own installer framework already uses to authenticate
+    this exact package's downloadable archives, and the real ordered
+    list of individual `.7z` archive filenames
+    (`DownloadableArchives`) that package's real install actually
+    downloads and extracts.
+
+    This is deliberately extracted from `packaging/qt_sdk_lock.json`'s
+    OWN already-checksum-pinned `updatesXmlUrl` payload (see
+    verify_qt_sdk_lock(), which fetches and sha256-verifies that exact
+    payload before this function is ever called on it) -- this project
+    invents no new archive identity of its own; it only makes the
+    SUBSET of that already-trusted upstream metadata this project's
+    OWN real CI pipeline actually installs (see ci.yml's own pinned
+    `modules: qtwebsockets` install-qt-action step) an explicit,
+    independently checked-in, separately-verified fact, rather than
+    something only implicitly true of whatever the aggregate
+    Updates.xml file's own sha256 happens to hash-pin. A same-version
+    substituted/tampered Updates.xml that nonetheless still describes a
+    DIFFERENT archive name, version, or package-level integrity hash
+    for one of these exact packages is therefore independently
+    detectable, even in the (astronomically unlikely, but not
+    dismissed on that basis alone) case of a maintainer mis-pinning
+    `updatesXmlSha256` itself against the wrong payload.
+
+    Raises ValueError (never returns a partial/best-effort result) if
+    any requested package name is entirely absent from the payload, or
+    if a present entry is missing any of the required fields -- an
+    upstream repository restructuring severe enough to break this
+    parsing is itself real, actionable information a silent partial
+    result would hide."""
+    try:
+        root = ET.fromstring(updates_xml_payload)
+    except ET.ParseError as error:
+        raise ValueError(f"cannot parse Qt Updates.xml payload: {error}") from error
+    by_name: dict[str, ET.Element] = {}
+    for package_update in root.findall(".//PackageUpdate"):
+        name = package_update.findtext("Name")
+        if isinstance(name, str) and name:
+            by_name[name] = package_update
+    packages: list[dict[str, object]] = []
+    for package_name in package_names:
+        package_update = by_name.get(package_name)
+        if package_update is None:
+            raise ValueError(
+                f"Qt Updates.xml payload has no <PackageUpdate> entry named "
+                f"{package_name!r} -- this project's own real install-qt-"
+                "action configuration requires it"
+            )
+        version = package_update.findtext("Version")
+        sha1 = package_update.findtext("SHA1")
+        archives_raw = package_update.findtext("DownloadableArchives")
+        if not isinstance(version, str) or not version:
+            raise ValueError(f"package {package_name!r} has no real <Version>")
+        if not isinstance(sha1, str) or not sha1:
+            raise ValueError(f"package {package_name!r} has no real <SHA1>")
+        archives = [
+            archive.strip()
+            for archive in (archives_raw or "").split(",")
+            if archive.strip()
+        ]
+        if not archives:
+            raise ValueError(
+                f"package {package_name!r} has no real <DownloadableArchives> "
+                "entries"
+            )
+        packages.append(
+            {
+                "name": package_name,
+                "version": version,
+                "sha1": sha1,
+                "archives": archives,
+            }
+        )
+    return packages
+
+
 def verify_qt_sdk_lock(
-    qt_sdk_lock: dict[str, str] | None = None,
-) -> dict[str, str]:
+    qt_sdk_lock: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Fetches the pinned upstream Qt Updates.xml metadata and verifies
     its sha256 against this repository's checked-in lock. Intended for
-    CI/workflow use BEFORE install-qt-action consumes the SDK."""
+    CI/workflow use BEFORE install-qt-action consumes the SDK.
+
+    Round-N+ review (HIGH, "qt_sdk_lock.json still lacks an exact
+    archive manifest"): ALSO independently re-parses that same fetched
+    payload for the exact per-package archive-name/version/sha1
+    manifest packaging/qt_sdk_lock.json's own checked-in `packages`
+    entry claims (see _parse_qt_sdk_locked_packages_from_updates_xml()'s
+    own docstring) and compares them field-for-field -- a genuinely
+    distinct check from the whole-file sha256 comparison above, closing
+    the residual gap where a correct aggregate hash alone would not
+    catch a wrong/stale/tampered `packages` entry in the lock file
+    itself.
+    """
     lock = qt_sdk_lock or _load_qt_sdk_lock()
     with urllib.request.urlopen(lock["updatesXmlUrl"]) as response:
         payload = response.read()
     actual_sha256 = hashlib.sha256(payload).hexdigest()
-    return {
+    result: dict[str, object] = {
         "sdkVersion": lock["sdkVersion"],
         "updatesXmlUrl": lock["updatesXmlUrl"],
         "expectedSha256": lock["updatesXmlSha256"],
         "actualSha256": actual_sha256,
-        "status": "matched"
-        if actual_sha256 == lock["updatesXmlSha256"]
-        else "content_mismatch",
     }
+    if actual_sha256 != lock["updatesXmlSha256"]:
+        result["status"] = "content_mismatch"
+        return result
+    locked_packages = lock["packages"]
+    assert isinstance(locked_packages, list)
+    package_names = tuple(
+        package["name"] for package in locked_packages if isinstance(package, dict)
+    )
+    try:
+        actual_packages = _parse_qt_sdk_locked_packages_from_updates_xml(
+            payload, package_names
+        )
+    except ValueError as error:
+        result["status"] = "package_manifest_mismatch"
+        result["packageManifestError"] = str(error)
+        return result
+    if actual_packages != locked_packages:
+        result["status"] = "package_manifest_mismatch"
+        result["expectedPackages"] = locked_packages
+        result["actualPackages"] = actual_packages
+        return result
+    result["status"] = "matched"
+    result["lockedPackageCount"] = len(locked_packages)
+    return result
+
 
 
 def bind_bundled_library_to_qt_sdk_provenance(
@@ -6540,6 +6845,13 @@ def cmd_verify_qt_sdk_lock(_args: argparse.Namespace) -> int:
     except Exception as error:
         print(f"audit_codec_notices: failed to verify Qt SDK lock: {error}", file=sys.stderr)
         return 1
+    if result["status"] == "package_manifest_mismatch":
+        print(
+            "audit_codec_notices: pinned Qt SDK package archive manifest "
+            f"mismatch: {result.get('packageManifestError') or result}",
+            file=sys.stderr,
+        )
+        return 1
     if result["status"] != "matched":
         print(
             "audit_codec_notices: pinned Qt SDK metadata digest mismatch: "
@@ -6550,7 +6862,9 @@ def cmd_verify_qt_sdk_lock(_args: argparse.Namespace) -> int:
         return 1
     print(
         "audit_codec_notices: verified pinned Qt SDK metadata "
-        f"{result['updatesXmlUrl']} sha256={result['actualSha256']}"
+        f"{result['updatesXmlUrl']} sha256={result['actualSha256']} "
+        f"({result['lockedPackageCount']} locked package archive manifest(s) "
+        "confirmed)"
     )
     return 0
 
