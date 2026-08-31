@@ -2840,6 +2840,21 @@ AssetCache::AssetCache(Config config) : m_config(std::move(config)) {
   // already-shared RootAuthority::memory) is fully resolved -- see the
   // comment where this call used to live, right after
   // validateConfiguration(), for why doing it that early was wrong.
+  //
+  // No separate upper-bound check is needed on memoryMaxCostBytes (a
+  // qint64) before this call: unlike Qt 5, where QCache::setMaxCost()
+  // took a plain `int` and an over-INT_MAX byte limit would silently
+  // truncate/wrap, Qt 6's QCache<Key, T>::setMaxCost() (and ::insert()'s
+  // own cost parameter, used below) takes a `qsizetype` -- confirmed by
+  // inspecting this project's actual linked Qt 6.11.1
+  // QtCore.framework/Headers/qcache.h, which declares
+  // `void setMaxCost(qsizetype m)` and
+  // `bool insert(const Key &key, T *object, qsizetype cost = 1)`.
+  // qsizetype is a signed 64-bit type on every platform this project
+  // targets (Linux/SteamOS, 64-bit only; see CMakeLists.txt), so it has
+  // the identical range as qint64 and this qint64->qsizetype conversion
+  // is lossless for every value configHasValidMemoryByteLimit() above
+  // already accepts (i.e. every non-negative qint64).
   m_memory->setMaxCost(configHasValidMemoryByteLimit(m_config)
                            ? m_config.memoryMaxCostBytes
                            : 0);

@@ -84,8 +84,11 @@ fi
 # runs under a plain POSIX "sh -c" (not bash), so avoid bash-only array
 # and process-substitution syntax; xargs -0 with an explicit exec both
 # handles arbitrary filenames safely and preserves clang-format's exit
-# status through the pipeline.
-find src tests \( -name '*.cpp' -o -name '*.h' \) -print0 | sort -z |
+# status through the pipeline. Deliberately not piping through
+# "sort -z": that flag is GNU-sort-only and unsupported by the default
+# BSD sort on macOS, and clang-format's --dry-run --Werror result for a
+# given file doesn't depend on the order files are checked in anyway.
+find src tests \( -name '*.cpp' -o -name '*.h' \) -print0 |
   xargs -0 "$CLANG_FORMAT" --dry-run --Werror
 for file in qml/*.qml; do
   formatted="$(mktemp)"
