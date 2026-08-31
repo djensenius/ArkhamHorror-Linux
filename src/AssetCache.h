@@ -8,6 +8,7 @@
 #include <QHash>
 #include <QImage>
 #include <QMutex>
+#include <QSet>
 #include <QSize>
 #include <QString>
 #include <QUrl>
@@ -398,6 +399,34 @@ public:
   // at all) for backward compatibility with every pre-existing caller
   // that never participates in this protocol.
   [[nodiscard]] quint64 issueKeyGeneration(const QString &key);
+
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // marks a token issueKeyGeneration()/snapshotAndIssueGeneration()
+  // previously minted for `key` as RESOLVED -- its owning operation has
+  // reached its own terminal outcome (delivered a result, been
+  // cancelled, or otherwise given up on ever calling any of
+  // store()/touchAfterNotModified()/promoteToMemory()/
+  // updateMemoryDecodedImage()/recordNegative404()/
+  // invalidateAndRecordNegative404() for this token). A caller must call
+  // this EXACTLY ONCE for every token it was ever handed, regardless of
+  // whether that token ever actually reached a CAS-guarded mutation call
+  // or was rejected/never attempted one at all -- this is the only
+  // ground-truth signal touchAndPruneKeyGenerationMapsLocked() has for
+  // "no one still needs `key`'s watermark to remain in memory," and
+  // omitting it for even one token would leave that key's tracking
+  // state permanently unprunable (a bounded-memory regression), while
+  // calling it BEFORE the token's owner is genuinely done (a
+  // use-after-release) would let the exact same class of bug this
+  // method exists to close (a stale-but-still-outstanding token
+  // wrongly resurrected against a pruned/reset watermark) recur. A
+  // no-op for `key == kUnconditionalGeneration` tokens (never tracked as
+  // outstanding in the first place -- see issueKeyGeneration()'s own
+  // comment on that constant) and for any token already released
+  // (idempotent, so a defensive caller-side double-release, e.g. from
+  // two different failure paths racing to unwind the same operation, is
+  // always safe).
+  void releaseKeyGeneration(const QString &key, quint64 issuedGeneration);
 
   // Cumulative review (independent re-review, HIGH, "shared authority
   // remains non-linearizable... negative 404 is coordinator-local and
@@ -1027,6 +1056,35 @@ public:
   static void setMountTransitionPolicyQualificationOverrideForTesting(
       bool active, bool qualified = false);
 
+  // Test-only, deterministic, UNPRIVILEGED override of
+  // componentPassesOwnershipModePolicy()'s raw fstat()-based
+  // ANCESTOR-position ownership/mode decision (AssetCache.cpp) -- there
+  // is no portable, unprivileged way to make a real directory
+  // genuinely owned by root (uid 0) for an ordinary, unprivileged test
+  // fixture, so the "an ordinary, legitimately root-provisioned
+  // ancestor passes" branch is otherwise untestable hermetically. Lets
+  // a test force EITHER answer deterministically for every ANCESTOR
+  // component (`active=true, passes=<value>`), regardless of that
+  // component's real owning uid/mode. This deliberately does NOT
+  // affect the FINAL-account-home-component decision at all, which
+  // ALWAYS uses the real, unmodified check -- an unprivileged test
+  // process genuinely owns its own final-home fixture directories
+  // already, and can make one group/world-writable via a real
+  // chmod(), so that decision needs no override to prove either
+  // acceptance or rejection for real. This also does NOT need to be
+  // used at all to prove ANCESTOR rejection (wrong owner,
+  // group/world-writable) -- an unprivileged test process's own
+  // directories already genuinely fail the "owned by root" / "never
+  // writable by group or other" ancestor requirement without any
+  // override. `active=false` (the default, and what a test MUST reset
+  // back to before returning, ideally via an RAII scope guard) restores
+  // the real, unmodified fstat()-based ancestor check; production code
+  // paths never depend on this outside of a test binary calling the
+  // setter below.
+  static void
+  setHomeComponentOwnershipModePolicyOverrideForTesting(bool active,
+                                                        bool passes = false);
+
   // Test-only, deterministic, UNPRIVILEGED injection of an INDETERMINATE
   // (never partial) directory-listing failure -- see
   // listAllEntriesRelativeOnce()/listAllEntriesRelative()'s own comments
@@ -1207,6 +1265,9 @@ private:
   // out so snapshotAndIssueGeneration() can mint a token from WITHIN its
   // own single mutex acquisition. Callers must already hold m_mutex.
   [[nodiscard]] quint64 issueKeyGenerationLocked(const QString &key);
+  // The locked body of the public releaseKeyGeneration() above. Callers
+  // must already hold m_mutex.
+  void releaseKeyGenerationLocked(const QString &key, quint64 issuedGeneration);
   // Cumulative review (independent re-review, HIGH, "shared root
   // authority incomplete"): the read half of the shared cross-instance
   // issuance/applied-watermark CAS protocol -- see issueKeyGeneration()'s
@@ -1243,36 +1304,41 @@ private:
   // watermark (never permanently stuck behind it). Callers must already
   // hold m_mutex.
   void advanceKeyGenerationPastAllIssuedLocked(const QString &key);
-  // Independent cumulative re-review (HIGH, "root authority... m_key
-  // issued/applied maps never prune"): records `key`'s entry in the
-  // shared "last touched" real steady-clock-ms map
-  // (m_keyGenerationLastTouchSteadyMs) as touched right now, then, only
-  // once the tracked-key count exceeds kMaxTrackedKeyGenerationEntries,
-  // evicts the oldest-touched keys down to a low-water mark -- but ONLY
-  // keys that satisfy BOTH of:
-  //   (1) issued == applied watermark (no known outstanding gap -- see
-  //       tryApplyKeyGenerationLocked()'s own comment for why an older,
-  //       still-outstanding issued token must never be allowed to
-  //       silently regain the ability to publish after eviction), AND
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // records `key`'s entry in the shared "last touched" real
+  // steady-clock-ms map (m_keyGenerationLastTouchSteadyMs) as touched
+  // right now, then, only once the tracked-key count exceeds
+  // kMaxTrackedKeyGenerationEntries, evicts the oldest-touched keys down
+  // to a low-water mark -- but ONLY keys that satisfy BOTH of:
+  //   (1) m_keyOutstandingGeneration[key] is empty -- no token
+  //       issueKeyGeneration() has ever minted for `key` remains
+  //       un-released (see releaseKeyGeneration()'s own comment). This
+  //       is genuine ground truth, not a heuristic: a previous version
+  //       of this method instead checked "issued == applied watermark,"
+  //       which is NOT a reliable proxy for "nothing outstanding" -- a
+  //       token minted long before the current applied watermark can
+  //       still be genuinely in flight (its holder simply hasn't
+  //       finished yet) even while a LATER token has already been
+  //       issued AND applied for the same key, making
+  //       issued == applied true despite that earlier token's holder
+  //       still being able to call tryApplyKeyGenerationLocked() at any
+  //       moment; evicting `key`'s watermark in that state resets it to
+  //       0 (via the default-0 lookup every reader here uses), letting
+  //       that stale-but-still-outstanding token wrongly satisfy the
+  //       CAS against an amnesia'd watermark instead of the real,
+  //       already-superseded one it should be compared against. AND
   //   (2) idle for at least m_keyGenerationIdleEvictionThresholdMs by a
   //       REAL std::chrono::steady_clock reading (keyGenerationIdleNowMs()
   //       -- never the caller-supplied, test-fakeable "nowMonotonicMs"
   //       negative404 uses, since that value is under a TEST's control
   //       and could otherwise be used to defeat this safeguard).
-  // Condition (1) alone is not sufficient by itself to prove no
-  // operation is still genuinely in flight for a key (AssetCache has no
-  // visibility into AssetRequestCoordinator's own live candidate/
-  // operation bookkeeping) -- condition (2)'s generous default (15
-  // minutes, kDefaultKeyGenerationIdleEvictionThresholdMs) makes it
-  // implausible for any real network operation (bounded by this
-  // project's own, far shorter, request timeouts) to still be
-  // outstanding for a key by the time its bookkeeping becomes
-  // eviction-eligible. This is a documented, bounded residual risk
-  // rather than an airtight proof (a true airtight fix would require
-  // AssetRequestCoordinator to explicitly report its own live in-flight
-  // key set down into AssetCache, which is out of scope for this fix),
-  // consistent with the "STATX_MNT_ID unavailable" fallback documented
-  // elsewhere in this class.
+  // Condition (1) alone is sufficient to prove no operation can still
+  // successfully publish against `key`'s current watermark once evicted
+  // (every token that could ever call tryApplyKeyGenerationLocked() for
+  // it has already been released); condition (2) exists purely to bound
+  // how eagerly an otherwise-idle key's bookkeeping is reclaimed, not to
+  // paper over any remaining correctness gap.
   // Called from issueKeyGenerationLocked() and
   // tryApplyKeyGenerationLocked() -- the only two places that ever touch
   // a key's issued/applied watermark -- so every key that is ever
@@ -1459,6 +1525,24 @@ private:
   QHash<QString, qint64> *m_keyGenerationLastTouchSteadyMs{
       &m_privateKeyGenerationLastTouchSteadyMsFallback};
   QHash<QString, qint64> m_privateKeyGenerationLastTouchSteadyMsFallback;
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // the actual, ground-truth set of tokens issueKeyGeneration() has
+  // handed out for a key that have NOT yet reached releaseKeyGeneration()
+  // -- see both methods' own comments. `issued == applied` is NOT a
+  // reliable proxy for "nothing outstanding": a token minted long before
+  // the current applied watermark can still be genuinely in flight (its
+  // holder simply hasn't finished yet) even while a LATER token has
+  // already been issued AND applied for the same key, making
+  // issued == applied true despite that earlier token's holder still
+  // being able to call tryApplyKeyGenerationLocked() at any moment.
+  // touchAndPruneKeyGenerationMapsLocked() now consults this set
+  // directly instead. Repointed alongside m_keyIssuedGeneration/
+  // m_keyAppliedGeneration above (same RootAuthority, same sharing
+  // rules).
+  QHash<QString, QSet<quint64>> *m_keyOutstandingGeneration{
+      &m_privateKeyOutstandingGenerationFallback};
+  QHash<QString, QSet<quint64>> m_privateKeyOutstandingGenerationFallback;
   // Cumulative review (independent re-review, HIGH, "negative 404 is
   // coordinator-local and can hide sibling-populated cache"): the
   // shared negative-404 tombstone map -- see NegativeCacheRecord's own

@@ -104,6 +104,29 @@ AssetRequestCoordinator::AssetRequestCoordinator(AssetCache &cache,
       m_monotonicNowMs(&defaultMonotonicNowMs) {}
 
 AssetRequestCoordinator::~AssetRequestCoordinator() {
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // every still-outstanding AssetCache-level token this coordinator ever
+  // minted -- one per live CandidateAttempt (network fetches, including
+  // revalidations) and one per waiter still queued in a
+  // PendingCacheDecode (cache-hit decode groups) -- must be released
+  // before this object goes away, or AssetCache::
+  // touchAndPruneKeyGenerationMapsLocked() can never consider the
+  // corresponding key prunable again even though the operation that
+  // minted it no longer exists to ever release it itself. m_cache is a
+  // reference to an AssetCache guaranteed to outlive this coordinator
+  // (see the class comment on m_cache's declaration), so this is safe to
+  // call from here.
+  for (auto it = m_candidateAttempts.constBegin();
+       it != m_candidateAttempts.constEnd(); ++it) {
+    m_cache.releaseKeyGeneration(it->cacheKey, it->assetCacheGeneration);
+  }
+  for (auto it = m_pendingCacheDecodes.constBegin();
+       it != m_pendingCacheDecodes.constEnd(); ++it) {
+    for (const GroupWaiter &waiter : it->waiters) {
+      m_cache.releaseKeyGeneration(it->cacheKey, waiter.assetCacheGeneration);
+    }
+  }
   // Abort every in-flight fetch without invoking any consumer's callback:
   // destruction must never deliver a stale completion. Consumers simply
   // never hear back, exactly as documented for a destroyed QObject seam.
@@ -120,6 +143,7 @@ AssetRequestCoordinator::~AssetRequestCoordinator() {
   m_operations.clear();
   m_handleToOperation.clear();
   m_candidateAttempts.clear();
+  m_pendingCacheDecodes.clear();
 }
 
 AssetRequestCoordinator::RequestHandle
@@ -214,6 +238,13 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
         m_cache.snapshotAndIssueGeneration(cacheKey, m_monotonicNowMs());
 
     if (snapshot.authoritativeNegative404) {
+      // Independent cumulative re-review (HIGH, "root authority... Prune
+      // issued==applied while older token outstanding resets
+      // watermark"): snapshotAndIssueGeneration() unconditionally mints
+      // `snapshot.issuedGeneration` even for a confirmed-absent record
+      // -- this candidate is never fetched/decoded/promoted using it, so
+      // it must be released here rather than left outstanding forever.
+      m_cache.releaseKeyGeneration(cacheKey, snapshot.issuedGeneration);
       continue; // authoritatively confirmed absent: try the next candidate
     }
 
@@ -267,6 +298,15 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
       // for this exact opKey is currently in flight (see the top of this
       // function, review round-4 item 6) -- nothing synchronous between
       // that check and here can have started one.
+      //
+      // Independent cumulative re-review (HIGH, "root authority... Prune
+      // issued==applied while older token outstanding resets
+      // watermark"): `snapshot.issuedGeneration` is never applied by
+      // this branch -- startRevalidation() below mints its OWN, separate
+      // AssetCache-level token for the actual conditional GET (see its
+      // comment) -- so it must be released here rather than left
+      // outstanding forever.
+      m_cache.releaseKeyGeneration(cacheKey, snapshot.issuedGeneration);
       const quint64 handleId = m_nextHandle++;
       const quint64 operationId = m_nextOperationId++;
       Operation operation;
@@ -295,6 +335,14 @@ AssetRequestCoordinator::request(const AssetKey &key, ResultCallback callback) {
     // an untried higher-priority candidate must never be skipped in
     // favour of a lower-priority one that merely happens to already be
     // cached.
+    //
+    // Independent cumulative re-review (HIGH, "root authority... Prune
+    // issued==applied while older token outstanding resets watermark"):
+    // `snapshot.issuedGeneration` is never applied by this iteration --
+    // the network path constructed below (startCandidate()) mints its
+    // OWN, separate AssetCache-level token -- so it must be released
+    // rather than left outstanding forever.
+    m_cache.releaseKeyGeneration(cacheKey, snapshot.issuedGeneration);
     break;
   }
 
@@ -387,6 +435,17 @@ AssetRequestCoordinator::unsubscribeFromCandidateAttempt(
     return AssetNetworkFetcher::FetchHandle{};
   }
   const AssetNetworkFetcher::FetchHandle fetchHandle = attemptIt->fetchHandle;
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // every subscriber of this attempt has now cancelled, so the shared
+  // fetch is aborted below and its completion lambda -- which finds
+  // this exact `attemptKey` already erased from m_candidateAttempts and
+  // returns immediately without ever calling dispatchCandidateFetchResult()
+  // / dispatchRevalidationResult() -- will NEVER release
+  // `assetCacheGeneration` on this attempt's behalf. Release it here,
+  // the one place that genuinely knows this token's lifecycle is over.
+  m_cache.releaseKeyGeneration(attemptIt->cacheKey,
+                               attemptIt->assetCacheGeneration);
   m_candidateAttempts.erase(attemptIt);
   return fetchHandle;
 }
@@ -702,43 +761,84 @@ void AssetRequestCoordinator::completeCacheReadGroupOrQuarantine(
   AssetOutcome<AssetCache::CachedEntry> outcome =
       ensureDecoded(std::move(entry), expectedFormat);
 
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // every GroupWaiter::assetCacheGeneration token was minted by an
+  // earlier snapshotAndIssueGeneration()/issueKeyGeneration() call and
+  // MUST be released exactly once, from every exit this function can
+  // take for a given waiter (cancelled-before-delivery, successful
+  // delivery, a CAS rejection that resnapshots/retries via
+  // advanceCandidates(), a non-quarantine failure, or a quarantine
+  // invalidate+retry via startCandidate()) -- otherwise
+  // AssetCache::touchAndPruneKeyGenerationMapsLocked() can never
+  // consider `cacheKey` prunable again even after every real operation
+  // using it has long since finished.
+  auto releaseToken = [this, &cacheKey](const GroupWaiter &waiter) {
+    m_cache.releaseKeyGeneration(cacheKey, waiter.assetCacheGeneration);
+  };
+
   if (outcome) {
-    // Review round-3 items 14/15: gate BOTH the memory-decoded-image
-    // republish (ensureDecoded() is deliberately side-effect-free -- see
-    // its comment) and, when requested, the full promoteToMemory() behind
-    // the SAME issuance-ordered CAS (tryApplyCacheKeyMutation()), applied
-    // independently per waiter and in registration order -- so the FINAL
-    // applied generation for `cacheKey` is exactly what fully independent,
-    // one-decode-per-operation processing would have left behind, even
-    // though the decode itself ran only once for the whole group.
+    // Independent cumulative re-review (HIGH, "root authority... Cached
+    // decode paths cast SkippedStale to void and deliver old body"):
+    // gate ACTUAL DELIVERY of this already-decoded read on the SAME
+    // issuance-ordered CAS (both the coordinator-local
+    // tryApplyCacheKeyMutation() AND the separate, AssetCache-level
+    // token's own CAS inside updateMemoryDecodedImage()/
+    // promoteToMemory()) -- applied independently per waiter and in
+    // registration order. A previous version of this loop discarded
+    // BOTH CAS results entirely (a bare `(void)`-cast call) and
+    // delivered `perWaiterOutcome` to every waiter regardless: if a
+    // same-root sibling's invalidate() or a newer store() had already
+    // superseded `cacheKey` by the time this decode finished, that
+    // stale, already-known-obsolete body was still handed back as if it
+    // were current. Rejecting delivery and re-snapshotting/retrying
+    // instead (via advanceCandidates(), the SAME primitive
+    // dispatchCandidateFetchResult()'s own staleRetryNeeded branch
+    // uses) means this waiter observes whatever the shared authority
+    // actually holds NOW, never a result it has already disowned.
     for (const GroupWaiter &waiter : waiters) {
       if (m_operations.find(waiter.operationId) == m_operations.end()) {
+        releaseToken(waiter);
         continue; // cancelled before delivery -- see header comment
       }
+      if (!tryApplyCacheKeyMutation(cacheKey, waiter.expectedGeneration)) {
+        releaseToken(waiter);
+        advanceCandidates(waiter.operationId);
+        continue;
+      }
       AssetOutcome<AssetCache::CachedEntry> perWaiterOutcome(*outcome);
-      if (tryApplyCacheKeyMutation(cacheKey, waiter.expectedGeneration)) {
-        // Cumulative review (independent re-review, HIGH, "shared root
-        // authority incomplete"): thread each waiter's own, SEPARATE
-        // AssetCache-level token through -- see GroupWaiter::
-        // assetCacheGeneration's comment. Both calls' MutationOutcome
-        // returns are deliberately discarded (never checked/acted upon)
-        // -- SkippedStaleGeneration here means only that a same-root
-        // sibling raced ahead and already replaced/invalidated this key
-        // in the interim, which is not itself a failure of anything:
-        // this waiter's OWN delivery below (perWaiterOutcome, the
-        // already-decoded, already-valid entry it looked up) is
-        // completely unaffected either way, and there is nothing further
-        // for this best-effort memory-cache republish to do once a
-        // newer sibling state already exists -- leaving that newer
-        // state undisturbed IS the correct outcome.
-        (void)m_cache.updateMemoryDecodedImage(cacheKey,
-                                               perWaiterOutcome->decodedImage,
-                                               waiter.assetCacheGeneration);
-        if (promoteOnSuccess) {
-          (void)m_cache.promoteToMemory(cacheKey, *perWaiterOutcome,
-                                        waiter.assetCacheGeneration);
+      // Cumulative review (independent re-review, HIGH, "shared root
+      // authority incomplete"): thread each waiter's own, SEPARATE
+      // AssetCache-level token through -- see GroupWaiter::
+      // assetCacheGeneration's comment. Unlike the coordinator-local
+      // CAS above, EITHER of these two calls reporting
+      // SkippedStaleGeneration also means a same-root SIBLING already
+      // replaced/invalidated this key more recently than this read --
+      // exactly as disqualifying for delivery as the coordinator-local
+      // rejection above, so both results are now checked (never
+      // discarded) and gate delivery identically.
+      const AssetCache::MutationOutcome memoryOutcome =
+          m_cache.updateMemoryDecodedImage(cacheKey,
+                                           perWaiterOutcome->decodedImage,
+                                           waiter.assetCacheGeneration);
+      if (memoryOutcome ==
+          AssetCache::MutationOutcome::SkippedStaleGeneration) {
+        releaseToken(waiter);
+        advanceCandidates(waiter.operationId);
+        continue;
+      }
+      if (promoteOnSuccess) {
+        const AssetCache::MutationOutcome promoteOutcome =
+            m_cache.promoteToMemory(cacheKey, *perWaiterOutcome,
+                                    waiter.assetCacheGeneration);
+        if (promoteOutcome ==
+            AssetCache::MutationOutcome::SkippedStaleGeneration) {
+          releaseToken(waiter);
+          advanceCandidates(waiter.operationId);
+          continue;
         }
       }
+      releaseToken(waiter);
       completeOperation(waiter.operationId, std::move(perWaiterOutcome));
     }
     return;
@@ -746,6 +846,7 @@ void AssetRequestCoordinator::completeCacheReadGroupOrQuarantine(
 
   if (!isQuarantineWorthy(outcome.error().code)) {
     for (const GroupWaiter &waiter : waiters) {
+      releaseToken(waiter);
       if (m_operations.find(waiter.operationId) == m_operations.end()) {
         continue;
       }
@@ -772,9 +873,11 @@ void AssetRequestCoordinator::completeCacheReadGroupOrQuarantine(
   for (const GroupWaiter &waiter : waiters) {
     auto it = m_operations.find(waiter.operationId);
     if (it == m_operations.end()) {
+      releaseToken(waiter);
       continue;
     }
     if (!tryApplyCacheKeyMutation(cacheKey, waiter.expectedGeneration)) {
+      releaseToken(waiter);
       completeOperation(waiter.operationId,
                         AssetOutcome<AssetCache::CachedEntry>(outcome.error()));
       continue;
@@ -783,6 +886,7 @@ void AssetRequestCoordinator::completeCacheReadGroupOrQuarantine(
       (void)m_cache.invalidate(cacheKey);
       invalidatedThisGroup = true;
     }
+    releaseToken(waiter);
     Operation &operation = it.value();
     operation.isRevalidation = false;
     operation.staleEntry.reset();
@@ -810,6 +914,15 @@ void AssetRequestCoordinator::pruneCancelledPendingCacheDecodeWaiter(
     QVector<GroupWaiter> &waiters = it->waiters;
     for (int i = waiters.size() - 1; i >= 0; --i) {
       if (waiters[i].operationId == operationId) {
+        // Independent cumulative re-review (HIGH, "root authority...
+        // Prune issued==applied while older token outstanding resets
+        // watermark"): this cancelled waiter's own GroupWaiter is about
+        // to be discarded WITHOUT ever reaching
+        // completeCacheReadGroupOrQuarantine() (the only other place
+        // that releases a GroupWaiter's assetCacheGeneration) -- release
+        // it here instead, or it stays outstanding forever.
+        m_cache.releaseKeyGeneration(it->cacheKey,
+                                     waiters[i].assetCacheGeneration);
         waiters.remove(i);
       }
     }
@@ -858,6 +971,11 @@ void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
         m_cache.snapshotAndIssueGeneration(cacheKey, m_monotonicNowMs());
 
     if (snapshot.authoritativeNegative404) {
+      // Independent cumulative re-review (HIGH, "root authority... Prune
+      // issued==applied while older token outstanding resets
+      // watermark"): see request()'s identical comment -- this minted
+      // token is never used by this candidate and must be released here.
+      m_cache.releaseKeyGeneration(cacheKey, snapshot.issuedGeneration);
       continue; // authoritatively confirmed absent: try the next candidate
     }
 
@@ -878,6 +996,14 @@ void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
                                       /*promoteOnSuccess=*/false);
         return;
       }
+      // Independent cumulative re-review (HIGH, "root authority... Prune
+      // issued==applied while older token outstanding resets
+      // watermark"): this branch never applies `snapshot.issuedGeneration`
+      // -- startRevalidation() below mints its OWN, separate
+      // AssetCache-level token for the actual conditional GET (see its
+      // comment) -- so this one must be released rather than left
+      // outstanding forever.
+      m_cache.releaseKeyGeneration(cacheKey, snapshot.issuedGeneration);
       operation.isRevalidation = true;
       operation.revalidationCacheKey = cacheKey;
       operation.staleEntry = std::move(entry);
@@ -888,6 +1014,12 @@ void AssetRequestCoordinator::advanceCandidates(quint64 operationId) {
     // Neither a confirmed-absent record nor a cache hit: the first
     // genuinely untried candidate from here -- fall through to the
     // network.
+    //
+    // Independent cumulative re-review (HIGH, "root authority... Prune
+    // issued==applied while older token outstanding resets watermark"):
+    // see request()'s identical comment -- startCandidate() below mints
+    // its OWN, separate token, so this one must be released.
+    m_cache.releaseKeyGeneration(cacheKey, snapshot.issuedGeneration);
     startCandidate(operationId);
     return;
   }
@@ -1151,6 +1283,17 @@ void AssetRequestCoordinator::dispatchCandidateFetchResult(
       }
     }
   }
+
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // `assetCacheGeneration` was minted ONCE for this whole coalesced
+  // attempt (see startCandidate()'s comment) and every branch above has
+  // now either applied it, discovered it stale, or determined it never
+  // applied (the defensive-only notModified branch) -- its lifecycle as
+  // an outstanding token is over regardless of which subscriber loop
+  // branch runs below, so it is released exactly once here, before any
+  // subscriber is notified.
+  m_cache.releaseKeyGeneration(cacheKey, assetCacheGeneration);
 
   for (const quint64 subscriberId : subscribers) {
     auto opIt = m_operations.find(subscriberId);
@@ -1439,6 +1582,30 @@ void AssetRequestCoordinator::dispatchRevalidationResult(
     verdict = staleGeneration ? Verdict::StaleRetryViaResnapshot
                               : Verdict::FreshReplace;
   }
+
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // `assetCacheGeneration` was minted ONCE for this whole coalesced
+  // revalidation attempt (see startRevalidation()'s comment) and every
+  // verdict branch above has now either applied it
+  // (touchAfterNotModified()/store()/invalidateAndRecordNegative404()),
+  // discovered it stale, or determined it never needed applying (the
+  // defensive-only StaleIfError branch) -- its lifecycle as an
+  // outstanding token is over regardless of which subscriber-loop
+  // verdict runs below, so it is released exactly once here, before any
+  // subscriber is notified. Two of the four verdicts below
+  // (StaleRetryViaResnapshot, NotFoundFailedClosed/NotFoundAdvance,
+  // FreshReplace) never separately re-thread this SAME token through
+  // completeCacheReadGroupOrQuarantine() at all, so without this
+  // explicit release those subscribers' share of it would never be
+  // released anywhere, permanently pinning `cacheKey` un-prunable. The
+  // StaleIfError/NotModifiedPromote verdicts below DO also thread this
+  // identical token into their own GroupWaiters, which independently
+  // release it again per-subscriber -- releasing the same
+  // (key, token) pair more than once is always idempotent/safe (see
+  // releaseKeyGenerationLocked()'s own comment), so doing both here is
+  // never a double-free-style hazard.
+  m_cache.releaseKeyGeneration(cacheKey, assetCacheGeneration);
 
   // Round-9+ review item 3/7: accumulators for the batched, single-decode
   // StaleIfError/NotModifiedPromote groups built up by the loop below --

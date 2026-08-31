@@ -219,13 +219,63 @@ rm -rf "$distro_provenance_stage_dir"
 mapfile -d '' -t qt_plugin_elf_files < <(
   find "$qt_reference_dir/plugins" -type f -print0 2>/dev/null
 )
+
+# Round-N+ review (HIGH, "Prefer replaying the exact trusted packaging
+# transform ... byte-compare final with a transformation receipt"):
+# extract the REAL patchelf/strip binaries bundled inside this
+# project's own pinned, sha256-verified $linuxdeploy/$qt_plugin
+# AppImages (see .github/workflows/ci.yml's "Download packaging tools"
+# step, which verifies both AppImages' own sha256 BEFORE this script
+# ever runs) so audit_codec_notices.py can later REPLAY each bundled
+# library's real strip-then-patchelf transformation and byte-compare
+# the result, rather than only ever trusting a heuristic digest
+# comparison. `--appimage-extract` is each AppImage's own documented,
+# no-FUSE-required extraction mode (this project's own empirical
+# research already used it directly against these exact pinned
+# releases to derive the transformation recipe replay_strip_and_rpath_
+# transform() below implements). Extracted into a dedicated staging
+# directory (never the repo root) so these tool binaries can never be
+# mistaken for, or accidentally bundled alongside, this project's own
+# first-party artifacts.
+replay_tool_stage_dir="$repo_root/.linuxdeploy-replay-tools-stage"
+rm -rf "$replay_tool_stage_dir"
+mkdir -p "$replay_tool_stage_dir/linuxdeploy" "$replay_tool_stage_dir/linuxdeploy-plugin-qt"
+linuxdeploy_real_path="$(command -v "$linuxdeploy")"
+qt_plugin_real_path="$(command -v "$qt_plugin")"
+(
+  cd "$replay_tool_stage_dir/linuxdeploy"
+  "$linuxdeploy_real_path" --appimage-extract >/dev/null
+)
+(
+  cd "$replay_tool_stage_dir/linuxdeploy-plugin-qt"
+  "$qt_plugin_real_path" --appimage-extract >/dev/null
+)
+linuxdeploy_patchelf="$replay_tool_stage_dir/linuxdeploy/squashfs-root/usr/bin/patchelf"
+linuxdeploy_strip="$replay_tool_stage_dir/linuxdeploy/squashfs-root/usr/bin/strip"
+linuxdeploy_qt_patchelf="$replay_tool_stage_dir/linuxdeploy-plugin-qt/squashfs-root/usr/bin/patchelf"
+linuxdeploy_qt_strip="$replay_tool_stage_dir/linuxdeploy-plugin-qt/squashfs-root/usr/bin/strip"
+for extracted_tool in \
+  "$linuxdeploy_patchelf" "$linuxdeploy_strip" \
+  "$linuxdeploy_qt_patchelf" "$linuxdeploy_qt_strip"; do
+  [[ -x "$extracted_tool" ]] || {
+    echo "Extracted linuxdeploy/linuxdeploy-plugin-qt replay tool" \
+      "'$extracted_tool' is missing or not executable -- cannot capture" \
+      "replay evidence for distro provenance." >&2
+    exit 1
+  }
+done
+
 python3 "$repo_root/packaging/audit_codec_notices.py" capture-distro-provenance \
   "$app_dir/usr/bin/arkham-horror" \
   "$libsecret_so" "$libgpgerror_so" "$libgccs_so" "$libstdcxx_so" \
   "$libz_so" "$libcomerr_so" \
   "${qt_plugin_elf_files[@]}" \
   --output "$distro_provenance_manifest" \
-  --staging-dir "$distro_provenance_stage_dir"
+  --staging-dir "$distro_provenance_stage_dir" \
+  --linuxdeploy-patchelf "$linuxdeploy_patchelf" \
+  --linuxdeploy-strip "$linuxdeploy_strip" \
+  --linuxdeploy-qt-patchelf "$linuxdeploy_qt_patchelf" \
+  --linuxdeploy-qt-strip "$linuxdeploy_qt_strip"
 echo "Wrote distro-package provenance manifest to $distro_provenance_manifest"
 
 # Round-N+ review (HIGH, "staged capture exists, but linuxdeploy still

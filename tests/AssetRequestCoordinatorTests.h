@@ -180,6 +180,41 @@ private slots:
   crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidationPreventsStaleTouch();
   void
   crossInstanceSiblingDefinitiveInvalidateDuringInFlightRevalidationFreshReplacePreventsStaleOverwrite();
+  // Independent cumulative re-review (HIGH, "root authority... Cached
+  // decode paths cast SkippedStale to void and deliver old body"): the
+  // cross-instance sibling tests above all cover the NETWORK-fetch
+  // dispatch path (dispatchCandidateFetchResult()/
+  // dispatchRevalidationResult()); this test covers the SEPARATE,
+  // previously-unprotected coalesced-cache-hit-decode delivery path
+  // (completeCacheReadGroupOrQuarantine()) -- a memory hit whose decode
+  // is queued, during which a sibling AssetCache instance sharing the
+  // same physical root publishes a strictly newer value for the exact
+  // same key, must never have its now-stale, already-decoded body
+  // delivered; it must instead transparently re-snapshot/retry and
+  // deliver the sibling's newer content.
+  void
+  siblingPublishDuringQueuedCoalescedCacheHitDecodeNeverDeliversStaleBody();
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // proves the production AssetRequestCoordinator dispatch path (not
+  // just AssetCache's own direct unit test of the same fix) never
+  // leaves an AssetCache-level token permanently outstanding once the
+  // operation that minted it has genuinely finished with it -- a
+  // cancelled coalesced cache-hit waiter's own token must still be
+  // released, or AssetCache::touchAndPruneKeyGenerationMapsLocked()
+  // could never consider this key prunable again.
+  void
+  cancellingACoalescedCacheHitDecodeWaiterReleasesItsAssetCacheLevelToken();
+  // Independent cumulative re-review (HIGH, "root authority... Track
+  // in-flight tokens and bounded prune"): dispatchRevalidationResult()'s
+  // FreshReplace verdict (a fresh 200 body despite conditional headers)
+  // routes every subscriber straight to completeOperation(), never
+  // through completeCacheReadGroupOrQuarantine()'s own per-waiter token
+  // release -- proves the ONE assetCacheGeneration token shared by the
+  // whole coalesced revalidation attempt is still explicitly released
+  // exactly once, so the affected key remains genuinely prunable
+  // afterward instead of being pinned outstanding forever.
+  void freshReplaceRevalidationVerdictReleasesItsSharedAssetCacheLevelToken();
 
 private:
   QString m_tempDirPath;

@@ -1055,7 +1055,9 @@ class SbomInventoryTests(unittest.TestCase):
             by_path["libavif.so.16.0.0"]["packageProvenance"],
             content_bound_sentinel,
         )
-        bound_mock.assert_called_once_with(self.lib_dir / "libavif.so.16.0.0")
+        bound_mock.assert_called_once_with(
+            self.lib_dir / "libavif.so.16.0.0", replay_toolset=None
+        )
         basename_mock.assert_not_called()
 
     def test_package_provenance_surfaces_a_real_content_mismatch_in_the_sbom(
@@ -2349,30 +2351,63 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
         vaddr = struct.unpack_from("<Q", data, vaddr_off)[0]
         struct.pack_into("<Q", data, vaddr_off, vaddr + delta)
 
-    def test_canonical_load_digest_stable_when_dynamic_segment_is_relocated(
+    def _bind_isolated_program_header_mutation_via_captured_provenance(
+        self, staged_reference: Path, mutated_bundled: Path
+    ) -> dict[str, object]:
+        """Builds a minimal formatVersion-2 captured-provenance manifest
+        binding `staged_reference` (playing the role of the immutable
+        staged pre-packaging source object) to a single AppDir-relative
+        destination, then binds `mutated_bundled` (playing the role of
+        the final shipped file) against it with NO replay_toolset --
+        i.e. exactly the heuristic-only _canonical_load_digest() path
+        exercised directly by the (removed) stability assertions this
+        replaces. Uses "zlib"'s own real, pinned
+        COMPONENT_EXPECTED_SOURCE_PACKAGES/COMPONENT_EXPECTED_SOURCE_VERSION
+        entries so validate_bundled_library_package_provenance()'s
+        unconditional (not require_provenance-gated) package-identity/
+        version checks agree, isolating this test to exactly the
+        evidenceStrength enforcement under test."""
+        manifest = {
+            "formatVersion": 2,
+            "bundledPaths": {
+                "usr/lib/isolated-mutation-fixture.so": {
+                    "bundledPath": "usr/lib/isolated-mutation-fixture.so",
+                    "stagedPath": str(staged_reference),
+                    "sourceRealPath": str(staged_reference),
+                    "sha256": audit._sha256(staged_reference),
+                    "canonicalLoadDigest": audit._canonical_load_digest(staged_reference),
+                    "package": "zlib1g",
+                    "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["zlib"],
+                    "sourcePackage": "zlib",
+                }
+            },
+        }
+        return audit.bind_bundled_library_to_captured_provenance(
+            mutated_bundled, manifest, "usr/lib/isolated-mutation-fixture.so"
+        )
+
+    def test_dynamic_segment_isolated_relocation_passes_heuristic_but_fails_required_provenance(
         self,
     ) -> None:
-        # Companion/regression guard for the PT_DYNAMIC-location
-        # exclusion documented in _non_load_program_header_records()'s
-        # own module comment: unlike PT_GNU_RELRO/PT_TLS below,
-        # PT_DYNAMIC's own location is NOT bound into the digest at
-        # all, specifically because a real `patchelf --set-rpath`
-        # rewrite empirically relocates it to an inconsistent
-        # offset-vaddr relationship (proven directly against real
-        # patchelf 0.14.3 output, not merely assumed) -- so mutating
-        # its p_vaddr/p_offset/p_paddr here, with no section or
-        # `.dynamic` tag content moved at all, must NOT be flagged, or
-        # every real, legitimate AppImage RPATH rewrite that relocates
-        # PT_DYNAMIC into a freshly appended trailing LOAD segment
-        # (test_canonical_load_digest_is_stable_across_patchelf_rpath_
-        # relocation/_edit) would start failing this digest comparison.
+        # Round-N+ review (HIGH, "Tests currently require attacker
+        # p_vaddr mutations to pass -- reverse them"): PT_DYNAMIC's own
+        # location is intentionally excluded from
+        # _canonical_load_digest() (see _non_load_program_header_
+        # records()'s own module comment: a real `patchelf --set-rpath`
+        # rewrite empirically relocates it), so this isolated
+        # relocation -- no section or `.dynamic` tag content moved at
+        # all -- legitimately still passes the pure heuristic
+        # comparison. But it MUST now be rejected under
+        # --require-package-provenance, which demands a byte-identical
+        # replay of the real pinned packaging transform, never merely
+        # heuristic agreement.
         PT_DYNAMIC = 2
         reference = self.root / "dynloc_ref.so"
         self._build_rich_shared_object(reference)
         mutated = self.root / "dynloc_mut.so"
         mutated.write_bytes(reference.read_bytes())
         data = bytearray(mutated.read_bytes())
-        self._mutate_program_header_vaddr(data, PT_DYNAMIC, 0x1000)
+        self._mutate_program_header_vaddr(data, PT_DYNAMIC, 4096)
         mutated.write_bytes(bytes(data))
 
         self.assertEqual(
@@ -2384,26 +2419,107 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
             audit._canonical_load_digest(mutated),
         )
 
-    def test_canonical_load_digest_stable_when_gnu_property_segment_is_relocated(
+        binding = self._bind_isolated_program_header_mutation_via_captured_provenance(
+            reference, mutated
+        )
+        self.assertEqual(binding["status"], "matched")
+        self.assertEqual(binding["evidenceStrength"], "canonical_digest_heuristic")
+
+        problem = audit.validate_bundled_library_package_provenance(
+            "zlib", binding, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("replay", problem)
+
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "zlib", binding, require_provenance=False
+            )
+        )
+
+    def test_dynamic_segment_isolated_relocation_is_rejected_when_replay_toolset_supplied(
         self,
     ) -> None:
-        # Companion/regression guard for the PT_GNU_PROPERTY exclusion
-        # documented in _non_load_program_header_records()'s own module
-        # comment: a real `patchelf --set-rpath` rewrite (even a SHORT,
-        # in-place one; see
-        # test_build_id_survives_a_patchelf_style_rpath_edit) empirically
-        # relocates GNU_PROPERTY's own program header to an inconsistent
-        # offset-vaddr relationship because it physically travels with
-        # the `.note.gnu.property` section it describes. That section's
-        # own content is independently authenticated elsewhere, so this
-        # segment's raw location must NOT be flagged, or legitimate
-        # AppImage RPATH edits would fail this digest comparison.
+        # Companion to the test above: when a (fake, deterministic)
+        # replay toolset IS supplied, bind_bundled_library_to_captured_
+        # provenance() must use replay_strip_and_rpath_transform()
+        # instead of the heuristic, and a replay that disagrees (this
+        # fake never claims to reproduce the mutated file) is always a
+        # decisive "content_mismatch"/"replay_mismatch", never silently
+        # downgraded back to the heuristic's "matched" verdict.
+        PT_DYNAMIC = 2
+        reference = self.root / "dynloc_ref2.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "dynloc_mut2.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        self._mutate_program_header_vaddr(data, PT_DYNAMIC, 4096)
+        mutated.write_bytes(bytes(data))
+
+        fake_toolset = {
+            "toolLabel": "fake-linuxdeploy",
+            "patchelfPath": "/nonexistent/patchelf",
+            "patchelfSha256": "fake",
+            "stripPath": "/nonexistent/strip",
+            "stripSha256": "fake",
+        }
+
+        def fake_replay(
+            reference_path: Path, final_path: Path, toolset: dict[str, str]
+        ) -> dict[str, object]:
+            return {
+                "toolLabel": toolset["toolLabel"],
+                "matched": False,
+                "replayedSha256": audit._sha256(reference_path),
+                "finalSha256": audit._sha256(final_path),
+            }
+
+        with mock.patch.object(
+            audit, "replay_strip_and_rpath_transform", side_effect=fake_replay
+        ):
+            manifest = {
+                "formatVersion": 2,
+                "bundledPaths": {
+                    "usr/lib/isolated-mutation-fixture.so": {
+                        "bundledPath": "usr/lib/isolated-mutation-fixture.so",
+                        "stagedPath": str(reference),
+                        "sourceRealPath": str(reference),
+                        "sha256": audit._sha256(reference),
+                        "canonicalLoadDigest": audit._canonical_load_digest(reference),
+                        "package": "zlib1g",
+                        "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["zlib"],
+                        "sourcePackage": "zlib",
+                    }
+                },
+            }
+            binding = audit.bind_bundled_library_to_captured_provenance(
+                mutated,
+                manifest,
+                "usr/lib/isolated-mutation-fixture.so",
+                replay_toolset=fake_toolset,
+            )
+
+        self.assertEqual(binding["status"], "content_mismatch")
+        self.assertEqual(binding["evidenceStrength"], "replay_mismatch")
+        problem = audit.validate_bundled_library_package_provenance(
+            "zlib", binding, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+
+    def test_gnu_property_segment_isolated_relocation_passes_heuristic_but_fails_required_provenance(
+        self,
+    ) -> None:
+        # Same reasoning as the PT_DYNAMIC test above, for the other
+        # location intentionally excluded from _canonical_load_digest()
+        # -- PT_GNU_PROPERTY, which physically travels with
+        # `.note.gnu.property` during a real `patchelf --set-rpath`
+        # rewrite.
         reference = self.root / "propertyloc_ref.so"
         self._build_rich_shared_object(reference)
         mutated = self.root / "propertyloc_mut.so"
         mutated.write_bytes(reference.read_bytes())
         data = bytearray(mutated.read_bytes())
-        self._mutate_program_header_vaddr(data, _PT_GNU_PROPERTY, 0x1000)
+        self._mutate_program_header_vaddr(data, _PT_GNU_PROPERTY, 4096)
         mutated.write_bytes(bytes(data))
 
         self.assertEqual(
@@ -2413,6 +2529,24 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
         self.assertEqual(
             audit._canonical_load_digest(reference),
             audit._canonical_load_digest(mutated),
+        )
+
+        binding = self._bind_isolated_program_header_mutation_via_captured_provenance(
+            reference, mutated
+        )
+        self.assertEqual(binding["status"], "matched")
+        self.assertEqual(binding["evidenceStrength"], "canonical_digest_heuristic")
+
+        problem = audit.validate_bundled_library_package_provenance(
+            "zlib", binding, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("replay", problem)
+
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "zlib", binding, require_provenance=False
+            )
         )
 
     def test_canonical_load_digest_detects_gnu_relro_segment_location_mutation(
@@ -3022,7 +3156,9 @@ class PackageProvenanceTests(unittest.TestCase):
         (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
         (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
 
-        def fake_bind(bundled_path: Path) -> dict[str, object]:
+        def fake_bind(
+            bundled_path: Path, replay_toolset: dict[str, str] | None = None
+        ) -> dict[str, object]:
             if bundled_path.name == "libcom_err.so.2":
                 return {
                     "status": "matched",
@@ -3049,7 +3185,9 @@ class PackageProvenanceTests(unittest.TestCase):
         (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
         (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
 
-        def fake_bind(bundled_path: Path) -> dict[str, object]:
+        def fake_bind(
+            bundled_path: Path, replay_toolset: dict[str, str] | None = None
+        ) -> dict[str, object]:
             if bundled_path.name == "libcom_err.so.2":
                 return {
                     "status": "matched",
@@ -3098,6 +3236,7 @@ class PackageProvenanceTests(unittest.TestCase):
             bundled_path: Path,
             manifest: dict[str, object],
             bundled_relative_path: str | None = None,
+            replay_toolset: dict[str, str] | None = None,
         ) -> dict[str, object]:
             if bundled_path.name == "libcom_err.so.2":
                 return {"status": "not_found"}
@@ -3135,7 +3274,9 @@ class PackageProvenanceTests(unittest.TestCase):
         (lib_dir / "libcom_err.so.2").write_bytes(_FAKE_ELF_BYTES)
         (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
 
-        def fake_bind(bundled_path: Path) -> dict[str, object]:
+        def fake_bind(
+            bundled_path: Path, replay_toolset: dict[str, str] | None = None
+        ) -> dict[str, object]:
             return {"status": "not_found"}
 
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -3245,6 +3386,7 @@ class PackageProvenanceTests(unittest.TestCase):
                 "systemPath": str((system_dir / "libfoo.so.1").resolve()),
                 "systemSha256": audit._sha256(system_dir / "libfoo.so.1"),
                 "bundledCanonicalLoadDigest": "same-digest",
+                "evidenceStrength": "canonical_digest_heuristic",
             },
         )
 
@@ -4339,12 +4481,50 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
             "referencePath": "/qt/lib/libicudata.so.73",
             "sdkVersion": audit.EXPECTED_QT_SDK_VERSION,
             "sdkSourceProvenance": audit._qt_sdk_source_provenance(),
+            "evidenceStrength": "replay_byte_identical",
         }
         self.assertIsNone(
             audit.validate_bundled_library_qt_sdk_provenance(
                 "icu", binding, require_provenance=True
             )
         )
+
+    def test_validate_qt_sdk_provenance_accepts_matched_without_replay_evidence_when_not_required(
+        self,
+    ) -> None:
+        binding = {
+            "status": "matched",
+            "referencePath": "/qt/lib/libicudata.so.73",
+            "sdkVersion": audit.EXPECTED_QT_SDK_VERSION,
+            "sdkSourceProvenance": audit._qt_sdk_source_provenance(),
+            "evidenceStrength": "canonical_digest_heuristic",
+        }
+        self.assertIsNone(
+            audit.validate_bundled_library_qt_sdk_provenance("icu", binding)
+        )
+
+    def test_validate_qt_sdk_provenance_rejects_matched_without_replay_evidence_when_required(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, Qt/ICU provenance): a "matched" status
+        # under --require-package-provenance must be backed by a
+        # byte-identical replay of the real pinned linuxdeploy-plugin-qt
+        # strip/patchelf transformation, never merely the older
+        # _canonical_load_digest() heuristic -- same enforcement as
+        # validate_bundled_library_package_provenance() above, mirrored
+        # here for the Qt SDK reference path.
+        binding = {
+            "status": "matched",
+            "referencePath": "/qt/lib/libicudata.so.73",
+            "sdkVersion": audit.EXPECTED_QT_SDK_VERSION,
+            "sdkSourceProvenance": audit._qt_sdk_source_provenance(),
+            "evidenceStrength": "canonical_digest_heuristic",
+        }
+        problem = audit.validate_bundled_library_qt_sdk_provenance(
+            "icu", binding, require_provenance=True
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("replay", problem)
 
     def test_validate_qt_sdk_provenance_rejects_sdk_version_drift_unconditionally(
         self,
@@ -4490,16 +4670,51 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
         # --distro-provenance-manifest too (see
         # CaptureBeforePackagingProvenanceTests); its own content is
         # irrelevant to this test's actual assertion (icu never
-        # consults it at all), so an empty manifest is supplied and its
-        # own binder is mocked to unconditionally "match" so libavif's
+        # consults it at all), so its own binder is mocked to
+        # unconditionally "match" (with a real-looking
+        # "replay_byte_identical" evidenceStrength, matching this
+        # project's own pinned appimage-smoke CI job's actual
+        # --linuxdeploy-patchelf/--linuxdeploy-strip usage) so libavif's
         # own provenance never spuriously fails this specific test.
+        #
+        # Round-N+ review (HIGH, Qt/ICU provenance): the manifest now
+        # also carries a real "linuxdeployPluginQt" replay toolset entry
+        # (see cmd_capture_distro_provenance()'s own "replayTools"
+        # embedding), rehydrated by _replay_toolset_from_manifest() and
+        # passed through to bind_bundled_library_to_qt_sdk_provenance()
+        # -- exercising the same --require-package-provenance
+        # replay-evidence enforcement for the Qt SDK reference path that
+        # validate_bundled_library_qt_sdk_provenance() above proves in
+        # isolation.
+        qt_patchelf_stub = self.root / "fake-linuxdeploy-qt-patchelf"
+        qt_strip_stub = self.root / "fake-linuxdeploy-qt-strip"
+        qt_patchelf_stub.write_bytes(b"fake patchelf binary")
+        qt_strip_stub.write_bytes(b"fake strip binary")
+
         manifest_path = self.root / "manifest.json"
-        manifest_path.write_text(json.dumps({}))
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "formatVersion": 2,
+                    "bundledPaths": {},
+                    "replayTools": {
+                        "linuxdeployPluginQt": {
+                            "toolLabel": "linuxdeploy-plugin-qt",
+                            "patchelfPath": str(qt_patchelf_stub),
+                            "patchelfSha256": audit._sha256(qt_patchelf_stub),
+                            "stripPath": str(qt_strip_stub),
+                            "stripSha256": audit._sha256(qt_strip_stub),
+                        }
+                    },
+                }
+            )
+        )
 
         def fail_if_called_for_icu(
             bundled_path: Path,
             manifest: dict[str, object],
             bundled_relative_path: str | None = None,
+            replay_toolset: dict[str, str] | None = None,
         ) -> dict[str, object]:
             if bundled_path.name == "libicudata.so.73":
                 self.fail(
@@ -4513,6 +4728,25 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
                 "package": "libavif16",
                 "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["libavif"],
                 "sourcePackage": "libavif",
+                "evidenceStrength": "replay_byte_identical",
+            }
+
+        def fake_replay(
+            reference_path: Path, final_path: Path, toolset: dict[str, str]
+        ) -> dict[str, object]:
+            return {
+                "toolLabel": toolset["toolLabel"],
+                "patchelfSha256": toolset["patchelfSha256"],
+                "stripSha256": toolset["stripSha256"],
+                "referenceRealPath": str(reference_path),
+                "referenceSha256": "fake-reference-sha",
+                "finalSha256": "fake-final-sha",
+                "referenceObservedRpath": None,
+                "finalObservedRpath": None,
+                "stripApplied": True,
+                "patchelfSetRpathApplied": False,
+                "replayedSha256": "fake-final-sha",
+                "matched": True,
             }
 
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -4522,6 +4756,8 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
             side_effect=fail_if_called_for_icu,
         ), mock.patch.object(
             audit, "_canonical_load_digest", return_value="same-digest"
+        ), mock.patch.object(
+            audit, "replay_strip_and_rpath_transform", side_effect=fake_replay
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = audit.main(
                 [
@@ -4561,6 +4797,7 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
             bundled_path: Path,
             manifest: dict[str, object],
             bundled_relative_path: str | None = None,
+            replay_toolset: dict[str, str] | None = None,
         ) -> dict[str, object]:
             if bundled_path.name == "libicudata.so.73":
                 self.fail(
@@ -4910,8 +5147,35 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
         lib_dir = icu_bundled.parent
         (lib_dir / "libavif.so.16").write_bytes(_FAKE_ELF_BYTES)
 
+        # Round-N+ review (HIGH, Qt/ICU provenance): exercise the same
+        # real "linuxdeployPluginQt" replay-toolset manifest embedding
+        # as test_cmd_classify_uses_qt_sdk_provenance_for_icu_never_dpkg
+        # above, so this end-to-end coalescing test also proves the
+        # replay-evidence path (not merely the pre-existing heuristic
+        # one) is only ever consumed once.
+        qt_patchelf_stub = self.root / "fake-linuxdeploy-qt-patchelf"
+        qt_strip_stub = self.root / "fake-linuxdeploy-qt-strip"
+        qt_patchelf_stub.write_bytes(b"fake patchelf binary")
+        qt_strip_stub.write_bytes(b"fake strip binary")
+
         manifest_path = self.root / "manifest.json"
-        manifest_path.write_text(json.dumps({}))
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "formatVersion": 2,
+                    "bundledPaths": {},
+                    "replayTools": {
+                        "linuxdeployPluginQt": {
+                            "toolLabel": "linuxdeploy-plugin-qt",
+                            "patchelfPath": str(qt_patchelf_stub),
+                            "patchelfSha256": audit._sha256(qt_patchelf_stub),
+                            "stripPath": str(qt_strip_stub),
+                            "stripSha256": audit._sha256(qt_strip_stub),
+                        }
+                    },
+                }
+            )
+        )
         sbom_path = self.root / "sbom.json"
 
         call_count = 0
@@ -4921,6 +5185,24 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
             nonlocal call_count
             call_count += 1
             return real_bind(*args, **kwargs)  # type: ignore[arg-type]
+
+        def fake_replay(
+            reference_path: Path, final_path: Path, toolset: dict[str, str]
+        ) -> dict[str, object]:
+            return {
+                "toolLabel": toolset["toolLabel"],
+                "patchelfSha256": toolset["patchelfSha256"],
+                "stripSha256": toolset["stripSha256"],
+                "referenceRealPath": str(reference_path),
+                "referenceSha256": "fake-reference-sha",
+                "finalSha256": "fake-final-sha",
+                "referenceObservedRpath": None,
+                "finalObservedRpath": None,
+                "stripApplied": True,
+                "patchelfSetRpathApplied": False,
+                "replayedSha256": "fake-final-sha",
+                "matched": True,
+            }
 
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(
@@ -4933,9 +5215,12 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
                 "package": "libavif16",
                 "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["libavif"],
                 "sourcePackage": "libavif",
+                "evidenceStrength": "replay_byte_identical",
             },
         ), mock.patch.object(
             audit, "_canonical_load_digest", return_value="same-digest"
+        ), mock.patch.object(
+            audit, "replay_strip_and_rpath_transform", side_effect=fake_replay
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = audit.main(
                 [
@@ -5686,6 +5971,200 @@ class RealDpkgArchitectureAndFileIntegrityTests(unittest.TestCase):
             self.assertEqual(record["dpkgFileIntegrity"], "mismatch")
             self.assertEqual(record["dpkgRecordedMd5"], recorded)
             self.assertNotEqual(record["dpkgActualMd5"], recorded)
+
+
+class RealReplayStripAndRpathTransformTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    packaging transform on trusted source in hermetic toolchain and
+    byte-compare final"): proves replay_strip_and_rpath_transform()
+    itself against a REAL patchelf/strip invocation (this project's own
+    exhaustive interactive research already proved the exact pinned
+    linuxdeploy/linuxdeploy-plugin-qt release's own bundled
+    patchelf/strip binaries reproduce a byte-identical result this same
+    way; this suite proves the PRODUCTION CODE implementing that same
+    recipe does too, using whatever real patchelf/strip this host
+    provides -- the replay mechanism itself is tool-version-agnostic,
+    only the specific pinned binaries build-appimage.sh supplies in
+    real CI are version-pinned) -- never only against a mocked
+    replay_strip_and_rpath_transform() the way this module's other,
+    portable (non-Linux-host) tests must."""
+
+    def setUp(self) -> None:
+        if not (shutil.which("patchelf") and shutil.which("strip")):
+            self.skipTest("requires real patchelf and strip binaries")
+        self.cc_bin = shutil.which("cc") or shutil.which("gcc")
+        if self.cc_bin is None:
+            self.skipTest("requires a real C compiler to build a genuine ELF fixture")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.toolset = audit._build_replay_toolset(
+            Path(shutil.which("patchelf")),
+            Path(shutil.which("strip")),
+            "system-toolchain",
+        )
+        self.assertIsNotNone(self.toolset)
+
+    def _build_reference(self) -> Path:
+        reference = self.root / "reference.so"
+        _compile_shared_object(
+            self.cc_bin,
+            "int replay_fixture_entry(void) { return 1; }\n",
+            reference,
+        )
+        return reference
+
+    def test_replay_reproduces_a_genuine_short_inplace_rpath_edit(self) -> None:
+        reference = self._build_reference()
+        final = self.root / "final_short.so"
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        subprocess.run(
+            ["strip", "--strip-unneeded", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["patchelf", "--set-rpath", "$ORIGIN/../lib", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(final))
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset
+        )
+        self.assertTrue(receipt["matched"], receipt)
+        self.assertEqual(receipt["replayedSha256"], receipt["finalSha256"])
+        self.assertTrue(receipt["stripApplied"])
+        self.assertTrue(receipt["patchelfSetRpathApplied"])
+
+    def test_replay_reproduces_a_genuine_long_relocating_rpath_edit(self) -> None:
+        reference = self._build_reference()
+        final = self.root / "final_long.so"
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        subprocess.run(
+            ["strip", "--strip-unneeded", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        # A long RPATH forces patchelf to physically relocate
+        # PT_DYNAMIC/the .dynstr content into a freshly appended
+        # trailing LOAD segment rather than editing in place.
+        long_rpath = "/".join(["deliberately-very-long-rpath-component"] * 40)
+        subprocess.run(
+            ["patchelf", "--set-rpath", long_rpath, str(final)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(final))
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset
+        )
+        self.assertTrue(receipt["matched"], receipt)
+        self.assertEqual(receipt["replayedSha256"], receipt["finalSha256"])
+
+    def test_replay_rejects_a_final_file_tampered_after_the_genuine_transform(
+        self,
+    ) -> None:
+        reference = self._build_reference()
+        final = self.root / "final_tampered.so"
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        subprocess.run(
+            ["strip", "--strip-unneeded", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["patchelf", "--set-rpath", "$ORIGIN/../lib", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        genuine_receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset
+        )
+        self.assertTrue(genuine_receipt["matched"], genuine_receipt)
+
+        tampered_bytes = bytearray(final.read_bytes())
+        flip_index = len(tampered_bytes) // 2
+        tampered_bytes[flip_index] ^= 0xFF
+        final.write_bytes(bytes(tampered_bytes))
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset
+        )
+        self.assertFalse(receipt["matched"])
+        self.assertNotEqual(receipt["replayedSha256"], receipt["finalSha256"])
+
+    def test_replay_skips_strip_when_reference_rpath_already_dollar_prefixed(
+        self,
+    ) -> None:
+        # Companion to setUp's own recipe: when the STAGED reference's
+        # own observed rpath is already "$"-prefixed (patchelf already
+        # ran against it upstream, e.g. a linuxdeploy-plugin-qt-bundled
+        # Qt library that already carries a $ORIGIN-relative rpath),
+        # replay must skip the strip step entirely -- stripping an
+        # already-stripped, already-patched reference a second time is
+        # not part of the real observed linuxdeploy recipe.
+        base = self._build_reference()
+        reference = self.root / "reference_dollar.so"
+        reference.write_bytes(base.read_bytes())
+        reference.chmod(0o755)
+        subprocess.run(
+            ["patchelf", "--set-rpath", "$ORIGIN/../lib", str(reference)],
+            check=True,
+            capture_output=True,
+        )
+        final = self.root / "final_dollar.so"
+        final.write_bytes(reference.read_bytes())
+        final.chmod(0o755)
+        subprocess.run(
+            ["patchelf", "--set-rpath", "$ORIGIN/../lib2", str(final)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(audit._sha256(reference), audit._sha256(final))
+
+        receipt = audit.replay_strip_and_rpath_transform(
+            reference, final, self.toolset
+        )
+        self.assertTrue(receipt["matched"], receipt)
+        self.assertFalse(receipt["stripApplied"])
+        self.assertTrue(receipt["patchelfSetRpathApplied"])
+
+    def test_replay_toolset_from_manifest_rejects_a_tampered_tool_binary(
+        self,
+    ) -> None:
+        patchelf_copy = self.root / "patchelf-copy"
+        shutil.copyfile(shutil.which("patchelf"), patchelf_copy)
+        patchelf_copy.chmod(0o755)
+        original_sha256 = audit._sha256(patchelf_copy)
+
+        manifest = {
+            "replayTools": {
+                "linuxdeploy": {
+                    "toolLabel": "linuxdeploy",
+                    "patchelfPath": str(patchelf_copy),
+                    "patchelfSha256": original_sha256,
+                    "stripPath": shutil.which("strip"),
+                    "stripSha256": audit._sha256(Path(shutil.which("strip"))),
+                }
+            }
+        }
+
+        toolset = audit._replay_toolset_from_manifest(manifest, "linuxdeploy")
+        self.assertIsNotNone(toolset)
+
+        with open(patchelf_copy, "ab") as handle:
+            handle.write(b"\x00tampered-tool-binary")
+
+        toolset_after_tamper = audit._replay_toolset_from_manifest(
+            manifest, "linuxdeploy"
+        )
+        self.assertIsNone(toolset_after_tamper)
 
 
 if __name__ == "__main__":

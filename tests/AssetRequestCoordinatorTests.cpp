@@ -4028,3 +4028,262 @@ void AssetRequestCoordinatorTests::
   QVERIFY(afterCompletionA.has_value());
   QCOMPARE(afterCompletionA->encodedBytes, v2.encodedBytes);
 }
+
+void AssetRequestCoordinatorTests::
+    siblingPublishDuringQueuedCoalescedCacheHitDecodeNeverDeliversStaleBody() {
+  // Independent cumulative re-review (HIGH, "root authority... Cached
+  // decode paths cast SkippedStale to void and deliver old body"): a
+  // memory hit whose decode is coalesced/queued (see
+  // concurrentAliasedMemoryHitRequestsCoalesceIntoASingleDecode() above
+  // for the identical coalescing setup) must never deliver its already-
+  // decoded body once a SIBLING AssetCache instance sharing the same
+  // physical root has published a strictly newer value for the exact
+  // same key before that queued decode actually runs. Before this fix,
+  // completeCacheReadGroupOrQuarantine() discarded
+  // updateMemoryDecodedImage()'s MutationOutcome entirely (a bare
+  // `(void)`-cast call) and delivered the stale, already-superseded
+  // body regardless; this test fails on that old behavior and passes
+  // once delivery is gated on that same CAS result, re-snapshotting/
+  // retrying (via advanceCandidates()) instead of ever delivering it.
+  MockHttpServer server;
+  // No response registered: neither the original memory hit nor the
+  // eventual retry (also served from memory) ever touches the network.
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cacheA(cacheConfig);
+  // A second AssetCache instance over the SAME physical root -- stands
+  // in for a sibling AssetRequestCoordinator/process sharing this cache
+  // (see the cross-instance sibling tests above for the identical
+  // sharing setup and rationale).
+  AssetCache cacheB(cacheConfig);
+
+  const AssetKey key =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  const auto candidates = AssetLocator::resolveCandidates(key);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry oldEntry;
+  oldEntry.encodedBytes = encodePng(8, 8);
+  oldEntry.contentType = QStringLiteral("image/png");
+  oldEntry.dimensions = QSize(8, 8);
+  QCOMPARE(cacheA.store(cacheKey, oldEntry),
+           AssetCache::MutationOutcome::Applied);
+
+  AssetRequestCoordinator coordinator(cacheA, fetcher);
+
+  std::optional<Result> result;
+  coordinator.request(key, [&](Result r) { result = std::move(r); });
+
+  // Synchronously (before the event loop has run the queued
+  // completeCoalescedCacheDecode() call at all): a memory hit joined
+  // exactly one pending decode group, carrying the AssetCache-level
+  // token minted at request()-time.
+  QCOMPARE(coordinator.pendingCacheDecodeGroupCountForTesting(), 1);
+
+  // The sibling instance now publishes a genuinely newer value for the
+  // identical key, with a token strictly greater than the one already
+  // minted above -- exactly the "delayed decode vs. sibling replace"
+  // race the review describes.
+  AssetCache::CachedEntry newerEntry;
+  newerEntry.encodedBytes = encodePng(16, 16);
+  newerEntry.contentType = QStringLiteral("image/png");
+  newerEntry.dimensions = QSize(16, 16);
+  const quint64 siblingToken = cacheB.issueKeyGeneration(cacheKey);
+  QCOMPARE(cacheB.store(cacheKey, newerEntry, siblingToken),
+           AssetCache::MutationOutcome::Applied);
+
+  QVERIFY(QTest::qWaitFor([&]() { return result.has_value(); }, 5000));
+  QVERIFY2(bool(*result), qPrintable(result->error().message));
+
+  // The decisive assertion: the delivered result reflects the sibling's
+  // NEWER (16x16) content, never the original, already-decoded but now-
+  // superseded (8x8) body the coalesced group actually read and
+  // decoded first.
+  QCOMPARE((**result).decodedImage.size(), QSize(16, 16));
+  QCOMPARE((**result).encodedBytes, newerEntry.encodedBytes);
+
+  // Two real decodes genuinely ran: the discarded stale one, and the
+  // fresh retry that actually got delivered -- proving this is a real
+  // re-snapshot/retry, not a lucky coincidence of never having decoded
+  // the stale body at all.
+  QCOMPARE(coordinator.realDecodeCallCountForTesting(), 2);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           0);
+}
+
+void AssetRequestCoordinatorTests::
+    cancellingACoalescedCacheHitDecodeWaiterReleasesItsAssetCacheLevelToken() {
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // proves the production AssetRequestCoordinator dispatch path never
+  // leaves an AssetCache-level token permanently outstanding once every
+  // operation that minted one has genuinely finished with it (here, via
+  // cancellation before the shared queued decode ever ran) -- see
+  // AssetCacheTests::
+  // outstandingTokenKeepsCasWatermarkAliveAcrossAggressivePruningUntilReleased()
+  // for the identical AssetCache-level technique this test drives
+  // through the real coordinator dispatch path instead.
+  MockHttpServer server;
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+  // A cap of 1 (not 0 -- see setMaxTrackedKeyGenerationEntriesForTesting()'s
+  // own doc comment: 0 is a "restore production default" sentinel here,
+  // identical to setMaxTrackedNegative404EntriesForTesting()) forces a
+  // full eviction sweep the instant a second, unrelated key is issued.
+  cache.setMaxTrackedKeyGenerationEntriesForTesting(1);
+  cache.setKeyGenerationIdleEvictionThresholdMsForTesting(0);
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(8, 8);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(8, 8);
+  QCOMPARE(cache.store(cacheKey, preSeeded),
+           AssetCache::MutationOutcome::Applied);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  const AssetRequestCoordinator::RequestHandle handleA =
+      coordinator.request(keyA, [](Result) {});
+  const AssetRequestCoordinator::RequestHandle handleB =
+      coordinator.request(keyB, [](Result) {});
+  QCOMPARE(coordinator.pendingCacheDecodeGroupCountForTesting(), 1);
+  QCOMPARE(coordinator.pendingCacheDecodeWaiterCountForTesting(
+               cacheKey, AssetFormat::Png),
+           2);
+
+  // Cancel BOTH waiters before the shared queued decode ever runs: the
+  // whole PendingCacheDecode group is erased, and both waiters' own
+  // AssetCache-level tokens must be released.
+  coordinator.cancel(handleA);
+  coordinator.cancel(handleB);
+  QCOMPARE(coordinator.pendingCacheDecodeGroupCountForTesting(), 0);
+
+  // A prune sweep triggered by an entirely unrelated key: with a zero
+  // entry cap and a zero idle threshold, `cacheKey`'s issued/applied
+  // bookkeeping is only evictable if BOTH tokens were genuinely
+  // released above -- if either had leaked, it would still be
+  // outstanding and this key would remain pinned forever.
+  const QString otherKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("http://127.0.0.1:%1/unrelated").arg(server.port())));
+  cache.issueKeyGeneration(otherKey);
+
+  // A fresh issuance for `cacheKey` after that eviction restarts its
+  // counter from 0 -- the clearest possible signal that its prior
+  // bookkeeping (and, transitively, both cancelled waiters' tokens) was
+  // actually reclaimed rather than left outstanding forever.
+  QCOMPARE(cache.issueKeyGeneration(cacheKey), quint64{1});
+}
+
+void AssetRequestCoordinatorTests::
+    freshReplaceRevalidationVerdictReleasesItsSharedAssetCacheLevelToken() {
+  // Independent cumulative re-review (HIGH, "root authority... Track
+  // in-flight tokens and bounded prune"): dispatchRevalidationResult()'s
+  // FreshReplace verdict (an origin sending a fresh 200 body despite
+  // conditional headers -- see
+  // coalescedRevalidationAppliesFreshReplaceOnceForAllSubscribers()
+  // above for the identical coalescing setup this test reuses) routes
+  // every subscriber straight to completeOperation(), NEVER through
+  // completeCacheReadGroupOrQuarantine()'s own per-waiter token release
+  // -- so the ONE assetCacheGeneration token shared by the whole
+  // coalesced revalidation attempt (minted once by startRevalidation())
+  // must be explicitly released elsewhere in dispatchRevalidationResult()
+  // itself, exactly once, regardless of which verdict is ultimately
+  // reached. This test proves that release genuinely happens: were it
+  // missing, `cacheKey`'s issued/applied bookkeeping would remain
+  // permanently outstanding and un-prunable forever, exactly like the
+  // AssetCache-level
+  // outstandingTokenKeepsCasWatermarkAliveAcrossAggressivePruningUntilReleased
+  // test's own decisive assertion (see AssetCacheTests) at a lower
+  // layer.
+  MockHttpServer server;
+  const QString path = QStringLiteral("/img/arkham/sets/valid01.png");
+  MockHttpServer::Response freshResponse;
+  freshResponse.contentType = "image/png";
+  freshResponse.body = encodePng(16, 16);
+  server.setResponse(path, freshResponse);
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  QVERIFY(!(keyA == keyB));
+
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  // Written through a throwaway instance so the stale entry exists ONLY
+  // on disk (a memory hit would otherwise be served with no
+  // revalidation at all) -- identical setup to
+  // coalescedRevalidationAppliesFreshReplaceOnceForAllSubscribers().
+  {
+    AssetCache seedCache(cacheConfig);
+    AssetCache::CachedEntry staleSeed;
+    staleSeed.encodedBytes = encodePng(4, 4);
+    staleSeed.contentType = QStringLiteral("image/png");
+    staleSeed.dimensions = QSize(4, 4);
+    staleSeed.etag = QStringLiteral("\"shared-etag\"");
+    QCOMPARE(seedCache.store(cacheKey, staleSeed),
+             AssetCache::MutationOutcome::Applied);
+  }
+  AssetCache cache(cacheConfig);
+  QVERIFY(cache.lookupDisk(cacheKey).has_value());
+  QVERIFY(!cache.lookupMemory(cacheKey).has_value());
+  // A cap of 1 (not 0 -- see setMaxTrackedKeyGenerationEntriesForTesting()'s
+  // own doc comment) forces a full eviction sweep the instant a second,
+  // unrelated key is issued.
+  cache.setMaxTrackedKeyGenerationEntriesForTesting(1);
+  cache.setKeyGenerationIdleEvictionThresholdMsForTesting(0);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
+  coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+
+  QCOMPARE(coordinator.candidateAttemptCountForTesting(), 1);
+  QCOMPARE(coordinator.candidateAttemptSubscriberCountForTesting(cacheKey), 2);
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() { return resultA.has_value() && resultB.has_value(); }, 5000));
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QCOMPARE((**resultA).decodedImage.size(), QSize(16, 16));
+
+  // Trigger a prune sweep via an entirely unrelated key.
+  const QString otherKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("http://127.0.0.1:%1/unrelated").arg(server.port())));
+  cache.issueKeyGeneration(otherKey);
+
+  // The decisive assertion: `cacheKey`'s own issued/applied bookkeeping
+  // was genuinely reclaimed -- a fresh issuance restarts its counter
+  // from 0, proving the FreshReplace verdict's shared token was
+  // actually released rather than left outstanding forever.
+  QCOMPARE(cache.issueKeyGeneration(cacheKey), quint64{1});
+}

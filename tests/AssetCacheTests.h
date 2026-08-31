@@ -109,6 +109,8 @@ private slots:
   ownedSuffixComponentThatIsASymlinkIsRejectedEvenWhenTrustedAnchorIsPlain();
   void ownedSuffixOfPlainDirectoriesUnderTrustedAnchorResolvesSuccessfully();
   void crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted();
+  void
+  realBindMountWithOpenat2ForcedUnavailableIsStillConfirmedAndSkippedNeverDisablingDiskCache();
   void mountIdentificationIsActuallySupportedOnThisLinuxBuildUnprivileged();
   void mountinfoRawReadParsesAtLeastOneEntryOnThisLinuxBuildUnprivileged();
 
@@ -174,6 +176,26 @@ private slots:
   // resolution whenever $HOME happens to differ from this test
   // process's own real home.
   void ordinaryMultiComponentHomePathWithNoSymlinksResolvesSuccessfully();
+
+  // Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+  // EVERY opened component regardless mount transition ... Production
+  // same-mount test wrong owner/world-writable"): a group/world-
+  // writable FINAL account-home directory must be rejected even when
+  // NO mount transition occurs anywhere in the walk at all (an
+  // entirely ordinary same-mount fake home, real chmod()'d 0777 --
+  // no privilege, no override needed). Proves the new unconditional
+  // per-component ownership/mode check actually runs for the
+  // final-home position even without a transition, not merely at
+  // transition boundaries as before this fix.
+  void
+  sameMountGroupWorldWritableFinalHomeDirectoryIsRejectedWithoutAnyMountTransition();
+  // Sibling of the test above: an ORDINARY, non-writable final home
+  // directory (still same-mount, still no transition) must keep
+  // resolving successfully -- proving the rejection above is specific
+  // to the writable mode, not a general regression whenever no
+  // transition occurs.
+  void
+  sameMountOrdinaryFinalHomeDirectoryStillResolvesSuccessfullyWithoutAnyMountTransition();
 
   // Cumulative review (PR #18, MEDIUM): an UNAUTHENTICATED mount
   // transition landing exactly on a fake $HOME (i.e. the account
@@ -459,6 +481,20 @@ private slots:
   // the stronger "a brand-new AssetCache constructed after a fork()
   // fails disk authority closed" contract.
   void forkedChildProcessNeverJoinsParentsInheritedRootAuthority();
+  // Independent cumulative re-review (MEDIUM, "fork destruction... real
+  // inherited stack object normal-scope destruction under held parent
+  // mutex must be addressed, not `_exit`-only test"): the test above
+  // deliberately never destroys anything in its forked child (its
+  // child calls ::_exit() immediately, bypassing every destructor) --
+  // this test instead lets a genuinely stack-scoped, pre-fork
+  // AssetCache instance be destroyed via ORDINARY C++ scope-exit
+  // semantics in a real forked child, and proves ~AssetCache()'s own
+  // forked-child branch terminates that process deterministically
+  // (via a distinguishable ::_exit() code) from WITHIN the destructor
+  // call itself, rather than letting any further code -- including any
+  // other member's own destructor -- run at all.
+  void
+  forkedChildDestroyingInheritedStackAssetCacheTerminatesProcessDeterministically();
   // Cumulative review (independent re-review, MEDIUM, "atfork child
   // handler unsafe"): proves the review's specific demand --
   // "continuing child must fail disk authority closed on first use"
@@ -606,6 +642,25 @@ private slots:
   // instance's own private state.
   void
   siblingInstanceSnapshotAndIssueGenerationObservesOtherSiblingsNegative404();
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // an OLDER token can still be genuinely outstanding (never released)
+  // even after a strictly NEWER token for the identical key has already
+  // been issued AND applied -- making issued==applied true for that
+  // key. Before this fix, touchAndPruneKeyGenerationMapsLocked() used
+  // exactly that issued==applied condition (rather than the ground-
+  // truth outstanding-token set) as its eviction-eligibility check, so
+  // an aggressive prune sweep (forced here via a zero tracked-entry cap
+  // and a zero idle-eviction threshold) could reset this key's tracked
+  // issued/applied watermark back to its 0 default WHILE the older
+  // token was still outstanding -- letting that older token's own,
+  // later store() attempt wrongly succeed against the reset watermark
+  // instead of correctly failing its CAS against the real, newer-
+  // applied generation. This test fails against that old behavior and
+  // passes once eviction eligibility is gated on the outstanding-token
+  // set instead.
+  void
+  outstandingTokenKeepsCasWatermarkAliveAcrossAggressivePruningUntilReleased();
 
 private:
   QString m_tempDirPath;

@@ -318,6 +318,31 @@ QString g_authoritativeAccountHomeOverrideValueForTesting;
 std::atomic<bool> g_forceMountTransitionPolicyOverrideActiveForTesting{false};
 std::atomic<bool> g_forceMountTransitionPolicyOverrideValueForTesting{false};
 
+// Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+// EVERY opened component regardless mount transition"): the raw
+// ownership/mode policy itself (directoryDescriptorPassesOwnerAndModePolicy()
+// / directoryDescriptorPassesAncestorOwnerAndModePolicy(), both real
+// fstat()-based checks) has NO portable, unprivileged way for a test to
+// fake either answer either -- an ordinary test process can readily
+// create a directory it does NOT own the way it likes (chmod to
+// group/world-writable), proving the "fails" branch entirely for real,
+// but it can never create one genuinely owned by root (uid 0) without
+// actual root privilege, making the "an ordinary, legitimately
+// root-provisioned ancestor passes" branch otherwise untestable
+// hermetically. This process-wide, test-only override exists solely to
+// let a test simulate THAT one otherwise-unreachable branch
+// deterministically; `g_..Active` false (the default, and what a test
+// MUST reset back to before returning, ideally via an RAII scope guard)
+// means "use the real fstat()-based ownership/mode checks, unmodified"
+// -- production code paths never depend on this outside of a test
+// binary calling the setter below. Tests proving REJECTION (wrong
+// owner, world-writable) exercise the genuine, unmodified checks
+// instead, since an unprivileged test process's own directories already
+// naturally fail the "owned by root" / "never writable by group or
+// other" ancestor requirement without needing any override at all.
+std::atomic<bool> g_forceOwnershipModePolicyOverrideActiveForTesting{false};
+std::atomic<bool> g_forceOwnershipModePolicyOverrideValueForTesting{false};
+
 // Test-only, deterministic, UNPRIVILEGED injection of an INDETERMINATE
 // directory-listing failure -- see
 // AssetCache::setListAllEntriesRelativeForcedFailureForTesting()'s own
@@ -575,6 +600,34 @@ bool mountIdentityMatchesStrictRequiringMountId(const MountIdentity &actual,
   return actual.hasMountId && expected.hasMountId &&
          actual.device == expected.device && actual.mountId == expected.mountId;
 }
+
+// Independent cumulative re-review (repeat finding, "disk-usage
+// accounting fails closed on a legitimate, kernel-CONFIRMED same-device
+// bind mount when openat2() itself is unavailable"): plain
+// mountIdentityMatchesStrictRequiringMountId() above collapses two
+// semantically distinct outcomes into a single `false`: (1) a mount id
+// is missing on EITHER side, so nothing at all can be proven either
+// way (genuinely INDETERMINATE), and (2) BOTH sides have a real kernel-
+// reported mount id and they DEFINITIVELY DIFFER -- exactly as
+// authoritative a proof of a real mount boundary as openat2()'s own
+// EXDEV refusal already is elsewhere in this file. A caller (like
+// openSubdirectoryNoFollowMountChecked() below) that needs to treat
+// "confirmed different mount, already safely accounted for and
+// deliberately never descended into" differently from "cannot verify,
+// must fail closed" cannot make that distinction from a bare bool
+// alone. This sibling reports both: the return value is true iff the
+// comparison could be made DEFINITIVELY (mount ids present on both
+// sides), and `*matches` (only ever written when this returns true) is
+// the actual same-mount verdict.
+bool mountIdentityStrictRequiringMountIdDefinitive(
+    const MountIdentity &actual, const MountIdentity &expected, bool *matches) {
+  if (!actual.hasMountId || !expected.hasMountId) {
+    return false;
+  }
+  *matches =
+      actual.device == expected.device && actual.mountId == expected.mountId;
+  return true;
+}
 #endif
 
 // Round-N+ review (HIGH, repeat finding, "cleanup can traverse
@@ -640,10 +693,32 @@ int openSubdirectoryNoFollowMountChecked(int dirFd, const char *name,
   }
   bool mountOk;
 #if defined(__linux__)
-  mountOk = usedStrongNoXdev ? mountIdentityMatches(mountIdentityForFd(childFd),
-                                                    expectedMount)
-                             : mountIdentityMatchesStrictRequiringMountId(
-                                   mountIdentityForFd(childFd), expectedMount);
+  if (usedStrongNoXdev) {
+    mountOk = mountIdentityMatches(mountIdentityForFd(childFd), expectedMount);
+  } else {
+    // Round-N+ review (repeat finding, "disk-usage accounting fails
+    // closed on a legitimate, kernel-CONFIRMED cross-mount directory
+    // when openat2 is unavailable"): a DEFINITIVE mount-id mismatch
+    // here (both sides had a real kernel-reported mount id, and they
+    // disagree) is exactly as authoritative as openat2()'s own EXDEV
+    // refusal above -- report it as `confirmedCrossMount`, not merely
+    // "not ok", so sumUsageRelative()'s caller treats it as the
+    // deliberate skip it already gives every other proven cross-mount
+    // case, rather than disabling disk I/O outright. Only a genuinely
+    // INDETERMINATE comparison (mount id missing on either side) still
+    // falls through to the plain `mountOk = false` fail-closed path
+    // below.
+    bool matches = false;
+    if (mountIdentityStrictRequiringMountIdDefinitive(
+            mountIdentityForFd(childFd), expectedMount, &matches)) {
+      mountOk = matches;
+      if (!matches && confirmedCrossMount) {
+        *confirmedCrossMount = true;
+      }
+    } else {
+      mountOk = false;
+    }
+  }
 #else
   mountOk = mountIdentityMatches(mountIdentityForFd(childFd), expectedMount);
 #endif
@@ -1425,6 +1500,45 @@ bool directoryDescriptorPassesAncestorOwnerAndModePolicy(int fd) {
   return true;
 }
 
+// Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+// EVERY opened component regardless mount transition"): the single
+// entry point every caller (both the per-component walk below, which
+// now consults this UNCONDITIONALLY for every component regardless of
+// whether that component is also a mount transition, and
+// mountTransitionIsIndependentlyPolicyQualified(), which still needs
+// the identical decision for the transition-specific "also a
+// kernel-recorded trusted filesystem type" check) uses to decide
+// ownership/mode -- see the g_forceOwnershipModePolicyOverrideActiveForTesting
+// comment above for why the test-only override exists, and why only
+// the "passes" branch needs it (the "fails" branch is fully exercisable
+// hermetically using an unprivileged test process's own, genuinely
+// non-root-owned directories).
+//
+// The override applies ONLY to the ANCESTOR-position decision, NEVER
+// to the final-account-home-component decision: an unprivileged test
+// process can never genuinely own a root-owned directory (the only
+// thing the ancestor override exists to simulate), but it CAN -- and,
+// to keep this real fstat()-based check genuinely exercised end to
+// end, always DOES -- genuinely own (and, via a real chmod(), make
+// group/world-writable) its own final-home fixture directories. Were
+// the final-component decision also overridable, a test could not
+// prove "a same-mount, group/world-writable final home directory is
+// rejected" (round-6/independent-re-review's explicit "same-mount test
+// wrong owner/world-writable" demand) without ALSO masking the very
+// check it exists to prove.
+bool componentPassesOwnershipModePolicy(int fd,
+                                        bool isFinalAccountHomeComponent) {
+  if (!isFinalAccountHomeComponent &&
+      g_forceOwnershipModePolicyOverrideActiveForTesting.load(
+          std::memory_order_acquire)) {
+    return g_forceOwnershipModePolicyOverrideValueForTesting.load(
+        std::memory_order_acquire);
+  }
+  return isFinalAccountHomeComponent
+             ? directoryDescriptorPassesOwnerAndModePolicy(fd)
+             : directoryDescriptorPassesAncestorOwnerAndModePolicy(fd);
+}
+
 #if defined(__linux__)
 // Cumulative review (independent re-review, MEDIUM, "home trust still
 // pathname-only" -- "trusted deployment/mount identity independently
@@ -1762,9 +1876,7 @@ bool mountPointHasTrustedLocalFilesystemTypeByPath(
 bool mountTransitionIsIndependentlyPolicyQualified(
     int fd, const MountIdentity &identity, bool isFinalAccountHomeTransition) {
   const bool ownershipOk =
-      isFinalAccountHomeTransition
-          ? directoryDescriptorPassesOwnerAndModePolicy(fd)
-          : directoryDescriptorPassesAncestorOwnerAndModePolicy(fd);
+      componentPassesOwnershipModePolicy(fd, isFinalAccountHomeTransition);
   if (!ownershipOk) {
     qWarning() << "AssetCache: mount transition destination fails the "
                   "ownership/mode policy ("
@@ -1958,6 +2070,47 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
 #else
     sameMount = mountIdentityMatches(nextMount, currentMount);
 #endif
+    // Independent cumulative re-review (MEDIUM, "Validate owner/mode
+    // for EVERY opened component regardless mount transition... same-mount
+    // wrong owner/world-writable"): previously, the ownership/mode
+    // policy below was consulted ONLY inside the `!sameMount` branch --
+    // i.e. only when this component's open() actually crossed onto a
+    // DIFFERENT mount than its parent. On a perfectly ordinary
+    // single-partition system (no separate "/home" mount at all, so
+    // EVERY component of $HOME stays on the same root filesystem
+    // throughout this entire walk), that condition is simply never
+    // true for ANY component -- meaning an attacker who can arrange for
+    // some ancestor of $HOME (or $HOME itself) to become group/world-
+    // writable, or owned by an unexpected uid, on that SAME mount would
+    // never have been caught here at all, since no transition -- the
+    // only place this walk ever checked ownership/mode -- would ever
+    // occur. This project's entire "beneath home is trusted, single-
+    // owner" model requires every component to independently satisfy
+    // this policy, mount transition or not:
+    // `directoryDescriptorPassesOwnerAndModePolicy()` (current-uid ownership,
+    // never group/world-writable) for the final account-home component,
+    // `directoryDescriptorPassesAncestorOwnerAndModePolicy()` (root ownership,
+    // never group/world-writable) for every earlier ancestor component -- run
+    // unconditionally here, BEFORE the transition-specific policy check below
+    // (which additionally requires a kernel-recorded trusted-local filesystem
+    // type, but only actually matters when a genuine mount boundary was
+    // crossed).
+    const bool ownershipModeOk =
+        componentPassesOwnershipModePolicy(nextFd, isFinalAccountHomeComponent);
+    if (!ownershipModeOk) {
+      qWarning() << "AssetCache: refusing to treat" << home
+                 << "as a trusted home directory anchor -- component"
+                 << component << "fails the ownership/mode policy ("
+                 << (isFinalAccountHomeComponent
+                         ? "not owned by the current uid, or "
+                           "group/world-writable"
+                         : "not owned by root, or group/world-writable")
+                 << "), independent of whether it is also a mount "
+                    "transition";
+      ::close(currentFd);
+      ::close(nextFd);
+      return std::nullopt;
+    }
     if (!sameMount) {
       // Every transition -- not merely the first one ever encountered
       // -- must independently be BOTH authenticated (home matches the
@@ -2412,6 +2565,13 @@ struct RootAuthority {
   // own comment in AssetCache.h. Repointed alongside
   // keyIssuedGeneration/keyAppliedGeneration above.
   QHash<QString, qint64> keyGenerationLastTouchSteadyMs;
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // ground-truth set of currently-outstanding (issued but not yet
+  // released) tokens per key -- see AssetCache::releaseKeyGeneration()'s
+  // own comment. Repointed alongside keyIssuedGeneration/
+  // keyAppliedGeneration above.
+  QHash<QString, QSet<quint64>> keyOutstandingGeneration;
   // Cumulative review (independent re-review, HIGH, "negative 404 is
   // coordinator-local and can hide sibling-populated cache"): the
   // shared negative-404 tombstone map -- see AssetCache::
@@ -2813,6 +2973,12 @@ AssetCache::AssetCache(Config config) : m_config(std::move(config)) {
           // immediately above.
           m_keyGenerationLastTouchSteadyMs =
               &authority->keyGenerationLastTouchSteadyMs;
+          // Independent cumulative re-review (HIGH, "root authority...
+          // Prune issued==applied while older token outstanding resets
+          // watermark"): repoint the shared outstanding-token set too,
+          // exactly like the fields immediately above -- see
+          // releaseKeyGeneration()'s own comment.
+          m_keyOutstandingGeneration = &authority->keyOutstandingGeneration;
           // Cumulative review (independent re-review, HIGH, "negative
           // 404 is coordinator-local and can hide sibling-populated
           // cache"): repoint m_negative404 too, exactly like the three
@@ -2873,41 +3039,55 @@ AssetCache::~AssetCache() {
   // once the LAST same-process sibling's m_rootAuthorityHandle share is
   // released, never by this destructor at all.
 #if defined(Q_OS_UNIX)
-  // Independent cumulative re-review (MEDIUM, "atfork child handler
-  // unsafe"/"destructor touches inherited FDs/shared_ptr/Qt heap"):
-  // every OTHER public method already fails closed via
-  // hasForkedSinceConstruction() BEFORE touching any inherited mutex/
-  // memory/disk state -- see lookupMemory()'s identical check -- but a
-  // destructor cannot simply return early: it must still leave every
-  // member in a destructible state. m_rootAuthorityHandle's ORDINARY
-  // destruction would decrement a std::shared_ptr refcount whose
-  // control block was itself duplicated (COW) by fork(), never
-  // genuinely shared across processes; if THIS process's own copy of
-  // that count happens to reach zero here, it would invoke
-  // ~RootAuthority(), which owns a QMutex/QHash that may have been
-  // captured mid-mutation by a PARENT-process thread that does not
-  // exist at all in this child (fork() only ever duplicates the single
-  // calling thread) -- destroying those is not safe to assume
-  // well-defined. The documented, safe policy in a forked child is
-  // instead to ABANDON this instance's own reference entirely, without
-  // ever invoking its deleter: leaking it into a heap block this
-  // process intentionally never frees (bounded by this process's own
-  // lifetime) rather than risking an unsafe inherited teardown --
-  // acquireExclusiveRootOwnershipOrFailClosed()'s own guard already
-  // requires exec() before any FRESH authority can ever be acquired by
-  // a forked-and-continuing process, so this leaked reference can never
-  // reappear as a real, usable authority either.
+  // Independent cumulative re-review (MEDIUM, "fork destruction... `new
+  // shared_ptr` leaks but allocation itself unsafe and automatic Qt/STL
+  // member destructors still run"): a prior version of this branch
+  // moved `m_rootAuthorityHandle` into a deliberately-leaked heap block
+  // and then `return`ed early -- but an early `return` from THIS
+  // destructor's own body does NOT, and cannot, prevent the compiler-
+  // generated MEMBER destruction step that unconditionally runs
+  // immediately afterward regardless of what this body does: every
+  // OTHER nontrivial member (m_privateMutexFallback's QMutex,
+  // m_privateMemoryFallback's QCache, every QHash fallback map,
+  // m_directory/m_config/m_configurationError's QStrings, etc.) would
+  // still have its own destructor invoked right after this function
+  // returns, each one independently capable of the exact same hazard
+  // this branch exists to avoid: destroying a QMutex a parent-process
+  // thread held at fork() time is undefined behaviour, and freeing heap
+  // state via an allocator whose arena a parent thread may have held
+  // locked at fork() time is not something this class can safely
+  // assume well-defined for every member's own implementation. A "leak
+  // one thing and hope the rest is fine" partial measure was therefore
+  // still a false safety claim.
+  //
+  // The only way to make EVERY remaining member destructor never run at
+  // all -- not just avoid one of them -- is for this function to never
+  // return control to that automatic step in the first place: ::_exit()
+  // terminates this process immediately at the OS level, skipping every
+  // remaining stage of both this destructor's body and the ordinary
+  // C++ object-teardown sequence entirely, including every member
+  // destructor below, any atexit() handler, and any enclosing stack
+  // unwinding. This is a deliberate, HARD, documented invariant, not a
+  // soft best-effort leak: destroying ANY AssetCache instance (by any
+  // means -- an explicit `delete`, a smart pointer going out of scope,
+  // or an ordinary stack-scoped local's normal function return) in a
+  // process that has forked-without-exec is FATAL to that process, full
+  // stop -- exactly mirroring acquireExclusiveRootOwnershipOrFailClosed()'s
+  // own "a fresh authority requires exec()" guard, extended to cover
+  // teardown of an already-live, pre-fork instance as well. A
+  // well-behaved forked-and-continuing child must therefore either
+  // exec() before ever letting an inherited AssetCache instance be
+  // destroyed, or otherwise terminate itself (::_exit()/::abort()) FIRST
+  // -- see
+  // forkedChildDestroyingInheritedStackAssetCacheTerminatesProcessDeterministically()
+  // in AssetCacheTests for a real, non-`_exit()`-bypassing subprocess
+  // proof: a genuinely stack-scoped, pre-fork instance destroyed via
+  // ORDINARY C++ scope-exit semantics in the child (never an explicit
+  // destructor call, and never a test that itself calls ::_exit() before
+  // this destructor ever runs, which would prove nothing about this
+  // code path at all).
   if (hasForkedSinceConstruction()) {
-    if (m_rootAuthorityHandle) {
-      new std::shared_ptr<void>(std::move(m_rootAuthorityHandle));
-    }
-    // A plain close() syscall is async-signal-safe and touches no Qt/
-    // heap state at all, unlike the shared_ptr teardown avoided above --
-    // safe to still run even for an inherited fd.
-    if (m_rootFd >= 0) {
-      ::close(m_rootFd);
-    }
-    return;
+    ::_exit(70);
   }
   // m_rootAuthorityHandle's own shared_ptr destruction (implicit,
   // default member-destruction order, happens automatically here)
@@ -3055,8 +3235,43 @@ quint64 AssetCache::nextAccessSequenceLocked() {
 quint64 AssetCache::issueKeyGenerationLocked(const QString &key) {
   const quint64 next = m_keyIssuedGeneration->value(key, 0) + 1;
   (*m_keyIssuedGeneration)[key] = next;
+  // Independent cumulative re-review (HIGH, "root authority... Prune
+  // issued==applied while older token outstanding resets watermark"):
+  // record this freshly minted token as outstanding BEFORE
+  // touchAndPruneKeyGenerationMapsLocked() below ever runs, so a
+  // pruning sweep triggered by THIS very call can never observe `key`
+  // as having zero outstanding tokens while this one is, in fact, about
+  // to be handed to a caller.
+  (*m_keyOutstandingGeneration)[key].insert(next);
   touchAndPruneKeyGenerationMapsLocked(key);
   return next;
+}
+
+void AssetCache::releaseKeyGenerationLocked(const QString &key,
+                                            quint64 issuedGeneration) {
+  if (issuedGeneration == kUnconditionalGeneration) {
+    // Never tracked as outstanding in the first place -- see
+    // issueKeyGeneration()'s own comment on this constant.
+    return;
+  }
+  auto it = m_keyOutstandingGeneration->find(key);
+  if (it == m_keyOutstandingGeneration->end()) {
+    return; // Already released (or never actually issued) -- idempotent.
+  }
+  it->remove(issuedGeneration);
+  if (it->isEmpty()) {
+    m_keyOutstandingGeneration->erase(it);
+  }
+}
+
+void AssetCache::releaseKeyGeneration(const QString &key,
+                                      quint64 issuedGeneration) {
+  // See lookupMemory()'s identical check for the full rationale.
+  if (hasForkedSinceConstruction()) {
+    return;
+  }
+  QMutexLocker locker(m_mutex);
+  releaseKeyGenerationLocked(key, issuedGeneration);
 }
 
 quint64 AssetCache::issueKeyGeneration(const QString &key) {
@@ -3305,11 +3520,11 @@ void AssetCache::touchAndPruneKeyGenerationMapsLocked(const QString &key) {
   if (m_keyIssuedGeneration->size() <= m_maxTrackedKeyGenerationEntries) {
     return;
   }
-  // Gather eviction candidates: keys whose issued/applied watermarks are
-  // CURRENTLY EQUAL (no known outstanding gap) AND have been idle at
-  // least m_keyGenerationIdleEvictionThresholdMs -- see this method's
-  // own declaration comment in AssetCache.h for the full rationale on
-  // why BOTH conditions are required. Sorted oldest-touched first so
+  // Gather eviction candidates: keys with NO currently-outstanding
+  // (issued-but-not-yet-released) token AND idle at least
+  // m_keyGenerationIdleEvictionThresholdMs -- see this method's own
+  // declaration comment in AssetCache.h for the full rationale on why
+  // BOTH conditions are required. Sorted oldest-touched first so
   // eviction proceeds in genuine least-recently-used order among
   // eligible keys.
   QVector<QString> candidates;
@@ -3317,8 +3532,11 @@ void AssetCache::touchAndPruneKeyGenerationMapsLocked(const QString &key) {
   for (auto it = m_keyIssuedGeneration->constBegin();
        it != m_keyIssuedGeneration->constEnd(); ++it) {
     const QString &candidateKey = it.key();
-    if (m_keyAppliedGeneration->value(candidateKey, 0) != it.value()) {
-      continue; // A genuinely outstanding gap -- never evict.
+    const auto outstandingIt =
+        m_keyOutstandingGeneration->constFind(candidateKey);
+    if (outstandingIt != m_keyOutstandingGeneration->constEnd() &&
+        !outstandingIt->isEmpty()) {
+      continue; // A genuinely outstanding token -- never evict.
     }
     const qint64 lastTouchMs =
         m_keyGenerationLastTouchSteadyMs->value(candidateKey, nowMs);
@@ -3339,6 +3557,12 @@ void AssetCache::touchAndPruneKeyGenerationMapsLocked(const QString &key) {
     m_keyIssuedGeneration->remove(evictKey);
     m_keyAppliedGeneration->remove(evictKey);
     m_keyGenerationLastTouchSteadyMs->remove(evictKey);
+    // Defensive cleanup only: releaseKeyGenerationLocked() already
+    // erases a key's entry entirely once its outstanding set becomes
+    // empty, so there should never be a leftover empty entry here for a
+    // candidate that passed the check above -- but remove() on a
+    // possibly-absent key is always safe regardless.
+    m_keyOutstandingGeneration->remove(evictKey);
   }
 }
 
@@ -5287,6 +5511,22 @@ void AssetCache::setMountTransitionPolicyQualificationOverrideForTesting(
   g_forceMountTransitionPolicyOverrideValueForTesting.store(
       qualified, std::memory_order_release);
   g_forceMountTransitionPolicyOverrideActiveForTesting.store(
+      active, std::memory_order_release);
+}
+
+void AssetCache::setHomeComponentOwnershipModePolicyOverrideForTesting(
+    bool active, bool passes) {
+  // Same release/acquire discipline as
+  // setMountTransitionPolicyQualificationOverrideForTesting() immediately
+  // above: value stored before the active flag, so every reader
+  // (componentPassesOwnershipModePolicy(), which every ownership/mode
+  // decision -- both the unconditional per-component walk and
+  // mountTransitionIsIndependentlyPolicyQualified()'s own check -- now
+  // routes through exclusively) observes this exact value whenever it
+  // sees the override active.
+  g_forceOwnershipModePolicyOverrideValueForTesting.store(
+      passes, std::memory_order_release);
+  g_forceOwnershipModePolicyOverrideActiveForTesting.store(
       active, std::memory_order_release);
 }
 

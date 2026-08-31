@@ -2403,6 +2403,109 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    realBindMountWithOpenat2ForcedUnavailableIsStillConfirmedAndSkippedNeverDisablingDiskCache() {
+  // Independent cumulative re-review: root-cause fix for a real bug
+  // this exact test suite's own
+  // crossMountBindMountDirectoryDuringCleanupIsNeverDescendedIntoOrDeleted()
+  // test only ever happened to catch on a kernel that genuinely lacks
+  // openat2() at all (e.g. this project's own containerized
+  // verification environment) -- and even there, only ever surfaced as
+  // an intermittent-looking failure rather than a deterministic,
+  // environment-independent regression test. Root cause: when
+  // openat2()'s kernel-native RESOLVE_NO_XDEV guarantee is unavailable,
+  // openSubdirectoryNoFollowMountChecked() falls back to comparing
+  // STATX_MNT_ID on both sides -- but a DEFINITIVE mismatch there (both
+  // sides report a real mount id, and they genuinely differ, exactly
+  // proving a real bind mount) was previously reported to its caller
+  // identically to a genuinely INDETERMINATE result (mount id missing
+  // entirely), so sumUsageRelative() disabled disk I/O for the whole
+  // instance instead of performing the deliberate, already-tested skip
+  // every OTHER proven-cross-mount case already receives.
+  //
+  // This test forces the exact "openat2 unavailable" condition
+  // deterministically (via setMountIdentificationDegradedForTesting(),
+  // no reliance on this build's actual kernel) while still requiring a
+  // REAL bind mount so STATX_MNT_ID genuinely, definitively disagrees
+  // between the two sides -- reproducing the precise fixed code path
+  // regardless of whether the kernel this test happens to run on
+  // natively supports openat2() or not.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString decoyMountPoint =
+      m_tempDirPath + QStringLiteral("/degraded-decoy-mount");
+  QVERIFY(QDir().mkpath(decoyMountPoint));
+
+  QTemporaryDir bindSourceDir;
+  QVERIFY(bindSourceDir.isValid());
+  const QString bindSource = bindSourceDir.path();
+  {
+    QFile sentinel(bindSource + QStringLiteral("/sentinel.bin"));
+    QVERIFY(sentinel.open(QIODevice::WriteOnly));
+    sentinel.write(QByteArray(2048, 's'));
+  }
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, decoyMountPoint});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{decoyMountPoint};
+
+  // Force the exact no-openat2 fallback path -- mount id support
+  // itself stays genuinely available, so STATX_MNT_ID can (and, over
+  // a real bind mount, definitively will) disagree. Constructed BEFORE
+  // AssetCache below so that its constructor's own automatic
+  // reapAndEnforceQuota() sweep -- which walks this exact decoy mount
+  // point -- exercises the fixed fallback path too, not just a later
+  // explicit call.
+  MountIdentificationDegradationGuard guard(
+      /*forceOpenat2Unavailable=*/true, /*forceMountIdUnavailable=*/false);
+
+  AssetCache cache(configFor(m_tempDirPath));
+
+  // The fix under test: this must be treated exactly like the
+  // openat2-available case above -- a confirmed cross-mount skip, never
+  // an indeterminate disable of the whole instance's disk I/O. This is
+  // asserted directly via isDiskCacheDisabledForTesting() (the exact
+  // regression: before the fix, a definitive same-device mount-id
+  // mismatch reached via this fallback path was indistinguishable from
+  // a genuinely indeterminate one, and disabled disk I/O for the whole
+  // instance) rather than solely via a physical-byte-count comparison,
+  // since some filesystems (e.g. certain overlayfs configurations, as
+  // seen in this project's own containerized verification environment)
+  // legitimately report zero allocated blocks for every directory node,
+  // which would make a strict "> 0" byte-count assertion unreliable
+  // there even though the underlying fix (not disabling the instance)
+  // is unaffected by that filesystem quirk. diskUsageBytes() is still
+  // required to complete without disabling the instance and to return a
+  // valid non-negative total (never treated as indeterminate).
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+  QVERIFY(cache.diskUsageBytes() >= qint64(0));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  cache.reapAndEnforceQuota();
+
+  QVERIFY(QFileInfo::exists(decoyMountPoint));
+  QVERIFY(QFileInfo::exists(bindSource + QStringLiteral("/sentinel.bin")));
+#endif
+}
+
+void AssetCacheTests::
     ownedSuffixMissingComponentsAreCreatedViaMkdiratNeverPathBasedMkpath() {
   // Round-7/8 item 2/5 (HIGH): the constructor no longer calls
   // QDir::mkpath() at all -- openDirectoryChainNoFollow() itself must
@@ -2771,6 +2874,28 @@ struct HomeEnvOverrideGuard {
   bool m_hadOriginal;
   QByteArray m_originalHome;
 };
+
+// RAII guard around
+// AssetCache::setHomeComponentOwnershipModePolicyOverrideForTesting() --
+// used ONLY to prove the otherwise-unreachable-without-real-root
+// "ordinary, legitimately root-provisioned ancestor / legitimately
+// account-owned home passes" branch hermetically; tests proving
+// rejection use the real, unmodified fstat()-based checks instead (see
+// the override's own declaration comment in AssetCache.h).
+struct HomeComponentOwnershipModePolicyOverrideGuard {
+  explicit HomeComponentOwnershipModePolicyOverrideGuard(bool passes) {
+    AssetCache::setHomeComponentOwnershipModePolicyOverrideForTesting(
+        /*active=*/true, passes);
+  }
+  HomeComponentOwnershipModePolicyOverrideGuard(
+      const HomeComponentOwnershipModePolicyOverrideGuard &) = delete;
+  HomeComponentOwnershipModePolicyOverrideGuard &
+  operator=(const HomeComponentOwnershipModePolicyOverrideGuard &) = delete;
+  ~HomeComponentOwnershipModePolicyOverrideGuard() {
+    AssetCache::setHomeComponentOwnershipModePolicyOverrideForTesting(
+        /*active=*/false);
+  }
+};
 } // namespace
 
 void AssetCacheTests::
@@ -2849,6 +2974,26 @@ void AssetCacheTests::
   HomeEnvOverrideGuard homeGuard(fakeHome);
   QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
 
+  // Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+  // EVERY opened component regardless mount transition"): every
+  // ANCESTOR component of $HOME is now checked for real, root
+  // ownership even without a transition -- but this fixture's fake
+  // home tree lives entirely beneath this TEST PROCESS'S OWN temp
+  // directory, so every one of its ancestor components is genuinely
+  // owned by this (unprivileged, non-root) test process, not root,
+  // exactly like the "wrong owner ancestor" case the fix now correctly
+  // refuses. There is no portable, unprivileged way to make a real
+  // directory genuinely root-owned, so this override is used ONLY to
+  // simulate "every ancestor legitimately passes the real-world
+  // ownership/mode policy" for this specific positive control -- it
+  // does not weaken or bypass the real check in production, never
+  // affects the FINAL-home decision (which this fixture's own,
+  // genuinely-owned, non-writable directory already satisfies for
+  // real, unconditionally), and no mount transition is even in play
+  // here (this whole fake tree lives on one mount throughout).
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
+
   const QString configuredUnderFakeHome =
       fakeHome + QStringLiteral("/assets/v1");
   QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
@@ -2856,6 +3001,73 @@ void AssetCacheTests::
 
   QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
   QVERIFY(!QFileInfo(configuredUnderFakeHome).isSymLink());
+}
+
+void AssetCacheTests::
+    sameMountGroupWorldWritableFinalHomeDirectoryIsRejectedWithoutAnyMountTransition() {
+  // Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+  // EVERY opened component regardless mount transition ... Production
+  // same-mount test wrong owner/world-writable"): before this fix,
+  // ownership/mode was consulted ONLY inside resolveHomeDirectoryNoFollow()'s
+  // `!sameMount` branch -- i.e. only when a component's open() actually
+  // crossed onto a DIFFERENT mount than its parent. This fake home has
+  // NO mount transition anywhere in its walk at all (its entire tree
+  // lives beneath this test process's own temp directory, on one
+  // mount, throughout) -- exactly the shape an ordinary, unprivileged,
+  // entirely unmounted misconfiguration (or attacker who can influence
+  // permissions but not plant an actual mount) would produce. The
+  // FINAL account-home directory itself is real-chmod()'d to 0777
+  // (group AND world-writable) -- no privilege needed, since this
+  // process already owns it -- and this decision deliberately is NEVER
+  // subject to the ancestor-only test override (see
+  // componentPassesOwnershipModePolicy()'s own comment), so this
+  // exercises the REAL, unmodified fstat()-based final-home check.
+  const QString fakeHome =
+      m_tempDirPath +
+      QStringLiteral("/world-writable-final-home-parent/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+  QVERIFY(::chmod(QFile::encodeName(fakeHome).constData(),
+                  S_IRWXU | S_IRWXG | S_IRWXO) == 0);
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  // Ancestors above this fixture's own final component still need the
+  // override (they can never be genuinely root-owned in an
+  // unprivileged test) -- but the final-home decision under test here
+  // is never affected by it.
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+}
+
+void AssetCacheTests::
+    sameMountOrdinaryFinalHomeDirectoryStillResolvesSuccessfullyWithoutAnyMountTransition() {
+  // Negative control for the test above: the IDENTICAL same-mount, no-
+  // transition shape, but the final home directory keeps its ordinary,
+  // non-group/world-writable mode -- proving the rejection above is
+  // specific to the writable mode, not a general regression whenever
+  // no mount transition occurs anywhere in the walk.
+  const QString fakeHome =
+      m_tempDirPath +
+      QStringLiteral("/ordinary-final-home-no-transition-parent/actual-home");
+  QVERIFY(QDir().mkpath(fakeHome));
+  QVERIFY(::chmod(QFile::encodeName(fakeHome).constData(), S_IRWXU) == 0);
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
 }
 
 namespace {
@@ -3013,6 +3225,19 @@ void AssetCacheTests::
   // database is forced to agree this is genuinely the current
   // account's own home, authenticating the mount transition.
   AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+  // Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+  // EVERY opened component regardless mount transition"): this test's
+  // fake $HOME tree lives beneath this TEST PROCESS'S OWN temp
+  // directory, so every ANCESTOR component above the real bind-mounted
+  // transition this test actually exercises is genuinely owned by this
+  // unprivileged process, not root -- there is no portable,
+  // unprivileged way to make those scaffolding ancestors genuinely
+  // root-owned. This override isolates the test to what it actually
+  // verifies (the mount-transition-specific authentication/identity
+  // logic, exercised for real via the genuine bind mount above), not
+  // the separately-tested raw ownership/mode policy itself.
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
 
   const QString configuredUnderFakeHome =
       fakeHome + QStringLiteral("/assets/v1");
@@ -3123,6 +3348,18 @@ void AssetCacheTests::
   HomeEnvOverrideGuard homeGuard(fakeHome);
   QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
   AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+  // Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+  // EVERY opened component regardless mount transition"): the mount
+  // transition's OWN destination (fakeHomeParent, chowned to root:root
+  // above) already genuinely satisfies the real ancestor ownership
+  // policy without any override -- but the SCAFFOLDING levels ABOVE
+  // it (this test process's own temp-directory hierarchy) are
+  // genuinely owned by this unprivileged process, not root, and there
+  // is no portable way to make them so. This override isolates the
+  // test to what it actually verifies (the real, chowned mount
+  // transition), not the unrelated scaffolding ancestors above it.
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
 
   const QString configuredUnderFakeHome =
       fakeHome + QStringLiteral("/assets/v1");
@@ -3525,6 +3762,19 @@ void AssetCacheTests::
   HomeEnvOverrideGuard homeGuard(fakeHome);
   QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
   AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+  // Independent cumulative re-review (MEDIUM, "Validate owner/mode for
+  // EVERY opened component regardless mount transition"): both real
+  // mount transitions this test exercises are already genuinely
+  // policy-qualified for real (the ancestor destination chowned to
+  // root:root, the final-home destination owned by this process's own
+  // uid) -- but the SCAFFOLDING levels above the outermost transition
+  // (this test process's own temp-directory hierarchy) are genuinely
+  // owned by this unprivileged process, not root, and there is no
+  // portable way to make them so. This override isolates the test to
+  // what it actually verifies (both real, independently-qualified
+  // transitions), not the unrelated scaffolding ancestors above them.
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
 
   const QString configuredUnderFakeHome =
       fakeHome + QStringLiteral("/assets/v1");
@@ -4437,6 +4687,99 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
+    forkedChildDestroyingInheritedStackAssetCacheTerminatesProcessDeterministically() {
+#if !defined(Q_OS_UNIX)
+  QSKIP("fork() is a POSIX-specific mechanism; not applicable on this "
+        "platform");
+#else
+  // Independent cumulative re-review (MEDIUM, "fork destruction...
+  // real inherited stack object normal-scope destruction under held
+  // parent mutex must be addressed, not `_exit`-only test"):
+  // forkedChildProcessNeverJoinsParentsInheritedRootAuthority() above
+  // deliberately never lets its forked child destroy anything at all
+  // (its child calls ::_exit() immediately, which bypasses every
+  // destructor entirely) -- so it proves nothing about
+  // ~AssetCache()'s own forked-child behaviour. THIS test instead lets
+  // a genuinely STACK-scoped (not heap/pointer-held), pre-fork
+  // AssetCache instance be destroyed via ORDINARY C++ scope-exit
+  // semantics in the child -- exactly as an ordinary function return
+  // would -- never an explicit destructor call, and never a premature
+  // ::_exit() that would prevent this destructor from ever running at
+  // all.
+  int pipeFds[2] = {-1, -1};
+  QVERIFY(::pipe(pipeFds) == 0);
+
+  pid_t child = -1;
+  {
+    AssetCache cache(configFor(m_tempDirPath));
+    QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+    child = ::fork();
+    QVERIFY(child >= 0);
+    if (child == 0) {
+      ::close(pipeFds[0]);
+      // Deliberately do nothing else here: falling out of this scope
+      // block normally, right now, invokes `cache`'s ORDINARY
+      // destructor via real C++ stack-unwinding semantics. If
+      // ~AssetCache()'s forked-child branch works as designed, this
+      // process terminates (via ::_exit()) from WITHIN that destructor
+      // call, and every line below this block in the child is never
+      // reached at all.
+    }
+  }
+  // If control ever reaches here in the CHILD, the destructor's
+  // forked-child branch failed to terminate the process as designed --
+  // report that as a distinguishable, deterministic verdict rather than
+  // silently falling through to the parent-only code below (which
+  // would otherwise construct a SECOND live AssetCache over the
+  // identical root from within this same forked-without-exec child --
+  // itself an entirely separate hazard this test must not risk
+  // triggering).
+  if (child == 0) {
+    const char verdict = 'X'; // "destructor did not terminate the process"
+    ssize_t written = ::write(pipeFds[1], &verdict, 1);
+    (void)written;
+    ::close(pipeFds[1]);
+    ::_exit(99);
+  }
+
+  // PARENT: the parent's own `cache` (out of scope above) destructed
+  // completely normally -- hasForkedSinceConstruction() is false for
+  // it, since its own getpid() never changed across the fork().
+  ::close(pipeFds[1]);
+  char verdict = '?';
+  const ssize_t bytesRead = ::read(pipeFds[0], &verdict, 1);
+  ::close(pipeFds[0]);
+  int status = 0;
+  QVERIFY2(::waitpid(child, &status, 0) == child,
+           "waitpid() never reaped the forked child");
+
+  // The decisive assertion: the child must have terminated via the
+  // destructor's OWN ::_exit() call while still INSIDE `cache`'s
+  // normal-scope destruction -- it must never reach (and report via
+  // the pipe) the 'X' fallback verdict above, which would mean the
+  // fix failed to intercept this exact "real inherited stack object,
+  // ordinary scope-exit" destruction path; and it must never crash via
+  // an unrelated signal either, which would mean an unsafe member
+  // destructor actually ran and corrupted/deadlocked this process
+  // instead of the fix cleanly terminating it first.
+  QVERIFY2(bytesRead == 0,
+           "the forked child's normal-scope AssetCache destruction did "
+           "not terminate the process immediately, as the fix requires "
+           "-- it kept running far enough to report a fallback verdict");
+  QVERIFY2(
+      WIFEXITED(status),
+      qPrintable(QStringLiteral("forked child did not exit normally via the "
+                                "destructor's own ::_exit() (raw status=%1, "
+                                "WIFSIGNALED=%2, WTERMSIG=%3)")
+                     .arg(status)
+                     .arg(WIFSIGNALED(status) ? 1 : 0)
+                     .arg(WIFSIGNALED(status) ? WTERMSIG(status) : -1)));
+  QCOMPARE(WEXITSTATUS(status), 70);
+#endif
+}
+
+void AssetCacheTests::
     constructingAssetCacheAfterSimulatedForkFailsDiskAuthorityClosed() {
 #if !defined(Q_OS_UNIX)
   QSKIP("this fork-safety mechanism is POSIX-specific; not applicable on "
@@ -5211,4 +5554,66 @@ void AssetCacheTests::
   QVERIFY2(second.hasNegative404ForTesting(key, /*nowMonotonicMs=*/4'000),
            "the public test hook must agree with the snapshot result when "
            "queried from the OTHER sibling instance");
+}
+
+void AssetCacheTests::
+    outstandingTokenKeepsCasWatermarkAliveAcrossAggressivePruningUntilReleased() {
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+  // Forces every issued key-generation token to be evicted the instant
+  // it is no longer outstanding and idle at all -- see
+  // touchAndPruneKeyGenerationMapsLocked()'s comment: a tracked-entry
+  // cap of 1 means ANY subsequent issuance for a DIFFERENT key triggers
+  // a full eviction sweep (0 itself is a "restore production default"
+  // sentinel here, mirroring setMaxTrackedNegative404EntriesForTesting()
+  // -- see this setter's own doc comment), and a zero idle threshold
+  // makes every non-outstanding key immediately eligible.
+  cache.setMaxTrackedKeyGenerationEntriesForTesting(1);
+  cache.setKeyGenerationIdleEvictionThresholdMsForTesting(0);
+
+  const QString key = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/outstanding-token-prune.png")));
+
+  // An older token, deliberately never released -- standing in for a
+  // request whose own completion handling has not run yet.
+  const quint64 olderOutstandingToken = cache.issueKeyGeneration(key);
+  // A strictly newer token for the SAME key, applied and then released
+  // immediately (as every correctly-behaving caller does once it is
+  // genuinely done with it) -- issued==applied is now true for `key`,
+  // even though `olderOutstandingToken` is still outstanding.
+  const quint64 newerToken = cache.issueKeyGeneration(key);
+  QCOMPARE(
+      cache.store(key, makeEntry(QByteArrayLiteral("newer-bytes")), newerToken),
+      AssetCache::MutationOutcome::Applied);
+  cache.releaseKeyGeneration(key, newerToken);
+
+  // Trigger a prune sweep via an entirely UNRELATED key. `key` must
+  // survive: its own older token is still genuinely outstanding.
+  const QString otherKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/unrelated-prune-trigger.png")));
+  cache.issueKeyGeneration(otherKey);
+
+  // The decisive assertion: the older, still-outstanding token must
+  // still correctly fail its CAS against the real (newer) applied
+  // generation -- never wrongly succeed against a watermark a buggy
+  // prune sweep reset to 0 while it was still in flight.
+  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("stale-older-bytes")),
+                       olderOutstandingToken),
+           AssetCache::MutationOutcome::SkippedStaleGeneration);
+  QVERIFY2(cache.lookupMemory(key).has_value(),
+           "the newer entry must still be present in memory");
+  QCOMPARE(cache.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("newer-bytes"));
+
+  // Once genuinely released, `key` becomes eligible for eviction again
+  // -- proving the fix does not simply pin every touched key forever
+  // either. A fresh issuance for `key` after this eviction restarts its
+  // counter from 0, the clearest possible signal that its prior
+  // bookkeeping was actually reclaimed.
+  cache.releaseKeyGeneration(key, olderOutstandingToken);
+  const QString secondTriggerKey = AssetCache::cacheKeyFor(
+      QUrl(QStringLiteral("https://example.com/second-unrelated-trigger.png")));
+  cache.issueKeyGeneration(secondTriggerKey);
+
+  QCOMPARE(cache.issueKeyGeneration(key), quint64{1});
 }

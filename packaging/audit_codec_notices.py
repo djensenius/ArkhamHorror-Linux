@@ -71,6 +71,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -396,6 +397,46 @@ def _read_dynamic_tags(path: Path) -> list[tuple[str, str]]:
         (match.group("tag"), match.group("value"))
         for match in _DYNAMIC_TAG_RE.finditer(_readelf(path, "-d", "-W"))
     ]
+
+
+# readelf -d -W's own decoded RPATH/RUNPATH tag value text always wraps
+# the actual string content in square brackets, e.g.
+# "Library runpath: [$ORIGIN/../lib]" -- mirrors _SONAME_RE's own
+# bracket-extraction pattern above for the identical "Shared library:
+# [libfoo.so.1]" shape. An empty bracket ("[]") is tolerated (never
+# observed from a real patchelf rewrite in this project's own testing,
+# but not itself a parse error) rather than requiring at least one
+# character the way _SONAME_RE does.
+_BRACKETED_TAG_VALUE_RE = re.compile(r"\[(?P<value>[^\]]*)\]")
+
+
+def _observed_rpath_or_runpath(path: Path) -> str | None:
+    """Returns the exact decoded DT_RUNPATH/DT_RPATH string value (e.g.
+    "$ORIGIN/../lib") readelf -d -W reports for `path`, or None if
+    neither tag is present (a statically linked file, or one whose
+    rpath was explicitly cleared). Prefers DT_RUNPATH over legacy
+    DT_RPATH when a file somehow carries both, since this project's own
+    empirical testing (see _read_dynamic_tags()'s own docstring) found
+    a real `patchelf --set-rpath` rewrite on the toolchain this
+    project's pinned linuxdeploy/linuxdeploy-plugin-qt releases bundle
+    always writes DT_RUNPATH, never legacy DT_RPATH -- so a genuinely
+    patchelf-rewritten file's own real, currently-effective value is
+    always found here first.
+
+    Used by replay_strip_and_rpath_transform() below to read both the
+    untouched reference file's OWN pre-existing rpath (to decide
+    whether linuxdeploy would have skipped strip -- see that function's
+    own docstring) and the final bundled file's OWN observed rpath (the
+    exact value to replay via `patchelf --set-rpath`)."""
+    tags = dict(_read_dynamic_tags(path))
+    for tag_name in ("RUNPATH", "RPATH"):
+        raw_value = tags.get(tag_name)
+        if raw_value is None:
+            continue
+        match = _BRACKETED_TAG_VALUE_RE.search(raw_value)
+        if match:
+            return match.group("value")
+    return None
 
 
 # readelf --dyn-syms -W's one-line-per-entry decoded dynamic symbol
@@ -2521,6 +2562,7 @@ def validate_component_package_provenance(
 
 def bind_bundled_library_to_system_provenance(
     bundled_path: Path,
+    replay_toolset: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Round-7 review (HIGH, "distro provenance looks up an unrelated
     host file by basename and is not cryptographically bound to the
@@ -2582,7 +2624,21 @@ def bind_bundled_library_to_system_provenance(
         digest both files agree on) -- again for full independent SBOM
         reconstruction -- so this dict can be passed directly to
         validate_component_package_provenance() for the source-package
-        name check."""
+        name check.
+
+    Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    packaging transform ... generated transformation receipt"): when
+    `replay_toolset` is supplied (see _build_replay_toolset()/
+    _replay_toolset_from_manifest()), a resolved dpkg-owned system copy
+    is authenticated by replay_strip_and_rpath_transform() instead of
+    _canonical_load_digest() comparison -- the strongest evidence this
+    module can offer, and DECISIVE either way (a replay mismatch is
+    always "content_mismatch", never re-checked against the weaker
+    heuristic digest). Every "matched"/"content_mismatch" result then
+    also carries "transformationReceipt" and "evidenceStrength"
+    ("replay_byte_identical" or "replay_mismatch"). Omitting
+    `replay_toolset` preserves the prior _canonical_load_digest()-only
+    behavior, marked "evidenceStrength": "canonical_digest_heuristic"."""
     if shutil.which("dpkg") is None or shutil.which("dpkg-query") is None:
         return {"status": "dpkg_unavailable"}
     basename = bundled_path.name
@@ -2608,6 +2664,28 @@ def bind_bundled_library_to_system_provenance(
         if record is None:
             continue
         found_any_dpkg_owned_copy = True
+        if replay_toolset is not None and bundled_path.is_file():
+            receipt = replay_strip_and_rpath_transform(
+                resolved, bundled_path, replay_toolset
+            )
+            matched = bool(receipt["matched"])
+            result: dict[str, object] = {
+                "status": "matched" if matched else "content_mismatch",
+                **record,
+                "systemPath": str(resolved),
+                "systemSha256": str(receipt["referenceSha256"]),
+                "transformationReceipt": receipt,
+                "evidenceStrength": (
+                    "replay_byte_identical" if matched else "replay_mismatch"
+                ),
+            }
+            if matched:
+                result["bundledCanonicalLoadDigest"] = _canonical_load_digest(
+                    bundled_path
+                )
+            else:
+                result["systemCanonicalLoadDigest"] = _canonical_load_digest(resolved)
+            return result
         bundled_digest = _canonical_load_digest(bundled_path)
         system_digest = _canonical_load_digest(resolved)
         if (
@@ -2621,6 +2699,7 @@ def bind_bundled_library_to_system_provenance(
                 "systemPath": str(resolved),
                 "systemSha256": _sha256(resolved),
                 "systemCanonicalLoadDigest": system_digest,
+                "evidenceStrength": "canonical_digest_heuristic",
             }
         return {
             "status": "matched",
@@ -2628,6 +2707,7 @@ def bind_bundled_library_to_system_provenance(
             "systemPath": str(resolved),
             "systemSha256": _sha256(resolved),
             "bundledCanonicalLoadDigest": bundled_digest,
+            "evidenceStrength": "canonical_digest_heuristic",
         }
     if found_any_dpkg_owned_copy:
         # Unreachable in practice (a dpkg-owned copy found by the loop
@@ -2798,6 +2878,204 @@ def _nofollow_open_flags() -> int:
     return flags
 
 
+# Round-N+ review (HIGH, "ELF identity still omits actual PT_LOAD
+# mappings ... Prefer replaying the exact trusted packaging transform
+# and byte-comparing final with a transformation receipt"): rather than
+# continuing to widen _canonical_load_digest()'s own heuristic
+# tolerance for whatever fields a legitimate patchelf/strip rewrite
+# happens to touch (an approach every prior review round has found a
+# new gap in), this project's own hands-on empirical testing --
+# extracting the ACTUAL pinned linuxdeploy/linuxdeploy-plugin-qt
+# AppImage releases this project's own CI/build-appimage.sh already
+# hash-pins (see build-appimage.sh's own replay-tool-extraction step),
+# running the real tool against a real AppDir, and observing its own
+# console log -- proved that linuxdeploy's real, complete distro-
+# library transformation is exactly two steps, always in this order:
+#   1. `strip --strip-unneeded` -- UNLESS the untouched reference
+#      file's OWN pre-existing rpath/runpath already starts with "$"
+#      (linuxdeploy's own console log: "Not calling strip on binary:
+#      rpath starts with $").
+#   2. `patchelf --set-rpath <value>` -- to the exact rpath/runpath
+#      value the FINAL bundled file itself carries (linuxdeploy's own
+#      console log: "Setting rpath in ELF file").
+# Replaying this exact recipe, using the EXACT bundled patchelf/strip
+# binaries extracted from inside this project's own pinned, sha256-
+# verified linuxdeploy/linuxdeploy-plugin-qt AppImage release (never a
+# host-installed patchelf/strip of unknown/unpinned provenance), against
+# a private scratch copy of the untouched reference file, was
+# empirically confirmed (see this project's own testing notes) to
+# reproduce the real tool's own output byte-for-byte. A byte-identical
+# replay is therefore the single strongest possible authentication this
+# module can offer for a bundled distro/Qt-SDK library's identity --
+# strictly stronger than, and never laundered back through,
+# _canonical_load_digest()'s own heuristic tolerance -- and a mismatch
+# here is always decisive, never silently accepted merely because the
+# older heuristic digest still happens to agree.
+_REPLAY_TOOLSET_REQUIRED_KEYS = (
+    "toolLabel",
+    "patchelfPath",
+    "patchelfSha256",
+    "stripPath",
+    "stripSha256",
+)
+
+
+def _build_replay_toolset(
+    patchelf_path: Path | None, strip_path: Path | None, tool_label: str
+) -> dict[str, str] | None:
+    """Builds an immutable, hash-pinned description of the exact
+    patchelf/strip binaries bundled inside this project's own pinned
+    linuxdeploy or linuxdeploy-plugin-qt AppImage release, for
+    replay_strip_and_rpath_transform() below to invoke. Returns None
+    (never raises) if either path is not supplied, does not exist, or
+    is not executable -- callers must treat a None toolset as "replay
+    evidence unavailable for this run", not silently skip verification
+    of the file it would have authenticated (see
+    bind_bundled_library_to_captured_provenance()'s own "evidenceStrength"
+    field and validate_bundled_library_package_provenance()'s own
+    enforcement of it under --require-package-provenance)."""
+    if patchelf_path is None or strip_path is None:
+        return None
+    if not patchelf_path.is_file() or not os.access(patchelf_path, os.X_OK):
+        return None
+    if not strip_path.is_file() or not os.access(strip_path, os.X_OK):
+        return None
+    return {
+        "toolLabel": tool_label,
+        "patchelfPath": str(patchelf_path),
+        "patchelfSha256": _sha256(patchelf_path),
+        "stripPath": str(strip_path),
+        "stripSha256": _sha256(strip_path),
+    }
+
+
+def _replay_toolset_from_manifest(
+    manifest: dict[str, object] | None, tool_key: str
+) -> dict[str, str] | None:
+    """Rehydrates a replay toolset embedded (by
+    cmd_capture_distro_provenance(), see build_distro_provenance_manifest()'s
+    own "replayTools" key) inside a distro-provenance-manifest.json
+    previously loaded via load_distro_provenance_manifest(), for
+    cmd_classify() to pass to bind_bundled_library_to_captured_
+    provenance()/bind_bundled_library_to_qt_sdk_provenance().
+
+    Round-N+ review (defense-in-depth against the staged tool binaries
+    changing on disk between the capture-distro-provenance step and
+    this later classify invocation, however unlikely within one CI
+    job's own single, ephemeral workspace): every returned toolset's
+    patchelf/strip sha256 is re-verified against the manifest's own
+    pinned value HERE, at use time, not merely trusted from whenever it
+    was originally captured. Returns None (never raises) on any
+    missing/malformed/mismatched field -- a caller then has no replay
+    toolset for this run, which validate_bundled_library_package_
+    provenance()/validate_bundled_library_qt_sdk_provenance() enforce as
+    a hard failure under --require-package-provenance rather than a
+    silent downgrade to weaker evidence."""
+    if manifest is None:
+        return None
+    replay_tools = manifest.get("replayTools")
+    if not isinstance(replay_tools, dict):
+        return None
+    toolset = replay_tools.get(tool_key)
+    if not isinstance(toolset, dict):
+        return None
+    if not all(
+        isinstance(toolset.get(key), str) for key in _REPLAY_TOOLSET_REQUIRED_KEYS
+    ):
+        return None
+    patchelf_path = Path(str(toolset["patchelfPath"]))
+    strip_path = Path(str(toolset["stripPath"]))
+    if not patchelf_path.is_file() or not strip_path.is_file():
+        return None
+    if _sha256(patchelf_path) != toolset["patchelfSha256"]:
+        return None
+    if _sha256(strip_path) != toolset["stripSha256"]:
+        return None
+    return {
+        "toolLabel": str(toolset["toolLabel"]),
+        "patchelfPath": str(patchelf_path),
+        "patchelfSha256": str(toolset["patchelfSha256"]),
+        "stripPath": str(strip_path),
+        "stripSha256": str(toolset["stripSha256"]),
+    }
+
+
+def replay_strip_and_rpath_transform(
+    reference_path: Path, final_path: Path, toolset: dict[str, str]
+) -> dict[str, object]:
+    """Replays linuxdeploy's own real, empirically observed
+    strip-then-patchelf transformation (see the module comment
+    immediately above _nofollow_open_flags() for the full recipe and
+    how it was derived) against a private scratch copy of
+    `reference_path`, using the exact bundled patchelf/strip binaries
+    described by `toolset` (see _build_replay_toolset()/
+    _replay_toolset_from_manifest()), then byte-compares the replayed
+    result to `final_path`.
+
+    Returns a "transformation receipt" dict recording every input to
+    the replay (the toolset's own pinned identity/hashes, the
+    reference's own real path/sha256, its own observed pre-existing
+    rpath, whether strip was applied, the final file's own observed
+    rpath, whether patchelf --set-rpath was applied, the final file's
+    own sha256) and its outcome (the replayed scratch file's own
+    sha256, and a "matched" boolean) -- this receipt is the complete,
+    independently-reconstructable evidence bind_bundled_library_to_
+    captured_provenance()/bind_bundled_library_to_qt_sdk_provenance()
+    below serialize unchanged into the SBOM as each binding's own
+    "transformationReceipt".
+
+    Never raises: a subprocess failure (a corrupt/incompatible tool
+    binary, an unexpected non-ELF input, ...) is recorded as
+    "replayError" with "matched": False, never propagated as an
+    exception -- a failed replay attempt is exactly as decisive
+    (content_mismatch) as one that ran to completion and disagreed."""
+    receipt: dict[str, object] = {
+        "toolLabel": toolset["toolLabel"],
+        "patchelfSha256": toolset["patchelfSha256"],
+        "stripSha256": toolset["stripSha256"],
+        "referenceRealPath": str(reference_path),
+        "referenceSha256": _sha256(reference_path),
+        "finalSha256": _sha256(final_path),
+    }
+    reference_rpath = _observed_rpath_or_runpath(reference_path)
+    final_rpath = _observed_rpath_or_runpath(final_path)
+    receipt["referenceObservedRpath"] = reference_rpath
+    receipt["finalObservedRpath"] = final_rpath
+    skip_strip = reference_rpath is not None and reference_rpath.startswith("$")
+    receipt["stripApplied"] = not skip_strip
+    receipt["patchelfSetRpathApplied"] = final_rpath is not None
+    try:
+        with tempfile.TemporaryDirectory(prefix="assetcache-elf-replay-") as workdir:
+            scratch_path = Path(workdir) / f"replay--{final_path.name}"
+            shutil.copyfile(reference_path, scratch_path)
+            scratch_path.chmod(0o755)
+            if not skip_strip:
+                subprocess.run(
+                    [toolset["stripPath"], "--strip-unneeded", str(scratch_path)],
+                    check=True,
+                    capture_output=True,
+                )
+            if final_rpath is not None:
+                subprocess.run(
+                    [
+                        toolset["patchelfPath"],
+                        "--set-rpath",
+                        final_rpath,
+                        str(scratch_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            replayed_sha256 = _sha256(scratch_path)
+    except (OSError, subprocess.CalledProcessError) as error:
+        receipt["replayError"] = str(error)
+        receipt["matched"] = False
+        return receipt
+    receipt["replayedSha256"] = replayed_sha256
+    receipt["matched"] = replayed_sha256 == receipt["finalSha256"]
+    return receipt
+
+
 def _capture_immutable_staged_file(
     source_path: Path, staging_dir: Path
 ) -> dict[str, str] | None:
@@ -2921,7 +3199,9 @@ def _bundled_library_destination_path(needed: str) -> str:
 
 
 def build_distro_provenance_manifest(
-    dependency_edges: list[tuple[Path, str, Path]], staging_dir: Path
+    dependency_edges: list[tuple[Path, str, Path]],
+    staging_dir: Path,
+    replay_tools: dict[str, dict[str, str]] | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     """Builds the authoritative capture-before-packaging distro
     provenance manifest used by cmd_capture_distro_provenance() and, in
@@ -2937,7 +3217,20 @@ def build_distro_provenance_manifest(
     requester resolutions" / "same basename force bundle"): if two
     distinct real source objects would land at the SAME bundled path but
     differ in sourceRealPath/sha256, that is reported as a conflict
-    rather than letting one silently overwrite the other."""
+    rather than letting one silently overwrite the other.
+
+    Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    packaging transform ... generated transformation receipt"):
+    `replay_tools`, when supplied (built by cmd_capture_distro_
+    provenance() from --linuxdeploy-patchelf/--linuxdeploy-strip/
+    --linuxdeploy-qt-patchelf/--linuxdeploy-qt-strip via
+    _build_replay_toolset()), is embedded verbatim into the returned
+    manifest's own "replayTools" key -- the SAME immutable object
+    cmd_classify() later rehydrates (via _replay_toolset_from_manifest(),
+    which re-verifies each tool binary's own pinned sha256 at use time
+    too) and passes to bind_bundled_library_to_captured_provenance()/
+    bind_bundled_library_to_qt_sdk_provenance() as the strongest
+    available authentication for every real distro/Qt-SDK component."""
     bundled_paths: dict[str, dict[str, object]] = {}
     conflicts: list[str] = []
     for requester, needed, loader_path in dependency_edges:
@@ -2970,13 +3263,17 @@ def build_distro_provenance_manifest(
             f"{existing['sourceRealPath']!r} ({existing['sha256']!r}) vs "
             f"{entry['sourceRealPath']!r} ({entry['sha256']!r})"
         )
-    return {"formatVersion": 2, "bundledPaths": bundled_paths}, conflicts
+    manifest: dict[str, object] = {"formatVersion": 2, "bundledPaths": bundled_paths}
+    if replay_tools:
+        manifest["replayTools"] = replay_tools
+    return manifest, conflicts
 
 
 def bind_bundled_library_to_captured_provenance(
     bundled_path: Path,
     manifest: dict[str, object],
     bundled_relative_path: str | None = None,
+    replay_toolset: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """The capture-before-packaging replacement for
     bind_bundled_library_to_system_provenance() above (see this
@@ -3013,7 +3310,21 @@ def bind_bundled_library_to_captured_provenance(
     Round-N+ review ("changed file after capture"): the staged source
     object's own sha256 is re-verified here too. The original system
     path is deliberately never re-opened after capture; only the
-    immutable staged object is trusted."""
+    immutable staged object is trusted.
+
+    Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    packaging transform and byte-comparing final with a transformation
+    receipt"): when `replay_toolset` is supplied, the immutable staged
+    reference object is authenticated by replay_strip_and_rpath_
+    transform() -- replaying linuxdeploy's own real strip-then-patchelf
+    recipe and byte-comparing the result to `bundled_path` -- rather
+    than _canonical_load_digest() comparison; this is decisive either
+    way and never falls back to the weaker heuristic. Every returned
+    "matched"/"content_mismatch" result then carries
+    "transformationReceipt" and "evidenceStrength" ("replay_byte_
+    identical"/"replay_mismatch"). Omitting `replay_toolset` preserves
+    the prior heuristic-only behavior, marked "evidenceStrength":
+    "canonical_digest_heuristic"."""
     if manifest.get("formatVersion") != 2:
         legacy_candidates = manifest.get(bundled_path.name)
         if not isinstance(legacy_candidates, list):
@@ -3107,17 +3418,34 @@ def bind_bundled_library_to_captured_provenance(
                 "after capture"
             ),
         }
+    if replay_toolset is not None and bundled_path.is_file():
+        receipt = replay_strip_and_rpath_transform(staged_path, bundled_path, replay_toolset)
+        matched = bool(receipt["matched"])
+        result: dict[str, object] = {
+            "status": "matched" if matched else "content_mismatch",
+            **entry,
+            "systemPath": str(entry["sourceRealPath"]),
+            "systemSha256": staged_sha256,
+            "transformationReceipt": receipt,
+            "evidenceStrength": "replay_byte_identical" if matched else "replay_mismatch",
+        }
+        if matched:
+            result["bundledCanonicalLoadDigest"] = bundled_digest
+        else:
+            result["systemCanonicalLoadDigest"] = entry.get("canonicalLoadDigest")
+        return result
     staged_digest = entry.get("canonicalLoadDigest")
     if bundled_digest is not None and staged_digest is not None:
         matched = bundled_digest == staged_digest
     else:
         matched = _sha256(bundled_path) == staged_sha256
-    result: dict[str, object] = {
+    result = {
         "status": "matched" if matched else "content_mismatch",
         **entry,
         "systemPath": str(entry["sourceRealPath"]),
         "systemSha256": staged_sha256,
         "systemCanonicalLoadDigest": staged_digest,
+        "evidenceStrength": "canonical_digest_heuristic",
     }
     if bundled_digest is not None:
         result["bundledCanonicalLoadDigest"] = bundled_digest
@@ -3240,6 +3568,35 @@ def validate_bundled_library_package_provenance(
             f"of the same basename ({binding.get('sourcePackage')!r} "
             f"{binding.get('version')!r}) -- the bundled file cannot be "
             "proven to actually be that package's own build output at all"
+        )
+    # Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    # packaging transform ... byte/canonical compare with a generated
+    # transformation receipt"): a "matched" status under
+    # --require-package-provenance must be backed by the strongest
+    # available evidence -- a byte-identical replay of the real pinned
+    # linuxdeploy strip/patchelf transformation (see
+    # replay_strip_and_rpath_transform()'s own docstring) -- never
+    # merely the older _canonical_load_digest() heuristic, which every
+    # prior review round has found a new tolerance gap in. This project's
+    # own pinned ubuntu-22.04 appimage-smoke CI job (the only real
+    # caller of --require-package-provenance) always supplies replay
+    # tool binaries via build-appimage.sh's own replay-tool-extraction
+    # step, so "matched" without real replay evidence here means replay
+    # was either not attempted or failed to authenticate -- both are
+    # hard failures under this flag, never silently downgraded.
+    if require_provenance and binding.get("evidenceStrength") != "replay_byte_identical":
+        return (
+            f"component {component!r}'s bundled library is only "
+            "authenticated by the weaker _canonical_load_digest() "
+            "heuristic comparison (evidenceStrength="
+            f"{binding.get('evidenceStrength')!r}), not a byte-identical "
+            "replay of the real pinned linuxdeploy strip/patchelf "
+            "transformation -- --require-package-provenance demands the "
+            "strongest available evidence; ensure capture-distro-"
+            "provenance was invoked with --linuxdeploy-patchelf/"
+            "--linuxdeploy-strip (see build-appimage.sh's own replay-"
+            "tool-extraction step) so real replay evidence is captured "
+            "and carried through to this validation"
         )
     # Round-N+ review (HIGH, "distro provenance collapses identity ...
     # arch stripped"): the reference system copy's own dpkg-recorded
@@ -3392,6 +3749,7 @@ def bind_bundled_library_to_qt_sdk_provenance(
     qt_reference_dir: Path | None,
     sdk_version: str | None = None,
     sdk_source_provenance: dict[str, str] | None = None,
+    replay_toolset: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Companion to bind_bundled_library_to_system_provenance() for
     components in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE (see that
@@ -3442,7 +3800,20 @@ def bind_bundled_library_to_qt_sdk_provenance(
     binding's own digest comparison already accepts (Round-N+ review,
     "no explicit 'allowed transform' evidence field ... only implicit
     via digest matching") -- rather than leaving that fact only
-    inferable by reading _canonical_load_digest()'s own source."""
+    inferable by reading _canonical_load_digest()'s own source.
+
+    Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    packaging transform ... generated transformation receipt"): when
+    `replay_toolset` is supplied (the linuxdeploy-plugin-qt-bundled
+    patchelf/strip binaries -- see _build_replay_toolset()/
+    _replay_toolset_from_manifest()), the reference copy is
+    authenticated by replay_strip_and_rpath_transform() instead of
+    _canonical_load_digest() comparison -- decisive either way, never
+    falling back to the weaker heuristic. Every "matched"/"content_
+    mismatch" result then also carries "transformationReceipt" and
+    "evidenceStrength" ("replay_byte_identical"/"replay_mismatch").
+    Omitting `replay_toolset` preserves the prior heuristic-only
+    behavior, marked "evidenceStrength": "canonical_digest_heuristic"."""
     sdk_source_provenance = sdk_source_provenance or _qt_sdk_source_provenance()
     allowed_transform = (
         "patchelf RUNPATH/RPATH rewrite only (see _canonical_load_digest()"
@@ -3490,6 +3861,18 @@ def bind_bundled_library_to_qt_sdk_provenance(
         # module's own pure path-resolution unit tests exercise a
         # bundled_path that was never materialized on disk).
         matched = True
+        result["evidenceStrength"] = "canonical_digest_heuristic"
+    elif replay_toolset is not None:
+        receipt = replay_strip_and_rpath_transform(candidate, bundled_path, replay_toolset)
+        matched = bool(receipt["matched"])
+        result["transformationReceipt"] = receipt
+        result["evidenceStrength"] = (
+            "replay_byte_identical" if matched else "replay_mismatch"
+        )
+        if matched:
+            result["bundledCanonicalLoadDigest"] = _canonical_load_digest(bundled_path)
+        else:
+            result["bundledSha256"] = str(receipt["finalSha256"])
     else:
         bundled_sha256 = _sha256(bundled_path)
         bundled_digest = _canonical_load_digest(bundled_path)
@@ -3499,6 +3882,7 @@ def bind_bundled_library_to_qt_sdk_provenance(
             matched = reference_digest == bundled_digest
         else:
             matched = reference_sha256 == bundled_sha256
+        result["evidenceStrength"] = "canonical_digest_heuristic"
     result["status"] = "matched" if matched else "content_mismatch"
     if sdk_version is not None:
         result["sdkVersion"] = sdk_version
@@ -3614,6 +3998,29 @@ def validate_bundled_library_qt_sdk_provenance(
             "the governed EXPECTED_QT_SDK_VERSION pin can only protect a "
             "run that actually supplies something to check it against"
         )
+    # Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    # packaging transform ... byte/canonical compare with a generated
+    # transformation receipt"): mirrors validate_bundled_library_
+    # package_provenance()'s own identical enforcement -- a "matched"
+    # status under --require-package-provenance must be backed by a
+    # byte-identical replay of the real pinned linuxdeploy-plugin-qt
+    # strip/patchelf transformation, never merely the older
+    # _canonical_load_digest() heuristic.
+    if require_provenance and binding.get("evidenceStrength") != "replay_byte_identical":
+        return (
+            f"component {component!r}'s bundled library is only "
+            "authenticated by the weaker _canonical_load_digest() "
+            "heuristic comparison (evidenceStrength="
+            f"{binding.get('evidenceStrength')!r}), not a byte-identical "
+            "replay of the real pinned linuxdeploy-plugin-qt strip/"
+            "patchelf transformation -- --require-package-provenance "
+            "demands the strongest available evidence; ensure "
+            "--linuxdeploy-qt-patchelf/--linuxdeploy-qt-strip were "
+            "supplied to capture-distro-provenance (see build-"
+            "appimage.sh's own replay-tool-extraction step) so real "
+            "replay evidence is captured and carried through to this "
+            "validation"
+        )
     return None
 
 
@@ -3622,6 +4029,7 @@ def compute_qt_sdk_bindings(
     by_component: dict[str, list[Path]],
     qt_reference_dir: Path | None,
     sdk_version: str | None = None,
+    replay_toolset: dict[str, str] | None = None,
 ) -> dict[Path, dict[str, object]]:
     """Computes bind_bundled_library_to_qt_sdk_provenance() EXACTLY ONCE
     per bundled file in `by_component` whose component is in
@@ -3661,7 +4069,11 @@ def compute_qt_sdk_bindings(
             continue
         for path in paths:
             bindings[path] = bind_bundled_library_to_qt_sdk_provenance(
-                path, qt_reference_dir, sdk_version, sdk_source_provenance
+                path,
+                qt_reference_dir,
+                sdk_version,
+                sdk_source_provenance,
+                replay_toolset=replay_toolset,
             )
     return bindings
 
@@ -4068,6 +4480,7 @@ def build_sbom_inventory(
     distro_provenance_manifest: dict[str, object] | None = None,
     qt_sdk_bindings: dict[Path, dict[str, object]] | None = None,
     qt_sdk_version: str | None = None,
+    distro_replay_toolset: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     """Every real bundled ELF found under lib_dir, with NO exclusions --
     unlike classify_all() above (whose whole purpose is deciding what
@@ -4173,10 +4586,15 @@ def build_sbom_inventory(
         entry.update(elf_identity(path))
         if distro_provenance_manifest is not None:
             entry["packageProvenance"] = bind_bundled_library_to_captured_provenance(
-                path, distro_provenance_manifest, relative_path
+                path,
+                distro_provenance_manifest,
+                relative_path,
+                replay_toolset=distro_replay_toolset,
             )
         else:
-            entry["packageProvenance"] = bind_bundled_library_to_system_provenance(path)
+            entry["packageProvenance"] = bind_bundled_library_to_system_provenance(
+                path, replay_toolset=distro_replay_toolset
+            )
         if classification in _COMPONENTS_WITH_QT_SDK_BUNDLED_PROVENANCE:
             if qt_sdk_bindings is not None and path in qt_sdk_bindings:
                 entry["qtSdkProvenance"] = qt_sdk_bindings[path]
@@ -4280,7 +4698,68 @@ def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
     staging_dir = getattr(args, "staging_dir", None) or (
         args.output.parent / ".distro-provenance-stage"
     )
-    manifest, conflicts = build_distro_provenance_manifest(dependency_edges, staging_dir)
+    # Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    # packaging transform ... generated transformation receipt"):
+    # build (and pin, by sha256, right now -- see _build_replay_
+    # toolset()'s own docstring) an immutable description of the exact
+    # patchelf/strip binaries build-appimage.sh already extracted from
+    # this project's own pinned, sha256-verified linuxdeploy/
+    # linuxdeploy-plugin-qt AppImage releases (see that script's own
+    # replay-tool-extraction step), embedding them into the SAME
+    # manifest this subcommand writes -- so cmd_classify() later
+    # rehydrates (and re-verifies again, at use time) the identical
+    # toolset via _replay_toolset_from_manifest() without any separate
+    # CLI plumbing of its own.
+    linuxdeploy_patchelf: Path | None = getattr(args, "linuxdeploy_patchelf", None)
+    linuxdeploy_strip: Path | None = getattr(args, "linuxdeploy_strip", None)
+    linuxdeploy_qt_patchelf: Path | None = getattr(args, "linuxdeploy_qt_patchelf", None)
+    linuxdeploy_qt_strip: Path | None = getattr(args, "linuxdeploy_qt_strip", None)
+    if (linuxdeploy_patchelf is None) != (linuxdeploy_strip is None):
+        print(
+            "audit_codec_notices: --linuxdeploy-patchelf and "
+            "--linuxdeploy-strip must be supplied together or not at all "
+            "-- a partial toolset can never actually replay linuxdeploy's "
+            "real transformation.",
+            file=sys.stderr,
+        )
+        return 2
+    if (linuxdeploy_qt_patchelf is None) != (linuxdeploy_qt_strip is None):
+        print(
+            "audit_codec_notices: --linuxdeploy-qt-patchelf and "
+            "--linuxdeploy-qt-strip must be supplied together or not at "
+            "all -- a partial toolset can never actually replay "
+            "linuxdeploy-plugin-qt's real transformation.",
+            file=sys.stderr,
+        )
+        return 2
+    replay_tools: dict[str, dict[str, str]] = {}
+    if linuxdeploy_patchelf is not None:
+        toolset = _build_replay_toolset(
+            linuxdeploy_patchelf, linuxdeploy_strip, "linuxdeploy"
+        )
+        if toolset is None:
+            print(
+                "audit_codec_notices: --linuxdeploy-patchelf/"
+                "--linuxdeploy-strip must be existing, executable files.",
+                file=sys.stderr,
+            )
+            return 2
+        replay_tools["linuxdeploy"] = toolset
+    if linuxdeploy_qt_patchelf is not None:
+        toolset = _build_replay_toolset(
+            linuxdeploy_qt_patchelf, linuxdeploy_qt_strip, "linuxdeploy-plugin-qt"
+        )
+        if toolset is None:
+            print(
+                "audit_codec_notices: --linuxdeploy-qt-patchelf/"
+                "--linuxdeploy-qt-strip must be existing, executable files.",
+                file=sys.stderr,
+            )
+            return 2
+        replay_tools["linuxdeployPluginQt"] = toolset
+    manifest, conflicts = build_distro_provenance_manifest(
+        dependency_edges, staging_dir, replay_tools or None
+    )
     if conflicts:
         print(
             "audit_codec_notices: conflicting distro provenance would map "
@@ -4327,6 +4806,26 @@ def cmd_classify(args: argparse.Namespace) -> int:
             return 2
     qt_sdk_version: str | None = getattr(args, "qt_sdk_version", None)
 
+    # Round-N+ review (HIGH, "Prefer replaying the exact trusted
+    # packaging transform ... generated transformation receipt"):
+    # rehydrate (and re-verify, at USE time, not merely trust from
+    # whenever they were captured) the exact bundled patchelf/strip
+    # binaries this project's own pinned linuxdeploy/linuxdeploy-
+    # plugin-qt release embedded into the SAME distro-provenance
+    # manifest (see _replay_toolset_from_manifest()'s own docstring and
+    # build-appimage.sh's own replay-tool-extraction step) -- shared
+    # once here, exactly like qt_sdk_bindings above, so both the
+    # "inventory" JSON output and this function's own provenance-
+    # validation loop below use the identical toolset for the identical
+    # replay attempt on the identical files, never two independent,
+    # possibly time-of-check/time-of-use-divergent replays.
+    distro_replay_toolset = _replay_toolset_from_manifest(
+        distro_provenance_manifest, "linuxdeploy"
+    )
+    qt_replay_toolset = _replay_toolset_from_manifest(
+        distro_provenance_manifest, "linuxdeployPluginQt"
+    )
+
     by_component, unmapped = classify_all(lib_dir, qt_reference_dir)
 
     # Round-N+ review ("build_sbom_inventory binds separately before
@@ -4339,7 +4838,9 @@ def cmd_classify(args: argparse.Namespace) -> int:
     # for why this closes the reference-mutation/race window a second,
     # independent recomputation in each of those two places previously
     # left open.
-    qt_sdk_bindings = compute_qt_sdk_bindings(by_component, qt_reference_dir, qt_sdk_version)
+    qt_sdk_bindings = compute_qt_sdk_bindings(
+        by_component, qt_reference_dir, qt_sdk_version, replay_toolset=qt_replay_toolset
+    )
 
     if args.json_out is not None:
         manifest = {
@@ -4362,6 +4863,7 @@ def cmd_classify(args: argparse.Namespace) -> int:
                 qt_reference_dir,
                 distro_provenance_manifest,
                 qt_sdk_bindings,
+                distro_replay_toolset=distro_replay_toolset,
             ),
         }
         args.json_out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -4478,13 +4980,18 @@ def cmd_classify(args: argparse.Namespace) -> int:
                 )
             elif distro_provenance_manifest is not None:
                 binding = bind_bundled_library_to_captured_provenance(
-                    path, distro_provenance_manifest, str(path.relative_to(lib_dir))
+                    path,
+                    distro_provenance_manifest,
+                    str(path.relative_to(lib_dir)),
+                    replay_toolset=distro_replay_toolset,
                 )
                 problem = validate_bundled_library_package_provenance(
                     component, binding, require_package_provenance
                 )
             else:
-                binding = bind_bundled_library_to_system_provenance(path)
+                binding = bind_bundled_library_to_system_provenance(
+                    path, replay_toolset=distro_replay_toolset
+                )
                 problem = validate_bundled_library_package_provenance(
                     component, binding, require_package_provenance
                 )
@@ -4723,6 +5230,54 @@ def main(argv: list[str]) -> int:
             "Directory where immutable same-open-descriptor staged copies of "
             "captured distro source files are stored. Defaults to a sibling "
             ".distro-provenance-stage directory next to --output."
+        ),
+    )
+    capture_provenance_parser.add_argument(
+        "--linuxdeploy-patchelf",
+        type=Path,
+        default=None,
+        help=(
+            "Round-N+ review (HIGH, \"Prefer replaying the exact trusted "
+            "packaging transform ... generated transformation receipt\"): "
+            "path to the real `patchelf` binary bundled INSIDE this "
+            "project's own pinned, sha256-verified linuxdeploy AppImage "
+            "release (see build-appimage.sh's own replay-tool-extraction "
+            "step). Embedded (with its own sha256) into --output's "
+            "manifest as \"replayTools\".\"linuxdeploy\" for cmd_classify() "
+            "to later replay linuxdeploy's real strip/patchelf "
+            "transformation against every real distro component. Must be "
+            "supplied together with --linuxdeploy-strip."
+        ),
+    )
+    capture_provenance_parser.add_argument(
+        "--linuxdeploy-strip",
+        type=Path,
+        default=None,
+        help=(
+            "Companion to --linuxdeploy-patchelf: the real `strip` binary "
+            "bundled inside the same pinned linuxdeploy AppImage release."
+        ),
+    )
+    capture_provenance_parser.add_argument(
+        "--linuxdeploy-qt-patchelf",
+        type=Path,
+        default=None,
+        help=(
+            "Same as --linuxdeploy-patchelf, but for the real `patchelf` "
+            "binary bundled inside this project's own pinned linuxdeploy-"
+            "plugin-qt AppImage release -- used to replay Qt/ICU library, "
+            "plugin, and QML module transformations. Must be supplied "
+            "together with --linuxdeploy-qt-strip."
+        ),
+    )
+    capture_provenance_parser.add_argument(
+        "--linuxdeploy-qt-strip",
+        type=Path,
+        default=None,
+        help=(
+            "Companion to --linuxdeploy-qt-patchelf: the real `strip` "
+            "binary bundled inside the same pinned linuxdeploy-plugin-qt "
+            "AppImage release."
         ),
     )
     capture_provenance_parser.set_defaults(func=cmd_capture_distro_provenance)
