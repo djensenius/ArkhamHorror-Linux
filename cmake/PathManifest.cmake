@@ -725,6 +725,30 @@ function(arkham_write_encoder_hygiene_target_universe)
         if(NOT _arkham_ehu_graph_interface_links)
             set(_arkham_ehu_graph_interface_links "")
         endif()
+        # TARGET_GENEX_EVAL evaluates link properties in link context, where
+        # COMPILE_ONLY intentionally disappears. Emit a second, structurally
+        # transformed view for compile reachability: replacing only the exact
+        # COMPILE_ONLY operator with the always-true identity operator keeps
+        # all nested IF/CONFIG/TARGET_PROPERTY semantics under CMake's own
+        # evaluator while preserving the compile-only payload.
+        string(REPLACE "$<COMPILE_ONLY:" "$<1:"
+            _arkham_ehu_graph_compile_links "${_arkham_ehu_graph_links}")
+        string(REPLACE "$<COMPILE_ONLY:" "$<1:"
+            _arkham_ehu_graph_compile_interface_links
+            "${_arkham_ehu_graph_interface_links}")
+        if(_arkham_ehu_graph_compile_links MATCHES "\\$<COMPILE_ONLY" OR
+                _arkham_ehu_graph_compile_interface_links MATCHES
+                    "\\$<COMPILE_ONLY")
+            message(FATAL_ERROR
+                "Encoder-hygiene could not structurally normalize a "
+                "COMPILE_ONLY usage edge on '${_arkham_ehu_graph_target}'")
+        endif()
+        set_property(TARGET ${_arkham_ehu_graph_target} PROPERTY
+            ARKHAM_ENCODER_HYGIENE_COMPILE_LINKS
+            "${_arkham_ehu_graph_compile_links}")
+        set_property(TARGET ${_arkham_ehu_graph_target} PROPERTY
+            ARKHAM_ENCODER_HYGIENE_COMPILE_INTERFACE_LINKS
+            "${_arkham_ehu_graph_compile_interface_links}")
         foreach(_arkham_ehu_raw_edge IN LISTS
                 _arkham_ehu_graph_links _arkham_ehu_graph_interface_links)
             if(_arkham_ehu_raw_edge MATCHES "[|\n\r]")
@@ -782,7 +806,7 @@ function(arkham_write_encoder_hygiene_target_universe)
                 OUTPUT
                     "${_arkham_ehu_graph_dir}/$<CONFIG>/${_arkham_ehu_graph_hash}.txt"
                 CONTENT
-                    "consumer\t${_arkham_ehu_graph_consumer}\ntarget\t${_arkham_ehu_graph_target}\nimported\t${_arkham_ehu_graph_imported}\nlinks\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},LINK_LIBRARIES>>,|>\ninterface\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES>>,|>\ndirect\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES_DIRECT>>,|>\nexclude\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE>>,|>\n")
+                    "consumer\t${_arkham_ehu_graph_consumer}\ntarget\t${_arkham_ehu_graph_target}\nimported\t${_arkham_ehu_graph_imported}\nlinks\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},LINK_LIBRARIES>>,|>\ninterface\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES>>,|>\ncompile_links\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},ARKHAM_ENCODER_HYGIENE_COMPILE_LINKS>>,|>\ncompile_interface\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},ARKHAM_ENCODER_HYGIENE_COMPILE_INTERFACE_LINKS>>,|>\ndirect\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES_DIRECT>>,|>\nexclude\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE>>,|>\n")
         endforeach()
     endforeach()
     set(_arkham_ehu_universe "")

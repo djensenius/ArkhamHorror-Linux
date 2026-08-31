@@ -35,7 +35,9 @@ generator expressions before Python reads it, applies transitive
 INTERFACE_LINK_LIBRARIES_DIRECT injection followed by
 INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE precedence, and rejects any
 unevaluated or unclassified result rather than guessing target names from
-generator-expression text.
+generator-expression text. A second structurally normalized compile graph
+preserves nested COMPILE_ONLY payloads which intentionally disappear from
+link-context evaluation.
 
 Both header sets are audited by this ONE script/policy, not just the
 domain one: a review round demonstrated that scoping the AST scan to
@@ -161,6 +163,10 @@ an ever-growing fragment of C++ parsing by hand:
     construction merely because its outer declaration has no wire type.
     Lambda parameters and concrete function-template TypeRef arguments are
     independent surfaces; unresolved dependent body TypeRefs fail closed.
+    Namespace-scope explicit instantiations/specializations are compiler-
+    tokenized and matched to Clang's canonical specialization AST, even when
+    the primary template is declared in an external/system header and
+    libclang emits no project-owned cursor for the instantiation spelling.
     Every numeric cursor kind used here is checked against the installed
     libclang's own clang_getCursorKindSpelling result at startup.
   - A declaration is a *violation* if any semantic type component is in
@@ -1644,6 +1650,328 @@ def _cursor_template_argument_fingerprint(
         if forbidden:
             return f"template-arg[{index}]:{forbidden}"
     return None
+
+
+@dataclass(frozen=True)
+class _ExplicitTemplateCandidate:
+    line: int
+    offset: int
+    statement: str
+    names_and_args: tuple[tuple[str, tuple[str, ...]], ...]
+
+
+_EXPLICIT_TEMPLATE_START = _re.compile(
+    r"(?m)^[ \t]*(?:extern[ \t]+template(?![ \t]*<)[ \t]+|"
+    r"template[ \t]*<[ \t]*>|template(?![ \t]*<)[ \t]+)"
+)
+
+
+def _split_template_arguments(value: str) -> tuple[str, ...]:
+    arguments: list[str] = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(value):
+        if character in "<([{":
+            depth += 1
+        elif character in ">)]}":
+            depth -= 1
+        elif character == "," and depth == 0:
+            arguments.append(value[start:index].strip())
+            start = index + 1
+    arguments.append(value[start:].strip())
+    return tuple(argument for argument in arguments if argument)
+
+
+def _template_names_and_arguments(
+    statement: str,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    result: list[tuple[str, tuple[str, ...]]] = []
+    for match in _re.finditer(r"([A-Za-z_]\w*)[ \t]*<", statement):
+        name = match.group(1)
+        if name == "template":
+            continue
+        begin = match.end()
+        depth = 1
+        index = begin
+        while index < len(statement) and depth:
+            if statement[index] == "<":
+                depth += 1
+            elif statement[index] == ">":
+                depth -= 1
+            index += 1
+        if depth:
+            continue
+        result.append(
+            (
+                name,
+                _split_template_arguments(statement[begin : index - 1]),
+            )
+        )
+    return tuple(result)
+
+
+def _explicit_template_candidates(
+    path: Path,
+    arguments: Sequence[str],
+    directory: Path,
+) -> list[_ExplicitTemplateCandidate]:
+    text = path.read_text(encoding="utf-8")
+    if _EXPLICIT_TEMPLATE_START.search(text) is None:
+        return []
+    compiler = os.environ.get("ARKHAM_CLANGXX", "clang++")
+    token_command = [
+        compiler,
+        *arguments,
+        "-Xclang",
+        "-dump-tokens",
+        "-fsyntax-only",
+        "-x",
+        "c++",
+        str(path),
+    ]
+    token_result = subprocess.run(
+        token_command,
+        cwd=directory,
+        capture_output=True,
+        text=True,
+    )
+    if token_result.returncode != 0:
+        raise EncoderHygieneError(
+            f"Compiler tokenization failed while resolving explicit template "
+            f"instantiations in {path}:\n{token_result.stderr}"
+        )
+    tokens: list[tuple[str, int, int]] = []
+    for output_line in token_result.stderr.splitlines():
+        location_match = _re.search(r"Loc=<(.+):(\d+):(\d+)>$", output_line)
+        first_quote = output_line.find("'")
+        second_quote = output_line.find("'", first_quote + 1)
+        if (
+            location_match is None
+            or first_quote < 0
+            or second_quote < 0
+        ):
+            continue
+        location_path = Path(location_match.group(1))
+        if not location_path.is_absolute():
+            location_path = directory / location_path
+        if location_path.resolve() != path.resolve():
+            continue
+        tokens.append(
+            (
+                output_line[first_quote + 1 : second_quote],
+                int(location_match.group(2)),
+                int(location_match.group(3)),
+            )
+        )
+
+    line_starts = [0]
+    for match in _re.finditer("\n", text):
+        line_starts.append(match.end())
+    candidates: list[_ExplicitTemplateCandidate] = []
+    for token_index, (token, line, column) in enumerate(tokens):
+        if token != "template":
+            continue
+        next_index = token_index + 1
+        if next_index < len(tokens) and tokens[next_index][0] == "<":
+            # `template<class T>` is a primary declaration. Only the empty
+            # `template<>` form is an explicit specialization.
+            if (
+                next_index + 1 >= len(tokens)
+                or tokens[next_index + 1][0] != ">"
+            ):
+                continue
+        statement_tokens: list[str] = []
+        angle_depth = 0
+        paren_depth = 0
+        for current, _token_line, _token_column in tokens[token_index:]:
+            statement_tokens.append(current)
+            if current == "<":
+                angle_depth += 1
+            elif current == ">" and angle_depth:
+                angle_depth -= 1
+            elif current == "(":
+                paren_depth += 1
+            elif current == ")" and paren_depth:
+                paren_depth -= 1
+            elif current in {";", "{"} and angle_depth == 0 and paren_depth == 0:
+                break
+        statement = " ".join(statement_tokens)
+        names_and_args = _template_names_and_arguments(statement)
+        if not names_and_args:
+            raise EncoderHygieneError(
+                f"Could not resolve explicit template declaration at "
+                f"{path}:{line}"
+            )
+        character_offset = line_starts[line - 1] + column - 1
+        byte_offset = len(text[:character_offset].encode("utf-8"))
+        candidates.append(
+            _ExplicitTemplateCandidate(
+                line=line,
+                offset=byte_offset,
+                statement=statement,
+                names_and_args=names_and_args,
+            )
+        )
+    return candidates
+
+
+def _normalized_template_spelling(value: str) -> str:
+    return _re.sub(r"\b(?:class|struct|union|enum)\s+", "", value).replace(
+        " ", ""
+    )
+
+
+def _collect_explicit_template_findings(
+    path: Path,
+    arguments: Sequence[str],
+    directory: Path,
+    repo_root: Path,
+    observation_context: str,
+) -> list[Finding]:
+    candidates = _explicit_template_candidates(path, arguments, directory)
+    if not candidates:
+        return []
+    compiler = os.environ.get("ARKHAM_CLANGXX", "clang++")
+    command = [
+        compiler,
+        *arguments,
+        "-Xclang",
+        "-ast-dump=json",
+        "-fsyntax-only",
+        "-x",
+        "c++",
+        str(path),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=directory,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise EncoderHygieneError(
+            f"Compiler AST dump failed while resolving explicit template "
+            f"instantiations in {path}:\n{completed.stderr}"
+        )
+    try:
+        root = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise EncoderHygieneError(
+            f"Compiler returned malformed AST JSON for {path}: {exc}"
+        ) from exc
+
+    specializations: dict[str, list[tuple[tuple[str, ...], tuple[str, ...]]]] = {}
+    type_aliases: dict[str, str] = {}
+
+    def visit(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        name = node.get("name")
+        inner = node.get("inner")
+        type_info = node.get("type")
+        if (
+            node.get("kind") in {"TypeAliasDecl", "TypedefDecl"}
+            and isinstance(name, str)
+            and isinstance(type_info, dict)
+        ):
+            canonical_alias = type_info.get(
+                "desugaredQualType", type_info.get("qualType")
+            )
+            if isinstance(canonical_alias, str):
+                type_aliases[name] = canonical_alias
+        if isinstance(name, str) and isinstance(inner, list):
+            arguments_found: list[str] = []
+            canonical_found: list[str] = []
+            for child in inner:
+                if not isinstance(child, dict) or child.get("kind") != "TemplateArgument":
+                    continue
+                type_info = child.get("type")
+                if not isinstance(type_info, dict):
+                    continue
+                written = type_info.get("qualType")
+                canonical = type_info.get("desugaredQualType", written)
+                if isinstance(written, str) and isinstance(canonical, str):
+                    arguments_found.append(written)
+                    canonical_found.append(canonical)
+            if arguments_found:
+                specializations.setdefault(name, []).append(
+                    (tuple(arguments_found), tuple(canonical_found))
+                )
+        if isinstance(inner, list):
+            for child in inner:
+                visit(child)
+
+    visit(root)
+    findings: list[Finding] = []
+    try:
+        relative = path.resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        relative = path.resolve().as_posix()
+    for candidate in candidates:
+        matches: list[tuple[str, tuple[str, ...]]] = []
+        for name, provided_arguments in candidate.names_and_args:
+            normalized_provided = tuple(
+                _normalized_template_spelling(argument)
+                for argument in provided_arguments
+            )
+            for written, canonical in specializations.get(name, ()):
+                if len(written) < len(normalized_provided):
+                    continue
+                if all(
+                    {
+                        expected,
+                        _normalized_template_spelling(
+                            type_aliases.get(
+                                provided_arguments[index].split("::")[-1],
+                                provided_arguments[index],
+                            )
+                        ),
+                    }
+                    & {
+                        _normalized_template_spelling(written[index]),
+                        _normalized_template_spelling(canonical[index]),
+                    }
+                    for index, expected in enumerate(normalized_provided)
+                ):
+                    matches.append((name, canonical))
+        if not matches:
+            raise EncoderHygieneError(
+                f"Compiler AST did not expose the explicit template "
+                f"specialization spelled at {path}:{candidate.line}: "
+                f"{candidate.statement}"
+            )
+        forbidden = [
+            f"{name}:{argument}"
+            for name, arguments_found in matches
+            for argument in arguments_found
+            if _is_qjson_family(argument)
+        ]
+        if not forbidden:
+            continue
+        identity = ",".join(sorted(set(forbidden)))
+        findings.append(
+            Finding(
+                file=relative,
+                line=candidate.line,
+                display_name=candidate.statement,
+                canonical_return_type=(
+                    "kind=explicit-template-instantiation;"
+                    f"forbidden=[{identity}]"
+                ),
+                usr=(
+                    f"c:@explicit-template@{candidate.offset}@"
+                    f"{hashlib.sha256(candidate.statement.encode('utf-8')).hexdigest()}"
+                ),
+                access=_CX_CXXInvalidAccessSpecifier,
+                linkage=_CXLinkage_External,
+                offset=candidate.offset,
+                spelling_file=relative,
+                spelling_offset=candidate.offset,
+                observation_context=observation_context,
+                body_surface=False,
+            )
+        )
+    return findings
 
 
 def _is_qjson_family(canonical_type_spelling: str) -> bool:
@@ -3157,6 +3485,8 @@ def _load_evaluated_link_contexts(
         "imported",
         "links",
         "interface",
+        "compile_links",
+        "compile_interface",
         "direct",
         "exclude",
     }
@@ -3243,7 +3573,14 @@ def _load_evaluated_link_contexts(
                 field: tuple(
                     edge for edge in fields[field].split("|") if edge
                 )
-                for field in ("links", "interface", "direct", "exclude")
+                for field in (
+                    "links",
+                    "interface",
+                    "compile_links",
+                    "compile_interface",
+                    "direct",
+                    "exclude",
+                )
             }
         node_sets = {
             frozenset(graph) for graph in consumer_graphs.values()
@@ -3337,6 +3674,7 @@ def _load_evaluated_link_contexts(
     def transitive_usage(
         graph: dict[str, dict[str, frozenset[str]]],
         roots: set[str],
+        edge_field: str = "interface",
     ) -> set[str]:
         reached: set[str] = set()
         pending = list(roots)
@@ -3345,7 +3683,7 @@ def _load_evaluated_link_contexts(
             if current in reached:
                 continue
             reached.add(current)
-            pending.extend(graph[current]["interface"] - reached)
+            pending.extend(graph[current][edge_field] - reached)
         return reached
 
     def consumer_link_closure(
@@ -3370,7 +3708,13 @@ def _load_evaluated_link_contexts(
             set(),
         )
         effective_direct -= excluded
-        return transitive_usage(graph, effective_direct)
+        link_usage = transitive_usage(graph, effective_direct)
+        compile_usage = transitive_usage(
+            graph,
+            set(graph[consumer]["compile_links"]),
+            "compile_interface",
+        )
+        return link_usage | compile_usage
 
     compile_config_by_audited = {
         configuration: (
@@ -4309,6 +4653,23 @@ def _scan_headers(
                 )
                 root = clang.lib.clang_getTranslationUnitCursor(tu)
                 clang.lib.clang_visitChildren(root, visitor_cb, None)
+                for finding in _collect_explicit_template_findings(
+                    header,
+                    (*context.arguments, *sysroot_args),
+                    context.directory,
+                    repo_root,
+                    active_observation_context,
+                ):
+                    explicit_key = (
+                        active_observation_context,
+                        finding.file,
+                        finding.offset,
+                        finding.usr,
+                        finding.canonical_return_type,
+                    )
+                    if explicit_key not in seen:
+                        seen.add(explicit_key)
+                        findings.append(finding)
             finally:
                 clang.lib.clang_disposeTranslationUnit(tu)
 
@@ -4818,6 +5179,23 @@ def _scan_sources(
                 root = clang.lib.clang_getTranslationUnitCursor(tu)
                 visitor_cb = clang._visitor_func_type(make_visitor(source.resolve()))
                 clang.lib.clang_visitChildren(root, visitor_cb, None)
+                for finding in _collect_explicit_template_findings(
+                    source,
+                    (*context.arguments, *sysroot_args),
+                    context.directory,
+                    repo_root,
+                    active_observation_context,
+                ):
+                    explicit_key = (
+                        active_observation_context,
+                        finding.file,
+                        finding.offset,
+                        finding.usr,
+                        finding.canonical_return_type,
+                    )
+                    if explicit_key not in seen:
+                        seen.add(explicit_key)
+                        findings.append(finding)
             finally:
                 clang.lib.clang_disposeTranslationUnit(tu)
     return violations, findings

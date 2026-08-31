@@ -140,14 +140,24 @@ class _RealLibclangTestCase(unittest.TestCase):
         return findings, structural_violations
 
     def _scan_source_fixture(
-        self, source: Path, allowed_closure: frozenset[Path], seen: set[tuple] | None = None
+        self,
+        source: Path,
+        allowed_closure: frozenset[Path],
+        seen: set[tuple] | None = None,
+        arguments: tuple[str, ...] = ("-std=c++23",),
+        external_roots: frozenset[Path] = frozenset(),
     ) -> tuple[list[str], list[ceh.Finding]]:
         source_abs = str(source.resolve())
         compile_commands = [
             {
                 "directory": str(self.scratch.resolve()),
                 "file": source_abs,
-                "command": f"c++ -std=c++23 -c {source_abs} -o {source_abs}.o",
+                "arguments": [
+                    "clang++",
+                    *arguments,
+                    "-c",
+                    source_abs,
+                ],
                 "output": str(
                     (self.scratch / f"CMakeFiles/fixture.dir/{source.name}.o").resolve()
                 ),
@@ -160,7 +170,7 @@ class _RealLibclangTestCase(unittest.TestCase):
             compile_commands,
             self.sysroot_args,
             self.repo_root,
-            frozenset(),
+            external_roots,
             allowed_closure,
             seen if seen is not None else set(),
         )
@@ -487,6 +497,78 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         }
         self.assertTrue({7, 9}.issubset(forbidden_lines))
         self.assertFalse(any(finding.line == 11 for finding in findings))
+
+    def test_external_explicit_instantiations_are_attributed_to_source_lines(
+        self,
+    ) -> None:
+        system_header = self._write(
+            "system/ExternalTemplates.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "struct Safe {};\n"
+            "using WireAlias = QJsonObject;\n"
+            "template<class T, class Default = QJsonObject>\n"
+            "int externalFunction() { return sizeof(T) + sizeof(Default); }\n"
+            "template<class T> int externalExtern() { return sizeof(T); }\n"
+            "template<class T> struct ExternalClass { T value; };\n"
+            "template<class T> struct ExternalSpecializedClass { T value; };\n"
+            "template<class T> struct ExternalMember {\n"
+            "  static int run() { return sizeof(T); }\n"
+            "};\n"
+            "template<class T> int externalSpecialization() { return sizeof(T); }\n"
+            "template<class T> int externalAlias() { return sizeof(T); }\n"
+            "template<class T> int externalSafe() { return sizeof(T); }\n",
+        )
+        source = self._write(
+            "ExternalInstantiations.cpp",
+            "#include <ExternalTemplates.h>\n"
+            "template int externalFunction<QJsonObject>();\n"
+            "extern template int externalExtern<QJsonObject>();\n"
+            "template class ExternalClass<QJsonObject>;\n"
+            "template <> struct ExternalSpecializedClass<QJsonObject> {\n"
+            "  QJsonObject value;\n"
+            "};\n"
+            "template int ExternalMember<QJsonObject>::run();\n"
+            "template <> int externalSpecialization<QJsonObject>() {\n"
+            "  return 0;\n"
+            "}\n"
+            "template int externalAlias<WireAlias>();\n"
+            "template int externalFunction<int>();\n"
+            "template int externalSafe<Safe>();\n"
+            "// template int externalAlias<QJsonObject>();\n"
+            'static const char *text = R"(template int externalAlias<QJsonObject>();)";\n',
+        )
+        violations, findings = self._scan_source_fixture(
+            source,
+            frozenset(),
+            arguments=(
+                "-std=c++23",
+                "-isystem",
+                str(system_header.parent),
+            ),
+            external_roots=frozenset({system_header.parent.resolve()}),
+        )
+        self.assertEqual(violations, [])
+        explicit = [
+            finding
+            for finding in findings
+            if "kind=explicit-template-instantiation"
+            in finding.canonical_return_type
+        ]
+        self.assertEqual(
+            {finding.line for finding in explicit},
+            {2, 3, 4, 5, 8, 9, 12, 13},
+        )
+        self.assertTrue(
+            all(
+                finding.file == "ExternalInstantiations.cpp"
+                and not finding.body_surface
+                for finding in explicit
+            )
+        )
+        self.assertFalse(
+            any(finding.line in {14, 15, 16} for finding in explicit)
+        )
 
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
         source = self._write(
@@ -2071,6 +2153,9 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             "#endif\n"
             "#ifdef EXCLUDED_ENCODER\n"
             "QJsonObject excludedEncoder();\n"
+            "#endif\n"
+            "#ifdef COMPILE_CONTEXT_ENCODER\n"
+            "QJsonObject compileOnlyEncoder();\n"
             "#endif\n",
         )
         self._write(
@@ -2081,6 +2166,20 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         self._write("src/ConsumerTwo.cpp", "int main() { return 0; }\n")
         self._write("src/ConsumerDirect.cpp", "int main() { return 0; }\n")
         self._write("src/ConsumerExcluded.cpp", "int main() { return 0; }\n")
+        self._write(
+            "src/ConsumerCompile.cpp",
+            "#ifndef COMPILE_CONTEXT_ENCODER\n"
+            '#error "compile-only usage requirements were not inherited"\n'
+            "#endif\n"
+            "int main() { return 0; }\n",
+        )
+        self._write(
+            "src/ConsumerCompileSafe.cpp",
+            "#ifdef COMPILE_CONTEXT_ENCODER\n"
+            '#error "disabled compile-only usage leaked into safe consumer"\n'
+            "#endif\n"
+            "int main() { return 0; }\n",
+        )
         cmake = (
             "cmake_minimum_required(VERSION 3.25)\n"
             "project(ClosedHeaderUniverse CXX)\n"
@@ -2094,7 +2193,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_library(wire_interface INTERFACE)\n"
             + 'target_sources(wire_interface INTERFACE FILE_SET wire_headers TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/InterfaceWire.h")\n'
             + 'target_sources(wire_interface INTERFACE "${CMAKE_SOURCE_DIR}/src/InterfaceSource.cpp")\n'
-            + "target_compile_definitions(wire_interface INTERFACE INTERFACE_OWN_ENCODER)\n"
+            + "target_compile_definitions(wire_interface INTERFACE INTERFACE_OWN_ENCODER COMPILE_CONTEXT_ENCODER)\n"
             + "add_library(WireAlias ALIAS wire_interface)\n"
             + "add_library(wire_bridge INTERFACE)\n"
             + "target_link_libraries(wire_bridge INTERFACE WireAlias)\n"
@@ -2128,6 +2227,16 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "set_property(TARGET consumer_excluded PROPERTY ENABLE_DIRECT TRUE)\n"
             + "set_property(TARGET consumer_excluded PROPERTY DISABLE_DIRECT TRUE)\n"
             + "target_compile_definitions(consumer_excluded PRIVATE EXCLUDED_ENCODER)\n"
+            + "add_library(compile_provider INTERFACE)\n"
+            + 'target_link_libraries(compile_provider INTERFACE "$<$<BOOL:$<TARGET_PROPERTY:ENABLE_COMPILE_WIRE>>:$<COMPILE_ONLY:wire_interface>>")\n'
+            + "add_library(ImportedCompile INTERFACE IMPORTED)\n"
+            + 'set_property(TARGET ImportedCompile PROPERTY INTERFACE_LINK_LIBRARIES "$<IF:$<CONFIG:Debug>,$<COMPILE_ONLY:compile_provider>,$<IF:$<CONFIG:Release>,$<COMPILE_ONLY:$<TARGET_NAME_IF_EXISTS:compile_provider>>,$<COMPILE_ONLY:$<JOIN:compile_;provider,>>>>")\n'
+            + "add_executable(consumer_compile src/ConsumerCompile.cpp)\n"
+            + "target_link_libraries(consumer_compile PRIVATE ImportedCompile)\n"
+            + "set_property(TARGET consumer_compile PROPERTY ENABLE_COMPILE_WIRE TRUE)\n"
+            + "add_executable(consumer_compile_safe src/ConsumerCompileSafe.cpp)\n"
+            + "target_link_libraries(consumer_compile_safe PRIVATE ImportedCompile)\n"
+            + "set_property(TARGET consumer_compile_safe PROPERTY ENABLE_COMPILE_WIRE FALSE)\n"
             + 'file(WRITE "${CMAKE_BINARY_DIR}/GeneratedWire.h" "struct QJsonObject {}; QJsonObject generatedHeaderEncoder();\\n")\n'
             + 'target_sources(app PUBLIC FILE_SET app_late_generated TYPE HEADERS BASE_DIRS "${CMAKE_BINARY_DIR}" FILES "${CMAKE_BINARY_DIR}/GeneratedWire.h")\n'
             + "add_library(Imported::Legitimate INTERFACE IMPORTED)\n"
@@ -2136,12 +2245,15 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + 'arkham_append_encoder_hygiene_target(TARGET consumer_two CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET consumer_direct CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET consumer_excluded CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET consumer_compile CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET consumer_compile_safe CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET wire_interface CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET wire_bridge CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET exempt_bridge CLASSIFICATION EXTERNAL EXEMPT_REASON "test imported/exempt graph wrapper" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET direct_provider CLASSIFICATION EXTERNAL EXEMPT_REASON "test direct injection provider" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET direct_bridge CLASSIFICATION EXTERNAL EXEMPT_REASON "test direct injection bridge" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET exclude_provider CLASSIFICATION EXTERNAL EXEMPT_REASON "test direct exclusion provider" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET compile_provider CLASSIFICATION EXTERNAL EXEMPT_REASON "test compile-only provider" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + self._register_manifests("domain", "foundation")
         )
         self._write("CMakeLists.txt", cmake)
@@ -2154,6 +2266,8 @@ class ProductionCMakeSeamTests(unittest.TestCase):
                 "consumer_two",
                 "consumer_direct",
                 "consumer_excluded",
+                "consumer_compile",
+                "consumer_compile_safe",
             ],
             multi_config=True,
         )
@@ -2173,6 +2287,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
                 "consumerRelWithEncoder",
                 "consumerTwoEncoder",
                 "directEncoder",
+                "compileOnlyEncoder",
                 "interfaceSourceEncoder",
                 "generatedHeaderEncoder",
             },
@@ -2214,6 +2329,32 @@ class ProductionCMakeSeamTests(unittest.TestCase):
                 ("consumer_excluded", configuration),
                 evaluated_contexts["wire_interface"],
             )
+            self.assertIn(
+                ("consumer_compile", configuration),
+                evaluated_contexts["wire_interface"],
+            )
+            self.assertNotIn(
+                ("consumer_compile_safe", configuration),
+                evaluated_contexts["wire_interface"],
+            )
+        compile_contexts = ceh._compile_contexts_for_source(
+            commands, self.root / "src/ConsumerCompile.cpp"
+        )
+        safe_contexts = ceh._compile_contexts_for_source(
+            commands, self.root / "src/ConsumerCompileSafe.cpp"
+        )
+        self.assertTrue(
+            all(
+                "-DCOMPILE_CONTEXT_ENCODER" in context.arguments
+                for context in compile_contexts
+            )
+        )
+        self.assertTrue(
+            all(
+                "-DCOMPILE_CONTEXT_ENCODER" not in context.arguments
+                for context in safe_contexts
+            )
+        )
         stale = (
             self.build
             / "generated/target_link_graph/Debug/stale.txt"
@@ -2251,7 +2392,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_library(foundation STATIC src/Foundation.cpp)\n"
             'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
             + "add_library(ImportedBridge INTERFACE IMPORTED)\n"
-            + 'set_property(TARGET ImportedBridge PROPERTY INTERFACE_LINK_LIBRARIES "$<LOWER_CASE:NOT_ENUMERATED>")\n'
+            + 'set_property(TARGET ImportedBridge PROPERTY INTERFACE_LINK_LIBRARIES "$<COMPILE_ONLY:$<LOWER_CASE:NOT_ENUMERATED>>")\n'
             + "add_executable(app src/main.cpp)\n"
             + "target_link_libraries(app PRIVATE ImportedBridge)\n"
             + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
