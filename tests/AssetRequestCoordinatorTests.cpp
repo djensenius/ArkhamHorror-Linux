@@ -3266,6 +3266,92 @@ void AssetRequestCoordinatorTests::
 }
 
 void AssetRequestCoordinatorTests::
+    threeWayCoalescedCacheDecodeGroupPublishesUsingTheHighestMemberTokenNotTheLeaders() {
+  // Independent cumulative re-review (HIGH, repeat finding,
+  // "supersession uses highest currently outstanding... Maintain
+  // monotonic latestIssued watermark"): with THREE simultaneously-
+  // joining waiters, the group's shared representative token must be
+  // updated to the HIGHEST of all three as each subsequent joiner's own
+  // token is minted (strictly increasing per key), and every waiter --
+  // including the FIRST (leader) and SECOND, not just the LAST -- must
+  // be re-synced to that final, highest value before delivery. If the
+  // group instead kept using the leader's own (numerically lowest)
+  // token, AssetCache::tryApplyKeyGenerationLocked()'s strictly
+  // monotonic ceiling (raised past it the instant the second waiter's
+  // own token was minted) would reject delivery for the whole group,
+  // and every waiter would incorrectly fall back to a real network
+  // fetch instead of the one shared cache decode.
+  MockHttpServer server;
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam);
+  AssetCache::Config cacheConfig;
+  cacheConfig.directory = m_tempDirPath;
+  AssetCache cache(cacheConfig);
+
+  AssetKey keyA =
+      makeKey(QStringLiteral("http://127.0.0.1:%1").arg(server.port()));
+  keyA.locale = QString();
+  AssetKey keyB = keyA;
+  keyB.locale = QStringLiteral("fr");
+  AssetKey keyC = keyA;
+  keyC.locale = QStringLiteral("de");
+  QVERIFY(!(keyA == keyB));
+  QVERIFY(!(keyA == keyC));
+  QVERIFY(!(keyB == keyC));
+
+  const auto candidates = AssetLocator::resolveCandidates(keyA);
+  QVERIFY(bool(candidates));
+  const QString cacheKey = AssetCache::cacheKeyFor(candidates->first().url);
+
+  AssetCache::CachedEntry preSeeded;
+  preSeeded.encodedBytes = encodePng(8, 8);
+  preSeeded.contentType = QStringLiteral("image/png");
+  preSeeded.dimensions = QSize(8, 8);
+  cache.store(cacheKey, preSeeded);
+
+  AssetRequestCoordinator coordinator(cache, fetcher);
+
+  std::optional<Result> resultA;
+  std::optional<Result> resultB;
+  std::optional<Result> resultC;
+  coordinator.request(keyA, [&](Result r) { resultA = std::move(r); });
+  coordinator.request(keyB, [&](Result r) { resultB = std::move(r); });
+  coordinator.request(keyC, [&](Result r) { resultC = std::move(r); });
+
+  // All three genuinely joined ONE shared pending decode group -- checked
+  // synchronously, before the event loop has had any chance to run the
+  // queued completeCoalescedCacheDecode() call.
+  QCOMPARE(coordinator.pendingCacheDecodeGroupCountForTesting(), 1);
+  QCOMPARE(coordinator.pendingCacheDecodeWaiterCountForTesting(
+               cacheKey, AssetFormat::Png),
+           3);
+
+  QVERIFY(QTest::qWaitFor(
+      [&]() {
+        return resultA.has_value() && resultB.has_value() &&
+               resultC.has_value();
+      },
+      5000));
+
+  QVERIFY2(bool(*resultA), qPrintable(resultA->error().message));
+  QVERIFY2(bool(*resultB), qPrintable(resultB->error().message));
+  QVERIFY2(bool(*resultC), qPrintable(resultC->error().message));
+  QCOMPARE((**resultA).decodedImage.size(), QSize(8, 8));
+  QCOMPARE((**resultB).decodedImage.size(), QSize(8, 8));
+  QCOMPARE((**resultC).decodedImage.size(), QSize(8, 8));
+
+  // The decisive assertions: exactly ONE real decode ran for all three
+  // waiters, and none of them fell back to a real network fetch (which
+  // is exactly what a spurious SkippedStaleGeneration rejection for the
+  // leader's or second waiter's own stale token would have caused).
+  QCOMPARE(coordinator.realDecodeCallCountForTesting(), 1);
+  QCOMPARE(server.requestCount(QStringLiteral("/img/arkham/sets/valid01.png")),
+           0);
+  QCOMPARE(coordinator.pendingCacheDecodeGroupCountForTesting(), 0);
+}
+
+void AssetRequestCoordinatorTests::
     cancellingEveryWaiterInACoalescedCacheDecodeGroupPreventsTheDecodeEntirely() {
   // Round-9+ review item 3/7 ("fully cancelled PendingCacheDecode groups
   // retained and still decode"): unlike the test above (one survivor

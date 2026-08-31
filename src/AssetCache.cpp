@@ -1632,8 +1632,39 @@ std::optional<QByteArray> readEntireProcFileRaw(const char *path) {
 // between this descriptor's open() and this read of mountinfo) or an
 // inconsistency this project has no way to explain, so it fails closed
 // rather than trusting a partially-inconsistent record.
+//
+// Independent cumulative re-review (MEDIUM, repeat finding across
+// several rounds, "home trust... arbitrary same-device bind mount still
+// passes because parent/root/mountpoint/source/options/super-options
+// ignored... authenticate each permitted transition against an
+// independently established expected source/root/device/parent
+// topology"): `expectedParentDevice` (the CALLER-already-validated
+// mount identity's own device -- i.e. the mount this walk is
+// transitioning FROM, never re-derived here) additionally binds this
+// mount's own mountinfo PARENT-ID field (field 1) back to that exact
+// ancestor. mountinfo's parent-id is the kernel's own record of which
+// OTHER mount table entry this mount is grafted directly onto -- an
+// entirely independent, kernel-maintained topology fact, never
+// something this project computed or could be spoofed by a caller
+// supplying an arbitrary path string. Requiring that the PARENT
+// mount's OWN recorded device match `expectedParentDevice` proves this
+// mount is genuinely attached directly to the ancestor this walk just
+// validated, not some unrelated, stacked, or orphaned mount whose
+// MOUNTPOINT PATH merely happens to coincide with this walk's current
+// position (a real ambiguity mountinfo's own path field alone cannot
+// resolve, since multiple mounts can share a mountpoint path when
+// stacked -- exactly why this whole scheme avoids path-string
+// correlation everywhere else too). This closes the residual "arbitrary
+// same-device bind mount still passes" gap ALONGSIDE (never as a
+// substitute for) the caller's own separate requirement that a
+// permitted transition also represent a genuine DEVICE change (see
+// resolveHomeDirectoryNoFollow()'s own comment) -- together, a
+// same-device bind mount of some unrelated directory can never satisfy
+// both a real device change AND a parent-id chain that resolves back to
+// the exact ancestor already walked.
 bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
-                                          quint64 expectedDevice) {
+                                          quint64 expectedDevice,
+                                          quint64 expectedParentDevice) {
   if (g_forceMountTransitionPolicyOverrideActiveForTesting.load(
           std::memory_order_acquire)) {
     return g_forceMountTransitionPolicyOverrideValueForTesting.load(
@@ -1672,6 +1703,11 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
     if (!mountIdOk || lineMountId != mountId) {
       continue;
     }
+    bool parentIdOk = false;
+    const quint64 lineParentId = beforeDash.at(1).toULongLong(&parentIdOk);
+    if (!parentIdOk) {
+      continue;
+    }
     const QStringList majorMinor =
         beforeDash.at(2).split(QLatin1Char(':'), Qt::SkipEmptyParts);
     if (majorMinor.size() != 2) {
@@ -1692,6 +1728,71 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
                  << "does not match this descriptor's own st_dev -- refusing "
                     "(possible mount-table race between open() and this "
                     "read, or an unexplained inconsistency)";
+      return false;
+    }
+    // Independently resolve the PARENT mount-id's own record (a second,
+    // entirely separate scan of the same already-read mountinfo
+    // content) and require ITS device to match the ancestor this walk
+    // already validated -- see this function's own top comment for the
+    // full "arbitrary same-device bind mount" rationale.
+    bool parentDeviceFound = false;
+    bool parentDeviceMatches = false;
+    for (const QByteArray &parentRawLine : rawLines) {
+      if (parentRawLine.isEmpty()) {
+        continue;
+      }
+      const QString parentLine = QString::fromUtf8(parentRawLine);
+      const int parentDashIndex = parentLine.indexOf(QStringLiteral(" - "));
+      if (parentDashIndex < 0) {
+        continue;
+      }
+      const QStringList parentBeforeDash =
+          parentLine.left(parentDashIndex)
+              .split(QLatin1Char(' '), Qt::SkipEmptyParts);
+      if (parentBeforeDash.size() < 5) {
+        continue;
+      }
+      bool candidateMountIdOk = false;
+      const quint64 candidateMountId =
+          parentBeforeDash.at(0).toULongLong(&candidateMountIdOk);
+      if (!candidateMountIdOk || candidateMountId != lineParentId) {
+        continue;
+      }
+      const QStringList parentMajorMinor =
+          parentBeforeDash.at(2).split(QLatin1Char(':'), Qt::SkipEmptyParts);
+      if (parentMajorMinor.size() != 2) {
+        continue;
+      }
+      bool parentMajorOk = false;
+      bool parentMinorOk = false;
+      const unsigned int parentMajor =
+          parentMajorMinor.at(0).toUInt(&parentMajorOk);
+      const unsigned int parentMinor =
+          parentMajorMinor.at(1).toUInt(&parentMinorOk);
+      if (!parentMajorOk || !parentMinorOk) {
+        continue;
+      }
+      parentDeviceFound = true;
+      const quint64 parentLineDevice =
+          static_cast<quint64>(::makedev(parentMajor, parentMinor));
+      parentDeviceMatches = (parentLineDevice == expectedParentDevice);
+      break;
+    }
+    if (!parentDeviceFound) {
+      qWarning() << "AssetCache: mountinfo mount id" << mountId
+                 << "references parent-id" << lineParentId
+                 << "which has no resolvable mountinfo entry of its own -- "
+                    "refusing";
+      return false;
+    }
+    if (!parentDeviceMatches) {
+      qWarning()
+          << "AssetCache: mountinfo mount id" << mountId << "parent-id"
+          << lineParentId
+          << "does not resolve to the ancestor mount this walk already "
+             "validated -- refusing (possible stacked/orphaned mount whose "
+             "mountpoint path merely coincides with this walk position, or "
+             "an arbitrary same-device bind mount)";
       return false;
     }
 #endif
@@ -1766,7 +1867,8 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
 // strictly preferred over (and, whenever available, entirely replaces)
 // matching mountinfo by a re-resolved path string.
 bool mountTransitionIsIndependentlyPolicyQualified(
-    int fd, const MountIdentity &identity, bool isFinalAccountHomeTransition) {
+    int fd, const MountIdentity &identity, bool isFinalAccountHomeTransition,
+    const MountIdentity &parentIdentity) {
   const bool ownershipOk =
       componentPassesOwnershipModePolicy(fd, isFinalAccountHomeTransition);
   if (!ownershipOk) {
@@ -1779,9 +1881,38 @@ bool mountTransitionIsIndependentlyPolicyQualified(
     return false;
   }
 #if defined(__linux__)
+  // Independent cumulative re-review (MEDIUM, repeat finding, "home
+  // trust... arbitrary same-device bind mount still passes"): a
+  // GENUINE distinct, dedicated partition (a real "/home" mount, or a
+  // SteamOS-style "/home/deck" split) is, by definition, backed by a
+  // distinct block device -- that is what a "partition" or separate
+  // filesystem mount fundamentally means. A mount whose device is
+  // IDENTICAL to the ancestor it is grafted onto, yet whose mount-id
+  // nonetheless differs (the only way `!sameMount` can be true at all;
+  // see the caller's own comment), can only be a BIND mount of some
+  // OTHER directory already living on that very same filesystem --
+  // never a real, independent, distinctly-provisioned deployment
+  // partition. Such same-device "transitions" carry zero independent
+  // topology evidence: fstype, ownership, and mode are all trivially
+  // inherited from the very filesystem the walk was already on, so
+  // ANY directory an attacker (already needing root to satisfy the
+  // ancestor ownership policy above) can bind-mount there would
+  // otherwise pass every other check unchanged. Refusing this
+  // outright -- independent of, and prior to, the mountinfo
+  // filesystem-type/parent-topology check below -- is the only
+  // discriminator that actually distinguishes a real dedicated
+  // partition from an arbitrary same-device bind mount.
+  if (identity.device == parentIdentity.device) {
+    qWarning() << "AssetCache: mount transition destination reports the "
+                  "SAME device as its parent despite a differing mount id "
+                  "-- refusing (this can only be a same-device bind mount "
+                  "of an unrelated directory, never a genuine distinct "
+                  "partition)";
+    return false;
+  }
   if (identity.hasMountId) {
-    return mountIdHasTrustedLocalFilesystemType(identity.mountId,
-                                                identity.device);
+    return mountIdHasTrustedLocalFilesystemType(
+        identity.mountId, identity.device, parentIdentity.device);
   }
   // Independent cumulative re-review (repeat finding, MEDIUM/HIGH
   // across several rounds, "remove pathname fallback when
@@ -2021,7 +2152,7 @@ std::optional<std::pair<int, MountIdentity>> resolveHomeDirectoryNoFollow() {
       // it is ever granted.
       if (!transitionMayBeAttemptedHere ||
           !mountTransitionIsIndependentlyPolicyQualified(
-              nextFd, nextMount, isFinalAccountHomeComponent)) {
+              nextFd, nextMount, isFinalAccountHomeComponent, currentMount)) {
         qWarning() << "AssetCache: refusing to treat" << home
                    << "as a trusted home directory anchor -- component"
                    << component
@@ -2460,6 +2591,15 @@ struct RootAuthority {
   QCache<QString, AssetCache::CachedEntry> memory;
   QHash<QString, quint64> keyIssuedGeneration;
   QHash<QString, quint64> keyAppliedGeneration;
+  // Independent cumulative re-review (HIGH, repeat finding -- see
+  // AssetCache::latestCommittedGenerationLocked()'s own comment for the
+  // full rationale): the shared ceiling that ONLY a real,
+  // write-intending attempt's own designated token (never a discarded
+  // probe) ever advances -- distinct from keyIssuedGeneration, which
+  // every mere issuance mint (including a probe) advances. Repointed
+  // alongside keyIssuedGeneration/keyAppliedGeneration above for exactly
+  // the same cross-instance sharing reason.
+  QHash<QString, quint64> keyCommittedGeneration;
   // Independent cumulative re-review (HIGH, "root authority... m_key
   // issued/applied maps never prune"): shared "last touched" real
   // steady-clock-ms bookkeeping for
@@ -2869,6 +3009,7 @@ AssetCache::AssetCache(Config config) : m_config(std::move(config)) {
           m_memory = &authority->memory;
           m_keyIssuedGeneration = &authority->keyIssuedGeneration;
           m_keyAppliedGeneration = &authority->keyAppliedGeneration;
+          m_keyCommittedGeneration = &authority->keyCommittedGeneration;
           // Independent cumulative re-review (HIGH, "root authority...
           // m_key issued/applied maps never prune"): repoint the shared
           // touch-order bookkeeping too, exactly like the two fields
@@ -3204,7 +3345,17 @@ quint64 AssetCache::issueKeyGeneration(const QString &key) {
     return kUnconditionalGeneration;
   }
   QMutexLocker locker(m_mutex);
-  return issueKeyGenerationLocked(key);
+  const quint64 token = issueKeyGenerationLocked(key);
+  // Independent cumulative re-review (HIGH, repeat finding -- see
+  // latestCommittedGenerationLocked()'s own comment for the full
+  // rationale): this bare entry point is the ONLY mint site that also
+  // commits, because every one of its callers, by issueKeyGeneration()'s
+  // own header comment, retains and eventually threads this exact token
+  // through to a real mutation -- unlike snapshotAndIssueGeneration()'s
+  // internal mint just below, which may be discarded the instant the
+  // caller decides to defer to an already-in-flight attempt instead.
+  commitKeyGenerationLocked(key, token);
+  return token;
 }
 
 AssetCache::KeyGenerationSnapshot
@@ -3333,17 +3484,15 @@ quint64 AssetCache::currentKeyGenerationLocked(const QString &key) const {
   return m_keyAppliedGeneration->value(key, 0);
 }
 
-quint64
-AssetCache::highestOutstandingGenerationLocked(const QString &key) const {
-  const auto it = m_keyOutstandingGeneration->constFind(key);
-  if (it == m_keyOutstandingGeneration->constEnd() || it->isEmpty()) {
-    return 0;
+quint64 AssetCache::latestCommittedGenerationLocked(const QString &key) const {
+  return m_keyCommittedGeneration->value(key, 0);
+}
+
+void AssetCache::commitKeyGenerationLocked(const QString &key, quint64 token) {
+  quint64 &slot = (*m_keyCommittedGeneration)[key];
+  if (token > slot) {
+    slot = token;
   }
-  quint64 highest = 0;
-  for (const quint64 token : *it) {
-    highest = (std::max)(highest, token);
-  }
-  return highest;
 }
 
 bool AssetCache::tryApplyKeyGenerationLocked(const QString &key,
@@ -3355,46 +3504,49 @@ bool AssetCache::tryApplyKeyGenerationLocked(const QString &key,
     // participant might still legitimately need to satisfy.
     return true;
   }
-  // Independent cumulative re-review (HIGH, repeat finding, "tryApply
-  // compares highest APPLIED, not latest issued... Gen1 404 after Gen2
-  // issuance is accepted and can install tombstone/advance fallback"):
-  // comparing ONLY against the previously-APPLIED watermark (this
-  // method's entire prior behavior, restored from an even earlier
-  // over-correction that compared against "highest EVER issued" and
-  // reintroduced a livelock -- see highestOutstandingGenerationLocked()'s
-  // own comment for exactly why that reading was wrong) is insufficient
-  // on its own: it leaves a real window, between two genuinely
-  // concurrent operations for the SAME key (e.g. a conditional
-  // revalidation of an already-cached candidate racing a fresh,
-  // unconditional fetch for that same candidate resolved via a
-  // DIFFERENT logical AssetKey -- these legitimately use different
-  // CandidateAttempt identities and so are never coalesced onto one
-  // HTTP request, see AssetRequestCoordinator::candidateAttemptKey()'s
-  // own comment), in which the OLDER token (Gen1) can still
-  // successfully publish (install a negative-404 tombstone, or store a
-  // body) simply because NEITHER token has applied yet, even though a
-  // strictly NEWER token (Gen2) is already outstanding and about to
-  // decide something more authoritative. A third reader arriving in
-  // that exact window would observe Gen1's now-superseded verdict as
-  // if it were final.
+  // Independent cumulative re-review (HIGH, repeat finding, "supersession
+  // uses highest currently outstanding; cancel/release gen2 makes
+  // delayed gen1 authoritative again" -- and, on the exact same finding
+  // recurring against a first "highest ever ISSUED" fix, "second/third
+  // joiner's own mere issuance would permanently and spuriously fail the
+  // whole group's eventual publish" plus several coalesced-revalidation
+  // regressions): comparing against the highest token currently
+  // OUTSTANDING (the original behavior) is insufficient -- that ceiling
+  // SHRINKS the instant a blocking token is released, even if that
+  // token's own operation never applied or published anything at all,
+  // letting a stale older token retroactively become authoritative
+  // again. Comparing instead against the raw highest-ever-ISSUED counter
+  // (the first fix) is ALSO insufficient in the other direction: that
+  // counter advances on EVERY mint, including a probe
+  // (snapshotAndIssueGeneration()) that is immediately discarded without
+  // ever being retained as an operation's own token -- which would
+  // permanently and incorrectly foreclose a genuinely still-live, lower-
+  // numbered REAL attempt for the same key, with no competing write ever
+  // having actually occurred.
   //
-  // Additionally requiring `issuedGeneration` to be no less than the
-  // highest token CURRENTLY OUTSTANDING for `key` closes this window
-  // without reintroducing the livelock the ever-issued reading caused
-  // -- see highestOutstandingGenerationLocked()'s own comment for the
-  // full argument for why this ceiling, unlike "ever issued", cannot
-  // grow without bound. `issuedGeneration` itself is always still a
-  // member of the outstanding set at the moment this very call runs
-  // (releaseKeyGenerationLocked() for THIS token has not yet been
-  // called -- every caller releases exactly once, always strictly
-  // after its own store()/invalidateAndRecordNegative404()/etc. call
-  // returns), so this added condition can only ever reject on account
-  // of a DIFFERENT, strictly greater outstanding token -- never on
-  // account of itself.
+  // Comparing instead against `latestCommittedGenerationLocked(key)` --
+  // see its own comment for the full contract -- closes both gaps: it
+  // only ever advances when a real, write-intending attempt's own
+  // designated token is committed (via issueKeyGeneration() or an
+  // invalidate()'s own advanceKeyGenerationPastAllIssuedLocked()), never
+  // merely because SOME token was issued or released. Once such a token
+  // is committed, this permanently forecloses every strictly older token
+  // for the same key, regardless of whether that newer attempt itself
+  // ever applies, is cancelled, or is destroyed -- while a never-
+  // retained probe token commits nothing and so can never falsely
+  // supersede anything.
+  //
+  // `issuedGeneration` itself is always
+  // `<= latestCommittedGenerationLocked(key)` whenever it was itself
+  // obtained via issueKeyGeneration() (which commits its own token
+  // before returning it, so the ceiling can only have grown further
+  // since, never shrunk relative to it) -- so this check can only ever
+  // reject on account of some OTHER, strictly greater COMMITTED
+  // issuance having since occurred, never on account of itself.
   const quint64 appliedWatermark = currentKeyGenerationLocked(key);
-  const quint64 outstandingCeiling = highestOutstandingGenerationLocked(key);
+  const quint64 committedCeiling = latestCommittedGenerationLocked(key);
   if (issuedGeneration < appliedWatermark ||
-      issuedGeneration < outstandingCeiling) {
+      issuedGeneration < committedCeiling) {
     return false;
   }
   (*m_keyAppliedGeneration)[key] = issuedGeneration;
@@ -3405,15 +3557,26 @@ bool AssetCache::tryApplyKeyGenerationLocked(const QString &key,
 void AssetCache::advanceKeyGenerationPastAllIssuedLocked(const QString &key) {
   const quint64 issuedCeiling = m_keyIssuedGeneration->value(key, 0);
   const quint64 appliedCeiling = m_keyAppliedGeneration->value(key, 0);
-  // Strictly past whichever of "the highest token ever issued" or "the
-  // highest token ever applied" is greater -- either one could already
-  // exceed the other (an issued-but-not-yet-applied token is common; an
-  // applied value exceeding the issued ceiling should never happen in
-  // practice, since applying REQUIRES an issued token, but is guarded
-  // defensively here regardless) -- so NO already-issued token can ever
-  // satisfy `>= ` this new watermark afterward.
-  const quint64 newWatermark = std::max(issuedCeiling, appliedCeiling) + 1;
+  const quint64 committedCeiling = m_keyCommittedGeneration->value(key, 0);
+  // Strictly past whichever of "the highest token ever issued", "the
+  // highest token ever applied", or "the highest token ever committed"
+  // is greatest -- any one of these could already exceed the others (an
+  // issued-but-not-yet-applied-or-committed token is common; an applied
+  // or committed value exceeding the issued ceiling should never happen
+  // in practice, since both require an issued token, but is guarded
+  // defensively here regardless) -- so NO already-issued OR already-
+  // committed token can ever satisfy `>= ` this new watermark afterward.
+  const quint64 newWatermark =
+      std::max({issuedCeiling, appliedCeiling, committedCeiling}) + 1;
   (*m_keyAppliedGeneration)[key] = newWatermark;
+  // Independent cumulative re-review (HIGH, repeat finding -- see
+  // latestCommittedGenerationLocked()'s own comment): invalidate() must
+  // permanently foreclose every already-issued token exactly like a
+  // committed newer real attempt would -- via this exact same ceiling
+  // tryApplyKeyGenerationLocked() now reads -- so this call is itself
+  // treated as committing `newWatermark` too, not merely bumping the
+  // applied watermark.
+  commitKeyGenerationLocked(key, newWatermark);
   // Keep the issuance counter itself in sync: without this, a FUTURE
   // issueKeyGeneration() call for this same key would keep minting
   // values starting from the OLD (now stale) issuedCeiling, which could
@@ -3446,13 +3609,34 @@ void AssetCache::touchAndPruneKeyGenerationMapsLocked(const QString &key) {
   if (m_keyIssuedGeneration->size() <= m_maxTrackedKeyGenerationEntries) {
     return;
   }
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // prunes but 15-minute idle threshold leaves >4096 young entries
+  // forever when activity stops... Hard cap must immediately evict
+  // eligible non-outstanding entries regardless soft idle"): once the
+  // tracked map exceeds the unconditional backstop ceiling
+  // (m_maxTrackedKeyGenerationEntriesHardCap -- see its own comment),
+  // eligibility below drops the idle-time gate entirely: ONLY condition
+  // (1) (no currently-outstanding token) still applies. This guarantees
+  // THIS very sweep -- triggered synchronously by the release/issue
+  // call that pushed the map over the hard cap -- can bound its size on
+  // its own, regardless of how recently every excess key happened to be
+  // last touched, closing the exact gap a single burst of activity
+  // (many distinct keys, each released before any later traffic ever
+  // arrives) left open under the production (15-real-minute) idle
+  // threshold: previously, no future call was guaranteed to ever occur
+  // that could sweep those young entries at all. Below the hard cap,
+  // the existing softer, idle-throttled eligibility (both conditions)
+  // still applies unchanged, so ordinary, gradually-idling traffic
+  // keeps its idle-gated behavior in the common case.
+  const bool overHardCap =
+      m_keyIssuedGeneration->size() > m_maxTrackedKeyGenerationEntriesHardCap;
   // Gather eviction candidates: keys with NO currently-outstanding
-  // (issued-but-not-yet-released) token AND idle at least
-  // m_keyGenerationIdleEvictionThresholdMs -- see this method's own
-  // declaration comment in AssetCache.h for the full rationale on why
-  // BOTH conditions are required. Sorted oldest-touched first so
-  // eviction proceeds in genuine least-recently-used order among
-  // eligible keys.
+  // (issued-but-not-yet-released) token AND, unless overHardCap (see
+  // above), idle at least m_keyGenerationIdleEvictionThresholdMs -- see
+  // this method's own declaration comment in AssetCache.h for the full
+  // rationale on why condition (1) is always required. Sorted
+  // oldest-touched first so eviction proceeds in genuine
+  // least-recently-used order among eligible keys.
   QVector<QString> candidates;
   candidates.reserve(m_keyIssuedGeneration->size());
   for (auto it = m_keyIssuedGeneration->constBegin();
@@ -3464,10 +3648,13 @@ void AssetCache::touchAndPruneKeyGenerationMapsLocked(const QString &key) {
         !outstandingIt->isEmpty()) {
       continue; // A genuinely outstanding token -- never evict.
     }
-    const qint64 lastTouchMs =
-        m_keyGenerationLastTouchSteadyMs->value(candidateKey, nowMs);
-    if (nowMs - lastTouchMs < m_keyGenerationIdleEvictionThresholdMs) {
-      continue; // Not idle long enough yet.
+    if (!overHardCap) {
+      const qint64 lastTouchMs =
+          m_keyGenerationLastTouchSteadyMs->value(candidateKey, nowMs);
+      if (nowMs - lastTouchMs < m_keyGenerationIdleEvictionThresholdMs) {
+        continue; // Not idle long enough yet, and the hard cap isn't
+                  // exceeded, so the softer throttle still applies.
+      }
     }
     candidates.append(candidateKey);
   }
@@ -3482,6 +3669,7 @@ void AssetCache::touchAndPruneKeyGenerationMapsLocked(const QString &key) {
     }
     m_keyIssuedGeneration->remove(evictKey);
     m_keyAppliedGeneration->remove(evictKey);
+    m_keyCommittedGeneration->remove(evictKey);
     m_keyGenerationLastTouchSteadyMs->remove(evictKey);
     // Defensive cleanup only: releaseKeyGenerationLocked() already
     // erases a key's entry entirely once its outstanding set becomes
@@ -5263,6 +5451,12 @@ int AssetCache::trackedKeyGenerationEntryCountForTesting() const {
   return m_keyIssuedGeneration->size();
 }
 
+void AssetCache::setMaxTrackedKeyGenerationEntriesHardCapForTesting(
+    int maxEntries) {
+  m_maxTrackedKeyGenerationEntriesHardCap =
+      maxEntries > 0 ? maxEntries : kMaxTrackedKeyGenerationEntriesHardCap;
+}
+
 bool AssetCache::hasNegative404ForTesting(const QString &key,
                                           qint64 nowMonotonicMs) const {
   QMutexLocker locker(m_mutex);
@@ -5334,7 +5528,8 @@ bool AssetCache::resolveTrustedDirectoryNoFollowForTesting(
 
 std::optional<bool>
 AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
-    const QString &directoryPath, bool isFinalAccountHomeTransition) {
+    const QString &directoryPath, bool isFinalAccountHomeTransition,
+    const QString &parentDirectoryPath) {
 #if defined(Q_OS_UNIX)
   const QByteArray pathUtf8 = directoryPath.toUtf8();
   const int fd = ::open(pathUtf8.constData(),
@@ -5343,13 +5538,36 @@ AssetCache::mountTransitionIsIndependentlyPolicyQualifiedForTesting(
     return std::nullopt;
   }
   const MountIdentity identity = mountIdentityForFd(fd);
+  MountIdentity parentIdentity;
+  if (parentDirectoryPath.isEmpty()) {
+    // See this wrapper's own header comment: a synthetic parent
+    // identity whose device is guaranteed to differ from `identity`'s
+    // own, so the new same-device rejection this parameter exists to
+    // exercise can never incidentally fire for the many existing
+    // callers that never supply a real parent path at all.
+    parentIdentity.device = identity.device + 1;
+    parentIdentity.mountId = identity.mountId;
+    parentIdentity.hasMountId = identity.hasMountId;
+  } else {
+    const QByteArray parentPathUtf8 = parentDirectoryPath.toUtf8();
+    const int parentFd =
+        ::open(parentPathUtf8.constData(),
+               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (parentFd < 0) {
+      ::close(fd);
+      return std::nullopt;
+    }
+    parentIdentity = mountIdentityForFd(parentFd);
+    ::close(parentFd);
+  }
   const bool qualified = mountTransitionIsIndependentlyPolicyQualified(
-      fd, identity, isFinalAccountHomeTransition);
+      fd, identity, isFinalAccountHomeTransition, parentIdentity);
   ::close(fd);
   return qualified;
 #else
   Q_UNUSED(directoryPath);
   Q_UNUSED(isFinalAccountHomeTransition);
+  Q_UNUSED(parentDirectoryPath);
   return std::nullopt;
 #endif
 }

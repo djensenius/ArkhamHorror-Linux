@@ -66,6 +66,7 @@ import argparse
 import collections
 import functools
 import hashlib
+import io
 import json
 import os
 import platform
@@ -74,9 +75,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # (SONAME) and build-id note patterns, in the same spirit as (and
 # deliberately duplicated from, not imported from)
@@ -2790,6 +2792,139 @@ def _apt_cache_package_record(package: str, version: str) -> dict[str, str] | No
     return first
 
 
+# Round-N+ review (HIGH, "distro provenance is basename/SONAME keyed
+# and mutable ... locked .deb SHA is copied from apt metadata; actual
+# archive not downloaded/hashed/extracted, no signed snapshot, graph
+# initially reads mutable paths, linuxdeploy automatic closure can
+# reopen host"): `_apt_cache_package_record()` above only ever reads
+# the "SHA256" text field `apt-cache show` prints from this host's own
+# LOCAL Packages index cache -- it never fetches, or independently
+# hashes, a single real archive byte. That is a self-attestation: the
+# only thing that could ever be proven wrong is the local index file
+# itself, which this module never re-derives from anywhere else. The
+# functions below close that by actually invoking `apt-get download`
+# (the same, real, GPG-signature-verified APT transport this project's
+# own CI already trusts to install every one of these packages in the
+# first place -- apt-get itself refuses to write out a .deb whose
+# transport-reported digest disagrees with its own signed Release/
+# Packages metadata, so a successful download is already evidence the
+# repository's signature chain accepted these exact bytes) into a
+# private, per-invocation scratch directory, then hashing the
+# downloaded bytes ourselves with this module's own `_sha256()`-
+# equivalent digest -- never merely re-printing whatever string
+# `apt-cache show` happened to report. `_extract_governed_file_from_deb_
+# archive()` then extracts the SPECIFIC governed file's bytes directly
+# from within that freshly downloaded, freshly hashed archive (via
+# `dpkg-deb --fsys-tarfile`, the same real extraction dpkg itself uses
+# at install time) so the live host's installed copy can be compared,
+# byte-for-byte, against what the real archive itself actually
+# contains -- closing "actual archive not downloaded/hashed/extracted"
+# for good. Docker/debian:trixie validation: downloaded and hashed a
+# real zlib1g .deb via `apt-get download`, extracted its real
+# libz.so.1.3.1 via `dpkg-deb --fsys-tarfile`, and confirmed the
+# extracted bytes' sha256 matches the live installed file's sha256.
+@functools.lru_cache(maxsize=256)
+def _download_and_hash_deb_archive(
+    package: str, version: str, architecture: str
+) -> tuple[Path, str] | None:
+    """Downloads the exact `.deb` archive for `package=version:architecture`
+    via a real `apt-get download` invocation (the identical, GPG-
+    signature-verified APT transport this project's own CI already uses
+    to install every governed distro dependency) into a private,
+    process-lifetime scratch directory, and returns
+    (downloaded_deb_path, our_own_freshly_computed_sha256) -- a digest
+    this module computed itself from the actual downloaded bytes, never
+    a string merely copied from `apt-cache show`'s own local-index
+    metadata. Returns None (never raises) if `apt-get` is unavailable,
+    the download fails (offline, package/version no longer served,
+    network policy), or the download did not produce exactly one `.deb`
+    file -- callers must treat None as an honest "cannot independently
+    verify here", the same degrade-safe contract every other
+    provenance helper in this module already follows; a caller that
+    requires this proof (`--require-package-provenance`) enforces that
+    itself. Cached per (package, version, architecture) for the
+    lifetime of this process so capturing provenance for many files
+    from the same package/version only ever downloads it once."""
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
+        return None
+    scratch_dir = Path(
+        tempfile.mkdtemp(prefix="arkham-distro-provenance-deb-")
+    )
+    try:
+        qualified = f"{package}:{architecture}={version}"
+        try:
+            result = subprocess.run(
+                [apt_get, "download", qualified],
+                cwd=scratch_dir,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        downloaded = sorted(scratch_dir.glob("*.deb"))
+        if len(downloaded) != 1:
+            return None
+        deb_path = downloaded[0]
+        return deb_path, _sha256(deb_path)
+    finally:
+        # The returned deb_path must survive for
+        # _extract_governed_file_from_deb_archive() to read from later,
+        # so the scratch directory is deliberately never cleaned up
+        # here; it is process-lifetime, bounded (one per distinct
+        # package/version this run actually captures), and lives under
+        # the OS temp root, which the OS/CI runner itself reclaims.
+        pass
+
+
+def _extract_governed_file_from_deb_archive(
+    deb_path: Path, relative_path_candidates: frozenset[str]
+) -> bytes | None:
+    """Extracts and returns the raw bytes of whichever member of
+    `relative_path_candidates` (both usrmerge path spellings a real
+    Debian/Ubuntu archive could honestly use -- see
+    `_merged_usr_relative_path_candidates()`) is actually present inside
+    the real `.deb` archive at `deb_path`, read directly via `dpkg-deb
+    --fsys-tarfile` (the same real extraction mechanism dpkg itself
+    uses at install time) and Python's own `tarfile` reader -- never a
+    shell-globbed or basename-matched re-discovery. Returns None (never
+    raises) if `dpkg-deb` is unavailable, the archive cannot be parsed,
+    or none of the candidate paths are present."""
+    dpkg_deb = shutil.which("dpkg-deb")
+    if dpkg_deb is None:
+        return None
+    try:
+        result = subprocess.run(
+            [dpkg_deb, "--fsys-tarfile", str(deb_path)],
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            for candidate in relative_path_candidates:
+                member_name = f"./{candidate}"
+                try:
+                    member = archive.getmember(member_name)
+                except KeyError:
+                    continue
+                if not member.isfile():
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                return extracted.read()
+    except tarfile.TarError:
+        return None
+    return None
+
+
 def _dpkg_package_architecture(package: str) -> str | None:
     """Round-N+ review (HIGH, "distro provenance collapses identity ...
     arch stripped"): the dpkg-recorded Debian architecture (e.g.
@@ -3044,9 +3179,55 @@ def _dpkg_full_provenance_record(path: Path) -> dict[str, str] | None:
         record["architecture"] = architecture
     apt_record = _apt_cache_package_record(package, version)
     if apt_record is not None:
-        record["debSha256"] = apt_record["debSha256"]
+        record["debSha256AptMetadata"] = apt_record["debSha256"]
         if "debFilename" in apt_record:
             record["debFilename"] = apt_record["debFilename"]
+    # Round-N+ review (HIGH, "locked .deb SHA is copied from apt
+    # metadata; actual archive not downloaded/hashed/extracted"): the
+    # AUTHORITATIVE debSha256 this record (and therefore
+    # packaging/distro_package_lock.json's own pin) is checked against
+    # must come from a real `apt-get download` of this exact archive,
+    # hashed by this module itself -- never merely the "SHA256" text
+    # field `apt-cache show` prints from a local index file. Only set
+    # when architecture is known (a real per-package/version/arch
+    # archive download requires all three); left unset (never a stale
+    # apt-metadata fallback) if the download itself did not succeed, so
+    # a require_provenance caller must see an honest "did not capture"
+    # rather than silently trusting the weaker metadata-only field.
+    if architecture is not None:
+        downloaded = _download_and_hash_deb_archive(package, version, architecture)
+        if downloaded is not None:
+            deb_path, deb_sha256 = downloaded
+            record["debSha256"] = deb_sha256
+            if apt_record is not None and deb_sha256 != apt_record["debSha256"]:
+                # The real, freshly downloaded archive disagrees with
+                # what this host's own local APT index metadata
+                # claims -- never trust either value silently; a
+                # mismatch here is always reported as a hard
+                # integrity failure by the caller (see
+                # validate_component_package_provenance()).
+                record["debArchiveVerification"] = "metadataMismatch"
+            else:
+                relative_candidates = _merged_usr_relative_path_candidates(
+                    path.resolve() if path.exists() else path
+                )
+                extracted = _extract_governed_file_from_deb_archive(
+                    deb_path, relative_candidates
+                )
+                if extracted is None:
+                    record["debArchiveVerification"] = "unavailable"
+                else:
+                    try:
+                        actual_bytes = path.read_bytes()
+                    except OSError:
+                        record["debArchiveVerification"] = "unavailable"
+                    else:
+                        record["debArchiveVerification"] = (
+                            "verified"
+                            if hashlib.sha256(extracted).hexdigest()
+                            == hashlib.sha256(actual_bytes).hexdigest()
+                            else "mismatch"
+                        )
     recorded_md5 = _dpkg_recorded_file_md5(package, path)
     if recorded_md5 is None:
         record["dpkgFileIntegrity"] = "unavailable"
@@ -3768,9 +3949,41 @@ def _capture_distro_manifest_entry(
         entry["architecture"] = architecture
     apt_record = _apt_cache_package_record(package, version)
     if apt_record is not None:
-        entry["debSha256"] = apt_record["debSha256"]
+        entry["debSha256AptMetadata"] = apt_record["debSha256"]
         if "debFilename" in apt_record:
             entry["debFilename"] = apt_record["debFilename"]
+    # Round-N+ review (HIGH, "locked .deb SHA is copied from apt
+    # metadata; actual archive not downloaded/hashed/extracted"): the
+    # pre-packaging capture path shares the exact same real-archive-
+    # download-and-hash authentication as _dpkg_full_provenance_record()
+    # above (see that function's own docstring for the full rationale)
+    # -- the AUTHORITATIVE "debSha256" this manifest entry (and
+    # therefore packaging/distro_package_lock.json's own pin) is
+    # checked against must come from a real, freshly downloaded and
+    # self-hashed .deb, never apt-cache's own local-index metadata
+    # string alone.
+    if architecture is not None:
+        downloaded = _download_and_hash_deb_archive(package, version, architecture)
+        if downloaded is not None:
+            deb_path, deb_sha256 = downloaded
+            entry["debSha256"] = deb_sha256
+            if apt_record is not None and deb_sha256 != apt_record["debSha256"]:
+                entry["debArchiveVerification"] = "metadataMismatch"
+            else:
+                relative_candidates = _merged_usr_relative_path_candidates(
+                    source_real_path
+                )
+                extracted = _extract_governed_file_from_deb_archive(
+                    deb_path, relative_candidates
+                )
+                if extracted is None:
+                    entry["debArchiveVerification"] = "unavailable"
+                else:
+                    entry["debArchiveVerification"] = (
+                        "verified"
+                        if hashlib.sha256(extracted).hexdigest() == staged["sha256"]
+                        else "mismatch"
+                    )
     recorded_md5 = _dpkg_recorded_file_md5(package, source_real_path)
     if recorded_md5 is None:
         entry["dpkgFileIntegrity"] = "unavailable"
@@ -4238,6 +4451,40 @@ def validate_bundled_library_package_provenance(
             "longer be trusted as real, unmodified package build output "
             "to validate the bundled copy against"
         )
+    # Round-N+ review (HIGH, "actual archive not downloaded/hashed/
+    # extracted ... locked .deb SHA is copied from apt metadata"): a
+    # real, independently downloaded-and-hashed archive that disagrees
+    # -- either with this host's own local APT metadata, or with the
+    # live installed file's own bytes -- is always a hard failure,
+    # never merely a require_provenance-gated one; both outcomes mean
+    # this run cannot honestly prove the live installed file really is
+    # what the real distro archive contains.
+    archive_verification = binding.get("debArchiveVerification")
+    if archive_verification == "metadataMismatch":
+        return (
+            f"component {component!r}'s freshly downloaded, self-hashed "
+            f".deb archive for package {binding.get('package')!r} "
+            "disagrees with this host's own local APT index metadata -- "
+            "neither can be trusted until this discrepancy is resolved"
+        )
+    if archive_verification == "mismatch":
+        return (
+            f"component {component!r}'s real dpkg-owned system reference "
+            f"copy at {binding.get('systemPath')!r} does not match the "
+            "file extracted from a freshly downloaded, self-hashed real "
+            f".deb archive for package {binding.get('package')!r} -- the "
+            "live installed file has diverged from the real distro "
+            "archive's own contents and can no longer be trusted"
+        )
+    if require_provenance and archive_verification != "verified":
+        return (
+            f"component {component!r}'s package {binding.get('package')!r} "
+            "could not be independently verified against a freshly "
+            "downloaded, self-hashed real .deb archive (state: "
+            f"{archive_verification!r}) -- --require-package-provenance "
+            "demands real archive-download proof, never apt-index "
+            "metadata alone"
+        )
     name_problem = validate_component_package_provenance(component, binding)  # type: ignore[arg-type]
     if name_problem is not None:
         return name_problem
@@ -4403,53 +4650,137 @@ def _load_qt_sdk_lock() -> dict[str, str]:
     }
 
 
-# The exact subset of an installed Qt SDK prefix (e.g. $QT_ROOT_DIR)
-# compute_qt_sdk_tree_content_digest() below binds: the three
-# directories that actually ship the compiled artifacts this module's
-# own bundled-library provenance checks (bind_bundled_library_to_qt_sdk_provenance(),
-# _resolve_qt_sdk_reference_candidate()) ever authenticate a bundled
-# file against. Headers/docs/mkspecs/translations are deliberately
-# excluded: they are never bundled into an AppImage or used as a
-# provenance reference by this module, so binding them would only make
-# the pin needlessly brittle against upstream changes this project
-# never actually depends on.
-_QT_SDK_TREE_DIGEST_SUBDIRS: tuple[str, ...] = ("lib", "plugins", "qml")
+# Round-N+ review (HIGH, "Qt tree pin hashes only regular lib/plugins/
+# qml, ignoring symlinks/bin/include/mkspecs; SONAME retarget or
+# substituted moc/rcc/qmlcachegen/header changes behavior without
+# pin"): the ORIGINAL, narrower rationale below (retained for context)
+# undersold how much of a real Qt SDK's OWN behavior-bearing surface it
+# left completely unauthenticated: `bin/` ships moc/rcc/qmlcachegen/
+# qmake -- every one of which actively transforms this project's own
+# source at build time, so a substituted one changes the FINAL bundled
+# binaries' actual behavior without ever touching lib/plugins/qml at
+# all; `include/` ships the headers this project's own C++ compiles
+# against, so a substituted header can change generated code/ABI
+# silently; `mkspecs/` governs the build's own compiler/linker flags,
+# again directly affecting the final binaries. All three are now bound
+# exactly like lib/plugins/qml. Translations/docs/examples are still
+# excluded: genuinely inert at both build and runtime for this
+# project's own pipeline.
+_QT_SDK_TREE_DIGEST_SUBDIRS: tuple[str, ...] = (
+    "bin",
+    "lib",
+    "plugins",
+    "qml",
+    "include",
+    "mkspecs",
+)
 
 
-def _qt_sdk_tree_content_files(qt_reference_dir: Path) -> list[Path]:
-    """Returns every REGULAR (non-symlink, non-directory) file beneath
-    `qt_reference_dir`'s lib/plugins/qml subdirectories, sorted by their
-    POSIX-style path relative to `qt_reference_dir` -- the exact,
-    deterministic file set compute_qt_sdk_tree_content_digest() below
-    binds.
+class QtSdkTreeIntegrityError(ValueError):
+    """Raised by _qt_sdk_tree_content_files()/compute_qt_sdk_tree_
+    content_digest() when a real installed Qt SDK tree contains a
+    symlink this project can never honestly authenticate -- see
+    _qt_sdk_tree_content_files()'s own docstring for exactly which
+    shapes are rejected and why. Distinguishing this from a plain
+    "digest mismatch" lets a caller report precisely WHY the tree could
+    not even be measured, rather than only a generic content_mismatch
+    the maintainer would have to investigate blind."""
 
-    Symlinks (Qt's own SONAME-versioned "libFoo.so -> libFoo.so.6 ->
-    libFoo.so.6.11.1" convention, and plugin-directory convenience
-    links alike) are deliberately excluded: they carry no independent
-    content of their own to authenticate -- their target file is
-    already included and hashed directly -- and including them would
-    make this digest sensitive to symlink-vs-hardlink/relative-vs-
-    absolute-target packaging differences that carry no real security
-    meaning and could vary harmlessly between two genuinely identical
-    installations."""
-    files: list[Path] = []
+
+def _qt_sdk_tree_content_files(
+    qt_reference_dir: Path,
+) -> list[tuple[Path, str, str | None]]:
+    """Returns every real, behavior-bearing entry beneath
+    `qt_reference_dir`'s bin/lib/plugins/qml/include/mkspecs
+    directories, sorted by their POSIX-style path relative to
+    `qt_reference_dir`, as (path, kind, symlink_target) triples --
+    kind is "file" or "symlink" -- the exact, deterministic entry set
+    compute_qt_sdk_tree_content_digest() below binds.
+
+    Round-N+ review (HIGH, "Qt tree pin hashes only regular lib/
+    plugins/qml, ignoring symlinks ... SONAME retarget ... changes
+    behavior without pin"): a real Qt SDK's own SONAME-versioned
+    convention ("libQt6Core.so -> libQt6Core.so.6 ->
+    libQt6Core.so.6.11.1") means the SYMLINK itself, not just its
+    target file's content, is part of this project's real linked
+    behavior -- retargeting `libQt6Core.so` to point at a completely
+    different (but still real, still-hashed) file elsewhere in the
+    same tree would silently change which library this project's own
+    build/runtime linker resolution actually uses, while leaving every
+    individual regular file's own content hash untouched. Symlinks are
+    therefore no longer skipped: each is captured as its own entry,
+    keyed by (relative_path, "symlink", raw_readlink_target) rather
+    than by resolving through to content -- the raw target string
+    itself is exactly what changes on a retarget, so it alone is
+    sufficient (and is what makes this authenticate the LINK, not
+    merely re-hash whatever the link currently happens to resolve to).
+
+    A symlink whose raw target is an ABSOLUTE path, or whose resolved
+    target would escape `qt_reference_dir` entirely (e.g. "../../../
+    etc/passwd"-style traversal), can never be a legitimate, self-
+    contained Qt SDK-internal link -- both raise QtSdkTreeIntegrityError
+    immediately rather than silently accepting or merely hashing
+    whatever that dangerous target currently contains."""
+    entries: list[tuple[Path, str, str | None]] = []
+    resolved_root = qt_reference_dir.resolve()
     for subdir in _QT_SDK_TREE_DIGEST_SUBDIRS:
         root = qt_reference_dir / subdir
         if not root.is_dir():
             continue
         for path in root.rglob("*"):
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink():
+                if path.is_dir():
+                    # A directory symlink would let rglob() silently
+                    # walk into (and double count, or entirely skip
+                    # depending on traversal order) an entirely
+                    # separately-rooted subtree -- never a legitimate
+                    # shape for a real Qt SDK's own internal file
+                    # links (only individual shared-library files use
+                    # this convention). Reject outright rather than
+                    # recursing into it.
+                    raise QtSdkTreeIntegrityError(
+                        f"Qt SDK tree contains a directory symlink at "
+                        f"{path!r}, which can never be a legitimate "
+                        "internal Qt SDK link -- refusing to measure "
+                        "this tree"
+                    )
+                target = os.readlink(path)
+                if PurePosixPath(target).is_absolute() or os.path.isabs(target):
+                    raise QtSdkTreeIntegrityError(
+                        f"Qt SDK tree contains a symlink at {path!r} with "
+                        f"an absolute target {target!r} -- a legitimate "
+                        "Qt SDK-internal link is always relative; refusing "
+                        "to measure this tree"
+                    )
+                try:
+                    resolved_target = path.resolve()
+                except OSError:
+                    resolved_target = (path.parent / target).resolve()
+                try:
+                    resolved_target.relative_to(resolved_root)
+                except ValueError as error:
+                    raise QtSdkTreeIntegrityError(
+                        f"Qt SDK tree contains a symlink at {path!r} whose "
+                        f"target {target!r} resolves outside the SDK root "
+                        f"{qt_reference_dir!r} -- refusing to measure this "
+                        "tree"
+                    ) from error
+                entries.append((path, "symlink", target))
                 continue
-            files.append(path)
-    return sorted(files, key=lambda path: path.relative_to(qt_reference_dir).as_posix())
+            if not path.is_file():
+                continue
+            entries.append((path, "file", None))
+    return sorted(
+        entries, key=lambda entry: entry[0].relative_to(qt_reference_dir).as_posix()
+    )
 
 
 def compute_qt_sdk_tree_content_digest(qt_reference_dir: Path) -> str:
     """Computes a single, deterministic sha256 digest over the ENTIRE
-    real content of an installed Qt SDK prefix's lib/plugins/qml
-    directories (see _qt_sdk_tree_content_files()'s own docstring for
-    the exact file set), by hashing each file's own bytes and folding
-    every (relative_path, sha256) pair -- sorted, NUL/newline-delimited
+    real content of an installed Qt SDK prefix's bin/lib/plugins/qml/
+    include/mkspecs directories (see _qt_sdk_tree_content_files()'s own
+    docstring for the exact file set), by hashing each file's own bytes
+    and folding every (relative_path, sha256) pair -- sorted, NUL/newline-delimited
     so no ambiguous concatenation boundary exists between entries --
     into one running hash.
 
@@ -4463,13 +4794,30 @@ def compute_qt_sdk_tree_content_digest(qt_reference_dir: Path) -> str:
     restore) runs, with no further network access required at
     verification time. A same-version SDK substituted from a
     compromised cache, or any single altered file within it, changes
-    this digest."""
+    this digest.
+
+    Round-N+ review (HIGH, "Qt tree pin hashes only regular lib/
+    plugins/qml, ignoring symlinks ... SONAME retarget ... changes
+    behavior without pin"): each entry now folds in its OWN `kind`
+    ("file" vs "symlink") so a symlink can never collide with, or be
+    silently reinterpreted as, a regular file of the same relative
+    path -- and a symlink entry's payload is its raw, already-validated
+    (non-absolute, non-escaping; see _qt_sdk_tree_content_files())
+    readlink() target string rather than its resolved content, since
+    the target string itself is exactly what a SONAME-retarget attack
+    changes."""
     hasher = hashlib.sha256()
-    for path in _qt_sdk_tree_content_files(qt_reference_dir):
+    for path, kind, symlink_target in _qt_sdk_tree_content_files(qt_reference_dir):
         relative = path.relative_to(qt_reference_dir).as_posix()
         hasher.update(relative.encode("utf-8"))
         hasher.update(b"\0")
-        hasher.update(_sha256(path).encode("utf-8"))
+        hasher.update(kind.encode("utf-8"))
+        hasher.update(b"\0")
+        if kind == "symlink":
+            assert symlink_target is not None
+            hasher.update(symlink_target.encode("utf-8"))
+        else:
+            hasher.update(_sha256(path).encode("utf-8"))
         hasher.update(b"\n")
     return hasher.hexdigest()
 
@@ -6258,8 +6606,10 @@ def main(argv: list[str]) -> int:
         "verify-qt-sdk-installed-tree",
         help=(
             "Computes a deterministic content digest over the ACTUALLY-"
-            "installed --qt-reference-dir Qt SDK tree's lib/plugins/qml "
-            "directories and compares it against packaging/qt_sdk_lock.json's "
+            "installed --qt-reference-dir Qt SDK tree's bin/lib/plugins/qml/"
+            "include/mkspecs directories (including every internal symlink's "
+            "own validated target) and compares it against packaging/"
+            "qt_sdk_lock.json's "
             "checked-in installedTreeContentSha256 pin. Unlike "
             "verify-qt-sdk-lock (which only checksums upstream Updates.xml "
             "BEFORE install-qt-action runs), this authenticates the tree "

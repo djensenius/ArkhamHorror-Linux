@@ -659,42 +659,54 @@ AssetRequestCoordinator::registerCacheHitCompletion(
   if (pendingIt != m_pendingCacheDecodes.end()) {
     if (pendingIt->entry.encodedBytes == entry.encodedBytes) {
       // Independent cumulative re-review (HIGH, repeat finding, "root
-      // authority... coalesced observers do not issue"): this joining
-      // waiter already minted its OWN AssetCache-level token
-      // (`assetCacheGeneration`, above, at its own earlier snapshot
-      // moment) before discovering a group to join -- but every waiter
-      // in this group is about to republish the SAME already-verified-
-      // identical bytes (the encodedBytes comparison just above), never
-      // conflicting content, so holding this waiter's own token
-      // outstanding for the group's entire remaining lifetime serves no
-      // purpose other than to let two purely COOPERATIVE siblings
-      // spuriously outrank one another the instant
-      // AssetCache::tryApplyKeyGenerationLocked() also has to reject an
-      // older token whenever a genuinely DIFFERENT, still-outstanding
-      // sibling token exists for the same key (see that method's own
-      // comment) -- exactly the false-positive rejection that would
-      // otherwise split one coalesced decode back into several
-      // independent ones. Release this now-redundant token immediately
-      // and have this waiter ride on the GROUP LEADER's own token (the
-      // very first one minted for this decodeKey) instead: it already
-      // represents a claim of "no write has raced since a moment no
-      // later than this joiner's own snapshot" (the leader's snapshot
-      // necessarily preceded or coincided with this joiner's, since the
-      // leader created this group first), so it remains at least as
-      // conservative a supersession check for this joiner as its own
-      // now-discarded token would have been, while collapsing the
-      // group down to the single outstanding token
-      // highestOutstandingGenerationLocked() is meant to reason about.
-      m_cache.releaseKeyGeneration(cacheKey, assetCacheGeneration);
-      const quint64 leaderAssetCacheGeneration =
-          pendingIt->waiters.constFirst().assetCacheGeneration;
+      // authority... coalesced observers do not issue" / "supersession
+      // uses highest currently outstanding... Maintain monotonic
+      // latestIssued watermark"): this joining waiter already minted its
+      // OWN AssetCache-level token (`assetCacheGeneration`, above, via
+      // snapshotAndIssueGeneration()'s internal, non-committing mint --
+      // see PendingCacheDecode::assetCacheGeneration's own comment) at
+      // its own, strictly LATER snapshot moment. That mint never commits
+      // anything against AssetCache::latestCommittedGenerationLocked()'s
+      // shared ceiling by itself (see its own comment in AssetCache.cpp
+      // for why: only a token actually retained as a real,
+      // write-intending attempt's own designated token -- via bare
+      // issueKeyGeneration() -- ever does), so a later joiner's own
+      // higher-numbered probe can never, by its mere existence, poison
+      // an earlier group representative's ability to publish. Even so,
+      // this group still always adopts the numerically HIGHER of the
+      // two candidate tokens as its one shared representative -- never
+      // required for correctness against a merely-higher, never-
+      // committed sibling probe, but strictly safer and free: the
+      // group's eventual tryApplyKeyGenerationLocked() check is a
+      // simple `>=` comparison, so using the freshest observed token
+      // can only ever make that check MORE likely to still succeed
+      // (never less) if some genuinely separate, actually-committed
+      // writer for this exact key has advanced the shared ceiling in
+      // the interim -- and releasing whichever token this group does
+      // NOT keep avoids leaking the discarded one as permanently
+      // "outstanding" bookkeeping for no purpose.
+      if (assetCacheGeneration > pendingIt->assetCacheGeneration) {
+        m_cache.releaseKeyGeneration(cacheKey, pendingIt->assetCacheGeneration);
+        pendingIt->assetCacheGeneration = assetCacheGeneration;
+      } else {
+        // Defensive only: a later join's token is always strictly
+        // higher in practice (see above) -- but never regress the
+        // group's representative if this ever somehow isn't so.
+        m_cache.releaseKeyGeneration(cacheKey, assetCacheGeneration);
+      }
       // A leader is already registered for the identical cached bytes:
       // attach as an additional waiter. No second queued decode is
       // scheduled -- the leader's own already-queued
       // completeCoalescedCacheDecode() call delivers to every waiter,
-      // including this one, once it runs.
+      // including this one, once it runs. This waiter's own stored
+      // token is re-synced to the group's (possibly since-advanced)
+      // final representative immediately before delivery regardless --
+      // see completeCoalescedCacheDecode()'s own comment -- so the
+      // value appended here only matters as this call's own
+      // intermediate bookkeeping, never as delivery's actual source of
+      // truth.
       pendingIt->waiters.append(GroupWaiter{operationId, expectedGeneration,
-                                            leaderAssetCacheGeneration});
+                                            pendingIt->assetCacheGeneration});
       return RequestHandle{handleId};
     }
     // Defensive only: the cache's live bytes for this exact key changed
@@ -713,11 +725,12 @@ AssetRequestCoordinator::registerCacheHitCompletion(
 
   m_pendingCacheDecodes.insert(
       decodeKey,
-      PendingCacheDecode{std::move(entry),
-                         cacheKey,
-                         expectedFormat,
-                         {GroupWaiter{operationId, expectedGeneration,
-                                      assetCacheGeneration}}});
+      PendingCacheDecode{
+          std::move(entry),
+          cacheKey,
+          expectedFormat,
+          {GroupWaiter{operationId, expectedGeneration, assetCacheGeneration}},
+          assetCacheGeneration});
 
   QPointer<AssetRequestCoordinator> self(this);
   QMetaObject::invokeMethod(
@@ -932,6 +945,28 @@ void AssetRequestCoordinator::completeCoalescedCacheDecode(
   }
   PendingCacheDecode pending = std::move(it.value());
   m_pendingCacheDecodes.erase(it);
+  // Independent cumulative re-review (HIGH, repeat finding, "supersession
+  // uses highest currently outstanding... Maintain monotonic
+  // latestIssued watermark"): re-sync EVERY waiter's own stored
+  // assetCacheGeneration to the group's FINAL representative (see
+  // PendingCacheDecode::assetCacheGeneration's own comment) here, at the
+  // exact moment delivery is about to happen -- by now every join that
+  // could possibly still occur before this queued closure runs already
+  // has (Qt::QueuedConnection guarantees no later synchronous join can
+  // race this call). An earlier-joined waiter's own GroupWaiter may
+  // still carry a now-superseded value captured at ITS OWN join moment,
+  // strictly lower than a LATER join's -- delivering with the freshest,
+  // highest observed token instead is not required to avoid a spurious
+  // AssetCache::tryApplyKeyGenerationLocked() rejection (member tokens
+  // here never commit against its ceiling by themselves -- see
+  // PendingCacheDecode::assetCacheGeneration's own comment), but it does
+  // maximize the chance of surviving that check if some genuinely
+  // separate, actually-committed writer for this exact key has advanced
+  // the shared ceiling in the interim, and keeps every waiter delivering
+  // under one single, consistent representative value.
+  for (GroupWaiter &waiter : pending.waiters) {
+    waiter.assetCacheGeneration = pending.assetCacheGeneration;
+  }
   completeCacheReadGroupOrQuarantine(pending.waiters, std::move(pending.entry),
                                      pending.cacheKey, pending.format,
                                      /*promoteOnSuccess=*/false);

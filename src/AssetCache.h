@@ -398,6 +398,20 @@ public:
   // (apply unconditionally, never checking or advancing this watermark
   // at all) for backward compatibility with every pre-existing caller
   // that never participates in this protocol.
+  //
+  // Independent cumulative re-review (HIGH, repeat finding -- see
+  // latestCommittedGenerationLocked()'s own .cpp-side comment for the
+  // full rationale): unlike snapshotAndIssueGeneration()'s own internal
+  // mint (used purely for atomic, may-be-immediately-discarded
+  // cache/negative-404 probes), THIS bare entry point also immediately
+  // commits its returned token as `key`'s new supersession ceiling --
+  // because every caller of this exact method, by this comment's own
+  // contract above, retains and eventually threads the token through to
+  // a real mutation, never discards it. This is what makes cancelling
+  // or abandoning that operation without ever publishing still
+  // permanently foreclose any OLDER token for the same key, while a
+  // merely-probed-and-discarded snapshotAndIssueGeneration() token never
+  // does.
   [[nodiscard]] quint64 issueKeyGeneration(const QString &key);
 
   // Independent cumulative re-review (HIGH, "root authority... Prune
@@ -857,6 +871,18 @@ public:
     m_maxTrackedKeyGenerationEntries =
         maxEntries > 0 ? maxEntries : kMaxTrackedKeyGenerationEntries;
   }
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // prunes but 15-minute idle threshold leaves >4096 young entries
+  // forever when activity stops... Hard cap must immediately evict
+  // eligible non-outstanding entries regardless soft idle"): overrides
+  // the unconditional backstop ceiling (kMaxTrackedKeyGenerationEntriesHardCap
+  // -- see its own comment on the private field) the same way
+  // setMaxTrackedKeyGenerationEntriesForTesting() overrides the soft
+  // cap, so a test can force the unconditional (never idle-gated)
+  // backstop to trigger with a small, fast number of local round trips
+  // instead of thousands, using the PRODUCTION idle-eviction threshold
+  // unchanged. 0 restores the production default.
+  void setMaxTrackedKeyGenerationEntriesHardCapForTesting(int maxEntries);
   // Independent cumulative re-review (HIGH, "root authority... Track
   // in-flight tokens and bounded prune"):
   // touchAndPruneKeyGenerationMapsLocked() (see its own .cpp comment)
@@ -967,9 +993,24 @@ public:
   // ownership check (current-uid); false exercises the ANCESTOR
   // ownership check (root-owned) instead -- see
   // mountTransitionIsIndependentlyPolicyQualified()'s own comment.
+  //
+  // `parentDirectoryPath` (independent cumulative re-review, MEDIUM,
+  // "arbitrary same-device bind mount still passes"): the directory
+  // this transition is modelled as being grafted ONTO, whose own mount
+  // identity is looked up and passed through to the exact same
+  // same-device rejection and mountinfo parent-id authentication the
+  // real resolveHomeDirectoryNoFollow() walk now performs. When
+  // omitted (the default every existing caller of this test hook
+  // already assumes, all of which are concerned with orthogonal
+  // ownership/mode/filesystem-type behaviour, never this specific
+  // check), a SYNTHETIC parent identity with a device deliberately
+  // guaranteed to differ from `directoryPath`'s own is used instead,
+  // so this newer check can never incidentally mask what those
+  // existing tests actually exercise.
   [[nodiscard]] static std::optional<bool>
   mountTransitionIsIndependentlyPolicyQualifiedForTesting(
-      const QString &directoryPath, bool isFinalAccountHomeTransition = true);
+      const QString &directoryPath, bool isFinalAccountHomeTransition = true,
+      const QString &parentDirectoryPath = QString());
 
   // Test-only, UNPRIVILEGED witness for whether this build actually
   // resolved the kernel's per-mount identifier (Linux 5.8+'s statx()
@@ -1275,29 +1316,92 @@ private:
   // hold m_mutex. A key never yet published or invalidated implicitly
   // starts at generation 0.
   [[nodiscard]] quint64 currentKeyGenerationLocked(const QString &key) const;
-  // Independent cumulative re-review (HIGH, "tryApply compares highest
-  // APPLIED, not latest issued... Gen1 404 after Gen2 issuance is
-  // accepted and can install tombstone/advance fallback"): the highest
-  // token currently OUTSTANDING (issued via issueKeyGenerationLocked()/
-  // snapshotAndIssueGeneration() but not yet released via
-  // releaseKeyGenerationLocked()) for `key`, or 0 if none is. This is
-  // DELIBERATELY distinct from "the highest token ever issued"
-  // (m_keyIssuedGeneration, a monotonic counter that never shrinks even
-  // after its token is released) -- comparing against THAT instead, as
-  // an earlier attempt at this exact fix did, reintroduces the
-  // LIVELOCK tryApplyKeyGenerationLocked()'s own comment used to warn
-  // against: a rejected, retried operation that mints a fresh token on
-  // every retry would otherwise ratchet the "ever issued" watermark up
-  // forever, with no way for that counter to ever come back down even
-  // once every real rival has long since finished. This set-based
-  // ceiling, by contrast, shrinks back down the instant a blocking
-  // token is released (regardless of whether it ever applied), so a
-  // rejected caller only ever has to wait for whatever is GENUINELY
-  // still in flight for `key` right now, never for a phantom ceiling
-  // inflated by its own past retries. Callers must already hold
-  // m_mutex.
+  // Independent cumulative re-review (HIGH, repeat finding: "supersession
+  // uses highest currently outstanding; cancel/release gen2 makes
+  // delayed gen1 authoritative again... Maintain monotonic latestIssued
+  // watermark independent of outstanding set", then, on the SAME finding
+  // recurring against the first fix, "PendingCacheDecode's shared
+  // representative... second or third joiner's own mere issuance would
+  // permanently and spuriously fail the whole group's eventual publish"
+  // and "delayedStaleRevalidationSuccess...", "coalescedRevalidation..."
+  // regressions caused by literally treating m_keyIssuedGeneration
+  // itself -- which every mere READ (snapshotAndIssueGeneration(), used
+  // for mint-then-immediately-release probe-and-defer decisions such as
+  // "check cache, decide to join an existing CandidateAttempt/revalidate
+  // instead") also advances -- as the ceiling): `key`'s highest token
+  // ever explicitly COMMITTED as a real, competing write-intending
+  // attempt's own designated token via commitKeyGenerationLocked() (see
+  // its own comment), or 0 if none has. This is deliberately NARROWER
+  // than "highest ever issued": issueKeyGenerationLocked() itself mints
+  // a strictly-increasing value for EVERY caller, including a caller
+  // that immediately releases it without ever using it for anything
+  // (e.g. AssetRequestCoordinator::advanceCandidates()'s own cache-hit/
+  // negative-404 probe, which frequently discovers it should defer
+  // entirely to an already-in-flight CandidateAttempt bearing a LOWER,
+  // still-valid token) -- committing on every mere issuance made EVERY
+  // such harmless, unused probe permanently poison every genuinely
+  // still-outstanding, LOWER real attempt for the same key, which is
+  // exactly the regression this narrower design fixes. Only
+  // issueKeyGeneration() (the bare public entry point -- used
+  // exclusively where the resulting token IS actually retained as a
+  // real attempt's own designated token: AssetRequestCoordinator's
+  // CandidateAttempt creation in startCandidate()/startRevalidation(),
+  // and any direct caller such as this class's own tests) commits
+  // automatically; snapshotAndIssueGeneration()'s own internal mint
+  // deliberately does not.
+  //
+  // This remains a value that can only ever grow for a given live key --
+  // unlike the outstanding-token-set-based ceiling a previous fix used,
+  // releasing (or even destroying) some OTHER, strictly newer COMMITTED
+  // token's operation can never make this value regress, so a strictly
+  // newer real attempt, once its token is committed, permanently
+  // forecloses every older token's ability to ever apply again for this
+  // key -- even if that newer attempt is later cancelled or abandoned
+  // without ever publishing anything itself. This is exactly the
+  // semantics the finding requires: cancellation must never
+  // retroactively re-authorize an older, already-superseded operation --
+  // while a mere, never-retained probe committing NOTHING means it can
+  // never falsely supersede a genuinely still-live, lower-numbered real
+  // attempt either.
+  //
+  // The still-earlier outstanding-set-based ceiling existed specifically
+  // to avoid a livelock a still-earlier "highest ever issued" attempt
+  // supposedly caused: "a rejected, retried operation that mints a
+  // fresh token on every retry would otherwise ratchet the watermark up
+  // forever." That concern does not apply here either: every rejection
+  // (`SkippedStaleGeneration`) is handled by
+  // AssetRequestCoordinator::advanceCandidates()/completeCacheReadGroupOrQuarantine(),
+  // which ALWAYS resnapshots the cache (a fresh, atomic,
+  // non-committing snapshotAndIssueGeneration()/lookup) BEFORE ever
+  // minting a new, committed token, and a fresh network attempt for the
+  // SAME resource only ever mints (and commits) a new token via
+  // startCandidate()/startRevalidation() if no CandidateAttempt is
+  // already in flight for that exact (cacheKey, format, etag,
+  // lastModified) identity (see candidateAttemptKey()'s own comment) --
+  // an already-in-flight attempt is joined as an additional subscriber
+  // instead, never given a second, independently-committing token. So
+  // this ceiling can only ever advance in step with a genuinely NEW,
+  // distinct real attempt actually starting for a key, never as an
+  // unbounded artifact of retrying the same one, and never as an
+  // artifact of an unrelated, never-retained probe read either.
   [[nodiscard]] quint64
-  highestOutstandingGenerationLocked(const QString &key) const;
+  latestCommittedGenerationLocked(const QString &key) const;
+  // Independent cumulative re-review (HIGH, repeat finding, same as
+  // latestCommittedGenerationLocked()'s own comment): explicitly records
+  // `token` as `key`'s designated real write-intending attempt token,
+  // advancing m_keyCommittedGeneration[key] to
+  // std::max(current, token) -- monotonic, exactly like
+  // m_keyIssuedGeneration/m_keyAppliedGeneration, and safe to call
+  // redundantly (e.g. once per PendingCacheDecode joiner-adopts event)
+  // with a value that is not strictly greater than the current one: a
+  // no-op in that case. Called automatically by issueKeyGeneration()
+  // (never by issueKeyGenerationLocked()'s raw mint alone, and never by
+  // snapshotAndIssueGeneration()) -- see issueKeyGeneration()'s own
+  // comment -- and also by advanceKeyGenerationPastAllIssuedLocked() (so
+  // invalidate() continues to permanently foreclose every already-
+  // issued token exactly as before, now via this ceiling instead of the
+  // raw issuance counter). Callers must already hold m_mutex.
+  void commitKeyGenerationLocked(const QString &key, quint64 token);
   // The single CAS gate every one of store()/touchAfterNotModified()/
   // promoteToMemory()/updateMemoryDecodedImage()'s actual mutations goes
   // through: kUnconditionalGeneration always succeeds (and, matching its
@@ -1308,17 +1412,17 @@ private:
   // succeeds -- applying it as `key`'s new watermark and returning true
   // -- iff it is STRICTLY neither less than `key`'s CURRENT applied
   // watermark (i.e. no invalidate() or newer-issued, already-applied
-  // publish has moved past it yet) NOR less than the highest token
-  // CURRENTLY OUTSTANDING for `key` other than itself (see
-  // highestOutstandingGenerationLocked()'s own comment: a strictly
-  // newer, still-unresolved sibling operation for this exact key must
-  // never have its eventual right to publish preempted by an older
-  // one that merely happens to finish first) -- otherwise returns
-  // false, and the caller must apply NONE of its intended mutation, and
-  // must treat this exact result as "some other operation for this key
-  // is more authoritative than mine; resnapshot and defer to it,
-  // never deliver my own now-superseded result." Callers must already
-  // hold m_mutex.
+  // publish has moved past it yet) NOR less than the highest token EVER
+  // COMMITTED for `key` other than itself (see
+  // latestCommittedGenerationLocked()'s own comment: a strictly newer
+  // real attempt for this exact key, once its token is committed, must
+  // never have its supersession of an older one undone merely because
+  // that newer attempt was itself later cancelled or abandoned) --
+  // otherwise returns false, and the caller must apply NONE of its
+  // intended mutation, and must treat this exact result as "some other
+  // operation for this key is more authoritative than mine; resnapshot
+  // and defer to it, never deliver my own now-superseded result."
+  // Callers must already hold m_mutex.
   [[nodiscard]] bool tryApplyKeyGenerationLocked(const QString &key,
                                                  quint64 issuedGeneration);
   // Cumulative review (independent re-review, HIGH, "shared root
@@ -1329,11 +1433,14 @@ private:
   // would NOT necessarily exceed a token issued -- but not yet
   // applied -- moments before this call), so that no already-issued
   // token can ever successfully tryApplyKeyGenerationLocked() again
-  // after this runs. Also advances the issuance counter itself to match,
-  // so a FUTURE issueKeyGeneration() call for the same key continues to
-  // mint values that are actually capable of satisfying the new
-  // watermark (never permanently stuck behind it). Callers must already
-  // hold m_mutex.
+  // after this runs. Also advances the issuance counter AND the
+  // committed-generation ceiling themselves to match, so a FUTURE
+  // issueKeyGeneration() call for the same key continues to mint values
+  // that are actually capable of satisfying the new watermark (never
+  // permanently stuck behind it), and so this invalidate() itself
+  // permanently forecloses every already-issued token exactly like a
+  // committed newer attempt would, via commitKeyGenerationLocked().
+  // Callers must already hold m_mutex.
   void advanceKeyGenerationPastAllIssuedLocked(const QString &key);
   // Independent cumulative re-review (HIGH, "root authority... Prune
   // issued==applied while older token outstanding resets watermark"):
@@ -1370,6 +1477,23 @@ private:
   // it has already been released); condition (2) exists purely to bound
   // how eagerly an otherwise-idle key's bookkeeping is reclaimed, not to
   // paper over any remaining correctness gap.
+  //
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // prunes but 15-minute idle threshold leaves >4096 young entries
+  // forever when activity stops... Hard cap must immediately evict
+  // eligible non-outstanding entries regardless soft idle"): condition
+  // (2) above is DROPPED once the tracked map exceeds the strictly
+  // larger, unconditional m_maxTrackedKeyGenerationEntriesHardCap
+  // ceiling (see its own comment) -- only condition (1) still applies in
+  // that case -- so this very sweep, triggered synchronously by
+  // whichever issue/apply/release call pushed the map over the hard
+  // cap, can bound the map's size entirely on its own, with no
+  // dependence on any future call ever occurring, regardless of how
+  // recently every excess key happened to be last touched. This closes
+  // the exact gap a single burst of activity across many distinct keys
+  // -- each released before any later traffic ever arrives -- left open
+  // under the production (15-real-minute) idle threshold: previously,
+  // every one of those young entries could remain tracked forever.
   // Called from issueKeyGenerationLocked() and
   // tryApplyKeyGenerationLocked() -- the only two places that ever touch
   // a key's issued/applied watermark -- so every key that is ever
@@ -1545,6 +1669,20 @@ private:
   QHash<QString, quint64> *m_keyAppliedGeneration{
       &m_privateKeyAppliedGenerationFallback};
   QHash<QString, quint64> m_privateKeyAppliedGenerationFallback;
+  // Independent cumulative re-review (HIGH, repeat finding: "highest
+  // currently outstanding" / "highest ever issued" both proven unsound
+  // -- see latestCommittedGenerationLocked()'s own comment for the full
+  // rationale): the shared ceiling that ONLY a real, write-intending
+  // attempt's own designated token (never a discarded probe) ever
+  // advances. Repointed alongside m_keyIssuedGeneration/
+  // m_keyAppliedGeneration above (same RootAuthority, same sharing
+  // rules) -- it must be shared cross-instance for exactly the same
+  // reason those two are: a sibling AssetCache instance for the same
+  // physical root committing a newer attempt's token must permanently
+  // foreclose an older, still-outstanding attempt in THIS instance too.
+  QHash<QString, quint64> *m_keyCommittedGeneration{
+      &m_privateKeyCommittedGenerationFallback};
+  QHash<QString, quint64> m_privateKeyCommittedGenerationFallback;
   // Independent cumulative re-review (HIGH, "root authority... m_key
   // issued/applied maps never prune"): the shared "last touched" real
   // steady-clock-ms map touchAndPruneKeyGenerationMapsLocked() uses to
@@ -1598,6 +1736,34 @@ private:
   // touchAndPruneKeyGenerationMapsLocked().
   static constexpr int kMaxTrackedKeyGenerationEntries = 4096;
   int m_maxTrackedKeyGenerationEntries{kMaxTrackedKeyGenerationEntries};
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // prunes but 15-minute idle threshold leaves >4096 young entries
+  // forever when activity stops... Hard cap must immediately evict
+  // eligible non-outstanding entries regardless soft idle"): a SECOND,
+  // strictly larger ceiling touchAndPruneKeyGenerationMapsLocked()
+  // additionally enforces UNCONDITIONALLY -- i.e. WITHOUT requiring
+  // m_keyGenerationIdleEvictionThresholdMs to have elapsed at all --
+  // the instant the tracked map size exceeds it, for any key whose
+  // outstanding set is empty (see condition (1) in that method's own
+  // comment; this hard cap never touches the correctness requirement,
+  // only the throttle). This closes the exact gap the soft,
+  // idle-gated cap alone left open: a single burst of activity for
+  // many distinct keys, each released before any later traffic ever
+  // arrives, would otherwise leave every one of those young (not yet
+  // idle for m_keyGenerationIdleEvictionThresholdMs -- which defaults
+  // to 15 real minutes in production) entries permanently tracked, with
+  // no future call ever guaranteed to occur that could sweep them.
+  // Deliberately a generous multiple of the soft cap (never the SAME
+  // value) so ordinary, gradually-idling traffic still gets the softer,
+  // idle-throttled eviction first in the common case -- this hard
+  // ceiling exists purely as an unconditional backstop, never as the
+  // primary eviction path. Overridable for testing via
+  // setMaxTrackedKeyGenerationEntriesHardCapForTesting() (public,
+  // above).
+  static constexpr int kMaxTrackedKeyGenerationEntriesHardCap =
+      kMaxTrackedKeyGenerationEntries * 4;
+  int m_maxTrackedKeyGenerationEntriesHardCap{
+      kMaxTrackedKeyGenerationEntriesHardCap};
   qint64 m_keyGenerationIdleEvictionThresholdMs{
       kDefaultKeyGenerationIdleEvictionThresholdMs};
   // Review round-3 item 9: an already-open, O_DIRECTORY|O_NOFOLLOW|

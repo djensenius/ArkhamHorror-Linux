@@ -669,6 +669,34 @@ private:
     QString cacheKey;
     AssetFormat format{AssetFormat::Png};
     QVector<GroupWaiter> waiters;
+    // Independent cumulative re-review (HIGH, repeat finding, "supersession
+    // uses highest currently outstanding... Maintain monotonic
+    // latestIssued watermark independent of outstanding set"): the
+    // single AssetCache-level token this WHOLE group currently uses for
+    // its eventual, shared CAS/apply attempt -- the numerically HIGHEST
+    // of every member's own independently-minted token seen so far
+    // (initially the leader's, at registration; advanced -- never
+    // regressed -- as later joiners with a still-higher token arrive;
+    // see registerCacheHitCompletion()'s own comment). Every member's own
+    // token is minted via snapshotAndIssueGeneration()'s internal,
+    // non-committing mint, so a later joiner's own higher-numbered token
+    // never, by itself, poisons AssetCache::
+    // latestCommittedGenerationLocked()'s shared ceiling against the
+    // group's earlier representative (see that method's own comment in
+    // AssetCache.cpp for the full contract) -- adopting the highest is
+    // therefore not required to avoid spurious rejection by the join
+    // itself, but remains strictly safer and free: the group's eventual
+    // tryApplyKeyGenerationLocked() check is a simple `>=` comparison, so
+    // publishing with the freshest observed token can only ever make
+    // that check MORE likely to still succeed if some genuinely
+    // separate, actually-committed writer for this exact key advanced
+    // the shared ceiling in the interim. Every waiter's own
+    // GroupWaiter::assetCacheGeneration is authoritatively re-synced to
+    // this exact value immediately before delivery -- see
+    // completeCoalescedCacheDecode()'s own comment -- since an earlier
+    // waiter's own stored copy can otherwise still reflect a value this
+    // field has since moved past.
+    quint64 assetCacheGeneration{0};
   };
   // Identifies a PendingCacheDecode group. Distinct from
   // candidateAttemptKey() (which additionally distinguishes conditional-

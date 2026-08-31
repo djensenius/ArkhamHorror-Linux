@@ -236,6 +236,16 @@ private slots:
   // (root-privileged); QSKIP when unavailable.
   void
   unauthenticatedAncestorMountTransitionModellingADedicatedHomePartitionIsRejected();
+  // Independent cumulative re-review (MEDIUM, repeat finding, "home
+  // trust... arbitrary same-device bind mount still passes"): a bind
+  // mount landing at an ancestor position that reports the IDENTICAL
+  // device as its parent must be refused even when fully authenticated
+  // and ownership/mode-qualified -- a real dedicated partition is, by
+  // definition, backed by a distinct device; a same-device "mount" can
+  // only be a redirect of some arbitrary directory. Requires a real
+  // bind mount (root-privileged); QSKIP when unavailable.
+  void
+  arbitrarySameDeviceBindMountOntoAncestorPositionIsRejectedEvenWhenFullyAuthenticatedAndOwnershipQualifies();
   // An unauthenticated $HOME whose mount-identification itself is
   // degraded (forced via setMountIdentificationDegradedForTesting(),
   // no privilege required) must fail closed exactly like an
@@ -695,17 +705,25 @@ private slots:
   // only ever the genuinely newer, still-current one.
   void
   bothOld404FirstAndOldSuccessFirstOrdersLeaveOnlyTheNewerTokenVisibleToAThirdReader();
-  // Independent cumulative re-review (HIGH, repeat finding): proves
-  // the fix does not reintroduce the historical livelock the removed
-  // "compare against highest EVER issued" over-correction caused --
-  // once the blocking newer token is genuinely released (never
-  // applied at all, e.g. its own operation was itself cancelled), the
-  // older token's later retry must succeed normally, because the
-  // outstanding-token ceiling this fix consults is a live, shrinking
-  // set (never a monotonic, ever-growing "highest ever issued"
-  // watermark).
+  // Independent cumulative re-review (HIGH, repeat finding,
+  // "supersession uses highest currently outstanding... Maintain
+  // monotonic latestIssued watermark independent of outstanding set.
+  // Cancellation never retroactively authorizes older 200/304/404/
+  // tombstone/fallback/delivery... Reverse test 5790-5834; cover gen1,
+  // gen2 cancel, gen1 404, third request"): this test's own name and
+  // final assertion are the exact reverse of its predecessor. The
+  // PRIOR version proved a since-removed, now-incorrect behavior --
+  // that releasing a blocking newer token without ever applying it
+  // lets an older token's retry succeed again. That behavior is
+  // exactly the bug this finding requires fixing:
+  // latestCommittedGenerationLocked() (see its own comment in
+  // AssetCache.cpp) is monotonic for every real, write-intending
+  // attempt's own token and never shrinks on release, so cancellation
+  // must never retroactively re-authorize an older, already-superseded
+  // token for ANY mutation -- store(), the 404 tombstone, or a third
+  // reader's own snapshot.
   void
-  oldTokenStoreSucceedsAfterTheBlockingNewerTokenIsReleasedWithoutEverApplying();
+  oldTokenNeverBecomesAuthoritativeAgainAfterBlockingNewerTokenIsReleasedWithoutEverApplying();
   // Independent cumulative re-review (MEDIUM, repeat finding, "release
   // does not prune... remains unbounded if no later activity"):
   // touchAndPruneKeyGenerationMapsLocked() was previously invoked ONLY
@@ -721,6 +739,30 @@ private slots:
   // once release() itself can also trigger the bounded sweep.
   void
   releasingTheLastOutstandingTokenForAKeyMakesItPrunableWithNoFurtherActivity();
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // prunes but 15-minute idle threshold leaves >4096 young entries
+  // forever when activity stops... Hard cap must immediately evict
+  // eligible non-outstanding entries regardless soft idle... Test
+  // default production threshold, burst/release/no later activity
+  // bounded"): unlike its predecessor above, this test deliberately
+  // NEVER overrides the idle-eviction threshold -- it uses the exact
+  // production default (15 real minutes) -- so it cannot rely on the
+  // softer, idle-gated eviction path at all within any plausible test
+  // runtime. It instead overrides ONLY the tracked-entry cap and the
+  // separate, strictly larger unconditional hard-cap backstop (see
+  // setMaxTrackedKeyGenerationEntriesHardCapForTesting()'s own comment)
+  // down to small values, issues and releases (never applies) tokens
+  // for more distinct keys than the hard cap allows in one burst, then
+  // -- with NO further issuance for any key, and NO idle sleep either
+  // -- proves the tracked map is still bounded, purely as a consequence
+  // of the hard-cap backstop itself. Fails against a fix that only
+  // adds condition-(2)-gated eviction to release() (Finding #2's FIRST,
+  // insufficient fix) -- which would leave every one of these young,
+  // just-touched entries stuck at the burst's peak size, since none of
+  // them can ever satisfy the production 15-minute idle gate within
+  // this test's own real running time.
+  void
+  releaseBurstAgainstProductionIdleThresholdIsStillBoundedByTheUnconditionalHardCap();
   // Independent cumulative re-review (MEDIUM, repeat finding, "remove
   // pathname fallback when STATX_MNT_ID unavailable; fail closed"):
   // an ordinary, otherwise perfectly owned/moded local directory must

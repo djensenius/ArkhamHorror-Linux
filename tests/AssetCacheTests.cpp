@@ -3111,6 +3111,51 @@ struct MountTransitionPolicyQualificationOverrideGuard {
 };
 } // namespace
 
+namespace {
+// Independent cumulative re-review (MEDIUM, repeat finding, "home
+// trust... arbitrary same-device bind mount still passes... Test
+// arbitrary same-device bind rejection and real expected SteamOS
+// home"): every bind-mount "legitimate mount transition" test in this
+// file must model a GENUINELY distinct-device source, now that the
+// production code itself refuses any transition landing on the SAME
+// device as its parent (see
+// mountTransitionIsIndependentlyPolicyQualified()'s own comment in
+// AssetCache.cpp for the full rationale). The default QTemporaryDir()
+// location (this process's own system temp directory) is USELESS for
+// that purpose on a typical single-partition CI runner, where $HOME,
+// the system temp directory, and everything else this test process
+// creates all live on the exact same root filesystem device --
+// bind-mounting from there would incidentally exercise the NEW
+// same-device rejection instead of the legitimate-transition
+// acceptance path these tests actually intend to verify. `/dev/shm`
+// is a dedicated tmpfs mount present on every mainstream Linux
+// distribution and container base image this project targets,
+// guaranteeing a real, independently-provisioned distinct device
+// without requiring an actual extra disk partition to exist. Returns
+// std::nullopt (never QSKIPs itself -- callers must do so, exactly
+// like every other privilege-dependent step in these tests) when
+// `/dev/shm` is unavailable or not writable in this environment.
+// `keepAliveOut` receives ownership of the underlying QTemporaryDir so
+// its directory (and everything bind-mounted from it) is not removed
+// out from under the caller until the caller itself goes out of
+// scope.
+std::optional<QString> createDeviceDistinctBindSourceDirectory(
+    std::unique_ptr<QTemporaryDir> &keepAliveOut) {
+  const QString shmRoot = QStringLiteral("/dev/shm");
+  if (!QFileInfo::exists(shmRoot) || !QFileInfo(shmRoot).isWritable()) {
+    return std::nullopt;
+  }
+  auto dir = std::make_unique<QTemporaryDir>(
+      shmRoot + QStringLiteral("/arkham-asset-cache-test-XXXXXX"));
+  if (!dir->isValid()) {
+    return std::nullopt;
+  }
+  const QString path = dir->path();
+  keepAliveOut = std::move(dir);
+  return path;
+}
+} // namespace
+
 void AssetCacheTests::
     unauthenticatedHomeMountTransitionOntoADifferentMountIsRejected() {
   // Cumulative review (PR #18, MEDIUM, "arbitrary mount exactly on
@@ -3196,9 +3241,22 @@ void AssetCacheTests::
   const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
   QVERIFY(QDir().mkpath(fakeHome));
 
-  QTemporaryDir bindSourceDir;
-  QVERIFY(bindSourceDir.isValid());
-  const QString bindSource = bindSourceDir.path();
+  // Independent cumulative re-review (MEDIUM, "arbitrary same-device
+  // bind mount still passes"): the bind source must live on a
+  // GENUINELY distinct device from `fakeHomeParent` -- see
+  // createDeviceDistinctBindSourceDirectory()'s own comment -- so this
+  // positive control keeps exercising a real, legitimate DIFFERENT-
+  // mount transition rather than incidentally tripping the new
+  // same-device rejection this fix adds.
+  std::unique_ptr<QTemporaryDir> bindSourceDirKeepAlive;
+  const std::optional<QString> bindSourceOpt =
+      createDeviceDistinctBindSourceDirectory(bindSourceDirKeepAlive);
+  if (!bindSourceOpt.has_value()) {
+    QSKIP("/dev/shm (a distinct-device tmpfs) unavailable/not writable in "
+          "this environment; cannot model a genuinely distinct-device "
+          "mount transition without it");
+  }
+  const QString bindSource = *bindSourceOpt;
 
   QProcess mountProc;
   mountProc.start(QStringLiteral("sudo"),
@@ -3273,9 +3331,20 @@ void AssetCacheTests::
       fakeHomeGrandparent + QStringLiteral("/mounted-ancestor");
   QVERIFY(QDir().mkpath(fakeHomeParent));
 
-  QTemporaryDir bindSourceDir;
-  QVERIFY(bindSourceDir.isValid());
-  const QString bindSource = bindSourceDir.path();
+  // Independent cumulative re-review (MEDIUM, "arbitrary same-device
+  // bind mount still passes"): see
+  // createDeviceDistinctBindSourceDirectory()'s own comment -- this
+  // positive control's bind source must live on a genuinely distinct
+  // device from `fakeHomeGrandparent`.
+  std::unique_ptr<QTemporaryDir> bindSourceDirKeepAlive;
+  const std::optional<QString> bindSourceOpt =
+      createDeviceDistinctBindSourceDirectory(bindSourceDirKeepAlive);
+  if (!bindSourceOpt.has_value()) {
+    QSKIP("/dev/shm (a distinct-device tmpfs) unavailable/not writable in "
+          "this environment; cannot model a genuinely distinct-device "
+          "mount transition without it");
+  }
+  const QString bindSource = *bindSourceOpt;
   QVERIFY(QDir().mkpath(bindSource + QStringLiteral("/actual-home")));
 
   // Cumulative review (independent re-review round-6, MEDIUM,
@@ -3429,6 +3498,117 @@ void AssetCacheTests::
       fakeHome + QStringLiteral("/assets/v1");
   QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
       configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+#endif
+}
+
+void AssetCacheTests::
+    arbitrarySameDeviceBindMountOntoAncestorPositionIsRejectedEvenWhenFullyAuthenticatedAndOwnershipQualifies() {
+  // Independent cumulative re-review (MEDIUM, repeat finding across
+  // several rounds, "home trust... arbitrary same-device bind mount
+  // still passes because parent/root/mountpoint/source/options/
+  // super-options ignored... Test arbitrary bind on same ext4/btrfs
+  // rejected and genuine SteamOS home accepted"): unlike every OTHER
+  // "permitted" test in this file (which now deliberately bind-mounts
+  // from a genuinely distinct-device source -- see
+  // createDeviceDistinctBindSourceDirectory()'s own comment), this
+  // test's bind source is a perfectly ordinary SIBLING directory of
+  // `fakeHomeGrandparent` itself, i.e. on the EXACT SAME underlying
+  // device/filesystem. It is chowned to root:root and chmod'd 0755
+  // (satisfying the ancestor-position ownership/mode policy exactly
+  // like the genuinely-distinct-device positive control does), and
+  // $HOME is fully authenticated against the account database -- every
+  // OTHER check this project performs is satisfied. Only the NEW
+  // same-device rejection this fix adds can refuse this: a bind mount
+  // whose destination reports the identical device as its parent can
+  // only ever be a same-filesystem redirect of an arbitrary directory,
+  // never a genuine, independently-provisioned dedicated partition --
+  // exactly the residual gap the reviewer's finding describes.
+#if !defined(__linux__)
+  QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
+        "platform");
+#else
+  const QString fakeHomeGrandparent =
+      m_tempDirPath + QStringLiteral("/same-device-bind-grandparent");
+  QVERIFY(QDir().mkpath(fakeHomeGrandparent));
+  const QString fakeHomeParent =
+      fakeHomeGrandparent + QStringLiteral("/mounted-ancestor");
+  QVERIFY(QDir().mkpath(fakeHomeParent));
+
+  // Deliberately a SIBLING of `fakeHomeGrandparent`, both directly
+  // under `m_tempDirPath` -- guaranteed to be on the SAME device,
+  // never bind-mounted from anywhere else, unlike every positive
+  // control test's own `/dev/shm`-backed source.
+  const QString bindSource =
+      m_tempDirPath + QStringLiteral("/same-device-bind-source");
+  QVERIFY(QDir().mkpath(bindSource + QStringLiteral("/actual-home")));
+
+  QProcess bindSourceChmodProc;
+  bindSourceChmodProc.start(QStringLiteral("chmod"),
+                            {QStringLiteral("755"), bindSource});
+  QVERIFY(bindSourceChmodProc.waitForFinished(5000));
+  QCOMPARE(bindSourceChmodProc.exitCode(), 0);
+
+  QProcess bindSourceChownProc;
+  bindSourceChownProc.start(QStringLiteral("sudo"),
+                            {QStringLiteral("-n"), QStringLiteral("chown"),
+                             QStringLiteral("root:root"), bindSource});
+  const bool bindSourceChowned = bindSourceChownProc.waitForFinished(5000) &&
+                                 bindSourceChownProc.exitCode() == 0;
+  if (!bindSourceChowned) {
+    QSKIP("passwordless chown privilege unavailable in this environment; "
+          "see the finding's own fail-closed allowance");
+  }
+  struct BindSourceChownBackGuard {
+    QString path;
+    ~BindSourceChownBackGuard() {
+      QProcess::execute(QStringLiteral("sudo"),
+                        {QStringLiteral("-n"), QStringLiteral("chown"),
+                         QString::number(::getuid()) + QLatin1Char(':') +
+                             QString::number(::getgid()),
+                         path});
+    }
+  } bindSourceChownBackGuard{bindSource};
+
+  QProcess mountProc;
+  mountProc.start(QStringLiteral("sudo"),
+                  {QStringLiteral("-n"), QStringLiteral("mount"),
+                   QStringLiteral("--bind"), bindSource, fakeHomeParent});
+  const bool mounted =
+      mountProc.waitForFinished(5000) && mountProc.exitCode() == 0;
+  if (!mounted) {
+    QSKIP("passwordless bind-mount privilege unavailable in this "
+          "environment; see the finding's own fail-closed allowance");
+  }
+  struct UnmountGuard {
+    QString mountPoint;
+    ~UnmountGuard() {
+      QProcess::execute(
+          QStringLiteral("sudo"),
+          {QStringLiteral("-n"), QStringLiteral("umount"), mountPoint});
+    }
+  } unmountGuard{fakeHomeParent};
+
+  const QString fakeHome = fakeHomeParent + QStringLiteral("/actual-home");
+  QVERIFY(QFileInfo::exists(fakeHome));
+
+  HomeEnvOverrideGuard homeGuard(fakeHome);
+  QCOMPARE(QDir::homePath(), QDir::cleanPath(fakeHome));
+  // Fully authenticated -- exactly like the genuinely-distinct-device
+  // positive control -- so the rejection below can only come from the
+  // NEW same-device check, never from an unauthenticated $HOME.
+  AuthoritativeAccountHomeOverrideGuard accountGuard(QDir::cleanPath(fakeHome));
+  HomeComponentOwnershipModePolicyOverrideGuard ownershipGuard(
+      /*passes=*/true);
+
+  const QString configuredUnderFakeHome =
+      fakeHome + QStringLiteral("/assets/v1");
+  QVERIFY2(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+               configuredUnderFakeHome, /*allowCreateMissingComponents=*/true),
+           "a bind mount reporting the SAME device as its parent must be "
+           "refused even when fully authenticated and ownership-qualified "
+           "-- it can only be a same-device redirect of an arbitrary "
+           "directory, never a genuine dedicated partition");
   QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
 #endif
 }
@@ -3656,9 +3836,25 @@ void AssetCacheTests::
       grandparent + QStringLiteral("/mounted-ancestor");
   QVERIFY(QDir().mkpath(mountedAncestor));
 
-  QTemporaryDir ancestorBindSourceDir;
-  QVERIFY(ancestorBindSourceDir.isValid());
-  const QString ancestorBindSource = ancestorBindSourceDir.path();
+  // Independent cumulative re-review (MEDIUM, "arbitrary same-device
+  // bind mount still passes"): see
+  // createDeviceDistinctBindSourceDirectory()'s own comment -- the
+  // ANCESTOR-position bind source (the first of the two transitions
+  // this test exercises) must live on a genuinely distinct device
+  // from `grandparent`. The SECOND transition (`homeBindSource` below,
+  // deliberately left as an ordinary QTemporaryDir()) then
+  // automatically also differs in device from `mountedAncestor`'s own
+  // NEW device once this first bind mount is in place, without
+  // needing the same treatment itself.
+  std::unique_ptr<QTemporaryDir> ancestorBindSourceDirKeepAlive;
+  const std::optional<QString> ancestorBindSourceOpt =
+      createDeviceDistinctBindSourceDirectory(ancestorBindSourceDirKeepAlive);
+  if (!ancestorBindSourceOpt.has_value()) {
+    QSKIP("/dev/shm (a distinct-device tmpfs) unavailable/not writable in "
+          "this environment; cannot model a genuinely distinct-device "
+          "mount transition without it");
+  }
+  const QString ancestorBindSource = *ancestorBindSourceOpt;
   QVERIFY(QDir().mkpath(ancestorBindSource + QStringLiteral("/actual-home")));
 
   // Cumulative review (independent re-review round-6, MEDIUM,
@@ -5787,50 +5983,100 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
-    oldTokenStoreSucceedsAfterTheBlockingNewerTokenIsReleasedWithoutEverApplying() {
-  // Independent cumulative re-review (HIGH, repeat finding): proves the
-  // fix does not reintroduce the historical livelock the removed
-  // "compare against highest EVER issued" over-correction caused (see
-  // highestOutstandingGenerationLocked()'s own comment in
-  // AssetCache.cpp). The outstanding-token ceiling this fix consults
-  // is a LIVE set that shrinks the instant a blocking token is
-  // released, never a monotonic "highest ever issued" watermark that
-  // can only ever grow -- so once the newer token's own operation is
-  // abandoned (e.g. cancelled) without ever applying anything, the
-  // older token's own later retry must succeed normally.
+    oldTokenNeverBecomesAuthoritativeAgainAfterBlockingNewerTokenIsReleasedWithoutEverApplying() {
+  // Independent cumulative re-review (HIGH, repeat finding,
+  // "supersession uses highest currently outstanding... Maintain
+  // monotonic latestIssued watermark independent of outstanding set...
+  // Cancellation never retroactively authorizes older 200/304/404/
+  // tombstone/fallback/delivery. Coalescing/resnapshot avoids
+  // livelock. Reverse test 5790-5834; cover gen1, gen2 cancel, gen1
+  // 404, third request"). This is the exact REVERSE of the removed
+  // predecessor test, which incorrectly asserted that releasing a
+  // blocking newer (gen2) token without ever applying it lets an
+  // older (gen1) token's later retry succeed again -- exactly the bug
+  // latestCommittedGenerationLocked() (see its own comment in
+  // AssetCache.cpp) exists to close, since it is monotonic for every
+  // real, write-intending attempt's own committed token and never
+  // shrinks on release, unlike the removed outstanding-set ceiling.
   AssetCache cache(configFor(m_tempDirPath));
   QVERIFY(!cache.isDiskCacheDisabledForTesting());
 
   const QString key = AssetCache::cacheKeyFor(
       QUrl(QStringLiteral("https://example.com/release-then-retry.png")));
 
-  const quint64 olderToken = cache.issueKeyGeneration(key);
-  const quint64 newerToken = cache.issueKeyGeneration(key);
-  QVERIFY(newerToken > olderToken);
+  // gen1: the older token.
+  const quint64 gen1 = cache.issueKeyGeneration(key);
+  // gen2: strictly superseding, still-outstanding newer token.
+  const quint64 gen2 = cache.issueKeyGeneration(key);
+  QVERIFY2(gen2 > gen1, "a later issuance must strictly exceed an earlier "
+                        "one");
 
-  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("first-attempt")),
-                       olderToken),
+  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("gen1-first-attempt")),
+                       gen1),
            AssetCache::MutationOutcome::SkippedStaleGeneration);
   QVERIFY(!cache.lookupMemory(key).has_value());
 
-  // The newer token's own operation is abandoned entirely -- released
-  // without ever calling store()/recordNegative404()/etc.
-  cache.releaseKeyGeneration(key, newerToken);
+  // gen2 cancel: gen2's own operation is abandoned entirely -- released
+  // without ever calling store()/recordNegative404()/etc. Under the
+  // OLD (buggy, outstanding-set) ceiling this would let gen1 become
+  // authoritative again; under the fixed, monotonic ceiling it must
+  // not.
+  cache.releaseKeyGeneration(key, gen2);
 
-  // The older token's retry (a fresh, real caller mints a NEW token
-  // rather than reusing a rejected one in production -- see
-  // dispatchCandidateFetchResult()'s staleRetryNeeded handling -- but
-  // this test proves the underlying ceiling itself has genuinely
-  // shrunk, independent of that retry convention) must now succeed:
-  // the blocking token is gone, never merely "still counted forever".
-  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("retry-succeeds")),
-                       olderToken),
-           AssetCache::MutationOutcome::Applied);
+  // gen1 404: gen1's own later attempt at a DIFFERENT kind of mutation
+  // (a negative-404 tombstone, not just another store()) must also
+  // never become authoritative, proving the fix applies uniformly
+  // across every mutation kind gated by tryApplyKeyGenerationLocked(),
+  // not merely store().
+  cache.recordNegative404(key, gen1, /*nowMonotonicMs=*/5'000,
+                          /*ttlMs=*/60'000);
+  QVERIFY2(!cache.hasNegative404ForTesting(key, /*nowMonotonicMs=*/5'000),
+           "gen1's negative-404 must never become authoritative once gen2 "
+           "was ever issued, even though gen2 itself was released without "
+           "ever applying anything");
+  QCOMPARE(cache.negative404RecordCountForTesting(), 0);
+
+  // A plain retry reusing gen1 itself must also still fail -- proves
+  // the ceiling genuinely never regresses, independent of which
+  // mutation kind is retried.
+  QCOMPARE(cache.store(key, makeEntry(QByteArrayLiteral("gen1-retry")), gen1),
+           AssetCache::MutationOutcome::SkippedStaleGeneration);
+  QVERIFY(!cache.lookupMemory(key).has_value());
+
+  // third request: a genuinely new, independent caller (a fresh
+  // snapshotAndIssueGeneration(), modelling a concurrent third
+  // request arriving in the exact race window) must observe neither
+  // gen1's rejected tombstone nor any stale hit -- and its own,
+  // strictly newer token (gen3) is the only one that can still
+  // succeed.
+  const AssetCache::KeyGenerationSnapshot thirdReader =
+      cache.snapshotAndIssueGeneration(key, /*nowMonotonicMs=*/5'000);
+  QVERIFY2(!thirdReader.authoritativeNegative404,
+           "a third reader must never observe gen1's rejected tombstone as "
+           "authoritative");
+  QVERIFY(!thirdReader.hit.has_value());
+  const quint64 gen3 = thirdReader.issuedGeneration;
+  QVERIFY(gen3 > gen2);
+
+  QCOMPARE(
+      cache.store(key, makeEntry(QByteArrayLiteral("gen3-succeeds")), gen3),
+      AssetCache::MutationOutcome::Applied);
   QVERIFY(cache.lookupMemory(key).has_value());
   QCOMPARE(cache.lookupMemory(key)->encodedBytes,
-           QByteArrayLiteral("retry-succeeds"));
+           QByteArrayLiteral("gen3-succeeds"));
 
-  cache.releaseKeyGeneration(key, olderToken);
+  // Even after gen3's own genuine success, gen1's own retry must
+  // STILL never become authoritative again, and must never clobber
+  // gen3's already-published, genuinely current content.
+  QCOMPARE(
+      cache.store(key, makeEntry(QByteArrayLiteral("gen1-too-late")), gen1),
+      AssetCache::MutationOutcome::SkippedStaleGeneration);
+  QVERIFY(cache.lookupMemory(key).has_value());
+  QCOMPARE(cache.lookupMemory(key)->encodedBytes,
+           QByteArrayLiteral("gen3-succeeds"));
+
+  cache.releaseKeyGeneration(key, gen1);
+  cache.releaseKeyGeneration(key, gen3);
 }
 
 void AssetCacheTests::
@@ -5892,6 +6138,63 @@ void AssetCacheTests::
            "a consequence of release() itself being able to trigger the "
            "bounded sweep -- no further issuance for any key ever "
            "occurred after the last of these releases");
+}
+
+void AssetCacheTests::
+    releaseBurstAgainstProductionIdleThresholdIsStillBoundedByTheUnconditionalHardCap() {
+  // Independent cumulative re-review (MEDIUM, repeat finding, "release
+  // prunes but 15-minute idle threshold leaves >4096 young entries
+  // forever when activity stops... Hard cap must immediately evict
+  // eligible non-outstanding entries regardless soft idle... Test
+  // default production threshold, burst/release/no later activity
+  // bounded"). See this test's own header declaration comment for the
+  // full rationale. Deliberately does NOT call
+  // setKeyGenerationIdleEvictionThresholdMsForTesting() at all -- the
+  // production default (15 real minutes) remains in effect throughout.
+  AssetCache cache(configFor(m_tempDirPath));
+  QVERIFY(!cache.isDiskCacheDisabledForTesting());
+
+  cache.setMaxTrackedKeyGenerationEntriesForTesting(4);
+  cache.setMaxTrackedKeyGenerationEntriesHardCapForTesting(8);
+
+  constexpr int kKeyCount = 32;
+  QVector<QString> keys;
+  QVector<quint64> tokens;
+  keys.reserve(kKeyCount);
+  tokens.reserve(kKeyCount);
+  for (int i = 0; i < kKeyCount; ++i) {
+    const QString key = AssetCache::cacheKeyFor(
+        QUrl(QStringLiteral("https://example.com/prune-hard-cap-burst-%1.png")
+                 .arg(i)));
+    keys.append(key);
+    // Every earlier key's own token is still genuinely outstanding at
+    // the moment each subsequent one is issued -- so none of THEIR own
+    // issuance-triggered sweeps can evict anything yet, exactly
+    // modelling every token still being genuinely in flight throughout
+    // the whole burst.
+    tokens.append(cache.issueKeyGeneration(key));
+  }
+  QVERIFY2(cache.trackedKeyGenerationEntryCountForTesting() >= kKeyCount,
+           "every one of these tokens must still be tracked while "
+           "genuinely outstanding, regardless of either cap");
+
+  for (int i = 0; i < kKeyCount; ++i) {
+    cache.releaseKeyGeneration(keys[i], tokens[i]);
+  }
+
+  // No further issueKeyGeneration()/invalidate() call for ANY key
+  // happens after this point, and no real idle time has elapsed at
+  // all (the production 15-minute threshold is nowhere close to
+  // satisfied) -- the releases above, and specifically the
+  // unconditional hard-cap backstop they trigger, are the only
+  // mechanism left that could possibly bound this map within this
+  // test's own real running time.
+  QVERIFY2(cache.trackedKeyGenerationEntryCountForTesting() <= 8,
+           "the tracked key-generation map must remain bounded by the "
+           "unconditional hard-cap backstop alone, even though every "
+           "evicted entry was touched moments ago and the production "
+           "15-minute idle-eviction threshold was never overridden or "
+           "satisfied");
 }
 
 void AssetCacheTests::

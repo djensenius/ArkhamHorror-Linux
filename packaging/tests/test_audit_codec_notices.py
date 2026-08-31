@@ -3617,6 +3617,7 @@ class PackageProvenanceTests(unittest.TestCase):
                     "sourcePackage": "zlib",
                     "architecture": "amd64",
                     "debSha256": "abc123",
+                    "debArchiveVerification": "verified",
                     "evidenceStrength": "replay_byte_identical",
                 },
                 require_provenance=True,
@@ -3651,6 +3652,7 @@ class PackageProvenanceTests(unittest.TestCase):
                     "sourcePackage": "zlib",
                     "architecture": "amd64",
                     "debSha256": "different-live-sha",
+                    "debArchiveVerification": "verified",
                     "evidenceStrength": "replay_byte_identical",
                 },
                 require_provenance=True,
@@ -3658,6 +3660,402 @@ class PackageProvenanceTests(unittest.TestCase):
         self.assertIsNotNone(problem)
         self.assertIn("different-live-sha", problem)
         self.assertIn("expected-lock-sha", problem)
+
+    def test_validate_bundled_provenance_rejects_metadata_mismatch_unconditionally(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "actual archive not downloaded/hashed/
+        # extracted"): a freshly downloaded, self-hashed archive that
+        # disagrees with this host's own local APT index metadata is a
+        # hard failure regardless of --require-package-provenance --
+        # neither value can be trusted until resolved.
+        problem = audit.validate_bundled_library_package_provenance(
+            "zlib",
+            {
+                "status": "matched",
+                "package": "zlib1g",
+                "version": "1:1.2.11.dfsg-2ubuntu9.2",
+                "sourcePackage": "zlib",
+                "architecture": "amd64",
+                "debArchiveVerification": "metadataMismatch",
+                "evidenceStrength": "replay_byte_identical",
+            },
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("zlib1g", problem)
+
+    def test_validate_bundled_provenance_rejects_archive_content_mismatch_unconditionally(
+        self,
+    ) -> None:
+        # A live installed file that disagrees with the real archive's
+        # own extracted bytes is a hard failure unconditionally -- the
+        # live file has diverged from what the real distro archive
+        # actually contains.
+        problem = audit.validate_bundled_library_package_provenance(
+            "zlib",
+            {
+                "status": "matched",
+                "package": "zlib1g",
+                "version": "1:1.2.11.dfsg-2ubuntu9.2",
+                "sourcePackage": "zlib",
+                "architecture": "amd64",
+                "debArchiveVerification": "mismatch",
+                "evidenceStrength": "replay_byte_identical",
+            },
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("zlib1g", problem)
+
+    def test_validate_bundled_provenance_allows_unavailable_archive_verification_when_not_required(
+        self,
+    ) -> None:
+        # An offline host/sandbox that cannot reach the network to
+        # download a real archive must not spuriously fail merely for
+        # lacking the STRONGER archive-download proof, unless
+        # --require-package-provenance explicitly demands it.
+        self.assertIsNone(
+            audit.validate_bundled_library_package_provenance(
+                "e2fsprogs",
+                {
+                    "status": "matched",
+                    "package": "libcom-err2",
+                    "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["e2fsprogs"],
+                    "sourcePackage": "e2fsprogs",
+                    "debArchiveVerification": "unavailable",
+                },
+            )
+        )
+
+    def test_validate_bundled_provenance_rejects_missing_archive_verification_when_required(
+        self,
+    ) -> None:
+        problem = audit.validate_bundled_library_package_provenance(
+            "e2fsprogs",
+            {
+                "status": "matched",
+                "package": "libcom-err2",
+                "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["e2fsprogs"],
+                "sourcePackage": "e2fsprogs",
+                "architecture": "amd64",
+                "evidenceStrength": "replay_byte_identical",
+            },
+            require_provenance=True,
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("libcom-err2", problem)
+
+    def test_validate_bundled_provenance_rejects_unavailable_archive_verification_when_required(
+        self,
+    ) -> None:
+        problem = audit.validate_bundled_library_package_provenance(
+            "e2fsprogs",
+            {
+                "status": "matched",
+                "package": "libcom-err2",
+                "version": audit.COMPONENT_EXPECTED_SOURCE_VERSION["e2fsprogs"],
+                "sourcePackage": "e2fsprogs",
+                "architecture": "amd64",
+                "debArchiveVerification": "unavailable",
+                "evidenceStrength": "replay_byte_identical",
+            },
+            require_provenance=True,
+        )
+        self.assertIsNotNone(problem)
+        self.assertIn("libcom-err2", problem)
+
+
+class RealArchiveDownloadAndExtractionTests(unittest.TestCase):
+    """Round-N+ review (HIGH, "distro provenance ... locked .deb SHA is
+    copied from apt metadata; actual archive not downloaded/hashed/
+    extracted, no signed snapshot, graph initially reads mutable paths,
+    linuxdeploy automatic closure can reopen host"): proves
+    _download_and_hash_deb_archive()/_extract_governed_file_from_deb_
+    archive()/_dpkg_full_provenance_record()'s new archive-download
+    authentication end-to-end -- both a REAL network download (skipped
+    gracefully offline, matching this module's own established "skip
+    when a real precondition is absent" convention) and fully
+    deterministic mocked coverage of every failure/mismatch outcome, so
+    the negative paths are never dependent on network availability."""
+
+    def _real_libz_path(self) -> Path | None:
+        for search_dir in audit._SYSTEM_LIBRARY_SEARCH_DIRS:
+            candidate = search_dir / "libz.so.1"
+            if candidate.exists():
+                return candidate.resolve()
+        return None
+
+    def test_download_and_hash_returns_none_when_apt_get_missing(self) -> None:
+        with mock.patch.object(audit.shutil, "which", return_value=None):
+            self.assertIsNone(
+                audit._download_and_hash_deb_archive.__wrapped__(
+                    "zlib1g", "1:1.2.11-1", "amd64"
+                )
+            )
+
+    def test_download_and_hash_returns_none_on_download_failure(self) -> None:
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/apt-get"
+        ), mock.patch.object(
+            audit.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="404 Not Found"
+            ),
+        ):
+            self.assertIsNone(
+                audit._download_and_hash_deb_archive.__wrapped__(
+                    "zlib1g", "1:1.2.11-1", "amd64"
+                )
+            )
+
+    def test_download_and_hash_returns_none_when_zero_or_multiple_debs_produced(
+        self,
+    ) -> None:
+        def fake_run(cmd, cwd=None, capture_output=True, text=True, timeout=None):
+            # Simulate apt-get download succeeding but writing an
+            # unexpected number of .deb files (e.g. a multi-arch
+            # resolution ambiguity) -- must be an honest "cannot
+            # verify", never a silent pick-one.
+            (Path(cwd) / "one.deb").write_bytes(b"\x00")
+            (Path(cwd) / "two.deb").write_bytes(b"\x00")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/apt-get"
+        ), mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(
+                audit._download_and_hash_deb_archive.__wrapped__(
+                    "zlib1g", "1:1.2.11-1", "amd64"
+                )
+            )
+
+    def test_download_and_hash_returns_our_own_sha256_of_downloaded_bytes(
+        self,
+    ) -> None:
+        def fake_run(cmd, cwd=None, capture_output=True, text=True, timeout=None):
+            (Path(cwd) / "zlib1g_1%3a1.2.11-1_amd64.deb").write_bytes(
+                b"totally-fake-but-deterministic-archive-bytes"
+            )
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(
+            audit.shutil, "which", return_value="/usr/bin/apt-get"
+        ), mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+            result = audit._download_and_hash_deb_archive.__wrapped__(
+                "zlib1g", "1:1.2.11-1", "amd64"
+            )
+        self.assertIsNotNone(result)
+        deb_path, deb_sha256 = result
+        self.assertEqual(
+            deb_sha256,
+            hashlib.sha256(
+                b"totally-fake-but-deterministic-archive-bytes"
+            ).hexdigest(),
+        )
+        self.assertEqual(deb_path.read_bytes(), b"totally-fake-but-deterministic-archive-bytes")
+
+    def test_extract_governed_file_returns_none_when_dpkg_deb_missing(self) -> None:
+        with mock.patch.object(audit.shutil, "which", return_value=None):
+            self.assertIsNone(
+                audit._extract_governed_file_from_deb_archive(
+                    Path("/nonexistent.deb"), frozenset({"lib/libfoo.so.1"})
+                )
+            )
+
+    def test_extract_governed_file_returns_none_when_member_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            deb_path = Path(scratch_dir) / "fake.deb"
+            deb_path.write_bytes(b"\x00")
+            with mock.patch.object(
+                audit.shutil, "which", return_value="/usr/bin/dpkg-deb"
+            ), mock.patch.object(
+                audit.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=b"", stderr=b""
+                ),
+            ):
+                self.assertIsNone(
+                    audit._extract_governed_file_from_deb_archive(
+                        deb_path, frozenset({"lib/libfoo.so.1"})
+                    )
+                )
+
+    def test_extract_governed_file_returns_real_bytes_from_a_real_tar_stream(
+        self,
+    ) -> None:
+        import tarfile as tarfile_module
+
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            tar_bytes_io = io.BytesIO()
+            with tarfile_module.open(fileobj=tar_bytes_io, mode="w") as archive:
+                info = tarfile_module.TarInfo(
+                    name="./usr/lib/x86_64-linux-gnu/libfoo.so.1"
+                )
+                payload = b"real-payload-bytes"
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            deb_path = Path(scratch_dir) / "fake.deb"
+            deb_path.write_bytes(b"\x00")
+            with mock.patch.object(
+                audit.shutil, "which", return_value="/usr/bin/dpkg-deb"
+            ), mock.patch.object(
+                audit.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=tar_bytes_io.getvalue(),
+                    stderr=b"",
+                ),
+            ):
+                extracted = audit._extract_governed_file_from_deb_archive(
+                    deb_path,
+                    frozenset({"usr/lib/x86_64-linux-gnu/libfoo.so.1"}),
+                )
+        self.assertEqual(extracted, b"real-payload-bytes")
+
+    def test_dpkg_full_provenance_record_reports_metadata_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            scratch_path = Path(scratch_dir) / "libfoo.so.1"
+            scratch_path.write_bytes(b"live-file-bytes")
+            with mock.patch.object(
+                audit, "_dpkg_owning_package", return_value="libfoo1"
+            ), mock.patch.object(
+                audit,
+                "_dpkg_package_metadata",
+                return_value=("1.2.3-1", "foosource"),
+            ), mock.patch.object(
+                audit, "_dpkg_package_architecture", return_value="amd64"
+            ), mock.patch.object(
+                audit,
+                "_apt_cache_package_record",
+                return_value={"architecture": "amd64", "debSha256": "a" * 64},
+            ), mock.patch.object(
+                audit,
+                "_download_and_hash_deb_archive",
+                return_value=(Path(scratch_dir) / "fake.deb", "b" * 64),
+            ):
+                record = audit._dpkg_full_provenance_record(scratch_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["debSha256"], "b" * 64)
+        self.assertEqual(record["debSha256AptMetadata"], "a" * 64)
+        self.assertEqual(record["debArchiveVerification"], "metadataMismatch")
+
+    def test_dpkg_full_provenance_record_reports_archive_content_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            scratch_path = Path(scratch_dir) / "libfoo.so.1"
+            scratch_path.write_bytes(b"live-file-bytes-tampered-locally")
+            deb_path = Path(scratch_dir) / "fake.deb"
+            deb_path.write_bytes(b"\x00")
+            with mock.patch.object(
+                audit, "_dpkg_owning_package", return_value="libfoo1"
+            ), mock.patch.object(
+                audit,
+                "_dpkg_package_metadata",
+                return_value=("1.2.3-1", "foosource"),
+            ), mock.patch.object(
+                audit, "_dpkg_package_architecture", return_value="amd64"
+            ), mock.patch.object(
+                audit,
+                "_apt_cache_package_record",
+                return_value={"architecture": "amd64", "debSha256": "c" * 64},
+            ), mock.patch.object(
+                audit,
+                "_download_and_hash_deb_archive",
+                return_value=(deb_path, "c" * 64),
+            ), mock.patch.object(
+                audit,
+                "_extract_governed_file_from_deb_archive",
+                return_value=b"real-archive-bytes-different-from-live-file",
+            ):
+                record = audit._dpkg_full_provenance_record(scratch_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["debArchiveVerification"], "mismatch")
+
+    def test_dpkg_full_provenance_record_reports_verified_when_bytes_agree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as scratch_dir:
+            live_bytes = b"identical-bytes-both-places"
+            scratch_path = Path(scratch_dir) / "libfoo.so.1"
+            scratch_path.write_bytes(live_bytes)
+            deb_path = Path(scratch_dir) / "fake.deb"
+            deb_path.write_bytes(b"\x00")
+            with mock.patch.object(
+                audit, "_dpkg_owning_package", return_value="libfoo1"
+            ), mock.patch.object(
+                audit,
+                "_dpkg_package_metadata",
+                return_value=("1.2.3-1", "foosource"),
+            ), mock.patch.object(
+                audit, "_dpkg_package_architecture", return_value="amd64"
+            ), mock.patch.object(
+                audit,
+                "_apt_cache_package_record",
+                return_value={"architecture": "amd64", "debSha256": "d" * 64},
+            ), mock.patch.object(
+                audit,
+                "_download_and_hash_deb_archive",
+                return_value=(deb_path, "d" * 64),
+            ), mock.patch.object(
+                audit,
+                "_extract_governed_file_from_deb_archive",
+                return_value=live_bytes,
+            ):
+                record = audit._dpkg_full_provenance_record(scratch_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["debArchiveVerification"], "verified")
+        self.assertEqual(record["debSha256"], "d" * 64)
+
+    def test_real_download_and_extract_against_the_real_installed_libz_package(
+        self,
+    ) -> None:
+        # Real end-to-end proof (no mocks at all): download the ACTUAL
+        # installed libz package's .deb over the network, hash it
+        # ourselves, extract the real libz.so.1(.x) member from inside
+        # it, and confirm those bytes agree with the real, live
+        # installed file. Gracefully skipped offline/without apt-get,
+        # matching this module's own established convention.
+        if shutil.which("apt-get") is None or shutil.which("dpkg-deb") is None:
+            self.skipTest("apt-get/dpkg-deb unavailable")
+        libz_path = self._real_libz_path()
+        if libz_path is None:
+            self.skipTest("no real libz.so.1 system copy found on this host")
+        package = audit._dpkg_owning_package(libz_path)
+        if package is None:
+            self.skipTest("real libz.so.1 copy is not dpkg-owned on this host")
+        metadata = audit._dpkg_package_metadata(package)
+        if metadata is None:
+            self.skipTest(f"no package metadata available for {package!r}")
+        version, _source_package = metadata
+        architecture = audit._dpkg_package_architecture(package)
+        if architecture is None:
+            self.skipTest(f"no architecture available for {package!r}")
+        downloaded = audit._download_and_hash_deb_archive(
+            package, version, architecture
+        )
+        if downloaded is None:
+            self.skipTest(
+                "real 'apt-get download' did not succeed in this environment "
+                "(offline sandbox/no network egress)"
+            )
+        deb_path, _deb_sha256 = downloaded
+        relative_candidates = audit._merged_usr_relative_path_candidates(libz_path)
+        extracted = audit._extract_governed_file_from_deb_archive(
+            deb_path, relative_candidates
+        )
+        if extracted is None:
+            self.skipTest(
+                "could not locate the real libz.so.1 member inside the "
+                "downloaded archive on this host's layout"
+            )
+        self.assertEqual(
+            hashlib.sha256(extracted).hexdigest(),
+            hashlib.sha256(libz_path.read_bytes()).hexdigest(),
+        )
 
 
 class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
@@ -5069,6 +5467,7 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
                 "sourcePackage": "libavif",
                 "architecture": "amd64",
                 "debSha256": "locked-libavif16-sha",
+                "debArchiveVerification": "verified",
                 "evidenceStrength": "replay_byte_identical",
             }
 
@@ -5425,9 +5824,17 @@ class QtSdkInstalledTreeProvenanceTests(unittest.TestCase):
         (root / "plugins" / "imageformats" / "libqjpeg.so").write_bytes(b"jpeg-plugin")
         (root / "qml" / "QtQuick").mkdir(parents=True)
         (root / "qml" / "QtQuick" / "libqtquick2plugin.so").write_bytes(b"qml-module")
+        (root / "bin").mkdir(parents=True)
+        (root / "bin" / "moc").write_bytes(b"moc-binary")
+        (root / "include" / "QtCore").mkdir(parents=True)
+        (root / "include" / "QtCore" / "qobject.h").write_bytes(b"header-content")
+        (root / "mkspecs" / "linux-g++").mkdir(parents=True)
+        (root / "mkspecs" / "linux-g++" / "qmake.conf").write_bytes(b"mkspecs-content")
         # A SONAME-style symlink, exactly like Qt's own real packaging
-        # convention -- must never affect the digest (see
-        # _qt_sdk_tree_content_files()'s own docstring for why).
+        # convention -- MUST now affect the digest (see
+        # _qt_sdk_tree_content_files()'s own docstring for why: the
+        # link itself, not merely its target's content, is real linked
+        # behavior a retarget attack could change).
         (root / "lib" / "libQt6Core.so").symlink_to("libQt6Core.so.6")
 
     def test_compute_qt_sdk_tree_content_digest_is_deterministic(self) -> None:
@@ -5437,12 +5844,74 @@ class QtSdkInstalledTreeProvenanceTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(first), 64)
 
-    def test_compute_qt_sdk_tree_content_digest_ignores_symlinks(self) -> None:
+    def test_compute_qt_sdk_tree_content_digest_detects_a_symlink_retarget(self) -> None:
+        # Round-N+ review (HIGH, "SONAME retarget ... changes behavior
+        # without pin"): retargeting the SONAME-versioned convenience
+        # symlink to a DIFFERENT (but still real, still hashed) file in
+        # the same tree must change the digest, even though every
+        # individual regular file's own content is completely
+        # untouched by this retarget.
         self._make_sdk_tree(self.root)
-        with_symlink = audit.compute_qt_sdk_tree_content_digest(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "lib" / "libQt6Other.so.6").write_bytes(b"other-content")
         (self.root / "lib" / "libQt6Core.so").unlink()
-        without_symlink = audit.compute_qt_sdk_tree_content_digest(self.root)
-        self.assertEqual(with_symlink, without_symlink)
+        (self.root / "lib" / "libQt6Core.so").symlink_to("libQt6Other.so.6")
+        retargeted = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, retargeted)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_a_change_in_bin(self) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "bin" / "moc").write_bytes(b"substituted-moc-binary")
+        tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, tampered)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_a_change_in_include(self) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "include" / "QtCore" / "qobject.h").write_bytes(
+            b"substituted-header-content"
+        )
+        tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, tampered)
+
+    def test_compute_qt_sdk_tree_content_digest_detects_a_change_in_mkspecs(self) -> None:
+        self._make_sdk_tree(self.root)
+        baseline = audit.compute_qt_sdk_tree_content_digest(self.root)
+        (self.root / "mkspecs" / "linux-g++" / "qmake.conf").write_bytes(
+            b"substituted-mkspecs-content"
+        )
+        tampered = audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertNotEqual(baseline, tampered)
+
+    def test_qt_sdk_tree_content_files_rejects_an_absolute_symlink_target(self) -> None:
+        self._make_sdk_tree(self.root)
+        (self.root / "lib" / "libQt6Core.so").unlink()
+        (self.root / "lib" / "libQt6Core.so").symlink_to("/etc/passwd")
+        with self.assertRaises(audit.QtSdkTreeIntegrityError) as raised:
+            audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertIn("absolute", str(raised.exception))
+
+    def test_qt_sdk_tree_content_files_rejects_a_root_escaping_symlink_target(
+        self,
+    ) -> None:
+        self._make_sdk_tree(self.root)
+        (self.root / "lib" / "libQt6Core.so").unlink()
+        (self.root / "lib" / "libQt6Core.so").symlink_to("../../../../etc/passwd")
+        with self.assertRaises(audit.QtSdkTreeIntegrityError) as raised:
+            audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertIn("outside", str(raised.exception))
+
+    def test_qt_sdk_tree_content_files_rejects_a_directory_symlink(self) -> None:
+        self._make_sdk_tree(self.root)
+        (self.root / "lib" / "extra-real-dir").mkdir()
+        (self.root / "lib" / "extra-real-dir" / "real.so").write_bytes(b"real")
+        (self.root / "lib" / "extra-symlinked-dir").symlink_to(
+            "extra-real-dir", target_is_directory=True
+        )
+        with self.assertRaises(audit.QtSdkTreeIntegrityError) as raised:
+            audit.compute_qt_sdk_tree_content_digest(self.root)
+        self.assertIn("directory symlink", str(raised.exception))
 
     def test_compute_qt_sdk_tree_content_digest_detects_a_single_byte_change_anywhere(
         self,
@@ -5849,6 +6318,7 @@ class UnifiedQtSdkBindingTests(unittest.TestCase):
                 "sourcePackage": "libavif",
                 "architecture": "amd64",
                 "debSha256": "locked-libavif16-sha",
+                "debArchiveVerification": "verified",
                 "evidenceStrength": "replay_byte_identical",
             },
         ), mock.patch.object(
@@ -6774,9 +7244,36 @@ class RealDpkgArchitectureAndFileIntegrityTests(unittest.TestCase):
         record = audit._dpkg_full_provenance_record(libz_path)
         if record is None:
             self.skipTest("real libz.so.1 copy is not dpkg-owned on this host")
+        # Round-N+ review (HIGH, "locked .deb SHA is copied from apt
+        # metadata; actual archive not downloaded/hashed/extracted"):
+        # the local-index-only metadata value now lives under
+        # "debSha256AptMetadata" -- it is still cross-checked here
+        # (both must agree on a genuine, untampered host), but it is no
+        # longer the AUTHORITATIVE "debSha256" this record/the lock
+        # file are validated against.
+        metadata_sha = record.get("debSha256AptMetadata")
+        self.assertRegex(str(metadata_sha), r"^[0-9a-f]{64}$")
+        self.assertEqual(metadata_sha, expected_sha)
+        if shutil.which("apt-get") is None:
+            self.skipTest("apt-get unavailable -- cannot exercise real archive download")
         deb_sha256 = record.get("debSha256")
+        if deb_sha256 is None:
+            self.skipTest(
+                "real 'apt-get download' of the installed libz package did not "
+                "succeed in this environment (offline sandbox/no network egress) "
+                "-- covered deterministically by the mocked "
+                "RealArchiveDownloadAndExtractionTests below instead"
+            )
         self.assertRegex(str(deb_sha256), r"^[0-9a-f]{64}$")
-        self.assertEqual(deb_sha256, expected_sha)
+        self.assertEqual(
+            deb_sha256,
+            expected_sha,
+            "a real, freshly downloaded .deb archive's own independently "
+            "computed sha256 must agree with this host's local APT index "
+            "metadata on a genuine, untampered host/mirror",
+        )
+        self.assertEqual(record.get("debArchiveVerification"), "verified")
+
 
     def test_dpkg_recorded_file_md5_matches_a_real_unmodified_system_file(
         self,

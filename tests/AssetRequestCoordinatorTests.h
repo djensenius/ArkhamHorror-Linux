@@ -115,6 +115,20 @@ private slots:
   void
   corruptCoalescedCacheHitInvalidatesExactlyOnceAndEachWaiterIndependentlyRefetches();
   void cancellingOneWaiterInACoalescedCacheDecodeGroupNeverAffectsAnother();
+  // Independent cumulative re-review (HIGH, repeat finding,
+  // "supersession uses highest currently outstanding... Maintain
+  // monotonic latestIssued watermark"): PendingCacheDecode's shared
+  // representative token must track the HIGHEST of every joining
+  // waiter's own AssetCache-level token, not merely the leader's (first-
+  // arrived, hence numerically lowest) one -- otherwise, under
+  // AssetCache::tryApplyKeyGenerationLocked()'s now strictly monotonic
+  // ceiling, a second or third joiner's own mere issuance would
+  // permanently and spuriously fail the whole group's eventual publish,
+  // even though every member is validating byte-identical, non-
+  // conflicting content. Three simultaneously-coalescing waiters (never
+  // just two) prove the fix generalizes to more than one join.
+  void
+  threeWayCoalescedCacheDecodeGroupPublishesUsingTheHighestMemberTokenNotTheLeaders();
   // Round-9+ review item 3/7 ("fully cancelled PendingCacheDecode groups
   // retained and still decode"): when EVERY waiter of a shared cache-hit
   // decode group cancels before its single queued decode has run, the
