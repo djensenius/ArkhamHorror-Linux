@@ -28,10 +28,14 @@ Every compile-command target is reverse-inventoried against explicit CMake
 target metadata. Unknown production targets fail; external, test, and
 try-compile commands are excluded only by exact target records.
 INTERFACE header contexts are derived from a CMake-evaluated link graph
-generated separately for every audited configuration. The graph crosses
-imported and exempt wrappers, resolves nested generator expressions before
-Python reads it, and rejects any unevaluated or unclassified result rather
-than guessing target names from generator-expression text.
+generated separately for every compiled consumer and audited configuration.
+Provider usage requirements are evaluated in the consumer's target-property
+context. The graph crosses imported and exempt wrappers, resolves nested
+generator expressions before Python reads it, applies transitive
+INTERFACE_LINK_LIBRARIES_DIRECT injection followed by
+INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE precedence, and rejects any
+unevaluated or unclassified result rather than guessing target names from
+generator-expression text.
 
 Both header sets are audited by this ONE script/policy, not just the
 domain one: a review round demonstrated that scoping the AST scan to
@@ -325,7 +329,7 @@ _NAMED_ALLOWLIST_IDENTITY_SET_SHA256 = (
     "04096034a5fb3bb78d8587a5360fec919df7e2a5eaf948192b311cb94956f08d"
 )
 _LOCAL_WIRE_SURFACE_SET_SHA256 = (
-    "636424def3e04237f53d8873b25675a9f9d53e7774a84f74d18f1ba08410275f"
+    "c967eb44fdf62f07b8d9d0c9c6cf70bfcb9698d8acc3f7c86617a30f69c95128"
 )
 
 
@@ -1585,6 +1589,42 @@ def _is_unresolved_dependent_type_ref(
     )
 
 
+def _type_ref_is_completely_covered_by_parent(
+    clang: "_LibClang", cursor: "_CXCursor", parent: "_CXCursor"
+) -> bool:
+    """Suppress only a TypeRef already represented by its immediate complete
+    declaration surface. References below initializer/reference expressions,
+    template defaults, or specialization uses remain independent findings."""
+
+    if clang.lib.clang_getCursorKind(cursor) != _CXCursor_TypeRef:
+        return False
+    parent_kind = clang.lib.clang_getCursorKind(parent)
+    if parent_kind == _CXCursor_TypeRef:
+        # A nested-name qualifier (QSettings in QSettings::Status) is not the
+        # selected type. The outer TypeRef is visited independently with the
+        # complete selected canonical type.
+        return True
+    if parent_kind == _CXCursor_UsingDeclaration:
+        # Every using-declaration is resolved separately by
+        # handle_inheritance_exposure(), including overload sets and access.
+        return True
+    if parent_kind in {
+        _CXCursor_ParmDecl,
+        _CXCursor_TypeAliasDecl,
+        _CXCursor_TypedefDecl,
+        _CXCursor_CXXBaseSpecifier,
+        _CXCursor_FieldDecl,
+        _CXCursor_VarDecl,
+    }:
+        # Each of these cursors is independently inspected with its complete
+        # selected canonical type. This also suppresses nested-name qualifiers
+        # such as QSettings in a safe QSettings::Status parameter.
+        return True
+    if parent_kind in _SIGNATURE_DECL_KINDS:
+        return _is_encoder_shaped(clang, parent, parent_kind)[0]
+    return False
+
+
 def _cursor_template_argument_fingerprint(
     clang: "_LibClang", cursor: "_CXCursor", kind: int
 ) -> str | None:
@@ -1598,7 +1638,9 @@ def _cursor_template_argument_fingerprint(
         )
         if argument.kind == 0:
             continue
-        forbidden = _forbidden_type_fingerprint(clang, argument)
+        forbidden = _forbidden_type_fingerprint(
+            clang, argument, traverse_records=False
+        )
         if forbidden:
             return f"template-arg[{index}]:{forbidden}"
     return None
@@ -3030,6 +3072,7 @@ def _load_target_policies(clang_build_dir: Path) -> dict[str, TargetPolicy]:
 
 
 def _load_evaluated_link_contexts(
+    repo_root: Path,
     clang_build_dir: Path,
     policies: dict[str, TargetPolicy],
     contexts_by_target: dict[str, list[CompileContext]],
@@ -3050,25 +3093,30 @@ def _load_evaluated_link_contexts(
             "Per-configuration CMake-evaluated target link graph metadata "
             "is missing"
         )
-    indexed_files: dict[str, str] = {}
+    indexed_files: dict[tuple[str, str], str] = {}
     for line_number, line in enumerate(
         graph_index_path.read_text(encoding="utf-8").splitlines(), start=1
     ):
         fields = line.split("\t")
         if (
-            len(fields) != 2
+            len(fields) != 3
             or not all(fields)
-            or fields[0] in indexed_files
-            or not _re.fullmatch(r"[0-9a-f]{64}\.txt", fields[1])
+            or (fields[0], fields[1]) in indexed_files
+            or not _re.fullmatch(r"[0-9a-f]{64}\.txt", fields[2])
         ):
             raise EncoderHygieneError(
                 f"{graph_index_path}:{line_number}: malformed/duplicate "
                 "evaluated graph index record"
             )
-        indexed_files[fields[0]] = fields[1]
+        indexed_files[(fields[0], fields[1])] = fields[2]
     if not indexed_files:
         raise EncoderHygieneError(
             f"Evaluated target graph index is empty: {graph_index_path}"
+        )
+    if len(set(indexed_files.values())) != len(indexed_files):
+        raise EncoderHygieneError(
+            f"Evaluated target graph index aliases two consumer/provider "
+            f"records to one file: {graph_index_path}"
         )
     actual_configs = {
         path.name for path in graph_root.iterdir() if path.is_dir()
@@ -3103,11 +3151,38 @@ def _load_evaluated_link_contexts(
         if line
     }
 
-    raw_graphs: dict[str, dict[str, tuple[str, ...]]] = {}
+    field_names = {
+        "consumer",
+        "target",
+        "imported",
+        "links",
+        "interface",
+        "direct",
+        "exclude",
+    }
+    raw_graphs: dict[
+        str, dict[str, dict[str, dict[str, tuple[str, ...]]]]
+    ] = {}
     expected_nodes: set[str] | None = None
+    imported_nodes: dict[str, bool] = {}
+    expected_consumers = {
+        target
+        for target, policy in policies.items()
+        if policy.classification == "SCAN"
+        and policy.target_type != "INTERFACE_LIBRARY"
+    }
+    indexed_consumers = {consumer for consumer, _target in indexed_files}
+    if indexed_consumers != expected_consumers:
+        raise EncoderHygieneError(
+            "Evaluated link graph consumer roots differ from compiled SCAN "
+            f"targets: indexed={sorted(indexed_consumers)}, "
+            f"expected={sorted(expected_consumers)}"
+        )
     for configuration in audited_configs:
         config_dir = graph_root / configuration
-        graph: dict[str, tuple[str, ...]] = {}
+        consumer_graphs: dict[
+            str, dict[str, dict[str, tuple[str, ...]]]
+        ] = {consumer: {} for consumer in expected_consumers}
         actual_files = {path.name for path in config_dir.glob("*.txt")}
         if actual_files != set(indexed_files.values()):
             raise EncoderHygieneError(
@@ -3116,7 +3191,9 @@ def _load_evaluated_link_contexts(
                 f"{sorted(set(indexed_files.values()) - actual_files)}, "
                 f"extra={sorted(actual_files - set(indexed_files.values()))}"
             )
-        for indexed_target, filename in sorted(indexed_files.items()):
+        for (indexed_consumer, indexed_target), filename in sorted(
+            indexed_files.items()
+        ):
             path = config_dir / filename
             fields: dict[str, str] = {}
             for line_number, line in enumerate(
@@ -3125,46 +3202,67 @@ def _load_evaluated_link_contexts(
                 key, separator, value = line.partition("\t")
                 if (
                     not separator
-                    or key not in {"target", "links", "interface"}
+                    or key not in field_names
                     or key in fields
                 ):
                     raise EncoderHygieneError(
                         f"{path}:{line_number}: malformed evaluated link record"
                     )
                 fields[key] = value
-            if set(fields) != {"target", "links", "interface"}:
+            if set(fields) != field_names:
                 raise EncoderHygieneError(
                     f"{path}: incomplete evaluated link record"
                 )
+            consumer = fields["consumer"]
             target = fields["target"]
             if (
-                not target
+                consumer != indexed_consumer
+                or consumer not in consumer_graphs
+                or not target
                 or target != indexed_target
-                or target in graph
+                or (
+                    consumer in consumer_graphs
+                    and target in consumer_graphs[consumer]
+                )
             ):
                 raise EncoderHygieneError(
-                    f"{path}: mismatched/duplicate evaluated target identity"
+                    f"{path}: mismatched/duplicate evaluated consumer/target "
+                    "identity"
                 )
-            edges = tuple(
-                edge
-                for value in (fields["links"], fields["interface"])
-                for edge in value.split("|")
-                if edge
-            )
-            graph[target] = edges
-        if not graph:
+            if fields["imported"] not in {"0", "1"}:
+                raise EncoderHygieneError(
+                    f"{path}: invalid imported-target marker"
+                )
+            imported = fields["imported"] == "1"
+            previous_imported = imported_nodes.setdefault(target, imported)
+            if previous_imported != imported:
+                raise EncoderHygieneError(
+                    f"{path}: inconsistent imported-target marker"
+                )
+            consumer_graphs[consumer][target] = {
+                field: tuple(
+                    edge for edge in fields[field].split("|") if edge
+                )
+                for field in ("links", "interface", "direct", "exclude")
+            }
+        node_sets = {
+            frozenset(graph) for graph in consumer_graphs.values()
+        }
+        if len(node_sets) != 1:
             raise EncoderHygieneError(
-                f"Evaluated link graph is empty for {configuration}"
+                f"Evaluated link graph providers differ by consumer in "
+                f"{configuration}"
             )
+        nodes = set(next(iter(node_sets)))
         if expected_nodes is None:
-            expected_nodes = set(graph)
-        elif set(graph) != expected_nodes:
+            expected_nodes = nodes
+        elif nodes != expected_nodes:
             raise EncoderHygieneError(
                 "Evaluated link graph target universe differs by "
                 f"configuration {configuration}: expected="
-                f"{sorted(expected_nodes)}, actual={sorted(graph)}"
+                f"{sorted(expected_nodes)}, actual={sorted(nodes)}"
             )
-        raw_graphs[configuration] = graph
+        raw_graphs[configuration] = consumer_graphs
 
     if expected_nodes is None:
         raise EncoderHygieneError(
@@ -3181,54 +3279,98 @@ def _load_evaluated_link_contexts(
                 f"Invalid evaluated target alias {alias} -> {canonical}"
             )
 
-    graphs: dict[str, dict[str, frozenset[str]]] = {}
+    graphs: dict[
+        str,
+        dict[str, dict[str, dict[str, frozenset[str]]]],
+    ] = {}
     link_only = _re.compile(r"^\$<LINK_ONLY:([^$<>]+)>$")
-    for configuration, raw_graph in raw_graphs.items():
-        graph: dict[str, frozenset[str]] = {}
-        for target, raw_edges in raw_graph.items():
-            resolved: set[str] = set()
-            for raw_edge in raw_edges:
-                edge = raw_edge
-                if edge.startswith("::@") or edge in {
-                    "debug",
-                    "optimized",
-                    "general",
-                }:
-                    continue
-                match = link_only.fullmatch(edge)
-                if match:
-                    edge = match.group(1)
-                if "$<" in edge:
-                    raise EncoderHygieneError(
-                        f"Target {target} configuration {configuration} has "
-                        f"an unevaluated link edge: {edge}"
-                    )
-                edge = aliases.get(edge, edge)
-                if edge in expected_nodes:
-                    resolved.add(edge)
-                elif edge not in external_items:
-                    raise EncoderHygieneError(
-                        f"Target {target} configuration {configuration} has "
-                        "an unclassified evaluated link edge (generator "
-                        f"expression result is not enumerable): {edge}"
-                    )
-            graph[target] = frozenset(resolved)
-        graphs[configuration] = graph
+    for configuration, raw_consumer_graphs in raw_graphs.items():
+        consumer_graphs: dict[
+            str, dict[str, dict[str, frozenset[str]]]
+        ] = {}
+        for consumer, raw_graph in raw_consumer_graphs.items():
+            graph: dict[str, dict[str, frozenset[str]]] = {}
+            for target, raw_fields in raw_graph.items():
+                resolved_fields: dict[str, frozenset[str]] = {}
+                for field, raw_edges in raw_fields.items():
+                    resolved: set[str] = set()
+                    for raw_edge in raw_edges:
+                        edge = raw_edge
+                        if edge.startswith("::@") or edge in {
+                            "debug",
+                            "optimized",
+                            "general",
+                        }:
+                            continue
+                        match = link_only.fullmatch(edge)
+                        if match:
+                            edge = match.group(1)
+                        if "$<" in edge:
+                            raise EncoderHygieneError(
+                                f"Target {target} consumer {consumer} "
+                                f"configuration {configuration} has an "
+                                f"unevaluated {field} link edge: {edge}"
+                            )
+                        edge = aliases.get(edge, edge)
+                        if edge in expected_nodes:
+                            resolved.add(edge)
+                        elif (
+                            imported_nodes[target]
+                            and Path(edge).is_absolute()
+                            and not Path(edge).resolve().is_relative_to(
+                                repo_root
+                            )
+                        ):
+                            continue
+                        elif edge not in external_items:
+                            raise EncoderHygieneError(
+                                f"Target {target} consumer {consumer} "
+                                f"configuration {configuration} has an "
+                                "unclassified evaluated link edge (generator "
+                                f"expression result is not enumerable): {edge}"
+                            )
+                    resolved_fields[field] = frozenset(resolved)
+                graph[target] = resolved_fields
+            consumer_graphs[consumer] = graph
+        graphs[configuration] = consumer_graphs
 
-    def reaches(
-        graph: dict[str, frozenset[str]],
-        current: str,
-        sought: str,
-        visited: frozenset[str] = frozenset(),
-    ) -> bool:
-        if current == sought:
-            return True
-        if current in visited:
-            return False
-        return any(
-            reaches(graph, edge, sought, visited | {current})
-            for edge in graph[current]
+    def transitive_usage(
+        graph: dict[str, dict[str, frozenset[str]]],
+        roots: set[str],
+    ) -> set[str]:
+        reached: set[str] = set()
+        pending = list(roots)
+        while pending:
+            current = pending.pop()
+            if current in reached:
+                continue
+            reached.add(current)
+            pending.extend(graph[current]["interface"] - reached)
+        return reached
+
+    def consumer_link_closure(
+        graph: dict[str, dict[str, frozenset[str]]],
+        consumer: str,
+    ) -> set[str]:
+        initial = set(graph[consumer]["links"])
+        effective_direct = set(initial)
+        while True:
+            usage = transitive_usage(graph, effective_direct)
+            injected = set().union(
+                *(graph[target]["direct"] for target in usage),
+                set(),
+            )
+            expanded = effective_direct | injected
+            if expanded == effective_direct:
+                break
+            effective_direct = expanded
+        usage = transitive_usage(graph, effective_direct)
+        excluded = set().union(
+            *(graph[target]["exclude"] for target in usage),
+            set(),
         )
+        effective_direct -= excluded
+        return transitive_usage(graph, effective_direct)
 
     compile_config_by_audited = {
         configuration: (
@@ -3249,7 +3391,7 @@ def _load_evaluated_link_contexts(
         refs: set[tuple[str, str]] = set()
         for configuration in audited_configs:
             compile_configuration = compile_config_by_audited[configuration]
-            graph = graphs[configuration]
+            consumer_graphs = graphs[configuration]
             for root in compiled_roots:
                 if not any(
                     context.configuration == compile_configuration
@@ -3261,7 +3403,10 @@ def _load_evaluated_link_contexts(
                     and root == target
                 ) or (
                     policy.target_type == "INTERFACE_LIBRARY"
-                    and reaches(graph, root, target)
+                    and target
+                    in consumer_link_closure(
+                        consumer_graphs[root], root
+                    )
                 ):
                     refs.add((root, compile_configuration))
             if policy.target_type == "INTERFACE_LIBRARY" and (
@@ -3326,6 +3471,7 @@ def _load_target_header_manifests(
     for context in contexts:
         contexts_by_target.setdefault(context.target, []).append(context)
     evaluated_contexts = _load_evaluated_link_contexts(
+        repo_root,
         clang_build_dir,
         policies,
         contexts_by_target,
@@ -3938,15 +4084,26 @@ def _scan_headers(
         body_surface = _type_surface_is_body(
             clang, cursor, kind, parent
         )
-        if kind in (_CXCursor_ParmDecl, _CXCursor_TypeRef) and not body_surface:
+        if kind == _CXCursor_ParmDecl and not body_surface:
             # Namespace/record signatures and aliases are already audited as
-            # complete outer declarations. ParmDecl/TypeRef are independently
-            # needed only inside lambdas/local declarations/specialization
-            # uses, where no outer owned declaration carries the concrete type.
+            # complete outer declarations. ParmDecl is independently needed
+            # only inside lambdas/local declarations.
+            return
+        if (
+            kind == _CXCursor_TypeRef
+            and not body_surface
+            and _type_ref_is_completely_covered_by_parent(
+                clang, cursor, parent
+            )
+        ):
             return
         access = clang.lib.clang_getCXXAccessSpecifier(cursor)
         cursor_type = clang.lib.clang_getCursorType(cursor)
-        forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
+        forbidden_path = _forbidden_type_fingerprint(
+            clang,
+            cursor_type,
+            traverse_records=kind != _CXCursor_TypeRef,
+        )
         if forbidden_path is None:
             forbidden_path = _cursor_template_argument_fingerprint(
                 clang, cursor, kind
@@ -4403,12 +4560,24 @@ def _scan_sources(
             body_surface = _type_surface_is_body(
                 clang, cursor, kind, parent
             )
-            if kind in (_CXCursor_ParmDecl, _CXCursor_TypeRef) and not body_surface:
+            if kind == _CXCursor_ParmDecl and not body_surface:
+                return
+            if (
+                kind == _CXCursor_TypeRef
+                and not body_surface
+                and _type_ref_is_completely_covered_by_parent(
+                    clang, cursor, parent
+                )
+            ):
                 return
             access = clang.lib.clang_getCXXAccessSpecifier(cursor)
             linkage = clang.lib.clang_getCursorLinkage(cursor)
             cursor_type = clang.lib.clang_getCursorType(cursor)
-            forbidden_path = _forbidden_type_fingerprint(clang, cursor_type)
+            forbidden_path = _forbidden_type_fingerprint(
+                clang,
+                cursor_type,
+                traverse_records=kind != _CXCursor_TypeRef,
+            )
             if forbidden_path is None:
                 forbidden_path = _cursor_template_argument_fingerprint(
                     clang, cursor, kind

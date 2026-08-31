@@ -411,6 +411,83 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             any(finding.line == 19 for finding in findings)
         )
 
+    def test_namespace_specialization_references_are_not_hidden_by_auto(
+        self,
+    ) -> None:
+        source = self._write(
+            "NamespaceSpecializations.cpp",
+            "struct QJsonObject {};\n"
+            "struct Safe {};\n"
+            "template<class T> int serializeInternally() { return sizeof(T); }\n"
+            "template<class T> struct Worker {\n"
+            "  int run() { return sizeof(T); }\n"
+            "};\n"
+            "static auto encoder = &serializeInternally<QJsonObject>;\n"
+            "struct Registry {\n"
+            "  static inline auto member = &Worker<QJsonObject>::run;\n"
+            "};\n"
+            "template int serializeInternally<QJsonObject>();\n"
+            "static auto safeEncoder = &serializeInternally<Safe>;\n"
+            "static auto safeMember = &Worker<Safe>::run;\n"
+            "struct QualifiedOwner {\n"
+            "  enum Status { Ready };\n"
+            "  QJsonObject unrelated;\n"
+            "};\n"
+            "static int safeQualified(QualifiedOwner::Status) { return 0; }\n",
+        )
+        violations, findings = self._scan_source_fixture(source, frozenset())
+        self.assertEqual(violations, [])
+        forbidden_lines = {
+            finding.line
+            for finding in findings
+            if "QJsonObject" in finding.canonical_return_type
+        }
+        self.assertTrue({7, 9}.issubset(forbidden_lines))
+        self.assertFalse(any(finding.line in {12, 13} for finding in findings))
+        self.assertFalse(
+            any(
+                finding.line == 18
+                for finding in findings
+            )
+        )
+        self.assertTrue(
+            any(
+                finding.line == 7
+                and "kind=43" in finding.canonical_return_type
+                and not finding.body_surface
+                for finding in findings
+            )
+        )
+
+    def test_header_namespace_and_static_member_specializations_are_audited(
+        self,
+    ) -> None:
+        header = self._write(
+            "NamespaceSpecializations.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "struct Safe {};\n"
+            "template<class T> inline int serializeInternally() {\n"
+            "  return sizeof(T);\n"
+            "}\n"
+            "inline auto headerEncoder = &serializeInternally<QJsonObject>;\n"
+            "struct HeaderRegistry {\n"
+            "  static inline auto encoder = &serializeInternally<QJsonObject>;\n"
+            "};\n"
+            "inline auto safeEncoder = &serializeInternally<Safe>;\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        forbidden_lines = {
+            finding.line
+            for finding in findings
+            if "QJsonObject" in finding.canonical_return_type
+        }
+        self.assertTrue({7, 9}.issubset(forbidden_lines))
+        self.assertFalse(any(finding.line == 11 for finding in findings))
+
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
         source = self._write(
             "Bar.cpp",
@@ -1988,6 +2065,12 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             "#endif\n"
             "#ifdef CONSUMER_TWO_ENCODER\n"
             "QJsonObject consumerTwoEncoder();\n"
+            "#endif\n"
+            "#ifdef DIRECT_ENCODER\n"
+            "QJsonObject directEncoder();\n"
+            "#endif\n"
+            "#ifdef EXCLUDED_ENCODER\n"
+            "QJsonObject excludedEncoder();\n"
             "#endif\n",
         )
         self._write(
@@ -1996,6 +2079,8 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         )
         self._write("src/ConsumerOne.cpp", "int main() { return 0; }\n")
         self._write("src/ConsumerTwo.cpp", "int main() { return 0; }\n")
+        self._write("src/ConsumerDirect.cpp", "int main() { return 0; }\n")
+        self._write("src/ConsumerExcluded.cpp", "int main() { return 0; }\n")
         cmake = (
             "cmake_minimum_required(VERSION 3.25)\n"
             "project(ClosedHeaderUniverse CXX)\n"
@@ -2014,7 +2099,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_library(wire_bridge INTERFACE)\n"
             + "target_link_libraries(wire_bridge INTERFACE WireAlias)\n"
             + "add_library(ImportedMid INTERFACE IMPORTED)\n"
-            + 'set_property(TARGET ImportedMid PROPERTY INTERFACE_LINK_LIBRARIES "$<IF:$<CONFIG:Debug>,$<LOWER_CASE:WIRE_INTERFACE>,$<IF:$<CONFIG:Release>,$<JOIN:wire_;interface,>,$<TARGET_NAME_IF_EXISTS:WireAlias>>>")\n'
+            + 'set_property(TARGET ImportedMid PROPERTY INTERFACE_LINK_LIBRARIES "$<$<BOOL:$<TARGET_PROPERTY:ENABLE_WIRE>>:$<IF:$<CONFIG:Debug>,$<LOWER_CASE:WIRE_INTERFACE>,$<IF:$<CONFIG:Release>,$<JOIN:wire_;interface,>,$<TARGET_NAME_IF_EXISTS:WireAlias>>>>")\n'
             + "add_library(ImportedMidAlias ALIAS ImportedMid)\n"
             + "add_library(ImportedBridge INTERFACE IMPORTED)\n"
             + 'set_property(TARGET ImportedBridge PROPERTY INTERFACE_LINK_LIBRARIES "$<IF:$<BOOL:1>,$<TARGET_NAME_IF_EXISTS:ImportedMidAlias>,missing>")\n'
@@ -2022,24 +2107,54 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "target_link_libraries(exempt_bridge INTERFACE ImportedBridge)\n"
             + "add_executable(consumer_one src/ConsumerOne.cpp)\n"
             + "target_link_libraries(consumer_one PRIVATE exempt_bridge)\n"
+            + "set_property(TARGET consumer_one PROPERTY ENABLE_WIRE TRUE)\n"
             + 'target_compile_definitions(consumer_one PRIVATE "$<$<CONFIG:Debug>:CONSUMER_DEBUG_ENCODER>" "$<$<CONFIG:Release>:CONSUMER_RELEASE_ENCODER>" "$<$<CONFIG:RelWithDebInfo>:CONSUMER_RELWITH_ENCODER>")\n'
             + "add_executable(consumer_two src/ConsumerTwo.cpp)\n"
             + "target_link_libraries(consumer_two PRIVATE wire_interface)\n"
             + "target_compile_definitions(consumer_two PRIVATE CONSUMER_TWO_ENCODER)\n"
+            + "add_library(direct_provider INTERFACE)\n"
+            + 'set_property(TARGET direct_provider PROPERTY INTERFACE_LINK_LIBRARIES_DIRECT "$<$<BOOL:$<TARGET_PROPERTY:ENABLE_DIRECT>>:wire_interface>")\n'
+            + "add_library(direct_bridge INTERFACE)\n"
+            + "target_link_libraries(direct_bridge INTERFACE direct_provider)\n"
+            + "add_executable(consumer_direct src/ConsumerDirect.cpp)\n"
+            + "target_link_libraries(consumer_direct PRIVATE direct_bridge)\n"
+            + "set_property(TARGET consumer_direct PROPERTY ENABLE_DIRECT TRUE)\n"
+            + "target_compile_definitions(consumer_direct PRIVATE DIRECT_ENCODER)\n"
+            + "add_library(exclude_provider INTERFACE)\n"
+            + "target_link_libraries(exclude_provider INTERFACE direct_provider)\n"
+            + 'set_property(TARGET exclude_provider PROPERTY INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE "$<$<BOOL:$<TARGET_PROPERTY:DISABLE_DIRECT>>:wire_interface>")\n'
+            + "add_executable(consumer_excluded src/ConsumerExcluded.cpp)\n"
+            + "target_link_libraries(consumer_excluded PRIVATE exclude_provider)\n"
+            + "set_property(TARGET consumer_excluded PROPERTY ENABLE_DIRECT TRUE)\n"
+            + "set_property(TARGET consumer_excluded PROPERTY DISABLE_DIRECT TRUE)\n"
+            + "target_compile_definitions(consumer_excluded PRIVATE EXCLUDED_ENCODER)\n"
             + 'file(WRITE "${CMAKE_BINARY_DIR}/GeneratedWire.h" "struct QJsonObject {}; QJsonObject generatedHeaderEncoder();\\n")\n'
             + 'target_sources(app PUBLIC FILE_SET app_late_generated TYPE HEADERS BASE_DIRS "${CMAKE_BINARY_DIR}" FILES "${CMAKE_BINARY_DIR}/GeneratedWire.h")\n'
             + "add_library(Imported::Legitimate INTERFACE IMPORTED)\n"
             + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET consumer_one CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET consumer_two CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET consumer_direct CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET consumer_excluded CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET wire_interface CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET wire_bridge CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET exempt_bridge CLASSIFICATION EXTERNAL EXEMPT_REASON "test imported/exempt graph wrapper" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET direct_provider CLASSIFICATION EXTERNAL EXEMPT_REASON "test direct injection provider" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET direct_bridge CLASSIFICATION EXTERNAL EXEMPT_REASON "test direct injection bridge" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET exclude_provider CLASSIFICATION EXTERNAL EXEMPT_REASON "test direct exclusion provider" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + self._register_manifests("domain", "foundation")
         )
         self._write("CMakeLists.txt", cmake)
         self._configure_and_build(
-            ["domain", "foundation", "app", "consumer_one", "consumer_two"],
+            [
+                "domain",
+                "foundation",
+                "app",
+                "consumer_one",
+                "consumer_two",
+                "consumer_direct",
+                "consumer_excluded",
+            ],
             multi_config=True,
         )
         findings = ceh.run_check(self.root, self.build, skip_configure=True)
@@ -2057,6 +2172,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
                 "consumerReleaseEncoder",
                 "consumerRelWithEncoder",
                 "consumerTwoEncoder",
+                "directEncoder",
                 "interfaceSourceEncoder",
                 "generatedHeaderEncoder",
             },
@@ -2088,6 +2204,14 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             )
             self.assertIn(
                 ("consumer_two", configuration),
+                evaluated_contexts["wire_interface"],
+            )
+            self.assertIn(
+                ("consumer_direct", configuration),
+                evaluated_contexts["wire_interface"],
+            )
+            self.assertNotIn(
+                ("consumer_excluded", configuration),
                 evaluated_contexts["wire_interface"],
             )
         stale = (

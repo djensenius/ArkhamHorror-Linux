@@ -682,18 +682,39 @@ function(arkham_write_encoder_hygiene_target_universe)
     file(WRITE "${_arkham_ehu_graph_index}" "")
     file(WRITE "${_arkham_ehu_alias_file}" "")
     file(WRITE "${_arkham_ehu_external_file}" "")
+    set(_arkham_ehu_graph_consumers "")
+    foreach(_arkham_ehu_consumer IN LISTS _arkham_ehu_targets)
+        get_target_property(_arkham_ehu_consumer_class
+            ${_arkham_ehu_consumer} ARKHAM_ENCODER_HYGIENE_CLASSIFICATION)
+        get_target_property(_arkham_ehu_consumer_type
+            ${_arkham_ehu_consumer} TYPE)
+        if(_arkham_ehu_consumer_class STREQUAL "SCAN" AND
+                NOT _arkham_ehu_consumer_type STREQUAL "INTERFACE_LIBRARY" AND
+                NOT _arkham_ehu_consumer_type STREQUAL "UTILITY")
+            list(APPEND _arkham_ehu_graph_consumers "${_arkham_ehu_consumer}")
+        endif()
+    endforeach()
+    list(SORT _arkham_ehu_graph_consumers)
+    if(NOT _arkham_ehu_graph_consumers)
+        message(FATAL_ERROR
+            "Encoder-hygiene evaluated link graph has no compiled SCAN consumers")
+    endif()
     foreach(_arkham_ehu_graph_target IN LISTS _arkham_ehu_graph_targets)
         if(NOT TARGET "${_arkham_ehu_graph_target}")
             continue()
         endif()
         get_target_property(_arkham_ehu_graph_type
             ${_arkham_ehu_graph_target} TYPE)
+        get_target_property(_arkham_ehu_graph_imported
+            ${_arkham_ehu_graph_target} IMPORTED)
+        if(_arkham_ehu_graph_imported)
+            set(_arkham_ehu_graph_imported 1)
+        else()
+            set(_arkham_ehu_graph_imported 0)
+        endif()
         if(_arkham_ehu_graph_type STREQUAL "UTILITY")
             continue()
         endif()
-        string(SHA256 _arkham_ehu_graph_hash "${_arkham_ehu_graph_target}")
-        file(APPEND "${_arkham_ehu_graph_index}"
-            "${_arkham_ehu_graph_target}\t${_arkham_ehu_graph_hash}.txt\n")
         get_target_property(_arkham_ehu_graph_links
             ${_arkham_ehu_graph_target} LINK_LIBRARIES)
         get_target_property(_arkham_ehu_graph_interface_links
@@ -751,11 +772,18 @@ function(arkham_write_encoder_hygiene_target_universe)
                 endforeach()
             endif()
         endforeach()
-        file(GENERATE
-            OUTPUT
-                "${_arkham_ehu_graph_dir}/$<CONFIG>/${_arkham_ehu_graph_hash}.txt"
-            CONTENT
-                "target\t${_arkham_ehu_graph_target}\nlinks\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_target},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},LINK_LIBRARIES>>,|>\ninterface\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_target},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES>>,|>\n")
+        foreach(_arkham_ehu_graph_consumer IN LISTS
+                _arkham_ehu_graph_consumers)
+            string(SHA256 _arkham_ehu_graph_hash
+                "${_arkham_ehu_graph_consumer}|${_arkham_ehu_graph_target}")
+            file(APPEND "${_arkham_ehu_graph_index}"
+                "${_arkham_ehu_graph_consumer}\t${_arkham_ehu_graph_target}\t${_arkham_ehu_graph_hash}.txt\n")
+            file(GENERATE
+                OUTPUT
+                    "${_arkham_ehu_graph_dir}/$<CONFIG>/${_arkham_ehu_graph_hash}.txt"
+                CONTENT
+                    "consumer\t${_arkham_ehu_graph_consumer}\ntarget\t${_arkham_ehu_graph_target}\nimported\t${_arkham_ehu_graph_imported}\nlinks\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},LINK_LIBRARIES>>,|>\ninterface\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES>>,|>\ndirect\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES_DIRECT>>,|>\nexclude\t$<JOIN:$<TARGET_GENEX_EVAL:${_arkham_ehu_graph_consumer},$<TARGET_PROPERTY:${_arkham_ehu_graph_target},INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE>>,|>\n")
+        endforeach()
     endforeach()
     set(_arkham_ehu_universe "")
     set(_arkham_ehu_index "")
