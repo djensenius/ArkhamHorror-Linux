@@ -18,6 +18,26 @@ permissions:
 
 env:
   QT_VERSION: 6.11.1
+  # Round-N+ review (HIGH, "Updates.xml hash is disconnected from
+  # independently cached install-qt SDK ... verify cached SDK contents
+  # against same lock before use"): "Verify pinned Qt SDK metadata lock"
+  # (verify-qt-sdk-lock, below) proves upstream Updates.xml still
+  # matches packaging/qt_sdk_lock.json's pinned sha256 -- but
+  # jurplel/install-qt-action's own `cache: true` restores a
+  # previously-installed Qt SDK straight from the GitHub Actions cache
+  # on a cache hit, never re-touching Updates.xml or aqtinstall's own
+  # checksum verification at all for that run. Left unpinned, that
+  # action's default cache key (OS/version/arch/modules only) cannot
+  # distinguish "the exact upstream contents this repository's lock
+  # currently pins" from "whatever happened to be cached under that
+  # same version string previously" -- silently reusing a stale or
+  # substituted cache entry the lock verification step never actually
+  # examined. Every install-qt-action step below is therefore given
+  # `cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}`:
+  # any deliberate re-pin of the lock (a real upstream Qt content
+  # change) invalidates every existing cache entry and forces a fresh,
+  # aqtinstall-checksum-verified download, and a cache entry captured
+  # under a DIFFERENT lock state can never satisfy this run's key.
 
 jobs:
   format:
@@ -36,6 +56,7 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
           cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
       - name: Install formatter
         run: sudo apt-get update && sudo apt-get install -y clang-format
       - run: mise run format:check
@@ -56,6 +77,7 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
       - name: Install QtKeychain, libavif and libjpeg build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev # libavif-dev/libjpeg-turbo8-dev/zlib1g-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)/find_package(ZLIB REQUIRED) need these even for the configure-only lint job.
       - run: mise run lint
@@ -76,6 +98,7 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. AVIF card art is decoded directly against libavif's own C API (see src/AssetAvifDecoder.cpp), and JPEG is decoded directly against libjpeg's own C API (see src/AssetJpegDecoder.cpp), neither through Qt's plugin registry -- Qt has no official AVIF plugin at all (upstream qtimageformats does not include one) -- so the codec-support tests exercise the real libavif/libjpeg-backed decode paths unconditionally rather than branching on QImageReader::supportedImageFormats().
           cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
       - name: Install QtKeychain, D-Bus, libavif, libjpeg and clang-format build dependencies
         run: |
           sudo apt-get update
@@ -146,6 +169,7 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
       - name: Install QtKeychain and libavif build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - run: mise run build
@@ -166,6 +190,7 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets
           cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
       - name: Install QtKeychain, libavif, libjpeg and zlib build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - name: Configure with ARKHAM_ENABLE_UBSAN in an optimized build
@@ -218,6 +243,7 @@ jobs:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; AVIF is decoded directly against a bundled libavif (see src/AssetAvifDecoder.cpp) rather than through any Qt image-format plugin, so no Qt AVIF module is needed here either.
           cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
       - name: Install QtKeychain and libavif build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - name: Test libsecret discovery fallback logic

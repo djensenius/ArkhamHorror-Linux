@@ -1201,6 +1201,7 @@ def _test_flip_first_non_executable_load_segment(path: Path) -> None:
 _PT_TLS = 7
 _PT_GNU_STACK = 0x6474E551
 _PT_GNU_RELRO = 0x6474E552
+_PT_GNU_PROPERTY = 0x6474E553
 _DT_INIT_ARRAY = 25
 
 
@@ -2320,6 +2321,143 @@ class QtPluginContentProvenanceTests(unittest.TestCase):
         memsz_off = entry_off + 40
         memsz = struct.unpack_from("<Q", data, memsz_off)[0]
         struct.pack_into("<Q", data, memsz_off, memsz + 8)
+        mutated.write_bytes(bytes(data))
+
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def _mutate_program_header_vaddr(
+        self, data: bytearray, p_type: int, delta: int
+    ) -> None:
+        """Adds `delta` to the p_vaddr field of the FIRST program
+        header of type `p_type` in-place, leaving p_offset/p_paddr and
+        every section untouched -- breaks that segment's own
+        offsetMinusVaddr (and, unless p_paddr already equalled p_vaddr,
+        also its paddrMinusVaddr) bias term without moving any byte of
+        real file content, exactly the "inconsistent repositioning"
+        Round-N+ review ("Include PT_DYNAMIC and non-LOAD addresses")
+        exists to catch."""
+        entry_off = _test_find_program_header_by_type(data, p_type)
+        self.assertIsNotNone(entry_off, f"fixture has no p_type={p_type:#x} header")
+        vaddr_off = entry_off + 16
+        vaddr = struct.unpack_from("<Q", data, vaddr_off)[0]
+        struct.pack_into("<Q", data, vaddr_off, vaddr + delta)
+
+    def test_canonical_load_digest_stable_when_dynamic_segment_is_relocated(
+        self,
+    ) -> None:
+        # Companion/regression guard for the PT_DYNAMIC-location
+        # exclusion documented in _non_load_program_header_records()'s
+        # own module comment: unlike PT_GNU_RELRO/PT_TLS below,
+        # PT_DYNAMIC's own location is NOT bound into the digest at
+        # all, specifically because a real `patchelf --set-rpath`
+        # rewrite empirically relocates it to an inconsistent
+        # offset-vaddr relationship (proven directly against real
+        # patchelf 0.14.3 output, not merely assumed) -- so mutating
+        # its p_vaddr/p_offset/p_paddr here, with no section or
+        # `.dynamic` tag content moved at all, must NOT be flagged, or
+        # every real, legitimate AppImage RPATH rewrite that relocates
+        # PT_DYNAMIC into a freshly appended trailing LOAD segment
+        # (test_canonical_load_digest_is_stable_across_patchelf_rpath_
+        # relocation/_edit) would start failing this digest comparison.
+        PT_DYNAMIC = 2
+        reference = self.root / "dynloc_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "dynloc_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        self._mutate_program_header_vaddr(data, PT_DYNAMIC, 0x1000)
+        mutated.write_bytes(bytes(data))
+
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_stable_when_gnu_property_segment_is_relocated(
+        self,
+    ) -> None:
+        # Companion/regression guard for the PT_GNU_PROPERTY exclusion
+        # documented in _non_load_program_header_records()'s own module
+        # comment: a real `patchelf --set-rpath` rewrite (even a SHORT,
+        # in-place one; see
+        # test_build_id_survives_a_patchelf_style_rpath_edit) empirically
+        # relocates GNU_PROPERTY's own program header to an inconsistent
+        # offset-vaddr relationship because it physically travels with
+        # the `.note.gnu.property` section it describes. That section's
+        # own content is independently authenticated elsewhere, so this
+        # segment's raw location must NOT be flagged, or legitimate
+        # AppImage RPATH edits would fail this digest comparison.
+        reference = self.root / "propertyloc_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "propertyloc_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        self._mutate_program_header_vaddr(data, _PT_GNU_PROPERTY, 0x1000)
+        mutated.write_bytes(bytes(data))
+
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_gnu_relro_segment_location_mutation(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "Include PT_DYNAMIC and non-LOAD
+        # addresses"): PT_GNU_RELRO's own location (which range the
+        # loader will actually mprotect read-only after relocation
+        # processing) was previously never bound, only its size. Unlike
+        # PT_DYNAMIC (see the test immediately above), PT_GNU_RELRO's
+        # own location was verified STABLE across a real patchelf
+        # RPATH-growth rewrite, so binding it here is safe.
+        reference = self.root / "relroloc_ref.so"
+        self._build_rich_shared_object(reference)
+        mutated = self.root / "relroloc_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        self._mutate_program_header_vaddr(data, _PT_GNU_RELRO, 0x1000)
+        mutated.write_bytes(bytes(data))
+
+        self.assertEqual(
+            audit._read_section_headers(reference),
+            audit._read_section_headers(mutated),
+        )
+        self.assertNotEqual(
+            audit._canonical_load_digest(reference),
+            audit._canonical_load_digest(mutated),
+        )
+
+    def test_canonical_load_digest_detects_tls_segment_location_mutation(
+        self,
+    ) -> None:
+        # Round-N+ review (HIGH, "Include PT_DYNAMIC and non-LOAD
+        # addresses"): PT_TLS's own location (where the loader's
+        # thread-local-storage template is actually read from) was
+        # previously never bound, only its size/alignment. Unlike
+        # PT_DYNAMIC (see the test above), PT_TLS's own location was
+        # verified STABLE across a real patchelf RPATH-growth rewrite,
+        # so binding it here is safe.
+        reference = self.root / "tlsloc_ref.so"
+        self._build_shared_object_with_two_constructors_and_tls(reference)
+        mutated = self.root / "tlsloc_mut.so"
+        mutated.write_bytes(reference.read_bytes())
+        data = bytearray(mutated.read_bytes())
+        self._mutate_program_header_vaddr(data, _PT_TLS, 0x1000)
         mutated.write_bytes(bytes(data))
 
         self.assertEqual(

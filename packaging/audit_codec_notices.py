@@ -1030,17 +1030,18 @@ def _canonical_load_segment_records(
 # executable, shrink/delete PT_GNU_RELRO, or alter PT_TLS's own
 # template size, and the previous digest would not change one bit.
 #
-# PT_LOAD, PT_DYNAMIC, and PT_NOTE are all deliberately excluded here,
-# for DIFFERENT documented-legitimate-repack reasons empirically
-# confirmed against a real patchelf 0.14.3 RUNPATH rewrite (this
-# project's own testing, see this module's cumulative-review test
-# suite): PT_LOAD's own per-segment filesz/memsz are NOT stable (moving
-# `.gnu.hash`/`.note.*`/`.dynstr` out of an existing LOAD segment into
-# a brand-new one legitimately shrinks the original segment's own
-# filesz/memsz) -- that segment class is already correctly
-# authenticated via the per-SECTION abstraction
-# (_section_to_segment_load_flags() + per-section content hashing)
-# rather than via any raw segment-level record, and must stay that way.
+# PT_LOAD and PT_NOTE are entirely excluded here, for DIFFERENT
+# documented-legitimate-repack reasons empirically confirmed against a
+# real patchelf 0.14.3 RUNPATH rewrite (this project's own testing, see
+# this module's cumulative-review test suite): PT_LOAD's own
+# per-segment filesz/memsz are NOT stable (moving `.gnu.hash`/
+# `.note.*`/`.dynstr` out of an existing LOAD segment into a brand-new
+# one legitimately shrinks the original segment's own filesz/memsz) --
+# that segment class is already correctly authenticated via the
+# per-SECTION abstraction (_section_to_segment_load_flags() +
+# per-section content hashing) rather than via any raw segment-level
+# record, and must stay that way.
+#
 # PT_DYNAMIC's own filesz/memsz are ALSO not stable (a longer RPATH
 # string can change the total number of Elf64_Dyn entries actually
 # emitted, e.g. via padding/alignment, changing PT_DYNAMIC's own
@@ -1048,8 +1049,57 @@ def _canonical_load_segment_records(
 # tag this project cares about is unchanged) -- `.dynamic`'s own
 # decoded tag content is already fully authenticated via
 # _read_dynamic_tags()'s own decoded, layout-independent view, so
-# PT_DYNAMIC's raw program-header size is pure redundant bookkeeping
-# for already-covered data, not an independent authentication gap.
+# PT_DYNAMIC's raw filesz/memsz specifically remain pure redundant
+# bookkeeping for already-covered data, not an independent
+# authentication gap.
+#
+# Independent cumulative re-review (HIGH, "Include PT_DYNAMIC ...
+# addresses") asked for PT_DYNAMIC's own LOCATION to be bound the same
+# offsetMinusVaddr/paddrMinusVaddr bias way every other retained
+# non-LOAD/NOTE segment now is below. This project's own real-Linux-CI
+# testing DISPROVED that this is safe: a genuine `patchelf --set-rpath`
+# rewrite that grows RPATH past the original file's available padding
+# does not merely shift PT_DYNAMIC by a consistent amount (which a bias
+# term would tolerate) -- it relocates PT_DYNAMIC (along with
+# `.note.*`/`.gnu.hash`-style metadata) into an entirely NEW, appended
+# trailing LOAD segment with a DIFFERENT offset-to-vaddr relationship
+# than the original (empirically: offsetMinusVaddr went from -0x1000 to
+# -0x2000 across a real patchelf 0.14.3 rewrite of a genuine, otherwise
+# byte-identical shared object -- see
+# test_canonical_load_digest_is_stable_across_patchelf_rpath_relocation/
+# test_canonical_load_digest_is_stable_across_patchelf_rpath_edit, both
+# of which exist specifically to prove this and would (and, during this
+# fix's own development, DID) regress the instant PT_DYNAMIC's location
+# was bound this way). No simple location-derived invariant (absolute
+# bias, or an offset relative to whichever LOAD segment currently
+# contains it) survives this real, REQUIRED AppImage-packaging
+# transform, so PT_DYNAMIC's own location remains excluded here too,
+# exactly like its filesz/memsz/flags/align -- this is a deliberate,
+# empirically-forced exception, not an oversight, and is narrower in
+# scope than it looks: RELRO/TLS/GNU_STACK's own locations (bound
+# below) were verified STABLE across this exact same real patchelf
+# rewrite (only PT_DYNAMIC, PT_NOTE, and PT_GNU_PROPERTY physically
+# moved), so this exclusion does not spread to any other segment type.
+#
+# PT_GNU_PROPERTY is excluded here too, for the SAME reason as
+# PT_DYNAMIC/PT_NOTE and empirically discovered the same way (a real
+# `patchelf --set-rpath` rewrite, even a SHORT one that fits without
+# growing the file, relocated GNU_PROPERTY's own program header from
+# offsetMinusVaddr 0x0 to -0x1000 in this project's own real-Linux-CI
+# testing -- see test_build_id_survives_a_patchelf_style_rpath_edit,
+# which regressed the instant GNU_PROPERTY's location was folded in):
+# GNU_PROPERTY physically shares its backing bytes with (and is
+# reorganized alongside) the `.note.gnu.property` NOTE section whenever
+# patchelf relocates note-adjacent metadata into a new/different LOAD
+# segment, exactly like PT_NOTE itself. That section's own content is
+# already fully authenticated by the main per-section digest loop in
+# _canonical_load_digest() (`.note.gnu.property` is not in
+# _CANONICAL_DIGEST_EXCLUDED_SECTIONS), so PT_GNU_PROPERTY's own raw
+# segment-level type/flags/filesz/memsz/align/location is, exactly like
+# PT_NOTE, pure redundant bookkeeping for already-covered data, not an
+# independent authentication gap -- it is therefore skipped entirely
+# here (never even emitted with an "<excluded>" placeholder), the same
+# way PT_LOAD/PT_NOTE are.
 #
 # PT_NOTE's own SEGMENT COUNT/filesz/memsz are, for exactly the same
 # reason, ALSO not stable: a real cumulative-review regression, found
@@ -1078,44 +1128,87 @@ def _canonical_load_segment_records(
 # unmodified Qt plugin/QML module with more than one loaded NOTE
 # section fail this digest comparison after every real patchelf run.
 #
-# Entries are returned SORTED by (type, flags, filesz, memsz, align)
-# rather than raw on-disk program-header-table order: this project's
-# own empirical testing found that a real patchelf 0.14.3 RUNPATH
-# rewrite can legitimately REORDER the program-header table itself
-# (e.g. swapping which of two GNU_STACK/GNU_RELRO-style segments
-# appears first) with no security consequence at all, since the loader
-# consults each entry by its own TYPE/semantics, never by table
-# position. Sorting by full content tuple (rather than raw index)
-# produces a canonical, order-independent representation of the exact
-# same multiset of entries, so a genuine reorder cannot change the
-# digest while any actual value change (flags/filesz/memsz/align)
-# still does.
-def _non_load_program_header_records(path: Path) -> list[tuple[str, str, str, str, str]]:
-    """Returns (type, flags, filesz, memsz, align) for every program
-    header entry in `path` whose type is none of "LOAD", "DYNAMIC", or
-    "NOTE", sorted into a canonical, table-position-independent order
-    (stable across a legitimate patchelf reordering of the table
-    itself) -- see this function's own preceding module comment for
-    exactly which security-relevant segments this closes
-    (PT_GNU_STACK/PT_GNU_RELRO/PT_TLS) and why PT_LOAD/PT_DYNAMIC/
-    PT_NOTE are all deliberately excluded (each is either already
-    authenticated via a content-stable, section-keyed abstraction
-    elsewhere in this module, or -- for PT_NOTE specifically -- its own
-    raw segment grouping/count is empirically not stable under a real
-    patchelf RUNPATH rewrite at all). Returns an empty list, never
-    raises, if `path`'s program headers cannot be parsed at all
-    (callers already tolerate this the same way they tolerate a
+# Entries are returned SORTED by their full content tuple rather than
+# raw on-disk program-header-table order: this project's own empirical
+# testing found that a real patchelf 0.14.3 RUNPATH rewrite can
+# legitimately REORDER the program-header table itself (e.g. swapping
+# which of two GNU_STACK/GNU_RELRO-style segments appears first) with
+# no security consequence at all, since the loader consults each entry
+# by its own TYPE/semantics, never by table position. Sorting by full
+# content tuple (rather than raw index) produces a canonical,
+# order-independent representation of the exact same multiset of
+# entries, so a genuine reorder cannot change the digest while any
+# actual value change (flags/filesz/memsz/align/location) still does.
+#
+# Independent cumulative re-review (HIGH, "ELF identity incomplete ...
+# Include PT_DYNAMIC and non-LOAD addresses"; test ask: "RELRO/TLS/
+# DYNAMIC location"): every retained record whose type is NOT DYNAMIC
+# now ALSO carries its own `offsetMinusVaddr`/`paddrMinusVaddr` bias
+# terms -- the exact same content-stable, relocation-tolerant
+# representation _canonical_load_segment_records() already uses for
+# PT_LOAD -- so a RELRO/TLS/GNU_STACK segment whose declared byte range
+# stays the same SIZE but is repositioned to an inconsistent file/
+# virtual/physical relationship (e.g. no longer actually overlapping
+# the GOT PT_GNU_RELRO is meant to protect) is caught even though its
+# raw absolute vaddr/offset/paddr are never themselves hashed as
+# absolute values. (PT_DYNAMIC's own location is deliberately NOT
+# included in this scheme -- see this comment block's own PT_DYNAMIC
+# paragraph above for the concrete empirical proof of why.)
+def _non_load_program_header_records(
+    path: Path,
+) -> list[tuple[str, str, str, str, str, str, str]]:
+    """Returns (type, flags, filesz, memsz, align, offsetMinusVaddr,
+    paddrMinusVaddr) for every program header entry in `path` whose
+    type is not "LOAD", "NOTE", or "GNU_PROPERTY" (see this function's
+    own preceding module comment for why those three specifically
+    remain excluded entirely), sorted into a canonical,
+    table-position-independent order (stable across a legitimate
+    patchelf reordering of the table itself). Every field of a
+    DYNAMIC-typed record (including its own location bias pair) is the
+    fixed "<excluded>" sentinel -- see this function's own preceding
+    module comment for exactly why (empirically proven patchelf
+    instability, not merely an unauthenticated gap). Returns an empty
+    list, never raises, if `path`'s program headers cannot be parsed at
+    all (callers already tolerate this the same way they tolerate a
     missing SONAME/build-id)."""
     try:
         headers = _read_program_headers(path)
     except ElfIdentityError:
         return []
-    return sorted(
-        (header["type"], header["flags"], header["filesz"], header["memsz"], header["align"])
-        for header in headers
-        if header["type"] not in ("LOAD", "DYNAMIC", "NOTE")
-    )
-
+    records: list[tuple[str, str, str, str, str, str, str]] = []
+    for header in headers:
+        if header["type"] in ("LOAD", "NOTE", "GNU_PROPERTY"):
+            continue
+        if header["type"] == "DYNAMIC":
+            records.append(
+                (
+                    header["type"],
+                    "<excluded>",
+                    "<excluded>",
+                    "<excluded>",
+                    "<excluded>",
+                    "<excluded>",
+                    "<excluded>",
+                )
+            )
+            continue
+        vaddr = int(header["vaddr"], 16)
+        offset = int(header["offset"], 16)
+        paddr = int(header["paddr"], 16)
+        offset_minus_vaddr = hex(offset - vaddr)
+        paddr_minus_vaddr = hex(paddr - vaddr)
+        records.append(
+            (
+                header["type"],
+                header["flags"],
+                header["filesz"],
+                header["memsz"],
+                header["align"],
+                offset_minus_vaddr,
+                paddr_minus_vaddr,
+            )
+        )
+    return sorted(records)
 
 
 def _read_section_headers(path: Path) -> list[dict[str, str]]:
@@ -1486,17 +1579,32 @@ def _canonical_load_digest(path: Path) -> str | None:
     for symbol in sorted(_read_symtab_symbols(path, sections)):
         digest.update(("SYMTAB\0" + "\0".join(symbol) + "\0").encode("utf-8"))
     # Third-HIGH-round review ("... executable GNU_STACK, RELRO/TLS/
-    # load offsets/sizes can pass with retained build ID"): every
-    # non-LOAD/DYNAMIC/NOTE program header (PT_GNU_STACK's own
-    # executable-stack flag, PT_GNU_RELRO's own protected range size,
-    # PT_TLS's own template size/alignment, and so on) is folded in
-    # here -- see _non_load_program_header_records()'s own preceding
-    # module comment for exactly why PT_LOAD/PT_DYNAMIC/PT_NOTE must
-    # stay excluded from this raw record while every OTHER segment type
-    # must not.
-    for type_, flags, filesz, memsz, align in _non_load_program_header_records(path):
+    # load offsets/sizes can pass with retained build ID"); independent
+    # cumulative re-review (HIGH, "Include PT_DYNAMIC and non-LOAD
+    # addresses"): every non-LOAD/NOTE/GNU_PROPERTY program header
+    # (PT_GNU_STACK's own executable-stack flag, PT_GNU_RELRO's own
+    # protected range size AND location, PT_TLS's own template
+    # size/alignment AND location, and so on) is folded in here,
+    # including each retained entry's own offsetMinusVaddr/
+    # paddrMinusVaddr location-bias pair -- except PT_DYNAMIC, whose
+    # every field (including location) stays the fixed "<excluded>"
+    # sentinel here, and PT_NOTE/PT_GNU_PROPERTY, which are omitted
+    # entirely -- see _non_load_program_header_records()'s own
+    # preceding module comment for exactly why PT_LOAD/PT_DYNAMIC/
+    # PT_NOTE/PT_GNU_PROPERTY must stay excluded from location-binding
+    # while every OTHER segment type must not.
+    for (
+        type_,
+        flags,
+        filesz,
+        memsz,
+        align,
+        offset_minus_vaddr,
+        paddr_minus_vaddr,
+    ) in _non_load_program_header_records(path):
         digest.update(
-            f"PHDR\0{type_}\0{flags}\0{filesz}\0{memsz}\0{align}\0".encode("utf-8")
+            f"PHDR\0{type_}\0{flags}\0{filesz}\0{memsz}\0{align}\0"
+            f"{offset_minus_vaddr}\0{paddr_minus_vaddr}\0".encode("utf-8")
         )
     # Round-N+ review (HIGH, "canonical ELF identity misses load
     # security/mapping ... e_entry ... load addresses/ranges/order/

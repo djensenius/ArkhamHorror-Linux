@@ -228,6 +228,72 @@ python3 "$repo_root/packaging/audit_codec_notices.py" capture-distro-provenance 
   --staging-dir "$distro_provenance_stage_dir"
 echo "Wrote distro-package provenance manifest to $distro_provenance_manifest"
 
+# Round-N+ review (HIGH, "staged capture exists, but linuxdeploy still
+# consumes original host paths"): for the six libraries this script
+# force-bundles by exact path (as opposed to the automatic ldd-based
+# closure linuxdeploy resolves on its own against arkham-horror/Qt's own
+# plugins, which is a much larger and less tractable surface to safely
+# redirect without a real Linux/linuxdeploy environment to validate
+# against), there is no reason to ever hand linuxdeploy the live host
+# path again once capture-distro-provenance above has already opened it
+# with O_NOFOLLOW, hashed it, and copied those exact bytes into the
+# immutable, read-only staging object above -- doing so would leave a
+# real TOCTOU window open between that capture and whenever linuxdeploy
+# itself gets around to reading the same host path a second time to
+# perform its own copy. Resolving each of these six libraries' bundled
+# destination ("usr/lib/<basename>") back to its manifest entry's own
+# "stagedPath" and handing linuxdeploy a same-basename symlink onto that
+# exact staged (sha256-prefixed, 0444, never-reopened-by-name) object
+# instead closes that window completely: what linuxdeploy actually
+# copies into the AppImage is now provably byte-identical to what was
+# captured, not merely "the same path, read again, hopefully unchanged".
+# A symlink (rather than the raw "<sha256>--<basename>" staged filename
+# itself) is required here because linuxdeploy's own --library flag
+# names the bundled copy after the basename of the path it is given,
+# and that bundled basename must exactly match the real SONAME
+# (libsecret-1.so.0, etc.) for the dynamic loader/dlopen() to find it at
+# runtime. (cmd_classify's own post-packaging bind_bundled_library_to_
+# captured_provenance() independently re-hashes the ACTUAL bundled
+# output and compares it to this same staged snapshot regardless, so a
+# mismatch here would already fail the build loudly -- this substitution
+# instead prevents the mismatch from being possible in the first place,
+# rather than merely detecting it after the fact.)
+staged_library_for_basename() {
+  python3 -c '
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+key = f"usr/lib/{sys.argv[2]}"
+entry = manifest.get("bundledPaths", {}).get(key)
+if not entry:
+    sys.exit(f"no captured distro provenance manifest entry for {key!r}")
+print(entry["stagedPath"])
+' "$distro_provenance_manifest" "$1"
+}
+staged_library_symlink_dir="$distro_provenance_stage_dir/for-linuxdeploy"
+mkdir -p "$staged_library_symlink_dir"
+staged_library_symlink_for() {
+  local original_path="$1"
+  local basename_of_original
+  basename_of_original="$(basename -- "$original_path")"
+  local staged_path
+  staged_path="$(staged_library_for_basename "$basename_of_original")"
+  [[ -n "$staged_path" && -f "$staged_path" ]] || {
+    echo "Could not resolve a captured immutable staged copy for" \
+      "'$basename_of_original' -- capture-distro-provenance above should" \
+      "have produced one." >&2
+    exit 2
+  }
+  local symlink_path="$staged_library_symlink_dir/$basename_of_original"
+  ln -sf -- "$staged_path" "$symlink_path"
+  printf '%s' "$symlink_path"
+}
+libsecret_so_staged="$(staged_library_symlink_for "$libsecret_so")"
+libgpgerror_so_staged="$(staged_library_symlink_for "$libgpgerror_so")"
+libgccs_so_staged="$(staged_library_symlink_for "$libgccs_so")"
+libstdcxx_so_staged="$(staged_library_symlink_for "$libstdcxx_so")"
+libz_so_staged="$(staged_library_symlink_for "$libz_so")"
+libcomerr_so_staged="$(staged_library_symlink_for "$libcomerr_so")"
+
 # Package the third-party attribution files (QtKeychain's BSD-3-Clause
 # LICENSE and this project's own NOTICE.md) into the distributed AppImage
 # so end users receive accurate attribution without this unlicensed
@@ -263,12 +329,12 @@ export EXTRA_PLATFORM_PLUGINS="libqoffscreen.so"
   --appdir "$app_dir" \
   --desktop-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.desktop" \
   --icon-file "$repo_root/packaging/io.github.djensenius.ArkhamHorror.svg" \
-  --library "$libsecret_so" \
-  --library "$libgpgerror_so" \
-  --library "$libgccs_so" \
-  --library "$libstdcxx_so" \
-  --library "$libz_so" \
-  --library "$libcomerr_so" \
+  --library "$libsecret_so_staged" \
+  --library "$libgpgerror_so_staged" \
+  --library "$libgccs_so_staged" \
+  --library "$libstdcxx_so_staged" \
+  --library "$libz_so_staged" \
+  --library "$libcomerr_so_staged" \
   --plugin qt
 
 bundled_search_root="$app_dir/usr"
