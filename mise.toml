@@ -77,7 +77,16 @@ if command -v brew >/dev/null 2>&1; then
     CLANG_FORMAT="$LLVM18_PREFIX/bin/clang-format"
   fi
 fi
-"$CLANG_FORMAT" --dry-run --Werror src/*.cpp src/*.h tests/*.cpp tests/*.h
+# Recurse into subdirectories (e.g. tests/helpers/) rather than a flat
+# src/*.cpp-style glob, so a source added under a nested test/helper
+# directory can't silently bypass this formatting gate the way
+# tests/helpers/AssetCacheLockHolderMain.cpp initially did. This task
+# runs under a plain POSIX "sh -c" (not bash), so avoid bash-only array
+# and process-substitution syntax; xargs -0 with an explicit exec both
+# handles arbitrary filenames safely and preserves clang-format's exit
+# status through the pipeline.
+find src tests \( -name '*.cpp' -o -name '*.h' \) -print0 | sort -z |
+  xargs -0 "$CLANG_FORMAT" --dry-run --Werror
 for file in qml/*.qml; do
   formatted="$(mktemp)"
   qmlformat "$file" > "$formatted"

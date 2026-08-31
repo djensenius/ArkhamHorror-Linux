@@ -43,8 +43,8 @@
 int main(int argc, char *argv[]) {
   QCoreApplication app(argc, argv);
   if (argc < 2) {
-    std::fprintf(stderr,
-                  "usage: %s <cache-directory>\n", argc > 0 ? argv[0] : "");
+    std::fprintf(stderr, "usage: %s <cache-directory>\n",
+                 argc > 0 ? argv[0] : "");
     return 2;
   }
 
