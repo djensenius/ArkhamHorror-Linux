@@ -598,6 +598,7 @@ function(_arkham_target_reaches_interface current_target sought_target visited o
         return()
     endif()
     list(APPEND visited "${current_target}")
+    get_target_property(_arkham_tri_current_imported ${current_target} IMPORTED)
     get_target_property(_arkham_tri_links ${current_target} LINK_LIBRARIES)
     get_target_property(_arkham_tri_interface_links ${current_target} INTERFACE_LINK_LIBRARIES)
     if(NOT _arkham_tri_links)
@@ -610,6 +611,35 @@ function(_arkham_target_reaches_interface current_target sought_target visited o
         if(_arkham_tri_link MATCHES "^\\$<LINK_ONLY:([^$<>]+)>$")
             set(_arkham_tri_link "${CMAKE_MATCH_1}")
         elseif(_arkham_tri_link MATCHES "\\$<")
+            if(_arkham_tri_current_imported)
+                # Imported packages commonly encode their interface with
+                # CONFIG/BOOL/TARGET_NAME_IF_EXISTS expressions. They are
+                # graph wrappers, not policy roots: walk every actual CMake
+                # target referenced anywhere in the expression rather than
+                # stopping at the imported node (or doing an unsafe substring
+                # match for only the final sought target).
+                string(REGEX MATCHALL
+                    "[A-Za-z_][A-Za-z0-9_.+-]*(::[A-Za-z_][A-Za-z0-9_.+-]*)*"
+                    _arkham_tri_genex_tokens "${_arkham_tri_link}")
+                foreach(_arkham_tri_candidate IN LISTS _arkham_tri_genex_tokens)
+                    if(NOT TARGET ${_arkham_tri_candidate})
+                        continue()
+                    endif()
+                    get_target_property(_arkham_tri_candidate_alias
+                        ${_arkham_tri_candidate} ALIASED_TARGET)
+                    if(_arkham_tri_candidate_alias)
+                        set(_arkham_tri_candidate "${_arkham_tri_candidate_alias}")
+                    endif()
+                    _arkham_target_reaches_interface(
+                        "${_arkham_tri_candidate}" "${sought_target}" "${visited}"
+                        _arkham_tri_genex_reaches)
+                    if(_arkham_tri_genex_reaches)
+                        set(${out_var} TRUE PARENT_SCOPE)
+                        return()
+                    endif()
+                endforeach()
+                continue()
+            endif()
             message(FATAL_ERROR
                 "Encoder-hygiene target graph edge '${current_target}' -> "
                 "'${_arkham_tri_link}' is generator-expression encoded and cannot "
@@ -627,11 +657,6 @@ function(_arkham_target_reaches_interface current_target sought_target visited o
             if(_arkham_tri_link STREQUAL sought_target)
                 set(${out_var} TRUE PARENT_SCOPE)
                 return()
-            endif()
-            get_target_property(_arkham_tri_class ${_arkham_tri_link}
-                ARKHAM_ENCODER_HYGIENE_CLASSIFICATION)
-            if(NOT _arkham_tri_class STREQUAL "SCAN")
-                continue()
             endif()
             _arkham_target_reaches_interface(
                 "${_arkham_tri_link}" "${sought_target}" "${visited}" _arkham_tri_reaches)

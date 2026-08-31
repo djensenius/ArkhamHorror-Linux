@@ -27,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -221,6 +222,71 @@ class ClassifyTests(unittest.TestCase):
             canonical_return_type="Arkham::ValueOrError<QJsonObject>",
         )
         self.assertEqual(ceh.classify(finding), "violation")
+
+
+class ExactIdentitySetTests(unittest.TestCase):
+    def _pinned_allowlisted_finding(self) -> ceh.Finding:
+        entry = ceh.ALLOWLIST[0]
+        return replace(
+            _finding(
+                file=entry.file,
+                usr=entry.usr,
+                canonical_return_type=_FIRST_ALLOWLIST_FULL_SIGNATURE,
+                access=entry.access,
+                linkage=entry.linkage,
+            ),
+            physical_identity_sha256=entry.physical_identity_sha256 or "",
+            observation_set_sha256=entry.observation_set_sha256 or "",
+        )
+
+    def test_allowance_compares_exact_physical_identity(self) -> None:
+        finding = self._pinned_allowlisted_finding()
+        self.assertEqual(ceh.classify(finding), "allowed")
+        self.assertEqual(
+            ceh.classify(
+                replace(finding, physical_identity_sha256="relocated")
+            ),
+            "violation",
+        )
+
+    def test_allowance_compares_exact_observation_set(self) -> None:
+        finding = self._pinned_allowlisted_finding()
+        self.assertEqual(
+            ceh.classify(
+                replace(finding, observation_set_sha256="extra-target-config-tu")
+            ),
+            "violation",
+        )
+
+    def test_physical_relocation_changes_exact_allowance_digest(self) -> None:
+        finding = replace(
+            _finding(canonical_return_type="QJsonObject"),
+            physical_identity_sha256="physical-a",
+            observation_set_sha256="observations-a",
+        )
+        relocated = replace(finding, physical_identity_sha256="physical-b")
+        self.assertNotEqual(
+            ceh._identity_set_digest([finding]),
+            ceh._identity_set_digest([relocated]),
+        )
+
+    def test_extra_target_config_or_tu_observation_changes_digest(self) -> None:
+        finding = replace(
+            _finding(canonical_return_type="QJsonObject"),
+            physical_identity_sha256="physical",
+            observation_set_sha256="target|Debug|source:Wire.cpp",
+        )
+        additionally_observed = replace(
+            finding,
+            observation_set_sha256=(
+                "target|Debug|source:Wire.cpp;"
+                "other|Release|source:Wire.cpp"
+            ),
+        )
+        self.assertNotEqual(
+            ceh._identity_set_digest([finding]),
+            ceh._identity_set_digest([additionally_observed]),
+        )
 
 
 class QJsonFamilyWrappedFormsAreDetectedTests(unittest.TestCase):
@@ -500,9 +566,15 @@ class AllowlistShapeTests(unittest.TestCase):
                 and not entry.file.startswith("src/domain/")
             )
 
-    def test_every_allowlist_entry_pins_signature_and_access(self) -> None:
+    def test_every_allowlist_entry_pins_full_declaration_identity(self) -> None:
         for entry in ceh.ALLOWLIST:
             self.assertRegex(entry.full_signature_sha256 or "", r"^[0-9a-f]{64}$")
+            self.assertRegex(
+                entry.physical_identity_sha256 or "", r"^[0-9a-f]{64}$"
+            )
+            self.assertRegex(
+                entry.observation_set_sha256 or "", r"^[0-9a-f]{64}$"
+            )
             self.assertIsNotNone(entry.access)
             self.assertIsNotNone(entry.linkage)
 

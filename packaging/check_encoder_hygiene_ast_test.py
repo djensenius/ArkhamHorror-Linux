@@ -52,6 +52,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_encoder_hygiene as ceh
 
 
+def _declaration_findings(
+    findings: list[ceh.Finding],
+) -> list[ceh.Finding]:
+    return [
+        finding
+        for finding in findings
+        if "@type-surface@" not in finding.usr
+    ]
+
+
 def _sysroot_args() -> list[str]:
     # Mirrors run_check()'s own is_macos/_macos_sdk_sysroot() logic
     # exactly, so these fixtures compile identically to how the real
@@ -184,14 +194,97 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "struct QJsonObject {};\n"
             "namespace Arkham {\n"
             "QJsonObject encodeSomethingNew() { return QJsonObject{}; }\n"
+            "}\n"
+        )
+        violations, findings = self._scan_source_fixture(source, frozenset())
+        self.assertEqual(violations, [])
+        findings = _declaration_findings(findings)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("encodeSomethingNew", findings[0].display_name)
+        self.assertEqual(findings[0].file, "Foo.cpp")
+        self.assertFalse(findings[0].body_surface)
+
+    def test_function_body_locals_temporaries_lambdas_and_local_classes_are_flagged(
+        self,
+    ) -> None:
+        source = self._write(
+            "LocalWire.cpp",
+            "struct Bytes {};\n"
+            "struct QString {};\n"
+            "struct QVariant {};\n"
+            "template<class K, class V> struct QMap {};\n"
+            "template<class T> struct QList {};\n"
+            "template<class K, class V> struct QHash {};\n"
+            "using QVariantMap = QMap<QString, QVariant>;\n"
+            "using QVariantList = QList<QVariant>;\n"
+            "using QVariantHash = QHash<QString, QVariant>;\n"
+            "struct QJsonObject {};\n"
+            "struct QJsonDocument {\n"
+            "  QJsonDocument(QJsonObject);\n"
+            "  Bytes toJson() const;\n"
+            "};\n"
+            "void submit() {\n"
+            "  QJsonObject body;\n"
+            "  static QJsonDocument cached(body);\n"
+            "  auto bytes = QJsonDocument(body).toJson();\n"
+            "  auto lambda = [] { QJsonObject nested; };\n"
+            "  struct Local {\n"
+            "    QJsonObject member;\n"
+            "    QJsonObject encode() { return {}; }\n"
+            "  };\n"
+            "  Local local;\n"
+            "  QVariantMap map; QVariantList list; QVariantHash hash;\n"
+            "  int harmless = 0;\n"
+            "  (void)bytes; (void)lambda; (void)local;\n"
+            "  (void)map; (void)list; (void)hash; (void)harmless;\n"
+            "}\n"
+            "QJsonObject alreadyForbidden() {\n"
+            "  QJsonDocument nestedDoc(QJsonObject{});\n"
+            "  return {};\n"
             "}\n",
         )
         violations, findings = self._scan_source_fixture(source, frozenset())
         self.assertEqual(violations, [])
-        self.assertEqual(len(findings), 1)
-        self.assertIn("encodeSomethingNew", findings[0].display_name)
-        self.assertEqual(findings[0].file, "Foo.cpp")
-
+        displays = {finding.display_name for finding in findings}
+        self.assertTrue(
+            {
+                "body",
+                "cached",
+                "nested",
+                "member",
+                "encode()",
+                "map",
+                "list",
+                "hash",
+                "nestedDoc",
+            }.issubset(displays)
+        )
+        self.assertFalse(any("harmless" in display for display in displays))
+        self.assertTrue(
+            all(
+                finding.body_surface
+                for finding in findings
+                if finding.display_name
+                in {
+                    "body",
+                    "cached",
+                    "nested",
+                    "member",
+                    "encode()",
+                    "map",
+                    "list",
+                    "hash",
+                    "nestedDoc",
+                }
+            )
+        )
+        self.assertTrue(
+            any(
+                "QJsonDocument" in finding.canonical_return_type
+                and "type-surface" in finding.usr
+                for finding in findings
+            )
+        )
     def test_internal_linkage_static_function_is_structurally_rejected(self) -> None:
         source = self._write(
             "Bar.cpp",
@@ -202,6 +295,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         )
         violations, findings = self._scan_source_fixture(source, frozenset())
         self.assertEqual(violations, [])
+        findings = _declaration_findings(findings)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].linkage, ceh._CXLinkage_Internal)
 
@@ -215,6 +309,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         )
         violations, findings = self._scan_source_fixture(source, frozenset())
         self.assertEqual(violations, [])
+        findings = _declaration_findings(findings)
         self.assertEqual(len(findings), 1)
         self.assertIn(
             findings[0].linkage,
@@ -236,6 +331,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         )
         violations, findings = self._scan_source_fixture(source, frozenset())
         self.assertEqual(violations, [])
+        findings = _declaration_findings(findings)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].access, ceh._CX_CXXPrivate)
 
@@ -255,9 +351,9 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "}\n",
         )
         allowed_closure = frozenset({header.resolve()})
-        # A single, shared `seen` set across both phases -- exactly like
-        # run_check() itself -- so the source scan can observe that this
-        # declaration was already counted by the header scan.
+        # A single shared `seen` set across both phases, exactly like
+        # run_check(). The physical declaration is the same, but its header
+        # wrapper and source-TU observations must remain separately visible.
         seen: set[tuple] = set()
         header_violations: list[str] = []
         header_findings = ceh._scan_headers(
@@ -286,6 +382,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
 
         source_violations, source_findings = self._scan_source_fixture(source, allowed_closure, seen=seen)
         self.assertEqual(source_violations, [])
+        source_findings = _declaration_findings(source_findings)
         self.assertEqual(len(source_findings), 1)
         self.assertEqual(source_findings[0].usr, header_findings[0].usr)
         self.assertEqual(source_findings[0].offset, header_findings[0].offset)
@@ -325,7 +422,10 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
 
         source_violations, findings = self._scan_source_fixture(source, closure)
         self.assertEqual(source_violations, [])
-        names = {finding.display_name.split("(", 1)[0] for finding in findings}
+        names = {
+            finding.display_name.split("(", 1)[0]
+            for finding in _declaration_findings(findings)
+        }
         self.assertEqual(
             names,
             {
@@ -386,6 +486,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             set(),
         )
         self.assertEqual(violations, [])
+        findings = _declaration_findings(findings)
         self.assertEqual(len(findings), 2)
         self.assertEqual(len({finding.usr for finding in findings}), 2)
 
@@ -426,6 +527,7 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             set(),
         )
         self.assertEqual(violations, [])
+        findings = _declaration_findings(findings)
         self.assertEqual(len(findings), 1)
         self.assertIn("exactDirectoryEncoder", findings[0].display_name)
 
@@ -1051,12 +1153,19 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
         system_header = self._write(
             "system/WireDependency.h",
             "struct QJsonObject {};\n"
-            "struct ExternalWireBox { private: QJsonObject value; };\n",
+            "struct ExternalLeaf { private: QJsonObject value; };\n"
+            "struct ExternalWireBox {\n"
+            "  ExternalWireBox(ExternalLeaf);\n"
+            "  ExternalLeaf result();\n"
+            "  void accept(ExternalLeaf);\n"
+            "};\n"
+            "struct ExternalSafe { int result(); };\n",
         )
         header = self._write(
             "domain/SystemOpaque.h",
             "#include <WireDependency.h>\n"
-            "ExternalWireBox fetchSystemOpaque();\n",
+            "ExternalWireBox fetchSystemOpaque();\n"
+            "ExternalSafe fetchSystemSafe();\n",
         )
         findings, violations = self._scan_header_fixture(
             header,
@@ -1073,6 +1182,69 @@ class OutputParameterAndInheritanceExposureTests(_RealLibclangTestCase):
             any(
                 finding.display_name.startswith("fetchSystemOpaque(")
                 for finding in findings
+            )
+        )
+        self.assertFalse(
+            any(
+                finding.display_name.startswith("fetchSystemSafe(")
+                for finding in findings
+            )
+        )
+
+    def test_opaque_record_traversal_continues_through_nested_method_signatures(
+        self,
+    ) -> None:
+        header = self._write(
+            "OpaqueMethodChain.h",
+            "struct QJsonObject {};\n"
+            "struct Leaf { Leaf *cycle(); QJsonObject value(); };\n"
+            "struct ThroughResult { Leaf result(); };\n"
+            "struct ThroughParameter { void accept(Leaf); };\n"
+            "struct ThroughConstructor { ThroughConstructor(Leaf); };\n"
+            "ThroughResult resultChain();\n"
+            "ThroughParameter parameterChain();\n"
+            "ThroughConstructor constructorChain();\n"
+            "struct CycleB;\n"
+            "struct CycleA { CycleB *back; QJsonObject payload; };\n"
+            "struct CycleB { CycleA *forward; };\n"
+            "CycleB cycleChain();\n"
+            "struct SafeCycle { SafeCycle *next(); int value(); };\n"
+            "SafeCycle safeChain();\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        names = {finding.display_name.split("(", 1)[0] for finding in findings}
+        self.assertTrue(
+            {
+                "resultChain",
+                "parameterChain",
+                "constructorChain",
+                "cycleChain",
+            }.issubset(names)
+        )
+        self.assertNotIn("safeChain", names)
+
+    def test_type_graph_complexity_limit_records_a_fail_closed_error(self) -> None:
+        nested = "int"
+        for _ in range(ceh._MAX_TYPE_DEPTH + 2):
+            nested = f"Box<{nested}>"
+        header = self._write(
+            "TooDeep.h",
+            "template<class T> struct Box { T value; };\n"
+            f"using TooDeep = {nested};\n",
+        )
+        findings, violations = self._scan_header_fixture(
+            header, frozenset({header.resolve()})
+        )
+        self.assertEqual(violations, [])
+        self.assertTrue(findings)
+        self.assertTrue(self.clang.type_graph_errors)
+        self.assertTrue(
+            any(
+                "semantic type graph exceeded" in error
+                for error in self.clang.type_graph_errors
             )
         )
 
@@ -1589,7 +1761,10 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         )
         findings = ceh.run_check(self.root, self.build, skip_configure=True)
         self.assertEqual(
-            [finding.display_name for finding in findings],
+            [
+                finding.display_name
+                for finding in _declaration_findings(findings)
+            ],
             ["consumerContextEncoder()"],
         )
 
@@ -1624,6 +1799,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             "src/main.cpp",
             "struct QJsonObject {};\n"
             "QJsonObject appSourceEncoder() { return {}; }\n"
+            "void submitAppBody() { QJsonObject localAppBody; }\n"
             "#ifdef APP_CONTEXT_ENCODER\n"
             "QJsonObject macroAppEncoder() { return {}; }\n"
             "#endif\n"
@@ -1637,7 +1813,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             'target_sources(domain PUBLIC FILE_SET dh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src/domain" FILES "${CMAKE_SOURCE_DIR}/src/domain/Domain.h")\n'
             + "add_library(foundation STATIC src/Foundation.cpp)\n"
             'target_sources(foundation PUBLIC FILE_SET fh TYPE HEADERS BASE_DIRS "${CMAKE_SOURCE_DIR}/src" FILES "${CMAKE_SOURCE_DIR}/src/Foundation.h")\n'
-            + 'file(WRITE "${CMAKE_BINARY_DIR}/GeneratedApp.cpp" "struct QJsonObject {}; QJsonObject generatedAppEncoder() { return {}; }\\n")\n'
+            + 'file(WRITE "${CMAKE_BINARY_DIR}/GeneratedApp.cpp" "struct QJsonObject {}; QJsonObject generatedAppEncoder() { return {}; } void generatedSubmit() { QJsonObject generatedBody; }\\n")\n'
             + 'add_executable(app src/main.cpp "${CMAKE_BINARY_DIR}/GeneratedApp.cpp")\n'
             + "target_compile_definitions(app PRIVATE APP_CONTEXT_ENCODER)\n"
             + 'arkham_append_encoder_hygiene_target(TARGET app CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
@@ -1646,13 +1822,16 @@ class ProductionCMakeSeamTests(unittest.TestCase):
         self._write("CMakeLists.txt", cmake)
         self._configure_and_build(["domain", "foundation", "app"])
         findings = ceh.run_check(self.root, self.build, skip_configure=True)
-        self.assertEqual(
-            {finding.display_name for finding in findings},
+        self.assertTrue(
             {
                 "appSourceEncoder()",
+                "localAppBody",
                 "macroAppEncoder()",
                 "generatedAppEncoder()",
-            },
+                "generatedBody",
+            }.issubset(
+                {finding.display_name for finding in findings}
+            )
         )
 
     def test_closed_target_universe_scans_unused_and_header_only_sets(self) -> None:
@@ -1702,8 +1881,15 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + "add_library(WireAlias ALIAS wire_interface)\n"
             + "add_library(wire_bridge INTERFACE)\n"
             + "target_link_libraries(wire_bridge INTERFACE WireAlias)\n"
+            + "add_library(ImportedMid INTERFACE IMPORTED)\n"
+            + 'set_property(TARGET ImportedMid PROPERTY INTERFACE_LINK_LIBRARIES "$<TARGET_NAME_IF_EXISTS:wire_bridge>")\n'
+            + "add_library(ImportedMidAlias ALIAS ImportedMid)\n"
+            + "add_library(ImportedBridge INTERFACE IMPORTED)\n"
+            + 'set_property(TARGET ImportedBridge PROPERTY INTERFACE_LINK_LIBRARIES "$<$<CONFIG:Debug>:ImportedMidAlias>")\n'
+            + "add_library(exempt_bridge INTERFACE)\n"
+            + "target_link_libraries(exempt_bridge INTERFACE ImportedBridge)\n"
             + "add_executable(consumer_one src/ConsumerOne.cpp)\n"
-            + "target_link_libraries(consumer_one PRIVATE wire_bridge)\n"
+            + "target_link_libraries(consumer_one PRIVATE exempt_bridge)\n"
             + "target_compile_definitions(consumer_one PRIVATE CONSUMER_ONE_ENCODER)\n"
             + "add_executable(consumer_two src/ConsumerTwo.cpp)\n"
             + "target_link_libraries(consumer_two PRIVATE wire_interface)\n"
@@ -1716,6 +1902,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             + 'arkham_append_encoder_hygiene_target(TARGET consumer_two CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET wire_interface CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + 'arkham_append_encoder_hygiene_target(TARGET wire_bridge CLASSIFICATION SCAN POLICY application OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
+            + 'arkham_append_encoder_hygiene_target(TARGET exempt_bridge CLASSIFICATION EXTERNAL EXEMPT_REASON "test imported/exempt graph wrapper" OUTPUT_FILE "${CMAKE_BINARY_DIR}/generated/target_policy.txt")\n'
             + self._register_manifests("domain", "foundation")
         )
         self._write("CMakeLists.txt", cmake)
@@ -1727,6 +1914,7 @@ class ProductionCMakeSeamTests(unittest.TestCase):
             {
                 finding.display_name.split("(", 1)[0]
                 for finding in findings
+                if finding.display_name
             },
             {
                 "unusedAppEncoder",

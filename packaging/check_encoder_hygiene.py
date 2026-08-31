@@ -113,14 +113,14 @@ included/generated header, conversion operators, overloads/duplicate
 identical class signatures colliding in a basename-keyed allowlist, and
 comment/raw-string-literal desynchronization of the stripper. Every one
 of those is a *textual* disguise for the exact same *semantic* fact --
-"this public function's return type, after full compiler resolution of
+"this declaration or expression's type, after full compiler resolution of
 aliases/templates/decltype/auto/macros, is in the QJson family" -- which
 only a real C++ compiler frontend can determine with certainty. This
 script asks Clang to determine that fact directly, via libclang's AST
 (https://clang.llvm.org/docs/LibClang.html), rather than re-implementing
 an ever-growing fragment of C++ parsing by hand:
 
-  - For every public function-like declaration (ordinary methods, free
+  - For every function-like declaration at every access/linkage (ordinary methods, free
     functions, friend functions, conversion operators, function
     templates, constructors) whose *own* location (after macro
     expansion) is exactly the one header currently being probed, this
@@ -134,7 +134,7 @@ an ever-growing fragment of C++ parsing by hand:
     signature-and-overload-aware identity Clang computes for every
     declaration; see https://clang.llvm.org/docs/USRs.html), access
     specifier, and exact source file.
-  - For every class/struct/class-template definition and public/protected
+  - For every class/struct/class-template definition and
     type alias whose own location
     is likewise exactly the header currently being probed, this script
     additionally walks its base-specifiers and using-declarations (see
@@ -145,6 +145,11 @@ an ever-growing fragment of C++ parsing by hand:
     to the EXPOSING class's own file/line rather than the original
     declaring class's file, so it cannot masquerade as an
     already-audited, already-allowlisted symbol.
+  - For every production function body, this also audits local/static
+    variables, local classes and lambdas, construction/call expressions,
+    casts, initializers, and materialized temporaries. A void-returning
+    submit function therefore cannot hide a QJsonDocument or QJsonObject
+    construction merely because its outer declaration has no wire type.
   - A declaration is a *violation* if any semantic type component is in
     the forbidden family and its exact file, USR, canonical semantic
     signature, access, and occurrence count are not one ALLOWLIST entry
@@ -238,10 +243,12 @@ while scanning a *different* header's wrapper TU (e.g. Decks.h's
 wrapper TU also enters ValueOrError.h, which Decks.h legitimately
 #includes), every declaration is attributed to its own true resolved
 source file (never to whichever header's wrapper TU happened to reach
-it) and recorded in one global, whole-run (file, line, USR) dedup set,
-so a legitimately shared/cross-included file's declarations are counted
-exactly once no matter how many other headers in its own closure
-#include it -- never once per including header.
+it). Repeats are deduplicated only within the same exact
+target/configuration/TU observation. Physical occurrences and their
+complete observation sets are aggregated afterward and pinned, so a
+shared header's normal repeated observations remain explicit while no
+additional target, configuration, TU, macro expansion, or relocated
+declaration can collapse into a previously allowed occurrence.
 """
 
 from __future__ import annotations
@@ -270,10 +277,10 @@ from typing import Iterator, Sequence
 #
 # Every entry names a source_file (a full path, relative to the repo root,
 # with forward slashes -- portable across checkouts/CI runners, and never
-# a bare basename), a qualified_usr, and an expected_count (how many times
-# that exact declaration must be found in that exact file -- not merely
-# "at least once"). A declaration is permitted only if ALL THREE match
-# exactly for its (file, usr) pair's total observed count.
+# a bare basename), qualified USR, full instantiated signature, access/linkage,
+# physical expansion+spelling identity, exact target/configuration/TU
+# observation set, and expected physical occurrence count. A declaration is
+# permitted only if every dimension matches.
 
 
 def _stable_usr(usr: str) -> str:
@@ -291,9 +298,26 @@ class AllowlistEntry:
     access: int | None = None
     linkage: int | None = None
     full_signature_sha256: str | None = None
+    physical_identity_sha256: str | None = None
+    observation_set_sha256: str | None = None
 
     def key(self) -> tuple[str, str]:
         return (self.file, self.usr)
+
+
+# These pins cover dimensions which cannot be represented portably by a
+# declaration USR alone. The first digest covers the complete physical
+# spelling/expansion identity and exact target/configuration/TU observation set
+# for every named ALLOWLIST declaration. The second covers every legitimate
+# function-body occurrence (locals, temporaries, constructions, calls, lambdas,
+# and local classes). Both are exact set pins: adding, removing, moving, or
+# observing a surface in one more context changes the digest and fails closed.
+_NAMED_ALLOWLIST_IDENTITY_SET_SHA256 = (
+    "04096034a5fb3bb78d8587a5360fec919df7e2a5eaf948192b311cb94956f08d"
+)
+_LOCAL_WIRE_SURFACE_SET_SHA256 = (
+    "fee5778d943ea700e7a6b9cf61054cd40d796de237844bb405e8feebbc6a7c5b"
+)
 
 
 # src/domain/RawJson.h: the three canonical, production-bounded exact
@@ -519,8 +543,105 @@ _FULL_SIGNATURE_SHA256 = (
     "60414f0a01d963397f22e2c56a3b1b5c7a34564a6c05442b08d6501645227724",
 )
 
+_PHYSICAL_OBSERVATION_SHA256 = tuple(
+    tuple(line.split())
+    for line in """
+0f9a250d54072a631f584497af47a1038f17c6093992cc7e7631c541dcbcea5f 0f673fbae863919c482461ceb3d3332f6a9967000442f12bd6b87f2259352a6e
+cdbff74369e44fff3ddbddeed0f85ba3b80b4b59be7370a31af5355e1cf6479d 0f673fbae863919c482461ceb3d3332f6a9967000442f12bd6b87f2259352a6e
+681299b767722ac879debc916fb6068ebc6c373256cbe18d787419c9f5b88f94 0f673fbae863919c482461ceb3d3332f6a9967000442f12bd6b87f2259352a6e
+c4789eabd7ace68d6262342757d177e3c77a96984d173eac8352c0ffdedcc579 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+a635722642ed0a31f22b01eecac20a4dbe863a5978402e4f87b4b2600be8ca4b 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+79c713fa15a817c2e50ce9ce0e0b809721ec63820a6f66e4e3fd39909f042c8d 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+d62ff777e4a5036b702c06824eb4fbb35e56e1bc057d1911f2f477f881400fb4 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+5f6cf275875f399304fec0768f2d1b25f22569cdb1c332cf17a7a9ba779583a4 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+4ad79d25162f858499b5637eb06056648da636974c0a31991a8b0cc3c645107d 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+59f378b7bafae4de6820349244e94a43469d217893178fdb280e8595c0e6a54b 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+62b8fd1351ed85165ab92cad5bc1396379bc5c782a7a77530c2af328c5378ab3 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+0174addc8027543e83a84d139b84aa1ab1a8dccb29e47535d44afbb26387191a 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+30a2e94d4421c9a297515de91b8bcc4473e516e9a61892a1aa115ef296ee1c16 9cdcb9f5ca677fe9d05e2c7393a7e3f44b58b0e0131a4dc1d6f9e8318491659e
+f33b3caa8432562b090da560d20cf4393ed9151cebfc68132e86386786309fc8 9cdcb9f5ca677fe9d05e2c7393a7e3f44b58b0e0131a4dc1d6f9e8318491659e
+b7977b2ef586291a5293cc7496dc2c911aafac8bc6efcdb8ebe0145473463040 9cdcb9f5ca677fe9d05e2c7393a7e3f44b58b0e0131a4dc1d6f9e8318491659e
+abf07117d48d970609516dcb657baa19819d455c3df383625a0e32e420f85f8f 9cdcb9f5ca677fe9d05e2c7393a7e3f44b58b0e0131a4dc1d6f9e8318491659e
+ef34f7e6e201b5c5d50f88955d38c6a3c29f9fa96395f749be28f32e9f5eeeac 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+2f23012d64db5f51f89752e0437c0c2153c0e4b8fe4edbd9fed9101039c198f3 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+ccb8b9f7d02a4d8f8b6609fec5216409136322e8550e25f623be124afbe60fe7 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+0a6a94ada05c72fda395de1826c1d194fc3d1630a6211896e99d8e5ba6175b18 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+9bf307c78c1f62e1b04d6e09c9272f3554b8b6a24125ec137445e18bbd51824a 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+f273bd242ed2d1d6f67853a64e45e5a195bbd8a0f8b402dc30d13bfab49e8379 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+53c7234764508625691428a44da6349b581541981e0f238e5419d55bd0f10fa5 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+a8b6a6680dba76bd42b7fd879c6a04a58239c78a89be31aac5f39700d238cc7b 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+663c988c42c31f21c4a8908ca945b326ff109913f9abd614fdc129c969ffeccc 6441d16fdc8f38459586d6355f5f7084a018f861c018d74eda533cd97a7afac0
+719519684dd10328e24e96c22ffaf4a0b78466b1813f0c93fd1cd995575bfbbb 1cae59a1be2fc73fe9f2bf70fd58013deb4c95f5e2ba56d04c571d26efe621a6
+064b4fb5b46b0afa2a61c2f88c4eae79f8377b1b2f3f93c71a903ff4fa386061 1cae59a1be2fc73fe9f2bf70fd58013deb4c95f5e2ba56d04c571d26efe621a6
+70d534023e0e26f86a708e8fa1a2c54457e69a7038a43a2fcc953600a295304a 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+05025d4987e4dfcd16ff25fd2c5280aa268e425b05d9ba358b0404a8772fb1a5 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+469e037555f0ff4761243f681ec5470406b53d901383827c9fd2fe97c268cf91 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+5ddf83c7ff4f89334c6be8e9d2d8ce110f6780c5176a723d0d98b13d8306e515 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+e69bedcb308ec05850ca6ecd1415bbea9ed0e85779c3c44c61d1a16a963992bd 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+1b153695d808371b811f3a29f76311945dcc7f7161c799f135fb07b6b9d17efb 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+d170a49b9d14b87be8dcc229efc69a6b1c471bd38615c34cd5e0e298d151840e 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+08b769347a52a73fb0658d2f4d47652fba438e498438f8a6fc7d364b07c1de98 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+979bbf03f024ecf3c957c9477536aaec65295b3427a14f6c3c7933b39cc1dc73 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+071c8481518f8a63b74be79c729b48feb84a16ba7deb6a19313d7f138192bb69 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+b159fdd212cb3b870cc93ab07879ca50932d1e9556085d9e2a38aed4dec1536a 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+7225be5df6d435766732ef46fe0dae33cc142faa56bae0c35c55ff68bdffeda9 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+815b0e6a55e0d2c1ea56bf54218617b938de92309e60ae325b87e5d5f68f7aa9 59b696445cc66278605c797280ddadfd88e7e26e7ac03bd7aace6ffb3e3b76f2
+fa348fb4146f1fc1c2e77a66a80e046c13de54461ef7e0cc30662da441ba3b7d a37c696d473335edc16dae41ea9c1c73d53d12b438e0d7c2464c56a9b85cb7b3
+904bc92d1664d4b5c14f49cd7a7c1eda30c0efbb08329aef71f88e7f7f5b6085 a37c696d473335edc16dae41ea9c1c73d53d12b438e0d7c2464c56a9b85cb7b3
+b9f7df8156378c4ed65f3d26155baf4177de2373e1004b5e92b1f65a386bbab8 a37c696d473335edc16dae41ea9c1c73d53d12b438e0d7c2464c56a9b85cb7b3
+b625bef0bcbb5409dd1f3e5d8e6e9bf0ed65540a8c9653bb4273c6a873c086b9 a37c696d473335edc16dae41ea9c1c73d53d12b438e0d7c2464c56a9b85cb7b3
+0f9dc24c3de062dee2ed0b986f0c07419f388a6fe6b1becf58895b48ce33ab21 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+b781abe6216bcb1baf78271d2f486908e2a240745263acd659662403c5d50426 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+ae5f06fbdb5216d4873f9022ba5a3b7e21d7255827922f765104101cfe37316e 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+255fa2834c7a3810b7a75ff66635016222e420f46823691bc211468473a15145 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+b89dc874df7c8cd6e852ce23570c727249db048c9ac4ad793a1d7b992cca8471 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+d9ac5412890e04ace216ee6fcb9d958346253d38e6e79991d75b65d4dd491ae1 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+02c6973a54953bddaa000c0ec0b9df83ebc3fd366a3978a1f1c74250beb70271 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+a6e060b1cff34d60af461e86000b6b786496c1ca3b33d5c2710c23a4f9fce88c 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+abf401ea67ef4b9a43bfdeffd96d590b159577347ff15140ef2e70cf3e878ccd 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+c04c07d09324f5e301e672540207c3ff3b91ca0c0fbb95c52dbf74d134265650 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+932ea2f132e021af995b5fa03717ed3ae9184478f100727e7c26713d9e39dc68 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+326cd32ee7dc2e1af2d4c30c258db6d8a75be1634735da3ee7d819b5e77d7ff6 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+98cc81db6a278d24796649234359e7932a814d9ebe13bd64d91914216d3bfcd2 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+c2473a0cb31796b0e86289f4e490cb9affeca51df3914c877f364fa0b3eb418c 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+a2268f0c77130928455f47dd7ef1e37a01b73bd6ee76fa27549c7f83945e27b1 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+a6f41581cf26c898a60754087a98410dfb57d7ddf8fe1b957a1ffa82f741ac8f 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+401319ba8bd89f67ff207e6e6b92b9869a160f6d86437da362798a6fb581f6d6 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+d908bd16f2065fe43c3b3976b7efcd9116b9cdf00c6e6348a20177a27a4d0f38 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+eacb2134cbe11a53e7858ba68050fde5f968336e91a684a19a0ddd11dd82451c 6c0dfd805c9328173130e7b7ac5738f389aa2c941aa17759553ecca83e941d2f
+3942edd96506c5e6ec900274791103aaea9ee5faebbed594b7aed6682f4791aa 0f673fbae863919c482461ceb3d3332f6a9967000442f12bd6b87f2259352a6e
+32efdc4e247c758d4ba0e770d0a033e638fe14813d27bd8f3b9d358c1a2b4517 0f673fbae863919c482461ceb3d3332f6a9967000442f12bd6b87f2259352a6e
+25de225f7baf1251c7ffa8253ece769761c9b3313eb4da002c9f67340cd46836 14f249ad9129a178ba7dffd159c5002e8933a02dcbfe46688f2c86f9b057803b
+3df277b5a4e13a38046fdd4347813c88584b25f91e134489cd76f69892439df1 14f249ad9129a178ba7dffd159c5002e8933a02dcbfe46688f2c86f9b057803b
+32b0f84519f812b908465f22ef9223750575ed726b3fef296c8a192028005f2b 14f249ad9129a178ba7dffd159c5002e8933a02dcbfe46688f2c86f9b057803b
+58394953e8d88279eeb13706ee222330b5403d5bfdd0ea35e43533a632b4e7a7 14f249ad9129a178ba7dffd159c5002e8933a02dcbfe46688f2c86f9b057803b
+aebf3376475743c02078ced70b19f25937e2381b88d020d31bce2529ee79f0eb 14f249ad9129a178ba7dffd159c5002e8933a02dcbfe46688f2c86f9b057803b
+5f97b70c2a3570ec95a04eeda835ed72972f33e77d811ee09f848a5aad79625f cdad59efb3e3d0d00f5f47300abba9585670411a257dd7810f8b71f878fac327
+85e4c8af04afa9b18bff66f30e0d1789f610f9be54e15359dce62e4f974b423f cdad59efb3e3d0d00f5f47300abba9585670411a257dd7810f8b71f878fac327
+f081ca18d38279284e1b4cebd1504bef2899f77325bef19edbce106132c4d085 cdad59efb3e3d0d00f5f47300abba9585670411a257dd7810f8b71f878fac327
+33fb66634ba898886d2c7dacf11f749c790a20825f9454f0772f11f518574ce8 1cae59a1be2fc73fe9f2bf70fd58013deb4c95f5e2ba56d04c571d26efe621a6
+9067d3080b73d4a4c8e043d39b8fdfd40cc81656e08b5ab9c4903a1a4cd034ce 1cae59a1be2fc73fe9f2bf70fd58013deb4c95f5e2ba56d04c571d26efe621a6
+13a1d0645938d20e013f6d13cde3df84665ff102ee09cd98b1d32483e5c1a3c8 98a651773ce7497f6057daabb0a8962c5c24958a5ffe035b21789329a48dc7d5
+0ee2bb9601578c93e7630124828c655e87fecc232ae088cd78f84800db3d3136 98a651773ce7497f6057daabb0a8962c5c24958a5ffe035b21789329a48dc7d5
+3d35b2a36befbc2018f061dbc9ee23c19ac4dd7c61440895c5376304bae144e1 98a651773ce7497f6057daabb0a8962c5c24958a5ffe035b21789329a48dc7d5
+ddc69cb5bac98d4727abae17b83eb9c203c5076a1977e97b861b1b1c6758ef58 98a651773ce7497f6057daabb0a8962c5c24958a5ffe035b21789329a48dc7d5
+f7fc661844b5ec0fb986ac1c9193490e2a10630cad0019c29f264b294843781b c09eb256b6b547c58e218da8f9f61ed70ca8ea4aeee84b3e4a4ecc3b7c0c87f8
+c8555a4172cda924837f6c8b76e469e482040e30010ad5e76c2e64ddb6a69c0e 6bd84007c0af0e12a60735d5904034e6b62b8e17dd8ee20635b770230b726a5d
+15aa03f86d12f797fb71a92a3aaa7b46f2f1a6ca99f48a9481e2c221ecb5669f 55de7050178e6e231d8d1d392544bf7d2b1e8a36f7793d4a49211bb7a751b41a
+9926bef10b71a8393a7bf0a913479ed9073a019d65675cbe82b237ddf4b1a5e6 55de7050178e6e231d8d1d392544bf7d2b1e8a36f7793d4a49211bb7a751b41a
+ec56b7c7ad3f5982b76809c86e85a17013da4eeb3890556f2ff99af14826e470 55de7050178e6e231d8d1d392544bf7d2b1e8a36f7793d4a49211bb7a751b41a
+2e46f13b51e1d1551a2cef60c981b211252a5cdcdb9b6081bf28a108b97b6d61 cd0ba248f2c5452c7b2d6d3ac7cd86591b4d7312a12eb8db47e2083cee24ef82
+2a200459170400e5b742b54a63afc712217799c78e01e0bd89c117381d935cd0 cd0ba248f2c5452c7b2d6d3ac7cd86591b4d7312a12eb8db47e2083cee24ef82
+4e4b1430daf5e6db73dc55f0f51a64a9565c10643b3fd8cfde808e835a7935b8 a4ca8f78d8f7af72acdb25bddb2d763b6e114a31a434137b7db99770ce193ad6
+c558a96d46f1905479c52e098e469d463f91ce7039743ac120dbdf336046c826 a4ca8f78d8f7af72acdb25bddb2d763b6e114a31a434137b7db99770ce193ad6
+""".splitlines()
+    if line
+)
+
 if len(_FULL_SIGNATURE_SHA256) != len(ALLOWLIST):
     raise AssertionError("full declaration-signature pin count does not match ALLOWLIST")
+if len(_PHYSICAL_OBSERVATION_SHA256) != len(ALLOWLIST):
+    raise AssertionError("physical/observation pin count does not match ALLOWLIST")
 
 ALLOWLIST = tuple(
     replace(
@@ -537,9 +658,14 @@ ALLOWLIST = tuple(
         ),
         linkage=2 if "@aN@" in entry.usr else 4,
         full_signature_sha256=signature_hash,
+        physical_identity_sha256=physical_hash,
+        observation_set_sha256=observation_hash,
     )
-    for entry, signature_hash in zip(
-        ALLOWLIST, _FULL_SIGNATURE_SHA256, strict=True
+    for entry, signature_hash, (physical_hash, observation_hash) in zip(
+        ALLOWLIST,
+        _FULL_SIGNATURE_SHA256,
+        _PHYSICAL_OBSERVATION_SHA256,
+        strict=True,
     )
 )
 DOMAIN_ALLOWLIST = ALLOWLIST[: len(DOMAIN_ALLOWLIST)]
@@ -709,6 +835,7 @@ _CXCursor_NoDeclFound = 71
 _CXCursor_TranslationUnit = 300
 _CXCursor_FriendDecl = 603
 _CXCursor_TemplateTypeParameter = 27
+_CXCursor_LambdaExpr = 145
 
 # The "shape-eligible" record/class-template kinds this script walks for
 # base-specifier/using-declaration inheritance exposure (see
@@ -753,6 +880,27 @@ _TYPE_SURFACE_KINDS = frozenset(
         _CXCursor_CXXBaseSpecifier,
         _CXCursor_FieldDecl,
         _CXCursor_VarDecl,
+    }
+)
+# Expression kinds that can introduce a typed construction independently of a
+# VarDecl. These are the stable CXCursor values for calls/constructor
+# temporaries, C/compound/list initialization, every C++ named/functional cast,
+# new expressions, and lambdas. Decl/member references do not need a second
+# finding: their declaring local/field is already audited, while calls and
+# temporaries may have no declaration at all.
+_EXPRESSION_SURFACE_KINDS = frozenset(
+    {
+        103,  # CXCursor_CallExpr
+        117,  # CXCursor_CStyleCastExpr
+        118,  # CXCursor_CompoundLiteralExpr
+        119,  # CXCursor_InitListExpr
+        124,  # CXCursor_CXXStaticCastExpr
+        125,  # CXCursor_CXXDynamicCastExpr
+        126,  # CXCursor_CXXReinterpretCastExpr
+        127,  # CXCursor_CXXConstCastExpr
+        128,  # CXCursor_CXXFunctionalCastExpr
+        134,  # CXCursor_CXXNewExpr
+        _CXCursor_LambdaExpr,
     }
 )
 
@@ -906,6 +1054,11 @@ class _LibClang:
         self.forbidden_type_active: set[
             tuple[int, str, bool, int, int]
         ] = set()
+        self.forbidden_type_blockers: dict[
+            tuple[int, str, bool, int, int],
+            set[tuple[int, str, bool, int, int]],
+        ] = {}
+        self.type_graph_errors: list[str] = []
         lib = self.lib
 
         lib.clang_getCString.restype = ctypes.c_char_p
@@ -1230,9 +1383,71 @@ class Finding:
     spelling_file: str = ""
     spelling_offset: int = 0
     observation_context: str = ""
+    physical_identity_sha256: str = ""
+    observation_set_sha256: str = ""
+    exact_set_allowed: bool = False
+    body_surface: bool = False
 
     def key(self) -> tuple[str, str]:
         return (self.file, self.usr)
+
+
+def _identity_set_digest(entries: Sequence[Finding]) -> str:
+    payload = [
+        {
+            "file": finding.file,
+            "usr": finding.usr,
+            "full_signature": hashlib.sha256(
+                finding.canonical_return_type.encode("utf-8")
+            ).hexdigest(),
+            "access": finding.access,
+            "linkage": finding.linkage,
+            "body_surface": finding.body_surface,
+            "physical_identity": finding.physical_identity_sha256,
+            "observation_set": finding.observation_set_sha256,
+        }
+        for finding in entries
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            sorted(
+                payload,
+                key=lambda item: (
+                    item["file"],
+                    item["usr"],
+                    item["physical_identity"],
+                    item["observation_set"],
+                ),
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _cursor_is_function_local(
+    clang: "_LibClang", cursor: "_CXCursor"
+) -> bool:
+    parent = clang.lib.clang_getCursorSemanticParent(cursor)
+    previous: tuple[int, int, int, int, int] | None = None
+    for _ in range(32):
+        kind = clang.lib.clang_getCursorKind(parent)
+        if kind in _SIGNATURE_DECL_KINDS or kind == _CXCursor_LambdaExpr:
+            return True
+        if kind in (_CXCursor_NoDeclFound, _CXCursor_TranslationUnit):
+            return False
+        identity = (
+            parent.kind,
+            parent.xdata,
+            int(parent.data[0] or 0),
+            int(parent.data[1] or 0),
+            int(parent.data[2] or 0),
+        )
+        if identity == previous:
+            return False
+        previous = identity
+        parent = clang.lib.clang_getCursorSemanticParent(parent)
+    return False
 
 
 def _is_qjson_family(canonical_type_spelling: str) -> bool:
@@ -1241,7 +1456,7 @@ def _is_qjson_family(canonical_type_spelling: str) -> bool:
     )
 
 
-_MAX_TYPE_DEPTH = 32
+_MAX_TYPE_DEPTH = 128
 
 def _resolve_substituted_type(
     clang: "_LibClang",
@@ -1311,7 +1526,12 @@ def _forbidden_type_fingerprint(
     semantic component references a forbidden Qt wire container."""
 
     if depth > _MAX_TYPE_DEPTH:
-        return None
+        message = (
+            f"semantic type graph exceeded {_MAX_TYPE_DEPTH} levels at "
+            f"{_stable_type_spelling(clang, value_type)}"
+        )
+        clang.type_graph_errors.append(message)
+        return "unresolved-complexity=>QJsonObject"
     canonical = clang.lib.clang_getCanonicalType(value_type)
     spelling = _stable_type_spelling(clang, canonical)
     cache_key = (
@@ -1322,14 +1542,31 @@ def _forbidden_type_fingerprint(
         int(canonical.data[1] or 0),
     )
     if cache_key in clang.forbidden_type_cache:
-        return clang.forbidden_type_cache[cache_key]
+        cached = clang.forbidden_type_cache[cache_key]
+        blockers = clang.forbidden_type_blockers.get(cache_key, set())
+        if cached is not None or not any(
+            clang.forbidden_type_cache.get(blocker) is not None
+            for blocker in blockers
+        ):
+            return cached
+        del clang.forbidden_type_cache[cache_key]
+        clang.forbidden_type_blockers.pop(cache_key, None)
     if cache_key in clang.forbidden_type_active:
+        # Record the cycle edge on every active caller. Negative results may
+        # still be cached for performance, but are invalidated if the cut
+        # dependency is subsequently proven to reach a forbidden type.
+        for active_key in clang.forbidden_type_active:
+            clang.forbidden_type_blockers.setdefault(active_key, set()).add(
+                cache_key
+            )
         return None
     clang.forbidden_type_active.add(cache_key)
 
     def finish(result: str | None) -> str | None:
         clang.forbidden_type_active.discard(cache_key)
         clang.forbidden_type_cache[cache_key] = result
+        if result is not None:
+            clang.forbidden_type_blockers.pop(cache_key, None)
         return result
 
     if _is_qjson_family(spelling):
@@ -1423,7 +1660,6 @@ def _forbidden_type_fingerprint(
                         clang.lib.clang_getCursorType(parameter)
                         for parameter in _parameter_cursors(clang, cursor)
                     )
-                    nested_traverse_records = False
                 elif kind in _TYPE_SURFACE_KINDS or kind in _RECORD_LIKE_KINDS:
                     nested_types.append(clang.lib.clang_getCursorType(cursor))
                 for nested_type in nested_types:
@@ -1943,6 +2179,8 @@ def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -
 
     if not _is_qjson_family(finding.canonical_return_type):
         return "allowed"
+    if finding.exact_set_allowed:
+        return "allowed"
     entry = ALLOWLIST_BY_KEY.get(finding.key())
     if entry is None:
         return "violation"
@@ -1956,6 +2194,16 @@ def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -
         or entry.access != finding.access
         or entry.linkage is None
         or entry.linkage != finding.linkage
+        or (
+            bool(finding.physical_identity_sha256)
+            and entry.physical_identity_sha256
+            != finding.physical_identity_sha256
+        )
+        or (
+            bool(finding.observation_set_sha256)
+            and entry.observation_set_sha256
+            != finding.observation_set_sha256
+        )
     ):
         return "violation"
     if counts is not None and counts[finding.key()] != entry.expected_count:
@@ -3100,8 +3348,8 @@ def _scan_headers(
         `allowed_closure` (see _audit_inclusion_graph()), appending any
         violation found to `structural_violations` -- a hard,
         never-allowlist-able failure (see run_check()).
-      - Records a Finding for every public/protected function-like or
-        constructor signature that semantically references a forbidden
+      - Records a Finding for every function-like or constructor signature,
+        at every access/linkage, that semantically references a forbidden
         Qt wire container anywhere in its recursive type graph
         declaration whose OWN resolved location is a member of
         `allowed_closure` -- not merely "== the header currently being
@@ -3122,18 +3370,25 @@ def _scan_headers(
         an already-allowlisted encoder type" bypass without any change
         to the allowlist mechanism itself.
 
-    `seen` is a single exact canonical-identity set shared across the
-    entire run. Own declarations include resolved file, line, USR, kind,
-    signature, access, and shape; inherited/alias exposures additionally
-    include their exposing declaration and reason. The differing keys guarantee
-    the two kinds can never collide with each other even at the exact
-    same nominal (file, line, usr), while still deduplicating repeats of
-    the *same* kind (e.g. a legitimately shared/cross-included file's
-    declarations, recorded exactly once no matter how many headers in
-    its own closure #include it -- never once per including header)."""
+    `seen` is shared across the run but every key begins with the exact
+    target/configuration/TU observation context. Own declarations include
+    resolved expansion/spelling identity, USR, kind, signature, access,
+    and shape; inherited/alias exposures additionally include their
+    exposing declaration and reason. Thus only duplicate visits within
+    one observation collapse. Physical occurrences and the complete set
+    of contexts which observed each one remain available for the final
+    exact-set allowance check."""
 
     findings: list[Finding] = []
     active_observation_context = ""
+
+    def policy_path(path: Path) -> str:
+        real = path.resolve()
+        return (
+            real.relative_to(repo_root).as_posix()
+            if real.is_relative_to(repo_root)
+            else real.as_posix()
+        )
 
     def record_if_new(
         *,
@@ -3148,6 +3403,7 @@ def _scan_headers(
         offset: int,
         spelling_file: str,
         spelling_offset: int,
+        body_surface: bool = False,
     ) -> None:
         observation_key = (active_observation_context, *dedup_key)
         if observation_key in seen:
@@ -3155,7 +3411,7 @@ def _scan_headers(
         seen.add(observation_key)
         findings.append(
             Finding(
-                file=real.relative_to(repo_root).as_posix(),
+                file=policy_path(real),
                 line=line,
                 display_name=display_name,
                 canonical_return_type=shape_description,
@@ -3166,10 +3422,11 @@ def _scan_headers(
                 spelling_file=spelling_file,
                 spelling_offset=spelling_offset,
                 observation_context=active_observation_context,
+                body_surface=body_surface,
             )
         )
 
-    def handle_own_declaration(cursor: _CXCursor, kind: int) -> None:
+    def handle_own_declaration(cursor: _CXCursor, kind: int) -> bool:
         canonical_cursor = clang.lib.clang_getCanonicalCursor(cursor)
         cursor_filename, _cursor_line = clang.cursor_file_and_line(cursor)
         canonical_filename, _canonical_line = clang.cursor_file_and_line(
@@ -3189,14 +3446,14 @@ def _scan_headers(
             spelling_offset,
         ) = clang.cursor_location_identity(physical_cursor)
         if filename is None:
-            return
+            return False
         real = Path(filename).resolve()
         if real not in allowed_closure:
-            return
+            return False
         access = clang.lib.clang_getCXXAccessSpecifier(canonical_cursor)
         is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
         if not is_shaped:
-            return
+            return False
         usr = _stable_usr(
             clang.to_str(clang.lib.clang_getCursorUSR(canonical_cursor))
         )
@@ -3224,12 +3481,14 @@ def _scan_headers(
             linkage=linkage,
             offset=offset,
             spelling_file=(
-                str(Path(spelling_filename).resolve())
+                policy_path(Path(spelling_filename))
                 if spelling_filename
                 else ""
             ),
             spelling_offset=spelling_offset,
+            body_surface=_cursor_is_function_local(clang, cursor),
         )
+        return True
 
     def handle_type_surface(
         cursor: _CXCursor, kind: int, parent: _CXCursor
@@ -3259,7 +3518,7 @@ def _scan_headers(
             owner_usr = _stable_usr(
                 clang.to_str(clang.lib.clang_getCursorUSR(parent))
             )
-            usr = f"{owner_usr}@type-surface@{kind}@{line}"
+            usr = f"{owner_usr}@type-surface@{kind}@{line}@{offset}"
         owner_usr = _stable_usr(
             clang.to_str(clang.lib.clang_getCursorUSR(parent))
         )
@@ -3281,11 +3540,15 @@ def _scan_headers(
             linkage=linkage,
             offset=offset,
             spelling_file=(
-                str(Path(spelling_filename).resolve())
+                policy_path(Path(spelling_filename))
                 if spelling_filename
                 else ""
             ),
             spelling_offset=spelling_offset,
+            body_surface=(
+                kind in _EXPRESSION_SURFACE_KINDS
+                or _cursor_is_function_local(clang, cursor)
+            ),
         )
 
     def handle_inheritance_exposure(
@@ -3331,8 +3594,11 @@ def _scan_headers(
                     access=class_access,
                     linkage=clang.lib.clang_getCursorLinkage(class_cursor),
                     offset=0,
-                    spelling_file=str(attribution_real),
+                    spelling_file=policy_path(attribution_real),
                     spelling_offset=0,
+                    body_surface=_cursor_is_function_local(
+                        clang, class_cursor
+                    ),
                 )
                 continue
             source_kind = clang.lib.clang_getCursorKind(exposure.source_cursor)
@@ -3374,8 +3640,11 @@ def _scan_headers(
                 access=class_access,
                 linkage=clang.lib.clang_getCursorLinkage(class_cursor),
                 offset=0,
-                spelling_file=str(attribution_real),
+                spelling_file=policy_path(attribution_real),
                 spelling_offset=0,
+                body_surface=_cursor_is_function_local(
+                    clang, class_cursor
+                ),
             )
 
     def visitor(cursor: _CXCursor, parent: _CXCursor, _client_data) -> int:
@@ -3393,15 +3662,11 @@ def _scan_headers(
             handle_own_declaration(cursor, kind)
             return 2
         if kind in _TYPE_SURFACE_KINDS:
-            if (
-                kind == _CXCursor_VarDecl
-                and clang.lib.clang_getCursorKind(parent)
-                not in _RECORD_LIKE_KINDS
-                | {_CXCursor_Namespace, _CXCursor_TranslationUnit}
-            ):
-                return 2
             handle_type_surface(cursor, kind, parent)
-            return 1
+            return 2
+        if kind in _EXPRESSION_SURFACE_KINDS:
+            handle_type_surface(cursor, kind, parent)
+            return 2
         return 2  # CXChildVisit_Recurse: keep looking for nested declarations.
 
     visitor_cb = clang._visitor_func_type(visitor)
@@ -3412,7 +3677,7 @@ def _scan_headers(
         for context in compile_contexts:
             active_observation_context = (
                 f"{context.target}|{context.configuration or '<single>'}|"
-                f"header:{header.resolve()}"
+                f"header:{policy_path(header)}"
             )
             tu, wrapper_filename = _parse_header_as_own_tu(
                 clang,
@@ -3553,8 +3818,18 @@ def _scan_sources(
         the identical way a header's own wrapper "main file" entry is,
         by passing the source's own path as the self-filtering
         `wrapper_filename` argument);
-      - collect Findings for source-only external declarations and for
-        project-header declarations visible only in this TU's exact
+      - collect Findings for source-only declarations at every access and
+        linkage, for project-header declarations visible only in the exact
+        source preprocessor context, and for every forbidden-typed local,
+        local class/field, lambda body, call, construction, initializer,
+        cast, new expression, and temporary in every production body. This
+        includes internal/static/anonymous/private code: wire construction is
+        not made safe by being uncallable from another translation unit;
+      - retain each exact target/configuration/TU observation separately for
+        the final physical occurrence and bidirectional observation-set pins.
+
+    Exact source-context discovery also includes project-header declarations
+        visible only in this TU's exact
         preprocessor context,
         such as a namespace-scope `QJsonObject encodeDeck(const
         DeckList&)` written directly in a .cpp with no header
@@ -3563,30 +3838,13 @@ def _scan_sources(
         ad-hoc `extern` forward declaration despite this script
         previously collecting zero findings from source scanning.
 
-    An out-of-line definition of an already observed header declaration (e.g.
-    src/domain/RawJson.cpp's `Value::toExactQJson()`, or
-    src/AuthModels.cpp's `AuthenticateRequest::toJson()`) is correctly
-    not re-flagged: it is skipped only when its exact canonical identity
-    (resolved path, line, USR, signature, access, and shape) is already
-    in unified `seen` data. Header-path membership alone never suppresses
-    a macro-conditional declaration absent from standalone wrappers. Only
-    when the canonical cursor's own file is the .cpp itself (no earlier
-    declaration anywhere) -- and that declaration has genuinely EXTERNAL
-    linkage (clang_getCursorLinkage() == CXLinkage_External; a `static`-
-    or anonymous-namespace-scoped helper has internal/unique-external
-    linkage and categorically cannot be referenced from another
-    translation unit, so is correctly never flagged) -- is a new Finding
-    recorded, keyed by the *source*'s own repo-relative path (which can
-    never match any ALLOWLIST entry, since every entry is keyed to a
-    header path), so it always, correctly, classifies as a violation.
-
-    `seen` is the same whole-run canonical-identity set _scan_headers()
-    uses (resolved file, line, USR, kind, signature, access, and shape):
-    a source-only declaration's key uses the source's own path, so it cannot
-    collide with a header-scan entry, but a source scanned more than
-    once (impossible in this script's normal flow, since each manifest
-    entry is scanned exactly once, but kept for defensive consistency
-    with _scan_headers()) would still be deduplicated correctly."""
+    An out-of-line definition is attributed to its exact canonical declaration
+    identity rather than counted as another physical declaration, but the
+    source-TU observation remains explicit and its body is still traversed.
+    Header-path membership alone never suppresses a macro-conditional
+    declaration absent from standalone wrappers. `seen` includes the exact
+    observation context, so only repeated AST visits within one context
+    deduplicate."""
 
     violations: list[str] = []
     findings: list[Finding] = []
@@ -3599,7 +3857,7 @@ def _scan_sources(
             return real.as_posix()
 
     def make_visitor(source_real: Path):
-        def record_own(cursor: _CXCursor, kind: int) -> None:
+        def record_own(cursor: _CXCursor, kind: int) -> bool:
             canonical = clang.lib.clang_getCanonicalCursor(cursor)
             cursor_filename, _cursor_line = clang.cursor_file_and_line(cursor)
             canonical_filename, _canonical_line = clang.cursor_file_and_line(
@@ -3620,16 +3878,16 @@ def _scan_sources(
             ) = clang.cursor_location_identity(physical_cursor)
             canonical_filename = physical_filename
             if canonical_filename is None:
-                return
+                return False
             canonical_real = Path(canonical_filename).resolve()
             if canonical_real not in allowed_closure and canonical_real != source_real:
-                return
+                return False
 
             access = clang.lib.clang_getCXXAccessSpecifier(canonical)
             linkage = clang.lib.clang_getCursorLinkage(canonical)
             is_shaped, shape_description = _is_encoder_shaped(clang, cursor, kind)
             if not is_shaped:
-                return
+                return False
             usr = _stable_usr(
                 clang.to_str(clang.lib.clang_getCursorUSR(canonical))
             )
@@ -3651,7 +3909,7 @@ def _scan_sources(
             )
             observation_key = (active_observation_context, *dedup_key)
             if observation_key in seen:
-                return
+                return True
             seen.add(observation_key)
             findings.append(
                 Finding(
@@ -3666,14 +3924,16 @@ def _scan_sources(
                     linkage=linkage,
                     offset=offset,
                     spelling_file=(
-                        str(Path(spelling_filename).resolve())
+                        finding_path(Path(spelling_filename).resolve())
                         if spelling_filename
                         else ""
                     ),
                     spelling_offset=spelling_offset,
                     observation_context=active_observation_context,
+                    body_surface=_cursor_is_function_local(clang, cursor),
                 )
             )
+            return True
 
         def record_type_surface(
             cursor: _CXCursor, kind: int, parent: _CXCursor
@@ -3703,7 +3963,7 @@ def _scan_sources(
                 owner_usr = _stable_usr(
                     clang.to_str(clang.lib.clang_getCursorUSR(parent))
                 )
-                usr = f"{owner_usr}@type-surface@{kind}@{line}"
+                usr = f"{owner_usr}@type-surface@{kind}@{line}@{offset}"
             owner_usr = _stable_usr(
                 clang.to_str(clang.lib.clang_getCursorUSR(parent))
             )
@@ -3730,12 +3990,16 @@ def _scan_sources(
                     linkage=linkage,
                     offset=offset,
                     spelling_file=(
-                        str(Path(spelling_filename).resolve())
+                        finding_path(Path(spelling_filename).resolve())
                         if spelling_filename
                         else ""
                     ),
                     spelling_offset=spelling_offset,
                     observation_context=active_observation_context,
+                    body_surface=(
+                        kind in _EXPRESSION_SURFACE_KINDS
+                        or _cursor_is_function_local(clang, cursor)
+                    ),
                 )
             )
 
@@ -3830,6 +4094,9 @@ def _scan_sources(
                         access=class_access,
                         linkage=clang.lib.clang_getCursorLinkage(class_cursor),
                         observation_context=active_observation_context,
+                        body_surface=_cursor_is_function_local(
+                            clang, class_cursor
+                        ),
                     )
                 )
 
@@ -3856,15 +4123,11 @@ def _scan_sources(
                 return 2
             if kind not in _SIGNATURE_DECL_KINDS:
                 if kind in _TYPE_SURFACE_KINDS:
-                    if (
-                        kind == _CXCursor_VarDecl
-                        and clang.lib.clang_getCursorKind(parent)
-                        not in _RECORD_LIKE_KINDS
-                        | {_CXCursor_Namespace, _CXCursor_TranslationUnit}
-                    ):
-                        return 2
                     record_type_surface(cursor, kind, parent)
-                    return 1
+                    return 2
+                if kind in _EXPRESSION_SURFACE_KINDS:
+                    record_type_surface(cursor, kind, parent)
+                    return 2
                 return 2
 
             canonical = clang.lib.clang_getCanonicalCursor(cursor)
@@ -3899,7 +4162,7 @@ def _scan_sources(
         for context in source_contexts:
             active_observation_context = (
                 f"{context.target}|{context.configuration or '<single>'}|"
-                f"source:{source_real}"
+                f"source:{finding_path(source_real)}"
             )
             tu = _parse_source_as_own_tu(clang, idx, context, sysroot_args)
             try:
@@ -4109,7 +4372,12 @@ def _configure_clang_build_dir(repo_root: Path, build_dir: Path) -> None:
         )
 
 
-def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> list[Finding]:
+def run_check(
+    repo_root: Path,
+    clang_build_dir: Path,
+    skip_configure: bool,
+    enforce_identity_pins: bool = False,
+) -> list[Finding]:
     if not skip_configure:
         _configure_clang_build_dir(repo_root, clang_build_dir)
 
@@ -4378,11 +4646,10 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     if not idx:
         raise EncoderHygieneError("clang_createIndex() failed")
 
-    # A single dedup set shared across BOTH passes below: once
-    # cross-closure #includes are permitted (a header may legitimately
-    # #include another member of its own closure), the same real
-    # declaration can be legitimately discovered while scanning more than
-    # one wrapper TU, and must only ever be recorded/counted once overall.
+    # One dedup set is shared across both passes, but keys include the exact
+    # target/configuration/TU context. Duplicate AST visits in one observation
+    # collapse; observations from another wrapper, source, target, or config
+    # remain explicit for the final bidirectional observation-set pin.
     seen: set[tuple] = set()
     structural_violations: list[str] = []
     generated_roots = frozenset(
@@ -4571,6 +4838,13 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
     finally:
         clang.lib.clang_disposeIndex(idx)
 
+    if clang.type_graph_errors:
+        raise EncoderHygieneError(
+            "Semantic type graph could not be closed within the configured "
+            "complexity bound:\n"
+            + "\n".join(sorted(set(clang.type_graph_errors)))
+        )
+
     if structural_violations:
         # A hard, never-allowlist-able failure: no AllowlistEntry can ever
         # excuse a forbidden cross-boundary #include, unlike a QJson
@@ -4586,7 +4860,7 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         )
 
     physical_findings: dict[tuple, Finding] = {}
-    observed_contexts: dict[tuple, set[tuple[str, str]]] = {}
+    observed_contexts: dict[tuple, set[str]] = {}
     for finding in findings:
         physical_key = (
             finding.file,
@@ -4598,13 +4872,12 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             finding.canonical_return_type,
             finding.access,
             finding.linkage,
+            finding.body_surface,
         )
         physical_findings.setdefault(physical_key, finding)
-        context_parts = finding.observation_context.split("|", 2)
-        if len(context_parts) >= 2:
-            observed_contexts.setdefault(physical_key, set()).add(
-                (context_parts[0], context_parts[1])
-            )
+        observed_contexts.setdefault(physical_key, set()).add(
+            finding.observation_context
+        )
 
     expected_contexts_by_file: dict[str, set[tuple[str, str]]] = {}
     for target, headers in target_headers.items():
@@ -4659,7 +4932,12 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
         if finding.key() not in ALLOWLIST_BY_KEY:
             continue
         required = expected_contexts_by_file.get(finding.file, set())
-        missing = required - observed_contexts.get(physical_key, set())
+        observed_pairs = {
+            (parts[0], parts[1])
+            for context in observed_contexts.get(physical_key, set())
+            if len(parts := context.split("|", 2)) >= 2
+        }
+        missing = required - observed_pairs
         if missing:
             missing_observations.append(
                 f"  {finding.file}:{finding.line} {finding.usr}: "
@@ -4671,7 +4949,77 @@ def run_check(repo_root: Path, clang_build_dir: Path, skip_configure: bool) -> l
             + "\n".join(missing_observations)
         )
 
-    return list(physical_findings.values())
+    pinned_findings: list[Finding] = []
+    for physical_key, finding in physical_findings.items():
+        physical_payload = json.dumps(
+            {
+                "file": finding.file,
+                "line": finding.line,
+                "offset": finding.offset,
+                "spelling_file": finding.spelling_file,
+                "spelling_offset": finding.spelling_offset,
+                "usr": finding.usr,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        observation_payload = json.dumps(
+            sorted(observed_contexts.get(physical_key, set())),
+            separators=(",", ":"),
+        )
+        pinned_findings.append(
+            replace(
+                finding,
+                physical_identity_sha256=hashlib.sha256(
+                    physical_payload.encode("utf-8")
+                ).hexdigest(),
+                observation_set_sha256=hashlib.sha256(
+                    observation_payload.encode("utf-8")
+                ).hexdigest(),
+            )
+        )
+
+    named_findings = [
+        finding
+        for finding in pinned_findings
+        if finding.key() in ALLOWLIST_BY_KEY
+    ]
+    body_findings = [
+        finding
+        for finding in pinned_findings
+        if finding.key() not in ALLOWLIST_BY_KEY and finding.body_surface
+    ]
+    named_digest = _identity_set_digest(named_findings)
+    local_digest = _identity_set_digest(body_findings)
+    identity_errors: list[str] = []
+    if named_digest != _NAMED_ALLOWLIST_IDENTITY_SET_SHA256:
+        identity_errors.append(
+            "named allowlist physical/observation set changed "
+            f"(expected {_NAMED_ALLOWLIST_IDENTITY_SET_SHA256}, found "
+            f"{named_digest}; {len(named_findings)} physical occurrences)"
+        )
+    if local_digest != _LOCAL_WIRE_SURFACE_SET_SHA256:
+        identity_errors.append(
+            "function-body wire surface set changed "
+            f"(expected {_LOCAL_WIRE_SURFACE_SET_SHA256}, found "
+            f"{local_digest}; {len(body_findings)} physical occurrences)"
+        )
+    if enforce_identity_pins and identity_errors:
+        raise EncoderHygieneError(
+            "Exact forbidden-type physical identity/observation allowance "
+            "mismatch. A declaration, macro expansion, local construction, or "
+            "target/configuration/TU observation was added, removed, or moved; "
+            "review the full production surface before deliberately repinning:\n"
+            + "\n".join(f"  {error}" for error in identity_errors)
+        )
+    if enforce_identity_pins:
+        return [
+            replace(finding, exact_set_allowed=True)
+            if finding.key() not in ALLOWLIST_BY_KEY and finding.body_surface
+            else finding
+            for finding in pinned_findings
+        ]
+    return pinned_findings
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -4715,7 +5063,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ).resolve()
 
     try:
-        findings = run_check(repo_root, clang_build_dir, args.skip_configure)
+        findings = run_check(
+            repo_root,
+            clang_build_dir,
+            args.skip_configure,
+            enforce_identity_pins=not args.list,
+        )
     except EncoderHygieneError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
