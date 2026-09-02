@@ -833,6 +833,14 @@ class _CXSourceLocation(ctypes.Structure):
     _fields_ = [("ptr_data", ctypes.c_void_p * 2), ("int_data", ctypes.c_uint)]
 
 
+class _CXSourceRange(ctypes.Structure):
+    _fields_ = [
+        ("ptr_data", ctypes.c_void_p * 2),
+        ("begin_int_data", ctypes.c_uint),
+        ("end_int_data", ctypes.c_uint),
+    ]
+
+
 class _CXUnsavedFile(ctypes.Structure):
     _fields_ = [("Filename", ctypes.c_char_p), ("Contents", ctypes.c_char_p), ("Length", ctypes.c_ulong)]
 
@@ -883,6 +891,8 @@ _CXCursor_ObjCBoolLiteralExpr = 145
 _CXCursor_TranslationUnit = 350
 _CXCursor_FriendDecl = 603
 _CXCursor_TemplateTypeParameter = 27
+_CXCursor_NonTypeTemplateParameter = 28
+_CXCursor_TemplateTemplateParameter = 29
 
 _EXPECTED_CURSOR_KIND_SPELLINGS = {
     _CXCursor_StructDecl: "StructDecl",
@@ -898,6 +908,8 @@ _EXPECTED_CURSOR_KIND_SPELLINGS = {
     _CXCursor_Constructor: "CXXConstructor",
     _CXCursor_ConversionFunction: "CXXConversion",
     _CXCursor_TemplateTypeParameter: "TemplateTypeParameter",
+    _CXCursor_NonTypeTemplateParameter: "NonTypeTemplateParameter",
+    _CXCursor_TemplateTemplateParameter: "TemplateTemplateParameter",
     _CXCursor_FunctionTemplate: "FunctionTemplate",
     _CXCursor_ClassTemplate: "ClassTemplate",
     _CXCursor_UsingDeclaration: "UsingDeclaration",
@@ -1038,6 +1050,29 @@ SUPPORTED_PRODUCTION_CONFIGS = ("Debug", "Release", "RelWithDebInfo")
 _CXLinkage_Internal = 2
 _CXLinkage_UniqueExternal = 3
 _CXLinkage_External = 4
+
+_CXTemplateArgumentKind_Null = 0
+_CXTemplateArgumentKind_Type = 1
+_CXTemplateArgumentKind_Declaration = 2
+_CXTemplateArgumentKind_NullPtr = 3
+_CXTemplateArgumentKind_Integral = 4
+_CXTemplateArgumentKind_Template = 5
+_CXTemplateArgumentKind_TemplateExpansion = 6
+_CXTemplateArgumentKind_Expression = 7
+_CXTemplateArgumentKind_Pack = 8
+_CXTemplateArgumentKind_Invalid = 9
+
+_TEMPLATE_ARGUMENT_KIND_NAMES = {
+    _CXTemplateArgumentKind_Null: "null",
+    _CXTemplateArgumentKind_Type: "type",
+    _CXTemplateArgumentKind_Declaration: "declaration",
+    _CXTemplateArgumentKind_NullPtr: "nullptr",
+    _CXTemplateArgumentKind_Integral: "integral",
+    _CXTemplateArgumentKind_Template: "template",
+    _CXTemplateArgumentKind_TemplateExpansion: "template-expansion",
+    _CXTemplateArgumentKind_Expression: "expression",
+    _CXTemplateArgumentKind_Pack: "pack",
+}
 
 
 
@@ -1313,6 +1348,23 @@ class _LibClang:
             _CXCursor,
             ctypes.c_uint,
         ]
+        lib.clang_Cursor_getTemplateArgumentKind.restype = ctypes.c_int
+        lib.clang_Cursor_getTemplateArgumentKind.argtypes = [
+            _CXCursor,
+            ctypes.c_uint,
+        ]
+        lib.clang_Cursor_getTemplateArgumentValue.restype = ctypes.c_longlong
+        lib.clang_Cursor_getTemplateArgumentValue.argtypes = [
+            _CXCursor,
+            ctypes.c_uint,
+        ]
+        lib.clang_Cursor_getTemplateArgumentUnsignedValue.restype = (
+            ctypes.c_ulonglong
+        )
+        lib.clang_Cursor_getTemplateArgumentUnsignedValue.argtypes = [
+            _CXCursor,
+            ctypes.c_uint,
+        ]
         lib.clang_getCursorSemanticParent.restype = _CXCursor
         lib.clang_getCursorSemanticParent.argtypes = [_CXCursor]
         lib.clang_getCXXAccessSpecifier.restype = ctypes.c_int
@@ -1336,6 +1388,10 @@ class _LibClang:
 
         lib.clang_getCursorLocation.restype = _CXSourceLocation
         lib.clang_getCursorLocation.argtypes = [_CXCursor]
+        lib.clang_getCursorExtent.restype = _CXSourceRange
+        lib.clang_getCursorExtent.argtypes = [_CXCursor]
+        lib.clang_getRangeStart.restype = _CXSourceLocation
+        lib.clang_getRangeStart.argtypes = [_CXSourceRange]
         lib.clang_getExpansionLocation.argtypes = [
             _CXSourceLocation,
             ctypes.POINTER(ctypes.c_void_p),
@@ -1456,7 +1512,22 @@ class _LibClang:
     def cursor_location_identity(
         self, cursor: _CXCursor
     ) -> tuple[str | None, int, int, str | None, int]:
-        loc = self.lib.clang_getCursorLocation(cursor)
+        return self.source_location_identity(
+            self.lib.clang_getCursorLocation(cursor)
+        )
+
+    def cursor_extent_start_identity(
+        self, cursor: _CXCursor
+    ) -> tuple[str | None, int, int, str | None, int]:
+        return self.source_location_identity(
+            self.lib.clang_getRangeStart(
+                self.lib.clang_getCursorExtent(cursor)
+            )
+        )
+
+    def source_location_identity(
+        self, loc: _CXSourceLocation
+    ) -> tuple[str | None, int, int, str | None, int]:
         file_ptr = ctypes.c_void_p()
         line = ctypes.c_uint()
         col = ctypes.c_uint()
@@ -1675,58 +1746,277 @@ class _ExplicitTemplateCandidate:
     spelling_file: Path
     spelling_offset: int
     statement: str
-    names_and_args: tuple[tuple[str, tuple[str, ...]], ...]
+    source_template_id: str | None
+    source_template_id_offset: int | None
+    source_argument_vector: tuple[str, ...]
+    source_identity_kind: str | None
+    is_specialization: bool
 
 
 _EXPLICIT_TEMPLATE_START = _re.compile(
     r"(?m)^[ \t]*(?:extern[ \t]+template(?![ \t]*<)[ \t]+|"
     r"template[ \t]*<[ \t]*>|template(?![ \t]*<)[ \t]+)"
 )
-def _split_template_arguments(value: str) -> tuple[str, ...]:
-    arguments: list[str] = []
-    start = 0
-    depth = 0
-    for index, character in enumerate(value):
-        if character in "<([{":
-            depth += 1
-        elif character in ">)]}":
-            depth -= 1
-        elif character == "," and depth == 0:
-            arguments.append(value[start:index].strip())
-            start = index + 1
-    arguments.append(value[start:].strip())
-    return tuple(argument for argument in arguments if argument)
 
 
-def _template_names_and_arguments(
-    statement: str,
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    result: list[tuple[str, tuple[str, ...]]] = []
-    for match in _re.finditer(
-        r"((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)[ \t]*<",
-        statement,
+@dataclass(frozen=True)
+class _SourceToken:
+    text: str
+    start: int
+    end: int
+
+
+_EXACT_SOURCE_TOKEN = _re.compile(
+    r"""
+    (?:
+        //[^\n]* | /\*.*?\*/ |
+        "(?:\\.|[^"\\])*" | '(?:\\.|[^'\\])*' |
+        [A-Za-z_]\w* |
+        :: | ->\*? | \.\.\. |
+        \S
+    )
+    """,
+    _re.DOTALL | _re.VERBOSE,
+)
+
+
+def _exact_source_tokens(source: str) -> tuple[_SourceToken, ...]:
+    """Tokenize only enough C++ punctuation to slice a written template-id.
+
+    This intentionally does not manufacture any replacement spelling.  The
+    result is used only to select a contiguous range from the compiler-token
+    validated declaration source; the exact bytes from that range are replayed
+    in a probe TU if libclang omits the specialized declaration cursor.
+    """
+
+    tokens: list[_SourceToken] = []
+    for match in _EXACT_SOURCE_TOKEN.finditer(source):
+        token = match.group(0)
+        if token.startswith("//") or token.startswith("/*"):
+            continue
+        tokens.append(_SourceToken(token, match.start(), match.end()))
+    return tuple(tokens)
+
+
+def _matching_template_open(
+    tokens: Sequence[_SourceToken], close_index: int
+) -> int | None:
+    """Find the opening angle for a template-id ending at ``close_index``.
+
+    Parenthesized/bracketed/braced expressions are skipped while walking
+    backward so an operator inside a non-type argument cannot be mistaken for
+    a template delimiter.  A malformed or ambiguous source range is rejected
+    by returning ``None``; callers fail closed rather than guessing.
+    """
+
+    angle_depth = 0
+    nested: list[str] = []
+    closes = {")": "(", "]": "[", "}": "{"}
+    for index in range(close_index, -1, -1):
+        token = tokens[index].text
+        if token in closes:
+            nested.append(closes[token])
+            continue
+        if nested:
+            if token == nested[-1]:
+                nested.pop()
+            continue
+        if token == ">":
+            angle_depth += 1
+        elif token == "<":
+            angle_depth -= 1
+            if angle_depth == 0:
+                return index
+            if angle_depth < 0:
+                return None
+    return None
+
+
+def _qualified_template_component_start(
+    tokens: Sequence[_SourceToken], end_index: int
+) -> int | None:
+    """Return the first token of a qualified component ending at ``end``."""
+
+    if end_index < 0:
+        return None
+    if tokens[end_index].text == ">":
+        open_index = _matching_template_open(tokens, end_index)
+        if open_index is None or open_index == 0:
+            return None
+        start = open_index - 1
+        if not _re.fullmatch(r"[A-Za-z_]\w*", tokens[start].text):
+            return None
+    elif (
+        _re.fullmatch(r"[A-Za-z_]\w*", tokens[end_index].text)
+        and tokens[end_index].text
+        not in {
+            "class",
+            "const",
+            "enum",
+            "extern",
+            "struct",
+            "template",
+            "typename",
+            "union",
+            "volatile",
+        }
     ):
-        name = match.group(1)
-        if name == "template":
-            continue
-        begin = match.end()
-        depth = 1
-        index = begin
-        while index < len(statement) and depth:
-            if statement[index] == "<":
-                depth += 1
-            elif statement[index] == ">":
-                depth -= 1
-            index += 1
-        if depth:
-            continue
-        result.append(
-            (
-                name,
-                _split_template_arguments(statement[begin : index - 1]),
-            )
+        start = end_index
+    else:
+        return None
+    if start > 0 and tokens[start - 1].text == "template":
+        start -= 1
+    return start
+
+
+def _qualified_template_id_start(
+    tokens: Sequence[_SourceToken], end_index: int
+) -> int | None:
+    start = _qualified_template_component_start(tokens, end_index)
+    if start is None:
+        return None
+    while start >= 2 and tokens[start - 1].text == "::":
+        previous = _qualified_template_component_start(tokens, start - 2)
+        if previous is None:
+            # `class ::qualified::Template<...>` starts with the global
+            # qualifier.  The declaration-specifier before that qualifier is
+            # not a template-id component.
+            start -= 1
+            break
+        start = previous
+    if start > 0 and tokens[start - 1].text == "::":
+        start -= 1
+    return start
+
+
+def _exact_template_argument_vector(
+    source: str,
+    tokens: Sequence[_SourceToken],
+    template_end_index: int,
+) -> tuple[str, ...]:
+    if tokens[template_end_index].text != ">":
+        return ()
+    open_index = _matching_template_open(tokens, template_end_index)
+    if open_index is None:
+        raise EncoderHygieneError(
+            "Could not match the exact source range of a template argument "
+            "vector; refusing to approximate it"
         )
-    return tuple(result)
+    if open_index + 1 == template_end_index:
+        return ()
+    arguments: list[str] = []
+    start = tokens[open_index + 1].start
+    nested_angles = 0
+    nested_delimiters: list[str] = []
+    open_to_close = {"(": ")", "[": "]", "{": "}"}
+    for index in range(open_index + 1, template_end_index):
+        token = tokens[index].text
+        if token in open_to_close:
+            nested_delimiters.append(open_to_close[token])
+        elif nested_delimiters:
+            if token == nested_delimiters[-1]:
+                nested_delimiters.pop()
+        elif token == "<":
+            nested_angles += 1
+        elif token == ">":
+            nested_angles -= 1
+        elif token == "," and nested_angles == 0:
+            arguments.append(source[start : tokens[index].start])
+            start = tokens[index].end
+    arguments.append(source[start : tokens[template_end_index].start])
+    if any(not argument.strip() for argument in arguments):
+        raise EncoderHygieneError(
+            "Compiler-token validated template argument vector contains an "
+            "empty argument; refusing to approximate it"
+        )
+    return tuple(arguments)
+
+
+def _exact_template_probe_id(
+    source: str,
+) -> tuple[str, int, tuple[str, ...]] | None:
+    """Extract one exact written template-id from an explicit declaration.
+
+    The result is a contiguous source slice, never a normalized/reassembled
+    identifier.  Class-template declarations normally bind directly through
+    libclang.  This is the fail-closed escape hatch for function/variable
+    specializations libclang does not enumerate as declaration cursors.
+    """
+
+    tokens = _exact_source_tokens(source)
+    if not tokens:
+        return None
+    angle_depth = 0
+    nested: list[str] = []
+    open_to_close = {"(": ")", "[": "]", "{": "}"}
+    limit = len(tokens)
+    for index, token_info in enumerate(tokens):
+        token = token_info.text
+        if token in open_to_close:
+            nested.append(open_to_close[token])
+            continue
+        if nested:
+            if token == nested[-1]:
+                nested.pop()
+            continue
+        if token == "<":
+            angle_depth += 1
+            continue
+        if token == ">":
+            angle_depth = max(angle_depth - 1, 0)
+            continue
+        if token in {";", "{"} and angle_depth == 0:
+            limit = index
+            break
+    if limit == 0:
+        return None
+
+    angle_depth = 0
+    nested = []
+    function_open: int | None = None
+    for index, token_info in enumerate(tokens[:limit]):
+        token = token_info.text
+        if token == "(" and not nested and angle_depth == 0 and index:
+            previous = tokens[index - 1].text
+            if previous == ">" or _re.fullmatch(
+                r"[A-Za-z_]\w*", previous
+            ):
+                function_open = index
+                break
+        if token in open_to_close:
+            nested.append(open_to_close[token])
+            continue
+        if nested:
+            if token == nested[-1]:
+                nested.pop()
+            continue
+        if token == "<":
+            angle_depth += 1
+            continue
+        if token == ">":
+            angle_depth = max(angle_depth - 1, 0)
+            continue
+    end_index = (
+        function_open - 1
+        if function_open is not None
+        else limit - 1
+    )
+    start_index = _qualified_template_id_start(tokens, end_index)
+    if start_index is None:
+        return None
+    if function_open is None and tokens[end_index].text != ">":
+        # A direct class specialization with no explicit argument list is not
+        # meaningful.  Treat any unsupported variable/function form as
+        # unresolvable instead of guessing a bare identifier.
+        return None
+    start = tokens[start_index].start
+    end = tokens[end_index].end
+    template_id = source[start:end]
+    return (
+        template_id,
+        start,
+        _exact_template_argument_vector(source, tokens, end_index),
+    )
 
 
 def _explicit_template_candidates(
@@ -1735,7 +2025,8 @@ def _explicit_template_candidates(
     directory: Path,
     always_tokenize: bool,
 ) -> list[_ExplicitTemplateCandidate]:
-    text = path.read_text(encoding="utf-8")
+    source_bytes = path.read_bytes()
+    text = source_bytes.decode("utf-8")
     compiler = os.environ.get("ARKHAM_CLANGXX", "clang++")
     if _EXPLICIT_TEMPLATE_START.search(text) is None:
         if not always_tokenize:
@@ -1864,9 +2155,10 @@ def _explicit_template_candidates(
             )
         )
 
-    line_starts = [0]
-    for match in _re.finditer("\n", text):
-        line_starts.append(match.end())
+    line_byte_starts = [0]
+    for index, byte in enumerate(source_bytes):
+        if byte == ord("\n"):
+            line_byte_starts.append(index + 1)
     candidates: list[_ExplicitTemplateCandidate] = []
     for token_index, (
         token,
@@ -1879,6 +2171,7 @@ def _explicit_template_candidates(
         if token != "template":
             continue
         next_index = token_index + 1
+        is_specialization = False
         if next_index < len(tokens) and tokens[next_index][0] == "<":
             # `template<class T>` is a primary declaration. Only the empty
             # `template<>` form is an explicit specialization.
@@ -1887,18 +2180,22 @@ def _explicit_template_candidates(
                 or tokens[next_index + 1][0] != ">"
             ):
                 continue
+            is_specialization = True
         statement_tokens: list[str] = []
+        statement_entries: list[tuple[str, int, int, Path, int, int]] = []
         angle_depth = 0
         paren_depth = 0
-        for (
-            current,
-            _token_line,
-            _token_column,
-            _spelling_path,
-            _spelling_line,
-            _spelling_column,
-        ) in tokens[token_index:]:
+        for entry in tokens[token_index:]:
+            (
+                current,
+                _token_line,
+                _token_column,
+                _spelling_path,
+                _spelling_line,
+                _spelling_column,
+            ) = entry
             statement_tokens.append(current)
+            statement_entries.append(entry)
             if current == "<":
                 angle_depth += 1
             elif current == ">" and angle_depth:
@@ -1912,14 +2209,70 @@ def _explicit_template_candidates(
         statement = _re.sub(
             r"\s*::\s*", "::", " ".join(statement_tokens)
         )
-        names_and_args = _template_names_and_arguments(statement)
-        if not names_and_args:
-            raise EncoderHygieneError(
-                f"Could not resolve explicit template declaration at "
-                f"{path}:{line}"
+        byte_offset = line_byte_starts[line - 1] + column - 1
+        (
+            last_token,
+            last_line,
+            last_column,
+            _last_spelling_path,
+            _last_spelling_line,
+            _last_spelling_column,
+        ) = statement_entries[-1]
+        statement_end_offset = (
+            line_byte_starts[last_line - 1]
+            + last_column
+            - 1
+            + len(last_token.encode("utf-8"))
+        )
+        source_template_id: str | None = None
+        source_template_id_offset: int | None = None
+        source_argument_vector: tuple[str, ...] = ()
+        source_identity_kind: str | None = None
+        physically_contiguous = all(
+            token_spelling_path == path.resolve()
+            and token_line == token_spelling_line
+            and token_column == token_spelling_column
+            for (
+                _token,
+                token_line,
+                token_column,
+                token_spelling_path,
+                token_spelling_line,
+                token_spelling_column,
+            ) in statement_entries
+        )
+        if physically_contiguous:
+            raw_statement = source_bytes[
+                byte_offset:statement_end_offset
+            ].decode("utf-8")
+            exact_probe = _exact_template_probe_id(raw_statement)
+            if exact_probe is not None:
+                (
+                    source_template_id,
+                    source_offset,
+                    source_argument_vector,
+                ) = exact_probe
+                source_template_id_offset = byte_offset + len(
+                    raw_statement[:source_offset].encode("utf-8")
+                )
+                source_identity_kind = "source-range"
+        else:
+            # Macro expansions do not have one contiguous range in the
+            # invoking file.  Preserve the compiler's exact preprocessor
+            # token sequence instead of rebuilding a spelling from names and
+            # arguments.  The eventual probe is still accepted only when
+            # libclang resolves it to one canonical specialization cursor.
+            exact_probe = _exact_template_probe_id(
+                " ".join(statement_tokens)
             )
-        character_offset = line_starts[line - 1] + column - 1
-        byte_offset = len(text[:character_offset].encode("utf-8"))
+            if exact_probe is not None:
+                (
+                    source_template_id,
+                    _source_offset,
+                    source_argument_vector,
+                ) = exact_probe
+                source_template_id_offset = byte_offset
+                source_identity_kind = "compiler-token-range"
         if spelling_path.is_file():
             spelling_text = spelling_path.read_text(encoding="utf-8")
             spelling_line_starts = [0]
@@ -1950,750 +2303,828 @@ def _explicit_template_candidates(
                 spelling_file=spelling_path,
                 spelling_offset=spelling_byte_offset,
                 statement=statement,
-                names_and_args=names_and_args,
+                source_template_id=source_template_id,
+                source_template_id_offset=source_template_id_offset,
+                source_argument_vector=source_argument_vector,
+                source_identity_kind=source_identity_kind,
+                is_specialization=is_specialization,
             )
         )
     return candidates
 
 
-def _normalized_template_spelling(value: str) -> str:
-    return _re.sub(r"\b(?:class|struct|union|enum)\s+", "", value).replace(
-        " ", ""
+@dataclass(frozen=True)
+class _BoundTemplateSpecialization:
+    canonical_usr: str
+    canonical_declaration: str
+    argument_fingerprints: tuple[str, ...]
+    source_identity: str
+    forbidden_surfaces: tuple[str, ...]
+
+
+def _resolved_location_path(value: str, directory: Path) -> Path:
+    location = Path(value)
+    return (
+        location if location.is_absolute() else directory / location
+    ).resolve()
+
+
+def _candidate_location_key(
+    candidate: _ExplicitTemplateCandidate, path: Path
+) -> tuple[Path, int, Path, int]:
+    return (
+        path.resolve(),
+        candidate.offset,
+        candidate.spelling_file.resolve(),
+        candidate.spelling_offset,
     )
 
 
+def _cursor_extent_location_key(
+    clang: "_LibClang", cursor: "_CXCursor", directory: Path
+) -> tuple[Path, int, Path, int] | None:
+    (
+        filename,
+        _line,
+        offset,
+        spelling_filename,
+        spelling_offset,
+    ) = clang.cursor_extent_start_identity(cursor)
+    if filename is None or spelling_filename is None:
+        return None
+    return (
+        _resolved_location_path(filename, directory),
+        offset,
+        _resolved_location_path(spelling_filename, directory),
+        spelling_offset,
+    )
+
+
+def _qualified_cursor_display_name(
+    clang: "_LibClang", cursor: "_CXCursor"
+) -> str:
+    parts = [
+        clang.to_str(clang.lib.clang_getCursorDisplayName(cursor))
+    ]
+    parent = clang.lib.clang_getCursorSemanticParent(cursor)
+    seen: set[tuple[int, int, int, int, int]] = set()
+    while True:
+        kind = clang.lib.clang_getCursorKind(parent)
+        if kind in (_CXCursor_NoDeclFound, _CXCursor_TranslationUnit):
+            break
+        identity = (
+            parent.kind,
+            parent.xdata,
+            int(parent.data[0] or 0),
+            int(parent.data[1] or 0),
+            int(parent.data[2] or 0),
+        )
+        if identity in seen:
+            break
+        seen.add(identity)
+        if kind == _CXCursor_Namespace or kind in _RECORD_LIKE_KINDS:
+            name = clang.to_str(
+                clang.lib.clang_getCursorDisplayName(parent)
+            )
+            if name:
+                parts.append(name)
+        parent = clang.lib.clang_getCursorSemanticParent(parent)
+    return "::".join(reversed([part for part in parts if part]))
+
+
+def _template_argument_fingerprints(
+    clang: "_LibClang", cursor: "_CXCursor"
+) -> tuple[str, ...]:
+    count = clang.lib.clang_Cursor_getNumTemplateArguments(cursor)
+    if count < 0:
+        raise EncoderHygieneError(
+            "Compiler cursor does not expose canonical template arguments "
+            f"for {_qualified_cursor_display_name(clang, cursor)}"
+        )
+    arguments: list[str] = []
+    for index in range(count):
+        kind = clang.lib.clang_Cursor_getTemplateArgumentKind(
+            cursor, index
+        )
+        kind_name = _TEMPLATE_ARGUMENT_KIND_NAMES.get(kind)
+        if kind_name is None or kind == _CXTemplateArgumentKind_Invalid:
+            raise EncoderHygieneError(
+                "Compiler returned an invalid template argument kind for "
+                f"{_qualified_cursor_display_name(clang, cursor)} "
+                f"argument {index}: {kind}"
+            )
+        if kind == _CXTemplateArgumentKind_Type:
+            argument_type = (
+                clang.lib.clang_Cursor_getTemplateArgumentType(
+                    cursor, index
+                )
+            )
+            if argument_type.kind == 0:
+                raise EncoderHygieneError(
+                    "Compiler returned an invalid canonical type for "
+                    f"{_qualified_cursor_display_name(clang, cursor)} "
+                    f"argument {index}"
+                )
+            arguments.append(
+                f"type:{_stable_type_spelling(clang, argument_type)}"
+            )
+        elif kind == _CXTemplateArgumentKind_Integral:
+            signed = clang.lib.clang_Cursor_getTemplateArgumentValue(
+                cursor, index
+            )
+            unsigned = (
+                clang.lib.clang_Cursor_getTemplateArgumentUnsignedValue(
+                    cursor, index
+                )
+            )
+            arguments.append(
+                f"integral:signed={signed}:unsigned={unsigned}"
+            )
+        elif kind == _CXTemplateArgumentKind_Pack:
+            # libclang exposes the pack node but not a recursively indexed
+            # C-API vector for its elements.  The candidate's exact source
+            # vector is therefore carried alongside this semantic `pack`
+            # marker by _bound_template_specialization(); do not incorrectly
+            # flatten unrelated outer type arguments into this pack.
+            arguments.append("pack")
+        else:
+            arguments.append(kind_name)
+    return tuple(arguments)
+
+
+def _forbidden_cursor_subtree(
+    clang: "_LibClang",
+    cursor: "_CXCursor",
+    *,
+    inspect_root: bool = True,
+    skip_template_parameters: bool = False,
+) -> set[str]:
+    forbidden: set[str] = set()
+
+    def inspect(current: "_CXCursor") -> None:
+        kind = clang.lib.clang_getCursorKind(current)
+        if kind in _SIGNATURE_DECL_KINDS:
+            shaped, description = _is_encoder_shaped(
+                clang, current, kind
+            )
+            if shaped:
+                forbidden.add(description)
+        value_type = clang.lib.clang_getCursorType(current)
+        if value_type.kind:
+            fingerprint = _forbidden_type_fingerprint(
+                clang, value_type
+            )
+            if fingerprint:
+                forbidden.add(
+                    f"cursor-kind={kind}:{fingerprint}"
+                )
+
+    if inspect_root:
+        inspect(cursor)
+
+    def visit(
+        child: "_CXCursor", _parent: "_CXCursor", _client_data
+    ) -> int:
+        if skip_template_parameters and clang.lib.clang_getCursorKind(
+            child
+        ) in {
+            _CXCursor_TemplateTypeParameter,
+            _CXCursor_NonTypeTemplateParameter,
+            _CXCursor_TemplateTemplateParameter,
+        }:
+            return 1
+        inspect(child)
+        return 2
+
+    callback = clang._visitor_func_type(visit)
+    clang.lib.clang_visitChildren(cursor, callback, None)
+    return forbidden
+
+
+def _bound_template_specialization(
+    clang: "_LibClang",
+    cursor: "_CXCursor",
+    evidence_cursor: "_CXCursor | None" = None,
+    candidate: _ExplicitTemplateCandidate | None = None,
+) -> _BoundTemplateSpecialization:
+    canonical = clang.lib.clang_getCanonicalCursor(cursor)
+    argument_cursor = canonical
+    identity_cursor = canonical
+    if clang.lib.clang_Cursor_getNumTemplateArguments(canonical) < 0:
+        semantic_parent = clang.lib.clang_getCursorSemanticParent(cursor)
+        if (
+            clang.lib.clang_Cursor_getNumTemplateArguments(semantic_parent)
+            >= 0
+        ):
+            # An explicit instantiation such as `C<T>::member()` is exposed
+            # as a non-template member cursor.  Its canonical cursor is the
+            # primary member declaration, so preserve the exact specialized
+            # member USR while taking the ordered argument vector from the
+            # concrete semantic parent.
+            identity_cursor = cursor
+            argument_cursor = semantic_parent
+    canonical_declaration = _qualified_cursor_display_name(
+        clang, identity_cursor
+    )
+    arguments = _template_argument_fingerprints(clang, argument_cursor)
+    opaque_argument_kinds = {
+        _CXTemplateArgumentKind_Null,
+        _CXTemplateArgumentKind_Declaration,
+        _CXTemplateArgumentKind_NullPtr,
+        _CXTemplateArgumentKind_Template,
+        _CXTemplateArgumentKind_TemplateExpansion,
+        _CXTemplateArgumentKind_Expression,
+        _CXTemplateArgumentKind_Pack,
+    }
+    has_opaque_argument = any(
+        clang.lib.clang_Cursor_getTemplateArgumentKind(
+            argument_cursor, index
+        )
+        in opaque_argument_kinds
+        for index in range(
+            max(
+                clang.lib.clang_Cursor_getNumTemplateArguments(
+                    argument_cursor
+                ),
+                0,
+            )
+        )
+    )
+    source_identity = ""
+    if (
+        candidate is not None
+        and candidate.source_template_id is not None
+        and candidate.source_template_id_offset is not None
+    ):
+        encoded_template_id = candidate.source_template_id.encode("utf-8")
+        source_arguments = ",".join(
+            f"{index}:{hashlib.sha256(argument.encode('utf-8')).hexdigest()}"
+            for index, argument in enumerate(
+                candidate.source_argument_vector
+            )
+        )
+        source_identity = (
+            f"{candidate.source_identity_kind}="
+            f"{candidate.source_template_id_offset}:"
+            f"{len(encoded_template_id)}:"
+            f"{hashlib.sha256(encoded_template_id).hexdigest()};"
+            f"arguments=[{source_arguments}]"
+        )
+    if has_opaque_argument and not source_identity:
+        raise EncoderHygieneError(
+            "libclang omitted a lossless semantic representation for one or "
+            "more explicit-template arguments and no contiguous compiler-"
+            "token-validated source range is available for "
+            f"{_qualified_cursor_display_name(clang, canonical)}; refusing "
+            "to bind it to a broader primary template or sibling "
+            "specialization"
+        )
+    canonical_usr = clang.to_str(
+        clang.lib.clang_getCursorUSR(identity_cursor)
+    )
+    if not canonical_usr:
+        primary = clang.lib.clang_getSpecializedCursorTemplate(
+            argument_cursor
+        )
+        primary_usr = clang.to_str(
+            clang.lib.clang_getCursorUSR(primary)
+        )
+        canonical_type = clang.lib.clang_getCanonicalType(
+            clang.lib.clang_getCursorType(argument_cursor)
+        )
+        compiler_identity = json.dumps(
+            {
+                "primary_usr": primary_usr,
+                "declaration": canonical_declaration,
+                "type": (
+                    _stable_type_spelling(clang, canonical_type)
+                    if canonical_type.kind
+                    else ""
+                ),
+                "arguments": arguments,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if not primary_usr or not canonical_declaration:
+            raise EncoderHygieneError(
+                "Compiler did not expose a complete canonical identity for "
+                f"explicit template specialization {canonical_declaration}"
+            )
+        canonical_usr = (
+            "c:@compiler-specialization@"
+            + hashlib.sha256(
+                compiler_identity.encode("utf-8")
+            ).hexdigest()
+        )
+    forbidden = _forbidden_cursor_subtree(clang, cursor)
+    argument_count = clang.lib.clang_Cursor_getNumTemplateArguments(
+        argument_cursor
+    )
+    for index in range(argument_count):
+        if (
+            clang.lib.clang_Cursor_getTemplateArgumentKind(
+                argument_cursor, index
+            )
+            != _CXTemplateArgumentKind_Type
+        ):
+            continue
+        argument_type = (
+            clang.lib.clang_Cursor_getTemplateArgumentType(
+                argument_cursor, index
+            )
+        )
+        if argument_type.kind:
+            fingerprint = _forbidden_type_fingerprint(
+                clang, argument_type, traverse_records=False
+            )
+            if fingerprint:
+                forbidden.add(
+                    f"template-argument[{index}]:{fingerprint}"
+                )
+
+    canonical_type = clang.lib.clang_getCanonicalType(
+        clang.lib.clang_getCursorType(argument_cursor)
+    )
+    for index in range(
+        max(
+            clang.lib.clang_Type_getNumTemplateArguments(canonical_type),
+            0,
+        )
+    ):
+        argument_type = (
+            clang.lib.clang_Type_getTemplateArgumentAsType(
+                canonical_type, index
+            )
+        )
+        if argument_type.kind:
+            fingerprint = _forbidden_type_fingerprint(
+                clang, argument_type, traverse_records=False
+            )
+            if fingerprint:
+                forbidden.add(
+                    f"template-argument[{index}]:{fingerprint}"
+                )
+
+    primary = clang.lib.clang_getSpecializedCursorTemplate(argument_cursor)
+    if clang.lib.clang_getCursorKind(primary) not in (
+        _CXCursor_NoDeclFound,
+        0,
+    ):
+        def inspect_parameter(
+            parameter: "_CXCursor",
+            _parent: "_CXCursor",
+            _client_data,
+        ) -> int:
+            if (
+                clang.lib.clang_getCursorKind(parameter)
+                == _CXCursor_NonTypeTemplateParameter
+            ):
+                parameter_type = clang.lib.clang_getCursorType(parameter)
+                if parameter_type.kind:
+                    fingerprint = _forbidden_type_fingerprint(
+                        clang,
+                        parameter_type,
+                        traverse_records=False,
+                    )
+                    if fingerprint:
+                        forbidden.add(
+                            "non-type-template-parameter:"
+                            f"{fingerprint}"
+                        )
+            return 1
+
+        parameter_callback = clang._visitor_func_type(
+            inspect_parameter
+        )
+        clang.lib.clang_visitChildren(
+            primary, parameter_callback, None
+        )
+        forbidden.update(
+            _forbidden_cursor_subtree(
+                clang,
+                primary,
+                inspect_root=False,
+                skip_template_parameters=True,
+            )
+        )
+
+    if evidence_cursor is not None:
+        forbidden.update(
+            _forbidden_cursor_subtree(clang, evidence_cursor)
+        )
+    return _BoundTemplateSpecialization(
+        canonical_usr=canonical_usr,
+        canonical_declaration=canonical_declaration,
+        argument_fingerprints=arguments,
+        source_identity=source_identity,
+        forbidden_surfaces=tuple(sorted(forbidden)),
+    )
+
+
+def _merge_bound_template_specialization(
+    identities: dict[str, _BoundTemplateSpecialization],
+    resolved: _BoundTemplateSpecialization,
+) -> None:
+    existing = identities.get(resolved.canonical_usr)
+    if existing is None:
+        identities[resolved.canonical_usr] = resolved
+        return
+    if (
+        existing.canonical_declaration
+        != resolved.canonical_declaration
+        or existing.argument_fingerprints
+        != resolved.argument_fingerprints
+        or existing.source_identity != resolved.source_identity
+    ):
+        raise EncoderHygieneError(
+            "Compiler returned conflicting canonical descriptions for "
+            f"template USR {resolved.canonical_usr}: "
+            f"{existing} versus {resolved}"
+        )
+    identities[resolved.canonical_usr] = _BoundTemplateSpecialization(
+        canonical_usr=existing.canonical_usr,
+        canonical_declaration=existing.canonical_declaration,
+        argument_fingerprints=existing.argument_fingerprints,
+        source_identity=existing.source_identity,
+        forbidden_surfaces=tuple(
+            sorted(
+                set(existing.forbidden_surfaces)
+                | set(resolved.forbidden_surfaces)
+            )
+        ),
+    )
+
+
+def _template_probe_name(probe_kind: str, candidate_index: int) -> str:
+    return f"__arkham_template_{probe_kind}_probe_{candidate_index}"
+
+
+def _template_probe_source(
+    path: Path,
+    candidates: Sequence[_ExplicitTemplateCandidate],
+    candidate_indices: Sequence[int],
+    probe_kind: str,
+) -> bytes:
+    source = path.read_bytes()
+    insertions: dict[int, list[bytes]] = {}
+    for candidate_index in candidate_indices:
+        candidate = candidates[candidate_index]
+        template_id = candidate.source_template_id
+        if template_id is None:
+            raise EncoderHygieneError(
+                "No contiguous compiler-token-validated source template-id "
+                f"is available for explicit template declaration at "
+                f"{path}:{candidate.line}; refusing to reconstruct its "
+                "spelling"
+            )
+        marker = _template_probe_name(probe_kind, candidate_index)
+        declaration = (
+            f"using {marker} = {template_id};\n"
+            if probe_kind == "type"
+            else (
+                f"static constexpr auto {marker} = "
+                f"&{template_id};\n"
+            )
+        )
+        insertions.setdefault(candidate.offset, []).append(
+            declaration.encode("utf-8")
+        )
+    for offset in sorted(insertions, reverse=True):
+        if offset < 0 or offset > len(source):
+            raise EncoderHygieneError(
+                f"Explicit-template probe offset {offset} is outside {path}"
+            )
+        source = (
+            source[:offset]
+            + b"".join(insertions[offset])
+            + source[offset:]
+        )
+    return source
+
+
+def _parse_template_probe_tu(
+    clang: "_LibClang",
+    idx: ctypes.c_void_p,
+    path: Path,
+    arguments: Sequence[str],
+    directory: Path,
+    modified_source: bytes,
+    wrapper_filename: str | None,
+) -> ctypes.c_void_p:
+    source_abs = str(path.resolve())
+    unsaved_entries = [
+        _CXUnsavedFile(
+            Filename=source_abs.encode("utf-8"),
+            Contents=modified_source,
+            Length=len(modified_source),
+        )
+    ]
+    parse_filename = source_abs
+    if wrapper_filename is not None:
+        wrapper_contents = f'#include "{source_abs}"\n'.encode("utf-8")
+        unsaved_entries.insert(
+            0,
+            _CXUnsavedFile(
+                Filename=wrapper_filename.encode("utf-8"),
+                Contents=wrapper_contents,
+                Length=len(wrapper_contents),
+            ),
+        )
+        parse_filename = wrapper_filename
+    unsaved_array = (_CXUnsavedFile * len(unsaved_entries))(
+        *unsaved_entries
+    )
+    args_bytes = [argument.encode("utf-8") for argument in arguments]
+    argv = (ctypes.c_char_p * len(args_bytes))(*args_bytes)
+    tu_ptr = ctypes.c_void_p()
+    with _working_directory(directory):
+        error = clang.lib.clang_parseTranslationUnit2(
+            idx,
+            parse_filename.encode("utf-8"),
+            argv,
+            len(args_bytes),
+            unsaved_array,
+            len(unsaved_entries),
+            0x0,
+            ctypes.byref(tu_ptr),
+        )
+    if error != 0 or not tu_ptr.value:
+        raise EncoderHygieneError(
+            "libclang failed to parse compiler-bound explicit-template "
+            f"probes for {path} (CXErrorCode={error})"
+        )
+    return tu_ptr.value
+
+
+def _probe_template_identities(
+    clang: "_LibClang",
+    idx: ctypes.c_void_p,
+    path: Path,
+    arguments: Sequence[str],
+    directory: Path,
+    candidates: Sequence[_ExplicitTemplateCandidate],
+    candidate_indices: Sequence[int],
+    probe_kind: str,
+    wrapper_filename: str | None,
+) -> dict[int, tuple[_BoundTemplateSpecialization, ...]]:
+    if not candidate_indices:
+        return {}
+    modified_source = _template_probe_source(
+        path, candidates, candidate_indices, probe_kind
+    )
+    tu = _parse_template_probe_tu(
+        clang,
+        idx,
+        path,
+        arguments,
+        directory,
+        modified_source,
+        wrapper_filename,
+    )
+    marker_candidates = {
+        _template_probe_name(probe_kind, candidate_index): candidate_index
+        for candidate_index in candidate_indices
+    }
+    resolved: dict[int, dict[str, _BoundTemplateSpecialization]] = {}
+    try:
+        def add(
+            candidate_index: int,
+            target: "_CXCursor",
+            evidence: "_CXCursor",
+        ) -> None:
+            target_arguments = (
+                clang.lib.clang_Cursor_getNumTemplateArguments(target)
+            )
+            parent_arguments = (
+                clang.lib.clang_Cursor_getNumTemplateArguments(
+                    clang.lib.clang_getCursorSemanticParent(target)
+                )
+            )
+            if target_arguments < 0 and parent_arguments < 0:
+                return
+            bound = _bound_template_specialization(
+                clang, target, evidence, candidates[candidate_index]
+            )
+            identities = resolved.setdefault(candidate_index, {})
+            _merge_bound_template_specialization(
+                identities, bound
+            )
+
+        def visit(
+            cursor: "_CXCursor",
+            _parent: "_CXCursor",
+            _client_data,
+        ) -> int:
+            name = clang.to_str(
+                clang.lib.clang_getCursorDisplayName(cursor)
+            )
+            candidate_index = marker_candidates.get(name)
+            if candidate_index is None:
+                return 2
+            kind = clang.lib.clang_getCursorKind(cursor)
+            if probe_kind == "type" and kind == _CXCursor_TypeAliasDecl:
+                target_type = clang.lib.clang_getCanonicalType(
+                    clang.lib.clang_getCursorType(cursor)
+                )
+                target = clang.lib.clang_getTypeDeclaration(target_type)
+                add(candidate_index, target, cursor)
+                return 1
+            if probe_kind == "value" and kind == _CXCursor_VarDecl:
+                def find_reference(
+                    child: "_CXCursor",
+                    _reference_parent: "_CXCursor",
+                    _reference_data,
+                ) -> int:
+                    referenced = clang.lib.clang_getCursorReferenced(
+                        child
+                    )
+                    add(candidate_index, referenced, cursor)
+                    return 2
+
+                reference_callback = clang._visitor_func_type(
+                    find_reference
+                )
+                clang.lib.clang_visitChildren(
+                    cursor, reference_callback, None
+                )
+                return 1
+            return 2
+
+        callback = clang._visitor_func_type(visit)
+        root = clang.lib.clang_getTranslationUnitCursor(tu)
+        clang.lib.clang_visitChildren(root, callback, None)
+    finally:
+        clang.lib.clang_disposeTranslationUnit(tu)
+    return {
+        candidate_index: tuple(identities.values())
+        for candidate_index, identities in resolved.items()
+    }
+
+
 def _collect_explicit_template_findings(
+    clang: "_LibClang",
+    idx: ctypes.c_void_p,
+    tu: ctypes.c_void_p,
     path: Path,
     arguments: Sequence[str],
     directory: Path,
     repo_root: Path,
     observation_context: str,
     always_tokenize: bool = False,
+    wrapper_filename: str | None = None,
 ) -> list[Finding]:
     candidates = _explicit_template_candidates(
         path, arguments, directory, always_tokenize
     )
     if not candidates:
         return []
-    compiler = os.environ.get("ARKHAM_CLANGXX", "clang++")
-    ignored_type_names = {
-        "auto",
-        "bool",
-        "char",
-        "const",
-        "double",
-        "float",
-        "int",
-        "long",
-        "short",
-        "signed",
-        "unsigned",
-        "void",
-        "volatile",
-    }
-    root_filters = {
-        name
-        for candidate in candidates
-        for name, _arguments in candidate.names_and_args
-    }
-    pending_filters = list(root_filters)
-    argument_filters: set[str] = set()
-    for candidate in candidates:
-        for _name, provided_arguments in candidate.names_and_args:
-            for argument in provided_arguments:
-                for referenced_name in _re.findall(
-                    r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
-                    argument,
-                ):
-                    if (
-                        referenced_name not in ignored_type_names
-                        and not referenced_name.startswith(
-                            ("QJson", "QVariant", "std::")
-                        )
-                    ):
-                        pending_filters.append(referenced_name)
-                        argument_filters.add(referenced_name)
-    seen_filters: set[str] = set()
-    ast_roots: list[dict] = []
-    decoder = json.JSONDecoder()
-    use_complete_ast = any(
-        name != "QMetaTypeId"
-        for candidate in candidates
-        for name, _arguments in candidate.names_and_args
-    )
-    if use_complete_ast:
-        completed = subprocess.run(
-            [
-                compiler,
-                *arguments,
-                "-Xclang",
-                "-ast-dump=json",
-                "-fsyntax-only",
-                "-x",
-                "c++",
-                str(path),
-            ],
-            cwd=directory,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            raise EncoderHygieneError(
-                f"Compiler AST dump failed while resolving explicit template "
-                f"declarations in {path}:\n{completed.stderr}"
-            )
-        try:
-            complete_root = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise EncoderHygieneError(
-                f"Compiler returned malformed canonical AST JSON for "
-                f"{path}: {exc}"
-            ) from exc
-        if not isinstance(complete_root, dict):
-            raise EncoderHygieneError(
-                f"Compiler returned a non-object canonical AST for {path}"
-            )
-        ast_roots.append(complete_root)
-        pending_filters.clear()
-    while pending_filters:
-        filter_name = pending_filters.pop()
-        if filter_name in seen_filters:
-            continue
-        seen_filters.add(filter_name)
-        if len(seen_filters) > _MAX_TYPE_DEPTH:
-            raise EncoderHygieneError(
-                "Explicit specialization declaration graph exceeded the "
-                f"{_MAX_TYPE_DEPTH}-identity complexity bound in {path}; "
-                f"recent identities={sorted(seen_filters)[-20:]}"
-            )
-        completed = subprocess.run(
-            [
-                compiler,
-                *arguments,
-                "-Xclang",
-                "-ast-dump=json",
-                "-Xclang",
-                "-ast-dump-filter",
-                "-Xclang",
-                filter_name,
-                "-fsyntax-only",
-                "-x",
-                "c++",
-                str(path),
-            ],
-            cwd=directory,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            raise EncoderHygieneError(
-                f"Compiler AST dump failed while resolving explicit template "
-                f"identity {filter_name!r} in {path}:\n{completed.stderr}"
-            )
-        index = 0
-        decoded: list[dict] = []
-        while index < len(completed.stdout):
-            while (
-                index < len(completed.stdout)
-                and completed.stdout[index].isspace()
-            ):
-                index += 1
-            if index == len(completed.stdout):
-                break
-            try:
-                value, index = decoder.raw_decode(completed.stdout, index)
-            except json.JSONDecodeError as exc:
-                raise EncoderHygieneError(
-                    f"Compiler returned malformed filtered AST JSON for "
-                    f"{path} identity {filter_name!r}: {exc}"
-                ) from exc
-            if isinstance(value, dict):
-                value["_arkham_scope"] = filter_name.split("::")[:-1]
-                decoded.append(value)
-        ast_roots.extend(decoded)
-        # Q_ENUM/Q_GADGET expand a project invocation into the verified Qt
-        # QMetaTypeId adapter. Its filtered specialization node remains in
-        # ast_roots and is inspected completely below, including every direct
-        # forbidden type. Do not recursively explode from that adapter into
-        # every unrelated Qt metadata implementation record.
-        if (
-            filter_name in argument_filters
-            and filter_name not in root_filters
-        ) or filter_name == "QMetaTypeId":
-            continue
 
-        referenced_names: set[str] = set()
-
-        def collect_type_names(value: object) -> None:
-            if isinstance(value, dict):
-                type_info = value.get("type")
-                if isinstance(type_info, dict):
-                    for key in ("qualType", "desugaredQualType"):
-                        spelling = type_info.get(key)
-                        if not isinstance(spelling, str):
-                            continue
-                        referenced_names.update(
-                            _re.findall(
-                                r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
-                                spelling,
-                            )
-                        )
-                for nested in value.values():
-                    collect_type_names(nested)
-            elif isinstance(value, list):
-                for nested in value:
-                    collect_type_names(nested)
-
-        for value in decoded:
-            collect_type_names(value)
-        filter_scope = filter_name.split("::")[:-1]
-        for referenced_name in referenced_names:
-            if (
-                referenced_name in ignored_type_names
-                or referenced_name.startswith("std::")
-                or (
-                    len(referenced_name) == 1
-                    and referenced_name.isupper()
-                )
-                or referenced_name == filter_name
-            ):
-                continue
-            pending_filters.append(
-                referenced_name
-                if "::" in referenced_name or not filter_scope
-                else "::".join((*filter_scope, referenced_name))
-            )
-    root: dict = {"kind": "TranslationUnitDecl", "inner": ast_roots}
-
-    specializations: dict[
-        str,
-        list[
-            tuple[
-                str,
-                tuple[str, ...],
-                tuple[str, ...],
-                dict,
-                tuple[str, ...],
-            ]
-        ],
+    candidate_keys: dict[
+        tuple[Path, int, Path, int], list[int]
     ] = {}
-    type_aliases: dict[str, str] = {}
-    namespace_aliases: dict[str, str] = {}
-    namespace_alias_names_by_id: dict[str, tuple[str, ...]] = {}
-    using_directives: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
-    using_record_targets: dict[tuple[tuple[str, ...], str], str] = {}
-    record_nodes: dict[str, list[tuple[dict, tuple[str, ...]]]] = {}
-    record_nodes_by_id: dict[str, tuple[dict, tuple[str, ...]]] = {}
+    candidate_expansion_keys: dict[tuple[Path, int], list[int]] = {}
+    for index, candidate in enumerate(candidates):
+        key = _candidate_location_key(candidate, path)
+        candidate_keys.setdefault(key, []).append(index)
+        candidate_expansion_keys.setdefault(key[:2], []).append(index)
+    bound_by_candidate: list[
+        dict[str, _BoundTemplateSpecialization]
+    ] = [{} for _candidate in candidates]
+    direct_binding_errors: list[EncoderHygieneError] = []
 
-    record_kinds = {
-        "CXXRecordDecl",
-        "RecordDecl",
-        "ClassTemplateSpecializationDecl",
-        "ClassTemplatePartialSpecializationDecl",
-    }
-    context_names_by_id: dict[str, tuple[str, ...]] = {}
-
-    def index_contexts(
-        node: object, scope: tuple[str, ...] = ()
-    ) -> None:
-        if not isinstance(node, dict):
-            return
-        annotated_scope = node.get("_arkham_scope")
-        if isinstance(annotated_scope, list) and all(
-            isinstance(part, str) for part in annotated_scope
-        ):
-            scope = tuple(annotated_scope)
-        kind = node.get("kind")
-        name = node.get("name")
-        child_scope = scope
-        if (
-            kind == "NamespaceDecl"
-            or (kind in record_kinds and not node.get("isImplicit"))
-        ) and isinstance(name, str) and name:
-            child_scope = (*scope, name)
-            if isinstance(node.get("id"), str):
-                context_names_by_id[node["id"]] = child_scope
-        inner = node.get("inner")
-        if isinstance(inner, list):
-            for child in inner:
-                index_contexts(child, child_scope)
-
-    index_contexts(root)
-
-    def visit(node: object, scope: tuple[str, ...] = ()) -> None:
-        if not isinstance(node, dict):
-            return
-        annotated_scope = node.get("_arkham_scope")
-        if isinstance(annotated_scope, list) and all(
-            isinstance(part, str) for part in annotated_scope
-        ):
-            scope = tuple(annotated_scope)
-        kind = node.get("kind")
-        name = node.get("name")
-        inner = node.get("inner")
-        type_info = node.get("type")
-        parent_context = node.get("parentDeclContextId")
-        semantic_scope = (
-            context_names_by_id[parent_context]
-            if isinstance(parent_context, str)
-            and parent_context in context_names_by_id
-            else scope
-        )
-        qualified_name = (
-            "::".join((*semantic_scope, name))
-            if isinstance(name, str) and name
-            else ""
-        )
-        arguments_found: list[str] = []
-        canonical_found: list[str] = []
-        if isinstance(inner, list):
-            for child in inner:
-                if (
-                    not isinstance(child, dict)
-                    or child.get("kind") != "TemplateArgument"
-                ):
-                    continue
-                argument_type = child.get("type")
-                if not isinstance(argument_type, dict):
-                    continue
-                written = argument_type.get("qualType")
-                canonical = argument_type.get(
-                    "desugaredQualType", written
-                )
-                if isinstance(written, str) and isinstance(canonical, str):
-                    arguments_found.append(written)
-                    canonical_found.append(canonical)
-        if (
-            kind in record_kinds
-            and qualified_name
-            and not node.get("isImplicit")
-            and node.get("completeDefinition")
-        ):
-            record_identity = qualified_name
-            if canonical_found:
-                record_identity += (
-                    "<" + ",".join(canonical_found) + ">"
-                )
-            record_nodes.setdefault(
-                _normalized_template_spelling(record_identity), []
-            ).append((node, semantic_scope))
-            if isinstance(node.get("id"), str):
-                record_nodes_by_id[node["id"]] = (node, semantic_scope)
-        if (
-            kind in {"TypeAliasDecl", "TypedefDecl"}
-            and qualified_name
-            and isinstance(type_info, dict)
-        ):
-            canonical_alias = type_info.get(
-                "desugaredQualType", type_info.get("qualType")
+    def bind_direct(
+        cursor: "_CXCursor",
+        _parent: "_CXCursor",
+        _client_data,
+    ) -> int:
+        if clang.lib.clang_Cursor_getNumTemplateArguments(cursor) < 0:
+            return 2
+        key = _cursor_extent_location_key(clang, cursor, directory)
+        if key is None:
+            return 2
+        candidate_indices = candidate_keys.get(key, ())
+        if not candidate_indices:
+            expansion_candidates = candidate_expansion_keys.get(
+                key[:2], ()
             )
-            if isinstance(canonical_alias, str):
-                type_aliases[qualified_name] = canonical_alias
-        if kind == "NamespaceAliasDecl" and qualified_name:
-            aliased_namespace = node.get("aliasedNamespace")
-            if isinstance(aliased_namespace, dict):
-                aliased_id = aliased_namespace.get("id")
-                aliased_name = (
-                    context_names_by_id.get(aliased_id)
-                    if isinstance(aliased_id, str)
-                    else None
+            if len(expansion_candidates) == 1:
+                candidate_indices = expansion_candidates
+        try:
+            for candidate_index in candidate_indices:
+                resolved = _bound_template_specialization(
+                    clang, cursor, cursor, candidates[candidate_index]
                 )
-                if aliased_name is None and isinstance(aliased_id, str):
-                    aliased_name = namespace_alias_names_by_id.get(
-                        aliased_id
-                    )
-                if aliased_name:
-                    namespace_aliases[qualified_name] = "::".join(
-                        aliased_name
-                    )
-                    if isinstance(node.get("id"), str):
-                        namespace_alias_names_by_id[node["id"]] = aliased_name
-        if kind == "UsingDirectiveDecl":
-            nominated = node.get("nominatedNamespace")
-            if isinstance(nominated, dict):
-                nominated_id = nominated.get("id")
-                target_scope = (
-                    context_names_by_id.get(nominated_id)
-                    if isinstance(nominated_id, str)
-                    else None
+                _merge_bound_template_specialization(
+                    bound_by_candidate[candidate_index], resolved
                 )
-                if target_scope:
-                    using_directives.setdefault(
-                        semantic_scope, set()
-                    ).add(target_scope)
-        if kind == "UsingShadowDecl":
-            target = node.get("target")
-            if isinstance(target, dict):
-                target_id = target.get("id")
-                target_name = target.get("name")
-                if isinstance(target_id, str) and isinstance(
-                    target_name, str
-                ):
-                    using_record_targets[
-                        (semantic_scope, target_name)
-                    ] = target_id
-        if qualified_name and arguments_found:
-            canonical_identity = (
-                node.get("mangledName")
-                if isinstance(node.get("mangledName"), str)
-                else (
-                    f"{kind}:{qualified_name}<"
-                    + ",".join(canonical_found)
-                    + ">"
-                )
+        except EncoderHygieneError as exc:
+            # ctypes logs and suppresses exceptions that cross a callback
+            # boundary. Capture this policy failure so it is raised after the
+            # traversal rather than silently leaving a candidate unbound.
+            direct_binding_errors.append(exc)
+            return 0
+        return 2
+
+    direct_callback = clang._visitor_func_type(bind_direct)
+    clang.lib.clang_visitChildren(
+        clang.lib.clang_getTranslationUnitCursor(tu),
+        direct_callback,
+        None,
+    )
+    if direct_binding_errors:
+        raise direct_binding_errors[0]
+
+    unresolved_candidates = [
+        candidate_index
+        for candidate_index, candidate in enumerate(candidates)
+        if not bound_by_candidate[candidate_index]
+    ]
+    type_resolved = _probe_template_identities(
+        clang,
+        idx,
+        path,
+        arguments,
+        directory,
+        candidates,
+        unresolved_candidates,
+        "type",
+        wrapper_filename,
+    )
+    for candidate_index, identities in type_resolved.items():
+        for identity in identities:
+            _merge_bound_template_specialization(
+                bound_by_candidate[candidate_index], identity
             )
-            specializations.setdefault(qualified_name, []).append(
-                (
-                    canonical_identity,
-                    tuple(arguments_found),
-                    tuple(canonical_found),
-                    node,
-                    semantic_scope,
-                )
+    value_candidates = [
+        candidate_index
+        for candidate_index in unresolved_candidates
+        if candidate_index not in type_resolved
+    ]
+    value_resolved = _probe_template_identities(
+        clang,
+        idx,
+        path,
+        arguments,
+        directory,
+        candidates,
+        value_candidates,
+        "value",
+        wrapper_filename,
+    )
+    for candidate_index, identities in value_resolved.items():
+        for identity in identities:
+            _merge_bound_template_specialization(
+                bound_by_candidate[candidate_index], identity
             )
-        child_scope = semantic_scope
-        if (
-            kind == "NamespaceDecl"
-            or (kind in record_kinds and not node.get("isImplicit"))
-        ) and isinstance(name, str) and name:
-            child_scope = (*semantic_scope, name)
-        if isinstance(inner, list):
-            for child in inner:
-                visit(child, child_scope)
-
-    visit(root)
-
-    def instantiated_surfaces(
-        node: dict,
-        scope: tuple[str, ...],
-        visited: frozenset[str] = frozenset(),
-        depth: int = 0,
-    ) -> set[str]:
-        if depth > _MAX_TYPE_DEPTH:
-            raise EncoderHygieneError(
-                "Explicit specialization AST graph exceeded the configured "
-                f"{_MAX_TYPE_DEPTH}-level complexity bound in {path}"
-            )
-        node_id = str(node.get("id", id(node)))
-        if node_id in visited:
-            return set()
-        nested_visited = visited | {node_id}
-        forbidden: set[str] = set()
-
-        def inspect_type(type_info: object) -> None:
-            if not isinstance(type_info, dict):
-                return
-            spellings = {
-                value
-                for key in ("qualType", "desugaredQualType")
-                if isinstance((value := type_info.get(key)), str)
-            }
-            for spelling in spellings:
-                if _is_qjson_family(spelling):
-                    forbidden.add(spelling)
-                referenced_names = _re.findall(
-                    r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
-                    spelling,
-                )
-                for referenced_name in referenced_names:
-                    if (
-                        referenced_name in ignored_type_names
-                        or referenced_name.startswith(
-                            ("QJson", "QVariant", "std::")
-                        )
-                    ):
-                        continue
-                    lookup_chain = (
-                        (referenced_name,)
-                        if "::" in referenced_name
-                        else tuple(
-                            "::".join((*scope[:scope_length], referenced_name))
-                            for scope_length in range(len(scope), -1, -1)
-                        )
-                    )
-                    for lookup in lookup_chain:
-                        normalized_lookup = _normalized_template_spelling(
-                            lookup
-                        )
-                        alias_targets = {
-                            target
-                            for identity, target in type_aliases.items()
-                            if _normalized_template_spelling(identity)
-                            == normalized_lookup
-                        }
-                        if len(alias_targets) > 1:
-                            raise EncoderHygieneError(
-                                f"Compiler AST alias resolution is ambiguous "
-                                f"for {lookup} in {path}"
-                            )
-                        if alias_targets:
-                            alias_target = next(iter(alias_targets))
-                            if _is_qjson_family(alias_target):
-                                forbidden.add(alias_target)
-                            break
-                        matching_records = [
-                            records
-                            for record_identity, records in record_nodes.items()
-                            if record_identity == normalized_lookup
-                            or record_identity.startswith(
-                                f"{normalized_lookup}<"
-                            )
-                        ]
-                        if matching_records:
-                            for records in matching_records:
-                                if len(records) != 1:
-                                    raise EncoderHygieneError(
-                                        "Compiler AST record resolution is "
-                                        f"not unique for {lookup} in {path}"
-                                    )
-                                for record, record_scope in records:
-                                    forbidden.update(
-                                        instantiated_surfaces(
-                                            record,
-                                            record_scope,
-                                            nested_visited,
-                                            depth + 1,
-                                        )
-                                    )
-                            break
-                        lookup_parts = tuple(lookup.split("::"))
-                        lookup_scope = lookup_parts[:-1]
-                        unqualified_name = lookup_parts[-1]
-                        using_target_id = using_record_targets.get(
-                            (lookup_scope, unqualified_name)
-                        )
-                        if (
-                            using_target_id is not None
-                            and using_target_id in record_nodes_by_id
-                        ):
-                            record, record_scope = record_nodes_by_id[
-                                using_target_id
-                            ]
-                            forbidden.update(
-                                instantiated_surfaces(
-                                    record,
-                                    record_scope,
-                                    nested_visited,
-                                    depth + 1,
-                                )
-                            )
-                            break
-                        directive_records: dict[
-                            str, list[tuple[dict, tuple[str, ...]]]
-                        ] = {}
-                        for target_scope in using_directives.get(
-                            lookup_scope, ()
-                        ):
-                            directive_identity = (
-                                _normalized_template_spelling(
-                                    "::".join(
-                                        (*target_scope, unqualified_name)
-                                    )
-                                )
-                            )
-                            for record_identity, records in record_nodes.items():
-                                if (
-                                    record_identity == directive_identity
-                                    or record_identity.startswith(
-                                        f"{directive_identity}<"
-                                    )
-                                ):
-                                    directive_records[record_identity] = records
-                        if len(
-                            {
-                                identity.split("<", 1)[0]
-                                for identity in directive_records
-                            }
-                        ) > 1:
-                            raise EncoderHygieneError(
-                                "Compiler AST using-directive resolution is "
-                                f"ambiguous for {referenced_name} in {path}"
-                            )
-                        if not directive_records:
-                            continue
-                        for records in directive_records.values():
-                            for record, record_scope in records:
-                                forbidden.update(
-                                    instantiated_surfaces(
-                                        record,
-                                        record_scope,
-                                        nested_visited,
-                                        depth + 1,
-                                    )
-                                )
-                        break
-
-        def inspect(value: object) -> None:
-            if isinstance(value, dict):
-                declaration = value.get("decl")
-                if isinstance(declaration, dict):
-                    declaration_id = declaration.get("id")
-                    if (
-                        isinstance(declaration_id, str)
-                        and declaration_id in record_nodes_by_id
-                    ):
-                        record, record_scope = record_nodes_by_id[
-                            declaration_id
-                        ]
-                        forbidden.update(
-                            instantiated_surfaces(
-                                record,
-                                record_scope,
-                                nested_visited,
-                                depth + 1,
-                            )
-                        )
-                inspect_type(value.get("type"))
-                for nested in value.values():
-                    inspect(nested)
-            elif isinstance(value, list):
-                for nested in value:
-                    inspect(nested)
-
-        inspect(node)
-        return forbidden
 
     findings: list[Finding] = []
     try:
         relative = path.resolve().relative_to(repo_root).as_posix()
     except ValueError:
         relative = path.resolve().as_posix()
-
-    def resolve_candidate_alias(argument: str) -> str:
-        normalized_argument = _normalized_template_spelling(argument)
-        aliases = [
-            target
-            for identity, target in type_aliases.items()
-            if _normalized_template_spelling(identity)
-            == normalized_argument
-            or (
-                "::" not in normalized_argument
-                and _normalized_template_spelling(identity).endswith(
-                    f"::{normalized_argument}"
-                )
-            )
-        ]
-        return aliases[0] if len(set(aliases)) == 1 else argument
-
-    def resolve_namespace_alias(identity: str) -> str:
-        current = identity
-        for _ in range(_MAX_TYPE_DEPTH):
-            replacement: tuple[str, str] | None = None
-            for alias, canonical in namespace_aliases.items():
-                if current == alias or current.startswith(f"{alias}::"):
-                    if replacement is None or len(alias) > len(replacement[0]):
-                        replacement = (alias, canonical)
-            if replacement is None:
-                return current
-            alias, canonical = replacement
-            current = canonical + current[len(alias) :]
-        raise EncoderHygieneError(
-            f"Namespace alias chain exceeded {_MAX_TYPE_DEPTH} levels for "
-            f"{identity} in {path}"
-        )
-
-    for candidate in candidates:
-        matches: list[
-            tuple[str, str, tuple[str, ...], dict, tuple[str, ...]]
-        ] = []
-        for name, provided_arguments in candidate.names_and_args:
-            name = resolve_namespace_alias(name)
-            normalized_provided = tuple(
-                _normalized_template_spelling(argument)
-                for argument in provided_arguments
-            )
-            candidate_identities = (
-                (name,)
-                if "::" in name
-                else tuple(
-                    identity
-                    for identity in specializations
-                    if identity == name or identity.endswith(f"::{name}")
-                )
-            )
-            for specialization_identity in candidate_identities:
-                for (
-                    canonical_identity,
-                    written,
-                    canonical,
-                    node,
-                    scope,
-                ) in specializations.get(specialization_identity, ()):
-                    if len(written) < len(normalized_provided):
-                        continue
-                    if all(
-                        {
-                            expected,
-                            _normalized_template_spelling(
-                                resolve_candidate_alias(
-                                    provided_arguments[index]
-                                )
-                            ),
-                        }
-                        & {
-                            _normalized_template_spelling(written[index]),
-                            _normalized_template_spelling(canonical[index]),
-                        }
-                        for index, expected in enumerate(normalized_provided)
-                    ):
-                        matches.append(
-                            (
-                                canonical_identity,
-                                specialization_identity,
-                                canonical,
-                                node,
-                                scope,
-                            )
-                        )
-        if not matches:
-            candidate_specializations = [
-                (identity, written, canonical)
-                for identity, written, canonical, _node, _scope
-                in specializations.get(
-                    candidate.names_and_args[0][0], ()
-                )
-            ]
+    for candidate_index, candidate in enumerate(candidates):
+        identities = bound_by_candidate[candidate_index]
+        if not identities:
             raise EncoderHygieneError(
-                f"Compiler AST did not expose the explicit template "
-                f"specialization spelled at {path}:{candidate.line}: "
-                f"{candidate.statement}; available identities="
-                f"{sorted(specializations)}; namespace aliases="
-                f"{namespace_aliases}; "
-                f"candidate specializations="
-                f"{candidate_specializations}"
+                "Compiler could not bind the explicit template declaration "
+                f"at {path}:{candidate.line} to a unique canonical "
+                f"specialization identity: {candidate.statement}"
             )
-        forbidden = [
-            f"{canonical_identity}:{argument}"
-            for (
-                canonical_identity,
-                _qualified_name,
-                arguments_found,
-                _node,
-                _scope,
-            ) in matches
-            for argument in arguments_found
-            if _is_qjson_family(argument)
-        ]
-        forbidden.extend(
-            f"{canonical_identity}:instantiated-surface:{surface}"
-            for (
-                canonical_identity,
-                _qualified_name,
-                _arguments_found,
-                node,
-                scope,
-            ) in matches
-            for surface in instantiated_surfaces(node, scope)
+        forbidden = sorted(
+            {
+                f"{identity.canonical_usr}:"
+                f"{identity.canonical_declaration}:{surface}"
+                for identity in identities.values()
+                for surface in identity.forbidden_surfaces
+            }
         )
         if not forbidden:
             continue
-        identity = ",".join(sorted(set(forbidden)))
+        canonical_identities = sorted(
+            (
+                f"{identity.canonical_usr}=>"
+                f"{identity.canonical_declaration}"
+                f"<{','.join(identity.argument_fingerprints)}>"
+                + (
+                    f";source={identity.source_identity}"
+                    if identity.source_identity
+                    else ""
+                )
+            )
+            for identity in identities.values()
+        )
         try:
             spelling_file = candidate.spelling_file.relative_to(
                 repo_root
             ).as_posix()
         except ValueError:
             spelling_file = candidate.spelling_file.as_posix()
+        identity_payload = json.dumps(
+            canonical_identities,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         findings.append(
             Finding(
                 file=relative,
@@ -2701,11 +3132,12 @@ def _collect_explicit_template_findings(
                 display_name=candidate.statement,
                 canonical_return_type=(
                     "kind=explicit-template-instantiation;"
-                    f"forbidden=[{identity}]"
+                    f"canonical-identities=[{';'.join(canonical_identities)}];"
+                    f"forbidden=[{';'.join(forbidden)}]"
                 ),
                 usr=(
                     f"c:@explicit-template@{candidate.offset}@"
-                    f"{hashlib.sha256(candidate.statement.encode('utf-8')).hexdigest()}"
+                    f"{hashlib.sha256(identity_payload.encode('utf-8')).hexdigest()}"
                 ),
                 access=_CX_CXXInvalidAccessSpecifier,
                 linkage=_CXLinkage_External,
@@ -5403,12 +5835,16 @@ def _scan_headers(
                 root = clang.lib.clang_getTranslationUnitCursor(tu)
                 clang.lib.clang_visitChildren(root, visitor_cb, None)
                 for finding in _collect_explicit_template_findings(
+                    clang,
+                    idx,
+                    tu,
                     header,
                     (*context.arguments, *sysroot_args),
                     context.directory,
                     repo_root,
                     active_observation_context,
                     always_tokenize=True,
+                    wrapper_filename=wrapper_filename,
                 ):
                     explicit_key = (
                         active_observation_context,
@@ -5930,6 +6366,9 @@ def _scan_sources(
                 visitor_cb = clang._visitor_func_type(make_visitor(source.resolve()))
                 clang.lib.clang_visitChildren(root, visitor_cb, None)
                 for finding in _collect_explicit_template_findings(
+                    clang,
+                    idx,
+                    tu,
                     source,
                     (*context.arguments, *sysroot_args),
                     context.directory,

@@ -38,6 +38,7 @@ Run directly: `python3 packaging/check_encoder_hygiene_ast_test.py`
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import platform
@@ -881,7 +882,8 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
             "nested::Outer::Box", by_line[4].canonical_return_type
         )
         self.assertIn(
-            "_ZN9dangerous8function", by_line[6].canonical_return_type
+            "c:@N@dangerous@F@function",
+            by_line[6].canonical_return_type,
         )
         self.assertIn(
             "dangerous::AliasBox", by_line[8].canonical_return_type
@@ -902,6 +904,324 @@ class SourceOnlyDeclarationScanTests(_RealLibclangTestCase):
         self.assertIn(
             "using_dangerous::DirectiveHolder",
             by_line[22].canonical_return_type,
+        )
+
+    def test_explicit_templates_use_canonical_compiler_argument_identities(
+        self,
+    ) -> None:
+        system_header = self._write(
+            "system/CanonicalTemplateArguments.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "namespace api { inline namespace v1 {\n"
+            "template<class T> struct Box { T value; };\n"
+            "} }\n"
+            "namespace safe {\n"
+            "struct Value {};\n"
+            "template<class T> struct Box { T value; };\n"
+            "}\n"
+            "namespace dangerous {\n"
+            "template<class T> struct Box { QJsonObject value; };\n"
+            "}\n"
+            "namespace nested { inline namespace abi { namespace inner {\n"
+            "template<class T> struct Box { T value; };\n"
+            "} } }\n"
+            "template<class T, int N> struct Buffer { T values[N]; };\n"
+            "template<class T, int N> struct DangerousBuffer {\n"
+            "  QJsonObject value;\n"
+            "};\n"
+            "inline constexpr int Width = 3;\n"
+            "template<class T> struct Plain { T value; };\n"
+            "template<template<class> class C> struct TemplateBox {};\n"
+            "template<template<class> class C>\n"
+            "struct DangerousTemplateBox { QJsonObject value; };\n"
+            "inline int safeGlobal = 0;\n"
+            "inline QJsonObject dangerousGlobal;\n"
+            "template<auto *P> struct PointerBox {};\n"
+            "template<auto *P> struct DangerousPointerBox {\n"
+            "  QJsonObject value;\n"
+            "};\n"
+            "template<int *P> struct NullableBox {};\n"
+            "template<int *P> struct DangerousNullableBox {\n"
+            "  QJsonObject value;\n"
+            "};\n"
+            "template<class... Ts> struct PackBox {};\n"
+            "template<class... Ts> struct DangerousPackBox {\n"
+            "  QJsonObject value;\n"
+            "};\n"
+            "template<template<class> class... Cs>\n"
+            "struct TemplatePackBox {};\n"
+            "template<template<class> class... Cs>\n"
+            "struct DangerousTemplatePackBox { QJsonObject value; };\n"
+            "struct StructuralValue { int value; };\n"
+            "template<StructuralValue V> struct StructuralBox {};\n"
+            "template<StructuralValue V>\n"
+            "struct DangerousStructuralBox { QJsonObject value; };\n"
+            "template<class T> struct Holder { safe::Box<int> value; };\n"
+            "template<class T> struct DangerousHolder {\n"
+            "  safe::Box<QJsonObject> value;\n"
+            "};\n",
+        )
+        source = self._write(
+            "CanonicalTemplateArguments.cpp",
+            "#include <CanonicalTemplateArguments.h>\n"
+            "namespace s1 = safe;\n"
+            "namespace s2 = s1;\n"
+            "template class api::Box<int>;\n"
+            "template class nested::inner::Box<int>;\n"
+            "template class safe::Box<s2::Value>;\n"
+            "template class Buffer<int, 4>;\n"
+            "template class Buffer<int, Width + 2>;\n"
+            "template class TemplateBox<Plain>;\n"
+            "template class PointerBox<&safeGlobal>;\n"
+            "template class NullableBox<nullptr>;\n"
+            "template class PackBox<int, long>;\n"
+            "template class TemplatePackBox<Plain>;\n"
+            "template class StructuralBox<StructuralValue{7}>;\n"
+            "template class Holder<long>;\n"
+            "template class safe::Box<QJsonObject>;\n"
+            "template class dangerous::Box<int>;\n"
+            "template class DangerousBuffer<int, Width + 3>;\n"
+            "template class DangerousTemplateBox<Plain>;\n"
+            "template class DangerousPointerBox<&safeGlobal>;\n"
+            "template class DangerousNullableBox<nullptr>;\n"
+            "template class DangerousPackBox<int, QJsonObject>;\n"
+            "template class DangerousTemplatePackBox<Plain>;\n"
+            "template class DangerousStructuralBox<StructuralValue{9}>;\n"
+            "template class DangerousHolder<long>;\n"
+            "template class PointerBox<&dangerousGlobal>;\n",
+        )
+        violations, findings = self._scan_source_fixture(
+            source,
+            frozenset(),
+            arguments=(
+                "-std=c++23",
+                "-isystem",
+                str(system_header.parent),
+            ),
+            external_roots=frozenset({system_header.parent.resolve()}),
+        )
+        self.assertEqual(violations, [])
+        explicit = [
+            finding
+            for finding in findings
+            if "kind=explicit-template-instantiation"
+            in finding.canonical_return_type
+        ]
+        self.assertEqual(
+            {finding.line for finding in explicit},
+            set(range(16, 27)),
+            [
+                (finding.line, finding.canonical_return_type)
+                for finding in explicit
+            ],
+        )
+        by_line = {finding.line: finding for finding in explicit}
+        self.assertIn(
+            "safe::Box<QJsonObject>",
+            by_line[16].canonical_return_type,
+        )
+        self.assertIn(
+            "dangerous::Box<int>",
+            by_line[17].canonical_return_type,
+        )
+        self.assertIn(
+            "integral:signed=6",
+            by_line[18].canonical_return_type,
+        )
+        self.assertIn("<template>", by_line[19].canonical_return_type)
+        self.assertIn(
+            "<declaration>", by_line[20].canonical_return_type
+        )
+        self.assertIn("<nullptr>", by_line[21].canonical_return_type)
+        self.assertIn(
+            "<pack>",
+            by_line[22].canonical_return_type,
+        )
+        self.assertIn("<pack>", by_line[23].canonical_return_type)
+        self.assertTrue(
+            any(
+                argument_kind in by_line[24].canonical_return_type
+                for argument_kind in ("<declaration>", "<expression>")
+            )
+        )
+        self.assertIn(
+            "DangerousHolder<long>",
+            by_line[25].canonical_return_type,
+        )
+        self.assertIn(
+            "PointerBox<&dangerousGlobal>",
+            by_line[26].canonical_return_type,
+        )
+
+    def test_canonical_specializations_are_order_independent_in_headers_and_generated_fragments(
+        self,
+    ) -> None:
+        system_header = self._write(
+            "system/MaterializationOrder.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "namespace versioned { inline namespace abi {\n"
+            "template<class T> struct Box { T value; };\n"
+            "} }\n"
+            "namespace model { struct Value {}; }\n"
+            "namespace model_alias = model;\n"
+            "template<class T> struct Box { T value; };\n"
+            "template<class T> struct Holder { Box<int> value; };\n"
+            "template<class T> struct DangerousHolder {\n"
+            "  Box<QJsonObject> value;\n"
+            "};\n"
+            "template<class T, int N> struct Buffer { T values[N]; };\n"
+            "inline constexpr int Count = 3;\n"
+            "#define MATERIALIZE_CANONICAL() \\\n"
+            "  template class versioned::Box<int>; \\\n"
+            "  template class Box<model_alias::Value>; \\\n"
+            "  template class Buffer<int, Count + 1>;\n"
+            "#define MATERIALIZE_DANGEROUS() \\\n"
+            "  template class DangerousHolder<long>;\n",
+        )
+        header = self._write(
+            "CanonicalMaterialization.h",
+            "#include <MaterializationOrder.h>\n"
+            "MATERIALIZE_CANONICAL()\n"
+            "template class Holder<long>;\n"
+            "template class Box<QJsonObject>;\n"
+            "MATERIALIZE_DANGEROUS()\n",
+        )
+        generated = self._write(
+            "generated/CanonicalMaterialization.moc",
+            "#include <MaterializationOrder.h>\n"
+            "template class Box<QJsonObject>;\n"
+            "MATERIALIZE_CANONICAL()\n"
+            "template class Holder<long>;\n"
+            "MATERIALIZE_DANGEROUS()\n",
+        )
+        arguments = (
+            "-std=c++23",
+            "-isystem",
+            str(system_header.parent),
+        )
+        external_roots = frozenset({system_header.parent.resolve()})
+        header_findings, header_violations = self._scan_header_fixture(
+            header,
+            frozenset({header.resolve()}),
+            external_roots=external_roots,
+            arguments=arguments,
+        )
+        generated_findings, generated_violations = (
+            self._scan_header_fixture(
+                generated,
+                frozenset({generated.resolve()}),
+                external_roots=external_roots,
+                arguments=arguments,
+            )
+        )
+        self.assertEqual(header_violations, [])
+        self.assertEqual(generated_violations, [])
+
+        def explicit_lines(
+            findings: list[ceh.Finding],
+        ) -> set[int]:
+            return {
+                finding.line
+                for finding in findings
+                if "kind=explicit-template-instantiation"
+                in finding.canonical_return_type
+            }
+
+        self.assertEqual(explicit_lines(header_findings), {4, 5})
+        self.assertEqual(explicit_lines(generated_findings), {2, 5})
+
+    def test_sibling_template_specializations_bind_full_argument_vectors(
+        self,
+    ) -> None:
+        header = self._write(
+            "SiblingTemplateSpecializations.h",
+            "#pragma once\n"
+            "struct QJsonObject {};\n"
+            "namespace model { inline namespace abi {\n"
+            "struct Safe {};\n"
+            "struct Dangerous {};\n"
+            "} }\n"
+            "namespace alias = model;\n"
+            "using AliasSafe = alias::Safe;\n"
+            "using AliasDangerous = alias::Dangerous;\n"
+            "inline int safeGlobal = 0;\n"
+            "inline constexpr int Count = 2;\n"
+            "template<class T> struct Plain {};\n"
+            "template<class T, int N, auto *P, template<class> class C, class... Ts>\n"
+            "struct Matrix { C<T> value; };\n"
+            "template<>\n"
+            "struct Matrix<model::Safe, 3, &safeGlobal, Plain, int, long> {\n"
+            "  int value;\n"
+            "};\n"
+            "template<>\n"
+            "struct Matrix<model::Dangerous, 3, &safeGlobal, Plain, int, long> {\n"
+            "  QJsonObject value;\n"
+            "};\n",
+        )
+        source = self._write(
+            "SiblingTemplateSpecializations.cpp",
+            '#include "SiblingTemplateSpecializations.h"\n'
+            "template class Matrix<AliasSafe, Count + 1, &safeGlobal, Plain, int, long>;\n"
+            "template class Matrix<AliasDangerous, Count + 1, &safeGlobal, Plain, int, long>;\n"
+            "template class Matrix<AliasSafe, Count + 1, &safeGlobal, Plain, int, QJsonObject>;\n",
+        )
+        violations, findings = self._scan_source_fixture(
+            source,
+            frozenset({header.resolve()}),
+        )
+        self.assertEqual(violations, [])
+        explicit = [
+            finding
+            for finding in findings
+            if "kind=explicit-template-instantiation"
+            in finding.canonical_return_type
+        ]
+        self.assertEqual(
+            {finding.line for finding in explicit},
+            {3, 4},
+            [
+                (finding.line, finding.canonical_return_type)
+                for finding in explicit
+            ],
+        )
+        by_line = {finding.line: finding for finding in explicit}
+        self.assertIn(
+            "Matrix<model::Dangerous, 3, &safeGlobal, Plain, int, long>"
+            "<type:model::Dangerous",
+            by_line[3].canonical_return_type,
+        )
+        self.assertIn(
+            "integral:signed=3:unsigned=3",
+            by_line[3].canonical_return_type,
+        )
+        self.assertIn(",declaration,", by_line[3].canonical_return_type)
+        self.assertIn(",template,", by_line[3].canonical_return_type)
+        self.assertIn(",pack>", by_line[3].canonical_return_type)
+        self.assertIn(
+            "source=source-range=",
+            by_line[3].canonical_return_type,
+        )
+        expected_argument_hashes = [
+            hashlib.sha256(argument.encode("utf-8")).hexdigest()
+            for argument in (
+                "AliasDangerous",
+                " Count + 1",
+                " &safeGlobal",
+                " Plain",
+                " int",
+                " long",
+            )
+        ]
+        for index, argument_hash in enumerate(expected_argument_hashes):
+            self.assertIn(
+                f"{index}:{argument_hash}",
+                by_line[3].canonical_return_type,
+            )
+        self.assertIn(
+            "QJsonObject",
+            by_line[4].canonical_return_type,
         )
 
     def test_owned_generated_fragment_macro_specializations_are_audited(
