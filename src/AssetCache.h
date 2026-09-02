@@ -1098,6 +1098,30 @@ public:
       bool active, bool qualified = false);
 
   // Test-only, deterministic, UNPRIVILEGED override of
+  // mountSourceIsTrustedBackingIdentity()'s independent "is this
+  // mount's SOURCE (backing device) trustworthy" verdict (AssetCache.cpp)
+  // -- unlike the filesystem-TYPE override immediately above, this is
+  // reached only via a REAL /proc/self/mountinfo lookup for a REAL
+  // mount (there is no portable way to fabricate a real loop/ram-major
+  // block device's absence for an ordinary test, only to force the
+  // resulting verdict), so a test using this override still exercises
+  // every OTHER real check (root=="/", mount-id/device/parent-id
+  // correlation, fstype allowlist) genuinely, unmodified. `active=true,
+  // trusted=<value>` forces exactly this ONE additional check's
+  // verdict, letting a real loopback-ext4 (necessarily loop-backed, and
+  // therefore genuinely refused by the real, unmodified check) fixture
+  // also prove the ACCEPT path once backing-identity is independently
+  // authenticated -- modelling what a real, non-loopback SteamOS
+  // partition would present. `active=false` (the default, and what a
+  // test MUST reset back to before returning, ideally via an RAII scope
+  // guard) restores the real, loopback/ram-rejecting check; production
+  // code paths never depend on this outside of a test binary calling
+  // the setter below.
+  static void
+  setMountSourceBackingIdentityOverrideForTesting(bool active,
+                                                  bool trusted = false);
+
+  // Test-only, deterministic, UNPRIVILEGED override of
   // componentPassesOwnershipModePolicy()'s raw fstat()-based
   // ANCESTOR-position ownership/mode decision (AssetCache.cpp) -- there
   // is no portable, unprivileged way to make a real directory

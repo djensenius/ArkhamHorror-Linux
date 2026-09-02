@@ -3109,6 +3109,29 @@ struct MountTransitionPolicyQualificationOverrideGuard {
         /*active=*/false);
   }
 };
+
+// RAII guard around
+// AssetCache::setMountSourceBackingIdentityOverrideForTesting() --
+// guarantees the process-wide override is always reset back to inactive
+// even when a QVERIFY inside the test body triggers an early return.
+// Unlike the guard above, this leaves every OTHER real mount-identity
+// check (root=="/", mount-id/device/parent-id correlation, fstype
+// allowlist) genuinely unmodified -- see
+// mountSourceIsTrustedBackingIdentity()'s own comment.
+struct MountSourceBackingIdentityOverrideGuard {
+  explicit MountSourceBackingIdentityOverrideGuard(bool trusted) {
+    AssetCache::setMountSourceBackingIdentityOverrideForTesting(
+        /*active=*/true, trusted);
+  }
+  MountSourceBackingIdentityOverrideGuard(
+      const MountSourceBackingIdentityOverrideGuard &) = delete;
+  MountSourceBackingIdentityOverrideGuard &
+  operator=(const MountSourceBackingIdentityOverrideGuard &) = delete;
+  ~MountSourceBackingIdentityOverrideGuard() {
+    AssetCache::setMountSourceBackingIdentityOverrideForTesting(
+        /*active=*/false);
+  }
+};
 } // namespace
 
 namespace {
@@ -3382,13 +3405,27 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
-    authenticatedHomeMountTransitionOntoADifferentMountIsPermitted() {
+    authenticatedHomeMountTransitionOntoALoopbackBackedMountRequiresAuthenticatedBackingIdentity() {
   // Positive control for the test above: the IDENTICAL bind-mount
-  // shape, but the account-database override now agrees this exact
+  // shape, and the account-database override now agrees this exact
   // fake $HOME path IS the current account's own registered home --
-  // modelling a real SteamOS-style dedicated "/home/deck" mount, which
-  // must keep working (disk cache not silently disabled) exactly as it
-  // did before this fix.
+  // modelling a real SteamOS-style dedicated "/home/deck" mount.
+  //
+  // Independent review (MEDIUM, repeat finding, "whole-filesystem mount
+  // substitution still accepted... reverse test; full-fs bind/move/
+  // loopback rejected unless explicitly configured/authenticated
+  // expected home volume"): a loopback ext4 filesystem is, by
+  // construction, backed by a loop device -- exactly the kind of
+  // trivially attacker-fabricable "device"
+  // mountSourceIsTrustedBackingIdentity() now refuses regardless of how
+  // perfectly every OTHER check (root==
+  // "/", distinct device, mount-id/parent-id correlation, trusted
+  // fstype, ownership/mode, account-database authentication) is
+  // satisfied. Phase 1 below proves that REAL, unmodified refusal;
+  // phase 2 proves the accept path still functions once an independent
+  // backing-identity authority (modelled here via the test-only
+  // override) actually vouches for this exact volume -- exactly what a
+  // real, non-loopback SteamOS partition would need to present.
 #if !defined(__linux__)
   QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
         "platform");
@@ -3461,6 +3498,19 @@ void AssetCacheTests::
 
   const QString configuredUnderFakeHome =
       fakeHome + QStringLiteral("/assets/v1");
+  // Phase 1: no backing-identity override active -- the REAL,
+  // unmodified check must refuse this loopback-backed mount despite
+  // every other check passing.
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+
+  // Phase 2: an independent backing-identity authority now vouches for
+  // this exact volume (modelling a real, non-loopback SteamOS
+  // partition) -- every other check remains genuinely, unmodifiedly
+  // exercised, and the transition is now permitted.
+  MountSourceBackingIdentityOverrideGuard backingIdentityGuard(
+      /*trusted=*/true);
   QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
       configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
   QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
@@ -3468,7 +3518,7 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
-    authenticatedAncestorMountTransitionModellingADedicatedHomePartitionIsPermitted() {
+    authenticatedAncestorMountTransitionOntoALoopbackBackedMountRequiresAuthenticatedBackingIdentity() {
   // Cumulative review (PR #18, MEDIUM, "home mount auth wrong
   // boundary"): unlike the two tests above (which bind-mount home's
   // own FINAL component), this bind-mounts fakeHome's PARENT directory
@@ -3477,11 +3527,18 @@ void AssetCacheTests::
   // at the leaf at all. This is exactly the shape of a real, ordinary
   // dedicated "/home" partition (as opposed to a SteamOS-style
   // "/home/deck" split): the transition happens at an ANCESTOR of
-  // home's final component, not at home's own final component. Before
-  // this fix, resolveHomeDirectoryNoFollow()'s ancestor walk enforced
-  // FULL same-mount continuity for every ancestor component
-  // unconditionally, which would have rejected this entirely
-  // legitimate, authenticated topology outright.
+  // home's final component, not at home's own final component.
+  //
+  // Independent review (MEDIUM, repeat finding, "whole-filesystem mount
+  // substitution still accepted... reverse test"): this bind source is
+  // a loopback ext4 filesystem (necessarily loop-backed), which
+  // mountSourceIsTrustedBackingIdentity() now refuses regardless of
+  // every other check (including the chowned root ownership this
+  // ancestor position requires) passing. Phase 1 below proves that
+  // REAL, unmodified refusal; phase 2 proves the accept path still
+  // functions once an independent backing-identity authority
+  // authenticates this exact volume, exactly modelling a real,
+  // non-loopback dedicated "/home" partition.
 #if !defined(__linux__)
   QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
         "platform");
@@ -3596,6 +3653,20 @@ void AssetCacheTests::
 
   const QString configuredUnderFakeHome =
       fakeHome + QStringLiteral("/assets/v1");
+  // Phase 1: no backing-identity override active -- the REAL,
+  // unmodified check must refuse this loopback-backed ancestor mount
+  // despite every other check (including the chowned root ownership)
+  // passing.
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+
+  // Phase 2: an independent backing-identity authority now vouches for
+  // this exact volume -- every other check remains genuinely,
+  // unmodifiedly exercised, and the transition is now permitted,
+  // exactly modelling a real, non-loopback dedicated "/home" partition.
+  MountSourceBackingIdentityOverrideGuard backingIdentityGuard(
+      /*trusted=*/true);
   QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
       configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
   QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());
@@ -3875,7 +3946,11 @@ void AssetCacheTests::
   // proving it is merely an arbitrary directory bind mount of SOME
   // already-existing filesystem -- regardless of how trustworthy that
   // filesystem's own type or device otherwise is -- never a genuine
-  // dedicated whole-partition mount.
+  // dedicated whole-partition mount. (This fixture is ALSO loop-backed
+  // and would independently fail mountSourceIsTrustedBackingIdentity()
+  // -- but the root-field check alone is sufficient and applies
+  // FIRST/independently here, so this test's assertion remains valid
+  // and specific to that check regardless of backing-identity policy.)
 #if !defined(__linux__)
   QSKIP("mounts are a Linux-specific concept; not applicable on this "
         "platform");
@@ -4130,7 +4205,7 @@ void AssetCacheTests::
 }
 
 void AssetCacheTests::
-    multipleIndependentlyQualifiedMountTransitionsInTheSameHomeWalkAreAllPermitted() {
+    multipleLoopbackBackedMountTransitionsInTheSameHomeWalkRequireAuthenticatedBackingIdentity() {
   // Cumulative review (independent re-review, MEDIUM, "only one
   // transition allowed"; independent re-review round-6, MEDIUM,
   // "position-sensitive ownership"): bind-mounts BOTH an ancestor of
@@ -4149,6 +4224,15 @@ void AssetCacheTests::
   // unmodified (no filesystem-type override) -- proving genuinely BOTH
   // transitions are granted through the real, unmodified, position-
   // sensitive production decision path end-to-end.
+  //
+  // Independent review (MEDIUM, repeat finding, "whole-filesystem mount
+  // substitution still accepted... reverse test"): BOTH bind sources
+  // are loopback ext4 filesystems (necessarily loop-backed), which
+  // mountSourceIsTrustedBackingIdentity() now refuses independently at
+  // EACH transition, regardless of every other check passing. Phase 1
+  // below proves that REAL, unmodified refusal for the walk as a
+  // whole; phase 2 proves BOTH transitions still grant once an
+  // independent backing-identity authority authenticates both volumes.
 #if !defined(__linux__)
   QSKIP("bind mounts are a Linux-specific concept; not applicable on this "
         "platform");
@@ -4312,6 +4396,21 @@ void AssetCacheTests::
 
   const QString configuredUnderFakeHome =
       fakeHome + QStringLiteral("/assets/v1");
+  // Phase 1: no backing-identity override active -- the REAL,
+  // unmodified check must refuse this walk despite BOTH mount
+  // transitions otherwise being fully authenticated/policy-qualified,
+  // since BOTH bind sources are loopback (loop-backed) filesystems.
+  QVERIFY(!AssetCache::resolveTrustedDirectoryNoFollowForTesting(
+      configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
+  QVERIFY(!QFileInfo::exists(configuredUnderFakeHome));
+
+  // Phase 2: an independent backing-identity authority now vouches for
+  // both volumes -- every other check remains genuinely, unmodifiedly
+  // exercised, and BOTH transitions are now permitted, exactly
+  // modelling a genuine SteamOS-style topology with more than one
+  // legitimate, non-loopback transition in the same walk.
+  MountSourceBackingIdentityOverrideGuard backingIdentityGuard(
+      /*trusted=*/true);
   QVERIFY(AssetCache::resolveTrustedDirectoryNoFollowForTesting(
       configuredUnderFakeHome, /*allowCreateMissingComponents=*/true));
   QVERIFY(QFileInfo(configuredUnderFakeHome).isDir());

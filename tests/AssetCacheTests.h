@@ -209,24 +209,37 @@ private slots:
   // Positive control for the test above: the SAME bind-mount shape,
   // but with the account database (forced via the test-only override)
   // agreeing this exact fake $HOME is the current user's own real
-  // home -- the mount transition MUST be permitted, exactly modelling
-  // a real SteamOS-style dedicated "/home/deck" mount. Requires a real
-  // bind mount (root-privileged); QSKIP when unavailable.
-  void authenticatedHomeMountTransitionOntoADifferentMountIsPermitted();
+  // home -- exercising the mount-transition authentication path.
+  // Independent review (MEDIUM, "whole-filesystem mount substitution
+  // still accepted"): this bind source is a loopback ext4 filesystem
+  // (necessarily loop-backed), which mountSourceIsTrustedBackingIdentity()
+  // now refuses regardless of every other check passing; this test
+  // proves BOTH that real, unmodified refusal AND that the accept path
+  // still functions once an independent backing-identity authority
+  // authenticates this exact volume (via the test-only override),
+  // exactly modelling what a real, non-loopback SteamOS "/home/deck"
+  // mount would present. Requires a real bind mount (root-privileged);
+  // QSKIP when unavailable.
+  void
+  authenticatedHomeMountTransitionOntoALoopbackBackedMountRequiresAuthenticatedBackingIdentity();
   // Cumulative review (PR #18, MEDIUM, "home mount auth wrong
   // boundary"): the two tests above only ever exercise a mount
   // transition landing on home's own FINAL path component. This test
   // (and its rejected companion below) instead bind-mounts an
   // ANCESTOR of home's final component -- modelling a real, ordinary
   // dedicated "/home" partition (distinct from a SteamOS-style
-  // "/home/deck" split) -- and proves the resolver now correctly
-  // permits it when authenticated, closing the exact gap where a
-  // prior version of this resolver hard-coded the permitted
-  // transition point to home's own final component and rejected this
-  // equally-legitimate topology outright. Requires a real bind mount
-  // (root-privileged); QSKIP when unavailable.
+  // "/home/deck" split).
+  // Independent review (MEDIUM, "whole-filesystem mount substitution
+  // still accepted"): the bind source is a loopback ext4 filesystem,
+  // which mountSourceIsTrustedBackingIdentity() now refuses regardless
+  // of every other check passing; this test proves BOTH that real,
+  // unmodified refusal AND that the accept path still functions once
+  // an independent backing-identity authority authenticates this exact
+  // volume, exactly modelling a real, non-loopback dedicated "/home"
+  // partition. Requires a real bind mount (root-privileged); QSKIP
+  // when unavailable.
   void
-  authenticatedAncestorMountTransitionModellingADedicatedHomePartitionIsPermitted();
+  authenticatedAncestorMountTransitionOntoALoopbackBackedMountRequiresAuthenticatedBackingIdentity();
   // Negative control for the test above: the identical ancestor
   // bind-mount shape, but unauthenticated -- must be rejected exactly
   // like every other unauthenticated mount transition, proving the
@@ -350,12 +363,18 @@ private slots:
   // home's own final component onto two SEPARATE, independent real
   // mounts -- modelling a genuine SteamOS-style topology with more than
   // one legitimate transition in the same walk (e.g. a dedicated
-  // "/home" partition AND a further per-user data mount beneath it) --
-  // and proves the resolver now permits BOTH, closing the prior
-  // artificial "at most one, ever" cap. Requires two real bind mounts
-  // (root-privileged); QSKIP when unavailable.
+  // "/home" partition AND a further per-user data mount beneath it).
+  // Independent review (MEDIUM, "whole-filesystem mount substitution
+  // still accepted"): both bind sources are loopback ext4 filesystems,
+  // which mountSourceIsTrustedBackingIdentity() now refuses at EACH
+  // transition regardless of every other check passing; this test
+  // proves BOTH that real, unmodified refusal AND that both
+  // transitions still grant once an independent backing-identity
+  // authority authenticates both volumes, closing the prior artificial
+  // "at most one, ever" cap for the ACCEPT path. Requires two real
+  // bind mounts (root-privileged); QSKIP when unavailable.
   void
-  multipleIndependentlyQualifiedMountTransitionsInTheSameHomeWalkAreAllPermitted();
+  multipleLoopbackBackedMountTransitionsInTheSameHomeWalkRequireAuthenticatedBackingIdentity();
 
   // Round-9+ review: for a caller-supplied Config::directory, this
   // resolver must still never auto-create ANY missing component, even

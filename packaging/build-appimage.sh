@@ -272,6 +272,18 @@ for extracted_tool in \
   }
 done
 
+# Independent review (HIGH, repeat finding, "live deps reach
+# linuxdeploy ... capture returns lockMismatch/mismatch instead of
+# abort ... abort capture before linuxdeploy on any nonverified
+# state"): --require-verified-archive-provenance makes THIS step
+# itself (not a later, deferred `classify --require-package-
+# provenance` call) the single, earliest gate -- if any dpkg-owned
+# captured library cannot be authenticated against a real, freshly
+# downloaded-and-hashed distro archive, this command exits nonzero
+# and this script's own `set -euo pipefail` aborts immediately, BEFORE
+# the "for-linuxdeploy" redirect below is even populated and BEFORE
+# linuxdeploy is ever invoked (see the "Capture distro provenance"
+# CLI subcommand's own docstring for the full rationale).
 python3 "$repo_root/packaging/audit_codec_notices.py" capture-distro-provenance \
   "$app_dir/usr/bin/arkham-horror" \
   "$libsecret_so" "$libgpgerror_so" "$libgccs_so" "$libstdcxx_so" \
@@ -282,7 +294,8 @@ python3 "$repo_root/packaging/audit_codec_notices.py" capture-distro-provenance 
   --linuxdeploy-patchelf "$linuxdeploy_patchelf" \
   --linuxdeploy-strip "$linuxdeploy_strip" \
   --linuxdeploy-qt-patchelf "$linuxdeploy_qt_patchelf" \
-  --linuxdeploy-qt-strip "$linuxdeploy_qt_strip"
+  --linuxdeploy-qt-strip "$linuxdeploy_qt_strip" \
+  --require-verified-archive-provenance
 echo "Wrote distro-package provenance manifest to $distro_provenance_manifest"
 
 # Round-N+ review (HIGH, "staged capture exists, but linuxdeploy still

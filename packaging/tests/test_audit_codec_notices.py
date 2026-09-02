@@ -17,6 +17,7 @@ Run directly:
 from __future__ import annotations
 
 import io
+import gzip
 import hashlib
 import json
 import os
@@ -5595,6 +5596,248 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("conflicting distro provenance", stderr.getvalue())
 
+    def test_cmd_capture_distro_provenance_require_verified_archive_provenance_aborts_on_lock_mismatch(
+        self,
+    ) -> None:
+        # Independent review (HIGH, repeat finding, "live deps reach
+        # linuxdeploy ... capture returns lockMismatch/mismatch instead
+        # of abort ... abort capture before linuxdeploy on any
+        # nonverified state"): the manifest MUST NEVER be written to
+        # disk (and this subcommand MUST exit nonzero) when a captured,
+        # dpkg-owned bundled destination's freshly downloaded-and-
+        # hashed .deb archive disagrees with this project's own
+        # checked-in packaging/distro_package_lock.json pin -- this is
+        # exactly the scenario build-appimage.sh's production
+        # --require-verified-archive-provenance flag exists to catch
+        # BEFORE linuxdeploy is ever invoked against the staged bytes,
+        # never merely deferred to a later `classify
+        # --require-package-provenance` call.
+        executable = self.tmp_path / "arkham-horror"
+        executable.write_bytes(_FAKE_ELF_BYTES)
+        loader_path = self.tmp_path / "system" / "libfoo.so.1"
+        loader_path.parent.mkdir()
+        loader_path.write_bytes(b"real-installed-bytes")
+        output_path = self.tmp_path / "manifest.json"
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        with mock.patch.object(
+            audit,
+            "resolve_dt_needed_dependency_graph",
+            return_value=[(executable, "libfoo.so.1", loader_path)],
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="libfoo1"
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("1.2.3-1", "foosource"),
+        ), mock.patch.object(
+            audit, "_dpkg_package_architecture", return_value="amd64"
+        ), mock.patch.object(
+            audit,
+            "_apt_cache_package_record",
+            return_value={"architecture": "amd64", "debSha256": "e" * 64},
+        ), mock.patch.object(
+            audit,
+            "_download_and_hash_deb_archive",
+            return_value=(self.tmp_path / "downloaded.deb", "e" * 64),
+        ), mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={
+                "distribution": "ubuntu-22.04",
+                "packages": {
+                    "libfoo1": {
+                        "architecture": "amd64",
+                        "version": "1.2.3-1",
+                        # Deliberately disagrees with the "e" * 64
+                        # freshly downloaded-and-hashed digest above.
+                        "debSha256": "f" * 64,
+                    }
+                },
+            },
+        ), mock.patch.object(
+            audit,
+            "_extract_governed_file_from_deb_archive",
+            side_effect=AssertionError(
+                "must never parse archive bytes after a lock mismatch"
+            ),
+        ), mock.patch.object(
+            audit, "_dpkg_recorded_file_md5", return_value=None
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(
+                [
+                    "capture-distro-provenance",
+                    str(executable),
+                    "--output",
+                    str(output_path),
+                    "--require-verified-archive-provenance",
+                ]
+            )
+        self.assertEqual(exit_code, 1)
+        self.assertIn("could not be authenticated", stderr.getvalue())
+        self.assertIn("lockMismatch", stderr.getvalue())
+        self.assertFalse(
+            output_path.exists(),
+            "the manifest must never be written to disk once an "
+            "unverified entry is found under --require-verified-"
+            "archive-provenance -- build-appimage.sh's own `set -e` "
+            "relies on this subcommand's exit code alone to abort "
+            "before ever invoking linuxdeploy",
+        )
+
+    def test_cmd_capture_distro_provenance_require_verified_archive_provenance_succeeds_when_fully_verified(
+        self,
+    ) -> None:
+        # Positive control for the test above: an identical shape, but
+        # every check genuinely agrees (matching apt metadata, matching
+        # lock pin, and the archive-extracted bytes matching the real
+        # loader-resolved file's own content) -- --require-verified-
+        # archive-provenance must not reject a genuinely fully-
+        # authenticated capture.
+        executable = self.tmp_path / "arkham-horror"
+        executable.write_bytes(_FAKE_ELF_BYTES)
+        loader_path = self.tmp_path / "system" / "libfoo.so.1"
+        loader_path.parent.mkdir()
+        loader_path.write_bytes(b"real-installed-bytes")
+        output_path = self.tmp_path / "manifest.json"
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        with mock.patch.object(
+            audit,
+            "resolve_dt_needed_dependency_graph",
+            return_value=[(executable, "libfoo.so.1", loader_path)],
+        ), mock.patch.object(
+            audit,
+            "_dpkg_owning_package",
+            # The self-entry capture (see cmd_capture_distro_
+            # provenance()'s own "force-bundled input's own exact
+            # bundled destination" logic) would otherwise ALSO try to
+            # authenticate `executable` itself against the same
+            # "libfoo1" package/lock fixture, but its real staged
+            # content (_FAKE_ELF_BYTES) never matches "real-installed-
+            # bytes" -- deliberately unowned here so only the genuine
+            # loader_path dependency edge is in scope for this test's
+            # assertion, exactly like `_dpkg_owning_package` returning
+            # None for any first-party input with no real dpkg owner.
+            side_effect=lambda path: (
+                "libfoo1" if path == loader_path.resolve() else None
+            ),
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("1.2.3-1", "foosource"),
+        ), mock.patch.object(
+            audit, "_dpkg_package_architecture", return_value="amd64"
+        ), mock.patch.object(
+            audit,
+            "_apt_cache_package_record",
+            return_value={"architecture": "amd64", "debSha256": "e" * 64},
+        ), mock.patch.object(
+            audit,
+            "_download_and_hash_deb_archive",
+            return_value=(self.tmp_path / "downloaded.deb", "e" * 64),
+        ), mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={
+                "distribution": "ubuntu-22.04",
+                "packages": {
+                    "libfoo1": {
+                        "architecture": "amd64",
+                        "version": "1.2.3-1",
+                        "debSha256": "e" * 64,
+                    }
+                },
+            },
+        ), mock.patch.object(
+            audit,
+            "_extract_governed_file_from_deb_archive",
+            return_value=b"real-installed-bytes",
+        ), mock.patch.object(
+            audit, "_dpkg_recorded_file_md5", return_value=None
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(
+                [
+                    "capture-distro-provenance",
+                    str(executable),
+                    "--output",
+                    str(output_path),
+                    "--require-verified-archive-provenance",
+                ]
+            )
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+        manifest = json.loads(output_path.read_text())
+        entry = manifest["bundledPaths"]["usr/lib/libfoo.so.1"]
+        self.assertEqual(entry["debArchiveVerification"], "verified")
+
+    def test_cmd_capture_distro_provenance_without_the_flag_still_tolerates_a_lock_mismatch(
+        self,
+    ) -> None:
+        # Regression guard: a local/dev invocation that omits
+        # --require-verified-archive-provenance (e.g. no real network
+        # access to download-and-hash an archive) must retain the
+        # pre-existing lenient behavior -- the manifest is still
+        # written, with the honest "lockMismatch" recorded in the
+        # entry for a LATER `classify --require-package-provenance`
+        # call to judge, exactly as before this finding's fix. Only
+        # the NEW flag changes this subcommand's own default behavior.
+        executable = self.tmp_path / "arkham-horror"
+        executable.write_bytes(_FAKE_ELF_BYTES)
+        loader_path = self.tmp_path / "system" / "libfoo.so.1"
+        loader_path.parent.mkdir()
+        loader_path.write_bytes(b"real-installed-bytes")
+        output_path = self.tmp_path / "manifest.json"
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        with mock.patch.object(
+            audit,
+            "resolve_dt_needed_dependency_graph",
+            return_value=[(executable, "libfoo.so.1", loader_path)],
+        ), mock.patch.object(
+            audit, "_dpkg_owning_package", return_value="libfoo1"
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("1.2.3-1", "foosource"),
+        ), mock.patch.object(
+            audit, "_dpkg_package_architecture", return_value="amd64"
+        ), mock.patch.object(
+            audit,
+            "_apt_cache_package_record",
+            return_value={"architecture": "amd64", "debSha256": "e" * 64},
+        ), mock.patch.object(
+            audit,
+            "_download_and_hash_deb_archive",
+            return_value=(self.tmp_path / "downloaded.deb", "e" * 64),
+        ), mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={
+                "distribution": "ubuntu-22.04",
+                "packages": {
+                    "libfoo1": {
+                        "architecture": "amd64",
+                        "version": "1.2.3-1",
+                        "debSha256": "f" * 64,
+                    }
+                },
+            },
+        ), mock.patch.object(
+            audit, "_dpkg_recorded_file_md5", return_value=None
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(
+                [
+                    "capture-distro-provenance",
+                    str(executable),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+        manifest = json.loads(output_path.read_text())
+        entry = manifest["bundledPaths"]["usr/lib/libfoo.so.1"]
+        self.assertEqual(entry["debArchiveVerification"], "lockMismatch")
+
 
 class QtSdkBundledProvenanceTests(unittest.TestCase):
     """New review item ("ICU library package-provenance mismatch",
@@ -6458,6 +6701,334 @@ class QtSdkBundledProvenanceTests(unittest.TestCase):
                 substituted, qt_reference_dir
             )
         self.assertEqual(binding["status"], "content_mismatch")
+
+
+class QtSdkArchiveManifestTests(unittest.TestCase):
+    """Independent review (HIGH, repeat finding, "Qt packages only
+    SHA1/archive names; no per-archive URL/size/SHA256/signature and
+    external install action not verified ... Tree omits translations
+    deployed into AppImage; SBOM receipt omits package/archive
+    records"): proves packaging/qt_sdk_lock.json's `archiveManifest`
+    field is well-formed, that verify_qt_sdk_archive_manifest()
+    genuinely detects a tampered/substituted individual archive pin
+    (even when every OTHER field -- sdkVersion, updatesXmlSha256,
+    installedTreeContentSha256 -- still agrees, exactly the "same-
+    version cache/translation mutation must fail" demand), and that
+    the manifest is carried unchanged into every Qt/ICU SBOM binding's
+    own sdkSourceProvenance."""
+
+    @staticmethod
+    def _metalink4_body(size: int, sha256: str) -> bytes:
+        """Builds a minimal, real Metalink4-shaped payload (RFC 5854,
+        the exact schema Qt's own real download.qt.io repository
+        serves for every individual archive's own ".meta4" sidecar --
+        see _fetch_verified_qt_archive_metadata()'s own docstring)."""
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<metalink xmlns="urn:ietf:params:xml:ns:metalink">\n'
+            "  <file name=\"archive.7z\">\n"
+            f"    <size>{size}</size>\n"
+            f'    <hash type="sha-256">{sha256}</hash>\n'
+            '    <hash type="md5">deadbeefdeadbeefdeadbeefdeadbeef</hash>\n'
+            "  </file>\n"
+            "</metalink>\n"
+        ).encode("utf-8")
+
+    def test_load_qt_sdk_lock_requires_archive_manifest_key(self) -> None:
+        lock_without_manifest = dict(audit._load_qt_sdk_lock())
+        del lock_without_manifest["archiveManifest"]
+        with mock.patch.object(
+            audit,
+            "_QT_SDK_LOCK_PATH",
+            _write_json_to_temp(lock_without_manifest),
+        ):
+            audit._load_qt_sdk_lock.cache_clear()
+            try:
+                with self.assertRaises(ValueError) as context:
+                    audit._load_qt_sdk_lock()
+            finally:
+                audit._load_qt_sdk_lock.cache_clear()
+        self.assertIn("archiveManifest", str(context.exception))
+
+    def test_load_qt_sdk_lock_rejects_archive_manifest_missing_a_declared_archive(
+        self,
+    ) -> None:
+        tampered = dict(audit._load_qt_sdk_lock())
+        tampered["archiveManifest"] = list(tampered["archiveManifest"])[1:]
+        with mock.patch.object(
+            audit, "_QT_SDK_LOCK_PATH", _write_json_to_temp(tampered)
+        ):
+            audit._load_qt_sdk_lock.cache_clear()
+            try:
+                with self.assertRaises(ValueError) as context:
+                    audit._load_qt_sdk_lock()
+            finally:
+                audit._load_qt_sdk_lock.cache_clear()
+        self.assertIn("archiveManifest", str(context.exception))
+
+    def test_load_qt_sdk_lock_rejects_duplicate_archive_manifest_filename(
+        self,
+    ) -> None:
+        tampered = dict(audit._load_qt_sdk_lock())
+        entries = [dict(entry) for entry in tampered["archiveManifest"]]
+        entries.append(dict(entries[0]))
+        tampered["archiveManifest"] = entries
+        with mock.patch.object(
+            audit, "_QT_SDK_LOCK_PATH", _write_json_to_temp(tampered)
+        ):
+            audit._load_qt_sdk_lock.cache_clear()
+            try:
+                with self.assertRaises(ValueError) as context:
+                    audit._load_qt_sdk_lock()
+            finally:
+                audit._load_qt_sdk_lock.cache_clear()
+        self.assertIn("more than once", str(context.exception))
+
+    def test_load_qt_sdk_lock_rejects_archive_manifest_entry_with_unknown_package(
+        self,
+    ) -> None:
+        tampered = dict(audit._load_qt_sdk_lock())
+        entries = [dict(entry) for entry in tampered["archiveManifest"]]
+        entries[0] = dict(entries[0])
+        entries[0]["packageName"] = "not-a-real-locked-package"
+        tampered["archiveManifest"] = entries
+        with mock.patch.object(
+            audit, "_QT_SDK_LOCK_PATH", _write_json_to_temp(tampered)
+        ):
+            audit._load_qt_sdk_lock.cache_clear()
+            try:
+                with self.assertRaises(ValueError) as context:
+                    audit._load_qt_sdk_lock()
+            finally:
+                audit._load_qt_sdk_lock.cache_clear()
+        self.assertIn("packageName", str(context.exception))
+
+    def test_load_qt_sdk_lock_rejects_non_hex_archive_sha256(self) -> None:
+        tampered = dict(audit._load_qt_sdk_lock())
+        entries = [dict(entry) for entry in tampered["archiveManifest"]]
+        entries[0] = dict(entries[0])
+        entries[0]["sha256"] = "not-hex" * 9
+        tampered["archiveManifest"] = entries
+        with mock.patch.object(
+            audit, "_QT_SDK_LOCK_PATH", _write_json_to_temp(tampered)
+        ):
+            audit._load_qt_sdk_lock.cache_clear()
+            try:
+                with self.assertRaises(ValueError) as context:
+                    audit._load_qt_sdk_lock()
+            finally:
+                audit._load_qt_sdk_lock.cache_clear()
+        self.assertIn("sha256", str(context.exception))
+
+    def test_qt_archive_repository_dir_matches_updates_xml_directory(self) -> None:
+        lock = audit._load_qt_sdk_lock()
+        repository_dir = audit._qt_archive_repository_dir(lock["updatesXmlUrl"])
+        self.assertEqual(
+            repository_dir,
+            "https://download.qt.io/online/qtsdkrepository/linux_x64/desktop/"
+            "qt6_6111/qt6_6111",
+        )
+
+    def test_qt_archive_download_url_concatenates_version_and_filename(self) -> None:
+        url = audit._qt_archive_download_url(
+            "https://example.invalid/repo",
+            "qt.qt6.6111.linux_gcc_64",
+            "6.11.1-0-202605090529",
+            "qtbase-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-X86_64.7z",
+        )
+        self.assertEqual(
+            url,
+            "https://example.invalid/repo/qt.qt6.6111.linux_gcc_64/"
+            "6.11.1-0-202605090529qtbase-Linux-RHEL_9_6-GCC-Linux-RHEL_9_6-"
+            "X86_64.7z",
+        )
+
+    def test_fetch_verified_qt_archive_metadata_parses_a_real_shaped_metalink4_body(
+        self,
+    ) -> None:
+        expected_sha256 = "a" * 64
+        payload = self._metalink4_body(12345, expected_sha256)
+
+        class _Response:
+            def __init__(self, body: bytes) -> None:
+                self._remaining = body
+
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, size: int) -> bytes:
+                chunk, self._remaining = self._remaining[:size], self._remaining[size:]
+                return chunk
+
+        with mock.patch.object(
+            audit.urllib.request, "urlopen", return_value=_Response(payload)
+        ):
+            result = audit._fetch_verified_qt_archive_metadata(
+                "https://example.invalid/repo", "qt.pkg", "1.0.0", "a.7z"
+            )
+        self.assertEqual(result, {"size": 12345, "sha256": expected_sha256})
+
+    def test_fetch_verified_qt_archive_metadata_returns_none_on_malformed_xml(
+        self,
+    ) -> None:
+        class _Response:
+            def __init__(self, body: bytes) -> None:
+                self._remaining = body
+
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, size: int) -> bytes:
+                chunk, self._remaining = self._remaining[:size], self._remaining[size:]
+                return chunk
+
+        with mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            return_value=_Response(b"not-xml-at-all"),
+        ):
+            result = audit._fetch_verified_qt_archive_metadata(
+                "https://example.invalid/repo", "qt.pkg", "1.0.0", "a.7z"
+            )
+        self.assertIsNone(result)
+
+    def test_fetch_verified_qt_archive_metadata_returns_none_on_network_error(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            side_effect=OSError("network unavailable"),
+        ):
+            result = audit._fetch_verified_qt_archive_metadata(
+                "https://example.invalid/repo", "qt.pkg", "1.0.0", "a.7z"
+            )
+        self.assertIsNone(result)
+
+    def _mock_live_metadata_matching_lock(self) -> mock._patch:
+        """Patches _fetch_verified_qt_archive_metadata() so every
+        locked archive's "live" metadata exactly matches this
+        project's own checked-in pin -- the honest baseline every
+        tamper-detection test below mutates exactly one field of."""
+        lock = audit._load_qt_sdk_lock()
+        by_filename = {
+            entry["filename"]: {"size": entry["size"], "sha256": entry["sha256"]}
+            for entry in lock["archiveManifest"]
+        }
+
+        def _fake_fetch(
+            _repository_dir: str, _package_name: str, _version: str, filename: str
+        ) -> dict[str, object] | None:
+            return by_filename.get(filename)
+
+        return mock.patch.object(
+            audit, "_fetch_verified_qt_archive_metadata", side_effect=_fake_fetch
+        )
+
+    def test_verify_qt_sdk_archive_manifest_accepts_matching_live_metadata(
+        self,
+    ) -> None:
+        with self._mock_live_metadata_matching_lock():
+            result = audit.verify_qt_sdk_archive_manifest()
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(
+            result["checkedArchiveCount"],
+            len(audit._load_qt_sdk_lock()["archiveManifest"]),
+        )
+
+    def test_verify_qt_sdk_archive_manifest_rejects_tampered_sha256(self) -> None:
+        # The concrete "same-version cache/translation mutation must
+        # fail" proof: sdkVersion/updatesXmlSha256/installedTreeContentSha256
+        # all still agree -- ONLY this one archive's own pinned sha256
+        # has been mistakenly/maliciously edited to no longer match
+        # what Qt's own real, live Metalink4 metadata reports.
+        tampered = dict(audit._load_qt_sdk_lock())
+        entries = [dict(entry) for entry in tampered["archiveManifest"]]
+        entries[0] = dict(entries[0])
+        entries[0]["sha256"] = "0" * 64
+        tampered["archiveManifest"] = entries
+        with self._mock_live_metadata_matching_lock():
+            result = audit.verify_qt_sdk_archive_manifest(tampered)
+        self.assertEqual(result["status"], "archive_mismatch")
+        self.assertEqual(result["archiveFilename"], entries[0]["filename"])
+
+    def test_verify_qt_sdk_archive_manifest_rejects_tampered_size(self) -> None:
+        tampered = dict(audit._load_qt_sdk_lock())
+        entries = [dict(entry) for entry in tampered["archiveManifest"]]
+        entries[0] = dict(entries[0])
+        entries[0]["size"] = entries[0]["size"] + 1
+        tampered["archiveManifest"] = entries
+        with self._mock_live_metadata_matching_lock():
+            result = audit.verify_qt_sdk_archive_manifest(tampered)
+        self.assertEqual(result["status"], "archive_mismatch")
+        self.assertEqual(result["archiveFilename"], entries[0]["filename"])
+
+    def test_verify_qt_sdk_archive_manifest_reports_unavailable_live_metadata(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            audit, "_fetch_verified_qt_archive_metadata", return_value=None
+        ):
+            result = audit.verify_qt_sdk_archive_manifest()
+        self.assertEqual(result["status"], "live_metadata_unavailable")
+
+    def test_qt_sdk_tree_digest_subdirs_includes_translations(self) -> None:
+        # Independent review (HIGH, "Tree omits translations deployed
+        # into AppImage"): translations/*.qm are genuinely bundled
+        # into the final shipped AppImage by linuxdeploy-plugin-qt's
+        # own real default behavior (no --skip-translations opt-out is
+        # ever passed by packaging/build-appimage.sh) -- so they can
+        # never be excluded as "inert" the way docs/examples remain.
+        self.assertIn("translations", audit._QT_SDK_TREE_DIGEST_SUBDIRS)
+
+    def test_qt_sdk_source_provenance_carries_packages_and_archive_manifest_unchanged(
+        self,
+    ) -> None:
+        # Independent review (HIGH, "SBOM receipt omits package/
+        # archive records"): every Qt/ICU-bound SBOM entry must carry
+        # this project's own checked-in per-package/per-archive
+        # manifest UNCHANGED, not merely the coarser whole-tree/
+        # whole-metadata-file digests.
+        lock = audit._load_qt_sdk_lock()
+        provenance = audit._qt_sdk_source_provenance()
+        self.assertEqual(provenance["packages"], lock["packages"])
+        self.assertEqual(provenance["archiveManifest"], lock["archiveManifest"])
+
+    def test_verify_qt_sdk_archive_manifest_real_network_matches_the_checked_in_lock(
+        self,
+    ) -> None:
+        # Real end-to-end proof (no mocks): fetches EVERY real, live
+        # Metalink4 sidecar this project's own checked-in
+        # `archiveManifest` claims to pin, and confirms every single
+        # one still agrees exactly. Gracefully skipped offline (never
+        # a false pass masquerading as "verified").
+        lock = audit._load_qt_sdk_lock()
+        try:
+            result = audit.verify_qt_sdk_archive_manifest(lock)
+        except Exception as error:  # pragma: no cover - defensive only
+            self.skipTest(f"real network egress unavailable: {error}")
+        if result["status"] == "live_metadata_unavailable":
+            self.skipTest(
+                "real network egress unavailable in this environment"
+            )
+        self.assertEqual(result["status"], "matched")
+
+
+def _write_json_to_temp(payload: dict[str, object]) -> Path:
+    """Writes `payload` as JSON to a fresh temp file and returns its
+    Path -- used by tests that need to feed _load_qt_sdk_lock() a
+    deliberately-tampered lock file shape without ever touching the
+    real checked-in packaging/qt_sdk_lock.json."""
+    fd, name = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as handle:
+        json.dump(payload, handle)
+    return Path(name)
 
 
 def _real_qt_sdk_reference_dir() -> Path | None:
@@ -8577,6 +9148,540 @@ class RealReplayStripAndRpathTransformTests(unittest.TestCase):
             manifest, "linuxdeploy"
         )
         self.assertIsNone(toolset_after_tamper)
+
+
+@unittest.skipUnless(
+    shutil.which("gpg") and shutil.which("gpgv"),
+    "requires real gpg/gpgv binaries to exercise genuine OpenPGP "
+    "clearsign generation and signature-chain verification",
+)
+class UbuntuSignedReleaseChainTests(unittest.TestCase):
+    """Independent review (HIGH, repeat finding, "distro lock lacks
+    archive size/repo/suite/pocket/component/signing key/signed
+    InRelease -> Release -> Packages chain ... pin publisher signing
+    fingerprints ... verify signatures/metadata before archive
+    bytes"): these tests exercise the REAL `gpgv` binary against a
+    genuinely freshly generated OpenPGP key and a genuinely clearsigned
+    document -- never a mocked/stubbed signature check -- so a
+    regression that silently stopped calling gpgv at all, or that
+    accepted an unsigned/tampered/wrong-key document, is caught by
+    ACTUAL cryptographic verification failing to behave as asserted,
+    not merely by a mock's call arguments.
+
+    A fresh, throwaway ed25519 signing key is generated once for the
+    whole test class (real key generation is slow enough that doing it
+    per-test would meaningfully slow the suite down) in an isolated,
+    temporary GNUPGHOME -- this project obviously has no access to
+    Ubuntu's own real private signing keys, so every test here
+    temporarily monkeypatches audit._UBUNTU_ARCHIVE_SIGNING_KEY_
+    FINGERPRINTS to include (or, for the negative "unpinned key" test,
+    deliberately exclude) this test-generated key's own real,
+    genuinely-computed fingerprint -- the pinning MECHANISM itself is
+    exercised for real; only the specific trusted fingerprint SET is
+    substituted for portability and determinism, exactly mirroring
+    this codebase's existing test-only-override convention used
+    elsewhere in this same module (e.g. mount trust's override guards)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._gnupg_home = tempfile.mkdtemp(prefix="arkham-test-gnupghome-")
+        os.chmod(cls._gnupg_home, 0o700)
+        env = dict(os.environ)
+        env["GNUPGHOME"] = cls._gnupg_home
+        subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-gen-key",
+                "Arkham Test Signer <arkham-test@example.invalid>",
+                "ed25519",
+                "sign",
+                "0",
+            ],
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        fingerprint_result = subprocess.run(
+            ["gpg", "--with-colons", "--fingerprint", "Arkham Test Signer"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        fingerprint = None
+        for line in fingerprint_result.stdout.splitlines():
+            if line.startswith("fpr:"):
+                fingerprint = line.split(":")[9]
+                break
+        assert fingerprint, "failed to determine generated test key fingerprint"
+        cls._fingerprint = fingerprint
+        cls._keyring_path = Path(cls._gnupg_home) / "test-keyring.gpg"
+        export_result = subprocess.run(
+            ["gpg", "--export", "Arkham Test Signer"],
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        cls._keyring_path.write_bytes(export_result.stdout)
+        cls._env = env
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls._gnupg_home, ignore_errors=True)
+
+    def setUp(self) -> None:
+        # _ubuntu_signed_packages_index() is deliberately process-
+        # lifetime cached (see its own docstring); tests reuse the
+        # same synthetic pocket/component/architecture keys across
+        # cases and must not observe a PRIOR test's cached result.
+        audit._ubuntu_signed_packages_index.cache_clear()
+
+    def _clearsign(self, content: bytes) -> bytes:
+        with tempfile.TemporaryDirectory() as scratch:
+            content_path = Path(scratch) / "content.txt"
+            content_path.write_bytes(content)
+            output_path = Path(scratch) / "signed.asc"
+            subprocess.run(
+                [
+                    "gpg",
+                    "--batch",
+                    "--pinentry-mode",
+                    "loopback",
+                    "--passphrase",
+                    "",
+                    "--clearsign",
+                    "-o",
+                    str(output_path),
+                    str(content_path),
+                ],
+                env=self._env,
+                check=True,
+                capture_output=True,
+            )
+            return output_path.read_bytes()
+
+    def _patched_keyring(self):
+        return mock.patch.multiple(
+            audit,
+            _UBUNTU_ARCHIVE_KEYRING_PATH=self._keyring_path,
+            _UBUNTU_ARCHIVE_KEYRING_SHA256=audit._sha256(self._keyring_path),
+            _UBUNTU_ARCHIVE_SIGNING_KEY_FINGERPRINTS=frozenset({self._fingerprint}),
+        )
+
+    class _Response:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+
+        def __enter__(self) -> "UbuntuSignedReleaseChainTests._Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, size: int | None = None) -> bytes:
+            if size is None:
+                data, self._data = self._data, b""
+                return data
+            data, self._data = self._data[:size], self._data[size:]
+            return data
+
+    def test_genuinely_signed_release_by_a_pinned_key_is_accepted(self) -> None:
+        signed = self._clearsign(b"Origin: Test\nSuite: test\n")
+        with self._patched_keyring(), mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            return_value=self._Response(signed),
+        ):
+            body = audit._ubuntu_archive_gpgv_verified_body("test-pocket")
+        self.assertIsNotNone(body)
+        self.assertIn("Origin: Test", body)
+
+    def test_genuinely_signed_release_by_an_unpinned_key_is_rejected(self) -> None:
+        # gpgv itself will report a genuinely valid signature (real
+        # crypto, real key) -- but that key's fingerprint is NOT one of
+        # the pinned trusted fingerprints, so this must still be
+        # rejected. This is the single most important assertion in
+        # this class: it proves the fingerprint pin is load-bearing,
+        # not merely "gpgv exited zero".
+        signed = self._clearsign(b"Origin: Test\nSuite: test\n")
+        with mock.patch.multiple(
+            audit,
+            _UBUNTU_ARCHIVE_KEYRING_PATH=self._keyring_path,
+            _UBUNTU_ARCHIVE_KEYRING_SHA256=audit._sha256(self._keyring_path),
+            _UBUNTU_ARCHIVE_SIGNING_KEY_FINGERPRINTS=frozenset(
+                {"0" * 40}
+            ),
+        ), mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            return_value=self._Response(signed),
+        ):
+            body = audit._ubuntu_archive_gpgv_verified_body("test-pocket")
+        self.assertIsNone(body)
+
+    def test_tampered_signed_body_is_rejected(self) -> None:
+        signed = self._clearsign(b"Origin: Test\nSuite: test\n")
+        tampered = signed.replace(b"Origin: Test", b"Origin: Evil")
+        with self._patched_keyring(), mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            return_value=self._Response(tampered),
+        ):
+            body = audit._ubuntu_archive_gpgv_verified_body("test-pocket")
+        self.assertIsNone(body)
+
+    def test_substituted_keyring_file_fails_its_own_sha256_self_check(self) -> None:
+        # Even if a tampered/substituted keyring file on disk happened
+        # to make gpgv itself pass (e.g. it contains a DIFFERENT
+        # trusted-looking key), this project's own pinned sha256 of the
+        # checked-in keyring FILE must independently catch that
+        # substitution before gpgv is ever invoked.
+        signed = self._clearsign(b"Origin: Test\nSuite: test\n")
+        with mock.patch.multiple(
+            audit,
+            _UBUNTU_ARCHIVE_KEYRING_PATH=self._keyring_path,
+            _UBUNTU_ARCHIVE_KEYRING_SHA256="0" * 64,
+            _UBUNTU_ARCHIVE_SIGNING_KEY_FINGERPRINTS=frozenset({self._fingerprint}),
+        ), mock.patch.object(
+            audit.urllib.request,
+            "urlopen",
+            return_value=self._Response(signed),
+        ):
+            body = audit._ubuntu_archive_gpgv_verified_body("test-pocket")
+        self.assertIsNone(body)
+
+    def test_clearsigned_message_body_extraction_undoes_dash_escaping(self) -> None:
+        content = b"- leading dash line\nplain line\n"
+        signed = self._clearsign(content)
+        body = audit._clearsigned_message_body(signed.decode("utf-8"))
+        self.assertEqual(body, "- leading dash line\nplain line")
+
+    def test_parse_release_sha256_index_extracts_path_digest_and_size(
+        self,
+    ) -> None:
+        body = (
+            "Origin: Test\n"
+            "SHA256:\n"
+            " " + ("a" * 64) + " 12345 main/binary-amd64/Packages.gz\n"
+            " " + ("b" * 64) + " 999 universe/binary-amd64/Packages.gz\n"
+        )
+        index = audit._parse_release_sha256_index(body)
+        self.assertEqual(
+            index["main/binary-amd64/Packages.gz"], ("a" * 64, 12345)
+        )
+        self.assertEqual(
+            index["universe/binary-amd64/Packages.gz"], ("b" * 64, 999)
+        )
+
+    def test_ubuntu_signed_packages_index_rejects_packages_gz_digest_mismatch(
+        self,
+    ) -> None:
+        # The InRelease chain itself is genuinely, cryptographically
+        # verified -- but the fetched Packages.gz bytes disagree with
+        # what that SIGNED document says they must be. This must be
+        # rejected BEFORE ever decompressing/parsing the payload.
+        packages_gz = gzip.compress(b"Package: fake\nVersion: 1\n")
+        wrong_digest = hashlib.sha256(b"not-the-real-bytes").hexdigest()
+        release_body = (
+            "Origin: Test\n"
+            "SHA256:\n"
+            f" {wrong_digest} {len(packages_gz)} "
+            "main/binary-amd64/Packages.gz\n"
+        )
+        signed = self._clearsign(release_body.encode("utf-8"))
+        responses = [self._Response(signed), self._Response(packages_gz)]
+
+        def _fake_urlopen(_url, timeout=None):  # noqa: ANN001
+            return responses.pop(0)
+
+        with self._patched_keyring(), mock.patch.object(
+            audit.urllib.request, "urlopen", side_effect=_fake_urlopen
+        ):
+            index = audit._ubuntu_signed_packages_index(
+                "test-pocket", "main", "amd64"
+            )
+        self.assertIsNone(index)
+
+    def test_ubuntu_signed_packages_index_parses_a_genuinely_verified_stanza(
+        self,
+    ) -> None:
+        packages_gz = gzip.compress(
+            b"Package: libfoo1\n"
+            b"Version: 1.2.3-1\n"
+            b"Filename: pool/main/libfoo1_1.2.3-1_amd64.deb\n"
+            b"Size: 4242\n"
+            b"SHA256: " + b"c" * 64 + b"\n\n"
+        )
+        real_digest = hashlib.sha256(packages_gz).hexdigest()
+        release_body = (
+            "Origin: Test\n"
+            "SHA256:\n"
+            f" {real_digest} {len(packages_gz)} "
+            "main/binary-amd64/Packages.gz\n"
+        )
+        signed = self._clearsign(release_body.encode("utf-8"))
+        responses = [self._Response(signed), self._Response(packages_gz)]
+
+        def _fake_urlopen(_url, timeout=None):  # noqa: ANN001
+            return responses.pop(0)
+
+        with self._patched_keyring(), mock.patch.object(
+            audit.urllib.request, "urlopen", side_effect=_fake_urlopen
+        ):
+            index = audit._ubuntu_signed_packages_index(
+                "test-pocket", "main", "amd64"
+            )
+        self.assertIsNotNone(index)
+        record = index[("libfoo1", "1.2.3-1")]
+        self.assertEqual(record["size"], 4242)
+        self.assertEqual(record["sha256"], "c" * 64)
+        self.assertEqual(record["pocket"], "test-pocket")
+        self.assertEqual(record["component"], "main")
+
+
+class VerifyDebArchiveAgainstSignedReleaseChainTests(unittest.TestCase):
+    """Independent review (HIGH, repeat finding): unit-level coverage
+    for `_verify_deb_archive_against_signed_release_chain()` itself,
+    mocking only `_ubuntu_signed_chain_record_for_package()` (already
+    covered end-to-end, including genuine gpgv verification, by
+    UbuntuSignedReleaseChainTests above) so these tests can
+    deterministically exercise every outcome without any real network/
+    gpg dependency. Also mocks `_load_distro_package_lock()` to pin
+    "libfoo1" as a governed package -- the real gate this function
+    applies (see its own docstring: only ever consulted for a package
+    this project's lock already governs) must not itself suppress
+    these otherwise-deterministic assertions."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={
+                "distribution": "ubuntu-22.04",
+                "packages": {
+                    "libfoo1": {
+                        "architecture": "amd64",
+                        "version": "1.0",
+                        "debSha256": "f" * 64,
+                    }
+                },
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_matching_record_is_accepted(self) -> None:
+        with mock.patch.object(
+            audit,
+            "_ubuntu_signed_chain_record_for_package",
+            return_value={
+                "sha256": "d" * 64,
+                "size": 1000,
+                "filename": "pool/main/libfoo1_1.0_amd64.deb",
+                "pocket": "jammy",
+                "component": "main",
+            },
+        ):
+            result = audit._verify_deb_archive_against_signed_release_chain(
+                "libfoo1", "1.0", "amd64", "D" * 64, 1000
+            )
+        self.assertIsNone(result)
+
+    def test_sha256_disagreement_is_a_hard_failure(self) -> None:
+        with mock.patch.object(
+            audit,
+            "_ubuntu_signed_chain_record_for_package",
+            return_value={
+                "sha256": "d" * 64,
+                "size": 1000,
+                "filename": "pool/main/libfoo1_1.0_amd64.deb",
+                "pocket": "jammy",
+                "component": "main",
+            },
+        ):
+            result = audit._verify_deb_archive_against_signed_release_chain(
+                "libfoo1", "1.0", "amd64", "e" * 64, 1000
+            )
+        self.assertEqual(result, "signedChainMismatch")
+
+    def test_size_disagreement_is_a_hard_failure(self) -> None:
+        with mock.patch.object(
+            audit,
+            "_ubuntu_signed_chain_record_for_package",
+            return_value={
+                "sha256": "d" * 64,
+                "size": 1000,
+                "filename": "pool/main/libfoo1_1.0_amd64.deb",
+                "pocket": "jammy",
+                "component": "main",
+            },
+        ):
+            result = audit._verify_deb_archive_against_signed_release_chain(
+                "libfoo1", "1.0", "amd64", "d" * 64, 1001
+            )
+        self.assertEqual(result, "signedChainMismatch")
+
+    def test_absent_chain_record_is_an_honest_not_applicable_never_a_failure(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            audit,
+            "_ubuntu_signed_chain_record_for_package",
+            return_value=None,
+        ):
+            result = audit._verify_deb_archive_against_signed_release_chain(
+                "libfoo1", "1.0", "amd64", "d" * 64, 1000
+            )
+        self.assertIsNone(result)
+
+    def test_ungoverned_package_skips_the_live_chain_lookup_entirely(self) -> None:
+        # A package this project's own distro_package_lock.json does
+        # NOT pin (e.g. a local development container's own unrelated
+        # system package) must never trigger the expensive live
+        # signed-chain walk at all -- proven here by making the walk
+        # itself raise if it is ever even called.
+        def _must_not_be_called(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError(
+                "_ubuntu_signed_chain_record_for_package() must not be "
+                "called for a package the lock does not govern"
+            )
+
+        with mock.patch.object(
+            audit,
+            "_ubuntu_signed_chain_record_for_package",
+            side_effect=_must_not_be_called,
+        ):
+            result = audit._verify_deb_archive_against_signed_release_chain(
+                "some-unrelated-package", "9.9", "amd64", "d" * 64, 1000
+            )
+        self.assertIsNone(result)
+
+
+class BoundedHttpsReadTests(unittest.TestCase):
+    """Independent review (HIGH, "Launchpad mutable API and unbounded
+    response.read()"): _bounded_https_read() itself, proven to reject
+    (never silently truncate) an over-cap response, and to correctly
+    pass through a within-cap one, for both the sized-read (real
+    network response) and unsized-read (deterministic test double)
+    code paths."""
+
+    class _ChunkedResponse:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+
+        def read(self, size: int) -> bytes:
+            data, self._data = self._data[:size], self._data[size:]
+            return data
+
+    class _UnsizedResponse:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+
+        def read(self) -> bytes:
+            data, self._data = self._data, b""
+            return data
+
+    def test_within_cap_chunked_response_is_returned_in_full(self) -> None:
+        data = b"x" * 5000
+        result = audit._bounded_https_read(self._ChunkedResponse(data), 10000)
+        self.assertEqual(result, data)
+
+    def test_over_cap_chunked_response_is_rejected_not_truncated(self) -> None:
+        data = b"x" * 5000
+        result = audit._bounded_https_read(self._ChunkedResponse(data), 4000)
+        self.assertIsNone(result)
+
+    def test_within_cap_unsized_response_is_returned_in_full(self) -> None:
+        data = b"y" * 5000
+        result = audit._bounded_https_read(self._UnsizedResponse(data), 10000)
+        self.assertEqual(result, data)
+
+    def test_over_cap_unsized_response_is_rejected_not_truncated(self) -> None:
+        data = b"y" * 5000
+        result = audit._bounded_https_read(self._UnsizedResponse(data), 4000)
+        self.assertIsNone(result)
+
+
+class DistroPackageLockOptionalArchiveFieldsSchemaTests(unittest.TestCase):
+    """Independent review (HIGH, "distro lock lacks archive size/repo/
+    suite/pocket/component"): packaging/distro_package_lock.json's own
+    per-package schema now accepts (but never requires) "size" (a
+    positive integer), "component", and "pocket" alongside the
+    pre-existing required architecture/version/debSha256 fields."""
+
+    def _load_with_packages(self, packages: dict) -> dict:
+        with tempfile.TemporaryDirectory() as scratch:
+            lock_path = Path(scratch) / "distro_package_lock.json"
+            lock_path.write_text(
+                json.dumps({"distribution": "ubuntu-22.04", "packages": packages})
+            )
+            with mock.patch.object(audit, "_DISTRO_PACKAGE_LOCK_PATH", lock_path):
+                audit._load_distro_package_lock.cache_clear()
+                try:
+                    return audit._load_distro_package_lock()
+                finally:
+                    audit._load_distro_package_lock.cache_clear()
+
+    def test_entry_with_only_required_fields_still_loads(self) -> None:
+        loaded = self._load_with_packages(
+            {
+                "libfoo1": {
+                    "architecture": "amd64",
+                    "version": "1.0",
+                    "debSha256": "a" * 64,
+                }
+            }
+        )
+        self.assertEqual(loaded["packages"]["libfoo1"]["architecture"], "amd64")
+
+    def test_entry_with_all_optional_fields_loads_and_preserves_them(self) -> None:
+        loaded = self._load_with_packages(
+            {
+                "libfoo1": {
+                    "architecture": "amd64",
+                    "version": "1.0",
+                    "debSha256": "a" * 64,
+                    "size": 4242,
+                    "component": "main",
+                    "pocket": "jammy",
+                }
+            }
+        )
+        entry = loaded["packages"]["libfoo1"]
+        self.assertEqual(entry["size"], 4242)
+        self.assertEqual(entry["component"], "main")
+        self.assertEqual(entry["pocket"], "jammy")
+
+    def test_non_positive_size_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._load_with_packages(
+                {
+                    "libfoo1": {
+                        "architecture": "amd64",
+                        "version": "1.0",
+                        "debSha256": "a" * 64,
+                        "size": 0,
+                    }
+                }
+            )
+
+    def test_unknown_extra_field_is_still_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._load_with_packages(
+                {
+                    "libfoo1": {
+                        "architecture": "amd64",
+                        "version": "1.0",
+                        "debSha256": "a" * 64,
+                        "unexpectedField": "x",
+                    }
+                }
+            )
 
 
 if __name__ == "__main__":

@@ -318,6 +318,44 @@ QString g_authoritativeAccountHomeOverrideValueForTesting;
 std::atomic<bool> g_forceMountTransitionPolicyOverrideActiveForTesting{false};
 std::atomic<bool> g_forceMountTransitionPolicyOverrideValueForTesting{false};
 
+// Independent review (MEDIUM, repeat finding, "whole-filesystem mount
+// substitution still accepted... reverse test; full-fs bind/move/
+// loopback rejected unless explicitly configured/authenticated expected
+// home volume"): a genuine, disk-backed-fstype, whole-filesystem
+// (mountinfo root=="/"), correctly-owned/moded, distinct-device mount
+// satisfies EVERY check mountIdHasTrustedLocalFilesystemType() and its
+// caller otherwise apply -- yet an attacker who can already run `mount`
+// (the same privilege every bind-mount test in this suite already
+// requires) can trivially manufacture EXACTLY that shape: format an
+// ordinary regular file with mkfs.ext4, attach it via losetup, and
+// bind- (or move-)mount it directly onto $HOME. None of the prior
+// checks (fstype allowlist, root=="/", mount-id/device/parent-id
+// correlation, ownership/mode) can distinguish that fabricated volume
+// from a genuine, administratively-provisioned dedicated partition,
+// because a loop device IS a real, distinct, disk-backed-fstype block
+// device by every measure those checks make -- its only distinguishing
+// property is that its BACKING STORE is itself an ordinary file this
+// process's own privilege level can create at will, never a
+// deployment-time-fixed piece of physical (or administratively
+// pre-configured virtual, e.g. LVM/dm-crypt) storage. This override
+// lets a test deterministically force mountSourceIsTrustedBackingIdentity()'s
+// verdict for exactly this ADDITIONAL check, independent of (and
+// reached only once) every pre-existing check above has already
+// passed -- letting the exact same real loopback-ext4 mount fixture
+// this suite already builds prove BOTH halves hermetically: the real,
+// unmodified check genuinely refuses a loopback-backed volume (no
+// override active), and a forced-trusted override proves the mount
+// still resolves successfully once backing-identity is independently
+// authenticated, exactly modelling what a real, non-loopback SteamOS
+// partition would present. `g_..Active` false (the default) means "use
+// the real, loopback/ram-rejecting backing-identity check, unmodified";
+// production code paths never depend on this outside of a test binary
+// calling the setter below.
+std::atomic<bool> g_forceMountSourceBackingIdentityOverrideActiveForTesting{
+    false};
+std::atomic<bool> g_forceMountSourceBackingIdentityOverrideValueForTesting{
+    false};
+
 // Independent cumulative re-review (MEDIUM, "Validate owner/mode for
 // EVERY opened component regardless mount transition"): the raw
 // ownership/mode policy itself (directoryDescriptorPassesOwnerAndModePolicy()
@@ -1689,6 +1727,68 @@ std::optional<QByteArray> readEntireProcFileRaw(const char *path) {
 // same-device bind mount of some unrelated directory can never satisfy
 // both a real device change AND a parent-id chain that resolves back to
 // the exact ancestor already walked.
+
+// Independent review (MEDIUM, "whole-filesystem mount substitution
+// still accepted... authenticate exact position-specific SteamOS
+// topology: ... source/backing identity..."): rejects a mount whose
+// SOURCE -- mountinfo's own record of what device (or pseudo-source)
+// this filesystem is actually backed by, the first field after the
+// fstype in the portion after " - " -- resolves to a well-known,
+// trivially attacker-fabricable VIRTUAL block device, never a genuine,
+// deployment-time-fixed piece of storage. Linux permanently reserves
+// major device number 7 for loop devices (LANANA-assigned, stable
+// across every distribution/kernel version this project targets) and
+// major 1 for ram disks -- BOTH are things an ordinary unprivileged-
+// beyond-mount-capability process can conjure at will (losetup a
+// freshly-created regular file, or attach a ramdisk), unlike a real
+// SCSI/SATA/NVMe/eMMC/device-mapper-backed partition, which requires
+// genuine, administratively-fixed physical (or pre-configured virtual,
+// e.g. LVM/dm-crypt, itself layered atop real physical storage) block
+// devices this project's own privilege level cannot fabricate from
+// nothing. A source that is not an absolute `/dev/...`-style path at
+// all (e.g. "tmpfs", "overlay", or any other pseudo-source token a
+// virtual filesystem might report) or that cannot be resolved to a
+// real block-special file via stat() fails closed identically -- there
+// is no independent backing-device evidence to trust in that case
+// either.
+bool mountSourceIsTrustedBackingIdentity(const QString &source) {
+  if (g_forceMountSourceBackingIdentityOverrideActiveForTesting.load(
+          std::memory_order_acquire)) {
+    return g_forceMountSourceBackingIdentityOverrideValueForTesting.load(
+        std::memory_order_acquire);
+  }
+  if (!source.startsWith(QLatin1Char('/'))) {
+    qWarning() << "AssetCache: mount source" << source
+               << "is not an absolute device path -- refusing (no "
+                  "independent backing-device evidence to authenticate)";
+    return false;
+  }
+  struct stat sourceSt {};
+  if (::stat(source.toLocal8Bit().constData(), &sourceSt) != 0) {
+    qWarning() << "AssetCache: mount source" << source
+               << "could not be stat()ed -- refusing";
+    return false;
+  }
+  if (!S_ISBLK(sourceSt.st_mode)) {
+    qWarning() << "AssetCache: mount source" << source
+               << "is not a block-special device -- refusing";
+    return false;
+  }
+  const unsigned int sourceMajor = ::major(sourceSt.st_rdev);
+  // Major 7: loop devices. Major 1: ram disks. Both LANANA-reserved,
+  // stable identifiers for virtual, trivially-fabricable block devices
+  // -- see this function's own top comment.
+  if (sourceMajor == 7 || sourceMajor == 1) {
+    qWarning() << "AssetCache: mount source" << source
+               << "is backed by a virtual (loop/ram) block device, major"
+               << sourceMajor
+               << "-- refusing (never a genuine, administratively-fixed "
+                  "dedicated partition)";
+    return false;
+  }
+  return true;
+}
+
 bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
                                           quint64 expectedDevice,
                                           quint64 expectedParentDevice) {
@@ -1708,6 +1808,7 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
   bool found = false;
   bool trusted = false;
   QString matchedFstype;
+  QString matchedSource;
   const QList<QByteArray> rawLines = mountinfoContent->split('\n');
   for (const QByteArray &rawLine : rawLines) {
     if (rawLine.isEmpty()) {
@@ -1858,7 +1959,16 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
     }
     found = true;
     matchedFstype = afterDash.at(0);
-    trusted = trustedLocalMountFilesystemTypes().contains(matchedFstype);
+    // afterDash[1], when present, is mountinfo's own "source" field --
+    // see mountSourceIsTrustedBackingIdentity()'s own comment for why
+    // this is now an INDEPENDENT, additional requirement alongside the
+    // fstype allowlist, never a substitute for it: a loop/ram-backed
+    // device can itself be formatted with a trusted on-disk fstype
+    // (that's exactly what makes it otherwise indistinguishable from a
+    // genuine dedicated partition), so both must independently pass.
+    matchedSource = afterDash.size() > 1 ? afterDash.at(1) : QString();
+    trusted = trustedLocalMountFilesystemTypes().contains(matchedFstype) &&
+              mountSourceIsTrustedBackingIdentity(matchedSource);
     // Mount ids are unique at any given moment -- exactly one line can
     // ever match, so breaking here is safe (there is no "last matching
     // line wins" ambiguity possible for a genuinely unique key, unlike
@@ -1876,9 +1986,12 @@ bool mountIdHasTrustedLocalFilesystemType(quint64 mountId,
         << "(diagnostic only -- see mountIdHasTrustedLocalFilesystemType())";
   } else if (!trusted) {
     qWarning() << "AssetCache: /proc/self/mountinfo mount id" << mountId
-               << "has filesystem type" << matchedFstype
-               << "which is not in the trusted-local allowlist (diagnostic "
-                  "only -- see mountIdHasTrustedLocalFilesystemType())";
+               << "has filesystem type" << matchedFstype << "and source"
+               << matchedSource
+               << "-- refused by the trusted-fstype allowlist and/or the "
+                  "backing-identity check (see this function's own reason "
+                  "already logged above; diagnostic only -- see "
+                  "mountIdHasTrustedLocalFilesystemType())";
   }
   return found && trusted;
 }
@@ -3880,16 +3993,17 @@ bool addUsageBytesOverflowSafe(qint64 *total, qint64 addition) {
 // `blkcnt_t` (a signed 64-bit type on every target platform here), and
 // the multiplication by 512 must not be allowed to silently wrap
 // either.
+constexpr qint64 kBytesPerPhysicalBlock = 512;
+
 bool physicalBytesOverflowSafe(const struct stat &st, qint64 *outBytes) {
   const qint64 blocks = static_cast<qint64>(st.st_blocks);
   if (blocks < 0) {
     return false;
   }
-  constexpr qint64 kBytesPerBlock = 512;
-  if (blocks > std::numeric_limits<qint64>::max() / kBytesPerBlock) {
+  if (blocks > std::numeric_limits<qint64>::max() / kBytesPerPhysicalBlock) {
     return false;
   }
-  *outBytes = blocks * kBytesPerBlock;
+  *outBytes = blocks * kBytesPerPhysicalBlock;
   return true;
 }
 
@@ -3942,12 +4056,16 @@ std::optional<qint64> sumUsageRelative(int dirFd,
       return std::nullopt;
     }
     if (S_ISDIR(st.st_mode)) {
-      // The directory node's own on-disk size is real, physical usage
-      // regardless of which mount it lives on -- see this function's
-      // own comment above.
+      // Determine the directory node's own physical allocation now,
+      // but add it only after deciding whether this is ordinary
+      // same-mount content or a positively confirmed mount boundary.
+      // Some filesystems (notably Docker overlayfs) report st_blocks ==
+      // 0 for a bind-mounted directory node. A confirmed foreign mount
+      // still needs a nonzero irreducible placeholder in that case so
+      // an undeletable planted mount cannot disappear from quota
+      // accounting entirely.
       qint64 dirPhysicalBytes = 0;
-      if (!physicalBytesOverflowSafe(st, &dirPhysicalBytes) ||
-          !addUsageBytesOverflowSafe(&total, dirPhysicalBytes)) {
+      if (!physicalBytesOverflowSafe(st, &dirPhysicalBytes)) {
         closedir(dirStream);
         return std::nullopt;
       }
@@ -3963,6 +4081,12 @@ std::optional<qint64> sumUsageRelative(int dirFd,
       const MountIdentity relativeMount =
           mountIdentityRelative(dirFd, entry->d_name, st);
       if (relativeMount.device != expectedMount.device) {
+        const qint64 crossMountBytes =
+            std::max(dirPhysicalBytes, kBytesPerPhysicalBlock);
+        if (!addUsageBytesOverflowSafe(&total, crossMountBytes)) {
+          closedir(dirStream);
+          return std::nullopt;
+        }
         errno = 0;
         continue;
       }
@@ -3995,9 +4119,20 @@ std::optional<qint64> sumUsageRelative(int dirFd,
           dirFd, entry->d_name, expectedMount, &confirmedCrossMount);
       if (childFd < 0) {
         if (confirmedCrossMount) {
+          const qint64 crossMountBytes =
+              std::max(dirPhysicalBytes, kBytesPerPhysicalBlock);
+          if (!addUsageBytesOverflowSafe(&total, crossMountBytes)) {
+            closedir(dirStream);
+            return std::nullopt;
+          }
           errno = 0;
           continue;
         }
+        closedir(dirStream);
+        return std::nullopt;
+      }
+      if (!addUsageBytesOverflowSafe(&total, dirPhysicalBytes)) {
+        ::close(childFd);
         closedir(dirStream);
         return std::nullopt;
       }
@@ -5709,6 +5844,19 @@ void AssetCache::setMountTransitionPolicyQualificationOverrideForTesting(
   g_forceMountTransitionPolicyOverrideValueForTesting.store(
       qualified, std::memory_order_release);
   g_forceMountTransitionPolicyOverrideActiveForTesting.store(
+      active, std::memory_order_release);
+}
+
+void AssetCache::setMountSourceBackingIdentityOverrideForTesting(bool active,
+                                                                 bool trusted) {
+  // Same release/acquire discipline as
+  // setMountTransitionPolicyQualificationOverrideForTesting() above:
+  // value stored before the active flag, so
+  // mountSourceIsTrustedBackingIdentity()'s acquire-ordered read
+  // observes this exact value whenever it sees the override active.
+  g_forceMountSourceBackingIdentityOverrideValueForTesting.store(
+      trusted, std::memory_order_release);
+  g_forceMountSourceBackingIdentityOverrideActiveForTesting.store(
       active, std::memory_order_release);
 }
 
