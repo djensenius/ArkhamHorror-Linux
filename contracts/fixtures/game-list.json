@@ -1,0 +1,103 @@
+[
+  {
+    "id": "00000000-0000-0000-0000-000000000003",
+    "scenario": {
+      "id": "c01104",
+      "difficulty": "Easy",
+      "name": {
+        "title": "The Gathering",
+        "subtitle": null
+      },
+      "variant": null
+    },
+    "campaign": null,
+    "gameState": {
+      "tag": "IsPending",
+      "contents": []
+    },
+    "name": "Contract fixture game",
+    "investigators": [],
+    "otherInvestigators": [],
+    "multiplayerVariant": "Solo",
+    "hasOpenSeats": false
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000004",
+    "scenario": null,
+    "campaign": {
+      "id": "06",
+      "difficulty": "Easy",
+      "currentCampaignMode": "TheDreamQuest"
+    },
+    "gameState": {
+      "tag": "IsChooseDecks",
+      "contents": [
+        "00000000-0000-0000-0000-000000000001"
+      ]
+    },
+    "name": "Campaign contract fixture",
+    "investigators": [
+      {
+        "id": "c06001",
+        "classSymbol": "Guardian"
+      },
+      {
+        "id": "c06002",
+        "classSymbol": "Seeker"
+      }
+    ],
+    "otherInvestigators": [
+      {
+        "id": "c06003",
+        "classSymbol": "Rogue"
+      }
+    ],
+    "multiplayerVariant": "WithFriends",
+    "hasOpenSeats": true
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000005",
+    "scenario": {
+      "id": "c01104",
+      "difficulty": "Easy",
+      "name": {
+        "title": "The Gathering",
+        "subtitle": null
+      },
+      "variant": null
+    },
+    "campaign": null,
+    "gameState": {
+      "tag": "IsActive"
+    },
+    "name": "Active contract fixture",
+    "investigators": [],
+    "otherInvestigators": [],
+    "multiplayerVariant": "Solo",
+    "hasOpenSeats": false
+  },
+  {
+    "id": "00000000-0000-0000-0000-000000000006",
+    "scenario": {
+      "id": "c01104",
+      "difficulty": "Easy",
+      "name": {
+        "title": "The Gathering",
+        "subtitle": null
+      },
+      "variant": null
+    },
+    "campaign": null,
+    "gameState": {
+      "tag": "IsOver"
+    },
+    "name": "Completed contract fixture",
+    "investigators": [],
+    "otherInvestigators": [],
+    "multiplayerVariant": "Solo",
+    "hasOpenSeats": false
+  },
+  {
+    "error": "Contract fixture failed to load."
+  }
+]

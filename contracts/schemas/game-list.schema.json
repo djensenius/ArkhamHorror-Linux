@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arkhamhorror.app/contracts/game-list.schema.json",
+  "title": "GameList",
+  "description": "Games visible to the authenticated account, ordered by most recently updated.",
+  "type": "array",
+  "items": {
+    "oneOf": [
+      {
+        "$ref": "#/$defs/gameDetails"
+      },
+      {
+        "$ref": "#/$defs/failedGameDetails"
+      }
+    ]
+  },
+  "$defs": {
+    "failedGameDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "gameDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "scenario",
+        "campaign",
+        "gameState",
+        "name",
+        "investigators",
+        "otherInvestigators",
+        "multiplayerVariant",
+        "hasOpenSeats"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "scenario": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "difficulty",
+            "name",
+            "variant"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "difficulty": {
+              "$ref": "#/$defs/difficulty"
+            },
+            "name": {
+              "$ref": "#/$defs/name"
+            },
+            "variant": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "campaign": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "difficulty",
+            "currentCampaignMode"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "difficulty": {
+              "$ref": "#/$defs/difficulty"
+            },
+            "currentCampaignMode": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "TheDreamQuest",
+                "TheWebOfDreams",
+                null
+              ]
+            }
+          }
+        },
+        "gameState": {
+          "$ref": "./game-state.schema.json"
+        },
+        "name": {
+          "type": "string"
+        },
+        "investigators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/investigator"
+          }
+        },
+        "otherInvestigators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/investigator"
+          }
+        },
+        "multiplayerVariant": {
+          "$ref": "#/$defs/multiplayerVariant"
+        },
+        "hasOpenSeats": {
+          "type": "boolean"
+        }
+      }
+    },
+    "investigator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "classSymbol"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "classSymbol": {
+          "enum": [
+            "Guardian",
+            "Seeker",
+            "Survivor",
+            "Rogue",
+            "Mystic",
+            "Neutral",
+            "Mythos"
+          ]
+        }
+      }
+    },
+    "difficulty": {
+      "enum": [
+        "Easy",
+        "Standard",
+        "Hard",
+        "Expert"
+      ]
+    },
+    "multiplayerVariant": {
+      "enum": [
+        "Solo",
+        "WithFriends"
+      ]
+    },
+    "name": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "subtitle"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "subtitle": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

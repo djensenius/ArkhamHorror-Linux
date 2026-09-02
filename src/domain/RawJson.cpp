@@ -1,0 +1,1336 @@
+#include "RawJson.h"
+
+#include "JsonDecode.h"
+
+#include <QAnyStringView>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QSet>
+#include <cmath>
+#include <limits>
+#include <new>
+#include <utility>
+
+using namespace Qt::StringLiterals;
+
+namespace Arkham::Json {
+
+namespace {
+
+[[nodiscard]] bool isAsciiDigit(char c) noexcept {
+  return c >= '0' && c <= '9';
+}
+
+[[nodiscard]] bool isHexDigit(char c) noexcept {
+  return isAsciiDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+[[nodiscard]] int hexValue(char c) noexcept {
+  if (isAsciiDigit(c))
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return 10 + (c - 'a');
+  return 10 + (c - 'A');
+}
+
+} // namespace
+
+// Recursive-descent RFC 8259 parser. One Parser is constructed per
+// Value::parse() call and owns all of that call's mutable scan state; every
+// method advances `m_pos` past what it consumed and returns a Failure on
+// the first byte that violates the grammar. `m_limits` bounds every
+// resource this parser allocates (see ParseLimits); `m_totalNodes` counts
+// every value produced so far against `m_limits.maxTotalNodes`.
+class Parser {
+public:
+  Parser(QByteArrayView bytes, QStringView path, const ParseLimits &limits)
+      : m_bytes(bytes), m_path(path), m_limits(limits) {}
+
+  [[nodiscard]] ValueOrError<Value> parseDocument() {
+    if (m_bytes.size() > m_limits.maxInputBytes)
+      return Failure{QStringLiteral("%1: input exceeds the maximum allowed "
+                                    "size of %2 bytes")
+                         .arg(m_path.toString())
+                         .arg(m_limits.maxInputBytes)};
+    skipWhitespace();
+    auto value = parseValue(0);
+    if (!value)
+      return Failure{value.error()};
+    skipWhitespace();
+    if (m_pos != m_bytes.size())
+      return failAt("trailing content after JSON value");
+    return *value;
+  }
+
+private:
+  QByteArrayView m_bytes;
+  QStringView m_path;
+  ParseLimits m_limits;
+  qsizetype m_pos = 0;
+  qsizetype m_totalNodes = 0;
+
+  [[nodiscard]] Failure failAt(QAnyStringView what) const {
+    return Failure{QStringLiteral("%1: byte offset %2: %3")
+                       .arg(m_path.toString())
+                       .arg(m_pos)
+                       .arg(what.toString())};
+  }
+
+  [[nodiscard]] bool atEnd() const noexcept { return m_pos >= m_bytes.size(); }
+  [[nodiscard]] char peek() const noexcept {
+    return atEnd() ? '\0' : m_bytes[m_pos];
+  }
+
+  void skipWhitespace() noexcept {
+    while (!atEnd()) {
+      char c = m_bytes[m_pos];
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+        ++m_pos;
+      else
+        break;
+    }
+  }
+
+  [[nodiscard]] ValueOrError<Value> parseValue(int depth) {
+    if (depth > m_limits.maxDepth)
+      return failAt("nesting depth exceeds the maximum allowed");
+    if (++m_totalNodes > m_limits.maxTotalNodes)
+      return failAt("document exceeds the maximum allowed total node count");
+    if (atEnd())
+      return failAt("unexpected end of input, expected a JSON value");
+    char c = peek();
+    if (c == '"')
+      return parseString();
+    if (c == '{')
+      return parseObject(depth + 1);
+    if (c == '[')
+      return parseArray(depth + 1);
+    if (c == 't')
+      return parseLiteral("true"_L1, [] {
+        Value v;
+        v.m_kind = Value::Kind::Bool;
+        v.m_bool = true;
+        return v;
+      });
+    if (c == 'f')
+      return parseLiteral("false"_L1, [] {
+        Value v;
+        v.m_kind = Value::Kind::Bool;
+        v.m_bool = false;
+        return v;
+      });
+    if (c == 'n')
+      return parseLiteral("null"_L1, [] {
+        Value v;
+        v.m_kind = Value::Kind::Null;
+        return v;
+      });
+    if (c == '-' || isAsciiDigit(c))
+      return parseNumber();
+    return failAt(
+        QStringLiteral("unexpected character '%1'").arg(QChar::fromLatin1(c)));
+  }
+
+  template <typename MakeValue>
+  [[nodiscard]] ValueOrError<Value> parseLiteral(QLatin1StringView text,
+                                                 MakeValue makeValue) {
+    if (m_pos + text.size() > m_bytes.size() ||
+        m_bytes.sliced(m_pos, text.size()) !=
+            QByteArrayView(text.data(), text.size()))
+      return failAt(QStringLiteral("invalid literal, expected '%1'")
+                        .arg(QString::fromLatin1(text)));
+    m_pos += text.size();
+    return makeValue();
+  }
+
+  // RFC 8259 number = -? int frac? exp?
+  [[nodiscard]] ValueOrError<Value> parseNumber() {
+    RawNumber number;
+    if (peek() == '-') {
+      number.m_negative = true;
+      ++m_pos;
+    }
+    if (atEnd() || !isAsciiDigit(peek()))
+      return failAt("invalid number: expected a digit");
+    qsizetype intStart = m_pos;
+    if (peek() == '0') {
+      ++m_pos;
+    } else {
+      while (!atEnd() && isAsciiDigit(peek()))
+        ++m_pos;
+    }
+    if (m_pos - intStart > m_limits.maxNumberDigits)
+      return failAt("number literal's integer part exceeds the maximum "
+                    "allowed digit count");
+    number.m_intDigits =
+        QString::fromLatin1(m_bytes.sliced(intStart, m_pos - intStart));
+    if (!atEnd() && peek() == '.') {
+      ++m_pos;
+      qsizetype fracStart = m_pos;
+      if (atEnd() || !isAsciiDigit(peek()))
+        return failAt("invalid number: expected a digit after '.'");
+      while (!atEnd() && isAsciiDigit(peek()))
+        ++m_pos;
+      if (m_pos - fracStart > m_limits.maxNumberDigits)
+        return failAt("number literal's fraction part exceeds the maximum "
+                      "allowed digit count");
+      number.m_fracDigits =
+          QString::fromLatin1(m_bytes.sliced(fracStart, m_pos - fracStart));
+    }
+    if (!atEnd() && (peek() == 'e' || peek() == 'E')) {
+      ++m_pos;
+      number.m_hasExponent = true;
+      if (!atEnd() && (peek() == '+' || peek() == '-')) {
+        number.m_exponentNegative = peek() == '-';
+        ++m_pos;
+      }
+      qsizetype expStart = m_pos;
+      if (atEnd() || !isAsciiDigit(peek()))
+        return failAt("invalid number: expected a digit in the exponent");
+      while (!atEnd() && isAsciiDigit(peek()))
+        ++m_pos;
+      if (m_pos - expStart > m_limits.maxNumberDigits)
+        return failAt("number literal's exponent part exceeds the maximum "
+                      "allowed digit count");
+      number.m_expDigits =
+          QString::fromLatin1(m_bytes.sliced(expStart, m_pos - expStart));
+    }
+    Value v;
+    v.m_kind = Value::Kind::Number;
+    v.m_number = std::move(number);
+    return v;
+  }
+
+  [[nodiscard]] ValueOrError<Value> parseString() {
+    auto text = parseStringText();
+    if (!text)
+      return Failure{text.error()};
+    Value v;
+    v.m_kind = Value::Kind::String;
+    v.m_string = std::move(*text);
+    return v;
+  }
+
+  // Consumes a JSON string literal (opening through closing quote already
+  // positioned at the opening quote) and returns its decoded text,
+  // validating escapes, surrogate pairs, and raw UTF-8 byte sequences.
+  [[nodiscard]] ValueOrError<QString> parseStringText() {
+    if (peek() != '"')
+      return failAt("expected '\"'");
+    ++m_pos;
+    QString out;
+    for (;;) {
+      if (atEnd())
+        return failAt("unterminated string literal");
+      unsigned char c = static_cast<unsigned char>(m_bytes[m_pos]);
+      // The closing quote is checked before the length bound below so an
+      // already-at-the-limit string that is about to terminate is never
+      // wrongly rejected.
+      if (c == '"') {
+        ++m_pos;
+        return out;
+      }
+      // A hard bound checked before consuming/appending anything else
+      // this iteration, guaranteeing `out` never grows past
+      // maxStringLength via a single-code-unit append. Branches that
+      // append two UTF-16 code units at once (a \u surrogate pair, or a
+      // decoded UTF-8 codepoint above the BMP) additionally re-check
+      // below, since this alone only guarantees one code unit of
+      // headroom.
+      if (out.size() >= m_limits.maxStringLength)
+        return failAt("string literal exceeds the maximum allowed length");
+      if (c == '\\') {
+        ++m_pos;
+        if (atEnd())
+          return failAt("unterminated escape sequence");
+        char esc = m_bytes[m_pos];
+        switch (esc) {
+        case '"':
+          out += QChar::fromLatin1('"');
+          ++m_pos;
+          break;
+        case '\\':
+          out += QChar::fromLatin1('\\');
+          ++m_pos;
+          break;
+        case '/':
+          out += QChar::fromLatin1('/');
+          ++m_pos;
+          break;
+        case 'b':
+          out += QChar::fromLatin1('\b');
+          ++m_pos;
+          break;
+        case 'f':
+          out += QChar::fromLatin1('\f');
+          ++m_pos;
+          break;
+        case 'n':
+          out += QChar::fromLatin1('\n');
+          ++m_pos;
+          break;
+        case 'r':
+          out += QChar::fromLatin1('\r');
+          ++m_pos;
+          break;
+        case 't':
+          out += QChar::fromLatin1('\t');
+          ++m_pos;
+          break;
+        case 'u': {
+          ++m_pos;
+          auto unit = parseHex4();
+          if (!unit)
+            return Failure{unit.error()};
+          char16_t code = *unit;
+          if (code >= 0xD800 && code <= 0xDBFF) {
+            // High surrogate: must be immediately followed by a low
+            // surrogate escape, or the pair is malformed.
+            if (m_pos + 1 >= m_bytes.size() || m_bytes[m_pos] != '\\' ||
+                m_bytes[m_pos + 1] != 'u')
+              return failAt("lone high surrogate in \\u escape (missing low "
+                            "surrogate)");
+            m_pos += 2;
+            auto low = parseHex4();
+            if (!low)
+              return Failure{low.error()};
+            if (*low < 0xDC00 || *low > 0xDFFF)
+              return failAt("high surrogate not followed by a valid low "
+                            "surrogate");
+            // This appends two code units at once, so the one-unit
+            // headroom already checked above is not enough on its own.
+            if (out.size() + 2 > m_limits.maxStringLength)
+              return failAt(
+                  "string literal exceeds the maximum allowed length");
+            out += QChar(code);
+            out += QChar(*low);
+          } else if (code >= 0xDC00 && code <= 0xDFFF) {
+            return failAt("lone low surrogate in \\u escape");
+          } else {
+            out += QChar(code);
+          }
+          break;
+        }
+        default:
+          return failAt("invalid escape sequence");
+        }
+        continue;
+      }
+      if (c < 0x20)
+        return failAt("unescaped control character in string literal");
+      if (c < 0x80) {
+        out += QChar::fromLatin1(static_cast<char>(c));
+        ++m_pos;
+        continue;
+      }
+      auto codepoint = parseUtf8Sequence();
+      if (!codepoint)
+        return Failure{codepoint.error()};
+      char32_t cp = *codepoint;
+      if (cp <= 0xFFFF) {
+        out += QChar(static_cast<char16_t>(cp));
+      } else {
+        cp -= 0x10000;
+        // A codepoint above the BMP appends two code units at once (a
+        // surrogate pair), so re-verify room for both before appending.
+        if (out.size() + 2 > m_limits.maxStringLength)
+          return failAt("string literal exceeds the maximum allowed length");
+        out += QChar(static_cast<char16_t>(0xD800 + (cp >> 10)));
+        out += QChar(static_cast<char16_t>(0xDC00 + (cp & 0x3FF)));
+      }
+    }
+  }
+
+  [[nodiscard]] ValueOrError<char16_t> parseHex4() {
+    if (m_pos + 4 > m_bytes.size())
+      return failAt("truncated \\u escape, expected 4 hex digits");
+    char16_t value = 0;
+    for (int i = 0; i < 4; ++i) {
+      char c = m_bytes[m_pos + i];
+      if (!isHexDigit(c))
+        return failAt("invalid hex digit in \\u escape");
+      value = static_cast<char16_t>((value << 4) | hexValue(c));
+    }
+    m_pos += 4;
+    return value;
+  }
+
+  // Decodes one well-formed UTF-8 sequence starting at m_pos (already known
+  // to be a lead byte >= 0x80), rejecting overlong encodings, surrogate
+  // code points, out-of-range code points, and truncated/invalid
+  // continuation bytes.
+  [[nodiscard]] ValueOrError<char32_t> parseUtf8Sequence() {
+    unsigned char lead = static_cast<unsigned char>(m_bytes[m_pos]);
+    int length;
+    char32_t codepoint;
+    char32_t minCodepoint;
+    if ((lead & 0xE0) == 0xC0) {
+      length = 2;
+      codepoint = lead & 0x1F;
+      minCodepoint = 0x80;
+    } else if ((lead & 0xF0) == 0xE0) {
+      length = 3;
+      codepoint = lead & 0x0F;
+      minCodepoint = 0x800;
+    } else if ((lead & 0xF8) == 0xF0) {
+      length = 4;
+      codepoint = lead & 0x07;
+      minCodepoint = 0x10000;
+    } else {
+      return failAt("invalid UTF-8 lead byte");
+    }
+    if (m_pos + length > m_bytes.size())
+      return failAt("truncated UTF-8 sequence");
+    for (int i = 1; i < length; ++i) {
+      unsigned char cont = static_cast<unsigned char>(m_bytes[m_pos + i]);
+      if ((cont & 0xC0) != 0x80)
+        return failAt("invalid UTF-8 continuation byte");
+      codepoint = (codepoint << 6) | (cont & 0x3F);
+    }
+    m_pos += length;
+    if (codepoint < minCodepoint)
+      return failAt("overlong UTF-8 encoding");
+    if (codepoint >= 0xD800 && codepoint <= 0xDFFF)
+      return failAt("UTF-8 encodes a surrogate code point");
+    if (codepoint > 0x10FFFF)
+      return failAt("UTF-8 code point out of Unicode range");
+    return codepoint;
+  }
+
+  // `depth` here is already the depth at which *this container's own
+  // members/elements* live -- i.e. one deeper than the array/object
+  // literal itself -- because the only caller, parseValue(parentDepth),
+  // unconditionally checks `parentDepth > m_limits.maxDepth` for
+  // *whatever value it is about to parse* (scalar, array, or object)
+  // before ever inspecting the next character, and only then dispatches
+  // here via parseArray(parentDepth + 1)/parseObject(parentDepth + 1).
+  // That means this array/object literal's own nesting level is always
+  // validated by its caller before this function is ever entered, so an
+  // empty container (the early "peek() == ']'"/"peek() == '}'" return
+  // below, with no elements/members left to check at `depth`) needs no
+  // depth check of its own here -- it would be redundant with the check
+  // parseValue() already performed for this exact node. Every genuine
+  // element/member IS still checked at `depth` via each parseValue(depth)
+  // call in the loop below, exactly mirroring toExactQJsonInner()'s
+  // identical check-before-dispatch-then-recurse-at-depth+1 pattern (see
+  // its own doc comment) -- see
+  // parseAcceptsEmptyArrayExactlyAtMaxDepthAndRejectsOneDeeper()/
+  // parseAcceptsEmptyObjectExactlyAtMaxDepthAndRejectsOneDeeper() in
+  // RawJsonTests.cpp for a direct empirical proof through Value::parse()
+  // itself.
+  [[nodiscard]] ValueOrError<Value> parseArray(int depth) {
+    ++m_pos; // '['
+    Value v;
+    v.m_kind = Value::Kind::Array;
+    skipWhitespace();
+    if (!atEnd() && peek() == ']') {
+      ++m_pos;
+      return v;
+    }
+    for (;;) {
+      skipWhitespace();
+      if (v.m_array.size() >= m_limits.maxArrayElements)
+        return failAt("array exceeds the maximum allowed element count");
+      auto element = parseValue(depth);
+      if (!element)
+        return Failure{element.error()};
+      v.m_array.append(std::move(*element));
+      skipWhitespace();
+      if (atEnd())
+        return failAt("unterminated array, expected ',' or ']'");
+      if (peek() == ',') {
+        ++m_pos;
+        continue;
+      }
+      if (peek() == ']') {
+        ++m_pos;
+        return v;
+      }
+      return failAt("expected ',' or ']' in array");
+    }
+  }
+
+  // See parseArray()'s doc comment immediately above: the identical
+  // reasoning applies here (`depth` is already this object's own
+  // members' depth, validated for this object literal itself by the
+  // parseValue() call that dispatched into parseObject(depth) in the
+  // first place).
+  [[nodiscard]] ValueOrError<Value> parseObject(int depth) {
+    ++m_pos; // '{'
+    Value v;
+    v.m_kind = Value::Kind::Object;
+    skipWhitespace();
+    if (!atEnd() && peek() == '}') {
+      ++m_pos;
+      return v;
+    }
+    for (;;) {
+      skipWhitespace();
+      if (v.m_object.size() >= m_limits.maxObjectMembers)
+        return failAt("object exceeds the maximum allowed member count");
+      if (atEnd() || peek() != '"')
+        return failAt("expected a string key in object");
+      auto key = parseStringText();
+      if (!key)
+        return Failure{key.error()};
+      if (v.m_objectIndex.contains(*key))
+        return failAt(QStringLiteral("duplicate object key '%1'").arg(*key));
+      skipWhitespace();
+      if (atEnd() || peek() != ':')
+        return failAt("expected ':' after object key");
+      ++m_pos;
+      skipWhitespace();
+      auto value = parseValue(depth);
+      if (!value)
+        return Failure{value.error()};
+      v.m_objectIndex.insert(*key, v.m_object.size());
+      v.m_object.append({std::move(*key), std::move(*value)});
+      skipWhitespace();
+      if (atEnd())
+        return failAt("unterminated object, expected ',' or '}'");
+      if (peek() == ',') {
+        ++m_pos;
+        continue;
+      }
+      if (peek() == '}') {
+        ++m_pos;
+        return v;
+      }
+      return failAt("expected ',' or '}' in object");
+    }
+  }
+};
+
+ValueOrError<Value> Value::parse(QByteArrayView bytes, QStringView path,
+                                 const ParseLimits &limits) {
+  // ParseLimits bounds a document's *shape* (depth/counts/lengths) before
+  // any container grows, but a pathological-yet-in-bounds combination
+  // (e.g. many objects each holding many long-but-within-limit strings)
+  // can still exhaust available memory on a resource-constrained device.
+  // Rather than let that surface as Qt's fatal qBadAlloc()-driven abort,
+  // catch the standard allocation-failure exception at this canonical
+  // parse boundary and report it as a typed decode failure like any other
+  // malformed input, instead of terminating the process.
+  try {
+    Parser parser(bytes, path, limits);
+    return parser.parseDocument();
+  } catch (const std::bad_alloc &) {
+    return Failure{QStringLiteral("%1: parsing exhausted available memory")
+                       .arg(path.toString())};
+  }
+}
+
+bool Value::contains(QLatin1StringView key) const {
+  if (m_kind != Kind::Object)
+    return false;
+  return m_objectIndex.contains(QString(key));
+}
+
+Value Value::value(QLatin1StringView key) const {
+  if (m_kind != Kind::Object)
+    return {};
+  const auto it = m_objectIndex.constFind(QString(key));
+  if (it == m_objectIndex.constEnd())
+    return {};
+  return m_object[*it].second;
+}
+
+std::optional<Value> Value::find(QLatin1StringView key) const {
+  if (m_kind != Kind::Object)
+    return std::nullopt;
+  const auto it = m_objectIndex.constFind(QString(key));
+  if (it == m_objectIndex.constEnd())
+    return std::nullopt;
+  return m_object[*it].second;
+}
+
+QStringList Value::keys() const {
+  QStringList result;
+  if (m_kind != Kind::Object)
+    return result;
+  result.reserve(m_object.size());
+  for (const auto &[k, v] : m_object)
+    result.append(k);
+  return result;
+}
+
+// Declared publicly in RawJson.h (see its doc comment there for the
+// rationale for exposing this outside RawJson.cpp): also shared with
+// appendJsonEncodedString()'s own surrogate handling below, and with
+// toExactQJsonInner()'s String/object-key checks a few lines down. A
+// QString -- unlike Value::parse()'s own input -- can be constructed
+// programmatically to hold a lone/mismatched UTF-16 surrogate (e.g. via
+// QString::fromRawData() or by slicing a valid string between a surrogate
+// pair); toExactQJson() must reject one exactly like toJsonBytes() does,
+// rather than silently building a QJsonValue no downstream UTF-8
+// serializer could faithfully encode.
+bool hasLoneSurrogate(const QString &s) {
+  for (qsizetype i = 0; i < s.size(); ++i) {
+    const QChar ch = s[i];
+    if (ch.isHighSurrogate()) {
+      if (i + 1 < s.size() && s[i + 1].isLowSurrogate()) {
+        ++i;
+        continue;
+      }
+      return true;
+    }
+    if (ch.isLowSurrogate())
+      return true;
+  }
+  return false;
+}
+
+ValueOrError<QJsonValue> Value::toExactQJsonInner(const ParseLimits &limits,
+                                                  int depth,
+                                                  qsizetype &totalNodes) const {
+  // Mirrors toJsonBytesInner()'s own bookkeeping exactly (see its doc
+  // comment / definition below): every node -- scalar or container --
+  // counts once against maxTotalNodes and is checked against maxDepth at
+  // its own nesting level *before* dispatching on kind, using the same
+  // `depth > limits.maxDepth` bound recursing at depth + 1 into children.
+  // Checking depth uniformly here (rather than only inside the
+  // Array/Object cases below) matters at the boundary: a leaf scalar
+  // sitting exactly one level past maxDepth (reached only because its
+  // *parent* container's shallower depth passed) must still be rejected
+  // here, exactly as it would be by parseValue()/toJsonBytesInner() --
+  // not silently accepted because scalars have no bound of their own.
+  // Likewise using `>` (not `>=`) lets a well-formed container sitting
+  // exactly at depth == maxDepth (e.g. an empty array with no children to
+  // push past the limit) still succeed, matching what parse()/
+  // toJsonBytes() themselves accept for the identical bytes; a stricter
+  // `>=` here would reject input the rest of this type accepts, a
+  // pathological or adversarially deep/wide programmatically-built AST
+  // still cannot recurse unboundedly or exhaust memory converting it to a
+  // QJsonValue tree, any more than it could serializing straight to
+  // bytes.
+  if (depth > limits.maxDepth)
+    return failure(QStringLiteral(
+        "Value::toExactQJson: nesting depth exceeds the configured "
+        "maximum"));
+  if (++totalNodes > limits.maxTotalNodes)
+    return failure(QStringLiteral(
+        "Value::toExactQJson: total node count exceeds the configured "
+        "limit"));
+  switch (m_kind) {
+  case Kind::Undefined:
+    // Only meaningful at the top level (the whole value is absent; see
+    // toExactQJson() below) -- a nested occurrence is rejected by the
+    // Array/Object cases below, which never call back in here for an
+    // Undefined child without checking the result first.
+    return QJsonValue(QJsonValue::Undefined);
+  case Kind::Null:
+    return QJsonValue(QJsonValue::Null);
+  case Kind::Bool:
+    return QJsonValue(m_bool);
+  case Kind::String:
+    if (m_string.size() > limits.maxStringLength)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: string exceeds the configured maximum "
+          "length"));
+    if (hasLoneSurrogate(m_string))
+      return failure(QStringLiteral(
+          "Value::toExactQJson: string contains a lone UTF-16 surrogate "
+          "code unit, which cannot be encoded as valid UTF-8"));
+    return QJsonValue(m_string);
+  case Kind::Number:
+    // Mirrors toJsonBytesInner()'s own per-part digit-count check (and its
+    // empty-coefficient guard) *before* ever calling toExactInt64(): a
+    // RawNumber parsed under wider custom ParseLimits.maxNumberDigits (or
+    // built programmatically) could otherwise round-trip through this
+    // function -- and every public request toJson() layered on top of it
+    // -- while the exact same Value would be rejected by toJsonBytes()
+    // under `limits`. A canonical, bounded "exact QJson" conversion must
+    // never be *more* permissive than the byte encoder it exists
+    // alongside; without this check, `limits` was accepted as a parameter
+    // here but silently ignored for every Number.
+    if (m_number.integerDigits().isEmpty())
+      return failure(
+          QStringLiteral("Value::toExactQJson: number has no digits"));
+    if (m_number.integerDigits().size() > limits.maxNumberDigits ||
+        m_number.fractionDigits().size() > limits.maxNumberDigits ||
+        m_number.exponentDigits().size() > limits.maxNumberDigits)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: number literal exceeds the configured "
+          "maximum digit count"));
+    // Preserve full int64 precision whenever the literal is mathematically
+    // integral and in range (see RawNumber::toExactInt64()); every other
+    // literal (a genuine decimal, or an integral value outside qint64's
+    // range) has no exact QJsonValue representation, so this is a typed
+    // failure rather than a lossy conversion's silent
+    // double-rounding fallback.
+    if (auto exact = m_number.toExactInt64())
+      return QJsonValue(*exact);
+    return failure(
+        QStringLiteral(
+            "Value::toExactQJson: numeric literal \"%1\" cannot be represented "
+            "exactly as a QJsonValue; use toJsonBytes()/the raw AST instead")
+            .arg(m_number.literal()));
+  case Kind::Array: {
+    if (m_array.size() > limits.maxArrayElements)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: array exceeds the configured maximum "
+          "element count"));
+    QJsonArray array;
+    for (qsizetype i = 0; i < m_array.size(); ++i) {
+      auto element =
+          m_array.at(i).toExactQJsonInner(limits, depth + 1, totalNodes);
+      if (!element)
+        return failure(QStringLiteral("[%1]: %2").arg(i).arg(element.error()));
+      if (element->isUndefined())
+        // An array element can never be Undefined in valid JSON (unlike an
+        // object key, there is no way to "omit" one array slot -- the
+        // element must be null or absent entirely by shortening the
+        // array); embedding one anyway would need QJsonArray::append() to
+        // silently drop or corrupt the index, exactly the kind of silent
+        // data loss this function exists to prevent.
+        return failure(
+            QStringLiteral(
+                "[%1]: cannot represent an embedded Undefined value inside an "
+                "array")
+                .arg(i));
+      array.append(*element);
+    }
+    return QJsonValue(array);
+  }
+  case Kind::Object: {
+    if (m_object.size() > limits.maxObjectMembers)
+      return failure(QStringLiteral(
+          "Value::toExactQJson: object exceeds the configured maximum "
+          "member count"));
+    QJsonObject object;
+    QSet<QString> seenKeys;
+    seenKeys.reserve(m_object.size());
+    for (const auto &[k, v] : m_object) {
+      if (k.size() > limits.maxStringLength)
+        return failure(QStringLiteral(
+            "Value::toExactQJson: object key exceeds the configured "
+            "maximum length"));
+      if (hasLoneSurrogate(k))
+        return failure(QStringLiteral(
+            "Value::toExactQJson: object key contains a lone UTF-16 "
+            "surrogate code unit, which cannot be encoded as valid UTF-8"));
+      // Unlike toJsonBytesInner()'s own duplicate-key check (which rejects
+      // during *serialization*), this guards conversion to an in-memory
+      // QJsonObject: QJsonObject::insert() silently overwrites an existing
+      // key rather than erroring, so without this check a
+      // programmatically-built Value with a repeated key (a transiently
+      // constructible but invalid state -- see makeObject()'s own doc
+      // comment) would let toExactQJson() quietly keep only the *last*
+      // occurrence's value, an entirely different (and silently
+      // corrupted) result from toJsonBytes()'s typed rejection of the
+      // same input.
+      if (seenKeys.contains(k))
+        return failure(
+            QStringLiteral("Value::toExactQJson: duplicate object key '%1'")
+                .arg(k));
+      seenKeys.insert(k);
+      auto value = v.toExactQJsonInner(limits, depth + 1, totalNodes);
+      if (!value)
+        return failure(QStringLiteral("%1: %2").arg(k, value.error()));
+      if (value->isUndefined())
+        // Unlike this function's own top-level Undefined case (see above),
+        // a *nested* Undefined member has no valid JSON spelling: Qt's
+        // QJsonObject::insert() silently drops the key entirely for an
+        // Undefined value rather than storing an explicit placeholder, so
+        // without this check the key -- and whatever it represented --
+        // would vanish from the result with no error and no trace,
+        // changing the represented data as surely as the duplicate-key
+        // collapse above.
+        return failure(
+            QStringLiteral(
+                "%1: cannot represent an embedded Undefined value inside an "
+                "object")
+                .arg(k));
+      object.insert(k, *value);
+    }
+    return QJsonValue(object);
+  }
+  }
+  return QJsonValue(QJsonValue::Undefined);
+}
+
+ValueOrError<QJsonValue> Value::toExactQJson() const {
+  qsizetype totalNodes = 0;
+  return toExactQJsonInner(ParseLimits::production(), 0, totalNodes);
+}
+
+ValueOrError<QJsonObject> Value::toExactQJsonObject() const {
+  if (m_kind != Kind::Object)
+    return failure(
+        QStringLiteral("Value::toExactQJsonObject: expected an object, got %1")
+            .arg(typeName(*this)));
+  auto exact = toExactQJson();
+  if (!exact)
+    return failure(exact.error());
+  // Kind::Object above guarantees toExactQJsonInner's Object branch ran,
+  // which only ever returns QJsonValue(QJsonObject) or a typed failure --
+  // never any other QJsonValue::Type -- so this is a lossless view, not a
+  // narrowing/defensive fallback.
+  return exact->toObject();
+}
+
+ValueOrError<QJsonArray> Value::toExactQJsonArray() const {
+  if (m_kind != Kind::Array)
+    return failure(
+        QStringLiteral("Value::toExactQJsonArray: expected an array, got %1")
+            .arg(typeName(*this)));
+  auto exact = toExactQJson();
+  if (!exact)
+    return failure(exact.error());
+  // Kind::Array above guarantees toExactQJsonInner's Array branch ran,
+  // which only ever returns QJsonValue(QJsonArray) or a typed failure --
+  // never any other QJsonValue::Type -- so this is a lossless view, not a
+  // narrowing/defensive fallback (see toExactQJsonObject()'s identical
+  // reasoning just above).
+  return exact->toArray();
+}
+
+Value Value::makeNull() {
+  Value v;
+  v.m_kind = Kind::Null;
+  return v;
+}
+
+Value Value::makeBool(bool value) {
+  Value v;
+  v.m_kind = Kind::Bool;
+  v.m_bool = value;
+  return v;
+}
+
+Value Value::makeNumber(RawNumber value) {
+  Value v;
+  v.m_kind = Kind::Number;
+  v.m_number = std::move(value);
+  return v;
+}
+
+Value Value::makeString(QString value) {
+  Value v;
+  v.m_kind = Kind::String;
+  v.m_string = std::move(value);
+  return v;
+}
+
+Value Value::makeArray(QList<Value> elements) {
+  Value v;
+  v.m_kind = Kind::Array;
+  v.m_array = std::move(elements);
+  return v;
+}
+
+Value Value::makeObject(QList<std::pair<QString, Value>> members) {
+  Value v;
+  v.m_kind = Kind::Object;
+  v.m_objectIndex.reserve(members.size());
+  for (qsizetype i = 0; i < members.size(); ++i) {
+    // First-occurrence wins for a transiently duplicate-keyed input (an
+    // invalid state toJsonBytes()'s own duplicate-key check rejects
+    // before it could ever be re-serialized), matching contains()/
+    // value()'s previous linear-scan behavior of returning the first
+    // match exactly.
+    if (!v.m_objectIndex.contains(members[i].first))
+      v.m_objectIndex.insert(members[i].first, i);
+  }
+  v.m_object = std::move(members);
+  return v;
+}
+
+ValueOrError<Value> Value::fromQJson(const QJsonValue &qv) {
+  switch (qv.type()) {
+  case QJsonValue::Null:
+    return makeNull();
+  case QJsonValue::Bool:
+    return makeBool(qv.toBool());
+  case QJsonValue::Double: {
+    const double d = qv.toDouble();
+    if (!std::isfinite(d))
+      return failure(
+          QStringLiteral("cannot convert a non-finite number to JSON"));
+    if (std::trunc(d) == d) {
+      // Always attempt the exact-integer round-trip, regardless of `d`'s
+      // magnitude: toInteger() reads the QJsonValue's underlying storage
+      // directly rather than approximating through `d`, so it recovers
+      // the true stored qint64 even right at the qint64 boundary, where
+      // `d` itself is already only an approximation (e.g. qint64::max()
+      // rounds UP to 2^63 as a double). A prior version of this function
+      // additionally gated this path on `std::abs(d) < 9.2e18`, which
+      // excluded exactly that boundary region and silently fell through
+      // to the lossy decimal-text fallback below for large-but-valid
+      // integers.
+      const qint64 asInt = qv.toInteger();
+      if (static_cast<double>(asInt) == d)
+        return makeNumber(RawNumber::fromInt64(asInt));
+    }
+    const QString text = QString::number(d, 'g', 17);
+    auto parsed = Value::parse(text.toUtf8(), QStringView());
+    if (!parsed || !parsed->isNumber())
+      return failure(
+          QStringLiteral("internal error converting number %1 to JSON")
+              .arg(text));
+    return *parsed;
+  }
+  case QJsonValue::String:
+    return makeString(qv.toString());
+  case QJsonValue::Array: {
+    const QJsonArray arr = qv.toArray();
+    QList<Value> elements;
+    elements.reserve(arr.size());
+    for (const auto &e : arr) {
+      auto element = fromQJson(e);
+      if (!element)
+        return failure(element.error());
+      elements.append(std::move(*element));
+    }
+    return makeArray(std::move(elements));
+  }
+  case QJsonValue::Object: {
+    const QJsonObject obj = qv.toObject();
+    QList<std::pair<QString, Value>> members;
+    members.reserve(obj.size());
+    for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
+      auto member = fromQJson(it.value());
+      if (!member)
+        return failure(member.error());
+      members.append({it.key(), std::move(*member)});
+    }
+    return makeObject(std::move(members));
+  }
+  case QJsonValue::Undefined:
+    return Value{};
+  }
+  return Value{};
+}
+
+namespace {
+// UTF-8-encodes and JSON-string-escapes `s`, appending to `out`. Handles
+// UTF-16 surrogate pairs (recombining into a single codepoint before
+// UTF-8 encoding) and escapes only what RFC 8259 requires (control
+// characters, '"', '\\'); every other Unicode character is emitted as
+// literal (encoded) UTF-8 bytes, which is valid directly inside a JSON
+// string with no escape needed.
+//
+// Returns false (leaving `out` in an unspecified, not-necessarily-valid
+// state the caller must discard) for a lone high surrogate not followed
+// by a matching low surrogate, or a lone low surrogate not preceded by a
+// consumed high surrogate: `s` is a QString, which -- unlike Value::parse()
+// 's own input -- can be constructed programmatically (e.g. via
+// QString::fromRawData() over ill-formed UTF-16, or by slicing a valid
+// string between a surrogate pair) to hold such an ill-formed code unit.
+// Encoding one directly as three UTF-8 bytes (as naive surrogate-oblivious
+// code does) produces a byte sequence RFC 8259/RFC 3629 both forbid, so
+// this function makes emitting it impossible rather than emitting invalid
+// JSON.
+[[nodiscard]] bool appendJsonEncodedString(QByteArray &out, const QString &s) {
+  out += '"';
+  for (qsizetype i = 0; i < s.size(); ++i) {
+    const QChar ch = s[i];
+    char32_t codepoint = ch.unicode();
+    if (ch.isHighSurrogate() && i + 1 < s.size() && s[i + 1].isLowSurrogate()) {
+      codepoint = QChar::surrogateToUcs4(ch, s[i + 1]);
+      ++i;
+    } else if (ch.isHighSurrogate() || ch.isLowSurrogate()) {
+      return false;
+    }
+    switch (codepoint) {
+    case '"':
+      out += "\\\"";
+      continue;
+    case '\\':
+      out += "\\\\";
+      continue;
+    case '\b':
+      out += "\\b";
+      continue;
+    case '\f':
+      out += "\\f";
+      continue;
+    case '\n':
+      out += "\\n";
+      continue;
+    case '\r':
+      out += "\\r";
+      continue;
+    case '\t':
+      out += "\\t";
+      continue;
+    default:
+      break;
+    }
+    if (codepoint < 0x20) {
+      static constexpr char kHex[] = "0123456789abcdef";
+      out += "\\u00";
+      out += kHex[(codepoint >> 4) & 0xF];
+      out += kHex[codepoint & 0xF];
+      continue;
+    }
+    // Encode as UTF-8 directly; valid inside a JSON string unescaped.
+    if (codepoint < 0x80) {
+      out += static_cast<char>(codepoint);
+    } else if (codepoint < 0x800) {
+      out += static_cast<char>(0xC0 | (codepoint >> 6));
+      out += static_cast<char>(0x80 | (codepoint & 0x3F));
+    } else if (codepoint < 0x10000) {
+      out += static_cast<char>(0xE0 | (codepoint >> 12));
+      out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+      out += static_cast<char>(0x80 | (codepoint & 0x3F));
+    } else {
+      out += static_cast<char>(0xF0 | (codepoint >> 18));
+      out += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+      out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+      out += static_cast<char>(0x80 | (codepoint & 0x3F));
+    }
+  }
+  out += '"';
+  return true;
+}
+} // namespace
+
+ValueOrError<QByteArray> Value::toJsonBytes(const ParseLimits &limits) const {
+  // See Value::parse()'s matching try/catch: a programmatically-built AST
+  // that satisfies every ParseLimits bound can still exhaust memory while
+  // serializing (e.g. concatenating many long-but-in-bounds strings into
+  // the output buffer); fail typed rather than let Qt's allocator abort.
+  try {
+    qsizetype totalNodes = 0;
+    return toJsonBytesInner(limits, 0, totalNodes);
+  } catch (const std::bad_alloc &) {
+    return Failure{QStringLiteral(
+        "Json::Value::toJsonBytes: serialization exhausted available "
+        "memory")};
+  }
+}
+
+ValueOrError<QByteArray> Value::toJsonBytesInner(const ParseLimits &limits,
+                                                 int depth,
+                                                 qsizetype &totalNodes) const {
+  if (depth > limits.maxDepth)
+    return failure(QStringLiteral(
+        "Json::Value::toJsonBytes: nesting depth exceeds the maximum "
+        "allowed"));
+  if (++totalNodes > limits.maxTotalNodes)
+    return failure(QStringLiteral(
+        "Json::Value::toJsonBytes: document exceeds the maximum allowed "
+        "total node count"));
+  switch (m_kind) {
+  case Kind::Undefined:
+    return failure(QStringLiteral(
+        "Json::Value::toJsonBytes: cannot serialize an undefined value"));
+  case Kind::Null:
+    return QByteArray("null");
+  case Kind::Bool:
+    return QByteArray(m_bool ? "true" : "false");
+  case Kind::Number:
+    // RawNumber's default constructor now yields the canonical "0" (see
+    // RawNumber's own doc comment in RawJson.h), and its copy/pseudo-move
+    // operations always preserve a valid digit string, so an empty
+    // m_intDigits is no longer reachable through any publicly documented
+    // construction path (default construction, Value::parse(),
+    // RawNumber::fromInt64(), copy, or move). This check is retained as
+    // pure defense-in-depth -- e.g. against a future internal path that
+    // might bypass RawNumber's own invariants -- so literal() can never
+    // silently emit an empty, syntactically-invalid token with no other
+    // check in this function ever catching that.
+    if (m_number.integerDigits().isEmpty())
+      return failure(
+          QStringLiteral("Json::Value::toJsonBytes: number has no digits"));
+    // Mirrors Parser::parseNumber()'s own per-part digit-count check: a
+    // programmatically-built RawNumber must not be able to emit an
+    // unbounded literal (e.g. via RawNumber::fromInt64() composed with a
+    // pathological fraction/exponent no parse() would ever have accepted)
+    // any more than a parsed one can.
+    if (m_number.integerDigits().size() > limits.maxNumberDigits ||
+        m_number.fractionDigits().size() > limits.maxNumberDigits ||
+        m_number.exponentDigits().size() > limits.maxNumberDigits)
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: number literal exceeds the maximum "
+          "allowed digit count"));
+    return m_number.literal().toUtf8();
+  case Kind::String: {
+    if (m_string.size() > limits.maxStringLength)
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: string exceeds the maximum allowed "
+          "length"));
+    QByteArray out;
+    if (!appendJsonEncodedString(out, m_string))
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: string contains a lone UTF-16 "
+          "surrogate code unit, which cannot be encoded as valid UTF-8"));
+    return out;
+  }
+  case Kind::Array: {
+    if (m_array.size() > limits.maxArrayElements)
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: array exceeds the maximum allowed "
+          "element count"));
+    QByteArray out = "[";
+    bool first = true;
+    for (const auto &element : m_array) {
+      if (!first)
+        out += ',';
+      first = false;
+      auto encoded = element.toJsonBytesInner(limits, depth + 1, totalNodes);
+      if (!encoded)
+        return failure(encoded.error());
+      out += *encoded;
+    }
+    out += ']';
+    return out;
+  }
+  case Kind::Object: {
+    if (m_object.size() > limits.maxObjectMembers)
+      return failure(QStringLiteral(
+          "Json::Value::toJsonBytes: object exceeds the maximum allowed "
+          "member count"));
+    QByteArray out = "{";
+    bool first = true;
+    QSet<QString> seenKeys;
+    for (const auto &[key, value] : m_object) {
+      if (key.size() > limits.maxStringLength)
+        return failure(QStringLiteral(
+            "Json::Value::toJsonBytes: object key exceeds the maximum "
+            "allowed length"));
+      // Mirrors Value::parse()'s own duplicate-key rejection: a
+      // programmatically-built AST must not be able to emit a duplicate
+      // object key any more than a parsed one can (see the class comment
+      // on injection safety).
+      if (seenKeys.contains(key))
+        return failure(
+            QStringLiteral(
+                "Json::Value::toJsonBytes: duplicate object key '%1'")
+                .arg(key));
+      seenKeys.insert(key);
+      if (!first)
+        out += ',';
+      first = false;
+      if (!appendJsonEncodedString(out, key))
+        return failure(QStringLiteral(
+            "Json::Value::toJsonBytes: object key contains a lone UTF-16 "
+            "surrogate code unit, which cannot be encoded as valid UTF-8"));
+      out += ':';
+      auto encoded = value.toJsonBytesInner(limits, depth + 1, totalNodes);
+      if (!encoded)
+        return failure(encoded.error());
+      out += *encoded;
+    }
+    out += '}';
+    return out;
+  }
+  }
+  return failure(QStringLiteral("Json::Value::toJsonBytes: unknown kind"));
+}
+
+QString RawNumber::literal() const {
+  QString out;
+  if (m_negative)
+    out += QChar::fromLatin1('-');
+  out += m_intDigits;
+  if (!m_fracDigits.isEmpty()) {
+    out += QChar::fromLatin1('.');
+    out += m_fracDigits;
+  }
+  if (m_hasExponent) {
+    out += QChar::fromLatin1('e');
+    if (m_exponentNegative)
+      out += QChar::fromLatin1('-');
+    out += m_expDigits;
+  }
+  return out;
+}
+
+std::optional<qint64> RawNumber::toInt64() const {
+  if (hasFraction() || hasExponent())
+    return std::nullopt;
+  // No separate "empty coefficient" guard is needed here the way
+  // toExactInt64() below needs one: an empty m_intDigits makes `text`
+  // either empty or the lone sign character "-", and
+  // QString::toLongLong() already fails (returns ok=false) on both,
+  // rather than vacuously succeeding the way an all-zero-digit loop
+  // would.
+  QString text = (m_negative ? QStringLiteral("-") : QString()) + m_intDigits;
+  bool ok = false;
+  qint64 value = text.toLongLong(&ok);
+  if (!ok)
+    return std::nullopt;
+  return value;
+}
+
+namespace {
+// Parses an unsigned decimal digit string (no sign) into a qint64
+// magnitude, given `negative` to select the valid bound (INT64_MAX for a
+// positive value, -INT64_MIN == 9223372036854775808 for a negative one --
+// both have exactly 19 digits). Never computes an intermediate value that
+// could itself overflow: a digit count above 19 (after stripping leading
+// zeros) is rejected outright, and an exact 19-digit string is compared
+// digit-by-digit against the bound's text before any arithmetic runs.
+std::optional<quint64> parseMagnitudeDigits(QStringView digits, bool negative) {
+  qsizetype start = 0;
+  while (start < digits.size() - 1 && digits[start] == u'0')
+    ++start;
+  const QStringView trimmed = digits.mid(start);
+  if (trimmed.size() > 19)
+    return std::nullopt;
+  if (trimmed.size() == 19) {
+    const QStringView bound =
+        negative ? u"9223372036854775808" : u"9223372036854775807";
+    for (qsizetype i = 0; i < 19; ++i) {
+      if (trimmed[i] < bound[i])
+        break;
+      if (trimmed[i] > bound[i])
+        return std::nullopt;
+    }
+  }
+  quint64 value = 0;
+  for (const QChar ch : trimmed)
+    value = value * 10 + static_cast<quint64>(ch.unicode() - u'0');
+  return value;
+}
+} // namespace
+
+std::optional<qint64> RawNumber::toExactInt64() const {
+  // A syntactically valid JSON number (RFC 8259: `-? int frac? exp?`)
+  // always has a non-empty `int` part -- the friend Parser never produces
+  // one otherwise, and this class's default constructor/fromInt64()
+  // above never leave it empty either, and (see the explicitly-declared
+  // copy constructor/assignment above) a moved-from RawNumber no longer
+  // can either. Reject an empty m_intDigits explicitly here, before the
+  // all-zero shortcut below, as defense in depth regardless: an empty
+  // digit string would otherwise vacuously satisfy that loop's "every
+  // digit is zero" check (there are no digits to fail it) and silently
+  // answer 0 for a value that literal()/toJsonBytes() correctly treat as
+  // an unrepresentable digit-less coefficient -- this keeps
+  // toExactInt64() consistent with that rejection instead of answering
+  // "0" for something that could never actually serialize.
+  if (m_intDigits.isEmpty())
+    return std::nullopt;
+
+  // Concatenate integer+fraction digits into one unsigned digit string;
+  // the decimal point conceptually sits at position m_intDigits.size() in
+  // that string, then is shifted further by the exponent (a positive
+  // exponent moves it right/toward the end, negative moves it left).
+  const QString digits = m_intDigits + m_fracDigits;
+
+  // A zero coefficient is exactly 0 regardless of how large a (validly
+  // parseable) exponent accompanies it -- 0 * 10^e == 0 for any finite e.
+  // Short-circuit here, before any exponent-magnitude arithmetic, so a
+  // literal like "0e9223372036854775807" is handled as the trivial exact
+  // zero it is: the decimal-point-position computation below adds the
+  // exponent to m_intDigits.size(), which would itself risk signed
+  // overflow for an exponent this large, even though the exponent's
+  // magnitude is completely irrelevant to a zero coefficient's value.
+  bool allZero = true;
+  for (const QChar c : digits) {
+    if (c != u'0') {
+      allZero = false;
+      break;
+    }
+  }
+  if (allZero) {
+    // m_expDigits (when m_hasExponent is set) is only ever populated by
+    // the friend Parser as a bounded (<= maxNumberDigits), non-empty,
+    // all-ASCII-digit string -- see parseNumber() above -- so it is
+    // always syntactically valid *regardless* of whether its magnitude
+    // happens to fit in qint64. A zero coefficient is exactly 0 for any
+    // such (however large) exponent -- e.g. "0e9223372036854775808" or
+    // "-0e9223372036854775808", both one past qint64's own range and
+    // rejected by the nonzero path below, yet still exact zero per the
+    // pinned backend's Aeson Scientific decoder. Do NOT require the
+    // exponent to itself parse as a qint64 (the previous check here):
+    // that incorrectly rejected an out-of-qint64-range-but-otherwise-
+    // valid exponent on a value whose magnitude never depends on it.
+    // Defense in depth: still verify non-empty/all-digit syntax, so a
+    // hypothetical future caller constructing a malformed m_expDigits by
+    // some other means cannot get a silent 0 out of this shortcut.
+    if (m_hasExponent) {
+      if (m_expDigits.isEmpty())
+        return std::nullopt;
+      for (const QChar c : m_expDigits) {
+        if (c.unicode() < u'0' || c.unicode() > u'9')
+          return std::nullopt;
+      }
+    }
+    return qint64(0);
+  }
+
+  qint64 exponent = 0;
+  if (m_hasExponent) {
+    bool ok = false;
+    // Exponent digit strings are themselves plain unsigned decimal text;
+    // one long enough to overflow qint64 unambiguously puts the value's
+    // magnitude far outside qint64's range regardless of sign, so treat
+    // an unparseable (absurdly long) exponent as simply out of range
+    // rather than a distinct error case.
+    const qint64 magnitude = m_expDigits.toLongLong(&ok);
+    if (!ok)
+      return std::nullopt;
+    exponent = m_exponentNegative ? -magnitude : magnitude;
+  }
+  // m_intDigits.size() + exponent, computed via checked addition: a
+  // nonzero coefficient with an exponent near qint64's own extremes (e.g.
+  // "1e9223372036854775807") would otherwise overflow this addition
+  // itself (signed integer overflow is undefined behavior), well before
+  // the result could be compared against any of the range checks below.
+  // Such a literal's magnitude is astronomically outside qint64's range
+  // regardless of the exact (unrepresentable) sum, so overflow here is
+  // unconditionally treated as "out of range" rather than computed.
+  qint64 decimalPointPos = 0;
+  if (__builtin_add_overflow(static_cast<qint64>(m_intDigits.size()), exponent,
+                             &decimalPointPos))
+    return std::nullopt;
+
+  QString magnitudeDigits;
+  if (decimalPointPos >= digits.size()) {
+    // Every digit lies before the effective point; pad with trailing
+    // zeros. Bound the padding itself: anything requiring more than 19
+    // digits overall is already out of qint64's range, so there is no
+    // need to materialize an arbitrarily long padded string first.
+    const qint64 zeroPad = decimalPointPos - digits.size();
+    if (zeroPad > 19)
+      return std::nullopt;
+    magnitudeDigits = digits + QString(static_cast<int>(zeroPad), u'0');
+  } else if (decimalPointPos <= 0) {
+    // The value's magnitude is < 1 unless every digit is zero.
+    for (const QChar c : digits)
+      if (c != u'0')
+        return std::nullopt;
+    magnitudeDigits = u"0"_s;
+  } else {
+    // Digits at or past the effective point must all be zero for the
+    // value to be integral.
+    for (qsizetype i = decimalPointPos; i < digits.size(); ++i)
+      if (digits[static_cast<qsizetype>(i)] != u'0')
+        return std::nullopt;
+    magnitudeDigits = digits.left(static_cast<qsizetype>(decimalPointPos));
+  }
+  if (magnitudeDigits.isEmpty())
+    magnitudeDigits = u"0"_s;
+
+  const auto magnitude = parseMagnitudeDigits(magnitudeDigits, m_negative);
+  if (!magnitude)
+    return std::nullopt;
+  if (m_negative) {
+    constexpr quint64 kMinMagnitude =
+        static_cast<quint64>(std::numeric_limits<qint64>::max()) + 1;
+    if (*magnitude == kMinMagnitude)
+      return std::numeric_limits<qint64>::min();
+    return -static_cast<qint64>(*magnitude);
+  }
+  if (*magnitude > static_cast<quint64>(std::numeric_limits<qint64>::max()))
+    return std::nullopt;
+  return static_cast<qint64>(*magnitude);
+}
+
+double RawNumber::toDouble() const { return literal().toDouble(); }
+
+RawNumber RawNumber::fromInt64(qint64 value) {
+  RawNumber result;
+  result.m_negative = value < 0;
+  // QString::number(qint64) correctly handles the full range, including
+  // std::numeric_limits<qint64>::min() (negating it directly would
+  // overflow), so build the signed text once and split off the sign.
+  const QString text = QString::number(value);
+  result.m_intDigits = result.m_negative ? text.mid(1) : text;
+  return result;
+}
+
+} // namespace Arkham::Json

@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arkhamhorror.app/contracts/game-lifecycle.schema.json",
+  "title": "Game Lifecycle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "createGame",
+    "createGameDefaults",
+    "createGameNullDefaults",
+    "chooseDeck",
+    "continueWithoutUpgrade",
+    "claimSeat",
+    "openSeats"
+  ],
+  "properties": {
+    "createGame": {
+      "$ref": "#/$defs/createGameRequest"
+    },
+    "createGameDefaults": {
+      "$ref": "#/$defs/createGameRequest"
+    },
+    "createGameNullDefaults": {
+      "$ref": "#/$defs/createGameRequest"
+    },
+    "chooseDeck": {
+      "$ref": "#/$defs/chooseDeckRequest"
+    },
+    "continueWithoutUpgrade": {
+      "$ref": "#/$defs/chooseDeckRequest"
+    },
+    "claimSeat": {
+      "$ref": "#/$defs/claimSeatRequest"
+    },
+    "openSeats": {
+      "$ref": "#/$defs/openSeats"
+    }
+  },
+  "$defs": {
+    "campaignOption": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "tag"
+          ],
+          "properties": {
+            "tag": {
+              "enum": [
+                "PerformIntro",
+                "PlayersDoNotControlStoryAssetClues",
+                "AddLitaChantler",
+                "Cheated",
+                "TakeArmitage",
+                "TakeWarrenRice",
+                "TakeFrancisMorgan",
+                "TakeZebulonWhately",
+                "TakeEarlSawyer",
+                "TakePowderOfIbnGhazi",
+                "TakeTheNecronomicon",
+                "AddAcrossSpaceAndTime",
+                "UseSwarmPlaceholders",
+                "TakeBlackBook",
+                "TakePuzzleBox",
+                "ProceedToInterlude3",
+                "DebugOption",
+                "ManuallyPickCamp",
+                "ManuallyPickKilledInPlaneCrash",
+                "AddGreenSoapstone",
+                "AddWoodenSledge",
+                "AddDynamite",
+                "AddMiasmicCrystal",
+                "AddMineralSpecimen",
+                "AddSmallRadio",
+                "AddSpareParts",
+                "IncludePartners",
+                "FatalMiragePart1",
+                "FatalMiragePart2",
+                "FatalMiragePart3",
+                "PlayAsMiniCampaign",
+                "PlayWithTheBlobThatAteEverythingElse"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "tag",
+            "contents"
+          ],
+          "properties": {
+            "tag": {
+              "const": "CampaignVariant"
+            },
+            "contents": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "ultimatumOrBoon": {
+      "enum": [
+        "BoonOfTheAncients",
+        "BoonOfAthena",
+        "BoonOfDestiny",
+        "BoonOfHades",
+        "BoonOfHermes",
+        "BoonOfThoth",
+        "BoonOfOsiris",
+        "BoonOfTheMorrigan",
+        "BoonOfPersephone",
+        "BoonOfTheExplorer",
+        "BoonOfTheChild",
+        "UltimatumOfAgony",
+        "UltimatumOfBrokenPromises",
+        "UltimatumOfTheBrokenVeil",
+        "UltimatumOfChaos",
+        "UltimatumOfDisaster",
+        "UltimatumOfDread",
+        "UltimatumOfFailure",
+        "UltimatumOfFinality",
+        "UltimatumOfForbiddenKnowledge",
+        "UltimatumOfHardship",
+        "UltimatumOfTheHighlander",
+        "UltimatumOfInduction",
+        "UltimatumOfOrthodoxy",
+        "UltimatumOfTheScream",
+        "UltimatumOfSurvival",
+        "UltimatumOfUltimatums",
+        "UltimatumOfExile",
+        "UltimatumOfTheSpiral",
+        "UltimatumOfMalevolence"
+      ]
+    },
+    "createGameRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "deckIds",
+        "playerCount",
+        "difficulty",
+        "campaignName",
+        "multiplayerVariant",
+        "includeTarotReadings",
+        "options"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "campaignId"
+          ],
+          "properties": {
+            "campaignId": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "required": [
+            "scenarioId"
+          ],
+          "properties": {
+            "scenarioId": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ],
+      "properties": {
+        "deckIds": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          }
+        },
+        "playerCount": {
+          "type": "integer"
+        },
+        "campaignId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scenarioId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "difficulty": {
+          "enum": [
+            "Easy",
+            "Standard",
+            "Hard",
+            "Expert"
+          ]
+        },
+        "campaignName": {
+          "type": "string"
+        },
+        "multiplayerVariant": {
+          "enum": [
+            "Solo",
+            "WithFriends"
+          ]
+        },
+        "includeTarotReadings": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/campaignOption"
+          }
+        },
+        "strictAsIfAt": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "asIfRuling": {
+          "enum": [
+            "chapter1",
+            "chapter2",
+            "Chapter1AsIfRuling",
+            "Chapter2AsIfRuling",
+            null
+          ]
+        },
+        "ultimatumsAndBoons": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ultimatumOrBoon"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": []
+        },
+        "achievementsEnabled": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": true
+        }
+      }
+    },
+    "chooseDeckRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "investigatorId"
+      ],
+      "properties": {
+        "investigatorId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "deckUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deckList": {
+          "oneOf": [
+            {
+              "$ref": "decks.schema.json#/$defs/deckListInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "claimSeatRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "investigatorId"
+      ],
+      "properties": {
+        "investigatorId": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "openSeats": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^c.+$"
+      }
+    }
+  }
+}

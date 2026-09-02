@@ -1,0 +1,533 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arkhamhorror.app/contracts/catalog.schema.json",
+  "title": "Catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "cards",
+    "homebrewCards",
+    "card",
+    "investigators"
+  ],
+  "properties": {
+    "cards": {
+      "$ref": "#/$defs/cardList"
+    },
+    "homebrewCards": {
+      "$ref": "#/$defs/cardList"
+    },
+    "card": {
+      "$ref": "#/$defs/cardDef"
+    },
+    "investigators": {
+      "$ref": "#/$defs/investigatorArtwork"
+    }
+  },
+  "$defs": {
+    "cardList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/cardDef"
+      }
+    },
+    "investigatorArtwork": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "cardDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cardCode",
+        "name",
+        "cardType",
+        "art"
+      ],
+      "properties": {
+        "cardCode": {
+          "$ref": "#/$defs/cardCode"
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "revealedName": {
+          "$ref": "#/$defs/name"
+        },
+        "cost": {
+          "$ref": "#/$defs/cardCost"
+        },
+        "additionalCost": {},
+        "level": {
+          "type": "integer"
+        },
+        "cardType": {
+          "$ref": "#/$defs/cardType"
+        },
+        "cardSubType": {
+          "enum": [
+            "Weakness",
+            "BasicWeakness"
+          ]
+        },
+        "classSymbols": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/classSymbol"
+          },
+          "uniqueItems": true
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/skillIcon"
+          }
+        },
+        "cardTraits": {
+          "$ref": "#/$defs/stringSet"
+        },
+        "revealedCardTraits": {
+          "$ref": "#/$defs/stringSet"
+        },
+        "keywords": {
+          "type": "array"
+        },
+        "fastWindow": {},
+        "actions": {},
+        "revelation": {
+          "enum": [
+            "NoRevelation",
+            "IsRevelation",
+            "CannotBeCanceledRevelation"
+          ]
+        },
+        "victoryPoints": {
+          "type": "integer"
+        },
+        "vengeancePoints": {
+          "type": "integer"
+        },
+        "criteria": {},
+        "overrideActionPlayableIfCriteriaMet": {
+          "type": "boolean"
+        },
+        "commitRestrictions": {
+          "type": "array"
+        },
+        "attackOfOpportunityModifiers": {
+          "type": "array"
+        },
+        "permanent": {
+          "type": "boolean"
+        },
+        "encounterSet": {
+          "type": "string"
+        },
+        "encounterSetQuantity": {
+          "type": "integer"
+        },
+        "unique": {
+          "type": "boolean"
+        },
+        "doubleSided": {
+          "type": "boolean"
+        },
+        "limits": {
+          "type": "array"
+        },
+        "exceptional": {
+          "type": "boolean"
+        },
+        "uses": {},
+        "playableFromDiscard": {
+          "type": "boolean"
+        },
+        "stage": {
+          "type": "integer"
+        },
+        "slots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/slotType"
+          }
+        },
+        "alternateCardCodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cardCode"
+          }
+        },
+        "art": {
+          "type": "string",
+          "minLength": 1
+        },
+        "locationSymbol": {},
+        "locationRevealedSymbol": {},
+        "locationConnections": {
+          "type": "array"
+        },
+        "locationRevealedConnections": {
+          "type": "array"
+        },
+        "purchaseTrauma": {},
+        "grantedXp": {
+          "type": "integer"
+        },
+        "canReplace": {
+          "type": "boolean"
+        },
+        "deckRestrictions": {
+          "type": "array"
+        },
+        "bondedWith": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "$ref": "#/$defs/cardCode"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "skipPlayWindows": {
+          "type": "boolean"
+        },
+        "beforeEffect": {
+          "type": "boolean"
+        },
+        "customizations": {},
+        "otherSide": {
+          "$ref": "#/$defs/cardCode"
+        },
+        "whenDiscarded": {
+          "enum": [
+            "ToDiscard",
+            "ToBonded",
+            "ToSetAside"
+          ]
+        },
+        "canCommitWhenNoIcons": {
+          "type": "boolean"
+        },
+        "commitTrigger": {
+          "type": "boolean"
+        },
+        "meta": {
+          "type": "object"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outOfPlayEffects": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "InHandEffect",
+              "InDiscardEffect",
+              "InSearchEffect",
+              "OnTopOfDeckEffect"
+            ]
+          }
+        },
+        "health": {
+          "$ref": "#/$defs/gameValue"
+        },
+        "fight": {
+          "$ref": "#/$defs/gameValue"
+        },
+        "evade": {
+          "$ref": "#/$defs/gameValue"
+        },
+        "healthDamage": {
+          "$ref": "#/$defs/gameValue"
+        },
+        "sanityDamage": {
+          "$ref": "#/$defs/gameValue"
+        },
+        "alternateSkills": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/skillIcon"
+            }
+          }
+        },
+        "alternateErrata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "errata": {
+          "type": "string"
+        }
+      }
+    },
+    "cardCode": {
+      "type": "string",
+      "pattern": "^c.+$"
+    },
+    "name": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "subtitle"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "subtitle": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "cardCost": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag",
+            "contents"
+          ],
+          "properties": {
+            "tag": {
+              "const": "StaticCost"
+            },
+            "contents": {
+              "type": "integer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag"
+          ],
+          "properties": {
+            "tag": {
+              "enum": [
+                "DynamicCost",
+                "DiscardAmountCost",
+                "DeferredCost"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag",
+            "contents"
+          ],
+          "properties": {
+            "tag": {
+              "enum": [
+                "MaxDynamicCost",
+                "AnyMatchingCardCost",
+                "MatchingEnemyFieldCost"
+              ]
+            },
+            "contents": {}
+          }
+        }
+      ]
+    },
+    "cardType": {
+      "enum": [
+        "AssetType",
+        "EventType",
+        "SkillType",
+        "PlayerTreacheryType",
+        "PlayerEnemyType",
+        "TreacheryType",
+        "EnemyType",
+        "LocationType",
+        "EnemyLocationCardType",
+        "EncounterAssetType",
+        "EncounterEventType",
+        "ActType",
+        "AgendaType",
+        "StoryType",
+        "InvestigatorType",
+        "ScenarioType",
+        "KeyType"
+      ]
+    },
+    "classSymbol": {
+      "enum": [
+        "Guardian",
+        "Seeker",
+        "Survivor",
+        "Rogue",
+        "Mystic",
+        "Neutral",
+        "Mythos"
+      ]
+    },
+    "skillIcon": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag",
+            "contents"
+          ],
+          "properties": {
+            "tag": {
+              "const": "SkillIcon"
+            },
+            "contents": {
+              "enum": [
+                "SkillWillpower",
+                "SkillIntellect",
+                "SkillCombat",
+                "SkillAgility"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag"
+          ],
+          "properties": {
+            "tag": {
+              "enum": [
+                "WildIcon",
+                "WildMinusIcon"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "slotType": {
+      "enum": [
+        "HandSlot",
+        "BodySlot",
+        "AllySlot",
+        "AccessorySlot",
+        "ArcaneSlot",
+        "TarotSlot",
+        "HeadSlot"
+      ]
+    },
+    "stringSet": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "gameValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag",
+            "contents"
+          ],
+          "properties": {
+            "tag": {
+              "enum": [
+                "Static",
+                "PerPlayer"
+              ]
+            },
+            "contents": {
+              "type": "integer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag",
+            "contents"
+          ],
+          "properties": {
+            "tag": {
+              "const": "StaticWithPerPlayer"
+            },
+            "contents": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "integer"
+                }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag",
+            "contents"
+          ],
+          "properties": {
+            "tag": {
+              "const": "ByPlayerCount"
+            },
+            "contents": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              },
+              "minItems": 4,
+              "maxItems": 4
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag"
+          ],
+          "properties": {
+            "tag": {
+              "enum": [
+                "ValueX",
+                "ValueStar",
+                "ValueUnknown"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

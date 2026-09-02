@@ -1,9 +1,9 @@
 {
-  "backendCommit": "2bf2935cde121498435744a06fcf63502a80ae43",
-  "sourceRef": "djensenius/ArkhamHorror#23",
-  "schemaRevision": "0.1.11",
-  "minimumServerSchemaRevision": "0.1.11",
+  "backendCommit": "6a1befbd7b01b4a0f763e41260ae4dd1a5d14c27",
+  "sourceRef": "djensenius/ArkhamHorror#24",
+  "schemaRevision": "0.1.12",
+  "minimumServerSchemaRevision": "0.1.12",
   "nativeClientMinimumRevision": "0.1.0",
   "apiBasePath": "/api/v1",
-  "note": "Minimum metadata pinned from backend PR #23. Not a full manifest. See djensenius/ArkhamHorror contracts/ for the authoritative full contract."
+  "note": "Minimum metadata pinned from backend PR #24 (building on #20 and #22). Not a full manifest. See djensenius/ArkhamHorror contracts/ for the authoritative full contract, vendored alongside this file for catalog/deck/game-lifecycle/game-list decoding."
 }

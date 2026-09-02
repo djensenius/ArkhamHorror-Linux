@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arkhamhorror.app/contracts/decks.schema.json",
+  "title": "Decks",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "createDeck",
+    "fetchDeck",
+    "validateDeckList",
+    "normalizedDeckList",
+    "deck",
+    "validationErrors",
+    "validationSuccess",
+    "operationError"
+  ],
+  "properties": {
+    "createDeck": {
+      "$ref": "#/$defs/createDeckRequest"
+    },
+    "fetchDeck": {
+      "$ref": "#/$defs/fetchDeckRequest"
+    },
+    "validateDeckList": {
+      "$ref": "#/$defs/deckListInput"
+    },
+    "normalizedDeckList": {
+      "$ref": "#/$defs/deckList"
+    },
+    "deck": {
+      "$ref": "#/$defs/deck"
+    },
+    "validationErrors": {
+      "$ref": "#/$defs/deckValidationErrors"
+    },
+    "validationSuccess": {
+      "$ref": "#/$defs/deckValidationSuccess"
+    },
+    "operationError": {
+      "$ref": "#/$defs/deckOperationError"
+    }
+  },
+  "$defs": {
+    "cardQuantityMapInput": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "type": "integer"
+      }
+    },
+    "cardQuantityMap": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^c.+$"
+      },
+      "additionalProperties": {
+        "type": "integer"
+      }
+    },
+    "deckListInput": {
+      "type": "object",
+      "required": [
+        "slots",
+        "investigator_code"
+      ],
+      "properties": {
+        "slots": {
+          "$ref": "#/$defs/cardQuantityMapInput"
+        },
+        "sideSlots": {
+          "description": "A card-quantity object when valid. The production decoder currently replaces any value that fails to decode as that object with an empty map."
+        },
+        "investigator_code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "investigator_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "meta": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taboo_id": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "deckList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slots",
+        "sideSlots",
+        "investigator_code",
+        "investigator_name",
+        "meta",
+        "taboo_id",
+        "url",
+        "id",
+        "name"
+      ],
+      "properties": {
+        "slots": {
+          "$ref": "#/$defs/cardQuantityMap"
+        },
+        "sideSlots": {
+          "$ref": "#/$defs/cardQuantityMap"
+        },
+        "investigator_code": {
+          "type": "string",
+          "pattern": "^c.+$"
+        },
+        "investigator_name": {
+          "type": "string"
+        },
+        "meta": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taboo_id": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "createDeckRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "deckId",
+        "deckName",
+        "deckList"
+      ],
+      "properties": {
+        "deckId": {
+          "type": "string"
+        },
+        "deckName": {
+          "type": "string"
+        },
+        "deckUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deckList": {
+          "$ref": "#/$defs/deckListInput"
+        }
+      }
+    },
+    "fetchDeckRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "deck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "userId",
+        "url",
+        "name",
+        "investigatorName",
+        "list"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "userId": {
+          "type": "integer"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "investigatorName": {
+          "type": "string"
+        },
+        "list": {
+          "$ref": "#/$defs/deckList"
+        }
+      }
+    },
+    "deckListResponse": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/deck"
+      }
+    },
+    "deckValidationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tag",
+        "contents"
+      ],
+      "properties": {
+        "tag": {
+          "const": "UnimplementedCard"
+        },
+        "contents": {
+          "type": "string",
+          "pattern": "^c.+$"
+        }
+      }
+    },
+    "deckValidationErrors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/deckValidationError"
+      }
+    },
+    "deckValidationSuccess": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "deckOperationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "errorMsg"
+      ],
+      "properties": {
+        "errorMsg": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
