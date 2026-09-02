@@ -1,0 +1,46 @@
+{
+  "provenance": {
+    "note": "Full, deterministically-generated import of the real web client's own per-locale image-existence digests, replacing the earlier 10-entry hand-authored seed (see git history for that file). This is authoritative, pinned source data, not hand-curated: tools/generate_asset_locale_digest.py parses each locale's raw file below independently, validates every path against the exact category-root/extension shapes this client models, and rejects anything else outright (an unmapped root that is not explicitly listed in ignoredCategoryRoots, a malformed path, or a duplicate) rather than silently dropping or reinterpreting it. Korean (ko) is intentionally empty: the upstream source itself ships zero entries for that locale, not a data-collection gap.",
+    "sourceRepository": "https://github.com/halogenandtoast/ArkhamHorror",
+    "sourceCommit": "330b7dda81e6fc3be17e50aefd5d0a6fced35a39",
+    "sourceCommitDate": "2026-08-29T08:30:59+09:00",
+    "sourceFileNote": "Each entry below is a raw JSON array of asset-relative paths (e.g. \"cards/01001b.avif\"), copied byte-for-byte from frontend/src/digests/<locale>.json at sourceCommit -- these are the exact files the real client's checkImageExists()/isLocalized() consult (see frontend/src/arkham/helpers.ts's digestLoaders map). No official image binaries are included anywhere in this repository: these files are plain lists of path strings.",
+    "sourceFiles": {
+      "ita": {
+        "path": "asset-locale-digest-sources/ita.json",
+        "sha256": "e56e8b7efd4f0923a2c0b01f7ef0f9b27c4abfe7bf5c963616e1dc0932a9b959"
+      },
+      "fr": {
+        "path": "asset-locale-digest-sources/fr.json",
+        "sha256": "39feec586970f6a004819bdcf6d20942f53a151efc2a7ed928e501f780faed55"
+      },
+      "es": {
+        "path": "asset-locale-digest-sources/es.json",
+        "sha256": "df3ce88328fd603f9ae4136214fa52fd4fd5448c778f36836bbec64affc9b236"
+      },
+      "ko": {
+        "path": "asset-locale-digest-sources/ko.json",
+        "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      "zh": {
+        "path": "asset-locale-digest-sources/zh.json",
+        "sha256": "ed8e006012040f1ea3358977959534438b16d84f0659c3d6226d9c9af39b9353"
+      }
+    }
+  },
+  "localeMapSource": "djensenius/ArkhamHorror-Linux#17 issue body: 'Preserve the web locale mapping it -> ita, fr -> fr, es -> es, ko -> ko, zh -> zh.'",
+  "localeMap": {
+    "it": "ita",
+    "fr": "fr",
+    "es": "es",
+    "ko": "ko",
+    "zh": "zh"
+  },
+  "acceptedCategoryRoots": {
+    "cards": "card"
+  },
+  "ignoredCategoryRootsNote": "Any path root NOT present in acceptedCategoryRoots and NOT listed here is a hard generator error, so a future upstream addition of localized art for a category this client does not yet model (e.g. portraits) cannot be silently dropped -- it must be a conscious code change.",
+  "ignoredCategoryRoots": {
+    "tarot": "Tarot-card art (frontend/src/digests/fr.json's 22 \"tarot/tarot-N.jpg\" entries) is not a modeled AssetCategory in this client (see AssetTypes.h); explicitly and deliberately excluded rather than silently dropped."
+  }
+}

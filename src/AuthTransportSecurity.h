@@ -84,6 +84,45 @@ namespace Arkham {
 [[nodiscard]] bool isCleartextAuthAllowedForRawInput(const QString &scheme,
                                                      const QString &rawUrlText);
 
+// Cumulative-review finding (PR #18): returns true iff the RAW authority
+// (userinfo@host:port, as literally spelled in |rawUrlText|, before any
+// QUrl normalisation) is unambiguous and well-formed enough that this
+// project's later use of a QUrl-parsed host()/port() cannot silently
+// diverge from what a human reading the raw input text would expect --
+// regardless of scheme. Unlike isCleartextAuthAllowedForRawInput() (which
+// only matters for the http-loopback exception), this check is a blanket
+// gate that MUST run for https just as much as for http: QUrl silently
+// normalises escaped/percent-encoded hosts, folds certain Unicode
+// look-alike characters, and canonicalises alternate numeric IP spellings
+// (octal/hex/shortened) at parse time, all before any later code ever
+// sees the result -- an https URL is just as capable of smuggling one of
+// these ambiguities as an http one, so it must not be exempted from this
+// check merely because it is not the loopback-cleartext exception this
+// file otherwise concerns itself with.
+//
+// Rejects (returns false) if the raw authority:
+//   - has no identifiable authority section at all (fail closed);
+//   - contains a userinfo-like '@' delimiter;
+//   - has an empty, or otherwise malformed/out-of-range, port (see
+//     isValidRawPort() above -- applies identically here);
+//   - has a host substring that is empty, contains a '%' (percent-escape;
+//     never legitimate in this project's own configured host text),
+//     contains any non-ASCII code point (no Unicode/IDNA hostnames are
+//     accepted by this policy at all -- see the class-level rationale in
+//     isCanonicalLoopbackHostText()'s doc comment for why ASCII-only
+//     comparisons are required to avoid Unicode case-fold/look-alike
+//     bypasses), contains a backslash or any control character, or is an
+//     "alternate numeric IP" spelling (a host composed only of digits,
+//     dots, and/or hex letters/'x' that is not itself a strict, canonical
+//     four-octet dotted-decimal IPv4 literal -- e.g. a shortened form
+//     like "127.1", a bare 32-bit integer, or an octal/hex-prefixed
+//     octet); or
+//   - is a bracketed IPv6 literal whose inner text contains any character
+//     other than a hex digit, ':', or '.' (the last permitted only for an
+//     IPv4-mapped/embedded form).
+[[nodiscard]] bool
+rawAuthorityHostIsUnambiguousAndWellFormed(const QString &rawUrlText);
+
 // Returns true if it is safe to send authentication traffic (a request or
 // response that may carry a password or bearer token) to |url| without
 // encryption.

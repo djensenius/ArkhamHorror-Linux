@@ -101,8 +101,14 @@ UrlValidationResult validateCustomUrl(const QString &input) {
     };
   }
 
-  // Fragments are rejected.
-  if (!url.fragment().isEmpty()) {
+  // Fragments are rejected. Round-9+ review (MEDIUM): checked via
+  // hasFragment(), never fragment().isEmpty() -- QUrl distinguishes "no
+  // fragment delimiter at all" from "an explicit `#` delimiter followed
+  // by an empty fragment" (e.g. a trailing bare "#", or "?#" combining an
+  // empty query and an empty fragment); the latter still carries the
+  // delimiter itself in the original URL text and must be rejected just
+  // as decisively as a non-empty fragment.
+  if (url.hasFragment()) {
     return UrlValidationError{
         UrlErrorCode::FragmentPresent,
         QStringLiteral("URL must not contain a fragment (#...)"),
@@ -114,6 +120,25 @@ UrlValidationResult validateCustomUrl(const QString &input) {
     return UrlValidationError{
         UrlErrorCode::QueryPresent,
         QStringLiteral("URL must not contain a query string (?...)"),
+    };
+  }
+
+  // Cumulative-review finding (PR #18): the raw, pre-QUrl authority text
+  // must be unambiguous and well-formed for EVERY scheme (not merely
+  // gated behind the http-loopback exception below) -- QUrl silently
+  // normalises percent-escaped hosts, folds certain Unicode look-alike
+  // characters, and canonicalises alternate numeric IP spellings at parse
+  // time, and an https URL is just as capable of carrying one of these
+  // ambiguities as an http one. See
+  // rawAuthorityHostIsUnambiguousAndWellFormed()'s doc comment in
+  // AuthTransportSecurity.h for the exact policy.
+  if (!rawAuthorityHostIsUnambiguousAndWellFormed(trimmedInput)) {
+    return UrlValidationError{
+        UrlErrorCode::AmbiguousAuthority,
+        QStringLiteral("URL authority is malformed or ambiguous (percent-"
+                       "escaped, non-ASCII, backslash/control characters, "
+                       "or an alternate numeric IP spelling are not "
+                       "permitted in the host)"),
     };
   }
 

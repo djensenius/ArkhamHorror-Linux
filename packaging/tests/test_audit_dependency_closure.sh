@@ -240,6 +240,624 @@ echo "$output_10" | grep -qi "outside" \
   || fail "case 10: failure output did not explain the symlink-escape rejection: $output_10"
 echo "PASS: an in-tree waypoint symlink chain that ultimately escapes the AppDir is rejected"
 
+# --- Case 11/12: --auto-roots. Builds a small synthetic AppDir/usr-style
+# tree with a "plugin" ELF nested two directories deep (mirroring a real
+# usr/lib/plugins/imageformats/libqjpeg.so-style layout) that NEEDs a
+# library which is bundled elsewhere in the tree (usr/lib), reachable only
+# via the plugin's own RUNPATH ($ORIGIN/../.. -- mirroring how real
+# linuxdeploy/patchelf actually sets a bundled Qt plugin's RUNPATH to
+# point back at the main lib directory), and which is NOT transitively
+# reachable from any of the existing --root chain above at all. This is
+# exactly the class of gap the review item this flag addresses
+# identified: a hand-picked --root list can prove the libsecret closure
+# complete while never noticing a *different* bundled ELF (a Qt plugin,
+# or the app's own executable) requires something never bundled.
+auto_root_tree="$work_dir/usr_auto_roots"
+mkdir -p "$auto_root_tree/lib" "$auto_root_tree/lib/plugins/imageformats" "$auto_root_tree/bin"
+
+cat > pluginleaf.c <<'EOF'
+int test_pluginleaf(void) { return 1; }
+EOF
+cat > plugin.c <<'EOF'
+int test_pluginleaf(void);
+int test_plugin_entry(void) { return test_pluginleaf(); }
+EOF
+cat > appexe.c <<'EOF'
+int main(void) { return 0; }
+EOF
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libpluginleaf.so.1 \
+  -o "$auto_root_tree/lib/libpluginleaf.so.1" pluginleaf.c
+ln -s libpluginleaf.so.1 "$auto_root_tree/lib/libpluginleaf.so"
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libqtestplugin.so \
+  -Wl,-rpath,'$ORIGIN/../..' \
+  -o "$auto_root_tree/lib/plugins/imageformats/libqtestplugin.so" plugin.c \
+  -L"$auto_root_tree/lib" -l:libpluginleaf.so.1
+
+"$cc_bin" -o "$auto_root_tree/bin/testapp" appexe.c
+
+# Without --auto-roots, only explicitly-named roots are walked, so the
+# nested plugin's own dependency on libpluginleaf.so.1 is never even
+# considered -- the audit reports success (0 required libraries) despite
+# the plugin's real dependency existing, unaudited, elsewhere in the tree.
+# This first assertion documents the exact gap being closed, not merely
+# that the new flag works in isolation.
+output_11_before="$(python3 "$auditor" "$auto_root_tree" --root testapp --list-only 2>&1)" \
+  || fail "case 11 (baseline): expected exit 0 auditing only the app executable's own (empty) closure"
+echo "$output_11_before" | grep -q "libpluginleaf" \
+  && fail "case 11 (baseline): did not expect the unreachable plugin's dependency to be audited without --auto-roots: $output_11_before"
+echo "PASS: without --auto-roots, a plugin's own dependency outside any --root chain is not audited (documents the gap)"
+
+# With --auto-roots pointed at the whole tree, every real ELF (the app
+# executable, the nested plugin, and the library it needs) is discovered
+# and rooted, so the plugin's dependency on libpluginleaf.so.1 is now
+# actually walked and resolved -- genuinely, via the plugin's own real
+# RUNPATH, not merely "found somewhere in the recursive tree".
+result_11="$(python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" --list-only)"
+echo "$result_11" | grep -q "^libpluginleaf.so.1$" \
+  || fail "case 11: expected --auto-roots to discover and resolve the nested plugin's own dependency, got: $result_11"
+echo "$result_11" | grep -q "^libqtestplugin.so$" \
+  || fail "case 11: expected --auto-roots to include the nested plugin itself as a discovered root, got: $result_11"
+echo "PASS: --auto-roots discovers every real ELF (nested plugin + app executable) and resolves their dependencies"
+
+# Case 12: deleting the plugin's own dependency must now be caught by
+# --auto-roots (proving this is a real, load-bearing check, not a
+# vacuous pass), even though it would have gone completely unnoticed by
+# the --root testapp-only baseline above.
+rm "$auto_root_tree/lib/libpluginleaf.so.1" "$auto_root_tree/lib/libpluginleaf.so"
+set +e
+output_12="$(python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" 2>&1)"
+case12_status=$?
+set -e
+[[ $case12_status -ne 0 ]] \
+  || fail "case 12: expected non-zero exit after deleting the auto-rooted plugin's own dependency"
+echo "$output_12" | grep -q "libpluginleaf.so.1" \
+  || fail "case 12: failure output did not name the missing plugin dependency: $output_12"
+echo "PASS: --auto-roots catches a missing dependency of a plugin/executable no hand-picked --root list named"
+
+# --- Case 17: loader-search-awareness (review item 8, "global basename
+# index treats library anywhere in usr as resolving DT_NEEDED, ignoring
+# requester RUNPATH/RPATH/$ORIGIN/AppRun LD_LIBRARY_PATH/search order").
+# Relocate the SAME dependency the plugin genuinely needs into a THIRD
+# directory that is on neither the plugin's own RUNPATH
+# ($ORIGIN/../.. -> lib/) nor the default global search directory
+# (lib_dir itself, here the whole auto_root_tree) -- a real dynamic
+# loader resolving libqtestplugin.so's own DT_NEEDED entries would never
+# find it there, exactly as surely as if it were entirely absent. The
+# audit must fail and name the dependency, proving this is a genuine
+# loader-search-context check, not merely "present somewhere in the
+# tree", which a purely recursive index (the pre-fix behavior) would
+# have silently accepted.
+mkdir -p "$auto_root_tree/lib/plugins/other"
+"$cc_bin" -shared -fPIC -Wl,-soname,libpluginleaf.so.1 \
+  -o "$auto_root_tree/lib/plugins/other/libpluginleaf.so.1" pluginleaf.c
+ln -s libpluginleaf.so.1 "$auto_root_tree/lib/plugins/other/libpluginleaf.so"
+set +e
+output_17="$(python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" 2>&1)"
+case17_status=$?
+set -e
+[[ $case17_status -ne 0 ]] \
+  || fail "case 17: expected non-zero exit for a dependency relocated to a directory unreachable from the plugin's own RUNPATH/global search dirs"
+echo "$output_17" | grep -q "libpluginleaf.so.1" \
+  || fail "case 17: failure output did not name the unreachable dependency: $output_17"
+echo "PASS: a dependency present only in an unsearched directory is correctly treated as unreachable, never silently resolved from elsewhere in the tree"
+rm -rf "$auto_root_tree/lib/plugins/other"
+
+# Restore the plugin's genuinely-reachable dependency (deleted by case 12
+# above) so any later case relying on this same auto_root_tree (none
+# currently do, but kept for robustness against future additions) sees a
+# consistent, intact tree.
+"$cc_bin" -shared -fPIC -Wl,-soname,libpluginleaf.so.1 \
+  -o "$auto_root_tree/lib/libpluginleaf.so.1" pluginleaf.c
+ln -sf libpluginleaf.so.1 "$auto_root_tree/lib/libpluginleaf.so"
+
+
+# --- Case 13: --allow-x11-desktop-stack. Builds a root that NEEDs a
+# stub library sharing an exact X11_DESKTOP_ABI_ALLOWLIST SONAME
+# (libxcb.so.1) -- never a real system libxcb, just a same-named stub
+# compiled locally -- then removes it from the AppDir entirely (as real
+# packaging deliberately does not bundle base X11/xcb libraries) and
+# proves the audit fails by default (the flag is not silently on) but
+# passes once --allow-x11-desktop-stack is explicitly given.
+x11_dir="$work_dir/appdir_x11"
+mkdir -p "$x11_dir"
+cat > x11root.c <<'EOF'
+int test_x11_stub(void);
+int test_x11_root(void) { return test_x11_stub(); }
+EOF
+cat > x11stub.c <<'EOF'
+int test_x11_stub(void) { return 1; }
+EOF
+"$cc_bin" -shared -fPIC -Wl,-soname,libxcb.so.1 \
+  -o "$work_dir/libxcb.so.1.tmp" x11stub.c
+cp "$work_dir/libxcb.so.1.tmp" "$x11_dir/libxcb.so.1"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestx11root.so.1 \
+  -o "$x11_dir/libtestx11root.so.1" x11root.c -L"$x11_dir" -l:libxcb.so.1
+# Remove the stub itself -- only the NEEDED entry naming it remains --
+# simulating linuxdeploy correctly refusing to bundle base X11/xcb.
+rm "$x11_dir/libxcb.so.1"
+
+set +e
+output_13_default="$(python3 "$auditor" "$x11_dir" --root libtestx11root.so.1 2>&1)"
+case13_default_status=$?
+set -e
+[[ $case13_default_status -ne 0 ]] \
+  || fail "case 13 (default): expected non-zero exit for missing libxcb.so.1 without --allow-x11-desktop-stack"
+echo "$output_13_default" | grep -q "libxcb.so.1" \
+  || fail "case 13 (default): failure output did not name libxcb.so.1: $output_13_default"
+echo "PASS: libxcb.so.1 is reported missing by default (the X11 desktop-stack allowlist is opt-in, never implicit)"
+
+python3 "$auditor" "$x11_dir" --root libtestx11root.so.1 --allow-x11-desktop-stack >/dev/null \
+  || fail "case 13 (--allow-x11-desktop-stack): expected exit 0 once the flag is explicitly given"
+echo "PASS: --allow-x11-desktop-stack explicitly permits libxcb.so.1 to resolve from the host"
+
+# --- Case 14: ambiguous duplicate basename. Two different files (proven
+# different by distinct real content, not merely different paths) sharing
+# the exact same basename in two different subdirectories of the same
+# audited tree must be rejected outright -- silently picking one could
+# resolve a NEEDED entry to the wrong file with different real content,
+# masking a substitution risk the recursive (rglob) index introduced by
+# --auto-roots makes newly possible (a flat, single-directory index could
+# never have two entries with the same basename at all).
+dup_tree="$work_dir/appdir_dup_basename"
+mkdir -p "$dup_tree/a" "$dup_tree/b"
+cat > dupa.c <<'EOF'
+int test_dup_a(void) { return 1; }
+EOF
+cat > dupb.c <<'EOF'
+int test_dup_b(void) { return 2; }
+EOF
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 -o "$dup_tree/a/libdup.so.1" dupa.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 -o "$dup_tree/b/libdup.so.1" dupb.c
+
+set +e
+output_14="$(python3 "$auditor" "$dup_tree" --root libdup.so.1 2>&1)"
+case14_status=$?
+set -e
+[[ $case14_status -ne 0 ]] \
+  || fail "case 14: expected non-zero exit for an ambiguous duplicate basename with different real content"
+echo "$output_14" | grep -qi "ambiguous" \
+  || fail "case 14: failure output did not explain the ambiguous-duplicate rejection: $output_14"
+echo "PASS: an ambiguous duplicate basename with genuinely different content is rejected, not silently resolved"
+
+# --- Case 15: non-ELF files sharing a basename must NEVER be treated as
+# ambiguous, even with genuinely different content -- this is the exact
+# real regression this project's own CI hit: every bundled Qt QML module
+# ships its own "plugins.qmltypes" (module-specific metadata, never a
+# shared object, never nameable by any DT_NEEDED tag), so two different,
+# legitimately-present QML modules' own "plugins.qmltypes" files sharing
+# that basename must be silently ignored by the indexer entirely, not
+# raise the same "ambiguous duplicate basename" error case 14 above
+# rightly raises for two genuinely-different ELF libraries.
+nonelf_tree="$work_dir/appdir_nonelf_dup_basename"
+mkdir -p "$nonelf_tree/qml/QtQml" "$nonelf_tree/qml/QML"
+printf 'module A metadata\n' >"$nonelf_tree/qml/QtQml/plugins.qmltypes"
+printf 'module B metadata, deliberately different content\n' \
+  >"$nonelf_tree/qml/QML/plugins.qmltypes"
+# A real root library must still be present so the walk has something to
+# resolve; the two non-ELF files above are otherwise-unrelated bystanders
+# in the very same recursively-audited tree.
+"$cc_bin" -shared -fPIC -Wl,-soname,libnonelfcheck.so.1 \
+  -o "$nonelf_tree/libnonelfcheck.so.1" dupa.c
+output_15="$(python3 "$auditor" "$nonelf_tree" --root libnonelfcheck.so.1 2>&1)" \
+  || fail "case 15: expected success auditing a tree with same-basename non-ELF files, got: $output_15"
+echo "$output_15" | grep -qi "ambiguous" \
+  && fail "case 15: non-ELF same-basename files were incorrectly treated as ambiguous: $output_15"
+echo "PASS: same-basename non-ELF files (e.g. Qt QML modules' own plugins.qmltypes) are never treated as ambiguous"
+
+# --- Case 16: --allow-font-rendering-stack. Builds a root that NEEDs a
+# stub library sharing an exact FONT_RENDERING_ABI_ALLOWLIST SONAME
+# (libfontconfig.so.1) -- never a real system fontconfig, just a
+# same-named stub compiled locally -- then removes it from the AppDir
+# entirely (as real packaging deliberately does not bundle fontconfig/
+# FreeType) and proves the audit fails by default (the flag is not
+# silently on, and is not implied by --allow-x11-desktop-stack) but
+# passes once --allow-font-rendering-stack is explicitly given.
+font_dir="$work_dir/appdir_font"
+mkdir -p "$font_dir"
+cat > fontroot.c <<'EOF'
+int test_font_stub(void);
+int test_font_root(void) { return test_font_stub(); }
+EOF
+cat > fontstub.c <<'EOF'
+int test_font_stub(void) { return 1; }
+EOF
+"$cc_bin" -shared -fPIC -Wl,-soname,libfontconfig.so.1 \
+  -o "$work_dir/libfontconfig.so.1.tmp" fontstub.c
+cp "$work_dir/libfontconfig.so.1.tmp" "$font_dir/libfontconfig.so.1"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestfontroot.so.1 \
+  -o "$font_dir/libtestfontroot.so.1" fontroot.c -L"$font_dir" -l:libfontconfig.so.1
+# Remove the stub itself -- only the NEEDED entry naming it remains --
+# simulating linuxdeploy correctly refusing to bundle fontconfig/FreeType.
+rm "$font_dir/libfontconfig.so.1"
+
+set +e
+output_16_default="$(python3 "$auditor" "$font_dir" --root libtestfontroot.so.1 2>&1)"
+case16_default_status=$?
+set -e
+[[ $case16_default_status -ne 0 ]] \
+  || fail "case 16 (default): expected non-zero exit for missing libfontconfig.so.1 without --allow-font-rendering-stack"
+echo "$output_16_default" | grep -q "libfontconfig.so.1" \
+  || fail "case 16 (default): failure output did not name libfontconfig.so.1: $output_16_default"
+echo "PASS: libfontconfig.so.1 is reported missing by default (the font-rendering allowlist is opt-in, never implicit)"
+
+set +e
+output_16_x11_only="$(python3 "$auditor" "$font_dir" --root libtestfontroot.so.1 --allow-x11-desktop-stack 2>&1)"
+case16_x11_only_status=$?
+set -e
+[[ $case16_x11_only_status -ne 0 ]] \
+  || fail "case 16 (--allow-x11-desktop-stack only): expected --allow-x11-desktop-stack to NOT also permit libfontconfig.so.1"
+echo "PASS: --allow-x11-desktop-stack alone does not implicitly permit the font-rendering stack"
+
+python3 "$auditor" "$font_dir" --root libtestfontroot.so.1 --allow-font-rendering-stack >/dev/null \
+  || fail "case 16 (--allow-font-rendering-stack): expected exit 0 once the flag is explicitly given"
+echo "PASS: --allow-font-rendering-stack explicitly permits libfontconfig.so.1 to resolve from the host"
+
+# --- Case 18: exact reachable-occurrence resolution (review item 4,
+# "index/root still one path per basename; reachability boolean then
+# recursion chooses index[name], not loader-selected duplicate"). Two
+# real, distinctly-compiled files sharing the exact same basename
+# ("libdup.so.1") exist in two different subdirectories: dir_good (the
+# ONLY one the root's own RUNPATH actually names) whose real dependency
+# is libgoodleaf.so.1 (genuinely bundled and reachable), and
+# dir_zzz_wrong (never named by anything's RUNPATH, sorts after dir_good
+# so a naive last-write-wins basename index would remember it instead)
+# whose own dependency is libphantom-never-bundled.so.1 (bundled
+# nowhere). A correct, loader-search-aware audit must resolve
+# "libdup.so.1" via dir_good specifically and therefore discover
+# libgoodleaf.so.1 as a real, satisfied dependency -- and must NEVER
+# explore dir_zzz_wrong's own DT_NEEDED entries at all, so the phantom
+# name must never appear anywhere in the output.
+dup_resolve_tree="$work_dir/appdir_dup_resolve"
+mkdir -p "$dup_resolve_tree/dir_good" "$dup_resolve_tree/dir_zzz_wrong"
+cat > goodleaf.c <<'EOF'
+int test_goodleaf(void) { return 1; }
+EOF
+cat > dupgood.c <<'EOF'
+int test_goodleaf(void);
+int test_dup(void) { return test_goodleaf(); }
+EOF
+cat > phantomstub.c <<'EOF'
+int test_phantom_dep(void) { return 1; }
+EOF
+cat > dupwrong.c <<'EOF'
+int test_phantom_dep(void);
+int test_dup(void) { return test_phantom_dep(); }
+EOF
+cat > duproot.c <<'EOF'
+int test_dup(void);
+int test_dup_root(void) { return test_dup(); }
+EOF
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libgoodleaf.so.1 \
+  -o "$dup_resolve_tree/dir_good/libgoodleaf.so.1" goodleaf.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 -Wl,-rpath,'$ORIGIN' \
+  -o "$dup_resolve_tree/dir_good/libdup.so.1" dupgood.c \
+  -L"$dup_resolve_tree/dir_good" -l:libgoodleaf.so.1
+# The "wrong" occurrence deliberately needs a phantom dependency that is
+# never actually bundled anywhere in the final tree -- link against a
+# throwaway stub providing the right SONAME, then delete the stub itself
+# (the same "NEEDED entry survives, target file does not" technique
+# already used by the X11/font-rendering cases above), so this file's
+# own DT_NEEDED names something that is never resolvable at all. If the
+# audit ever mistakenly resolves via this file instead of dir_good's,
+# this name must surface somewhere in the output (missing, at minimum).
+"$cc_bin" -shared -fPIC -Wl,-soname,libphantom-never-bundled.so.1 \
+  -o "$work_dir/libphantom-never-bundled.so.1.tmp" phantomstub.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libdup.so.1 \
+  -o "$dup_resolve_tree/dir_zzz_wrong/libdup.so.1" dupwrong.c \
+  -L"$work_dir" -l:libphantom-never-bundled.so.1.tmp
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestduproot.so.1 -Wl,-rpath,'$ORIGIN/dir_good' \
+  -o "$dup_resolve_tree/libtestduproot.so.1" duproot.c \
+  -L"$dup_resolve_tree/dir_good" -l:libdup.so.1
+rm "$work_dir/libphantom-never-bundled.so.1.tmp"
+
+result_18="$(python3 "$auditor" "$dup_resolve_tree" --root libtestduproot.so.1 --list-only)" \
+  || fail "case 18: expected exit 0 resolving the reachable dir_good occurrence"
+echo "$result_18" | grep -q "^libgoodleaf.so.1$" \
+  || fail "case 18: expected the genuinely-reachable occurrence's own real dependency libgoodleaf.so.1 to be resolved, got: $result_18"
+echo "$result_18" | grep -q "phantom" \
+  && fail "case 18: the unreachable occurrence's own phantom dependency must never appear in the resolved closure: $result_18"
+output_18_full="$(python3 "$auditor" "$dup_resolve_tree" --root libtestduproot.so.1 2>&1)" \
+  || fail "case 18: expected exit 0 in human-readable mode too"
+echo "$output_18_full" | grep -q "phantom" \
+  && fail "case 18: the unreachable occurrence's own phantom dependency must never appear in the full report either: $output_18_full"
+echo "PASS: a duplicate basename is resolved via the exact reachable occurrence, never an arbitrary same-named copy elsewhere in the tree"
+
+# --- Case 19: PT_INTERP validation (review item 4, "validate PT_INTERP
+# for executables"). A genuine compiled executable's own recorded
+# program interpreter must be exactly the host-guaranteed dynamic loader
+# this project's own build (linuxdeploy, unpatched PT_INTERP) always
+# produces. Mutate a fresh copy's own .interp section via objcopy
+# (binutils; the same package already required by this whole test file
+# for readelf, so no new tooling dependency) to a bogus, non-allowlisted
+# path, proving the check is load-bearing, not vacuous.
+if command -v objcopy >/dev/null 2>&1; then
+  interp_dir="$work_dir/appdir_interp"
+  mkdir -p "$interp_dir"
+  cp "$auto_root_tree/bin/testapp" "$interp_dir/testapp"
+  printf '/nonexistent/bogus-ld.so\0' > "$work_dir/bogus-interp.bin"
+  if objcopy --update-section .interp="$work_dir/bogus-interp.bin" \
+      "$interp_dir/testapp" 2>/dev/null; then
+    chmod +x "$interp_dir/testapp"
+
+    set +e
+    output_19="$(python3 "$auditor" "$interp_dir" --auto-roots "$interp_dir" 2>&1)"
+    case19_status=$?
+    set -e
+    [[ $case19_status -ne 0 ]] \
+      || fail "case 19: expected non-zero exit for an executable with a rewritten, non-allowlisted PT_INTERP"
+    echo "$output_19" | grep -qi "interpreter" \
+      || fail "case 19: failure output did not mention the interpreter problem: $output_19"
+    echo "PASS: an executable's own PT_INTERP naming something other than the host-guaranteed loader is rejected"
+  else
+    echo "SKIP (case 19): objcopy could not update .interp on this system; cannot mutate PT_INTERP for this regression."
+  fi
+else
+  echo "SKIP (case 19): objcopy not available; cannot mutate PT_INTERP for this regression."
+fi
+
+# A genuine, unmutated executable's own PT_INTERP (the plain host
+# loader) must never itself be rejected -- proving case 19 above is
+# testing a real mutation, not a check that always fails.
+python3 "$auditor" "$auto_root_tree" --auto-roots "$auto_root_tree" --list-only >/dev/null \
+  || fail "case 19 (baseline): expected the genuine, unmutated testapp executable's own PT_INTERP to pass validation"
+echo "PASS: a genuine, unmutated executable's own PT_INTERP (the host-guaranteed loader) passes validation"
+
+# --- Case 20: stripped-section-header PT_INTERP (round-N+ review HIGH,
+# "auditor can disagree with kernel/glibc: reads `.interp` section
+# rather than PT_INTERP"). A real toolchain is free to remove a binary's
+# ENTIRE section-header table (e_shnum/e_shstrndx zeroed) while leaving
+# every PROGRAM header -- including PT_INTERP and its underlying bytes
+# -- completely intact and exec()-able; the kernel and every dynamic
+# loader never consult section headers at all. Simulate this precisely
+# (zero e_shnum/e_shstrndx in the ELF header, leaving e_shoff/the
+# original table bytes untouched but unreferenced) and prove the
+# auditor still correctly reads and validates PT_INTERP via `readelf
+# -l`, never silently treating "no .interp SECTION" as "not an
+# executable at all".
+strip_dir="$work_dir/appdir_stripped_shdrs"
+mkdir -p "$strip_dir"
+cp "$auto_root_tree/bin/testapp" "$strip_dir/testapp"
+python3 - "$strip_dir/testapp" <<'PYEOF'
+import struct
+import sys
+
+path = sys.argv[1]
+with open(path, "r+b") as f:
+    data = bytearray(f.read())
+    # ELF64 header offsets: e_shnum at 0x3C (2 bytes), e_shstrndx at
+    # 0x3E (2 bytes) -- see elf(5). Leave e_shoff (0x28) untouched: the
+    # original section-header-table bytes remain physically present in
+    # the file but are no longer referenced by the ELF header at all,
+    # exactly matching a real "section headers stripped" toolchain
+    # output; program headers (e_phoff/e_phnum, including PT_INTERP)
+    # are completely unaffected by this.
+    struct.pack_into("<H", data, 0x3C, 0)
+    struct.pack_into("<H", data, 0x3E, 0)
+    f.seek(0)
+    f.write(data)
+PYEOF
+chmod +x "$strip_dir/testapp"
+# The binary must still genuinely execute (proving this is a realistic
+# mutation, not one that happens to also break the executable itself).
+"$strip_dir/testapp" || fail "case 20: section-header-stripped testapp no longer executes at all"
+# readelf's own section-based view must now report no .interp section
+# (proving this really does simulate the "stripped .interp section"
+# case the old, now-fixed code path would have silently mis-treated as
+# "not an executable").
+# readelf's own section-based view must now be unable to produce an
+# actual .interp string dump (proving this really does simulate the
+# "stripped .interp section" case the old, now-fixed code path would
+# have silently mis-treated as "not an executable") -- real readelf
+# builds report this either as an explicit "no such section" message or
+# (since e_shoff still points at now-unreferenced bytes) a "corrupt ELF
+# file header" warning; either way, no genuine "[ 0] /path" string dump
+# line is ever produced.
+readelf -p .interp "$strip_dir/testapp" 2>&1 | grep -q '^\s*\[\s*0\s*\]' \
+  && fail "case 20: readelf -p .interp unexpectedly still produced a real string dump -- section-header stripping did not take effect as intended"
+python3 "$auditor" "$strip_dir" --auto-roots "$strip_dir" --list-only >/dev/null \
+  || fail "case 20: expected a section-header-stripped executable's still-intact PT_INTERP program header to pass validation, not be silently treated as a non-executable"
+echo "PASS: PT_INTERP is validated via program headers even when the section-header table is entirely stripped"
+
+# --- Case 21: allowed-basename-invalid-path (round-N+ review HIGH,
+# "... allows nonexistent paths by basename"). An interpreter string
+# whose final path COMPONENT matches the allowlisted loader name, but
+# whose full path is some OTHER directory than the one real, canonical,
+# host-guaranteed absolute path (LOADER_CANONICAL_PATH) -- e.g. a
+# build-host-only path -- must be rejected: a basename match alone
+# proves nothing about whether that exact absolute path exists, at a
+# compatible ABI, on any real target machine.
+if command -v objcopy >/dev/null 2>&1; then
+  basename_dir="$work_dir/appdir_basename_only"
+  mkdir -p "$basename_dir"
+  cp "$auto_root_tree/bin/testapp" "$basename_dir/testapp"
+  printf '/opt/not-the-real-loader-dir/ld-linux-x86-64.so.2\0' \
+    > "$work_dir/basename-only-interp.bin"
+  if objcopy --update-section .interp="$work_dir/basename-only-interp.bin" \
+      "$basename_dir/testapp" 2>/dev/null; then
+    chmod +x "$basename_dir/testapp"
+
+    set +e
+    output_21="$(python3 "$auditor" "$basename_dir" --auto-roots "$basename_dir" 2>&1)"
+    case21_status=$?
+    set -e
+    [[ $case21_status -ne 0 ]] \
+      || fail "case 21: expected non-zero exit for a PT_INTERP whose basename matches the allowlisted loader but whose full path does not"
+    echo "$output_21" | grep -qi "interpreter" \
+      || fail "case 21: failure output did not mention the interpreter problem: $output_21"
+    echo "PASS: a PT_INTERP matching the loader's basename but not its exact canonical path is rejected"
+  else
+    echo "SKIP (case 21): objcopy could not update .interp on this system; cannot mutate PT_INTERP for this regression."
+  fi
+else
+  echo "SKIP (case 21): objcopy not available; cannot mutate PT_INTERP for this regression."
+fi
+
+# --- Case 22: external RPATH precedence (round-N+ review MEDIUM,
+# "silently drops external DT_RPATH that runtime may search before
+# LD_LIBRARY_PATH"). A bundled library recording a DT_RPATH entry that
+# resolves OUTSIDE the AppDir being audited must fail the WHOLE audit
+# loudly, never merely being reported as "unreachable" and otherwise
+# tolerated: a real loader on some target machine would still search
+# that exact external directory, and for a legacy DT_RPATH, would
+# search it BEFORE this project's own bundled LD_LIBRARY_PATH entries.
+external_rpath_dir="$work_dir/external_rpath_target"
+mkdir -p "$external_rpath_dir"
+external_rpath_appdir="$work_dir/appdir_external_rpath"
+mkdir -p "$external_rpath_appdir"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestleaf.so.1 \
+  -o "$external_rpath_appdir/libtestleaf.so.1" leaf.c
+ln -sf libtestleaf.so.1 "$external_rpath_appdir/libtestleaf.so"
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestexternalrpathroot.so.1 \
+  -Wl,-rpath,"$external_rpath_dir" \
+  -o "$external_rpath_appdir/libtestexternalrpathroot.so.1" mid.c \
+  -L"$external_rpath_appdir" -l:libtestleaf.so.1
+set +e
+output_22="$(python3 "$auditor" "$external_rpath_appdir" \
+  --root libtestexternalrpathroot.so.1 2>&1)"
+case22_status=$?
+set -e
+[[ $case22_status -ne 0 ]] \
+  || fail "case 22: expected non-zero exit for a bundled library carrying an external DT_RPATH entry"
+echo "$output_22" | grep -q "$external_rpath_dir" \
+  || fail "case 22: failure output did not name the external RPATH directory: $output_22"
+echo "PASS: a bundled library's own external DT_RPATH entry fails the whole audit, rather than being silently dropped or merely reported unreachable"
+
+# --- Case 23: byte-identical plugin copies at different $ORIGIN
+# contexts (round-9+ review item 4, "seen keyed only SONAME skips same
+# dependency from different requester/RPATH contexts"; round-N+ review
+# "duplicate-byte plugin/different-$ORIGIN"). Two requesters that are
+# genuinely BYTE-IDENTICAL copies of the same plugin (not merely
+# same-named-but-different-content, as case 18 above already covers)
+# must still each be independently reachability-checked via their own,
+# DIFFERENT $ORIGIN context -- one bundled beside its real dependency,
+# the other bundled alone -- so per-edge reachability is proven
+# independent of content-hash sameness, never short-circuited by an
+# earlier identical-content success.
+dup_byte_tree="$work_dir/appdir_dup_byte_identical"
+mkdir -p "$dup_byte_tree/plugin_ok" "$dup_byte_tree/plugin_broken"
+"$cc_bin" -shared -fPIC -Wl,-soname,libdupbyteleaf.so.1 \
+  -o "$dup_byte_tree/plugin_ok/libdupbyteleaf.so.1" leaf.c
+ln -sf libdupbyteleaf.so.1 "$dup_byte_tree/plugin_ok/libdupbyteleaf.so"
+"$cc_bin" -shared -fPIC -Wl,-soname,libdupbyteplugin.so.1 \
+  -Wl,-rpath,'$ORIGIN' \
+  -o "$dup_byte_tree/plugin_ok/libdupbyteplugin.so.1" mid.c \
+  -L"$dup_byte_tree/plugin_ok" -l:libdupbyteleaf.so.1
+# The "broken" copy is a byte-for-byte identical copy of the SAME
+# plugin file -- but placed in a directory with no dependency beside
+# it, and its own recorded RPATH ($ORIGIN, same as the original) can
+# therefore never actually reach a same-named leaf from THIS location.
+cp "$dup_byte_tree/plugin_ok/libdupbyteplugin.so.1" \
+  "$dup_byte_tree/plugin_broken/libdupbyteplugin.so.1"
+cmp -s "$dup_byte_tree/plugin_ok/libdupbyteplugin.so.1" \
+  "$dup_byte_tree/plugin_broken/libdupbyteplugin.so.1" \
+  || fail "case 23: the two plugin copies must be genuinely byte-identical for this regression to be meaningful"
+
+output_23="$(python3 "$auditor" "$dup_byte_tree" --auto-roots "$dup_byte_tree" 2>&1)" && \
+  fail "case 23: expected non-zero exit -- plugin_broken's identical-content copy cannot reach libdupbyteleaf.so.1 from its own location"
+echo "$output_23" | grep -q "libdupbyteleaf.so.1" \
+  || fail "case 23: failure output did not name the unreachable dependency: $output_23"
+rm "$dup_byte_tree/plugin_broken/libdupbyteplugin.so.1"
+python3 "$auditor" "$dup_byte_tree" --auto-roots "$dup_byte_tree" --list-only >/dev/null \
+  || fail "case 23 (baseline): expected plugin_ok's own copy, beside its real dependency, to resolve cleanly once the broken duplicate is removed"
+echo "PASS: byte-identical plugin copies at different \$ORIGIN contexts are independently reachability-checked, never short-circuited by content-hash sameness"
+
+# --- Case 24: nested legacy DT_RPATH order (round-N+ review HIGH,
+# "nested legacy RPATH order reversed ... current requester RPATH must
+# precede inherited ancestors (B before A in A->B->C)"). This is the
+# strongest possible proof of this fix: rather than only asserting the
+# Python auditor's own internal consistency (as
+# test_audit_dependency_closure.py's NestedRpathOrderTests already
+# does, via mocked readelf text), this case builds a REAL,
+# genuinely-compiled A(executable)->B->target chain, ACTUALLY EXECUTES
+# it under the real glibc dynamic linker on this machine, and confirms
+# (1) which copy the real ld.so genuinely loads at runtime, then
+# independently confirms (2) that this auditor's own resolution of the
+# identical on-disk chain agrees with that same, empirically-observed
+# real loader outcome -- not merely with what this fix's own authors
+# assumed ld.so does.
+#
+# Chain: test_order_exe (the executable itself, own DT_RPATH=
+# "$ORIGIN:$ORIGIN/a_private" -- "$ORIGIN" locates its own direct
+# libtestorderb.so.1, "$ORIGIN/a_private" is the ancestor scope this
+# case is actually about) -> libtestorderb.so.1 (own DT_RPATH=
+# "$ORIGIN/b_private") -> libtestordertarget.so.1, present at BOTH
+# a_private/ (target_value() returns 7, needs libtestorder_a_marker.so.1)
+# and b_private/ (target_value() returns 42, needs
+# libtestorder_b_marker.so.1). Real glibc dependency resolution of
+# libtestorderb.so.1's own NEEDED entry must use libtestorderb.so.1's
+# OWN, nearer DT_RPATH (b_private) -- never the executable's inherited
+# one (a_private) -- so a real run of the executable must exit with
+# status 42, and this auditor's own closure must contain
+# libtestorder_b_marker.so.1 but never libtestorder_a_marker.so.1.
+#
+# NB: modern binutils (since ~2.28) emits the NEW DT_RUNPATH tag by
+# default for a plain "-rpath" linker option, not the legacy DT_RPATH
+# this case needs to genuinely exercise (DT_RUNPATH is non-transitive
+# by design, which would silently make this case pass for the wrong
+# reason). "--disable-new-dtags" forces the real, legacy DT_RPATH tag.
+order_tree="$work_dir/appdir_rpath_order"
+mkdir -p "$order_tree/a_private" "$order_tree/b_private"
+
+cat > order_marker_a.c <<'EOF'
+int marker_a_touch(void) { return 0; }
+EOF
+cat > order_marker_b.c <<'EOF'
+int marker_b_touch(void) { return 0; }
+EOF
+cat > order_target_a.c <<'EOF'
+int marker_a_touch(void);
+int target_value(void) { return 7 + marker_a_touch(); }
+EOF
+cat > order_target_b.c <<'EOF'
+int marker_b_touch(void);
+int target_value(void) { return 42 + marker_b_touch(); }
+EOF
+cat > order_b.c <<'EOF'
+int target_value(void);
+int call_target(void) { return target_value(); }
+EOF
+cat > order_root.c <<'EOF'
+int call_target(void);
+int main(void) { return call_target(); }
+EOF
+
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestorder_a_marker.so.1 \
+  -o "$order_tree/a_private/libtestorder_a_marker.so.1" order_marker_a.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestorder_b_marker.so.1 \
+  -o "$order_tree/b_private/libtestorder_b_marker.so.1" order_marker_b.c
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestordertarget.so.1 \
+  -o "$order_tree/a_private/libtestordertarget.so.1" order_target_a.c \
+  -L"$order_tree/a_private" -l:libtestorder_a_marker.so.1
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestordertarget.so.1 \
+  -o "$order_tree/b_private/libtestordertarget.so.1" order_target_b.c \
+  -L"$order_tree/b_private" -l:libtestorder_b_marker.so.1
+"$cc_bin" -shared -fPIC -Wl,-soname,libtestorderb.so.1 -Wl,-rpath,'$ORIGIN/b_private' \
+  -Wl,--disable-new-dtags -Wl,--allow-shlib-undefined \
+  -o "$order_tree/libtestorderb.so.1" order_b.c \
+  -L"$order_tree/b_private" -l:libtestordertarget.so.1
+"$cc_bin" -fPIE -Wl,-rpath,'$ORIGIN:$ORIGIN/a_private' \
+  -Wl,--disable-new-dtags -Wl,--allow-shlib-undefined \
+  -o "$order_tree/test_order_exe" order_root.c \
+  -L"$order_tree" -l:libtestorderb.so.1
+
+set +e
+LD_LIBRARY_PATH= "$order_tree/test_order_exe"
+order_exit_status=$?
+set -e
+[[ $order_exit_status -eq 42 ]] \
+  || fail "case 24: expected the REAL glibc dynamic linker to resolve libtestorderb.so.1's own NEEDED entry via its own nearer DT_RPATH (b_private, exit 42), got exit $order_exit_status -- either this machine's ld.so genuinely behaves differently than assumed, or the compiled fixture is wrong"
+echo "PASS: a real compiled A(exe)->B->target chain confirms the actual glibc dynamic linker resolves B's own DT_RPATH before an inherited ancestor DT_RPATH (real exit code 42)"
+
+result_24="$(python3 "$auditor" "$order_tree" --root test_order_exe --list-only)"
+echo "$result_24" | grep -q "^libtestorder_b_marker.so.1$" \
+  || fail "case 24: expected this auditor's own resolution to agree with the real ld.so outcome and include libtestorder_b_marker.so.1, got: $result_24"
+echo "$result_24" | grep -q "^libtestorder_a_marker.so.1$" \
+  && fail "case 24: this auditor must never resolve via the executable's inherited, shadowed ancestor DT_RPATH: $result_24"
+echo "PASS: this auditor's own resolution of the identical real chain agrees with the empirically-observed real glibc loader outcome"
+
 # --- Case 3: mutation regression -- deleting the leaf (a real,
 # representative non-ABI transitive dependency, required only via mid,
 # not directly by root) must make the audit fail and must name the

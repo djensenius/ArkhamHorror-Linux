@@ -191,4 +191,29 @@ result_8c="$(PATH="$restricted_path" find_bundled_libz "$fake_root_8")"
   || fail "case 8c (libz find fallback): expected '$fake_root_8/libz.so.1', got '$result_8c'"
 echo "PASS: find_bundled_libgccs/find_bundled_libstdcxx/find_bundled_libz find() fallback works"
 
-echo "All find_bundled_libsecret()/find_bundled_libgpgerror()/find_bundled_libgccs()/find_bundled_libstdcxx()/find_bundled_libz() regression cases passed."
+# --- Case 9: find_bundled_libcomerr() is a distinct wrapper over the same
+# generic helper, added to force-bundle libcom_err.so.2 -- verified
+# directly against a real linuxdeploy run's own "Skipping deployment of
+# blacklisted library" diagnostic, discovered missing from a real produced
+# AppImage by the recursive closure audit. Proves it resolves its own
+# library via ldconfig, and falls back to find() without cross-matching
+# any of the wrappers above, when ldconfig is absent.
+install_fake_ldconfig 0 "$(cat <<'LDCONFIG_EOF'
+libcom_err.so.2 (libc6,x86-64) => /opt/fake/libcom_err.so.2.1
+LDCONFIG_EOF
+)"
+result_9a="$(PATH="$restricted_path" find_bundled_libcomerr "$work_dir/does-not-exist")"
+[[ "$result_9a" == "/opt/fake/libcom_err.so.2.1" ]] \
+  || fail "case 9a (libcomerr via ldconfig): expected '/opt/fake/libcom_err.so.2.1', got '$result_9a'"
+
+remove_fake_ldconfig
+fake_root_9="$work_dir/root9/lib"
+mkdir -p "$fake_root_9"
+: > "$fake_root_9/libcom_err.so.2"
+: > "$fake_root_9/libgcc_s.so.1"
+result_9b="$(PATH="$restricted_path" find_bundled_libcomerr "$fake_root_9")"
+[[ "$result_9b" == "$fake_root_9/libcom_err.so.2" ]] \
+  || fail "case 9b (libcomerr find fallback): expected '$fake_root_9/libcom_err.so.2', got '$result_9b'"
+echo "PASS: find_bundled_libcomerr resolves via ldconfig and find() fallback"
+
+echo "All find_bundled_libsecret()/find_bundled_libgpgerror()/find_bundled_libgccs()/find_bundled_libstdcxx()/find_bundled_libz()/find_bundled_libcomerr() regression cases passed."

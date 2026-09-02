@@ -18,6 +18,26 @@ permissions:
 
 env:
   QT_VERSION: 6.11.1
+  # Round-N+ review (HIGH, "Updates.xml hash is disconnected from
+  # independently cached install-qt SDK ... verify cached SDK contents
+  # against same lock before use"): "Verify pinned Qt SDK metadata lock"
+  # (verify-qt-sdk-lock, below) proves upstream Updates.xml still
+  # matches packaging/qt_sdk_lock.json's pinned sha256 -- but
+  # jurplel/install-qt-action's own `cache: true` restores a
+  # previously-installed Qt SDK straight from the GitHub Actions cache
+  # on a cache hit, never re-touching Updates.xml or aqtinstall's own
+  # checksum verification at all for that run. Left unpinned, that
+  # action's default cache key (OS/version/arch/modules only) cannot
+  # distinguish "the exact upstream contents this repository's lock
+  # currently pins" from "whatever happened to be cached under that
+  # same version string previously" -- silently reusing a stale or
+  # substituted cache entry the lock verification step never actually
+  # examined. Every install-qt-action step below is therefore given
+  # `cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}`:
+  # any deliberate re-pin of the lock (a real upstream Qt content
+  # change) invalidates every existing cache entry and forces a fresh,
+  # aqtinstall-checksum-verified download, and a cache entry captured
+  # under a DIFFERENT lock state can never satisfy this run's key.
 
 jobs:
   format:
@@ -29,11 +49,31 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
+      - name: Verify pinned Qt SDK archive manifest
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-archive-manifest
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
           cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
       - name: Install formatter
         run: sudo apt-get update && sudo apt-get install -y clang-format
       - run: mise run format:check
@@ -47,13 +87,33 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
+      - name: Verify pinned Qt SDK archive manifest
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-archive-manifest
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
-      - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
+      - name: Install QtKeychain, libavif and libjpeg build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev # libavif-dev/libjpeg-turbo8-dev/zlib1g-dev: CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)/find_package(ZLIB REQUIRED) need these even for the configure-only lint job.
       - run: mise run lint
 
   test:
@@ -65,15 +125,83 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
+      - name: Verify pinned Qt SDK archive manifest
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-archive-manifest
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. AVIF card art is decoded directly against libavif's own C API (see src/AssetAvifDecoder.cpp), and JPEG is decoded directly against libjpeg's own C API (see src/AssetJpegDecoder.cpp), neither through Qt's plugin registry -- Qt has no official AVIF plugin at all (upstream qtimageformats does not include one) -- so the codec-support tests exercise the real libavif/libjpeg-backed decode paths unconditionally rather than branching on QImageReader::supportedImageFormats().
           cache: true
-      - name: Install QtKeychain and D-Bus build dependencies
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
+      - name: Install QtKeychain, D-Bus, libavif, libjpeg and clang-format build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config dbus # dbus is required by kwallet_hardening test's fake KWallet service
+          sudo apt-get install -y libsecret-1-dev pkg-config dbus libavif-dev libjpeg-turbo8-dev zlib1g-dev clang-format # dbus is required by kwallet_hardening test's fake KWallet service; libavif-dev/libjpeg-turbo8-dev/zlib1g-dev provide the mandatory AVIF/JPEG decode and PNG IDAT-zlib-validation dependencies (CMake's pkg_check_modules(LIBAVIF REQUIRED ...)/pkg_check_modules(LIBJPEG REQUIRED ...)/find_package(ZLIB REQUIRED)); clang-format is required by generate_asset_locale_digest.py --check below (review round-6/7 item 10 -- --check fails closed without it, see that script's _clang_format()).
+      - name: Test asset locale digest generator's --check fail-closed behavior
+        # tools/generate_asset_locale_digest.py's --check mode (review
+        # round-3 item 16) is a standalone local dev tool no CMake/ctest
+        # target invokes, so its own regression suite
+        # (tools/test_generate_asset_locale_digest.py, stdlib unittest
+        # only -- no extra dependency) needs to be run here explicitly,
+        # or a regression in --check's fail-closed behavior would go
+        # uncaught by every other CI step.
+        run: python3 tools/test_generate_asset_locale_digest.py
+      - name: Test asset locale digest provenance verifier's fail-closed behavior
+        # tools/verify_asset_locale_digest_provenance.py (review round-4
+        # item 11) is itself only exercised offline against a mocked
+        # GitHub API response here (tools/test_verify_asset_locale_digest_provenance.py),
+        # so a regression in ITS OWN fail-closed logic (e.g. accepting a
+        # renamed sourceRepository, a wrong git blob mode, or a missing
+        # upstream blob) is caught before the real, network-dependent
+        # verification step below ever runs.
+        run: python3 tools/test_verify_asset_locale_digest_provenance.py
+      - name: Verify asset locale digest provenance against real upstream commit
+        # The actual live check (review round-4 item 11): fetches
+        # halogenandtoast/ArkhamHorror's real Git Data API tree listing at
+        # the exact commit contracts/asset-locale-digest.json pins, and
+        # requires every pinned contracts/asset-locale-digest-sources/*.json
+        # file to be a byte-for-byte identical git blob (by mode, path,
+        # and content-addressed sha) to what that commit's real tree
+        # actually contains -- rather than trusting the manifest's own
+        # self-reported sha256/sourceCommit fields. GITHUB_TOKEN is used
+        # only to raise this step's GitHub API rate limit; it is never
+        # sent to, and grants no access on, the upstream repository being
+        # verified (a public read-only Git Data API call). Any network
+        # failure, missing commit/blob, or mismatch fails this step --
+        # there is no fallback that lets a failed check pass silently.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/verify_asset_locale_digest_provenance.py
+      - name: Verify generated asset locale digest header is not stale
+        # Review round-6/7 item 10: previously CI only ran this script's
+        # OWN unit tests (above) plus tests/AssetLocaleDigestTests.cpp's
+        # independent C++ hash-drift check -- never the real
+        # generate_asset_locale_digest.py --check itself against the
+        # actual checked-in src/AssetLocaleDigestData.generated.h. That
+        # left a gap: --check's own stronger drift detection (full
+        # rendered-output comparison, not just embedded input hashes --
+        # see review round-3 item 16's _clang_format()/fail-closed logic)
+        # was never actually exercised in CI. clang-format is installed
+        # above so --check's fail-closed-without-a-formatter path is
+        # never spuriously triggered here.
+        run: python3 tools/generate_asset_locale_digest.py --check
       - run: mise run test
 
   build:
@@ -85,14 +213,99 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
+      - name: Verify pinned Qt SDK archive manifest
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-archive-manifest
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
-      - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
+      - name: Install QtKeychain and libavif build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - run: mise run build
+
+  ubsan:
+    name: UBSan (asset codecs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.14
+          cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
+      - name: Verify pinned Qt SDK archive manifest
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-archive-manifest
+      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtwebsockets
+          cache: true
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
+      - name: Install QtKeychain, libavif, libjpeg and zlib build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
+      - name: Configure with ARKHAM_ENABLE_UBSAN in an optimized build
+        # Cumulative-review finding (PR #18, exact head 4a47ea34): proves
+        # AssetJpegDecoder.cpp's setjmp/longjmp-adjacent state handling
+        # (and the rest of the asset codec/cache/coordinator paths this
+        # binary exercises) under Clang's UndefinedBehaviorSanitizer in an
+        # OPTIMIZED (RelWithDebInfo) build specifically -- see
+        # CMakeLists.txt's ARKHAM_ENABLE_UBSAN option doc comment for why
+        # an optimized build is the configuration most likely to actually
+        # miscompile around setjmp()'s limited guarantees, versus the
+        # normal -O0 Debug build every other CI job uses.
+        run: |
+          QT_PREFIX="${QT_PREFIX:-${QT_ROOT_DIR:-}}"
+          cmake -S . -B build-ubsan -G Ninja \
+            ${QT_PREFIX:+-DCMAKE_PREFIX_PATH="$QT_PREFIX"} \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=ON \
+            -DARKHAM_ENABLE_UBSAN=ON
+      - name: Build asset test binary under UBSan
+        # arkham-asset-cache-lock-holder is a real subprocess helper the
+        # cross-process cache-authority tests spawn (see AssetCacheTests'
+        # secondProcessHoldingRootLockForcesThisProcessMemoryOnlyUntilReleased);
+        # it must be built alongside the test binary itself, not omitted.
+        run: cmake --build build-ubsan --target arkham-asset-tests arkham-asset-cache-lock-holder --parallel
+      - name: Run asset tests under UBSan
+        env:
+          QT_QPA_PLATFORM: offscreen
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build-ubsan/arkham-asset-tests
 
   appimage-smoke:
     name: AppImage smoke artifact
@@ -108,13 +321,33 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
+      - name: Verify pinned Qt SDK metadata lock
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-lock
+      - name: Verify pinned Qt SDK archive manifest
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-archive-manifest
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
         with:
           version: ${{ env.QT_VERSION }}
-          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed. JPEG/PNG imageformat plugins already ship in the base qtbase archive; AVIF is decoded directly against a bundled libavif (see src/AssetAvifDecoder.cpp) rather than through any Qt image-format plugin, so no Qt AVIF module is needed here either.
           cache: true
-      - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+          cache-key-prefix: qt-sdk-lock-${{ hashFiles('packaging/qt_sdk_lock.json') }}
+      - name: Verify installed Qt SDK tree matches pinned lock
+        # Round-N+ review (HIGH, "Qt/ICU provenance is version-only/
+        # self-attested ... does not authenticate installed SDK tree
+        # ... same-version substituted cache must fail"): the
+        # "Verify pinned Qt SDK metadata lock" step above only
+        # checksums upstream Updates.xml BEFORE install-qt-action runs
+        # -- it says nothing about what a GitHub Actions cache HIT
+        # (jurplel/install-qt-action's own `cache: true`) actually
+        # restores. This step authenticates the REAL, just-restored
+        # $QT_ROOT_DIR tree itself against packaging/qt_sdk_lock.json's
+        # installedTreeContentSha256 pin, BEFORE any build or reference
+        # use of it -- catching a same-version but substituted/
+        # tampered/stale-cached SDK install that the metadata-only
+        # check above cannot.
+        run: python3 packaging/audit_codec_notices.py verify-qt-sdk-installed-tree "$QT_ROOT_DIR"
+      - name: Install QtKeychain and libavif build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config libavif-dev libjpeg-turbo8-dev zlib1g-dev
       - name: Test libsecret discovery fallback logic
         # Exercises find_bundled_libsecret() (used by build-appimage.sh
         # below) against ldconfig-absent, ldconfig-failing,
@@ -124,6 +357,26 @@ jobs:
         # rather than only by this runner happening to have a working
         # ldconfig.
         run: bash packaging/tests/test_find_bundled_libsecret.sh
+      - name: Test codec license/notice bundling logic
+        # Exercises bundle_codec_notices() (used by build-appimage.sh
+        # below, review round-3 item 17) against synthetic fake ".so"
+        # files in a temporary directory: only-libavif, libavif plus
+        # multiple codec backends, mandatory libavif missing (must fail,
+        # no partial bundling), a recognized codec library present with
+        # no corresponding notice source (must fail loudly rather than
+        # silently ship unattributed), and bundled notice content
+        # actually matching the checked-in third_party/ source. Hermetic
+        # (no AppImage/network dependency).
+        run: bash packaging/tests/test_bundle_codec_notices.sh
+      - name: Test full-AppDir codec/notice classifier auditor
+        # Portable (stdlib-only, no compiler/readelf/real ELF toolchain)
+        # unit tests for audit_codec_notices.py's classify()/verify-notices
+        # logic (review round-4 item 12 and round-9+ items 10-11):
+        # synthetic zero-byte fake ".so"/ELF files, since classify() only
+        # ever inspects a library's basename/path via COMPONENT_PATTERNS
+        # or (once discovered by ELF magic) its identity, never real
+        # dynamic-linking content.
+        run: python3 packaging/tests/test_audit_codec_notices.py -v
       - name: Test dependency-closure auditor against a synthetic ELF chain
         # Builds a small local three-library chain (root -> mid -> leaf)
         # with `cc`, then proves audit_dependency_closure.py: resolves a
@@ -134,7 +387,36 @@ jobs:
         # never present, and rejects a nonexistent root. This is hermetic
         # (no apt-get/network) and independent of the real
         # libsecret/libgpg-error closure exercised further below.
+        #
+        # Also covers --auto-roots (a synthetic nested plugin's own
+        # dependency is invisible to a hand-picked --root list but is
+        # discovered and resolved once auto-rooted -- and its deletion is
+        # then correctly caught), --allow-x11-desktop-stack (a stub
+        # libxcb.so.1 dependency is reported missing by default and only
+        # resolves once the flag is explicitly given), and the recursive
+        # index's ambiguous-duplicate-basename rejection.
         run: bash packaging/tests/test_audit_dependency_closure.sh
+      - name: Test dependency-closure auditor's per-edge/RUNPATH logic
+        # Portable (stdlib-only, no compiler/readelf/real ELF toolchain)
+        # unit tests for audit_dependency_closure.py's internal
+        # _effective_search_dirs()/audit_closure() logic (review round-9+
+        # item 4): monkeypatches _readelf_dynamic_text() with fabricated
+        # `readelf -d -W`-shaped text so the exact per-(name, requester)
+        # edge reachability BFS, the external-RUNPATH-path rejection, and
+        # the DT_RUNPATH-vs-DT_RPATH-vs-LD_LIBRARY_PATH precedence
+        # ordering are all exercised deterministically -- runs on any
+        # platform, complementing (never replacing) the Linux-only
+        # synthetic-ELF-chain test above.
+        run: python3 packaging/tests/test_audit_dependency_closure.py -v
+      - name: Test the AVIF bundled round-trip smoke program in isolation
+        # Hermetic (no AppImage/container/network dependency) proof that
+        # packaging/tests/avif_bundled_roundtrip_smoke.c -- used later in
+        # this job to prove the real packaged AppImage's bundled libavif
+        # decodes with no host fallback -- is itself a correct,
+        # deterministic encode/decode round trip against whatever libavif
+        # this runner already has installed, before it is ever trusted
+        # against the real produced AppImage.
+        run: bash packaging/tests/test_avif_bundled_roundtrip_smoke.sh
       - name: Download packaging tools
         # Downloaded into $RUNNER_TEMP (outside the repository working
         # directory that "*.AppImage" globs below and in the upload step
@@ -266,6 +548,228 @@ jobs:
             exit 1
           }
           echo "libsecret, libqt6keychain, and attribution files verified inside the AppImage."
+      - name: Verify the JPEG image-format plugin is bundled and loadable
+        # djensenius/ArkhamHorror-Linux#17's asset cache validates
+        # Content-Type plus real magic bytes for PNG/JPEG/AVIF and decodes
+        # via QImageReader. PNG decoding is compiled directly into QtGui
+        # (no separate plugin), but JPEG decoding is a separate Qt plugin
+        # (libqjpeg.so under .../plugins/imageformats/) that
+        # linuxdeploy-plugin-qt must actually bundle for JPEG assets to
+        # decode at all on a target host with no system Qt installed --
+        # unlike libsecret above, this is a Qt plugin loaded via Qt's own
+        # QFactoryLoader (scoped to the AppImage's own plugin path by
+        # AppRun), not a bare dlopen(), so a simple presence + ELF-validity
+        # check (mirroring the file-based half of the libsecret check) is
+        # the right-sized proof here; the "Launch the packaged AppImage
+        # headlessly" step below further proves the bundled Qt platform
+        # plugin loads with no host Qt leakage using the exact same
+        # plugin-path scoping mechanism.
+        #
+        # AVIF has no official Qt plugin at all as of this Qt release
+        # (upstream qtimageformats does not ship one; a working plugin
+        # would require the separate third-party
+        # novomesk/qt-avif-image-plugin, out of scope here) -- but unlike
+        # the earlier permanent-gap approach, this is not a problem: AVIF
+        # card art is decoded directly against a bundled libavif via its
+        # own C API (src/AssetAvifDecoder.cpp), bypassing Qt's plugin
+        # registry (QImageReader/QFactoryLoader) entirely, so there is
+        # deliberately no Qt AVIF *plugin* check here to assert against.
+        # See the "Verify libavif and its codec backend closure are
+        # bundled" and "Verify the bundled libavif decodes AVIF images
+        # with no host codec fallback" steps below for the actual AVIF
+        # proof.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          jpeg_plugin="$(find "$extracted" -path '*/imageformats/libqjpeg.so' | head -n1)"
+          [[ -n "$jpeg_plugin" ]] || {
+            echo "libqjpeg.so was not bundled into the AppImage's imageformats plugin directory." >&2
+            exit 1
+          }
+          echo "Found bundled JPEG plugin: $jpeg_plugin"
+          file "$jpeg_plugin" | grep -q 'ELF' || {
+            echo "Bundled libqjpeg.so is not a valid ELF shared object:" >&2
+            file "$jpeg_plugin" >&2
+            exit 1
+          }
+      - name: Verify libavif and its codec backend closure are bundled
+        # AVIF card art (djensenius/ArkhamHorror-Linux#17) is decoded
+        # directly against libavif's own C API (src/AssetAvifDecoder.cpp),
+        # linked as an ordinary ELF DT_NEEDED dependency -- unlike
+        # libsecret (loaded via dlopen()), linuxdeploy's default ldd-based
+        # automatic bundling is expected to have picked up libavif.so and
+        # its own transitive AV1 codec-backend dependencies (dav1d and/or
+        # aom) on its own, with no explicit --library flag needed in
+        # build-appimage.sh. This step proves that expectation against
+        # the real produced AppImage rather than merely assuming it,
+        # reusing the exact same host-independent recursive DT_NEEDED
+        # closure auditor already proven against the libsecret closure
+        # below (packaging/audit_dependency_closure.py), rooted at the
+        # bundled libavif instead.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          avif_lib="$(find "$extracted" -name 'libavif.so*' | head -n1)"
+          [[ -n "$avif_lib" ]] || {
+            echo "libavif.so was not bundled into the AppImage." >&2
+            exit 1
+          }
+          echo "Found bundled libavif: $avif_lib"
+          file "$avif_lib" | grep -q 'ELF' || {
+            echo "Bundled libavif.so is not a valid ELF shared object:" >&2
+            file "$avif_lib" >&2
+            exit 1
+          }
+          avif_lib_dir="$(dirname "$avif_lib")"
+          avif_name="$(basename "$avif_lib")"
+          echo "Auditing the real bundled libavif closure (codec backends included)..."
+          python3 packaging/audit_dependency_closure.py "$avif_lib_dir" --root "$avif_name"
+      - name: Verify every bundled ELF library ships its required license notice
+        # Review round-3 item 17 (initial version) / round-4 item 12 (this
+        # rewrite): linuxdeploy's automatic ldd-based bundling has no
+        # notion of license attribution at all, so nothing arranges for a
+        # bundled library's required notice text to ship alongside the
+        # bare .so files it copies -- and a small handwritten glob table
+        # (the prior version of this step) can only ever check the
+        # libraries its author happened to anticipate: round-4's own
+        # cumulative review found the real produced AppImage additionally
+        # bundling libjpeg and an entire family of libabsl_* (Abseil)
+        # libraries with zero notice coverage, entirely undetected by the
+        # old table.
+        #
+        # This step instead runs packaging/audit_codec_notices.py's
+        # verify-notices mode against the REAL, final, already-extracted
+        # AppImage (never the pre-packaging AppDir): it first recursively
+        # classifies EVERY bundled ELF object (discovered by magic bytes,
+        # not merely a `*.so*` name -- see round-9+ item 10) under the
+        # full extracted AppImage root, hard-failing by exact path if
+        # even one cannot be resolved
+        # to either the small ABI allowlist (needs no notice) or a known
+        # third_party/<component>/ notice source -- so a brand-new,
+        # never-before-seen bundled library (the exact class of defect
+        # round-4 item 12 found) fails packaging here rather than
+        # silently shipping unattributed. It then checksum-verifies every
+        # checked-in third_party/<component>/* file is also present,
+        # non-empty, and byte-for-byte identical under
+        # usr/share/doc/ArkhamHorror/third_party/<component>/ in the
+        # extracted AppImage -- proving genuine bundled *content*, not
+        # merely a same-named file.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          # Round-9+ review item 10 ("rglob *.so* omits main executable,
+          # helper ELFs, AppRun"): audit_codec_notices.py's
+          # find_bundled_libraries() now discovers every real ELF object
+          # by its own magic bytes, not merely files matching a `*.so*`
+          # basename glob, from wherever it is pointed -- so the scan
+          # root here is now the FULL extracted AppImage root
+          # ($extracted), not merely its usr/ subtree, since linuxdeploy's
+          # generated AppRun launcher and this project's own main
+          # application executable (usr/bin/arkham-horror, still inside
+          # usr/) must both be discovered, classified (first-party or a
+          # known component), and included in the SBOM -- AppRun in
+          # particular lives as a SIBLING of usr/, never reachable at
+          # all from a usr/-rooted scan.
+          lib_search_root="$extracted"
+          [[ -d "$lib_search_root/usr" ]] || {
+            echo "Expected extracted AppImage usr/ directory not found under: $lib_search_root" >&2
+            exit 1
+          }
+          doc_root="$extracted/usr/share/doc/ArkhamHorror/third_party"
+
+          # --qt-reference-dir anchors the classifier's Qt-plugin/QML
+          # directory-based fallback to the ACTUAL Qt SDK installed for
+          # this build ($QT_ROOT_DIR, exported by jurplel/install-qt-action
+          # above): a later cumulative review found the previous,
+          # directory-name-only fallback fail-open (an arbitrary .so
+          # merely placed inside e.g. imageformats/ was silently accepted
+          # as "qt"). With this argument, such a file is only classified
+          # as "qt" if a file with the identical relative sub-path also
+          # genuinely exists inside the pinned Qt SDK download itself.
+          [[ -n "${QT_ROOT_DIR:-}" ]] || {
+            echo "QT_ROOT_DIR is not set; install-qt-action should have exported it." >&2
+            exit 1
+          }
+
+          sbom_path="$(pwd)/codec-notice-sbom.json"
+          # Round-N+ review (HIGH, "No basename re-discovery ... capture
+          # exact loader/copy source BEFORE packaging"): the manifest
+          # produced BEFORE packaging by build-appimage.sh's own
+          # "Capture distro provenance" step (see packaging/build-
+          # appimage.sh and packaging/audit_codec_notices.py's own
+          # capture-distro-provenance subcommand) -- classify's
+          # --require-package-provenance now REQUIRES this manifest for
+          # every real distro component (see cmd_classify()'s own
+          # docstring/comments), rather than falling back to an
+          # after-the-fact directory search once packaging is already
+          # complete.
+          distro_provenance_manifest="$(pwd)/distro-provenance-manifest.json"
+          [[ -s "$distro_provenance_manifest" ]] || {
+            echo "Expected distro-provenance manifest not found or empty:" \
+              "$distro_provenance_manifest (build-appimage.sh's own" \
+              "'Capture distro provenance' step should have produced it)." >&2
+            exit 1
+          }
+
+          # --require-package-provenance (round-7 review, "missing
+          # provenance passes"/"governed expectations"): this step runs
+          # against the real, final, ldd-closure-resolved AppImage on
+          # this exact pinned ubuntu-22.04 runner, where every expected
+          # distro component's real system counterpart is genuinely
+          # guaranteed installed -- so a distro component whose
+          # provenance cannot be found/dpkg-owned here is a real
+          # problem, not a silently-tolerated gap.
+          python3 packaging/audit_codec_notices.py classify "$lib_search_root" \
+            --json-out "$sbom_path" --qt-reference-dir "$QT_ROOT_DIR" \
+            --require-package-provenance \
+            --distro-provenance-manifest "$distro_provenance_manifest" \
+            --qt-sdk-version "$QT_VERSION"
+          echo "Wrote machine-readable bundled-library SBOM to $sbom_path"
+
+          python3 packaging/audit_codec_notices.py verify-notices \
+            "$lib_search_root" third_party "$doc_root" --qt-reference-dir "$QT_ROOT_DIR"
+      - name: Upload bundled-library SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: codec-notice-sbom
+          path: codec-notice-sbom.json
+          if-no-files-found: error
+      - name: Verify the bundled libavif decodes AVIF images with no host codec fallback
+        # Complementary to the static closure audit above (mirroring the
+        # libsecret dlopen() no-host-fallback proof further below): builds
+        # packaging/tests/avif_bundled_roundtrip_smoke.c -- a small,
+        # self-contained program that encodes then decodes a tiny
+        # synthetic (never official card art) in-memory AVIF image using
+        # libavif's own C API, linked (`-lavif`) the same ordinary
+        # ELF-dependency way the real application is -- then runs the
+        # compiled binary inside a container built from
+        # debian:bookworm-slim (pinned by digest, matching this repo's
+        # policy of pinning external dependencies precisely; Debian
+        # bookworm's own default package set does not include any libavif
+        # package), mounting only the AppImage's extracted lib directory
+        # (read-only) and setting LD_LIBRARY_PATH at container-start so
+        # the dynamic linker is directed to the mounted bundled copy
+        # first. A successful encode+decode round trip is only possible
+        # if every one of libavif's own runtime dependencies -- the AV1
+        # codec backend included -- was actually bundled and is genuinely
+        # loadable, not merely present as an inert file.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          avif_lib="$(find "$extracted" -name 'libavif.so*' | head -n1)"
+          [[ -n "$avif_lib" ]] || {
+            echo "libavif.so not found in the extracted AppImage." >&2
+            exit 1
+          }
+          avif_lib_dir="$(dirname "$avif_lib")"
+          cc packaging/tests/avif_bundled_roundtrip_smoke.c -o "$RUNNER_TEMP/avif_bundled_roundtrip_smoke" \
+            $(pkg-config --cflags --libs libavif)
+          docker run --rm \
+            --env LD_LIBRARY_PATH=/appdir-lib \
+            --volume "$avif_lib_dir:/appdir-lib:ro" \
+            --volume "$RUNNER_TEMP/avif_bundled_roundtrip_smoke:/avif_bundled_roundtrip_smoke:ro" \
+            debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
+            /avif_bundled_roundtrip_smoke
       - name: Recursive DT_NEEDED closure audit (with mutation regressions)
         # A static, purely file-based proof (packaging/audit_dependency_closure.py)
         # that every non-ABI transitive dependency of the bundled libsecret
@@ -414,6 +918,81 @@ jobs:
             }
             echo "Confirmed: removing bundled '$victim' correctly fails the closure audit."
           done
+      - name: Exhaustive recursive DT_NEEDED closure audit (every bundled ELF as root)
+        # Review round-4/item 11: the closure audit above (and the AVIF/
+        # libavif-rooted audit further above) only ever starts from a
+        # small, hand-picked --root list (libsecret-1.so.0,
+        # libqt6keychain.so, libavif.so). Neither the app's own executable
+        # nor any Qt plugin (e.g. the xcb platform plugin,
+        # usr/lib/plugins/platforms/libqxcb.so) or QML module is
+        # transitively reachable from those roots at all, so a missing
+        # bundled dependency needed only by one of *them* (concretely:
+        # base libxcb.so.1, needed by libqxcb.so, which linuxdeploy's own
+        # default blacklist does not auto-bundle) was invisible to every
+        # existing closure-audit step. Compounding this, the existing
+        # "Launch the packaged AppImage headlessly" smoke test below uses
+        # QT_QPA_PLATFORM=offscreen, which loads libqoffscreen.so instead
+        # of libqxcb.so, so the real xcb platform-plugin load path (and
+        # its need for libxcb.so.1) was never actually exercised at
+        # runtime either -- offscreen smoke masked the gap.
+        #
+        # This step closes both gaps statically: --auto-roots recursively
+        # discovers and roots the walk at literally every real ELF file
+        # under the whole extracted usr/ tree (the app executable in
+        # usr/bin, every already-verified library in usr/lib, every Qt
+        # plugin under usr/lib/plugins/**, and every QML module under
+        # usr/qml/**), so nothing bundled can have an unaudited
+        # dependency purely because no hand-picked --root list happened to
+        # reach it.
+        #
+        # Base X11/xcb/xkbcommon/GL-EGL client libraries and the host's own
+        # fontconfig/FreeType font-rendering stack are the two deliberate,
+        # explicitly documented exceptions (X11_DESKTOP_ABI_ALLOWLIST and
+        # FONT_RENDERING_ABI_ALLOWLIST in audit_dependency_closure.py,
+        # opted into here via --allow-x11-desktop-stack and
+        # --allow-font-rendering-stack respectively): matching
+        # linuxdeploy's own default blacklist convention (verified via
+        # linuxdeploy's public documentation: base X11/xcb libraries are
+        # treated as "always already present on the target", the same
+        # category as glibc, precisely because bundling a
+        # possibly-mismatched xcb/X11 stack alongside a *different* host
+        # X server/XWayland compositor -- including SteamOS's Gamescope --
+        # can break in the opposite, non-obvious direction: protocol/ABI
+        # skew between client and server; and directly confirmed against a
+        # real linuxdeploy run's own "Skipping deployment of blacklisted
+        # library" diagnostic for libfontconfig.so.1/libfreetype.so.6:
+        # bundling one's own fontconfig/FreeType is a well-known
+        # font-cache/config-path compatibility hazard distinct from an ABI
+        # guarantee), these are intentionally NOT bundled and are asserted,
+        # by exact name, to be host-provided. This was previously an
+        # unstated, inconsistent assumption (this same workflow already
+        # `apt-get install`s libxkbcommon0/libgl1/libopengl0/libegl1 *and*
+        # fontconfig/fonts-dejavu-core into the offscreen-smoke container
+        # below specifically because they are assumed host-provided) --
+        # this step makes it complete and auditable in one explicit place
+        # rather than leaving new gaps in the same category undetected.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          usr_root="$extracted/usr"
+          [[ -d "$usr_root" ]] || {
+            echo "Expected extracted AppImage usr/ directory not found: $usr_root" >&2
+            exit 1
+          }
+          echo "Auditing the exhaustive closure of every real bundled ELF under $usr_root ..."
+          # --global-search-dir "$usr_root/lib" mirrors this project's real
+          # AppRun-exported LD_LIBRARY_PATH: it is searched for every
+          # bundled object's dependency edges regardless of that object's
+          # own RUNPATH/RPATH. Without it, only $ORIGIN-relative entries
+          # patchelf/linuxdeploy actually wrote onto each individual
+          # bundled ELF (not usr_root itself, which is never a real
+          # load-time search directory) would be honored -- see
+          # audit_dependency_closure.py's loader-search-awareness design.
+          python3 packaging/audit_dependency_closure.py "$usr_root" \
+            --auto-roots "$usr_root" \
+            --global-search-dir "$usr_root/lib" \
+            --allow-x11-desktop-stack \
+            --allow-font-rendering-stack
       - name: Verify bundled libsecret dependency closure has no host fallback
         # The static recursive closure audit above is the primary,
         # host-independent proof that every non-ABI transitive dependency
@@ -530,6 +1109,77 @@ jobs:
               timeout 60 /app/AppRun --smoke-test
             '
           echo "AppImage launched, entered the event loop, and rendered its first QML frame successfully in a minimal headless container."
+      - name: Launch the packaged AppImage under a real xcb display (Gaming Mode startup smoke)
+        # Review round-4/item 11: the offscreen smoke test above proves
+        # genuine Qt/QML startup, but QT_QPA_PLATFORM=offscreen loads
+        # libqoffscreen.so, never libqxcb.so -- so it never actually
+        # exercises the real xcb platform-plugin path a genuine desktop
+        # session (including SteamOS's Gamescope, an XWayland-backed
+        # compositor Qt's xcb plugin connects to exactly like any other
+        # X11 display) uses at runtime, and could not have caught a
+        # missing base-libxcb-style gap by itself.
+        #
+        # This step launches the same unmodified AppRun --smoke-test
+        # binary with QT_QPA_PLATFORM=xcb against a genuine (virtual) X11
+        # server (Xvfb), inside the same kind of intentionally
+        # libsecret/glib-less debian:bookworm-slim container used above --
+        # "without host leakage" here means this container never has the
+        # bundled Qt/app libraries themselves preinstalled (so a real
+        # startup failure cannot be masked by a host copy silently
+        # substituting for a broken bundle), while the base X11/xcb/GL
+        # client libraries it does install are the one deliberate,
+        # explicitly-documented exception (X11_DESKTOP_ABI_ALLOWLIST in
+        # audit_dependency_closure.py): this project's own policy is that
+        # those specific libraries are always host/session-provided, never
+        # bundled, so installing them here to provide a genuine X11
+        # session is the correct simulation of a real target host/Gamescope
+        # session, not a leak that could hide a real defect in anything
+        # this project actually bundles.
+        #
+        # QT_QUICK_BACKEND is deliberately left unset here (unlike the
+        # offscreen step above): a real xcb session is expected to
+        # negotiate a real GL context via the bundled libGL/libEGL
+        # dispatch libraries against the container's host-provided GL
+        # implementation (Mesa's software llvmpipe rasterizer, installed
+        # below), proving the actual production startup path end users
+        # will exercise, not an alternate raster-only code path.
+        run: |
+          set -euo pipefail
+          extracted="$(pwd)/squashfs-root"
+          [[ -x "$extracted/AppRun" ]] || {
+            echo "AppRun not found or not executable in the extracted AppImage." >&2
+            exit 1
+          }
+          docker run --rm \
+            --volume "$extracted:/app:ro" \
+            debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                xvfb xauth \
+                libxcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+                libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+                libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
+                libx11-xcb1 libxkbcommon0 libxkbcommon-x11-0 \
+                fontconfig fonts-dejavu-core \
+                libgl1 libopengl0 libegl1 libgl1-mesa-dri >/dev/null
+              Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
+              xvfb_pid=$!
+              trap "kill $xvfb_pid 2>/dev/null || true" EXIT
+              for _ in $(seq 1 50); do
+                [[ -e /tmp/.X11-unix/X99 ]] && break
+                sleep 0.1
+              done
+              [[ -e /tmp/.X11-unix/X99 ]] || {
+                echo "Xvfb did not create its display socket in time." >&2
+                exit 1
+              }
+              export DISPLAY=:99
+              export QT_QPA_PLATFORM=xcb
+              timeout 60 /app/AppRun --smoke-test
+            '
+          echo "AppImage launched under the real xcb platform plugin against a genuine (virtual) X11 display and rendered its first QML frame successfully."
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ArkhamHorror-Linux-AppImage

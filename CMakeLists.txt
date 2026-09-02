@@ -9,9 +9,93 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(QT_QML_GENERATE_QMLLS_INI ON)
 
+# Cumulative-review finding (PR #18, exact head 4a47ea34): the previous
+# AssetJpegDecoder.cpp kept its libjpeg cinfo/error-manager state as plain
+# automatic (stack) locals mutated after the setjmp() checkpoint --
+# formally undefined behavior per [csetjmp.syn], even though every
+# compiler actually observed happened to preserve their values across
+# longjmp() regardless (see AssetJpegDecoder.cpp's own restructuring to
+# heap-allocated, unchanged-pointer-reached state, which is what actually
+# fixes this at the root). This option lets CI additionally PROVE the fix
+# under Clang/GCC's UndefinedBehaviorSanitizer in an optimized
+# (RelWithDebInfo/Release) build -- exactly the configuration most likely
+# to have actually miscompiled the previous code, since only an optimizer
+# aggressive enough to register-allocate/reorder around setjmp()'s own
+# (deliberately limited) guarantees could turn this from "happens to
+# work" into an observable failure. Default OFF: this is an opt-in
+# diagnostic configuration, never the default developer/CI build (which
+# would be slower and would reject some otherwise-fine third-party code
+# this project does not control, e.g. inside Qt itself, if ever linked
+# statically).
+option(ARKHAM_ENABLE_UBSAN
+      "Build with -fsanitize=undefined (Clang/GCC only; opt-in diagnostic build, never the default)"
+      OFF)
+if(ARKHAM_ENABLE_UBSAN)
+  if(NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
+    message(FATAL_ERROR "ARKHAM_ENABLE_UBSAN requires Clang or GCC")
+  endif()
+  add_compile_options(-fsanitize=undefined -fno-sanitize-recover=undefined
+                      -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=undefined)
+endif()
+
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Network Quick QuickControls2 WebSockets)
 
 qt_standard_project_setup(REQUIRES 6.8)
+
+# --- libavif (BSD-2-Clause; https://github.com/AOMediaCodec/libavif) -------
+# Review item 4 (PR #18 cumulative review): Qt has no official AVIF plugin
+# (upstream qtimageformats does not ship one), and card art defaults to
+# AVIF -- a permanent AssetErrorCode::UnsupportedCodec for every card asset
+# is not acceptable. AssetAvifDecoder.cpp decodes AVIF directly against
+# libavif's C API instead, so this is a REQUIRED build dependency (not an
+# optional, best-effort one like WrapVulkanHeaders below) -- a configure
+# that cannot find libavif fails loudly rather than silently shipping a
+# build with no AVIF support at all. See mise.toml's setup:macos task and
+# .github/workflows/ci.yml for how each environment installs it, and
+# packaging/build-appimage.sh for how its own shared-library closure is
+# bundled into the AppImage.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBAVIF REQUIRED IMPORTED_TARGET libavif)
+
+# --- libjpeg / libjpeg-turbo (IJG/BSD-style; https://libjpeg-turbo.org/) ---
+# Review item 2 (PR #18 cumulative review at 14cf8de6): the previous JPEG
+# decode path went through QImageReader (Qt's bundled qjpeg plugin), with
+# a separate ScopedJpegDecodeWarningDetector installing a PROCESS-GLOBAL
+# Qt message handler to observe whether libjpeg had to recover from
+# corrupt/incomplete entropy-coded scan data -- unsafe under any
+# concurrent/reentrant decode (two overlapping instances corrupt each
+# other's shared static state and can self-recursively reinstall their own
+# handler). AssetJpegDecoder.cpp fixes this at the root by decoding JPEG
+# directly against libjpeg's own C API instead, with a per-call (never
+# static/shared) custom jpeg_error_mgr, exactly mirroring how
+# AssetAvifDecoder.cpp already decodes AVIF directly against libavif. This
+# is therefore a REQUIRED build dependency (not optional), like libavif
+# above. See mise.toml's setup:macos task and .github/workflows/ci.yml for
+# how each environment installs it.
+pkg_check_modules(LIBJPEG REQUIRED IMPORTED_TARGET libjpeg)
+
+# --- zlib (zlib License; https://zlib.net/) --------------------------------
+# Cumulative-review finding (PR #18, exact head 4a47ea34): a CRC-valid PNG
+# IDAT run can contain a complete, valid image zlib stream followed by
+# extra bytes or an entirely second zlib stream -- libpng only warns about
+# this (and Qt's qpng plugin surfaces no way to observe that warning), so
+# QImageReader/QImage happily decodes and this project would happily cache
+# the result. AssetPngValidator.cpp closes this by concatenating every
+# IDAT chunk's payload (already gathered while walking the chunk sequence
+# for pngChunksAreStrictlyValid()) and inflating it directly against
+# zlib's own C API, requiring the decompressed byte count to exactly equal
+# the expected (width/height/bit-depth/colour-type-derived) scanline byte
+# count, Z_STREAM_END to be reached, and every input byte to be consumed --
+# rejecting both truncated streams and any trailing/second-stream bytes.
+# Qt's own qUncompress()/qCompress() are NOT usable for this: they require
+# Qt's own wire format (a 4-byte big-endian uncompressed-length prefix
+# ahead of the zlib stream), not the bare zlib stream PNG's IDAT chunks
+# actually contain, so the real zlib C API is called directly here, exactly
+# mirroring how AssetAvifDecoder.cpp/AssetJpegDecoder.cpp call libavif/
+# libjpeg directly rather than going through Qt's own image plugins.
+find_package(ZLIB REQUIRED)
+
 
 # include(CTest) establishes the real BUILD_TESTING cache value (default ON)
 # before the QtKeychain FetchContent block below temporarily forces it off,
@@ -77,6 +161,26 @@ add_library(arkham_foundation STATIC
     src/AppBootstrap.h
     src/AppSessionComposition.cpp
     src/AppSessionComposition.h
+    src/AssetAvifDecoder.cpp
+    src/AssetAvifDecoder.h
+    src/AssetCache.cpp
+    src/AssetCache.h
+    src/AssetImageRequest.cpp
+    src/AssetImageRequest.h
+    src/AssetJpegDecoder.cpp
+    src/AssetJpegDecoder.h
+    src/AssetLocaleDigest.cpp
+    src/AssetLocaleDigest.h
+    src/AssetLocator.cpp
+    src/AssetLocator.h
+    src/AssetNetworkFetcher.cpp
+    src/AssetNetworkFetcher.h
+    src/AssetPngValidator.cpp
+    src/AssetPngValidator.h
+    src/AssetRequestCoordinator.cpp
+    src/AssetRequestCoordinator.h
+    src/AssetTypes.cpp
+    src/AssetTypes.h
     src/AuthModels.cpp
     src/AuthModels.h
     src/AuthTransportSecurity.cpp
@@ -134,6 +238,9 @@ target_link_libraries(arkham_foundation PUBLIC
     Qt6::Gui
     Qt6::Network
     Qt6Keychain::Qt6Keychain
+    PkgConfig::LIBAVIF
+    PkgConfig::LIBJPEG
+    ZLIB::ZLIB
 )
 
 qt_add_executable(arkham-horror
@@ -234,6 +341,49 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME app_bootstrap COMMAND arkham-app-bootstrap-tests)
+
+    qt_add_executable(arkham-asset-tests
+        tests/AssetCacheTests.cpp
+        tests/AssetCacheTests.h
+        tests/AssetFetchUrlTestSupport.h
+        tests/AssetImageRequestTests.cpp
+        tests/AssetImageRequestTests.h
+        tests/AssetLocaleDigestTests.cpp
+        tests/AssetLocaleDigestTests.h
+        tests/AssetLocatorTests.cpp
+        tests/AssetLocatorTests.h
+        tests/AssetNetworkFetcherTests.cpp
+        tests/AssetNetworkFetcherTests.h
+        tests/AssetRequestCoordinatorTests.cpp
+        tests/AssetRequestCoordinatorTests.h
+        tests/AssetTestsMain.cpp
+        tests/MockHttpServer.cpp
+        tests/MockHttpServer.h
+    )
+    target_compile_definitions(arkham-asset-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-asset-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME asset COMMAND arkham-asset-tests)
+
+    # Minimal, non-QtTest standalone helper process spawned as a REAL
+    # separate OS process by AssetCacheTests' cross-process root-lock
+    # tests (see AssetCacheLockHolderMain.cpp's own comment) -- a
+    # same-process second AssetCache instance always cooperates with a
+    # live sibling over the same root by design, so only an actual
+    # second process can prove the cross-process denial path. Not a
+    # CTest target itself; AssetCacheTests locates and launches its
+    # binary directly via QCoreApplication::applicationDirPath().
+    qt_add_executable(arkham-asset-cache-lock-holder
+        tests/helpers/AssetCacheLockHolderMain.cpp
+    )
+    target_link_libraries(arkham-asset-cache-lock-holder PRIVATE
+        arkham_foundation
+    )
 
     qt_add_executable(arkham-semantic-command-tests
         tests/SemanticCommandTests.cpp

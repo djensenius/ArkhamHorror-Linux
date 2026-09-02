@@ -19,7 +19,10 @@ enum class UrlErrorCode {
   FragmentPresent,         ///< A fragment component (#...) is present.
   QueryPresent,            ///< A query string (?...) is present.
   DuplicateApiPath,        ///< Path already contains the pinned API base path.
-  InsecureTransport, ///< http to a non-canonical-loopback host is rejected.
+  InsecureTransport,  ///< http to a non-canonical-loopback host is rejected.
+  AmbiguousAuthority, ///< Raw authority is malformed/ambiguous (percent-
+                      ///< escape, non-ASCII, backslash/control character,
+                      ///< or alternate numeric IP spelling in the host).
 };
 
 // Typed error returned by validateCustomUrl() on validation failure.

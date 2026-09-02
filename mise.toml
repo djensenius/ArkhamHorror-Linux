@@ -7,7 +7,33 @@ BUILD_DIR = "build"
 
 [tasks."setup:macos"]
 description = "Install Qt development dependencies with Homebrew"
-run = "brew install clang-format qtbase qtdeclarative qtshadertools qtsvg qtwebsockets"
+# Review item 4 (PR #18 cumulative review): AVIF is decoded directly
+# against libavif's own C API (see src/AssetAvifDecoder.cpp), never
+# through Qt's plugin registry -- Qt has no official AVIF plugin at all
+# (upstream qtimageformats does not include one), and card art defaults
+# to AVIF, so a permanent AssetErrorCode::UnsupportedCodec for every card
+# asset is not acceptable. libavif is therefore a REQUIRED build
+# dependency (see CMakeLists.txt's pkg_check_modules(LIBAVIF REQUIRED
+# ...)), installed here via Homebrew alongside the Qt packages.
+#
+# Review item 2 (PR #18 cumulative review at 14cf8de6): JPEG is likewise
+# decoded directly against libjpeg's own C API (see
+# src/AssetJpegDecoder.cpp), never through Qt's plugin registry -- see
+# CMakeLists.txt's pkg_check_modules(LIBJPEG REQUIRED ...). Homebrew's
+# "jpeg-turbo" formula (not the base system's own libjpeg, if any) is the
+# one that ships the pkg-config file CMake's REQUIRED lookup needs.
+#
+# llvm@18 (rather than the plain, ever-rolling-latest "clang-format"
+# formula) is installed specifically for its bundled clang-format: CI's
+# format job installs clang-format via `apt-get install clang-format` on
+# ubuntu-latest, which currently resolves to LLVM 18.x, and clang-format
+# has changed brace-init spacing rules for `Type var{};` locals between
+# major versions (verified: LLVM 18.1.x and 23.x disagree on this exact
+# construct). Pinning locally to the same major version CI actually uses
+# keeps `mise run format:check` meaningful here instead of silently
+# drifting out of sync with the one clang-format invocation that actually
+# gates merges.
+run = "brew install llvm@18 qtbase qtdeclarative qtshadertools qtsvg qtwebsockets libavif jpeg-turbo pkg-config"
 
 [tasks.configure]
 description = "Configure the Qt build"
@@ -33,7 +59,37 @@ run = "ctest --test-dir \"$BUILD_DIR\" --output-on-failure"
 [tasks."format:check"]
 description = "Check C++ and QML formatting"
 run = '''
-clang-format --dry-run --Werror src/*.cpp src/*.h tests/*.cpp
+# Prefer the llvm@18-pinned clang-format installed by setup:macos, so
+# this check agrees with CI's clang-format (currently 18.x via apt on
+# ubuntu-latest) rather than whatever newer major version Homebrew's
+# plain "clang-format" formula happens to track; fall back to whatever
+# "clang-format" is on PATH (e.g. Linux CI itself, or a macOS setup that
+# hasn't run setup:macos) if the pinned binary isn't present.
+CLANG_FORMAT="clang-format"
+if command -v brew >/dev/null 2>&1; then
+  LLVM18_PREFIX="$(brew --prefix llvm@18 2>/dev/null || true)"
+  # A failed `brew --prefix` leaves LLVM18_PREFIX empty; without this
+  # non-empty guard, "$LLVM18_PREFIX/bin/clang-format" collapses to the
+  # unrelated absolute path "/bin/clang-format", which could silently
+  # exist and override the intended "clang-format" PATH fallback above
+  # with an untracked binary instead of leaving CLANG_FORMAT as-is.
+  if [ -n "$LLVM18_PREFIX" ] && [ -x "$LLVM18_PREFIX/bin/clang-format" ]; then
+    CLANG_FORMAT="$LLVM18_PREFIX/bin/clang-format"
+  fi
+fi
+# Recurse into subdirectories (e.g. tests/helpers/) rather than a flat
+# src/*.cpp-style glob, so a source added under a nested test/helper
+# directory can't silently bypass this formatting gate the way
+# tests/helpers/AssetCacheLockHolderMain.cpp initially did. This task
+# runs under a plain POSIX "sh -c" (not bash), so avoid bash-only array
+# and process-substitution syntax; xargs -0 with an explicit exec both
+# handles arbitrary filenames safely and preserves clang-format's exit
+# status through the pipeline. Deliberately not piping through
+# "sort -z": that flag is GNU-sort-only and unsupported by the default
+# BSD sort on macOS, and clang-format's --dry-run --Werror result for a
+# given file doesn't depend on the order files are checked in anyway.
+find src tests \( -name '*.cpp' -o -name '*.h' \) -print0 |
+  xargs -0 "$CLANG_FORMAT" --dry-run --Werror
 for file in qml/*.qml; do
   formatted="$(mktemp)"
   qmlformat "$file" > "$formatted"

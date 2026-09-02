@@ -1,0 +1,429 @@
+#pragma once
+
+#include "AssetTypes.h"
+
+#include <QByteArray>
+#include <QHash>
+#include <QImage>
+#include <QObject>
+#include <QSize>
+#include <QString>
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <optional>
+
+class QNetworkAccessManager;
+class QNetworkReply;
+class QTimer;
+
+// Forward-declared at GLOBAL scope (matching where these Qt test classes
+// are actually defined -- see tests/AssetNetworkFetcherTests.h et al.,
+// none of which wrap their test class in any namespace) so that the
+// `friend class ::AssetNetworkFetcherTests;` etc. declarations inside
+// namespace Arkham below (explicitly `::`-qualified -- an unqualified
+// friend name written inside a namespace does NOT find an
+// already-visible same-named declaration from an enclosing/global scope;
+// it introduces a brand-new, unrelated class nested inside that
+// namespace instead, per the C++ standard's friend name lookup rules)
+// refer to these actual global-scope test classes.
+class AssetNetworkFetcherTests;
+class AssetRequestCoordinatorTests;
+class AssetImageRequestTests;
+
+namespace Arkham {
+
+class AssetRequestCoordinator;
+class AssetFetchUrlTestSupport;
+
+// Review round-4 item 1: the ONLY way AssetNetworkFetcher::fetch() can be
+// reached at all -- a QUrl by itself, however innocuous-looking, is never
+// an acceptable fetch() argument. An AssetFetchUrl cannot be default- or
+// copy-constructed from an arbitrary QUrl: its only construction path is
+// the validating factory validate(), which reuses this project's
+// existing shared transport-security policy exactly (see
+// isSecureOrLoopbackAuthTransport() in AuthTransportSecurity.h, already
+// used for the same purpose elsewhere) rather than forking a weaker,
+// asset-only reimplementation of "is this URL safe to request": https is
+// permitted to any host; http is permitted ONLY to an exact canonical
+// loopback spelling; a URL carrying userinfo, a missing host, a query
+// string, or a fragment is rejected outright.
+//
+// Review round-5 item 1 (PR #18 cumulative review at 6bdc68cf): validate()
+// itself is now PRIVATE. Before this, ANY code anywhere in the process --
+// not just AssetLocator's own candidate-building pipeline -- could call
+// AssetFetchUrl::validate(anyUrlItLikes) directly and obtain a value that
+// AssetNetworkFetcher::fetch() would accept, completely bypassing
+// AssetLocator's own additional asset-specific canonicalisation/identity
+// checks (exact configured host/port, hostile-identifier rejection,
+// canonical base-URL construction -- see AssetLocator.cpp/AssetTypes.cpp).
+// Generic transport-security safety (this class's own concern) is not the
+// same guarantee as "this URL was actually produced by the asset
+// locator/source pipeline this project trusts" (a concern that belongs to
+// AssetRequestCoordinator/AssetLocator, not here) -- conflating the two by
+// leaving validate() universally callable let a future or buggy call site
+// reach a real network fetch with an attacker-influenced URL that merely
+// happens to be https (or exact loopback http), never having gone through
+// AssetLocator at all. validate() is now reachable only from
+// AssetRequestCoordinator (this project's sole production caller, which
+// only ever calls it with an AssetCandidate::url that AssetLocator already
+// built from a validated ValidatedAssetSource) and from this project's own
+// test suite (via the dedicated AssetFetchUrlTestSupport seam declared in
+// tests/AssetFetchUrlTestSupport.h, which every test file that needs to
+// construct one directly -- rather than through a full
+// AssetRequestCoordinator round-trip -- includes explicitly). There is no
+// other bypass, public or private.
+class AssetFetchUrl {
+public:
+  [[nodiscard]] const QUrl &url() const { return m_url; }
+
+private:
+  [[nodiscard]] static AssetOutcome<AssetFetchUrl> validate(const QUrl &url);
+  explicit AssetFetchUrl(QUrl url) : m_url(std::move(url)) {}
+
+  friend class AssetRequestCoordinator;
+  friend class AssetFetchUrlTestSupport;
+
+  QUrl m_url;
+};
+
+// Dedicated, credential-free HTTP fetcher for asset candidate URLs.
+//
+// Isolation and transport-security posture (deliberately mirrors
+// NetworkAuthenticationClient's documented policy, applied here to image
+// fetches instead of authentication requests):
+//   - The production constructor owns a dedicated QNetworkAccessManager
+//     (destroyed together with this fetcher); no cookie jar is ever
+//     attached, and every request explicitly disables cookie load/save
+//     and cached-authentication reuse, so no cookie or credential can ever
+//     be sent or persisted.
+//   - No Authorization header is ever added by this class.
+//   - Every request uses QNetworkRequest::ManualRedirectPolicy; every 3xx
+//     response is reported as AssetErrorCode::RedirectRejected. No
+//     redirect is ever auto-followed, to another origin or the same one.
+//   - CacheLoadControlAttribute is AlwaysNetwork and CacheSaveControlAttribute
+//     is false: Qt's own built-in HTTP disk cache is never consulted or
+//     populated. Caching is handled exclusively by AssetCache, which has
+//     its own atomic on-disk format and quota policy.
+//   - The response body is capped incrementally as bytes arrive
+//     (QNetworkReply::readyRead), not merely checked once at the end:
+//     exceeding `limits.maxEncodedBytes` aborts the reply immediately, so
+//     a hostile or misconfigured server cannot exhaust memory by
+//     streaming an unbounded body before this class ever gets to check its
+//     final size.
+//
+// Content validation (only performed after a full, unaborted 2xx body is
+// received):
+//   1. The response's declared Content-Type must match the media type for
+//      `expectedFormat` (AssetErrorCode::ContentTypeMismatch otherwise).
+//   2. The body's magic bytes must independently identify the same format
+//      (AssetErrorCode::MagicBytesMismatch otherwise) -- a server lying
+//      about Content-Type is caught even if declared correctly by
+//      coincidence, and vice versa.
+//   3. The declared dimensions are inspected BEFORE any decode is
+//      attempted, against parsed-but-not-yet-fully-decoded container
+//      metadata -- for PNG this is still `QImageReader::size()`; for AVIF
+//      and JPEG it is read directly from libavif's/libjpeg's own header
+//      parse (see AssetAvifDecoder.cpp/AssetJpegDecoder.cpp respectively,
+//      dispatched from decodeAndValidate()'s per-format branches below).
+//      Each dimension is capped at `limits.maxDimensionPixels` and
+//      width*height (computed in 64-bit, never overflowing) is capped at
+//      `limits.maxTotalPixels`, rejecting a dimension/pixel bomb before a
+//      single pixel is decoded.
+//   4. Only then is the image actually decoded: AVIF goes directly
+//      through libavif's own C API (AssetAvifDecoder.h) and JPEG goes
+//      directly through libjpeg's own C API (AssetJpegDecoder.h) -- both
+//      required build/runtime dependencies, never through Qt's plugin
+//      registry (JPEG moved off QImageReader in PR #18's cumulative
+//      review at 14cf8de6: the previous QImageReader-based path's only
+//      way to detect libjpeg silently recovering from corrupt/incomplete
+//      entropy-coded scan data relied on a process-global Qt message
+//      handler, unsafe under concurrent/reentrant decode -- see
+//      decodeJpegImage()'s own comments). Only PNG still goes through
+//      QImageReader; if the installed Qt build has no plugin capable of
+//      decoding it, this is reported as the distinct
+//      AssetErrorCode::UnsupportedCodec rather than the generic
+//      AssetErrorCode::MalformedImage used for a truncated/corrupt PNG
+//      body.
+//
+// Every async callback is guarded by a QPointer and an exact per-request
+// handle so a reply belonging to an old, cancelled, or superseded request
+// can never invoke a callback after this object (or the specific pending
+// request) is gone -- see AssetNetworkFetcher::fetch()'s implementation
+// comment for the exact mechanism.
+class AssetNetworkFetcher final : public QObject {
+  Q_OBJECT
+public:
+  struct Limits {
+    qint64 maxEncodedBytes; // 20 MiB
+    int maxDimensionPixels;
+    qint64 maxTotalPixels; // 32 megapixels
+
+    // A normal (non-default-member-initializer) constructor avoids a Clang
+    // diagnostic ("default member initializer needed within definition of
+    // enclosing class") that fires when a nested aggregate with in-class
+    // default member initializers is used as a default argument value of
+    // the *enclosing* class's own constructor.
+    Limits()
+        : maxEncodedBytes(20LL * 1024 * 1024), maxDimensionPixels(8192),
+          maxTotalPixels(32'000'000) {}
+  };
+
+  // Review item 7: the sanity ceiling `maxEncodedBytes` (and every
+  // derived "+1 over-read" computation in handleReadyRead()/
+  // handleFinished()) must stay validated below, so that arithmetic on it
+  // can never overflow qint64 and the value always fits comfortably
+  // within QByteArray's/qsizetype's real capacity on every platform this
+  // project targets (32-bit qsizetype builds included). 1 GiB is already
+  // far larger than any plausible single card-art asset.
+  static constexpr qint64 kMaxAllowedEncodedBytes = 1LL * 1024 * 1024 * 1024;
+  // A configured dimension/pixel cap above this is nonsensical for card
+  // art and would itself risk overflow in downstream 32-bit-sized pixel
+  // buffers (QImage's own row-stride arithmetic); bounded here rather
+  // than trusted from configuration.
+  static constexpr int kMaxAllowedDimensionPixels = 65536;
+  static constexpr qint64 kMaxAllowedTotalPixels = 4'000'000'000LL;
+  // QTimer ultimately stores its interval as a plain `int` millisecond
+  // count. `QTimer::start(int)` takes its argument in milliseconds as a
+  // plain `int`, so any value up to `INT_MAX` milliseconds (~24.8 days)
+  // would itself be representable there -- but this constant is bounded
+  // far more tightly, to exactly 24 hours (24 * 60 * 60 * 1000 ms), which
+  // is a deliberately small, sane per-request network timeout ceiling,
+  // not merely "whatever avoids overflowing `int`". Being far below
+  // `INT_MAX` is simply a bonus consequence of that 24-hour policy
+  // choice, not the reason for it; the actual overflow-freedom guarantee
+  // comes from `timeout` additionally being validated as a small,
+  // positive, explicitly-bounded value before ever reaching
+  // `timer->start(m_timeout)`.
+  static constexpr std::chrono::milliseconds kMaxAllowedTimeout{24LL * 60 * 60 *
+                                                                1000};
+
+  struct FetchHandle {
+    quint64 id{0};
+    [[nodiscard]] bool isValid() const noexcept { return id != 0; }
+  };
+
+  // Optional conditional-request headers (ETag / Last-Modified) from a
+  // previously cached response. When either is non-empty, a 304 response
+  // is accepted as success-with-no-body (ConditionalFetchResult::notModified
+  // == true). When BOTH are empty (an unconditional request), a 304 is
+  // never valid and is reported as
+  // AssetErrorCode::ConditionalWithoutCachedBody: this client never
+  // silently treats a bodyless response as a successful image.
+  struct ConditionalHeaders {
+    QString etag;
+    QString lastModified;
+
+    [[nodiscard]] bool isEmpty() const {
+      return etag.isEmpty() && lastModified.isEmpty();
+    }
+  };
+
+  struct FetchedAsset {
+    QByteArray encodedBytes;
+    QString contentType; // normalised, e.g. "image/png"
+    QSize dimensions;
+    QImage decodedImage;
+    QString sha256Hex;
+    QString etag;         // may be empty
+    QString lastModified; // raw header text, may be empty
+    int httpStatus{0};
+  };
+
+  struct ConditionalFetchResult {
+    bool notModified{false};
+    std::optional<FetchedAsset> asset; // present iff !notModified
+    // A 304 response MAY carry refreshed validators even though it has
+    // no body (RFC 7232 S4.1): the server can extend/rotate an ETag or
+    // Last-Modified value at revalidation time without re-sending the
+    // representation. Populated only when notModified == true and the
+    // corresponding header was actually present; empty otherwise (never
+    // populated for a fresh 200, whose validators live on `asset`).
+    QString refreshedEtag;
+    QString refreshedLastModified;
+  };
+
+  using FetchCallback =
+      std::function<void(AssetOutcome<ConditionalFetchResult>)>;
+
+  static constexpr std::chrono::seconds kDefaultTimeout{30};
+
+  // Review item 7: preferred construction path for any real (non-test)
+  // caller -- validates `limits`/`timeout` BEFORE any QObject/
+  // QNetworkAccessManager is ever created, returning a typed
+  // AssetErrorCode::InvalidConfiguration instead of throwing. Composition
+  // code that wires this fetcher into the running application (outside
+  // this PR's scope; see the class comment) must surface this typed
+  // error rather than let an exception propagate out of startup.
+  [[nodiscard]] static AssetOutcome<std::unique_ptr<AssetNetworkFetcher>>
+  create(Limits limits = {},
+         std::chrono::milliseconds timeout = kDefaultTimeout,
+         QObject *parent = nullptr);
+
+  // Production constructor: owns a dedicated QNetworkAccessManager.
+  //
+  // Review item 7: an invalid `limits`/`timeout` no longer throws.
+  // Instead, this object is still fully constructed but enters a
+  // permanently-failed configuration state (see isValid()/
+  // configurationError()): every fetch() call on it completes
+  // asynchronously with AssetErrorCode::InvalidConfiguration, and no
+  // QNetworkAccessManager request is ever issued. Prefer create() over
+  // this constructor directly wherever the caller can act on a typed
+  // error before ever calling fetch() at all; this constructor exists
+  // (fail-closed rather than throwing) so existing call sites that
+  // always pass valid, statically-known-good configuration are never
+  // forced to handle a factory result they know can never be an error.
+  explicit AssetNetworkFetcher(
+      Limits limits = {}, std::chrono::milliseconds timeout = kDefaultTimeout,
+      QObject *parent = nullptr);
+  ~AssetNetworkFetcher() override;
+
+  [[nodiscard]] const Limits &limits() const { return m_limits; }
+
+  // Review item 7: true iff the configuration passed to the constructor
+  // was valid. False on a fetcher constructed with invalid
+  // limits/timeout: every fetch() call still completes asynchronously
+  // (never synchronously), always with AssetErrorCode::InvalidConfiguration,
+  // and never touches QNetworkAccessManager.
+  [[nodiscard]] bool isValid() const noexcept {
+    return !m_configurationError.has_value();
+  }
+  // Precondition: !isValid(). The exact typed reason construction failed.
+  [[nodiscard]] const AssetError &configurationError() const {
+    return *m_configurationError;
+  }
+
+  // Issues a GET for `fetchUrl.url()`, validating the response against
+  // `expectedFormat` as described in the class comment. `conditional` may
+  // be empty for a plain unconditional fetch. While this fetcher is
+  // alive, `callback` is invoked exactly once, asynchronously (never
+  // synchronously from within this call), with either the fetched result
+  // or a typed error. If this AssetNetworkFetcher is destroyed while the
+  // request is still pending, delivery is suppressed entirely (see the
+  // destructor) -- callers must not depend on `callback` firing once
+  // destruction is possible.
+  //
+  // Review round-4 item 1: `fetchUrl` is an AssetFetchUrl, not a bare
+  // QUrl -- see that class's comment above. This is the structural
+  // enforcement point: there is no overload of fetch() anywhere that
+  // accepts an unvalidated QUrl, so an arbitrary or forged URL can never
+  // reach this method's QNetworkAccessManager at all, regardless of
+  // caller. A defence-in-depth scheme re-check still runs inside fetch()
+  // itself (see the .cpp) purely as a belt-and-braces safeguard against
+  // a hypothetical future bug in AssetFetchUrl::validate(); it can never
+  // actually trigger given AssetFetchUrl's construction invariant today.
+  //
+  // The returned handle is invalid (FetchHandle::isValid() == false) in
+  // that defence-in-depth case: that request is rejected before any
+  // network operation begins, so there is nothing for cancel() to
+  // intercept, and `callback` will still fire with
+  // AssetErrorCode::UnsupportedScheme regardless of whether cancel() is
+  // ever called on the returned handle. For every other request, the
+  // returned handle is valid and eligible for cancel().
+  FetchHandle fetch(const AssetFetchUrl &fetchUrl, AssetFormat expectedFormat,
+                    ConditionalHeaders conditional, FetchCallback callback);
+
+  // Cancels a specific in-flight fetch. An invalid, stale, or unknown
+  // handle is a safe no-op that never invokes `callback` on cancel()'s
+  // behalf (the request's real outcome, if any is still pending
+  // delivery, is unaffected). For a handle that IS actually pending,
+  // cancellation removes it from the pending set synchronously (so a
+  // second cancel() on the same handle is immediately a no-op), but
+  // `callback`'s Cancelled delivery itself is queued via the event loop
+  // rather than invoked inline from this call. If this AssetNetworkFetcher
+  // is destroyed before that queued delivery runs, it is suppressed
+  // entirely, exactly like a still-pending fetch() callback would be.
+  void cancel(FetchHandle handle);
+
+  // Validates and decodes already-downloaded, already-trusted encoded
+  // bytes against `expectedFormat`, applying the exact same magic-byte,
+  // codec-support, and dimension/pixel-budget checks (steps 2-4 of the
+  // class comment above) that a live network fetch uses -- WITHOUT the
+  // Content-Type header check (step 1), since there is no live HTTP
+  // response to check it against here. This lets a caller serving a
+  // disk-cache hit whose CachedEntry never carried a decoded QImage (only
+  // encodedBytes/metadata are ever persisted to disk; see
+  // AssetCache::store()/lookupDisk()) decode it on demand through the
+  // identical validated codec path a fresh fetch uses, rather than a
+  // second, divergent decode implementation.
+  [[nodiscard]] AssetOutcome<QImage>
+  decodeAndValidate(const QByteArray &encodedBytes,
+                    AssetFormat expectedFormat) const;
+
+private:
+  struct Pending {
+    QNetworkReply *reply{nullptr};
+    QTimer *timer{nullptr};
+    AssetFormat expectedFormat{AssetFormat::Jpeg};
+    bool conditionalRequested{false};
+    QByteArray buffer;
+    bool overflowed{false};
+    FetchCallback callback;
+  };
+
+  // TEST-ONLY constructor: borrows an externally-owned, isolated
+  // QNetworkAccessManager (e.g. one pointed at a loopback test server).
+  //
+  // Review round-5 item 1 (PR #18 cumulative review at 6bdc68cf): this
+  // constructor is now PRIVATE, reachable only from this project's own
+  // test suite via the friend declarations below. Before this, it was
+  // public, and the ONLY thing stopping arbitrary production/composition
+  // code from calling it directly with an arbitrary, possibly
+  // caller-configured QNetworkAccessManager (which could carry cookies, a
+  // proxy with embedded credentials, or an authentication cache, and
+  // whose lifetime this class does not own or control -- an external
+  // caller destroying it out from under a still-alive AssetNetworkFetcher
+  // is a use-after-free) was a doc comment. This constructor still forces
+  // QNetworkProxy::NoProxy on the borrowed manager once here (see the
+  // .cpp), and fetch() ALSO re-asserts NoProxy immediately before every
+  // individual request precisely because a caller retaining its own live
+  // reference to the same borrowed manager could otherwise reconfigure
+  // its proxy at any later point -- but private construction is what
+  // actually proves an arbitrary/external QNetworkAccessManager can never
+  // reach this class from production code at all, rather than merely
+  // documenting that it must not.
+  explicit AssetNetworkFetcher(
+      QNetworkAccessManager &nam, Limits limits = {},
+      std::chrono::milliseconds timeout = kDefaultTimeout,
+      QObject *parent = nullptr);
+
+  AssetNetworkFetcher(std::unique_ptr<QNetworkAccessManager> ownedNam,
+                      QNetworkAccessManager *borrowedNam, Limits limits,
+                      std::chrono::milliseconds timeout, QObject *parent);
+
+  // Review item 7: returns the typed configuration error for
+  // `limits`/`timeout` if invalid, or std::nullopt if both are within the
+  // bounds documented on kMaxAllowedEncodedBytes/kMaxAllowedDimensionPixels/
+  // kMaxAllowedTotalPixels/kMaxAllowedTimeout above. A zero or negative
+  // timeout is rejected outright -- it is never silently reinterpreted as
+  // "disable the timeout".
+  [[nodiscard]] static std::optional<AssetError>
+  validateConfiguration(const Limits &limits,
+                        std::chrono::milliseconds timeout);
+
+  void completeWithError(quint64 handle, AssetError error);
+  void handleReadyRead(quint64 handle);
+  void handleFinished(quint64 handle);
+
+  // Review round-5 item 1: the ONLY code, anywhere, permitted to
+  // construct an AssetNetworkFetcher against a borrowed (non-owned)
+  // QNetworkAccessManager -- this project's own test suite. No
+  // production/composition code is listed here, and none may be added
+  // without also justifying why it needs to bypass this class's owned-
+  // manager isolation guarantee.
+  friend class ::AssetNetworkFetcherTests;
+  friend class ::AssetRequestCoordinatorTests;
+  friend class ::AssetImageRequestTests;
+
+  std::unique_ptr<QNetworkAccessManager> m_ownedNam;
+  QNetworkAccessManager &m_nam;
+  Limits m_limits;
+  std::chrono::milliseconds m_timeout;
+  quint64 m_nextHandle{1};
+  QHash<quint64, Pending> m_pending;
+  // Review item 7: set iff the constructor's limits/timeout failed
+  // validateConfiguration(); see isValid()/configurationError() above.
+  std::optional<AssetError> m_configurationError;
+};
+
+} // namespace Arkham
