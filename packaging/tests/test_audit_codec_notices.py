@@ -5612,9 +5612,15 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         # BEFORE linuxdeploy is ever invoked against the staged bytes,
         # never merely deferred to a later `classify
         # --require-package-provenance` call.
+        # The bundled destination deliberately uses a basename that
+        # really does classify to a concrete third-party component
+        # ("libpng16.so.16" -> "libpng"), because only such an entry is
+        # ever redirected into linuxdeploy's own --library arguments by
+        # build-appimage.sh -- i.e. only such an entry can actually
+        # reach linuxdeploy, which is precisely what this gate protects.
         executable = self.tmp_path / "arkham-horror"
         executable.write_bytes(_FAKE_ELF_BYTES)
-        loader_path = self.tmp_path / "system" / "libfoo.so.1"
+        loader_path = self.tmp_path / "system" / "libpng16.so.16"
         loader_path.parent.mkdir()
         loader_path.write_bytes(b"real-installed-bytes")
         output_path = self.tmp_path / "manifest.json"
@@ -5623,9 +5629,9 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         with mock.patch.object(
             audit,
             "resolve_dt_needed_dependency_graph",
-            return_value=[(executable, "libfoo.so.1", loader_path)],
+            return_value=[(executable, "libpng16.so.16", loader_path)],
         ), mock.patch.object(
-            audit, "_dpkg_owning_package", return_value="libfoo1"
+            audit, "_dpkg_owning_package", return_value="libpng16-16"
         ), mock.patch.object(
             audit,
             "_dpkg_package_metadata",
@@ -5646,7 +5652,7 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
             return_value={
                 "distribution": "ubuntu-22.04",
                 "packages": {
-                    "libfoo1": {
+                    "libpng16-16": {
                         "architecture": "amd64",
                         "version": "1.2.3-1",
                         # Deliberately disagrees with the "e" * 64
@@ -5769,6 +5775,91 @@ class CaptureBeforePackagingProvenanceTests(unittest.TestCase):
         manifest = json.loads(output_path.read_text())
         entry = manifest["bundledPaths"]["usr/lib/libfoo.so.1"]
         self.assertEqual(entry["debArchiveVerification"], "verified")
+
+    def test_cmd_capture_distro_provenance_require_verified_archive_provenance_ignores_a_never_redirected_straggler(
+        self,
+    ) -> None:
+        # Real regression this scoping exists for: capture deliberately
+        # scans the WHOLE Qt SDK plugins/ tree, including plugin
+        # categories this project can never load. GitHub's ubuntu-22.04
+        # runner preinstalls PostgreSQL's THIRD-PARTY PGDG "libpq5"
+        # (observed as 18.6-1.pgdg22.04+2), which Qt's
+        # sqldrivers/libqsqlpsql.so links. libpq is published by PGDG,
+        # not by Ubuntu, so it has NO record in Ubuntu's own signed
+        # InRelease -> Release -> Packages chain and can never be
+        # authenticated here.
+        #
+        # It also classifies to no component at all (see classify()),
+        # so build-appimage.sh never redirects it into a linuxdeploy
+        # --library argument, this project links no Qt6::Sql, and
+        # linuxdeploy-plugin-qt never deploys sqldrivers -- not one byte
+        # of it can reach the AppImage. Aborting the whole build on it
+        # would fail closed on a library that is provably never shipped
+        # while proving nothing about anything that is, so this gate is
+        # scoped to entries that can genuinely reach linuxdeploy.
+        # Anything that does land in the final AppDir remains hard-gated
+        # by `classify --require-package-provenance` afterwards.
+        executable = self.tmp_path / "arkham-horror"
+        executable.write_bytes(_FAKE_ELF_BYTES)
+        loader_path = self.tmp_path / "system" / "libpq.so.5"
+        loader_path.parent.mkdir()
+        loader_path.write_bytes(b"real-installed-bytes")
+        output_path = self.tmp_path / "manifest.json"
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        self.assertIsNone(
+            audit.classify("libpq.so.5"),
+            "this test's premise is that libpq classifies to no "
+            "component and is therefore never redirected to linuxdeploy",
+        )
+
+        with mock.patch.object(
+            audit,
+            "resolve_dt_needed_dependency_graph",
+            return_value=[(executable, "libpq.so.5", loader_path)],
+        ), mock.patch.object(
+            audit,
+            "_dpkg_owning_package",
+            side_effect=lambda path: (
+                "libpq5" if path == loader_path.resolve() else None
+            ),
+        ), mock.patch.object(
+            audit,
+            "_dpkg_package_metadata",
+            return_value=("18.6-1.pgdg22.04+2", "postgresql-18"),
+        ), mock.patch.object(
+            audit, "_dpkg_package_architecture", return_value="amd64"
+        ), mock.patch.object(
+            audit, "_apt_cache_package_record", return_value=None
+        ), mock.patch.object(
+            audit, "_download_and_hash_deb_archive", return_value=None
+        ), mock.patch.object(
+            audit,
+            "_load_distro_package_lock",
+            return_value={"distribution": "ubuntu-22.04", "packages": {}},
+        ), mock.patch.object(
+            audit, "_dpkg_recorded_file_md5", return_value=None
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = audit.main(
+                [
+                    "capture-distro-provenance",
+                    str(executable),
+                    "--output",
+                    str(output_path),
+                    "--require-verified-archive-provenance",
+                ]
+            )
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+        entry = json.loads(output_path.read_text())["bundledPaths"][
+            "usr/lib/libpq.so.5"
+        ]
+        self.assertNotEqual(entry.get("debArchiveVerification"), "verified")
+        self.assertNotIn(
+            "component",
+            entry,
+            "an unmapped straggler must carry no component, which is "
+            "exactly why it is never redirected to linuxdeploy",
+        )
 
     def test_cmd_capture_distro_provenance_without_the_flag_still_tolerates_a_lock_mismatch(
         self,

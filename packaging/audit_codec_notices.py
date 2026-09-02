@@ -7373,6 +7373,37 @@ def cmd_capture_distro_provenance(args: argparse.Namespace) -> int:
             # exactly as before.
             if not entry.get("package"):
                 continue
+            # Scope this pre-linuxdeploy gate to exactly the bytes that
+            # can actually REACH linuxdeploy. The staged "for-linuxdeploy"
+            # redirect below (see build-appimage.sh) hands linuxdeploy a
+            # --library argument for precisely those captured entries that
+            # classify to a concrete third-party `component`; an entry
+            # with no component is an unmapped straggler (or a host-only
+            # ABI_ALLOWLIST library) that is never redirected, never
+            # force-bundled, and therefore never presented to linuxdeploy
+            # at all.
+            #
+            # This matters because capture deliberately scans the whole Qt
+            # SDK plugins/ tree, including plugin categories this
+            # application can never load: GitHub's ubuntu-22.04 runner
+            # preinstalls PostgreSQL's THIRD-PARTY PGDG "libpq5" (e.g.
+            # 18.6-1.pgdg22.04+2), which Qt's sqldrivers/libqsqlpsql.so
+            # links. libpq has no record in Ubuntu's own signed
+            # InRelease -> Release -> Packages chain, so it can never be
+            # authenticated here -- yet this project links no Qt6::Sql
+            # (see CMakeLists.txt), linuxdeploy-plugin-qt never deploys
+            # sqldrivers, and not one byte of it can reach the AppImage.
+            # Failing the build on it would abort on a library that is
+            # provably never shipped, while proving nothing about what is.
+            #
+            # Nothing is weakened by this scoping: anything that does end
+            # up in the real, final AppDir is still hard-gated afterwards
+            # by `classify --require-package-provenance` over the actual
+            # shipped tree (see build-appimage.sh's own final call), which
+            # fails closed on any bundled file lacking full provenance.
+            component = entry.get("component")
+            if not isinstance(component, str) or not component:
+                continue
             verification = entry.get("debArchiveVerification")
             if verification != "verified":
                 unverified.append(
