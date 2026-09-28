@@ -185,8 +185,8 @@ void ContractTests::strictAsciiOnlyParsing() {
 
 void ContractTests::parsesVendoredFixture() {
   // Load from the vendored fixture, not from an inline duplicate string.
-  // This fixture is git-show 2bf2935:contracts/fixtures/capabilities.json,
-  // pinned to the PR#23 backend commit.
+  // This fixture is git-show 6a1befb:contracts/fixtures/capabilities.json,
+  // pinned to the PR#24 backend commit.
   const auto fileResult =
       openContractFile(QStringLiteral("/fixtures/capabilities.json"));
   if (!fileResult.has_value())
@@ -198,7 +198,7 @@ void ContractTests::parsesVendoredFixture() {
   if (!result.has_value())
     QFAIL(qPrintable(result.error()));
 
-  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 11}));
+  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 12}));
   QCOMPARE(result->status, QStringLiteral("baseline-incomplete"));
   QCOMPARE(result->apiBasePath, QStringLiteral("/api/v1"));
   QCOMPARE(result->nativeClientMinimumRevision, (ContractRevision{0, 1, 0}));

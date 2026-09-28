@@ -25,6 +25,7 @@
 #include <utility>
 
 #include "AuthTransportSecurity.h"
+#include "ContractPin.h"
 #include "ICapabilityProbe.h"
 #include "IProfileStore.h"
 #include "NetworkCapabilityProbe.h"
@@ -1401,13 +1402,27 @@ void NetworkTests::probeNonSuccessStatus() {
 
 void NetworkTests::probeIncompatible() {
   StubNetworkAccessManager nam;
-  nam.enqueue(200, QByteArrayLiteral(R"({
-    "schemaRevision": "0.1.11",
+  // nativeClientMinimumRevision is derived from this build's own pinned
+  // supportedSchemaRevision (currentPin(), the same value
+  // contracts/contract-pin.json is bumped in lockstep with) rather than a
+  // second hardcoded string, so this fixture cannot silently stop
+  // exercising a genuine client-too-old outcome the next time the pin
+  // advances -- a hand-written "one above" literal would otherwise need
+  // to be remembered and bumped separately from the pin itself.
+  const ContractRevision pinned = currentPin().supportedSchemaRevision;
+  ContractRevision aboveClient = pinned;
+  ++aboveClient.patch;
+  QVERIFY(aboveClient > pinned);
+
+  nam.enqueue(200, QStringLiteral(R"({
+    "schemaRevision": "%1",
     "status": "baseline-incomplete",
     "apiBasePath": "/api/v1",
-    "nativeClientMinimumRevision": "0.1.12",
+    "nativeClientMinimumRevision": "%2",
     "capabilities": []
-  })"));
+  })")
+                       .arg(pinned.toString(), aboveClient.toString())
+                       .toUtf8());
 
   NetworkCapabilityProbe probe(nam);
   const auto r = runProbe(probe, ServerProfile::hostedDefault());

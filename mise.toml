@@ -16,7 +16,8 @@ QT_PREFIX="${QT_PREFIX:-${QTDIR:-$(brew --prefix 2>/dev/null || true)}}"
 cmake -S . -B "$BUILD_DIR" -G Ninja \
   ${QT_PREFIX:+-DCMAKE_PREFIX_PATH="$QT_PREFIX"} \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DBUILD_TESTING=ON
+  -DBUILD_TESTING=ON \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 '''
 
 [tasks.build]
@@ -33,7 +34,8 @@ run = "ctest --test-dir \"$BUILD_DIR\" --output-on-failure"
 [tasks."format:check"]
 description = "Check C++ and QML formatting"
 run = '''
-clang-format --dry-run --Werror src/*.cpp src/*.h tests/*.cpp
+find src tests -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
+  | xargs -0 clang-format --dry-run --Werror
 for file in qml/*.qml; do
   formatted="$(mktemp)"
   qmlformat "$file" > "$formatted"
@@ -55,3 +57,23 @@ run = "qmllint -I \"$BUILD_DIR\" qml/*.qml"
 description = "Build a Linux x86_64 AppImage"
 depends = ["build"]
 run = "packaging/build-appimage.sh \"$BUILD_DIR\""
+
+[tasks."contracts:verify-provenance"]
+description = "Prove vendored contracts/ files are byte-identical to the pinned backend git commit (fetches from the real backend remote; not merely an offline digest re-check)"
+run = "python3 packaging/verify_contract_provenance.py"
+
+[tasks."contracts:test-provenance-script"]
+description = "Unit-test verify_contract_provenance.py's closure discovery/verify() logic against an in-memory fake backend tree (no network access)"
+run = "python3 packaging/verify_contract_provenance_test.py"
+
+[tasks."contracts:check-encoder-hygiene"]
+description = "Prove via real compiler-AST inspection (libclang) that every closed-world production target/header/source context obeys its exact closure and references no forbidden QJson/QVariant wire type except exact path+USR+semantic-signature+access+count positive allowances for intentional inbound decoders and bounded RawJson/Auth adapters."
+run = "python3 packaging/check_encoder_hygiene.py"
+
+[tasks."contracts:test-encoder-hygiene-script"]
+description = "Unit-test check_encoder_hygiene.py's classify()/allowlist/sanitize-args logic with synthetic data (no compiler invocation)"
+run = "python3 packaging/check_encoder_hygiene_test.py"
+
+[tasks."contracts:test-encoder-hygiene-ast-mutations"]
+description = "Real libclang/CMake fail-before/pass-after matrix for the closed forbidden-wire-type boundary across targets/configs, generator expressions, interface consumers, aliases/templates/arrays/callables/bases, and owned generated/AUTOGEN sources."
+run = "python3 packaging/check_encoder_hygiene_ast_test.py"

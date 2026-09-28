@@ -1,0 +1,100 @@
+{
+  "cards": [
+    {
+      "cardCode": "c01020",
+      "name": {
+        "title": "Machete",
+        "subtitle": null
+      },
+      "cost": {
+        "tag": "StaticCost",
+        "contents": 3
+      },
+      "level": 0,
+      "cardType": "AssetType",
+      "classSymbols": [
+        "Guardian"
+      ],
+      "skills": [
+        {
+          "contents": "SkillCombat",
+          "tag": "SkillIcon"
+        }
+      ],
+      "cardTraits": [
+        "Item",
+        "Melee",
+        "Weapon"
+      ],
+      "slots": [
+        "HandSlot"
+      ],
+      "alternateCardCodes": [
+        "c01520",
+        "c12020"
+      ],
+      "art": "01020",
+      "alternateErrata": {
+        "c12020": "This card’s ability should read “If you succeed and the attacked enemy is the only enemy engaged with you...”"
+      }
+    }
+  ],
+  "homebrewCards": [
+    {
+      "cardCode": "c:dark-matter:151",
+      "name": {
+        "title": "Rats?",
+        "subtitle": null
+      },
+      "cardType": "EnemyType",
+      "cardTraits": [
+        "Creature",
+        "Monster"
+      ],
+      "encounterSet": ":dark-matter:in_the_shadow_of_earth",
+      "encounterSetQuantity": 3,
+      "art": ":dark-matter:151",
+      "health": {
+        "tag": "Static",
+        "contents": 1
+      },
+      "fight": {
+        "tag": "Static",
+        "contents": 1
+      },
+      "evade": {
+        "tag": "Static",
+        "contents": 3
+      },
+      "healthDamage": {
+        "tag": "Static",
+        "contents": 1
+      }
+    }
+  ],
+  "card": {
+    "cardCode": "c01001",
+    "name": {
+      "title": "Roland Banks",
+      "subtitle": "The Fed"
+    },
+    "cardType": "InvestigatorType",
+    "classSymbols": [
+      "Guardian"
+    ],
+    "cardTraits": [
+      "Agency",
+      "Detective"
+    ],
+    "unique": true,
+    "alternateCardCodes": [
+      "c01501",
+      "c98004"
+    ],
+    "art": "01001"
+  },
+  "investigators": [
+    "01001",
+    "01002"
+  ]
+}

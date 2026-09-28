@@ -20,6 +20,29 @@ env:
   QT_VERSION: 6.11.1
 
 jobs:
+  contract-provenance:
+    name: Contract provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Only the pinned backend commit is fetched by the script itself
+          # (from the backend's own remote); the client checkout needs no
+          # special depth.
+          fetch-depth: 1
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.14
+          cache: true
+      # Offline unit tests for the provenance script's own logic
+      # (closure discovery, symlink-at-root/ancestor rejection,
+      # exact-mode/byte checks) against an in-memory fake backend tree,
+      # run before the live network check below so a regression in the
+      # checker itself is caught even if it would otherwise still "pass"
+      # against the real pinned backend commit.
+      - run: mise run contracts:test-provenance-script
+      - run: mise run contracts:verify-provenance
+
   format:
     name: Format
     runs-on: ubuntu-latest
@@ -93,6 +116,38 @@ jobs:
       - name: Install QtKeychain build dependencies
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
       - run: mise run build
+
+  encoder-hygiene:
+    name: Encoder hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
+        with:
+          version: 2026.8.14
+          cache: true
+      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
+          cache: true
+      - name: Install QtKeychain build dependencies and the Clang toolchain (incl. libclang, used via ctypes -- no pip clang/libclang package involved)
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config clang libclang-dev
+      # Offline unit tests for the checker script's own classify()/
+      # allowlist/compile-argument-sanitization logic against synthetic
+      # data, run before the real AST scan below so a regression in the
+      # checker itself is caught even if it would otherwise still "pass"
+      # against the actual, currently-clean project sources.
+      - run: mise run contracts:test-encoder-hygiene-script
+      # Real libclang fail-before/pass-after mutation tests (source-only
+      # declarations, output/inout parameters, inheritance/using-
+      # declaration exposure, inclusion-graph direction/system-header/
+      # external-root classification) against small on-disk fixtures --
+      # proves the AST-scanning core itself actually catches every
+      # historical bypass, independent of and in addition to the
+      # synthetic-data-only tests above.
+      - run: mise run contracts:test-encoder-hygiene-ast-mutations
+      - run: mise run contracts:check-encoder-hygiene
 
   appimage-smoke:
     name: AppImage smoke artifact
