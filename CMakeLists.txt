@@ -10,6 +10,9 @@ set(CMAKE_AUTORCC ON)
 set(QT_QML_GENERATE_QMLLS_INI ON)
 
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Network Quick QuickControls2 WebSockets)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBAVIF REQUIRED IMPORTED_TARGET libavif)
+pkg_check_modules(LIBJPEG REQUIRED IMPORTED_TARGET libjpeg)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -211,6 +214,10 @@ set(ARKHAM_DOMAIN_FRAGMENTS)
 set(ARKHAM_FOUNDATION_HEADERS
     src/AppBootstrap.h
     src/AppSessionComposition.h
+    src/AssetAvifDecoder.h
+    src/AssetJpegDecoder.h
+    src/AssetPngDecoder.h
+    src/AssetTypes.h
     src/AuthModels.h
     src/AuthTransportSecurity.h
     src/CompatibilityEvaluator.h
@@ -240,6 +247,10 @@ set(ARKHAM_FOUNDATION_HEADERS
 
 set(ARKHAM_FOUNDATION_SOURCES
     src/AppSessionComposition.cpp
+    src/AssetAvifDecoder.cpp
+    src/AssetJpegDecoder.cpp
+    src/AssetPngDecoder.cpp
+    src/AssetTypes.cpp
     src/AuthModels.cpp
     src/AuthTransportSecurity.cpp
     src/CompatibilityEvaluator.cpp
@@ -512,11 +523,15 @@ arkham_write_path_manifest(
 )
 
 target_include_directories(arkham_foundation PUBLIC src)
-target_link_libraries(arkham_foundation PUBLIC
-    arkham_domain_models
-    Qt6::Gui
-    Qt6::Network
-    Qt6Keychain::Qt6Keychain
+target_link_libraries(arkham_foundation
+    PUBLIC
+        arkham_domain_models
+        Qt6::Gui
+        Qt6::Network
+        Qt6Keychain::Qt6Keychain
+    PRIVATE
+        PkgConfig::LIBAVIF
+        PkgConfig::LIBJPEG
 )
 arkham_append_encoder_hygiene_target(
     TARGET arkham_foundation
@@ -585,6 +600,17 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME foundation COMMAND arkham-foundation-tests)
+
+    qt_add_executable(arkham-asset-decoder-tests
+        tests/AssetDecoderTests.cpp
+    )
+    target_link_libraries(arkham-asset-decoder-tests PRIVATE
+        arkham_foundation
+        PkgConfig::LIBAVIF
+        PkgConfig::LIBJPEG
+        Qt6::Test
+    )
+    add_test(NAME asset_decoders COMMAND arkham-asset-decoder-tests)
 
     qt_add_executable(arkham-contract-tests
         tests/ContractTests.cpp
