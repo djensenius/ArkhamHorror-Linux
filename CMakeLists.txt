@@ -216,6 +216,8 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/AppSessionComposition.h
     src/AssetAvifDecoder.h
     src/AssetJpegDecoder.h
+    src/AssetLocator.h
+    src/AssetNetworkFetcher.h
     src/AssetPngDecoder.h
     src/AssetTypes.h
     src/AuthModels.h
@@ -249,6 +251,8 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/AppSessionComposition.cpp
     src/AssetAvifDecoder.cpp
     src/AssetJpegDecoder.cpp
+    src/AssetLocator.cpp
+    src/AssetNetworkFetcher.cpp
     src/AssetPngDecoder.cpp
     src/AssetTypes.cpp
     src/AuthModels.cpp
@@ -611,6 +615,17 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME asset_decoders COMMAND arkham-asset-decoder-tests)
+
+    qt_add_executable(arkham-asset-locator-fetcher-tests
+        tests/AssetLocatorFetcherTests.cpp
+        tests/MockHttpServer.cpp
+    )
+    target_link_libraries(arkham-asset-locator-fetcher-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME asset_locator_fetcher COMMAND arkham-asset-locator-fetcher-tests)
 
     qt_add_executable(arkham-contract-tests
         tests/ContractTests.cpp
