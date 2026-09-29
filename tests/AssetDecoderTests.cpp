@@ -104,33 +104,50 @@ QByteArray encodeAvif() {
   return bytes;
 }
 
-QByteArray encodeAvifSequence() {
-  avifImage *image = createAvifImage();
-  if (!image) {
-    return {};
-  }
+quint32 readBigEndian32(const char *bytes) {
+  const auto *data = reinterpret_cast<const unsigned char *>(bytes);
+  return (static_cast<quint32>(data[0]) << 24) |
+         (static_cast<quint32>(data[1]) << 16) |
+         (static_cast<quint32>(data[2]) << 8) | static_cast<quint32>(data[3]);
+}
 
-  avifEncoder *encoder = avifEncoderCreate();
-  if (!encoder) {
-    avifImageDestroy(image);
-    return {};
+quint64 readBigEndian64(const char *bytes) {
+  const auto *data = reinterpret_cast<const unsigned char *>(bytes);
+  quint64 value = 0;
+  for (int i = 0; i < 8; ++i) {
+    value = (value << 8) | static_cast<quint64>(data[i]);
   }
-  encoder->maxThreads = 1;
-  encoder->minQuantizer = 0;
-  encoder->maxQuantizer = 4;
+  return value;
+}
 
-  QByteArray bytes;
-  avifResult result =
-      avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_NONE);
-  if (result == AVIF_RESULT_OK) {
-    result = avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_NONE);
+QByteArray renameTopLevelMetaBoxToFree(QByteArray avif) {
+  qsizetype offset = 0;
+  while (offset + 8 <= avif.size()) {
+    quint64 boxSize = readBigEndian32(avif.constData() + offset);
+    qsizetype headerSize = 8;
+    if (boxSize == 1) {
+      if (offset + 16 > avif.size()) {
+        return {};
+      }
+      boxSize = readBigEndian64(avif.constData() + offset + 8);
+      headerSize = 16;
+    } else if (boxSize == 0) {
+      boxSize = static_cast<quint64>(avif.size() - offset);
+    }
+
+    if (boxSize < static_cast<quint64>(headerSize) ||
+        boxSize > static_cast<quint64>(avif.size() - offset)) {
+      return {};
+    }
+
+    const qsizetype typeOffset = offset + 4;
+    if (std::memcmp(avif.constData() + typeOffset, "meta", 4) == 0) {
+      std::memcpy(avif.data() + typeOffset, "free", 4);
+      return avif;
+    }
+    offset += static_cast<qsizetype>(boxSize);
   }
-  if (result == AVIF_RESULT_OK) {
-    bytes = finishAvifEncode(encoder);
-  }
-  avifEncoderDestroy(encoder);
-  avifImageDestroy(image);
-  return bytes;
+  return {};
 }
 
 struct JpegWriteErrorManager {
@@ -409,17 +426,14 @@ void AssetDecoderTests::rejectsCmykJpeg() {
 }
 
 void AssetDecoderTests::rejectsPureAvifSequenceWithoutPrimaryItem() {
-  const QByteArray avif = encodeAvifSequence();
-  if (avif.isEmpty()) {
-    QSKIP("this libavif build could not encode a sequence fixture");
-  }
+  const QByteArray avif = encodeAvif();
+  QVERIFY(!avif.isEmpty());
 
-  const auto decoded = decodeAssetImage(avif);
-  if (decoded) {
-    QSKIP("this libavif encoder produced a primary item even when asked for a "
-          "sequence fixture");
-  }
-  QCOMPARE(decoded.error().code, AssetDecodeErrorCode::UnsupportedCodec);
+  const QByteArray withoutPrimaryItem = renameTopLevelMetaBoxToFree(avif);
+  QVERIFY(!withoutPrimaryItem.isEmpty());
+
+  expectDecodeError(withoutPrimaryItem, AssetDecodeLimits{},
+                    AssetDecodeErrorCode::UnsupportedCodec);
 }
 
 QTEST_APPLESS_MAIN(AssetDecoderTests)
