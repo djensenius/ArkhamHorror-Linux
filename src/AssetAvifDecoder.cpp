@@ -15,7 +15,9 @@ AssetDecodeErrorCode errorCodeForAvifResult(avifResult result) {
   case AVIF_RESULT_NO_CODEC_AVAILABLE:
   case AVIF_RESULT_NOT_IMPLEMENTED:
   case AVIF_RESULT_UNSUPPORTED_DEPTH:
+#if AVIF_VERSION >= 1000000
   case AVIF_RESULT_MISSING_IMAGE_ITEM:
+#endif
   case AVIF_RESULT_NO_IMAGES_REMAINING:
   case AVIF_RESULT_NO_CONTENT:
     return AssetDecodeErrorCode::UnsupportedCodec;
