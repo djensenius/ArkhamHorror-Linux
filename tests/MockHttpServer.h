@@ -17,9 +17,12 @@ public:
     QByteArray body;
     QByteArray location;
     bool includeContentLength{true};
+    qint64 contentLengthOverride{-1};
     QVector<QByteArray> chunks;
+    int headerDelayMs{0};
     int chunkDelayMs{10};
     bool hang{false};
+    bool hangAfterHeaders{false};
   };
 
   explicit MockHttpServer(QObject *parent = nullptr);
@@ -29,6 +32,7 @@ public:
   QUrl url(const QString &path) const;
   void setResponse(const QString &path, Response response);
   QByteArray lastRequest() const { return m_lastRequest; }
+  int disconnectCount() const { return m_disconnectCount; }
 
 protected:
   void incomingConnection(qintptr socketDescriptor) override;
@@ -41,4 +45,5 @@ private:
   QList<QTcpSocket *> m_sockets;
   QHash<QTcpSocket *, QByteArray> m_buffers;
   QByteArray m_lastRequest;
+  int m_disconnectCount{0};
 };

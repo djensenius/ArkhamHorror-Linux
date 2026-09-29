@@ -4,7 +4,13 @@
 #include <QDeadlineTimer>
 #include <QEventLoop>
 #include <QNetworkAccessManager>
+#include <QNetworkCookie>
+#include <QNetworkCookieJar>
+#include <QNetworkReply>
+#include <QQueue>
 #include <QtTest>
+#include <cstring>
+#include <functional>
 #include <optional>
 
 #include "AssetLocator.h"
@@ -20,16 +26,21 @@ QByteArray tinyPng() {
       "l6p7xNwAAAABJRU5ErkJggg==");
 }
 
+bool waitUntil(const std::function<bool()> &condition, int timeoutMs = 1000) {
+  const QDeadlineTimer deadline(timeoutMs);
+  while (!condition() && !deadline.hasExpired()) {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+  }
+  return condition();
+}
+
 AssetOutcome<AssetFetchResult> runFetch(AssetNetworkFetcher &fetcher,
                                         const QUrl &url, int timeoutMs = 2000) {
   std::optional<AssetOutcome<AssetFetchResult>> captured;
   fetcher.fetch(url, [&captured](AssetOutcome<AssetFetchResult> result) {
     captured.emplace(std::move(result));
   });
-  const QDeadlineTimer deadline(timeoutMs);
-  while (!captured.has_value() && !deadline.hasExpired()) {
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
-  }
+  waitUntil([&captured]() { return captured.has_value(); }, timeoutMs);
   if (!captured.has_value()) {
     return AssetError{AssetErrorCode::Timeout,
                       QStringLiteral("test timed out waiting for fetch")};
@@ -58,6 +69,71 @@ response(int status, QByteArray body = {},
   return result;
 }
 
+class SyntheticReply final : public QNetworkReply {
+public:
+  SyntheticReply(const QUrl &url, int status, QByteArray body,
+                 QByteArray contentType, QUrl redirect, QObject *parent)
+      : QNetworkReply(parent), m_body(std::move(body)) {
+    setUrl(url);
+    setOpenMode(QIODevice::ReadOnly);
+    setAttribute(QNetworkRequest::HttpStatusCodeAttribute, status);
+    if (!contentType.isEmpty()) {
+      setRawHeader("Content-Type", contentType);
+    }
+    if (!redirect.isEmpty()) {
+      setAttribute(QNetworkRequest::RedirectionTargetAttribute, redirect);
+    }
+    QMetaObject::invokeMethod(
+        this, [this]() { emit finished(); }, Qt::QueuedConnection);
+  }
+
+  void abort() override {}
+
+protected:
+  qint64 readData(char *data, qint64 maxSize) override {
+    const qint64 available = m_body.size() - m_offset;
+    if (available <= 0) {
+      return 0;
+    }
+    const qint64 count = qMin(available, maxSize);
+    std::memcpy(data, m_body.constData() + m_offset,
+                static_cast<size_t>(count));
+    m_offset += count;
+    return count;
+  }
+
+private:
+  QByteArray m_body;
+  qint64 m_offset{0};
+};
+
+class SyntheticNetworkAccessManager final : public QNetworkAccessManager {
+public:
+  struct Canned {
+    int status{200};
+    QByteArray body;
+    QByteArray contentType{QByteArrayLiteral("image/png")};
+    QUrl redirect;
+  };
+
+  void enqueue(Canned canned) { m_responses.enqueue(std::move(canned)); }
+
+protected:
+  QNetworkReply *createRequest(Operation, const QNetworkRequest &request,
+                               QIODevice *) override {
+    if (m_responses.isEmpty()) {
+      qFatal("SyntheticNetworkAccessManager: no response enqueued");
+    }
+    Canned canned = m_responses.dequeue();
+    return new SyntheticReply(
+        request.url(), canned.status, std::move(canned.body),
+        std::move(canned.contentType), std::move(canned.redirect), this);
+  }
+
+private:
+  QQueue<Canned> m_responses;
+};
+
 } // namespace
 
 class AssetLocatorFetcherTests final : public QObject {
@@ -66,23 +142,33 @@ class AssetLocatorFetcherTests final : public QObject {
 private slots:
   void locatorBuildsDefaultCardFrontUrl();
   void locatorBuildsBackUrlAndStripsLeadingC();
-  void locatorBuildsHomebrewCardUrl();
+  void locatorBuildsServerPrefixedHomebrewCardUrl();
+  void locatorBuildsAlreadyStrippedHomebrewCardUrl();
   void locatorPreservesBasePathPrefix();
-  void locatorRejectsUnsafeCardSegments_data();
-  void locatorRejectsUnsafeCardSegments();
+  void locatorAllowsAssetBaseWithApiPath();
+  void locatorRejectsUnsafeOfficialCodes_data();
+  void locatorRejectsUnsafeOfficialCodes();
+  void locatorRejectsUnsafeHomebrewSegments_data();
+  void locatorRejectsUnsafeHomebrewSegments();
   void locatorEnforcesHttpsExceptLoopbackHttp();
 
-  void fetcherReturnsPngBytes();
+  void fetcherReturnsPngBytesWithoutCookies();
   void fetcherReports404NotFound();
   void fetcherReports500HttpError();
-  void fetcherRejectsOversizeContentLength();
+  void fetcherRejectsOversizeContentLengthBeforeTimeout();
   void fetcherRejectsOversizeStreamWithoutContentLength();
   void fetcherTimesOut();
+  void fetcherUsesOneTotalTimeoutAcrossRedirects();
   void fetcherFollowsSameOriginRedirect();
   void fetcherRejectsRedirectToHttpNonLoopback();
+  void fetcherRejectsHttpsRemoteRedirectToHttpLoopback();
+  void fetcherAllowsCrossOriginHttpsRedirect();
   void fetcherCapsRedirectLoops();
+  void fetcherReportsRedirectWithoutLocation();
+  void fetcherReports304WithoutCache();
   void fetcherRejectsHtmlContentType();
   void destroyingFetcherCancelsInFlightWithoutCallback();
+  void destroyingNetworkManagerDuringRequestDoesNotCallbackOrCrash();
 };
 
 void AssetLocatorFetcherTests::locatorBuildsDefaultCardFrontUrl() {
@@ -102,7 +188,17 @@ void AssetLocatorFetcherTests::locatorBuildsBackUrlAndStripsLeadingC() {
   QCOMPARE(url->path(), QStringLiteral("/img/arkham/cards/01001b.avif"));
 }
 
-void AssetLocatorFetcherTests::locatorBuildsHomebrewCardUrl() {
+void AssetLocatorFetcherTests::locatorBuildsServerPrefixedHomebrewCardUrl() {
+  const auto url = AssetLocator::buildCardImageUrl(
+      AssetLocator::defaultAssetBaseUrl(),
+      {QStringLiteral("c:circus-ex-mortis:001"), AssetLocator::CardFace::Back});
+  QVERIFY(url);
+  QCOMPARE(
+      url->path(),
+      QStringLiteral("/img/arkham/homebrew/circus-ex-mortis/cards/001b.avif"));
+}
+
+void AssetLocatorFetcherTests::locatorBuildsAlreadyStrippedHomebrewCardUrl() {
   const auto url = AssetLocator::buildCardImageUrl(
       AssetLocator::defaultAssetBaseUrl(),
       {QStringLiteral(":circus-ex-mortis:001"), AssetLocator::CardFace::Back});
@@ -124,18 +220,58 @@ void AssetLocatorFetcherTests::locatorPreservesBasePathPrefix() {
       QStringLiteral("https://cdn.example/assets/img/arkham/cards/01002.avif"));
 }
 
-void AssetLocatorFetcherTests::locatorRejectsUnsafeCardSegments_data() {
+void AssetLocatorFetcherTests::locatorAllowsAssetBaseWithApiPath() {
+  const auto base = AssetLocator::assetBaseUrlFromString(
+      QStringLiteral("https://example.com/api/assets"));
+  QVERIFY(base);
+  const auto url =
+      AssetLocator::buildCardImageUrl(*base, {QStringLiteral("01002")});
+  QVERIFY(url);
+  QCOMPARE(url->toString(),
+           QStringLiteral(
+               "https://example.com/api/assets/img/arkham/cards/01002.avif"));
+}
+
+void AssetLocatorFetcherTests::locatorRejectsUnsafeOfficialCodes_data() {
   QTest::addColumn<QString>("cardCode");
 
   QTest::newRow("empty") << QString();
-  QTest::newRow("slash") << QStringLiteral("01/001");
-  QTest::newRow("backslash") << QStringLiteral("01\\001");
-  QTest::newRow("dot") << QStringLiteral(".");
   QTest::newRow("dotdot") << QStringLiteral("..");
-  QTest::newRow("control") << QStringLiteral("01001\n");
+  QTest::newRow("path") << QStringLiteral("a/b");
+  QTest::newRow("percent-dotdot") << QStringLiteral("%2e%2e");
+  QTest::newRow("percent-slash") << QStringLiteral("010%2f001");
+  QTest::newRow("percent-backslash") << QStringLiteral("010%5c001");
+  QTest::newRow("fullwidth-slash") << QString::fromUtf8("010／001");
+  QTest::newRow("fullwidth-dot") << QString::fromUtf8("010．001");
+  QTest::newRow("division-slash") << QString::fromUtf8("010∕001");
+  QTest::newRow("space") << QStringLiteral("010 01");
+  QTest::newRow("colon") << QStringLiteral("01001:evil");
+  QTest::newRow("non-ascii") << QString::fromUtf8("０1001");
 }
 
-void AssetLocatorFetcherTests::locatorRejectsUnsafeCardSegments() {
+void AssetLocatorFetcherTests::locatorRejectsUnsafeOfficialCodes() {
+  QFETCH(QString, cardCode);
+  const auto url = AssetLocator::buildCardImageUrl(
+      AssetLocator::defaultAssetBaseUrl(), {cardCode});
+  expectErrorCode(url, AssetErrorCode::InvalidAssetKey);
+}
+
+void AssetLocatorFetcherTests::locatorRejectsUnsafeHomebrewSegments_data() {
+  QTest::addColumn<QString>("cardCode");
+
+  QTest::newRow("empty-campaign") << QStringLiteral("c::001");
+  QTest::newRow("path-campaign") << QStringLiteral("c:../a/b:001");
+  QTest::newRow("empty-code") << QStringLiteral("c:circus-ex-mortis:");
+  QTest::newRow("space-campaign") << QStringLiteral("c:circus ex:001");
+  QTest::newRow("percent-campaign") << QStringLiteral("c:circus%2f:001");
+  QTest::newRow("percent-code") << QStringLiteral("c:circus-ex-mortis:00%2f");
+  QTest::newRow("colon-in-campaign")
+      << QStringLiteral("c:circus:ex-mortis:001");
+  QTest::newRow("fullwidth-code")
+      << QString::fromUtf8("c:circus-ex-mortis:００1");
+}
+
+void AssetLocatorFetcherTests::locatorRejectsUnsafeHomebrewSegments() {
   QFETCH(QString, cardCode);
   const auto url = AssetLocator::buildCardImageUrl(
       AssetLocator::defaultAssetBaseUrl(), {cardCode});
@@ -148,18 +284,33 @@ void AssetLocatorFetcherTests::locatorEnforcesHttpsExceptLoopbackHttp() {
   QVERIFY(AssetLocator::assetBaseUrlFromString(
       QStringLiteral("http://127.0.0.1:8080")));
   QVERIFY(AssetLocator::assetBaseUrlFromString(
+      QStringLiteral("http://localhost:8080")));
+  QVERIFY(AssetLocator::assetBaseUrlFromString(
       QStringLiteral("http://[::1]:8080")));
-  const auto rejected = AssetLocator::assetBaseUrlFromString(
-      QStringLiteral("http://example.com"));
-  expectErrorCode(rejected, AssetErrorCode::InvalidAssetBaseUrl);
+
+  const auto insecureBase = AssetLocator::buildCardImageUrl(
+      QUrl(QStringLiteral("http://example.com")), {QStringLiteral("01001")});
+  expectErrorCode(insecureBase, AssetErrorCode::InsecureTransport);
+
+  const auto loopbackBase = AssetLocator::buildCardImageUrl(
+      QUrl(QStringLiteral("http://localhost")), {QStringLiteral("01001")});
+  QVERIFY(loopbackBase);
 }
 
-void AssetLocatorFetcherTests::fetcherReturnsPngBytes() {
+void AssetLocatorFetcherTests::fetcherReturnsPngBytesWithoutCookies() {
   MockHttpServer server;
   QVERIFY(server.start());
   server.setResponse(QStringLiteral("/image.png"), response(200, tinyPng()));
 
   QNetworkAccessManager nam;
+  auto *jar = new QNetworkCookieJar(&nam);
+  QNetworkCookie cookie(QByteArrayLiteral("asset_session"),
+                        QByteArrayLiteral("secret"));
+  cookie.setDomain(QStringLiteral("127.0.0.1"));
+  cookie.setPath(QStringLiteral("/"));
+  jar->setCookiesFromUrl({cookie}, server.url(QStringLiteral("/image.png")));
+  nam.setCookieJar(jar);
+
   AssetNetworkFetcher fetcher(nam,
                               {.maxResponseBytes = 1024, .maxRedirects = 5},
                               std::chrono::milliseconds(500));
@@ -204,11 +355,14 @@ void AssetLocatorFetcherTests::fetcherReports500HttpError() {
   QCOMPARE(result.error().httpStatus, 500);
 }
 
-void AssetLocatorFetcherTests::fetcherRejectsOversizeContentLength() {
+void AssetLocatorFetcherTests::
+    fetcherRejectsOversizeContentLengthBeforeTimeout() {
   MockHttpServer server;
   QVERIFY(server.start());
-  server.setResponse(QStringLiteral("/large.png"),
-                     response(200, QByteArray(8, 'x')));
+  MockHttpServer::Response large = response(200);
+  large.contentLengthOverride = 99;
+  large.hangAfterHeaders = true;
+  server.setResponse(QStringLiteral("/large.png"), large);
 
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam, {.maxResponseBytes = 4, .maxRedirects = 5},
@@ -252,6 +406,28 @@ void AssetLocatorFetcherTests::fetcherTimesOut() {
   expectErrorCode(result, AssetErrorCode::Timeout);
 }
 
+void AssetLocatorFetcherTests::fetcherUsesOneTotalTimeoutAcrossRedirects() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  MockHttpServer::Response first = response(302);
+  first.location = QByteArrayLiteral("/second.png");
+  first.headerDelayMs = 45;
+  MockHttpServer::Response second = response(302);
+  second.location = QByteArrayLiteral("/final.png");
+  second.headerDelayMs = 45;
+  server.setResponse(QStringLiteral("/first.png"), first);
+  server.setResponse(QStringLiteral("/second.png"), second);
+  server.setResponse(QStringLiteral("/final.png"), response(200, tinyPng()));
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam,
+                              {.maxResponseBytes = 1024, .maxRedirects = 5},
+                              std::chrono::milliseconds(70));
+  const auto result =
+      runFetch(fetcher, server.url(QStringLiteral("/first.png")), 1000);
+  expectErrorCode(result, AssetErrorCode::Timeout);
+}
+
 void AssetLocatorFetcherTests::fetcherFollowsSameOriginRedirect() {
   MockHttpServer server;
   QVERIFY(server.start());
@@ -286,6 +462,34 @@ void AssetLocatorFetcherTests::fetcherRejectsRedirectToHttpNonLoopback() {
   expectErrorCode(result, AssetErrorCode::RedirectRejected);
 }
 
+void AssetLocatorFetcherTests::
+    fetcherRejectsHttpsRemoteRedirectToHttpLoopback() {
+  SyntheticNetworkAccessManager nam;
+  nam.enqueue(
+      {302, {}, {}, QUrl(QStringLiteral("http://127.0.0.1/image.png"))});
+
+  AssetNetworkFetcher fetcher(nam,
+                              {.maxResponseBytes = 1024, .maxRedirects = 5},
+                              std::chrono::milliseconds(500));
+  const auto result =
+      runFetch(fetcher, QUrl(QStringLiteral("https://assets.example/start")));
+  expectErrorCode(result, AssetErrorCode::RedirectRejected);
+}
+
+void AssetLocatorFetcherTests::fetcherAllowsCrossOriginHttpsRedirect() {
+  SyntheticNetworkAccessManager nam;
+  nam.enqueue({302, {}, {}, QUrl(QStringLiteral("https://cdn.example/final"))});
+  nam.enqueue({200, tinyPng(), QByteArrayLiteral("image/png"), {}});
+
+  AssetNetworkFetcher fetcher(nam,
+                              {.maxResponseBytes = 1024, .maxRedirects = 5},
+                              std::chrono::milliseconds(500));
+  const auto result =
+      runFetch(fetcher, QUrl(QStringLiteral("https://assets.example/start")));
+  QVERIFY(result);
+  QCOMPARE(result->finalUrl, QUrl(QStringLiteral("https://cdn.example/final")));
+}
+
 void AssetLocatorFetcherTests::fetcherCapsRedirectLoops() {
   MockHttpServer server;
   QVERIFY(server.start());
@@ -300,6 +504,34 @@ void AssetLocatorFetcherTests::fetcherCapsRedirectLoops() {
   const auto result =
       runFetch(fetcher, server.url(QStringLiteral("/loop.png")));
   expectErrorCode(result, AssetErrorCode::TooManyRedirects);
+}
+
+void AssetLocatorFetcherTests::fetcherReportsRedirectWithoutLocation() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  server.setResponse(QStringLiteral("/redirect.png"), response(302));
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam,
+                              {.maxResponseBytes = 1024, .maxRedirects = 5},
+                              std::chrono::milliseconds(500));
+  const auto result =
+      runFetch(fetcher, server.url(QStringLiteral("/redirect.png")));
+  expectErrorCode(result, AssetErrorCode::MissingRedirectLocation);
+}
+
+void AssetLocatorFetcherTests::fetcherReports304WithoutCache() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  server.setResponse(QStringLiteral("/not-modified.png"), response(304));
+
+  QNetworkAccessManager nam;
+  AssetNetworkFetcher fetcher(nam,
+                              {.maxResponseBytes = 1024, .maxRedirects = 5},
+                              std::chrono::milliseconds(500));
+  const auto result =
+      runFetch(fetcher, server.url(QStringLiteral("/not-modified.png")));
+  expectErrorCode(result, AssetErrorCode::NotModifiedWithoutCache);
 }
 
 void AssetLocatorFetcherTests::fetcherRejectsHtmlContentType() {
@@ -336,12 +568,33 @@ void AssetLocatorFetcherTests::
                   [&callbackCalled](AssetOutcome<AssetFetchResult>) {
                     callbackCalled = true;
                   });
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
+    QVERIFY(waitUntil([&server]() { return !server.lastRequest().isEmpty(); }));
   }
-  const QDeadlineTimer deadline(200);
-  while (!deadline.hasExpired()) {
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 25);
-  }
+  QVERIFY(waitUntil([&server]() { return server.disconnectCount() > 0; }));
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QVERIFY(!callbackCalled);
+}
+
+void AssetLocatorFetcherTests::
+    destroyingNetworkManagerDuringRequestDoesNotCallbackOrCrash() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  MockHttpServer::Response hanging = response(200);
+  hanging.hang = true;
+  server.setResponse(QStringLiteral("/hang.png"), hanging);
+
+  bool callbackCalled = false;
+  auto *nam = new QNetworkAccessManager;
+  AssetNetworkFetcher fetcher(*nam,
+                              {.maxResponseBytes = 1024, .maxRedirects = 5},
+                              std::chrono::milliseconds(500));
+  fetcher.fetch(server.url(QStringLiteral("/hang.png")),
+                [&callbackCalled](AssetOutcome<AssetFetchResult>) {
+                  callbackCalled = true;
+                });
+  QVERIFY(waitUntil([&server]() { return !server.lastRequest().isEmpty(); }));
+  delete nam;
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
   QVERIFY(!callbackCalled);
 }
 

@@ -48,9 +48,13 @@ private:
     QByteArray bytes;
     QTimer *timer{nullptr};
     int redirectCount{0};
+    QUrl originalUrl;
+    std::chrono::steady_clock::time_point deadline;
   };
 
-  void startRequest(const QUrl &url, int redirectCount, FetchCallback callback);
+  void startRequest(const QUrl &url, const QUrl &originalUrl, int redirectCount,
+                    std::chrono::steady_clock::time_point deadline,
+                    FetchCallback callback);
   void handleReadyRead(QNetworkReply *reply);
   void handleFinished(QNetworkReply *reply);
   void checkContentLength(QNetworkReply *reply);

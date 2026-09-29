@@ -64,6 +64,8 @@ void MockHttpServer::incomingConnection(qintptr socketDescriptor) {
     return;
   }
   m_sockets.append(socket);
+  connect(socket, &QTcpSocket::disconnected, this,
+          [this]() { ++m_disconnectCount; });
   connect(socket, &QObject::destroyed, this, [this, socket]() {
     m_sockets.removeAll(socket);
     m_buffers.remove(socket);
@@ -87,6 +89,16 @@ void MockHttpServer::handleRequest(QTcpSocket *socket) {
   if (response.hang) {
     return;
   }
+  if (response.headerDelayMs > 0) {
+    QPointer<QTcpSocket> guardedSocket(socket);
+    QTimer::singleShot(response.headerDelayMs, this,
+                       [this, guardedSocket, response]() {
+                         if (guardedSocket) {
+                           writeResponse(guardedSocket, response);
+                         }
+                       });
+    return;
+  }
   writeResponse(socket, response);
 }
 
@@ -102,14 +114,21 @@ void MockHttpServer::writeResponse(QTcpSocket *socket,
     header += "Location: " + response.location + "\r\n";
   }
   if (response.includeContentLength) {
-    qsizetype length = response.body.size();
-    for (const QByteArray &chunk : response.chunks) {
-      length += chunk.size();
+    qint64 length = response.contentLengthOverride;
+    if (length < 0) {
+      length = response.body.size();
+      for (const QByteArray &chunk : response.chunks) {
+        length += chunk.size();
+      }
     }
     header += "Content-Length: " + QByteArray::number(length) + "\r\n";
   }
   header += "\r\n";
   socket->write(header);
+
+  if (response.hangAfterHeaders) {
+    return;
+  }
 
   if (response.chunks.isEmpty()) {
     socket->write(response.body);

@@ -1,7 +1,6 @@
 #include "AssetLocator.h"
 
 #include "AuthTransportSecurity.h"
-#include "UrlValidator.h"
 
 #include <QStringList>
 
@@ -22,10 +21,44 @@ bool containsControlCharacter(const QString &text) {
   return false;
 }
 
-bool isRejectedSegment(const QString &segment) {
-  return segment.isEmpty() || segment == "."_L1 || segment == ".."_L1 ||
-         segment.contains(u'/') || segment.contains(u'\\') ||
-         containsControlCharacter(segment);
+bool isAsciiDigit(QChar c) { return c >= u'0' && c <= u'9'; }
+
+bool isAsciiLower(QChar c) { return c >= u'a' && c <= u'z'; }
+
+bool isOfficialCardCodeSegment(const QString &segment) {
+  if (segment.isEmpty()) {
+    return false;
+  }
+  qsizetype index = 0;
+  while (index < segment.size() && isAsciiDigit(segment.at(index))) {
+    ++index;
+  }
+  if (index == 0) {
+    return false;
+  }
+  while (index < segment.size()) {
+    if (!isAsciiLower(segment.at(index))) {
+      return false;
+    }
+    ++index;
+  }
+  return true;
+}
+
+bool isHomebrewCampaignSegment(const QString &segment) {
+  if (segment.isEmpty()) {
+    return false;
+  }
+  for (const QChar c : segment) {
+    if (!isAsciiDigit(c) && !isAsciiLower(c) && c != u'-') {
+      return false;
+    }
+  }
+  return true;
+}
+
+AssetError invalidKey(const QString &message) {
+  return AssetError{AssetErrorCode::InvalidAssetKey, message};
 }
 
 AssetOutcome<bool> validateAssetBaseUrl(const QUrl &url) {
@@ -59,7 +92,7 @@ AssetOutcome<bool> validateAssetBaseUrl(const QUrl &url) {
   return true;
 }
 
-QString strippedCardCode(const QString &cardCode) {
+QString stripOneServerCardPrefix(const QString &cardCode) {
   if (cardCode.startsWith(u'c')) {
     return cardCode.mid(1);
   }
@@ -82,8 +115,69 @@ QUrl appendPathSegments(QUrl base, const QStringList &segments) {
     path += u'/';
     path += segment;
   }
-  base.setPath(path);
+  base.setPath(path, QUrl::DecodedMode);
   return base;
+}
+
+AssetOutcome<QUrl> normalizeAssetBaseUrl(const QString &input) {
+  if (containsControlCharacter(input)) {
+    return AssetError{
+        AssetErrorCode::InvalidAssetBaseUrl,
+        QStringLiteral("asset base URL must not contain control characters")};
+  }
+  const QString trimmedInput = input.trimmed();
+  if (trimmedInput.isEmpty()) {
+    return AssetError{AssetErrorCode::InvalidAssetBaseUrl,
+                      QStringLiteral("asset base URL must not be empty")};
+  }
+
+  const QUrl url(trimmedInput, QUrl::StrictMode);
+  if (!url.isValid()) {
+    return AssetError{
+        AssetErrorCode::InvalidAssetBaseUrl,
+        QStringLiteral("invalid asset base URL: %1").arg(url.errorString())};
+  }
+
+  const QString scheme = url.scheme();
+  if (scheme != "https"_L1 && scheme != "http"_L1) {
+    return AssetError{AssetErrorCode::UnsupportedScheme,
+                      QStringLiteral("asset base URL must use https, except "
+                                     "http loopback for local development")};
+  }
+  if (url.host().isEmpty()) {
+    return AssetError{AssetErrorCode::InvalidAssetBaseUrl,
+                      QStringLiteral("asset base URL must include a host")};
+  }
+  if (!url.userInfo().isEmpty()) {
+    return AssetError{
+        AssetErrorCode::InvalidAssetBaseUrl,
+        QStringLiteral("asset base URL must not contain credentials")};
+  }
+  if (url.hasQuery() || url.hasFragment()) {
+    return AssetError{
+        AssetErrorCode::InvalidAssetBaseUrl,
+        QStringLiteral("asset base URL must not contain a query or fragment")};
+  }
+  if (!isCleartextAuthAllowedForRawInput(scheme, trimmedInput)) {
+    return AssetError{AssetErrorCode::InsecureTransport,
+                      QStringLiteral("asset base URL requires https unless the "
+                                     "host is exact loopback")};
+  }
+
+  QUrl normalized;
+  normalized.setScheme(scheme);
+  normalized.setHost(url.host());
+  if (url.port() != -1) {
+    normalized.setPort(url.port());
+  }
+  QString cleanPath = url.path();
+  while (cleanPath.size() > 1 && cleanPath.endsWith(u'/')) {
+    cleanPath.chop(1);
+  }
+  if (!cleanPath.isEmpty() && cleanPath != "/"_L1) {
+    normalized.setPath(cleanPath, QUrl::DecodedMode);
+  }
+  return normalized;
 }
 
 } // namespace
@@ -91,12 +185,7 @@ QUrl appendPathSegments(QUrl base, const QStringList &segments) {
 QUrl defaultAssetBaseUrl() { return QUrl(kDefaultAssetBase.toString()); }
 
 AssetOutcome<QUrl> assetBaseUrlFromString(const QString &input) {
-  const UrlValidationResult validated = validateCustomUrl(input);
-  if (!validated) {
-    return AssetError{AssetErrorCode::InvalidAssetBaseUrl,
-                      validated.error().message};
-  }
-  return *validated;
+  return normalizeAssetBaseUrl(input);
 }
 
 AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
@@ -106,33 +195,30 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
     return baseValidation.error();
   }
 
+  const QString artId = stripOneServerCardPrefix(key.cardCode);
   QStringList pathSegments{QStringLiteral("img"), QStringLiteral("arkham")};
-  if (key.cardCode.startsWith(u':')) {
-    const qsizetype separator = key.cardCode.lastIndexOf(u':');
-    if (separator <= 0 || separator == key.cardCode.size() - 1) {
-      return AssetError{
-          AssetErrorCode::InvalidAssetKey,
-          QStringLiteral("homebrew card art id must be :campaign:code")};
+  if (artId.startsWith(u':')) {
+    const qsizetype separator = artId.lastIndexOf(u':');
+    if (separator <= 1 || separator == artId.size() - 1) {
+      return invalidKey(
+          QStringLiteral("homebrew card art id must be :campaign:code with "
+                         "non-empty segments"));
     }
-    const QString campaign = key.cardCode.mid(1, separator - 1);
-    const QString fileName =
-        imageFileName(key.cardCode.mid(separator + 1), key.face);
-    if (isRejectedSegment(campaign) || isRejectedSegment(fileName)) {
-      return AssetError{
-          AssetErrorCode::InvalidAssetKey,
-          QStringLiteral("homebrew card art id is not a safe asset path")};
+    const QString campaign = artId.mid(1, separator - 1);
+    const QString code = artId.mid(separator + 1);
+    if (!isHomebrewCampaignSegment(campaign) ||
+        !isOfficialCardCodeSegment(code)) {
+      return invalidKey(QStringLiteral(
+          "homebrew card art id contains an invalid campaign or code segment"));
     }
     pathSegments << QStringLiteral("homebrew") << campaign
-                 << QStringLiteral("cards") << fileName;
+                 << QStringLiteral("cards") << imageFileName(code, key.face);
   } else {
-    const QString code = strippedCardCode(key.cardCode);
-    const QString fileName = imageFileName(code, key.face);
-    if (isRejectedSegment(code) || isRejectedSegment(fileName)) {
-      return AssetError{
-          AssetErrorCode::InvalidAssetKey,
-          QStringLiteral("card code is not a safe asset path segment")};
+    if (!isOfficialCardCodeSegment(artId)) {
+      return invalidKey(
+          QStringLiteral("card code is not a valid asset code segment"));
     }
-    pathSegments << QStringLiteral("cards") << fileName;
+    pathSegments << QStringLiteral("cards") << imageFileName(artId, key.face);
   }
 
   return appendPathSegments(assetBaseUrl, pathSegments);

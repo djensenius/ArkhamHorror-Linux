@@ -10,6 +10,7 @@
 #include <QTimer>
 #include <QVariant>
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -19,6 +20,8 @@ using namespace Qt::StringLiterals;
 namespace Arkham {
 
 namespace {
+
+constexpr qint64 kReadBufferCapBytes = 64 * 1024;
 
 bool parseContentLength(const QByteArray &header, qint64 *value) {
   if (header.isEmpty()) {
@@ -49,6 +52,10 @@ QString normalizedContentType(const QByteArray &rawHeader) {
 }
 
 bool isAcceptedContentType(const QString &contentType) {
+  // image/svg+xml is intentionally accepted by this coarse HTTP sanity check
+  // because it is an image/* media type. The separable decodeAssetImage()
+  // helper still rejects SVG bytes as UnrecognizedFormat because only PNG,
+  // JPEG, and AVIF magic bytes are supported by the native decoder.
   return contentType.startsWith("image/"_L1) ||
          contentType == "application/octet-stream"_L1;
 }
@@ -100,21 +107,34 @@ AssetOutcome<bool> validateFetchUrl(const QUrl &url) {
   return true;
 }
 
-bool redirectTargetAllowed(const QUrl &from, const QUrl &to) {
+bool redirectTargetAllowed(const QUrl &original, const QUrl &from,
+                           const QUrl &to) {
   if (sameOrigin(from, to)) {
     return true;
   }
   if (to.scheme() == "https"_L1) {
     return true;
   }
-  return to.scheme() == "http"_L1 && isSecureOrLoopbackAuthTransport(to);
+  return to.scheme() == "http"_L1 && isCanonicalLoopbackHostText(to.host()) &&
+         isCanonicalLoopbackHostText(original.host());
 }
 
 bool isRedirectStatus(int status) { return status >= 300 && status < 400; }
 
+std::chrono::milliseconds
+remainingTimeout(std::chrono::steady_clock::time_point deadline) {
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+  return std::max(remaining, std::chrono::milliseconds::zero());
+}
+
 void applyAssetRequestPolicy(QNetworkRequest &request) {
   request.setRawHeader("Accept",
                        "image/avif,image/jpeg,image/png,image/*;q=0.8");
+  // Prefer identity transfer coding so byte limits apply before any avoidable
+  // decompression buffer growth. If a server ignores this, the readyRead path
+  // still counts the bytes Qt delivers before appending them to our buffer.
+  request.setRawHeader("Accept-Encoding", "identity");
   request.setAttribute(QNetworkRequest::CookieLoadControlAttribute,
                        QNetworkRequest::Manual);
   request.setAttribute(QNetworkRequest::CookieSaveControlAttribute,
@@ -167,37 +187,77 @@ void AssetNetworkFetcher::fetch(const QUrl &url, FetchCallback callback) {
     deliver(std::move(callback), validation.error());
     return;
   }
-  startRequest(url, 0, std::move(callback));
+  startRequest(url, url, 0, std::chrono::steady_clock::now() + m_timeout,
+               std::move(callback));
 }
 
-void AssetNetworkFetcher::startRequest(const QUrl &url, int redirectCount,
-                                       FetchCallback callback) {
+void AssetNetworkFetcher::startRequest(
+    const QUrl &url, const QUrl &originalUrl, int redirectCount,
+    std::chrono::steady_clock::time_point deadline, FetchCallback callback) {
+  const std::chrono::milliseconds remaining = remainingTimeout(deadline);
+  if (remaining <= std::chrono::milliseconds::zero()) {
+    deliver(std::move(callback),
+            AssetError{AssetErrorCode::Timeout,
+                       QStringLiteral("asset fetch timed out"), 0, url});
+    return;
+  }
+
   QNetworkRequest request(url);
   applyAssetRequestPolicy(request);
 
   QNetworkReply *reply = m_networkAccessManager.get(request);
+  const qint64 plusOne =
+      m_limits.maxResponseBytes == std::numeric_limits<qint64>::max()
+          ? std::numeric_limits<qint64>::max()
+          : m_limits.maxResponseBytes + 1;
+  reply->setReadBufferSize(qMin(plusOne, kReadBufferCapBytes));
+
   auto *timer = new QTimer(this);
   timer->setSingleShot(true);
 
   m_pendingRequests.insert(
-      reply,
-      PendingRequest{std::move(callback), QByteArray{}, timer, redirectCount});
+      reply, PendingRequest{std::move(callback), QByteArray{}, timer,
+                            redirectCount, originalUrl, deadline});
 
-  connect(timer, &QTimer::timeout, this, [this, reply]() {
-    failReply(reply,
+  QPointer<QNetworkReply> guardedReply(reply);
+  connect(timer, &QTimer::timeout, this, [this, guardedReply]() {
+    if (!guardedReply) {
+      return;
+    }
+    failReply(guardedReply,
               AssetError{AssetErrorCode::Timeout,
                          QStringLiteral("asset fetch timed out"), 0,
-                         reply ? reply->url() : QUrl{}},
+                         guardedReply->url()},
               true);
   });
-  connect(reply, &QNetworkReply::metaDataChanged, this,
-          [this, reply]() { checkContentLength(reply); });
-  connect(reply, &QIODevice::readyRead, this,
-          [this, reply]() { handleReadyRead(reply); });
-  connect(reply, &QNetworkReply::finished, this,
-          [this, reply]() { handleFinished(reply); });
+  connect(reply, &QObject::destroyed, this, [this, reply]() {
+    auto it = m_pendingRequests.find(reply);
+    if (it == m_pendingRequests.end()) {
+      return;
+    }
+    if (it.value().timer) {
+      it.value().timer->stop();
+      it.value().timer->deleteLater();
+    }
+    m_pendingRequests.erase(it);
+  });
+  connect(reply, &QNetworkReply::metaDataChanged, this, [this, guardedReply]() {
+    if (guardedReply) {
+      checkContentLength(guardedReply);
+    }
+  });
+  connect(reply, &QIODevice::readyRead, this, [this, guardedReply]() {
+    if (guardedReply) {
+      handleReadyRead(guardedReply);
+    }
+  });
+  connect(reply, &QNetworkReply::finished, this, [this, guardedReply]() {
+    if (guardedReply) {
+      handleFinished(guardedReply);
+    }
+  });
 
-  timer->start(m_timeout);
+  timer->start(remaining);
 }
 
 void AssetNetworkFetcher::checkContentLength(QNetworkReply *reply) {
@@ -264,7 +324,27 @@ void AssetNetworkFetcher::handleFinished(QNetworkReply *reply) {
   }
   const int status = statusAttribute.toInt();
 
+  if (status == 304) {
+    deliver(
+        std::move(pending.callback),
+        AssetError{AssetErrorCode::NotModifiedWithoutCache,
+                   QStringLiteral(
+                       "asset fetch does not support bodyless 304 responses"),
+                   status, reply->url()});
+    return;
+  }
+
   if (isRedirectStatus(status)) {
+    const QVariant redirectAttribute =
+        reply->attribute(QNetworkRequest::RedirectionTargetAttribute);
+    if (!redirectAttribute.isValid() || redirectAttribute.toUrl().isEmpty()) {
+      deliver(
+          std::move(pending.callback),
+          AssetError{AssetErrorCode::MissingRedirectLocation,
+                     QStringLiteral("asset redirect response has no Location"),
+                     status, reply->url()});
+      return;
+    }
     if (pending.redirectCount >= m_limits.maxRedirects) {
       deliver(std::move(pending.callback),
               AssetError{AssetErrorCode::TooManyRedirects,
@@ -272,11 +352,10 @@ void AssetNetworkFetcher::handleFinished(QNetworkReply *reply) {
                          status, reply->url()});
       return;
     }
-    const QVariant redirectAttribute =
-        reply->attribute(QNetworkRequest::RedirectionTargetAttribute);
     const QUrl redirectUrl = reply->url().resolved(redirectAttribute.toUrl());
     const auto validation = validateFetchUrl(redirectUrl);
-    if (!validation || !redirectTargetAllowed(reply->url(), redirectUrl)) {
+    if (!validation || !redirectTargetAllowed(pending.originalUrl, reply->url(),
+                                              redirectUrl)) {
       deliver(
           std::move(pending.callback),
           AssetError{AssetErrorCode::RedirectRejected,
@@ -284,8 +363,8 @@ void AssetNetworkFetcher::handleFinished(QNetworkReply *reply) {
                      status, redirectUrl});
       return;
     }
-    startRequest(redirectUrl, pending.redirectCount + 1,
-                 std::move(pending.callback));
+    startRequest(redirectUrl, pending.originalUrl, pending.redirectCount + 1,
+                 pending.deadline, std::move(pending.callback));
     return;
   }
 

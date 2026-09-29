@@ -15,7 +15,8 @@ namespace Arkham {
 // success/unknown state: success is represented by AssetOutcome<T> carrying a
 // value, and every failure carries one of these explicit non-zero codes.
 enum class AssetErrorCode : int {
-  InvalidAssetBaseUrl = 1,
+  Unknown = 1,
+  InvalidAssetBaseUrl,
   InvalidAssetKey,
   InvalidFetchUrl,
   UnsupportedScheme,
@@ -23,15 +24,17 @@ enum class AssetErrorCode : int {
   NetworkError,
   Timeout,
   TooManyRedirects,
+  MissingRedirectLocation,
   RedirectRejected,
   ResponseTooLarge,
   NotFound,
   HttpError,
+  NotModifiedWithoutCache,
   UnsupportedContentType,
 };
 
 struct AssetError {
-  AssetErrorCode code{AssetErrorCode::NetworkError};
+  AssetErrorCode code{AssetErrorCode::Unknown};
   QString message;
   int httpStatus{0};
   QUrl url;
