@@ -230,14 +230,14 @@ jobs:
       # external-root classification) against small on-disk fixtures --
       # proves the AST-scanning core itself actually catches every
       # historical bypass. This is intentionally limited to checker/test/
-      # task/CI/cmake changes and scheduled/manual runs so unrelated PRs do not
+      # task/CI/cmake/ changes and scheduled/manual runs so unrelated PRs do not
       # pay the ~5 minute libclang self-test cost.
       - name: Run libclang encoder-hygiene mutation tests
         if: steps.encoder_hygiene_scope.outputs.run_ast_mutations == 'true'
         run: mise run contracts:test-encoder-hygiene-ast-mutations
       - name: Skip libclang encoder-hygiene mutation tests
         if: steps.encoder_hygiene_scope.outputs.run_ast_mutations != 'true'
-        run: echo "Skipping mutation self-tests; checker/tests/tasks/CI/cmake did not change."
+        run: echo "Skipping mutation self-tests; checker/tests/tasks/CI/cmake/ did not change."
       - name: Run full encoder-hygiene production policy check
         if: steps.encoder_hygiene_scope.outputs.run_full_policy == 'true'
         run: mise run contracts:check-encoder-hygiene
