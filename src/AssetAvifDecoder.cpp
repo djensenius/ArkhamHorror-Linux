@@ -5,65 +5,10 @@
 #include <avif/avif.h>
 
 #include <cstdint>
-#include <cstring>
 
 namespace Arkham {
 
 namespace {
-
-enum class AvifPrimaryItemMetadataState {
-  Present,
-  Missing,
-  Malformed,
-};
-
-quint32 readBigEndian32(const char *bytes) {
-  const auto *data = reinterpret_cast<const unsigned char *>(bytes);
-  return (static_cast<quint32>(data[0]) << 24) |
-         (static_cast<quint32>(data[1]) << 16) |
-         (static_cast<quint32>(data[2]) << 8) | static_cast<quint32>(data[3]);
-}
-
-quint64 readBigEndian64(const char *bytes) {
-  const auto *data = reinterpret_cast<const unsigned char *>(bytes);
-  quint64 value = 0;
-  for (int i = 0; i < 8; ++i) {
-    value = (value << 8) | static_cast<quint64>(data[i]);
-  }
-  return value;
-}
-
-AvifPrimaryItemMetadataState topLevelMetaBoxState(const QByteArray &bytes) {
-  qsizetype offset = 0;
-  while (offset + 8 <= bytes.size()) {
-    quint64 boxSize = readBigEndian32(bytes.constData() + offset);
-    qsizetype headerSize = 8;
-    if (boxSize == 1) {
-      if (offset + 16 > bytes.size()) {
-        return AvifPrimaryItemMetadataState::Malformed;
-      }
-      boxSize = readBigEndian64(bytes.constData() + offset + 8);
-      headerSize = 16;
-    } else if (boxSize == 0) {
-      boxSize = static_cast<quint64>(bytes.size() - offset);
-    }
-
-    if (boxSize < static_cast<quint64>(headerSize) ||
-        boxSize > static_cast<quint64>(bytes.size() - offset)) {
-      return AvifPrimaryItemMetadataState::Malformed;
-    }
-
-    if (std::memcmp(bytes.constData() + offset + 4, "meta", 4) == 0) {
-      return AvifPrimaryItemMetadataState::Present;
-    }
-    offset += static_cast<qsizetype>(boxSize);
-  }
-
-  if (offset != bytes.size()) {
-    return AvifPrimaryItemMetadataState::Malformed;
-  }
-  return AvifPrimaryItemMetadataState::Missing;
-}
 
 AssetDecodeErrorCode errorCodeForAvifResult(avifResult result) {
   switch (result) {
@@ -73,6 +18,7 @@ AssetDecodeErrorCode errorCodeForAvifResult(avifResult result) {
 #if AVIF_VERSION >= 1000000
   case AVIF_RESULT_MISSING_IMAGE_ITEM:
 #else
+  // No unit test: encoder writes primary; stripped meta is TRUNCATED_DATA.
   case AVIF_RESULT_NO_AV1_ITEMS_FOUND:
 #endif
   case AVIF_RESULT_NO_IMAGES_REMAINING:
@@ -121,15 +67,6 @@ validateAvifDimensions(uint32_t width, uint32_t height,
 
 AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
                                            const AssetDecodeLimits &limits) {
-  const AvifPrimaryItemMetadataState metadataState =
-      topLevelMetaBoxState(encodedBytes);
-  if (metadataState == AvifPrimaryItemMetadataState::Missing) {
-    return AssetDecodeError{
-        AssetDecodeErrorCode::UnsupportedCodec,
-        QStringLiteral(
-            "AVIF payload does not contain a primary item metadata box")};
-  }
-
   avifDecoder *decoder = avifDecoderCreate();
   if (!decoder) {
     return AssetDecodeError{

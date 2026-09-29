@@ -285,7 +285,7 @@ private slots:
   void rejectsJpegTruncatedWithWarning();
   void rejectsAvifTruncated();
   void rejectsCmykJpeg();
-  void rejectsPureAvifSequenceWithoutPrimaryItem();
+  void avifWithoutMetaBoxIsRejectedAsMalformed();
 };
 
 void AssetDecoderTests::validPngRoundTrip() {
@@ -425,15 +425,22 @@ void AssetDecoderTests::rejectsCmykJpeg() {
                     AssetDecodeErrorCode::UnsupportedCodec);
 }
 
-void AssetDecoderTests::rejectsPureAvifSequenceWithoutPrimaryItem() {
+void AssetDecoderTests::avifWithoutMetaBoxIsRejectedAsMalformed() {
   const QByteArray avif = encodeAvif();
   QVERIFY(!avif.isEmpty());
 
-  const QByteArray withoutPrimaryItem = renameTopLevelMetaBoxToFree(avif);
-  QVERIFY(!withoutPrimaryItem.isEmpty());
+  const QByteArray withoutMetaBox = renameTopLevelMetaBoxToFree(avif);
+  QVERIFY(!withoutMetaBox.isEmpty());
 
-  expectDecodeError(withoutPrimaryItem, AssetDecodeLimits{},
-                    AssetDecodeErrorCode::UnsupportedCodec);
+  const auto decoded = decodeAssetImage(withoutMetaBox);
+  QVERIFY(!decoded);
+  // libavif 1.4.2 reports this well-formed top-level box rewrite as
+  // AVIF_RESULT_TRUNCATED_DATA, which maps to MalformedImage. Older libavif
+  // versions may instead report the absence of a primary item directly, which
+  // maps to UnsupportedCodec; both are acceptable decoder rejections.
+  const AssetDecodeErrorCode code = decoded.error().code;
+  QVERIFY(code == AssetDecodeErrorCode::MalformedImage ||
+          code == AssetDecodeErrorCode::UnsupportedCodec);
 }
 
 QTEST_APPLESS_MAIN(AssetDecoderTests)
