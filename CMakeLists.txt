@@ -216,6 +216,8 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/AppSessionComposition.h
     src/AssetAvifDecoder.h
     src/AssetCache.h
+    src/AssetImageProvider.h
+    src/AssetImageRequestCoordinator.h
     src/AssetJpegDecoder.h
     src/AssetLocator.h
     src/AssetNetworkFetcher.h
@@ -252,6 +254,8 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/AppSessionComposition.cpp
     src/AssetAvifDecoder.cpp
     src/AssetCache.cpp
+    src/AssetImageProvider.cpp
+    src/AssetImageRequestCoordinator.cpp
     src/AssetJpegDecoder.cpp
     src/AssetLocator.cpp
     src/AssetNetworkFetcher.cpp
@@ -534,6 +538,7 @@ target_link_libraries(arkham_foundation
         arkham_domain_models
         Qt6::Gui
         Qt6::Network
+        Qt6::Quick
         Qt6Keychain::Qt6Keychain
     PRIVATE
         PkgConfig::LIBAVIF
@@ -637,6 +642,18 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME asset_cache COMMAND arkham-asset-cache-tests)
+
+    qt_add_executable(arkham-asset-image-provider-tests
+        tests/AssetImageProviderTests.cpp
+        tests/MockHttpServer.cpp
+    )
+    target_link_libraries(arkham-asset-image-provider-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Quick
+        Qt6::Test
+    )
+    add_test(NAME asset_image_provider COMMAND arkham-asset-image-provider-tests)
 
     qt_add_executable(arkham-contract-tests
         tests/ContractTests.cpp

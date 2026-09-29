@@ -262,6 +262,8 @@ void AssetCache::disableDisk(QString diagnostic, bool warn) {
 
 void AssetCache::buildIndex() {
   m_index.clear();
+  m_lruQueue.clear();
+  m_lruPositions.clear();
   m_diskBytes = 0;
   quint64 newestAccess = 0;
 
@@ -283,6 +285,7 @@ void AssetCache::buildIndex() {
     const quint64 lastAccess = static_cast<quint64>(
         std::max<qint64>(1, fileInfo.lastModified().toMSecsSinceEpoch()));
     m_index.insert(fileName, DiskEntry{fileSize, lastAccess});
+    setDiskEntryAccess(fileName, lastAccess);
     m_diskBytes += fileSize;
     newestAccess = std::max(newestAccess, lastAccess);
   }
@@ -301,8 +304,8 @@ void AssetCache::promoteToMemory(const QString &key, const QImage &image) {
 }
 
 void AssetCache::touchDiskEntry(const QString &diskKey) {
-  if (auto it = m_index.find(diskKey); it != m_index.end()) {
-    it->lastAccess = nextAccess();
+  if (m_index.contains(diskKey)) {
+    setDiskEntryAccess(diskKey, nextAccess());
   }
 }
 
@@ -358,7 +361,7 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
   if (auto it = m_index.find(diskKey); it != m_index.end()) {
     m_diskBytes += fileInfo.size() - it->fileSize;
     it->fileSize = fileInfo.size();
-    it->lastAccess = nextAccess();
+    setDiskEntryAccess(diskKey, nextAccess());
   }
   promoteToMemory(memoryKey, *decoded);
   return LookupResult{LookupSource::Disk, *decoded};
@@ -374,6 +377,7 @@ void AssetCache::storeDisk(const QString &diskKey,
     m_diagnostic =
         QStringLiteral("asset cache entry exceeds disk cache byte limit: %1")
             .arg(path);
+    removeDiskEntry(diskKey);
     return;
   }
 
@@ -394,7 +398,8 @@ void AssetCache::storeDisk(const QString &diskKey,
   const qint64 oldSize = m_index.value(diskKey).fileSize;
   const qint64 newSize = QFileInfo(path).size();
   m_diskBytes += newSize - oldSize;
-  m_index.insert(diskKey, DiskEntry{newSize, nextAccess()});
+  m_index.insert(diskKey, DiskEntry{newSize, 0});
+  setDiskEntryAccess(diskKey, nextAccess());
   evictIfNeeded();
 }
 
@@ -404,8 +409,28 @@ void AssetCache::removeDiskEntry(const QString &key) {
   if (QFileInfo::exists(path)) {
     QFile::remove(path);
   }
+  if (const auto position = m_lruPositions.find(key);
+      position != m_lruPositions.end()) {
+    m_lruQueue.erase(position->second);
+    m_lruPositions.erase(position);
+  }
   m_index.remove(key);
   m_diskBytes = std::max<qint64>(0, m_diskBytes - oldSize);
+}
+
+void AssetCache::setDiskEntryAccess(const QString &key, quint64 access) {
+  auto indexIt = m_index.find(key);
+  if (indexIt == m_index.end()) {
+    return;
+  }
+  if (const auto position = m_lruPositions.find(key);
+      position != m_lruPositions.end()) {
+    m_lruQueue.erase(position->second);
+    m_lruPositions.erase(position);
+  }
+  indexIt->lastAccess = access;
+  auto inserted = m_lruQueue.emplace(access, key);
+  m_lruPositions.emplace(key, inserted);
 }
 
 void AssetCache::evictIfNeeded() {
@@ -414,26 +439,9 @@ void AssetCache::evictIfNeeded() {
     return;
   }
 
-  std::vector<QString> keys;
-  keys.reserve(static_cast<size_t>(m_index.size()));
-  for (auto it = m_index.cbegin(); it != m_index.cend(); ++it) {
-    keys.push_back(it.key());
-  }
-  std::sort(keys.begin(), keys.end(),
-            [this](const QString &left, const QString &right) {
-              const DiskEntry leftEntry = m_index.value(left);
-              const DiskEntry rightEntry = m_index.value(right);
-              if (leftEntry.lastAccess != rightEntry.lastAccess) {
-                return leftEntry.lastAccess < rightEntry.lastAccess;
-              }
-              return left < right;
-            });
-
-  for (const QString &key : keys) {
-    if (m_diskBytes <= m_config.diskMaxBytes) {
-      break;
-    }
-    removeDiskEntry(key);
+  while (m_diskBytes > m_config.diskMaxBytes && !m_lruQueue.empty()) {
+    const QString victim = m_lruQueue.begin()->second;
+    removeDiskEntry(victim);
   }
 }
 

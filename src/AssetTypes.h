@@ -32,6 +32,7 @@ enum class AssetErrorCode : int {
   HttpError,
   NotModifiedWithoutCache,
   UnsupportedContentType,
+  DecodeError,
 };
 
 struct AssetError {

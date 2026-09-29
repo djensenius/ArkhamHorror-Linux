@@ -82,6 +82,8 @@ void MockHttpServer::handleRequest(QTcpSocket *socket) {
   }
   m_lastRequest = request;
   const QString path = requestPath(request);
+  ++m_requestCount;
+  ++m_requestCounts[path];
   m_buffers.remove(socket);
   const Response response =
       m_routes.value(path, Response{404, QByteArrayLiteral("text/plain"),

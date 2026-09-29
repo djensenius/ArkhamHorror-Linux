@@ -16,6 +16,10 @@ namespace Arkham::AssetLocator {
 // server API roots.
 [[nodiscard]] AssetOutcome<QUrl> assetBaseUrlFromString(const QString &input);
 
+// Web-compatible mutation suffix validation. The locator accepts only the
+// frontend convention _Mutated<N>; game-state-to-N mapping belongs elsewhere.
+[[nodiscard]] bool isMutationSuffix(const QString &suffix);
+
 // Card faces served by the web asset host. Official cards map to
 // /img/arkham/cards/<code>.avif and Back maps to
 // /img/arkham/cards/<code>b.avif after stripping one leading 'c' from the
@@ -32,6 +36,10 @@ struct CardImageKey {
   // 'c' in cardImages.ts and routing through helpers.ts's cardImgPath().
   QString cardCode;
   CardFace face{CardFace::Front};
+  // Optional web-compatible mutated art suffix, e.g. _Mutated1. The caller
+  // supplies the game-state-to-suffix mapping; the locator only validates and
+  // routes the resulting asset id.
+  QString mutationSuffix;
 };
 
 // Builds a single canonical AVIF card-art URL under the supplied asset base.

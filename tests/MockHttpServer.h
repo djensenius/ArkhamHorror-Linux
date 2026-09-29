@@ -32,6 +32,10 @@ public:
   QUrl url(const QString &path) const;
   void setResponse(const QString &path, Response response);
   QByteArray lastRequest() const { return m_lastRequest; }
+  int requestCount() const { return m_requestCount; }
+  int requestCountForPath(const QString &path) const {
+    return m_requestCounts.value(path);
+  }
   int disconnectCount() const { return m_disconnectCount; }
 
 protected:
@@ -45,5 +49,7 @@ private:
   QList<QTcpSocket *> m_sockets;
   QHash<QTcpSocket *, QByteArray> m_buffers;
   QByteArray m_lastRequest;
+  int m_requestCount{0};
+  QHash<QString, int> m_requestCounts;
   int m_disconnectCount{0};
 };

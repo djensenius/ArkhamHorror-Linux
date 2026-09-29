@@ -11,6 +11,7 @@
 
 #include "AppBootstrap.h"
 #include "AppSessionComposition.h"
+#include "AssetImageProvider.h"
 #include "ServerProfile.h"
 
 namespace {
@@ -66,6 +67,11 @@ int main(int argc, char *argv[]) {
   std::unique_ptr<Arkham::ProductionSession> session;
 
   QQmlApplicationEngine engine;
+  // TODO(A5): fetch /site-settings.assetHost and inject it into the card
+  // image provider config. A4 intentionally keeps the production provider on
+  // AssetLocator::defaultAssetBaseUrl() until the server settings wiring lands.
+  engine.addImageProvider(QStringLiteral("arkham-card"),
+                          new Arkham::AssetCardImageProvider());
   engine.setInitialProperties(
       {{QStringLiteral("configuredServer"), profile.baseUrl().toString()}});
 
