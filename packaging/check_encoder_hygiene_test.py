@@ -288,6 +288,18 @@ class ExactIdentitySetTests(unittest.TestCase):
             ceh._identity_set_digest([additionally_observed]),
         )
 
+    def test_pin_report_prints_reviewable_regeneration_snippet(self) -> None:
+        finding = self._pinned_allowlisted_finding()
+        report = "\n".join(ceh._pin_report_lines([finding]))
+        self.assertIn("_NAMED_ALLOWLIST_IDENTITY_SET_SHA256", report)
+        self.assertIn("_LOCAL_WIRE_SURFACE_SET_SHA256", report)
+        self.assertIn(ceh._full_signature_digest(finding), report)
+        self.assertIn(
+            f"{finding.physical_identity_sha256} {finding.observation_set_sha256}",
+            report,
+        )
+        self.assertIn("# WARNING: generated pin set is incomplete or ambiguous", report)
+
 
 class QJsonFamilyWrappedFormsAreDetectedTests(unittest.TestCase):
     """Coverage for _is_qjson_family()'s handling of QJsonDocument (a
