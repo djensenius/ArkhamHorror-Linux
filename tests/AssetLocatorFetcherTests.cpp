@@ -624,7 +624,7 @@ void AssetLocatorFetcherTests::fetcherCancelMidRedirectWithoutCallback() {
   QNetworkAccessManager nam;
   AssetNetworkFetcher fetcher(nam,
                               {.maxResponseBytes = 1024, .maxRedirects = 5},
-                              std::chrono::milliseconds(500));
+                              std::chrono::milliseconds(200));
   bool callbackCalled = false;
   const auto requestId =
       fetcher.fetch(server.url(QStringLiteral("/redirect.png")),
@@ -634,8 +634,12 @@ void AssetLocatorFetcherTests::fetcherCancelMidRedirectWithoutCallback() {
   QVERIFY(waitUntil([&server]() {
     return server.requestCountForPath(QStringLiteral("/final.png")) == 1;
   }));
+  const int disconnectsBeforeCancel = server.disconnectCount();
   fetcher.cancel(requestId);
-  QVERIFY(waitUntil([&server]() { return server.disconnectCount() > 0; }));
+  QVERIFY(waitUntil([&server, disconnectsBeforeCancel]() {
+    return server.disconnectCount() > disconnectsBeforeCancel;
+  }));
+  QTest::qWait(250);
   QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
   QVERIFY(!callbackCalled);
 }

@@ -440,7 +440,8 @@ void AssetCache::evictIfNeeded() {
   }
 
   while (m_diskBytes > m_config.diskMaxBytes && !m_lruQueue.empty()) {
-    removeDiskEntry(m_lruQueue.begin()->second);
+    const QString victim = m_lruQueue.begin()->second;
+    removeDiskEntry(victim);
   }
 }
 

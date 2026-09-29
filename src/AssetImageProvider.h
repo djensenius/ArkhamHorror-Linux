@@ -14,15 +14,17 @@
 #include <mutex>
 #include <optional>
 
-class QTimer;
-
 namespace Arkham {
+
+class AssetCardImageResponse;
 
 struct AssetCardImageResponseState {
   std::mutex mutex;
   bool alive{true};
   bool cancelled{false};
   bool finished{false};
+  bool drainPosted{false};
+  AssetCardImageResponse *response{nullptr};
   std::optional<AssetOutcome<QImage>> result;
   std::function<void()> cancelCallback;
   std::optional<quint64> requestId;
@@ -55,7 +57,6 @@ private:
   QImage m_image;
   QString m_errorString;
   std::shared_ptr<AssetCardImageResponseState> m_state;
-  QTimer *m_completionTimer{nullptr};
 };
 
 class AssetCardImageProvider final : public QQuickAsyncImageProvider {

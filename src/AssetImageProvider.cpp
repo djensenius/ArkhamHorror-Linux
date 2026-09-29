@@ -3,7 +3,6 @@
 #include <QMutexLocker>
 #include <QQuickTextureFactory>
 #include <QStringList>
-#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 
@@ -84,15 +83,17 @@ QImage scaledForRequest(const QImage &image, const QSize &requestedSize) {
 
 AssetCardImageResponse::AssetCardImageResponse(const QSize &requestedSize)
     : m_requestedSize(requestedSize),
-      m_state(std::make_shared<AssetCardImageResponseState>()),
-      m_completionTimer(new QTimer(this)) {
-  m_completionTimer->setInterval(5);
-  connect(m_completionTimer, &QTimer::timeout, this,
-          [this]() { drainCompletion(); });
-  m_completionTimer->start();
+      m_state(std::make_shared<AssetCardImageResponseState>()) {
+  std::lock_guard lock(m_state->mutex);
+  m_state->response = this;
 }
 
-AssetCardImageResponse::~AssetCardImageResponse() { cancel(); }
+AssetCardImageResponse::~AssetCardImageResponse() {
+  cancel();
+  std::lock_guard lock(m_state->mutex);
+  m_state->alive = false;
+  m_state->response = nullptr;
+}
 
 QQuickTextureFactory *AssetCardImageResponse::textureFactory() const {
   QMutexLocker locker(&m_mutex);
@@ -116,6 +117,7 @@ void AssetCardImageResponse::cancel() {
     }
     m_state->alive = false;
     m_state->cancelled = true;
+    m_state->response = nullptr;
     callback = std::move(m_state->cancelCallback);
     m_state->cancelCallback = {};
   }
@@ -156,6 +158,13 @@ void AssetCardImageResponse::completeState(
     return;
   }
   state->result.emplace(std::move(result));
+  if (state->response && !state->drainPosted) {
+    state->drainPosted = true;
+    AssetCardImageResponse *response = state->response;
+    QMetaObject::invokeMethod(
+        response, [response]() { response->drainCompletion(); },
+        Qt::QueuedConnection);
+  }
 }
 
 void AssetCardImageResponse::drainCompletion() {
@@ -164,12 +173,14 @@ void AssetCardImageResponse::drainCompletion() {
     std::lock_guard lock(m_state->mutex);
     if (!m_state->alive || m_state->cancelled || m_state->finished ||
         !m_state->result.has_value()) {
+      m_state->drainPosted = false;
       return;
     }
     result.emplace(std::move(*m_state->result));
     m_state->result.reset();
     m_state->finished = true;
     m_state->alive = false;
+    m_state->response = nullptr;
     m_state->cancelCallback = {};
   }
 
@@ -180,9 +191,6 @@ void AssetCardImageResponse::drainCompletion() {
     } else {
       m_errorString = imageErrorString(result->error());
     }
-  }
-  if (m_completionTimer) {
-    m_completionTimer->stop();
   }
   emit finished();
 }
@@ -363,8 +371,13 @@ AssetCardImageProvider::parseImageId(const QString &id) {
       return invalidProviderId(
           QStringLiteral("mutation suffix must be provided only once"));
     }
-    mutationSuffix = normalizedMutationSuffix(
-        query.queryItemValue(QStringLiteral("mutation")));
+    const QString mutationValue =
+        query.queryItemValue(QStringLiteral("mutation"));
+    if (mutationValue.isEmpty()) {
+      return invalidProviderId(
+          QStringLiteral("mutation suffix must not be empty"));
+    }
+    mutationSuffix = normalizedMutationSuffix(mutationValue);
     if (!AssetLocator::isMutationSuffix(mutationSuffix)) {
       return invalidProviderId(
           QStringLiteral("mutation suffix must match _Mutated<N>"));
