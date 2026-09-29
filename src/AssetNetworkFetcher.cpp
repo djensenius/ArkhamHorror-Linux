@@ -8,7 +8,6 @@
 #include <QNetworkRequest>
 #include <QPointer>
 #include <QTimer>
-#include <QVariant>
 
 #include <algorithm>
 #include <limits>
@@ -181,29 +180,60 @@ AssetNetworkFetcher::~AssetNetworkFetcher() {
     reply->deleteLater();
   }
   m_pendingRequests.clear();
+  m_repliesByRequestId.clear();
 }
 
-void AssetNetworkFetcher::fetch(const QUrl &url, FetchCallback callback) {
+AssetNetworkFetcher::RequestId
+AssetNetworkFetcher::fetch(const QUrl &url, FetchCallback callback) {
+  const RequestId requestId = m_nextRequestId++;
+  if (m_nextRequestId == 0) {
+    m_nextRequestId = 1;
+  }
   if (!m_networkAccessManager) {
     deliver(std::move(callback),
             AssetError{
                 AssetErrorCode::NetworkError,
                 QStringLiteral("asset network manager is no longer available"),
                 0, url});
-    return;
+    return requestId;
   }
   const auto validation = validateFetchUrl(url);
   if (!validation) {
     deliver(std::move(callback), validation.error());
+    return requestId;
+  }
+  startRequest(requestId, url, url, 0,
+               std::chrono::steady_clock::now() + m_timeout,
+               std::move(callback));
+  return requestId;
+}
+
+void AssetNetworkFetcher::cancel(RequestId requestId) {
+  auto replyIt = m_repliesByRequestId.find(requestId);
+  if (replyIt == m_repliesByRequestId.end()) {
     return;
   }
-  startRequest(url, url, 0, std::chrono::steady_clock::now() + m_timeout,
-               std::move(callback));
+  QNetworkReply *reply = replyIt.value();
+  m_repliesByRequestId.erase(replyIt);
+
+  auto pendingIt = m_pendingRequests.find(reply);
+  if (pendingIt != m_pendingRequests.end()) {
+    if (pendingIt.value().timer) {
+      pendingIt.value().timer->stop();
+      pendingIt.value().timer->deleteLater();
+    }
+    m_pendingRequests.erase(pendingIt);
+  }
+
+  QObject::disconnect(reply, nullptr, this, nullptr);
+  reply->abort();
+  reply->deleteLater();
 }
 
 void AssetNetworkFetcher::startRequest(
-    const QUrl &url, const QUrl &originalUrl, int redirectCount,
-    std::chrono::steady_clock::time_point deadline, FetchCallback callback) {
+    RequestId requestId, const QUrl &url, const QUrl &originalUrl,
+    int redirectCount, std::chrono::steady_clock::time_point deadline,
+    FetchCallback callback) {
   const std::chrono::milliseconds remaining = remainingTimeout(deadline);
   if (remaining <= std::chrono::milliseconds::zero()) {
     deliver(std::move(callback),
@@ -235,8 +265,9 @@ void AssetNetworkFetcher::startRequest(
   timer->setSingleShot(true);
 
   m_pendingRequests.insert(
-      reply, PendingRequest{std::move(callback), QByteArray{}, timer,
+      reply, PendingRequest{requestId, std::move(callback), QByteArray{}, timer,
                             redirectCount, originalUrl, deadline});
+  m_repliesByRequestId.insert(requestId, reply);
 
   QPointer<QNetworkReply> guardedReply(reply);
   connect(timer, &QTimer::timeout, this, [this, guardedReply]() {
@@ -317,6 +348,7 @@ void AssetNetworkFetcher::handleFinished(QNetworkReply *reply) {
   }
 
   PendingRequest pending = std::move(it.value());
+  m_repliesByRequestId.remove(pending.requestId);
   m_pendingRequests.erase(it);
   if (pending.timer) {
     pending.timer->stop();
@@ -324,7 +356,7 @@ void AssetNetworkFetcher::handleFinished(QNetworkReply *reply) {
   }
   reply->deleteLater();
 
-  const QVariant statusAttribute =
+  const auto statusAttribute =
       reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
   if (!statusAttribute.isValid()) {
     deliver(std::move(pending.callback),
@@ -345,7 +377,7 @@ void AssetNetworkFetcher::handleFinished(QNetworkReply *reply) {
   }
 
   if (isRedirectStatus(status)) {
-    const QVariant redirectAttribute =
+    const auto redirectAttribute =
         reply->attribute(QNetworkRequest::RedirectionTargetAttribute);
     if (!redirectAttribute.isValid() || redirectAttribute.toUrl().isEmpty()) {
       deliver(
@@ -373,8 +405,9 @@ void AssetNetworkFetcher::handleFinished(QNetworkReply *reply) {
                      status, redirectUrl});
       return;
     }
-    startRequest(redirectUrl, pending.originalUrl, pending.redirectCount + 1,
-                 pending.deadline, std::move(pending.callback));
+    startRequest(pending.requestId, redirectUrl, pending.originalUrl,
+                 pending.redirectCount + 1, pending.deadline,
+                 std::move(pending.callback));
     return;
   }
 
@@ -423,6 +456,7 @@ void AssetNetworkFetcher::failReply(QNetworkReply *reply, AssetError error,
     return;
   }
   PendingRequest pending = std::move(it.value());
+  m_repliesByRequestId.remove(pending.requestId);
   m_pendingRequests.erase(it);
   if (pending.timer) {
     pending.timer->stop();
@@ -442,6 +476,7 @@ void AssetNetworkFetcher::handleReplyDestroyed(QNetworkReply *reply) {
     return;
   }
   PendingRequest pending = std::move(it.value());
+  m_repliesByRequestId.remove(pending.requestId);
   m_pendingRequests.erase(it);
   if (pending.timer) {
     pending.timer->stop();
@@ -469,6 +504,7 @@ void AssetNetworkFetcher::handleNetworkManagerDestroyed() {
                        0, it.value().originalUrl});
   }
   m_pendingRequests.clear();
+  m_repliesByRequestId.clear();
 }
 
 void AssetNetworkFetcher::deliver(FetchCallback callback,

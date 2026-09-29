@@ -32,6 +32,7 @@ struct AssetFetchResult {
 class AssetNetworkFetcher final : public QObject {
 public:
   using FetchCallback = std::function<void(AssetOutcome<AssetFetchResult>)>;
+  using RequestId = quint64;
 
   static constexpr std::chrono::seconds kDefaultTimeout{30};
 
@@ -41,10 +42,12 @@ public:
       QObject *parent = nullptr);
   ~AssetNetworkFetcher() override;
 
-  void fetch(const QUrl &url, FetchCallback callback);
+  RequestId fetch(const QUrl &url, FetchCallback callback);
+  void cancel(RequestId requestId);
 
 private:
   struct PendingRequest {
+    RequestId requestId{0};
     FetchCallback callback;
     QByteArray bytes;
     QTimer *timer{nullptr};
@@ -53,7 +56,8 @@ private:
     std::chrono::steady_clock::time_point deadline;
   };
 
-  void startRequest(const QUrl &url, const QUrl &originalUrl, int redirectCount,
+  void startRequest(RequestId requestId, const QUrl &url,
+                    const QUrl &originalUrl, int redirectCount,
                     std::chrono::steady_clock::time_point deadline,
                     FetchCallback callback);
   void handleReadyRead(QNetworkReply *reply);
@@ -68,6 +72,8 @@ private:
   AssetFetchLimits m_limits;
   std::chrono::milliseconds m_timeout;
   QHash<QNetworkReply *, PendingRequest> m_pendingRequests;
+  QHash<RequestId, QNetworkReply *> m_repliesByRequestId;
+  RequestId m_nextRequestId{1};
 };
 
 [[nodiscard]] AssetDecodeOutcome<QImage>

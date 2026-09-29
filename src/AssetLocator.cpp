@@ -120,10 +120,28 @@ QString stripOneServerCardPrefix(const QString &cardCode) {
   return cardCode;
 }
 
-QString imageFileName(QString artCode, AssetLocator::CardFace face) {
+bool isMutationSuffix(const QString &suffix) {
+  constexpr QStringView kPrefix = u"_Mutated";
+  if (suffix.isEmpty()) {
+    return true;
+  }
+  if (!suffix.startsWith(kPrefix) || suffix.size() == kPrefix.size()) {
+    return false;
+  }
+  for (qsizetype index = kPrefix.size(); index < suffix.size(); ++index) {
+    if (!isAsciiDigit(suffix.at(index))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+QString imageFileName(QString artCode, AssetLocator::CardFace face,
+                      const QString &mutationSuffix) {
   if (face == AssetLocator::CardFace::Back) {
     artCode += u'b';
   }
+  artCode += mutationSuffix;
   return artCode + ".avif"_L1;
 }
 
@@ -216,6 +234,10 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
     return baseValidation.error();
   }
 
+  if (!isMutationSuffix(key.mutationSuffix)) {
+    return invalidKey(QStringLiteral("mutation suffix must match _Mutated<N>"));
+  }
+
   const QString artId = stripOneServerCardPrefix(key.cardCode);
   QStringList pathSegments{QStringLiteral("img"), QStringLiteral("arkham")};
   if (artId.startsWith(u':')) {
@@ -233,13 +255,15 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
           "homebrew card art id contains an invalid campaign or code segment"));
     }
     pathSegments << QStringLiteral("homebrew") << campaign
-                 << QStringLiteral("cards") << imageFileName(code, key.face);
+                 << QStringLiteral("cards")
+                 << imageFileName(code, key.face, key.mutationSuffix);
   } else {
     if (!isOfficialCardCodeSegment(artId)) {
       return invalidKey(
           QStringLiteral("card code is not a valid asset code segment"));
     }
-    pathSegments << QStringLiteral("cards") << imageFileName(artId, key.face);
+    pathSegments << QStringLiteral("cards")
+                 << imageFileName(artId, key.face, key.mutationSuffix);
   }
 
   return appendPathSegments(assetBaseUrl, pathSegments);

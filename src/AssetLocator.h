@@ -32,6 +32,10 @@ struct CardImageKey {
   // 'c' in cardImages.ts and routing through helpers.ts's cardImgPath().
   QString cardCode;
   CardFace face{CardFace::Front};
+  // Optional web-compatible mutated art suffix, e.g. _Mutated1. The caller
+  // supplies the game-state-to-suffix mapping; the locator only validates and
+  // routes the resulting asset id.
+  QString mutationSuffix;
 };
 
 // Builds a single canonical AVIF card-art URL under the supplied asset base.
