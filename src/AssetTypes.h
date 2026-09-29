@@ -12,8 +12,9 @@
 namespace Arkham {
 
 // Shared asset pipeline failures. There is intentionally no zero-valued
-// success/unknown state: success is represented by AssetOutcome<T> carrying a
-// value, and every failure carries one of these explicit non-zero codes.
+// success state: success is represented by AssetOutcome<T> carrying a value,
+// and every failure carries one of these explicit non-zero codes. Unknown is a
+// defensive default for uninitialised AssetError values, never a success.
 enum class AssetErrorCode : int {
   Unknown = 1,
   InvalidAssetBaseUrl,

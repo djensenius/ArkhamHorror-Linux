@@ -153,7 +153,7 @@ void applyAssetRequestPolicy(QNetworkRequest &request) {
 AssetNetworkFetcher::AssetNetworkFetcher(
     QNetworkAccessManager &networkAccessManager, AssetFetchLimits limits,
     std::chrono::milliseconds timeout, QObject *parent)
-    : QObject(parent), m_networkAccessManager(networkAccessManager),
+    : QObject(parent), m_networkAccessManager(&networkAccessManager),
       m_limits(limits), m_timeout(timeout) {
   if (m_limits.maxResponseBytes <= 0) {
     throw std::invalid_argument("asset response byte limit must be positive");
@@ -164,6 +164,8 @@ AssetNetworkFetcher::AssetNetworkFetcher(
   if (m_timeout <= std::chrono::milliseconds::zero()) {
     throw std::invalid_argument("asset fetch timeout must be positive");
   }
+  connect(&networkAccessManager, &QObject::destroyed, this,
+          [this]() { handleNetworkManagerDestroyed(); });
 }
 
 AssetNetworkFetcher::~AssetNetworkFetcher() {
@@ -182,6 +184,14 @@ AssetNetworkFetcher::~AssetNetworkFetcher() {
 }
 
 void AssetNetworkFetcher::fetch(const QUrl &url, FetchCallback callback) {
+  if (!m_networkAccessManager) {
+    deliver(std::move(callback),
+            AssetError{
+                AssetErrorCode::NetworkError,
+                QStringLiteral("asset network manager is no longer available"),
+                0, url});
+    return;
+  }
   const auto validation = validateFetchUrl(url);
   if (!validation) {
     deliver(std::move(callback), validation.error());
@@ -202,10 +212,19 @@ void AssetNetworkFetcher::startRequest(
     return;
   }
 
+  if (!m_networkAccessManager) {
+    deliver(std::move(callback),
+            AssetError{
+                AssetErrorCode::NetworkError,
+                QStringLiteral("asset network manager is no longer available"),
+                0, url});
+    return;
+  }
+
   QNetworkRequest request(url);
   applyAssetRequestPolicy(request);
 
-  QNetworkReply *reply = m_networkAccessManager.get(request);
+  QNetworkReply *reply = m_networkAccessManager->get(request);
   const qint64 plusOne =
       m_limits.maxResponseBytes == std::numeric_limits<qint64>::max()
           ? std::numeric_limits<qint64>::max()
@@ -230,17 +249,8 @@ void AssetNetworkFetcher::startRequest(
                          guardedReply->url()},
               true);
   });
-  connect(reply, &QObject::destroyed, this, [this, reply]() {
-    auto it = m_pendingRequests.find(reply);
-    if (it == m_pendingRequests.end()) {
-      return;
-    }
-    if (it.value().timer) {
-      it.value().timer->stop();
-      it.value().timer->deleteLater();
-    }
-    m_pendingRequests.erase(it);
-  });
+  connect(reply, &QObject::destroyed, this,
+          [this, reply]() { handleReplyDestroyed(reply); });
   connect(reply, &QNetworkReply::metaDataChanged, this, [this, guardedReply]() {
     if (guardedReply) {
       checkContentLength(guardedReply);
@@ -424,6 +434,41 @@ void AssetNetworkFetcher::failReply(QNetworkReply *reply, AssetError error,
   }
   reply->deleteLater();
   deliver(std::move(pending.callback), std::move(error));
+}
+
+void AssetNetworkFetcher::handleReplyDestroyed(QNetworkReply *reply) {
+  auto it = m_pendingRequests.find(reply);
+  if (it == m_pendingRequests.end()) {
+    return;
+  }
+  PendingRequest pending = std::move(it.value());
+  m_pendingRequests.erase(it);
+  if (pending.timer) {
+    pending.timer->stop();
+    pending.timer->deleteLater();
+  }
+  deliver(std::move(pending.callback),
+          AssetError{AssetErrorCode::NetworkError,
+                     QStringLiteral(
+                         "asset network reply was destroyed before completion"),
+                     0, pending.originalUrl});
+}
+
+void AssetNetworkFetcher::handleNetworkManagerDestroyed() {
+  for (auto it = m_pendingRequests.begin(); it != m_pendingRequests.end();
+       ++it) {
+    if (it.value().timer) {
+      it.value().timer->stop();
+      it.value().timer->deleteLater();
+    }
+    QObject::disconnect(it.key(), nullptr, this, nullptr);
+    deliver(std::move(it.value().callback),
+            AssetError{AssetErrorCode::NetworkError,
+                       QStringLiteral(
+                           "asset network manager was destroyed during fetch"),
+                       0, it.value().originalUrl});
+  }
+  m_pendingRequests.clear();
 }
 
 void AssetNetworkFetcher::deliver(FetchCallback callback,

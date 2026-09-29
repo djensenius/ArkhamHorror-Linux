@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QObject>
+#include <QPointer>
 #include <QUrl>
 
 #include <chrono>
@@ -59,9 +60,11 @@ private:
   void handleFinished(QNetworkReply *reply);
   void checkContentLength(QNetworkReply *reply);
   void failReply(QNetworkReply *reply, AssetError error, bool abortReply);
+  void handleReplyDestroyed(QNetworkReply *reply);
+  void handleNetworkManagerDestroyed();
   void deliver(FetchCallback callback, AssetOutcome<AssetFetchResult> result);
 
-  QNetworkAccessManager &m_networkAccessManager;
+  QPointer<QNetworkAccessManager> m_networkAccessManager;
   AssetFetchLimits m_limits;
   std::chrono::milliseconds m_timeout;
   QHash<QNetworkReply *, PendingRequest> m_pendingRequests;

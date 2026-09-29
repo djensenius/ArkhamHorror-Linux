@@ -25,15 +25,29 @@ bool isAsciiDigit(QChar c) { return c >= u'0' && c <= u'9'; }
 
 bool isAsciiLower(QChar c) { return c >= u'a' && c <= u'z'; }
 
-bool isOfficialCardCodeSegment(const QString &segment) {
-  if (segment.isEmpty()) {
+bool isLegacyXArtCodeSegment(const QString &segment) {
+  if (segment.size() < 2 || segment.front() != u'x') {
     return false;
   }
+  for (qsizetype index = 1; index < segment.size(); ++index) {
+    if (!isAsciiLower(segment.at(index))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isNumberedArtCodeSegment(const QString &segment) {
   qsizetype index = 0;
+  if (!segment.isEmpty() && isAsciiLower(segment.at(index)) &&
+      index + 1 < segment.size() && isAsciiDigit(segment.at(index + 1))) {
+    ++index;
+  }
+  const qsizetype digitsStart = index;
   while (index < segment.size() && isAsciiDigit(segment.at(index))) {
     ++index;
   }
-  if (index == 0) {
+  if (index == digitsStart) {
     return false;
   }
   while (index < segment.size()) {
@@ -43,6 +57,13 @@ bool isOfficialCardCodeSegment(const QString &segment) {
     ++index;
   }
   return true;
+}
+
+bool isOfficialCardCodeSegment(const QString &segment) {
+  if (segment.isEmpty()) {
+    return false;
+  }
+  return isNumberedArtCodeSegment(segment) || isLegacyXArtCodeSegment(segment);
 }
 
 bool isHomebrewCampaignSegment(const QString &segment) {

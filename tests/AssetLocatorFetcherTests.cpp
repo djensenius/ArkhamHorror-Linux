@@ -142,6 +142,7 @@ class AssetLocatorFetcherTests final : public QObject {
 private slots:
   void locatorBuildsDefaultCardFrontUrl();
   void locatorBuildsBackUrlAndStripsLeadingC();
+  void locatorBuildsLetterPrefixedOfficialArtUrl();
   void locatorBuildsServerPrefixedHomebrewCardUrl();
   void locatorBuildsAlreadyStrippedHomebrewCardUrl();
   void locatorPreservesBasePathPrefix();
@@ -168,7 +169,8 @@ private slots:
   void fetcherReports304WithoutCache();
   void fetcherRejectsHtmlContentType();
   void destroyingFetcherCancelsInFlightWithoutCallback();
-  void destroyingNetworkManagerDuringRequestDoesNotCallbackOrCrash();
+  void destroyingNetworkManagerDuringRequestReturnsNetworkError();
+  void fetchAfterNetworkManagerDestructionReturnsNetworkError();
 };
 
 void AssetLocatorFetcherTests::locatorBuildsDefaultCardFrontUrl() {
@@ -186,6 +188,19 @@ void AssetLocatorFetcherTests::locatorBuildsBackUrlAndStripsLeadingC() {
       {QStringLiteral("c01001"), AssetLocator::CardFace::Back});
   QVERIFY(url);
   QCOMPARE(url->path(), QStringLiteral("/img/arkham/cards/01001b.avif"));
+}
+
+void AssetLocatorFetcherTests::locatorBuildsLetterPrefixedOfficialArtUrl() {
+  const auto front = AssetLocator::buildCardImageUrl(
+      AssetLocator::defaultAssetBaseUrl(), {QStringLiteral("cx03185")});
+  QVERIFY(front);
+  QCOMPARE(front->path(), QStringLiteral("/img/arkham/cards/x03185.avif"));
+
+  const auto back = AssetLocator::buildCardImageUrl(
+      AssetLocator::defaultAssetBaseUrl(),
+      {QStringLiteral("cx03185"), AssetLocator::CardFace::Back});
+  QVERIFY(back);
+  QCOMPARE(back->path(), QStringLiteral("/img/arkham/cards/x03185b.avif"));
 }
 
 void AssetLocatorFetcherTests::locatorBuildsServerPrefixedHomebrewCardUrl() {
@@ -306,16 +321,16 @@ void AssetLocatorFetcherTests::fetcherReturnsPngBytesWithoutCookies() {
   auto *jar = new QNetworkCookieJar(&nam);
   QNetworkCookie cookie(QByteArrayLiteral("asset_session"),
                         QByteArrayLiteral("secret"));
-  cookie.setDomain(QStringLiteral("127.0.0.1"));
   cookie.setPath(QStringLiteral("/"));
-  jar->setCookiesFromUrl({cookie}, server.url(QStringLiteral("/image.png")));
+  const QUrl imageUrl = server.url(QStringLiteral("/image.png"));
+  QVERIFY(jar->setCookiesFromUrl({cookie}, imageUrl));
+  QVERIFY(!jar->cookiesForUrl(imageUrl).isEmpty());
   nam.setCookieJar(jar);
 
   AssetNetworkFetcher fetcher(nam,
                               {.maxResponseBytes = 1024, .maxRedirects = 5},
                               std::chrono::milliseconds(500));
-  const auto result =
-      runFetch(fetcher, server.url(QStringLiteral("/image.png")));
+  const auto result = runFetch(fetcher, imageUrl);
 
   QVERIFY(result);
   QCOMPARE(result->bytes, tinyPng());
@@ -576,26 +591,39 @@ void AssetLocatorFetcherTests::
 }
 
 void AssetLocatorFetcherTests::
-    destroyingNetworkManagerDuringRequestDoesNotCallbackOrCrash() {
+    destroyingNetworkManagerDuringRequestReturnsNetworkError() {
   MockHttpServer server;
   QVERIFY(server.start());
   MockHttpServer::Response hanging = response(200);
   hanging.hang = true;
   server.setResponse(QStringLiteral("/hang.png"), hanging);
 
-  bool callbackCalled = false;
+  std::optional<AssetOutcome<AssetFetchResult>> captured;
   auto *nam = new QNetworkAccessManager;
   AssetNetworkFetcher fetcher(*nam,
                               {.maxResponseBytes = 1024, .maxRedirects = 5},
                               std::chrono::milliseconds(500));
   fetcher.fetch(server.url(QStringLiteral("/hang.png")),
-                [&callbackCalled](AssetOutcome<AssetFetchResult>) {
-                  callbackCalled = true;
+                [&captured](AssetOutcome<AssetFetchResult> result) {
+                  captured.emplace(std::move(result));
                 });
   QVERIFY(waitUntil([&server]() { return !server.lastRequest().isEmpty(); }));
   delete nam;
-  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
-  QVERIFY(!callbackCalled);
+  QVERIFY(waitUntil([&captured]() { return captured.has_value(); }));
+  expectErrorCode(*captured, AssetErrorCode::NetworkError);
+}
+
+void AssetLocatorFetcherTests::
+    fetchAfterNetworkManagerDestructionReturnsNetworkError() {
+  auto *nam = new QNetworkAccessManager;
+  AssetNetworkFetcher fetcher(*nam,
+                              {.maxResponseBytes = 1024, .maxRedirects = 5},
+                              std::chrono::milliseconds(500));
+  delete nam;
+
+  const auto result = runFetch(
+      fetcher, QUrl(QStringLiteral("https://assets.example/image.png")));
+  expectErrorCode(result, AssetErrorCode::NetworkError);
 }
 
 QTEST_GUILESS_MAIN(AssetLocatorFetcherTests)
