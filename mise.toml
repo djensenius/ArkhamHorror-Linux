@@ -7,7 +7,7 @@ BUILD_DIR = "build"
 
 [tasks."setup:macos"]
 description = "Install Qt development dependencies with Homebrew"
-run = "brew install clang-format qtbase qtdeclarative qtshadertools qtsvg qtwebsockets"
+run = "brew install clang-format libavif jpeg-turbo pkg-config qtbase qtdeclarative qtshadertools qtsvg qtwebsockets"
 
 [tasks.configure]
 description = "Configure the Qt build"

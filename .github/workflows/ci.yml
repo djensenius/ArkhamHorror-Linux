@@ -76,7 +76,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libavif-dev libjpeg-turbo8-dev pkg-config
       - run: mise run lint
 
   test:
@@ -96,7 +96,7 @@ jobs:
       - name: Install QtKeychain and D-Bus build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config dbus # dbus is required by kwallet_hardening test's fake KWallet service
+          sudo apt-get install -y libsecret-1-dev libavif-dev libjpeg-turbo8-dev pkg-config dbus # dbus is required by kwallet_hardening test's fake KWallet service
       - run: mise run test
 
   build:
@@ -114,7 +114,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libavif-dev libjpeg-turbo8-dev pkg-config
       - run: mise run build
 
   encoder-hygiene:
@@ -132,7 +132,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
           cache: true
       - name: Install QtKeychain build dependencies and the Clang toolchain (incl. libclang, used via ctypes -- no pip clang/libclang package involved)
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config clang libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libavif-dev libjpeg-turbo8-dev pkg-config clang libclang-dev
       # Offline unit tests for the checker script's own classify()/
       # allowlist/compile-argument-sanitization logic against synthetic
       # data, run before the real AST scan below so a regression in the
@@ -169,7 +169,7 @@ jobs:
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
           cache: true
       - name: Install QtKeychain build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libavif-dev libjpeg-turbo8-dev pkg-config
       - name: Test libsecret discovery fallback logic
         # Exercises find_bundled_libsecret() (used by build-appimage.sh
         # below) against ldconfig-absent, ldconfig-failing,
