@@ -1633,7 +1633,7 @@ def _single_pin_value(values: Sequence[str], label: str, issues: list[str]) -> s
     return f"<ambiguous {label}>"
 
 
-def _pin_report_lines(findings: Sequence[Finding]) -> list[str]:
+def _pin_report(findings: Sequence[Finding]) -> tuple[list[str], list[str]]:
     named_findings = [
         finding for finding in findings if finding.key() in ALLOWLIST_BY_KEY
     ]
@@ -1713,6 +1713,11 @@ def _pin_report_lines(findings: Sequence[Finding]) -> list[str]:
             ")",
         ]
     )
+    return lines, issues
+
+
+def _pin_report_lines(findings: Sequence[Finding]) -> list[str]:
+    lines, _issues = _pin_report(findings)
     return lines
 
 
@@ -7410,7 +7415,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.print_pins:
-        print("\n".join(_pin_report_lines(findings)))
+        pin_lines, pin_issues = _pin_report(findings)
+        print("\n".join(pin_lines))
+        if pin_issues:
+            print(
+                "error: refusing to print a successful pin regeneration "
+                "result because the observed pin set is incomplete or "
+                "ambiguous; review the warnings above before repinning.",
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     violations = [f for f in findings if classify(f, counts) == "violation"]

@@ -12,7 +12,7 @@ on:
     - cron: "17 9 * * *"
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -136,6 +136,9 @@ jobs:
       # allowlist/compile-argument-sanitization logic against synthetic
       # data. This is the fast PR policy guard and intentionally stays on
       # every PR even when the slow libclang scans below are path-skipped.
+      # This job is not configured as a required check; the full scan still
+      # runs for PRs touching src/**, cmake/**, CMakeLists.txt, or qml/**,
+      # plus checker/test/task/CI changes and scheduled/manual runs.
       - name: Run fast encoder-hygiene policy tests
         run: mise run contracts:test-encoder-hygiene-script
       - name: Classify encoder-hygiene change scope
@@ -181,22 +184,27 @@ jobs:
               run_full_policy=true
               reason="could not classify changed paths for $EVENT_NAME; failing closed"
             else
-              git diff --name-only "$base" "$head" > "$changed_files"
-              while IFS= read -r path; do
-                case "$path" in
-                  packaging/check_encoder_hygiene*.py|mise.toml|.github/workflows/ci.yml)
-                    run_ast_mutations=true
-                    run_full_policy=true
-                    reason="encoder-hygiene checker/test, task, or CI wiring changed"
-                    ;;
-                  CMakeLists.txt|cmake/*|src/*)
-                    run_full_policy=true
-                    if [[ "$reason" == "no encoder-hygiene-sensitive paths changed" ]]; then
-                      reason="production C++/CMake policy surface changed"
-                    fi
-                    ;;
-                esac
-              done < "$changed_files"
+              if ! git diff --no-renames --name-only "$base" "$head" > "$changed_files"; then
+                run_ast_mutations=true
+                run_full_policy=true
+                reason="could not diff changed paths for $EVENT_NAME; running full suite"
+              else
+                while IFS= read -r path; do
+                  case "$path" in
+                    packaging/check_encoder_hygiene*.py|mise.toml|.github/workflows/ci.yml|cmake/*)
+                      run_ast_mutations=true
+                      run_full_policy=true
+                      reason="encoder-hygiene checker/test, task, CI, or CMake helper changed"
+                      ;;
+                    CMakeLists.txt|src/*|qml/*)
+                      run_full_policy=true
+                      if [[ "$reason" == "no encoder-hygiene-sensitive paths changed" ]]; then
+                        reason="production C++/CMake/QML policy surface changed"
+                      fi
+                      ;;
+                  esac
+                done < "$changed_files"
+              fi
             fi
           fi
 
@@ -245,7 +253,7 @@ jobs:
         run: mise run contracts:check-encoder-hygiene
       - name: Skip full encoder-hygiene production policy check
         if: steps.encoder_hygiene_scope.outputs.run_full_policy != 'true'
-        run: echo "Skipping full production scan; no production C++/CMake or checker policy paths changed."
+        run: echo "Skipping full production scan; no production C++/CMake/QML or checker policy paths changed."
 
   appimage-smoke:
     name: AppImage smoke artifact
