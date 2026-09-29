@@ -3,12 +3,65 @@
 #include <QByteArray>
 #include <QImage>
 #include <QString>
+#include <QUrl>
 #include <QtAssert>
 
 #include <optional>
 #include <utility>
 
 namespace Arkham {
+
+// Shared asset pipeline failures. There is intentionally no zero-valued
+// success state: success is represented by AssetOutcome<T> carrying a value,
+// and every failure carries one of these explicit non-zero codes. Unknown is a
+// defensive default for uninitialised AssetError values, never a success.
+enum class AssetErrorCode : int {
+  Unknown = 1,
+  InvalidAssetBaseUrl,
+  InvalidAssetKey,
+  InvalidFetchUrl,
+  UnsupportedScheme,
+  InsecureTransport,
+  NetworkError,
+  Timeout,
+  TooManyRedirects,
+  MissingRedirectLocation,
+  RedirectRejected,
+  ResponseTooLarge,
+  NotFound,
+  HttpError,
+  NotModifiedWithoutCache,
+  UnsupportedContentType,
+};
+
+struct AssetError {
+  AssetErrorCode code{AssetErrorCode::Unknown};
+  QString message;
+  int httpStatus{0};
+  QUrl url;
+};
+
+template <typename T> class AssetOutcome {
+public:
+  AssetOutcome(T value) : m_value(std::move(value)) {}          // NOLINT
+  AssetOutcome(AssetError error) : m_error(std::move(error)) {} // NOLINT
+
+  [[nodiscard]] bool has_value() const noexcept { return m_value.has_value(); }
+  [[nodiscard]] explicit operator bool() const noexcept { return has_value(); }
+  [[nodiscard]] const T &operator*() const { return *m_value; }
+  [[nodiscard]] T &operator*() { return *m_value; }
+  [[nodiscard]] const T *operator->() const { return &*m_value; }
+  [[nodiscard]] T *operator->() { return &*m_value; }
+  [[nodiscard]] const AssetError &error() const {
+    Q_ASSERT_X(!has_value(), "AssetOutcome::error",
+               "error() is valid only on a failed asset outcome");
+    return m_error;
+  }
+
+private:
+  std::optional<T> m_value;
+  AssetError m_error;
+};
 
 // Encoded still-image formats accepted by the native asset decoder. The
 // format is selected only by sniffing the payload bytes; file extensions and
