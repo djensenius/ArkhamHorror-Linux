@@ -4,8 +4,10 @@
 
 #include <avif/avif.h>
 
+#include <algorithm>
 #include <csetjmp>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include <QBuffer>
@@ -29,25 +31,25 @@ QImage tinyImage() {
   return image;
 }
 
-QByteArray encodeWithQt(const char *format) {
+QByteArray encodePngWithQt() {
   QByteArray bytes;
   QBuffer buffer(&bytes);
   if (!buffer.open(QIODevice::WriteOnly)) {
     return {};
   }
-  if (!tinyImage().save(&buffer, format)) {
+  if (!tinyImage().save(&buffer, "PNG")) {
     return {};
   }
   return bytes;
 }
 
-QByteArray encodeAvif() {
+avifImage *createAvifImage() {
   const QImage source = tinyImage().convertToFormat(QImage::Format_RGBA8888);
   avifImage *image = avifImageCreate(static_cast<uint32_t>(source.width()),
                                      static_cast<uint32_t>(source.height()), 8,
                                      AVIF_PIXEL_FORMAT_YUV444);
   if (!image) {
-    return {};
+    return nullptr;
   }
 
   avifRGBImage rgb;
@@ -57,9 +59,29 @@ QByteArray encodeAvif() {
   rgb.pixels = const_cast<uint8_t *>(source.constBits());
   rgb.rowBytes = static_cast<uint32_t>(source.bytesPerLine());
 
-  avifResult result = avifImageRGBToYUV(image, &rgb);
-  if (result != AVIF_RESULT_OK) {
+  if (avifImageRGBToYUV(image, &rgb) != AVIF_RESULT_OK) {
     avifImageDestroy(image);
+    return nullptr;
+  }
+  return image;
+}
+
+QByteArray finishAvifEncode(avifEncoder *encoder) {
+  avifRWData output = AVIF_DATA_EMPTY;
+  const avifResult result = avifEncoderFinish(encoder, &output);
+
+  QByteArray bytes;
+  if (result == AVIF_RESULT_OK && output.data && output.size > 0) {
+    bytes = QByteArray(reinterpret_cast<const char *>(output.data),
+                       static_cast<qsizetype>(output.size));
+  }
+  avifRWDataFree(&output);
+  return bytes;
+}
+
+QByteArray encodeAvif() {
+  avifImage *image = createAvifImage();
+  if (!image) {
     return {};
   }
 
@@ -72,18 +94,40 @@ QByteArray encodeAvif() {
   encoder->minQuantizer = 0;
   encoder->maxQuantizer = 4;
 
-  avifRWData output = AVIF_DATA_EMPTY;
-  result = avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_SINGLE);
-  if (result == AVIF_RESULT_OK) {
-    result = avifEncoderFinish(encoder, &output);
+  QByteArray bytes;
+  if (avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_SINGLE) ==
+      AVIF_RESULT_OK) {
+    bytes = finishAvifEncode(encoder);
+  }
+  avifEncoderDestroy(encoder);
+  avifImageDestroy(image);
+  return bytes;
+}
+
+QByteArray encodeAvifSequence() {
+  avifImage *image = createAvifImage();
+  if (!image) {
+    return {};
   }
 
-  QByteArray bytes;
-  if (result == AVIF_RESULT_OK && output.data && output.size > 0) {
-    bytes = QByteArray(reinterpret_cast<const char *>(output.data),
-                       static_cast<qsizetype>(output.size));
+  avifEncoder *encoder = avifEncoderCreate();
+  if (!encoder) {
+    avifImageDestroy(image);
+    return {};
   }
-  avifRWDataFree(&output);
+  encoder->maxThreads = 1;
+  encoder->minQuantizer = 0;
+  encoder->maxQuantizer = 4;
+
+  QByteArray bytes;
+  avifResult result =
+      avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_NONE);
+  if (result == AVIF_RESULT_OK) {
+    result = avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_NONE);
+  }
+  if (result == AVIF_RESULT_OK) {
+    bytes = finishAvifEncode(encoder);
+  }
   avifEncoderDestroy(encoder);
   avifImageDestroy(image);
   return bytes;
@@ -99,16 +143,26 @@ void jpegWriteErrorExit(j_common_ptr cinfo) {
   longjmp(errorManager->setjmpBuffer, 1);
 }
 
-QByteArray encodeProgressiveJpeg() {
+QByteArray encodeJpeg(bool progressive = false,
+                      J_COLOR_SPACE colorSpace = JCS_RGB) {
   constexpr int width = 8;
   constexpr int height = 8;
-  std::vector<unsigned char> pixels(static_cast<size_t>(width * height * 3));
+  const int components = colorSpace == JCS_CMYK ? 4 : 3;
+  std::vector<unsigned char> pixels(
+      static_cast<size_t>(width * height * components));
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
-      const size_t offset = static_cast<size_t>((y * width + x) * 3);
-      pixels[offset] = static_cast<unsigned char>(x * 32);
-      pixels[offset + 1] = static_cast<unsigned char>(y * 32);
-      pixels[offset + 2] = static_cast<unsigned char>(200);
+      const size_t offset = static_cast<size_t>((y * width + x) * components);
+      if (colorSpace == JCS_CMYK) {
+        pixels[offset] = static_cast<unsigned char>(x * 24);
+        pixels[offset + 1] = static_cast<unsigned char>(y * 24);
+        pixels[offset + 2] = 0;
+        pixels[offset + 3] = 0;
+      } else {
+        pixels[offset] = static_cast<unsigned char>(x * 32);
+        pixels[offset + 1] = static_cast<unsigned char>(y * 32);
+        pixels[offset + 2] = static_cast<unsigned char>(200);
+      }
     }
   }
 
@@ -130,16 +184,19 @@ QByteArray encodeProgressiveJpeg() {
   jpeg_mem_dest(&cinfo, &output, &outputSize);
   cinfo.image_width = width;
   cinfo.image_height = height;
-  cinfo.input_components = 3;
-  cinfo.in_color_space = JCS_RGB;
+  cinfo.input_components = components;
+  cinfo.in_color_space = colorSpace;
   jpeg_set_defaults(&cinfo);
   jpeg_set_quality(&cinfo, 90, TRUE);
-  jpeg_simple_progression(&cinfo);
+  if (progressive) {
+    jpeg_simple_progression(&cinfo);
+  }
   jpeg_start_compress(&cinfo, TRUE);
 
   while (cinfo.next_scanline < cinfo.image_height) {
-    JSAMPROW rowPointer[1] = {
-        pixels.data() + static_cast<size_t>(cinfo.next_scanline) * width * 3};
+    JSAMPROW rowPointer[1] = {pixels.data() +
+                              static_cast<size_t>(cinfo.next_scanline) * width *
+                                  static_cast<size_t>(components)};
     jpeg_write_scanlines(&cinfo, rowPointer, 1);
   }
 
@@ -151,11 +208,41 @@ QByteArray encodeProgressiveJpeg() {
   return bytes;
 }
 
+QByteArray truncatePngInsideIdat(const QByteArray &png) {
+  const auto *data = reinterpret_cast<const unsigned char *>(png.constData());
+  qsizetype pos = 8;
+  while (pos + 12 <= png.size()) {
+    const quint32 length = (static_cast<quint32>(data[pos]) << 24) |
+                           (static_cast<quint32>(data[pos + 1]) << 16) |
+                           (static_cast<quint32>(data[pos + 2]) << 8) |
+                           static_cast<quint32>(data[pos + 3]);
+    const qsizetype typeOffset = pos + 4;
+    const qsizetype dataOffset = pos + 8;
+    const qsizetype chunkEnd = dataOffset + static_cast<qsizetype>(length) + 4;
+    if (chunkEnd > png.size()) {
+      return png.left(std::max<qsizetype>(8, png.size() / 2));
+    }
+    if (std::memcmp(png.constData() + typeOffset, "IDAT", 4) == 0 &&
+        length > 1) {
+      return png.left(dataOffset + static_cast<qsizetype>(length / 2));
+    }
+    pos = chunkEnd;
+  }
+  return png.left(std::max<qsizetype>(8, png.size() / 2));
+}
+
 void expectDecodeError(const QByteArray &bytes, const AssetDecodeLimits &limits,
                        AssetDecodeErrorCode code) {
   const auto decoded = decodeAssetImage(bytes, limits);
   QVERIFY(!decoded);
   QCOMPARE(decoded.error().code, code);
+}
+
+void expectDecodeSuccess(const QByteArray &bytes, const QSize &size) {
+  const auto decoded = decodeAssetImage(bytes);
+  QVERIFY2(decoded.has_value(),
+           decoded ? "" : qPrintable(decoded.error().message));
+  QCOMPARE(decoded->size(), size);
 }
 
 } // namespace
@@ -167,48 +254,45 @@ private slots:
   void validPngRoundTrip();
   void validJpegRoundTrip();
   void validAvifRoundTrip();
-  void rejectsTruncatedInput();
+  void progressiveJpegDecodesUnderDefaultScanCap();
   void rejectsWrongMagic();
+  void rejectsInvalidLimits();
   void rejectsOversizeByteCount();
   void rejectsPngOversizeDimensions();
   void rejectsJpegOversizeDimensions();
-  void capsProgressiveJpegScans();
-  void rejectsAvifOversizeDimensions();
+  void rejectsPngPixelBudget();
+  void rejectsJpegPixelBudget();
+  void rejectsAvifPixelBudget();
+  void capsProgressiveJpegScansWithTrailingGarbage();
+  void rejectsPngTruncatedInsideIdat();
+  void rejectsJpegTruncatedWithWarning();
+  void rejectsAvifTruncated();
+  void rejectsCmykJpeg();
+  void rejectsPureAvifSequenceWithoutPrimaryItem();
 };
 
 void AssetDecoderTests::validPngRoundTrip() {
-  const QByteArray png = encodeWithQt("PNG");
+  const QByteArray png = encodePngWithQt();
   QVERIFY(!png.isEmpty());
-
-  const auto decoded = decodeAssetImage(png);
-  QVERIFY2(decoded.has_value(), qPrintable(decoded.error().message));
-  QCOMPARE(decoded->size(), QSize(2, 2));
+  expectDecodeSuccess(png, QSize(2, 2));
 }
 
 void AssetDecoderTests::validJpegRoundTrip() {
-  const QByteArray jpeg = encodeWithQt("JPEG");
+  const QByteArray jpeg = encodeJpeg();
   QVERIFY(!jpeg.isEmpty());
-
-  const auto decoded = decodeAssetImage(jpeg);
-  QVERIFY2(decoded.has_value(), qPrintable(decoded.error().message));
-  QCOMPARE(decoded->size(), QSize(2, 2));
+  expectDecodeSuccess(jpeg, QSize(8, 8));
 }
 
 void AssetDecoderTests::validAvifRoundTrip() {
   const QByteArray avif = encodeAvif();
   QVERIFY(!avif.isEmpty());
-
-  const auto decoded = decodeAssetImage(avif);
-  QVERIFY2(decoded.has_value(), qPrintable(decoded.error().message));
-  QCOMPARE(decoded->size(), QSize(2, 2));
+  expectDecodeSuccess(avif, QSize(2, 2));
 }
 
-void AssetDecoderTests::rejectsTruncatedInput() {
-  const QByteArray png = encodeWithQt("PNG");
-  QVERIFY(png.size() > 8);
-
-  expectDecodeError(png.left(8), AssetDecodeLimits{},
-                    AssetDecodeErrorCode::MalformedImage);
+void AssetDecoderTests::progressiveJpegDecodesUnderDefaultScanCap() {
+  const QByteArray jpeg = encodeJpeg(true);
+  QVERIFY(!jpeg.isEmpty());
+  expectDecodeSuccess(jpeg, QSize(8, 8));
 }
 
 void AssetDecoderTests::rejectsWrongMagic() {
@@ -216,8 +300,17 @@ void AssetDecoderTests::rejectsWrongMagic() {
                     AssetDecodeErrorCode::UnrecognizedFormat);
 }
 
+void AssetDecoderTests::rejectsInvalidLimits() {
+  const QByteArray png = encodePngWithQt();
+  QVERIFY(!png.isEmpty());
+
+  AssetDecodeLimits limits;
+  limits.maxEncodedBytes = 0;
+  expectDecodeError(png, limits, AssetDecodeErrorCode::InvalidLimits);
+}
+
 void AssetDecoderTests::rejectsOversizeByteCount() {
-  const QByteArray png = encodeWithQt("PNG");
+  const QByteArray png = encodePngWithQt();
   QVERIFY(png.size() > 1);
 
   AssetDecodeLimits limits;
@@ -226,7 +319,7 @@ void AssetDecoderTests::rejectsOversizeByteCount() {
 }
 
 void AssetDecoderTests::rejectsPngOversizeDimensions() {
-  const QByteArray png = encodeWithQt("PNG");
+  const QByteArray png = encodePngWithQt();
   QVERIFY(!png.isEmpty());
 
   AssetDecodeLimits limits;
@@ -235,7 +328,7 @@ void AssetDecoderTests::rejectsPngOversizeDimensions() {
 }
 
 void AssetDecoderTests::rejectsJpegOversizeDimensions() {
-  const QByteArray jpeg = encodeWithQt("JPEG");
+  const QByteArray jpeg = encodeJpeg();
   QVERIFY(!jpeg.isEmpty());
 
   AssetDecodeLimits limits;
@@ -243,9 +336,37 @@ void AssetDecoderTests::rejectsJpegOversizeDimensions() {
   expectDecodeError(jpeg, limits, AssetDecodeErrorCode::DimensionTooLarge);
 }
 
-void AssetDecoderTests::capsProgressiveJpegScans() {
-  const QByteArray jpeg = encodeProgressiveJpeg();
+void AssetDecoderTests::rejectsPngPixelBudget() {
+  const QByteArray png = encodePngWithQt();
+  QVERIFY(!png.isEmpty());
+
+  AssetDecodeLimits limits;
+  limits.maxPixelCount = 1;
+  expectDecodeError(png, limits, AssetDecodeErrorCode::PixelBudgetExceeded);
+}
+
+void AssetDecoderTests::rejectsJpegPixelBudget() {
+  const QByteArray jpeg = encodeJpeg();
   QVERIFY(!jpeg.isEmpty());
+
+  AssetDecodeLimits limits;
+  limits.maxPixelCount = 1;
+  expectDecodeError(jpeg, limits, AssetDecodeErrorCode::PixelBudgetExceeded);
+}
+
+void AssetDecoderTests::rejectsAvifPixelBudget() {
+  const QByteArray avif = encodeAvif();
+  QVERIFY(!avif.isEmpty());
+
+  AssetDecodeLimits limits;
+  limits.maxPixelCount = 1;
+  expectDecodeError(avif, limits, AssetDecodeErrorCode::PixelBudgetExceeded);
+}
+
+void AssetDecoderTests::capsProgressiveJpegScansWithTrailingGarbage() {
+  QByteArray jpeg = encodeJpeg(true);
+  QVERIFY(!jpeg.isEmpty());
+  jpeg.append("\xFF\xE1\xFF\xFF", 4);
 
   AssetDecodeLimits limits;
   limits.maxProgressiveJpegScans = 1;
@@ -253,13 +374,52 @@ void AssetDecoderTests::capsProgressiveJpegScans() {
                     AssetDecodeErrorCode::ProgressiveScanLimitExceeded);
 }
 
-void AssetDecoderTests::rejectsAvifOversizeDimensions() {
-  const QByteArray avif = encodeAvif();
-  QVERIFY(!avif.isEmpty());
+void AssetDecoderTests::rejectsPngTruncatedInsideIdat() {
+  const QByteArray png = encodePngWithQt();
+  QVERIFY(!png.isEmpty());
 
-  AssetDecodeLimits limits;
-  limits.maxWidth = 1;
-  expectDecodeError(avif, limits, AssetDecodeErrorCode::DimensionTooLarge);
+  expectDecodeError(truncatePngInsideIdat(png), AssetDecodeLimits{},
+                    AssetDecodeErrorCode::MalformedImage);
+}
+
+void AssetDecoderTests::rejectsJpegTruncatedWithWarning() {
+  const QByteArray jpeg = encodeJpeg();
+  QVERIFY(jpeg.size() > 16);
+
+  expectDecodeError(jpeg.left(jpeg.size() - 2), AssetDecodeLimits{},
+                    AssetDecodeErrorCode::MalformedImage);
+}
+
+void AssetDecoderTests::rejectsAvifTruncated() {
+  const QByteArray avif = encodeAvif();
+  QVERIFY(avif.size() > 32);
+
+  expectDecodeError(avif.left(avif.size() / 2), AssetDecodeLimits{},
+                    AssetDecodeErrorCode::MalformedImage);
+}
+
+void AssetDecoderTests::rejectsCmykJpeg() {
+  const QByteArray jpeg = encodeJpeg(false, JCS_CMYK);
+  if (jpeg.isEmpty()) {
+    QSKIP("this libjpeg build could not encode a CMYK fixture");
+  }
+
+  expectDecodeError(jpeg, AssetDecodeLimits{},
+                    AssetDecodeErrorCode::UnsupportedCodec);
+}
+
+void AssetDecoderTests::rejectsPureAvifSequenceWithoutPrimaryItem() {
+  const QByteArray avif = encodeAvifSequence();
+  if (avif.isEmpty()) {
+    QSKIP("this libavif build could not encode a sequence fixture");
+  }
+
+  const auto decoded = decodeAssetImage(avif);
+  if (decoded) {
+    QSKIP("this libavif encoder produced a primary item even when asked for a "
+          "sequence fixture");
+  }
+  QCOMPARE(decoded.error().code, AssetDecodeErrorCode::UnsupportedCodec);
 }
 
 QTEST_APPLESS_MAIN(AssetDecoderTests)

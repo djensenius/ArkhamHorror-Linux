@@ -1,10 +1,10 @@
 #include "AssetAvifDecoder.h"
 
+#include "AssetTypes.h"
+
 #include <avif/avif.h>
 
-#include <algorithm>
 #include <cstdint>
-#include <limits>
 
 namespace Arkham {
 
@@ -15,6 +15,9 @@ AssetDecodeErrorCode errorCodeForAvifResult(avifResult result) {
   case AVIF_RESULT_NO_CODEC_AVAILABLE:
   case AVIF_RESULT_NOT_IMPLEMENTED:
   case AVIF_RESULT_UNSUPPORTED_DEPTH:
+  case AVIF_RESULT_MISSING_IMAGE_ITEM:
+  case AVIF_RESULT_NO_IMAGES_REMAINING:
+  case AVIF_RESULT_NO_CONTENT:
     return AssetDecodeErrorCode::UnsupportedCodec;
   default:
     return AssetDecodeErrorCode::MalformedImage;
@@ -67,9 +70,7 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   }
 
   decoder->maxThreads = 1;
-  decoder->imageCountLimit = 1;
-  decoder->imageSizeLimit = static_cast<uint32_t>(std::clamp<qint64>(
-      limits.maxPixelCount, 1, std::numeric_limits<uint32_t>::max()));
+  decoder->requestedSource = AVIF_DECODER_SOURCE_PRIMARY_ITEM;
 
   avifResult result = avifDecoderSetIOMemory(
       decoder, reinterpret_cast<const uint8_t *>(encodedBytes.constData()),
@@ -90,19 +91,16 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
     avifDecoderDestroy(decoder);
     return AssetDecodeError{
         code,
-        QStringLiteral("libavif failed to parse AVIF container: %1")
+        QStringLiteral("libavif failed to parse primary AVIF item: %1")
             .arg(QString::fromLatin1(avifResultToString(result))),
     };
   }
 
-  if (decoder->imageCount != 1) {
-    const int imageCount = decoder->imageCount;
+  if (!decoder->image) {
     avifDecoderDestroy(decoder);
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
-        QStringLiteral("AVIF image sequences are rejected (imageCount=%1)")
-            .arg(imageCount),
-    };
+        AssetDecodeErrorCode::UnsupportedCodec,
+        QStringLiteral("AVIF payload does not contain a primary still image")};
   }
 
   const auto preDecodeValidation = validateAvifDimensions(
@@ -119,7 +117,7 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
     avifDecoderDestroy(decoder);
     return AssetDecodeError{
         code,
-        QStringLiteral("libavif failed to decode AVIF image: %1")
+        QStringLiteral("libavif failed to decode AVIF primary item: %1")
             .arg(QString::fromLatin1(avifResultToString(result))),
     };
   }

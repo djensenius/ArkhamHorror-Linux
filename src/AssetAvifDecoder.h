@@ -1,14 +1,7 @@
 #pragma once
 
-#include "AssetTypes.h"
-
-namespace Arkham {
-
-// Decodes a single still AVIF payload through libavif. AVIF image sequences or
-// animations are rejected rather than silently decoding only frame 0, because
-// native Arkham assets are canonical still images.
-[[nodiscard]] AssetDecodeOutcome<QImage>
-decodeAvifImage(const QByteArray &encodedBytes,
-                const AssetDecodeLimits &limits);
-
-} // namespace Arkham
+// Implementation-detail header declared only for the project's src/ header
+// inventory. AVIF decoding is reached through decodeAssetImage() in
+// AssetTypes.h; no per-format decoder is public API. The implementation asks
+// libavif for the primary still-image item only: sequence tracks may be present
+// but are ignored, while files with no primary still image are unsupported.

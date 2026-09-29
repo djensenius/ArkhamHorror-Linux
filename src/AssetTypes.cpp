@@ -8,6 +8,13 @@
 
 namespace Arkham {
 
+AssetDecodeOutcome<QImage> decodePngImage(const QByteArray &encodedBytes,
+                                          const AssetDecodeLimits &limits);
+AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
+                                           const AssetDecodeLimits &limits);
+AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
+                                           const AssetDecodeLimits &limits);
+
 namespace {
 
 bool hasPrefix(const QByteArray &bytes, const unsigned char *prefix,

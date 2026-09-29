@@ -1,5 +1,7 @@
 #include "AssetJpegDecoder.h"
 
+#include "AssetTypes.h"
+
 #include <cstdio>
 
 #include <jpeglib.h>
@@ -8,7 +10,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <optional>
 
 namespace Arkham {
 
@@ -20,73 +21,35 @@ struct JpegErrorManager {
   char fatalMessage[JMSG_LENGTH_MAX];
 };
 
+struct JpegProgressManager {
+  jpeg_progress_mgr pub;
+  int maxProgressiveScans;
+};
+
 struct JpegDecodeState {
   jpeg_decompress_struct cinfo;
   JpegErrorManager errorManager;
+  JpegProgressManager progressManager;
   unsigned char *scanlineBuffer;
+  bool progressiveScanLimitExceeded;
 };
 
 void jpegErrorExit(j_common_ptr cinfo) {
-  auto *errorManager = static_cast<JpegErrorManager *>(cinfo->client_data);
-  (*cinfo->err->format_message)(cinfo, errorManager->fatalMessage);
-  longjmp(errorManager->setjmpBuffer, 1);
+  auto *state = static_cast<JpegDecodeState *>(cinfo->client_data);
+  (*cinfo->err->format_message)(cinfo, state->errorManager.fatalMessage);
+  longjmp(state->errorManager.setjmpBuffer, 1);
 }
 
 void jpegOutputMessageNoop(j_common_ptr) {}
 
-bool isStandaloneMarker(unsigned char marker) {
-  return marker == 0x01 || marker == 0xD8 || marker == 0xD9 ||
-         (marker >= 0xD0 && marker <= 0xD7);
-}
-
-std::optional<int> countStartOfScanMarkers(const QByteArray &encodedBytes) {
-  const auto *data =
-      reinterpret_cast<const unsigned char *>(encodedBytes.constData());
-  const qsizetype size = encodedBytes.size();
-  if (size < 2 || data[0] != 0xFF || data[1] != 0xD8) {
-    return std::nullopt;
+void jpegProgressMonitor(j_common_ptr cinfo) {
+  auto *state = static_cast<JpegDecodeState *>(cinfo->client_data);
+  const auto *decompress = reinterpret_cast<j_decompress_ptr>(cinfo);
+  if (decompress->input_scan_number >
+      state->progressManager.maxProgressiveScans) {
+    state->progressiveScanLimitExceeded = true;
+    longjmp(state->errorManager.setjmpBuffer, 1);
   }
-
-  qsizetype pos = 2;
-  int scans = 0;
-  while (pos < size) {
-    while (pos < size && data[pos] != 0xFF) {
-      ++pos;
-    }
-    if (pos >= size) {
-      return scans;
-    }
-    while (pos < size && data[pos] == 0xFF) {
-      ++pos;
-    }
-    if (pos >= size) {
-      return std::nullopt;
-    }
-
-    const unsigned char marker = data[pos++];
-    if (marker == 0x00) {
-      continue; // byte-stuffed 0xFF inside entropy-coded scan data
-    }
-    if (marker == 0xD9) {
-      return scans;
-    }
-    if (isStandaloneMarker(marker)) {
-      continue;
-    }
-    if (pos + 2 > size) {
-      return std::nullopt;
-    }
-    const qsizetype segmentLength = (static_cast<qsizetype>(data[pos]) << 8) |
-                                    static_cast<qsizetype>(data[pos + 1]);
-    if (segmentLength < 2 || pos + segmentLength > size) {
-      return std::nullopt;
-    }
-    if (marker == 0xDA) {
-      ++scans;
-    }
-    pos += segmentLength;
-  }
-  return scans;
 }
 
 AssetDecodeOutcome<qint64>
@@ -147,16 +110,29 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   state->cinfo.err = jpeg_std_error(&state->errorManager.pub);
   state->errorManager.pub.error_exit = jpegErrorExit;
   state->errorManager.pub.output_message = jpegOutputMessageNoop;
-  state->cinfo.client_data = &state->errorManager;
+  state->progressManager.maxProgressiveScans = limits.maxProgressiveJpegScans;
+  state->progressManager.pub.progress_monitor = jpegProgressMonitor;
+  state->cinfo.client_data = state;
+  state->cinfo.progress = &state->progressManager.pub;
 
   if (setjmp(state->errorManager.setjmpBuffer)) {
     JpegDecodeState *const failedState = state;
     char messageCopy[JMSG_LENGTH_MAX];
     std::memcpy(messageCopy, failedState->errorManager.fatalMessage,
                 sizeof(messageCopy));
+    const bool scanLimitExceeded = failedState->progressiveScanLimitExceeded;
+    const int maxScans = failedState->progressManager.maxProgressiveScans;
     std::free(failedState->scanlineBuffer);
     jpeg_destroy_decompress(&failedState->cinfo);
     std::free(failedState);
+    if (scanLimitExceeded) {
+      return AssetDecodeError{
+          AssetDecodeErrorCode::ProgressiveScanLimitExceeded,
+          QStringLiteral(
+              "progressive JPEG exceeded the configured cap of %1 scans")
+              .arg(maxScans),
+      };
+    }
     return AssetDecodeError{
         AssetDecodeErrorCode::MalformedImage,
         QStringLiteral("libjpeg failed to decode the JPEG payload: %1")
@@ -165,6 +141,8 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   }
 
   jpeg_create_decompress(&state->cinfo);
+  state->cinfo.client_data = state;
+  state->cinfo.progress = &state->progressManager.pub;
   jpeg_mem_src(
       &state->cinfo,
       reinterpret_cast<const unsigned char *>(encodedBytes.constData()),
@@ -178,28 +156,24 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
         QStringLiteral("libjpeg did not find a JPEG image header")};
   }
 
-  if (jpeg_has_multiple_scans(&state->cinfo)) {
-    const std::optional<int> scanCount = countStartOfScanMarkers(encodedBytes);
-    if (scanCount && *scanCount > limits.maxProgressiveJpegScans) {
+  {
+    const auto dimensionValidation = validateJpegDimensions(
+        state->cinfo.image_width, state->cinfo.image_height, limits);
+    if (!dimensionValidation) {
+      const AssetDecodeError error = dimensionValidation.error();
       jpeg_destroy_decompress(&state->cinfo);
       std::free(state);
-      return AssetDecodeError{
-          AssetDecodeErrorCode::ProgressiveScanLimitExceeded,
-          QStringLiteral("progressive JPEG has %1 scans, exceeding the "
-                         "configured cap of %2")
-              .arg(*scanCount)
-              .arg(limits.maxProgressiveJpegScans),
-      };
+      return error;
     }
   }
 
-  const auto dimensionValidation = validateJpegDimensions(
-      state->cinfo.image_width, state->cinfo.image_height, limits);
-  if (!dimensionValidation) {
-    const AssetDecodeError error = dimensionValidation.error();
+  if (state->cinfo.jpeg_color_space == JCS_CMYK ||
+      state->cinfo.jpeg_color_space == JCS_YCCK) {
     jpeg_destroy_decompress(&state->cinfo);
     std::free(state);
-    return error;
+    return AssetDecodeError{
+        AssetDecodeErrorCode::UnsupportedCodec,
+        QStringLiteral("CMYK/YCCK JPEG assets are not supported")};
   }
 
   state->cinfo.out_color_space = JCS_RGB;

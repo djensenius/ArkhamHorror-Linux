@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QImage>
 #include <QString>
+#include <QtAssert>
 
 #include <optional>
 #include <utility>
@@ -49,7 +50,11 @@ public:
   [[nodiscard]] T &operator*() { return *m_value; }
   [[nodiscard]] const T *operator->() const { return &*m_value; }
   [[nodiscard]] T *operator->() { return &*m_value; }
-  [[nodiscard]] const AssetDecodeError &error() const { return m_error; }
+  [[nodiscard]] const AssetDecodeError &error() const {
+    Q_ASSERT_X(!has_value(), "AssetDecodeOutcome::error",
+               "error() is valid only on a failed decode outcome");
+    return m_error;
+  }
 
 private:
   std::optional<T> m_value;

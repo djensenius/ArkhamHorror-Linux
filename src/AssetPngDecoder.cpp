@@ -1,5 +1,7 @@
 #include "AssetPngDecoder.h"
 
+#include "AssetTypes.h"
+
 #include <QBuffer>
 #include <QImageReader>
 

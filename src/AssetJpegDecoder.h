@@ -1,15 +1,8 @@
 #pragma once
 
-#include "AssetTypes.h"
-
-namespace Arkham {
-
-// Decodes a JPEG payload through libjpeg's C API. Dimensions are read and
-// checked immediately after jpeg_read_header(), before any full-size pixel
-// buffer is allocated. Progressive JPEGs are accepted only when their Start Of
-// Scan marker count stays within AssetDecodeLimits::maxProgressiveJpegScans.
-[[nodiscard]] AssetDecodeOutcome<QImage>
-decodeJpegImage(const QByteArray &encodedBytes,
-                const AssetDecodeLimits &limits);
-
-} // namespace Arkham
+// Implementation-detail header declared only for the project's src/ header
+// inventory. JPEG decoding is reached through decodeAssetImage() in
+// AssetTypes.h; no per-format decoder is public API. The implementation uses
+// libjpeg directly, treats any libjpeg corrupt-data warning as fatal, rejects
+// CMYK/YCCK input, and enforces progressive scan limits through libjpeg's
+// progress callback rather than by trusting marker pre-scans.
