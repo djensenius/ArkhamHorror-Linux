@@ -22,11 +22,13 @@ Run directly: `python3 packaging/check_encoder_hygiene_test.py`
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
 import unittest
 from collections import Counter
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 
@@ -287,6 +289,40 @@ class ExactIdentitySetTests(unittest.TestCase):
             ceh._identity_set_digest([finding]),
             ceh._identity_set_digest([additionally_observed]),
         )
+
+    def test_pin_report_prints_reviewable_regeneration_snippet(self) -> None:
+        finding = self._pinned_allowlisted_finding()
+        lines, issues = ceh._pin_report([finding])
+        report = "\n".join(lines)
+        self.assertTrue(issues)
+        self.assertIn("_NAMED_ALLOWLIST_IDENTITY_SET_SHA256", report)
+        self.assertIn("_LOCAL_WIRE_SURFACE_SET_SHA256", report)
+        self.assertIn(ceh._full_signature_digest(finding), report)
+        self.assertIn(
+            f"{finding.physical_identity_sha256} {finding.observation_set_sha256}",
+            report,
+        )
+        self.assertIn("# WARNING: generated pin set is incomplete or ambiguous", report)
+
+    def test_print_pins_returns_nonzero_for_incomplete_pin_set(self) -> None:
+        finding = self._pinned_allowlisted_finding()
+        original_run_check = ceh.run_check
+
+        def fake_run_check(*_args: object, **_kwargs: object) -> list[ceh.Finding]:
+            return [finding]
+
+        ceh.run_check = fake_run_check
+        try:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = ceh.main(["--print-pins"])
+        finally:
+            ceh.run_check = original_run_check
+
+        self.assertEqual(result, 1)
+        self.assertIn("# WARNING: generated pin set is incomplete or ambiguous", stdout.getvalue())
+        self.assertIn("refusing to print a successful pin regeneration", stderr.getvalue())
 
 
 class QJsonFamilyWrappedFormsAreDetectedTests(unittest.TestCase):

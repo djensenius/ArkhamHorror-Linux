@@ -70,6 +70,10 @@ run = "python3 packaging/verify_contract_provenance_test.py"
 description = "Prove via real compiler-AST inspection (libclang) that every closed-world production target/header/source context obeys its exact closure and references no forbidden QJson/QVariant wire type except exact path+USR+semantic-signature+access+count positive allowances for intentional inbound decoders and bounded RawJson/Auth adapters."
 run = "python3 packaging/check_encoder_hygiene.py"
 
+[tasks."contracts:print-encoder-hygiene-pins"]
+description = "Print a reviewed-repinning snippet for encoder-hygiene exact signature, physical identity, and observation-set pins after a deliberate allowlist/policy change."
+run = "python3 packaging/check_encoder_hygiene.py --print-pins"
+
 [tasks."contracts:test-encoder-hygiene-script"]
 description = "Unit-test check_encoder_hygiene.py's classify()/allowlist/sanitize-args logic with synthetic data (no compiler invocation)"
 run = "python3 packaging/check_encoder_hygiene_test.py"

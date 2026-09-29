@@ -8,9 +8,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * *"
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -122,32 +124,126 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # The PR fast path needs the base/head commits for a local path
+          # classification without adding another third-party action.
+          fetch-depth: 0
       - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db
         with:
           version: 2026.8.14
           cache: true
+      # Offline unit tests for the checker script's own classify()/
+      # allowlist/compile-argument-sanitization logic against synthetic
+      # data. This is the fast PR policy guard and intentionally stays on
+      # every PR even when the slow libclang scans below are path-skipped.
+      # This job is not configured as a required check; the full scan still
+      # runs for PRs touching src/**, cmake/**, CMakeLists.txt, or qml/**,
+      # plus checker/test/task/CI changes and scheduled/manual runs.
+      - name: Run fast encoder-hygiene policy tests
+        run: mise run contracts:test-encoder-hygiene-script
+      - name: Classify encoder-hygiene change scope
+        id: encoder_hygiene_scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          run_ast_mutations=false
+          run_full_policy=false
+          reason="no encoder-hygiene-sensitive paths changed"
+          changed_files="$RUNNER_TEMP/encoder-hygiene-changed-files.txt"
+          : > "$changed_files"
+
+          if [[ "$EVENT_NAME" == "schedule" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            run_ast_mutations=true
+            run_full_policy=true
+            reason="$EVENT_NAME runs the full encoder-hygiene suite"
+          else
+            case "$EVENT_NAME" in
+              pull_request)
+                base="$PR_BASE_SHA"
+                head="$PR_HEAD_SHA"
+                ;;
+              push)
+                base="$PUSH_BEFORE_SHA"
+                head="$CURRENT_SHA"
+                ;;
+              *)
+                base=""
+                head=""
+                ;;
+            esac
+
+            if [[ -z "$base" || -z "$head" || "$base" =~ ^0+$ ]]; then
+              run_ast_mutations=true
+              run_full_policy=true
+              reason="could not classify changed paths for $EVENT_NAME; failing closed"
+            else
+              if ! git diff --no-renames --name-only "$base" "$head" > "$changed_files"; then
+                run_ast_mutations=true
+                run_full_policy=true
+                reason="could not diff changed paths for $EVENT_NAME; running full suite"
+              else
+                while IFS= read -r path; do
+                  case "$path" in
+                    packaging/check_encoder_hygiene*.py|mise.toml|.github/workflows/ci.yml|cmake/*)
+                      run_ast_mutations=true
+                      run_full_policy=true
+                      reason="encoder-hygiene checker/test, task, CI, or CMake helper changed"
+                      ;;
+                    CMakeLists.txt|src/*|qml/*)
+                      run_full_policy=true
+                      if [[ "$reason" == "no encoder-hygiene-sensitive paths changed" ]]; then
+                        reason="production C++/CMake/QML policy surface changed"
+                      fi
+                      ;;
+                  esac
+                done < "$changed_files"
+              fi
+            fi
+          fi
+
+          echo "run_ast_mutations=$run_ast_mutations" >> "$GITHUB_OUTPUT"
+          echo "run_full_policy=$run_full_policy" >> "$GITHUB_OUTPUT"
+          echo "Encoder hygiene scope: ast_mutations=$run_ast_mutations full_policy=$run_full_policy ($reason)"
+          if [[ -s "$changed_files" ]]; then
+            echo "Changed files considered for encoder hygiene:"
+            sed 's/^/  /' "$changed_files"
+          fi
       - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+        if: steps.encoder_hygiene_scope.outputs.run_full_policy == 'true'
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
           cache: true
-      - name: Install QtKeychain build dependencies and the Clang toolchain (incl. libclang, used via ctypes -- no pip clang/libclang package involved)
+      - name: Install encoder-hygiene native dependencies
+        if: steps.encoder_hygiene_scope.outputs.run_ast_mutations == 'true' || steps.encoder_hygiene_scope.outputs.run_full_policy == 'true'
         run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev libavif-dev libjpeg-turbo8-dev pkg-config clang libclang-dev
-      # Offline unit tests for the checker script's own classify()/
-      # allowlist/compile-argument-sanitization logic against synthetic
-      # data, run before the real AST scan below so a regression in the
-      # checker itself is caught even if it would otherwise still "pass"
-      # against the actual, currently-clean project sources.
-      - run: mise run contracts:test-encoder-hygiene-script
       # Real libclang fail-before/pass-after mutation tests (source-only
       # declarations, output/inout parameters, inheritance/using-
       # declaration exposure, inclusion-graph direction/system-header/
       # external-root classification) against small on-disk fixtures --
       # proves the AST-scanning core itself actually catches every
-      # historical bypass, independent of and in addition to the
-      # synthetic-data-only tests above.
-      - run: mise run contracts:test-encoder-hygiene-ast-mutations
-      - run: mise run contracts:check-encoder-hygiene
+      # historical bypass. This is intentionally limited to checker/test/
+      # task/CI/cmake/ changes and scheduled/manual runs so unrelated PRs do not
+      # pay the ~5 minute libclang self-test cost.
+      - name: Run libclang encoder-hygiene mutation tests
+        if: steps.encoder_hygiene_scope.outputs.run_ast_mutations == 'true'
+        run: mise run contracts:test-encoder-hygiene-ast-mutations
+      - name: Skip libclang encoder-hygiene mutation tests
+        if: steps.encoder_hygiene_scope.outputs.run_ast_mutations != 'true'
+        run: echo "Skipping mutation self-tests; checker/tests/tasks/CI/cmake/ did not change."
+      - name: Run full encoder-hygiene production policy check
+        if: steps.encoder_hygiene_scope.outputs.run_full_policy == 'true'
+        run: mise run contracts:check-encoder-hygiene
+      - name: Skip full encoder-hygiene production policy check
+        if: steps.encoder_hygiene_scope.outputs.run_full_policy != 'true'
+        run: echo "Skipping full production scan; no production C++/CMake/QML or checker policy paths changed."
 
   appimage-smoke:
     name: AppImage smoke artifact
