@@ -81,8 +81,10 @@ private:
   void disableDisk(QString diagnostic, bool warn);
   void buildIndex();
   void promoteToMemory(const QString &key, const QImage &image);
-  [[nodiscard]] LookupResult lookupDisk(const QString &key);
-  void storeDisk(const QString &key, const QByteArray &encodedBytes,
+  void touchDiskEntry(const QString &diskKey);
+  [[nodiscard]] LookupResult lookupDisk(const QString &diskKey,
+                                        const QString &memoryKey);
+  void storeDisk(const QString &diskKey, const QByteArray &encodedBytes,
                  const QString &contentType);
   void removeDiskEntry(const QString &key);
   void evictIfNeeded();

@@ -145,11 +145,13 @@ QString AssetCache::diskCacheFileNameForUrl(const QUrl &url) {
 
 AssetCache::LookupResult AssetCache::lookup(const QUrl &url) {
   const QString memoryKey = QString::fromLatin1(canonicalUrlBytes(url));
+  const QString diskKey = diskCacheFileNameForUrl(url);
   if (const QImage *cached = m_memoryCache.object(memoryKey)) {
+    touchDiskEntry(diskKey);
     return LookupResult{LookupSource::Memory, *cached};
   }
   if (m_diskStatus == DiskStatus::Enabled) {
-    return lookupDisk(diskCacheFileNameForUrl(url));
+    return lookupDisk(diskKey, memoryKey);
   }
   return {};
 }
@@ -270,10 +272,12 @@ void AssetCache::buildIndex() {
   for (const QFileInfo &fileInfo : files) {
     const QString fileName = fileInfo.fileName();
     if (!isLowerHexSha256FileName(fileName)) {
+      QFile::remove(fileInfo.absoluteFilePath());
       continue;
     }
     const qint64 fileSize = fileInfo.size();
     if (fileSize <= 0) {
+      QFile::remove(fileInfo.absoluteFilePath());
       continue;
     }
     const quint64 lastAccess = static_cast<quint64>(
@@ -296,19 +300,26 @@ void AssetCache::promoteToMemory(const QString &key, const QImage &image) {
   m_memoryCache.insert(key, new QImage(image), cost);
 }
 
-AssetCache::LookupResult AssetCache::lookupDisk(const QString &key) {
-  if (!m_index.contains(key)) {
+void AssetCache::touchDiskEntry(const QString &diskKey) {
+  if (auto it = m_index.find(diskKey); it != m_index.end()) {
+    it->lastAccess = nextAccess();
+  }
+}
+
+AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
+                                                const QString &memoryKey) {
+  if (!m_index.contains(diskKey)) {
     return {};
   }
 
-  const QString path = filePathForName(key);
+  const QString path = filePathForName(diskKey);
   const QFileInfo fileInfo(path);
   const qint64 maxFileSize =
       static_cast<qint64>(m_config.decodeLimits.maxEncodedBytes) +
       kMaxHeaderBytes;
   if (!fileInfo.isFile() || fileInfo.size() <= 0 ||
       fileInfo.size() > maxFileSize) {
-    removeDiskEntry(key);
+    removeDiskEntry(diskKey);
     return {};
   }
 
@@ -318,13 +329,13 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &key) {
   }
   const QByteArray fileBytes = file.read(fileInfo.size() + 1);
   if (fileBytes.size() != fileInfo.size()) {
-    removeDiskEntry(key);
+    removeDiskEntry(diskKey);
     return {};
   }
 
   const qsizetype separator = fileBytes.indexOf("\n\n");
   if (separator < 0 || separator > kMaxHeaderBytes) {
-    removeDiskEntry(key);
+    removeDiskEntry(diskKey);
     return {};
   }
 
@@ -334,50 +345,64 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &key) {
       parseHeader(header, m_config.decodeLimits.maxEncodedBytes);
   if (!parsed || payload.size() != parsed->payloadLength ||
       payloadSha256Hex(payload) != parsed->payloadSha256) {
-    removeDiskEntry(key);
+    removeDiskEntry(diskKey);
     return {};
   }
 
   auto decoded = decodeAssetImage(payload, m_config.decodeLimits);
   if (!decoded) {
-    removeDiskEntry(key);
+    removeDiskEntry(diskKey);
     return {};
   }
 
-  if (auto it = m_index.find(key); it != m_index.end()) {
+  if (auto it = m_index.find(diskKey); it != m_index.end()) {
     m_diskBytes += fileInfo.size() - it->fileSize;
     it->fileSize = fileInfo.size();
     it->lastAccess = nextAccess();
   }
-  promoteToMemory(key, *decoded);
+  promoteToMemory(memoryKey, *decoded);
   return LookupResult{LookupSource::Disk, *decoded};
 }
 
-void AssetCache::storeDisk(const QString &key, const QByteArray &encodedBytes,
+void AssetCache::storeDisk(const QString &diskKey,
+                           const QByteArray &encodedBytes,
                            const QString &contentType) {
-  const QString path = filePathForName(key);
+  const QString path = filePathForName(diskKey);
   const QByteArray header = buildHeader(encodedBytes, contentType);
+  const qint64 entrySize = header.size() + encodedBytes.size();
+  if (entrySize > m_config.diskMaxBytes) {
+    m_diagnostic =
+        QStringLiteral("asset cache entry exceeds disk cache byte limit: %1")
+            .arg(path);
+    return;
+  }
+
   QSaveFile output(path);
   if (!output.open(QIODevice::WriteOnly) ||
       output.write(header) != header.size() ||
       output.write(encodedBytes) != encodedBytes.size() || !output.commit()) {
     m_diagnostic =
         QStringLiteral("could not write asset cache entry: %1").arg(path);
+    QFile stale(path);
+    if (stale.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+      stale.close();
+    }
+    removeDiskEntry(diskKey);
     return;
   }
 
-  const qint64 oldSize = m_index.value(key).fileSize;
+  const qint64 oldSize = m_index.value(diskKey).fileSize;
   const qint64 newSize = QFileInfo(path).size();
   m_diskBytes += newSize - oldSize;
-  m_index.insert(key, DiskEntry{newSize, nextAccess()});
+  m_index.insert(diskKey, DiskEntry{newSize, nextAccess()});
   evictIfNeeded();
 }
 
 void AssetCache::removeDiskEntry(const QString &key) {
   const QString path = filePathForName(key);
   const qint64 oldSize = m_index.value(key).fileSize;
-  if (QFileInfo::exists(path) && !QFile::remove(path)) {
-    return;
+  if (QFileInfo::exists(path)) {
+    QFile::remove(path);
   }
   m_index.remove(key);
   m_diskBytes = std::max<qint64>(0, m_diskBytes - oldSize);
