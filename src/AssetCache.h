@@ -8,6 +8,8 @@
 #include <QString>
 #include <QUrl>
 
+#include <map>
+
 namespace Arkham {
 
 // Thread-confined decoded-image asset cache. AssetCache is intended to be used
@@ -87,12 +89,15 @@ private:
   void storeDisk(const QString &diskKey, const QByteArray &encodedBytes,
                  const QString &contentType);
   void removeDiskEntry(const QString &key);
+  void setDiskEntryAccess(const QString &key, quint64 access);
   void evictIfNeeded();
   [[nodiscard]] quint64 nextAccess();
 
   Config m_config;
   QCache<QString, QImage> m_memoryCache;
   QHash<QString, DiskEntry> m_index;
+  std::multimap<quint64, QString> m_lruQueue;
+  std::map<QString, std::multimap<quint64, QString>::iterator> m_lruPositions;
   DiskStatus m_diskStatus{DiskStatus::MemoryOnly};
   QString m_rootDirectory;
   QString m_diagnostic;

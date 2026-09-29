@@ -3,6 +3,7 @@
 #include <QMutexLocker>
 #include <QQuickTextureFactory>
 #include <QStringList>
+#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 
@@ -16,20 +17,6 @@ namespace {
 
 AssetError invalidProviderId(const QString &message) {
   return AssetError{AssetErrorCode::InvalidAssetKey, message};
-}
-
-bool isMutationSuffix(const QString &suffix) {
-  constexpr QStringView kPrefix = u"_Mutated";
-  if (!suffix.startsWith(kPrefix) || suffix.size() == kPrefix.size()) {
-    return false;
-  }
-  for (qsizetype index = kPrefix.size(); index < suffix.size(); ++index) {
-    const QChar c = suffix.at(index);
-    if (c < u'0' || c > u'9') {
-      return false;
-    }
-  }
-  return true;
 }
 
 QString normalizedMutationSuffix(QString mutation) {
@@ -48,7 +35,7 @@ AssetOutcome<QString> splitMutationSuffix(QString *cardCode) {
     return QString();
   }
   const QString suffix = cardCode->mid(marker);
-  if (!isMutationSuffix(suffix)) {
+  if (!AssetLocator::isMutationSuffix(suffix)) {
     return invalidProviderId(
         QStringLiteral("mutation suffix must match _Mutated<N>"));
   }
@@ -78,8 +65,16 @@ QString imageErrorString(const AssetError &error) {
 }
 
 QImage scaledForRequest(const QImage &image, const QSize &requestedSize) {
-  if (image.isNull() || !requestedSize.isValid() || requestedSize.isEmpty()) {
+  if (image.isNull() || !requestedSize.isValid() ||
+      (requestedSize.width() <= 0 && requestedSize.height() <= 0)) {
     return image;
+  }
+  if (requestedSize.width() > 0 && requestedSize.height() <= 0) {
+    return image.scaledToWidth(requestedSize.width(), Qt::SmoothTransformation);
+  }
+  if (requestedSize.height() > 0 && requestedSize.width() <= 0) {
+    return image.scaledToHeight(requestedSize.height(),
+                                Qt::SmoothTransformation);
   }
   return image.scaled(requestedSize, Qt::KeepAspectRatio,
                       Qt::SmoothTransformation);
@@ -88,7 +83,14 @@ QImage scaledForRequest(const QImage &image, const QSize &requestedSize) {
 } // namespace
 
 AssetCardImageResponse::AssetCardImageResponse(const QSize &requestedSize)
-    : m_requestedSize(requestedSize) {}
+    : m_requestedSize(requestedSize),
+      m_state(std::make_shared<AssetCardImageResponseState>()),
+      m_completionTimer(new QTimer(this)) {
+  m_completionTimer->setInterval(5);
+  connect(m_completionTimer, &QTimer::timeout, this,
+          [this]() { drainCompletion(); });
+  m_completionTimer->start();
+}
 
 AssetCardImageResponse::~AssetCardImageResponse() { cancel(); }
 
@@ -108,12 +110,14 @@ QString AssetCardImageResponse::errorString() const {
 void AssetCardImageResponse::cancel() {
   CancelCallback callback;
   {
-    QMutexLocker locker(&m_mutex);
-    if (m_cancelled || m_finished) {
+    std::lock_guard lock(m_state->mutex);
+    if (!m_state->alive || m_state->finished || m_state->cancelled) {
       return;
     }
-    m_cancelled = true;
-    callback = std::move(m_cancelCallback);
+    m_state->alive = false;
+    m_state->cancelled = true;
+    callback = std::move(m_state->cancelCallback);
+    m_state->cancelCallback = {};
   }
   if (callback) {
     callback();
@@ -123,11 +127,11 @@ void AssetCardImageResponse::cancel() {
 void AssetCardImageResponse::setCancelCallback(CancelCallback callback) {
   bool callImmediately = false;
   {
-    QMutexLocker locker(&m_mutex);
-    if (m_cancelled && !m_finished) {
+    std::lock_guard lock(m_state->mutex);
+    if (m_state->cancelled && !m_state->finished) {
       callImmediately = true;
     } else {
-      m_cancelCallback = std::move(callback);
+      m_state->cancelCallback = std::move(callback);
     }
   }
   if (callImmediately && callback) {
@@ -136,18 +140,49 @@ void AssetCardImageResponse::setCancelCallback(CancelCallback callback) {
 }
 
 void AssetCardImageResponse::complete(AssetOutcome<QImage> result) {
+  completeState(m_state, std::move(result));
+  drainCompletion();
+}
+
+void AssetCardImageResponse::completeState(
+    std::shared_ptr<AssetCardImageResponseState> state,
+    AssetOutcome<QImage> result) {
+  if (!state) {
+    return;
+  }
+  std::lock_guard lock(state->mutex);
+  if (!state->alive || state->cancelled || state->finished ||
+      state->result.has_value()) {
+    return;
+  }
+  state->result.emplace(std::move(result));
+}
+
+void AssetCardImageResponse::drainCompletion() {
+  std::optional<AssetOutcome<QImage>> result;
   {
-    QMutexLocker locker(&m_mutex);
-    if (m_cancelled || m_finished) {
+    std::lock_guard lock(m_state->mutex);
+    if (!m_state->alive || m_state->cancelled || m_state->finished ||
+        !m_state->result.has_value()) {
       return;
     }
-    m_finished = true;
-    m_cancelCallback = {};
-    if (result) {
-      m_image = scaledForRequest(*result, m_requestedSize);
+    result.emplace(std::move(*m_state->result));
+    m_state->result.reset();
+    m_state->finished = true;
+    m_state->alive = false;
+    m_state->cancelCallback = {};
+  }
+
+  {
+    QMutexLocker locker(&m_mutex);
+    if (*result) {
+      m_image = scaledForRequest(**result, m_requestedSize);
     } else {
-      m_errorString = imageErrorString(result.error());
+      m_errorString = imageErrorString(result->error());
     }
+  }
+  if (m_completionTimer) {
+    m_completionTimer->stop();
   }
   emit finished();
 }
@@ -156,19 +191,30 @@ AssetCardImageProvider::AssetCardImageProvider()
     : AssetCardImageProvider(AssetImageRequestCoordinator::Config{}) {}
 
 AssetCardImageProvider::AssetCardImageProvider(
-    AssetImageRequestCoordinator::Config config) {
+    AssetImageRequestCoordinator::Config config)
+    : m_coordinatorHandle(std::make_shared<CoordinatorHandle>()) {
   auto *coordinator = new AssetImageRequestCoordinator(std::move(config));
   coordinator->moveToThread(&m_workerThread);
   QObject::connect(&m_workerThread, &QThread::finished, coordinator,
                    &QObject::deleteLater);
-  m_coordinator = coordinator;
+  {
+    std::lock_guard lock(m_coordinatorHandle->mutex);
+    m_coordinatorHandle->coordinator = coordinator;
+  }
   m_workerThread.setObjectName(QStringLiteral("arkham-card-image-provider"));
   m_workerThread.start();
 }
 
 AssetCardImageProvider::~AssetCardImageProvider() {
-  if (m_coordinator) {
-    QMetaObject::invokeMethod(m_coordinator,
+  AssetImageRequestCoordinator *coordinator = nullptr;
+  {
+    std::lock_guard lock(m_coordinatorHandle->mutex);
+    coordinator = m_coordinatorHandle->coordinator;
+    m_coordinatorHandle->alive = false;
+    m_coordinatorHandle->coordinator = nullptr;
+  }
+  if (coordinator) {
+    QMetaObject::invokeMethod(coordinator,
                               &AssetImageRequestCoordinator::cancelAll,
                               Qt::BlockingQueuedConnection);
   }
@@ -186,53 +232,82 @@ AssetCardImageProvider::requestImageResponse(const QString &id,
     return response;
   }
 
-  const quint64 responseId = m_pendingResponseId.fetch_add(1);
-  QPointer<AssetImageRequestCoordinator> coordinator = m_coordinator;
-  QPointer<AssetCardImageResponse> guardedResponse(response);
-  if (!coordinator) {
-    response->complete(
-        AssetError{AssetErrorCode::NetworkError,
-                   QStringLiteral("card image provider is not available")});
-    return response;
-  }
+  const std::shared_ptr<AssetCardImageResponseState> responseState =
+      response->state();
+  const std::shared_ptr<CoordinatorHandle> coordinatorHandle =
+      m_coordinatorHandle;
 
-  response->setCancelCallback([coordinator, responseId]() {
-    if (!coordinator) {
+  response->setCancelCallback([responseState, coordinatorHandle]() {
+    std::optional<quint64> requestId;
+    {
+      std::lock_guard responseLock(responseState->mutex);
+      requestId = responseState->requestId;
+    }
+    if (!requestId.has_value()) {
+      return;
+    }
+
+    std::lock_guard coordinatorLock(coordinatorHandle->mutex);
+    if (!coordinatorHandle->alive || !coordinatorHandle->coordinator) {
       return;
     }
     QMetaObject::invokeMethod(
-        coordinator,
-        [coordinator, responseId]() {
-          if (coordinator) {
-            coordinator->cancel(responseId);
+        coordinatorHandle->coordinator,
+        [coordinatorHandle, requestId = *requestId]() {
+          AssetImageRequestCoordinator *coordinator = nullptr;
+          {
+            std::lock_guard coordinatorLock(coordinatorHandle->mutex);
+            if (!coordinatorHandle->alive || !coordinatorHandle->coordinator) {
+              return;
+            }
+            coordinator = coordinatorHandle->coordinator;
           }
+          coordinator->cancel(requestId);
         },
         Qt::QueuedConnection);
   });
 
-  QMetaObject::invokeMethod(
-      coordinator,
-      [coordinator, guardedResponse, key = *key, responseId]() mutable {
-        if (!coordinator || !guardedResponse) {
-          return;
-        }
-        coordinator->requestCardImage(
-            responseId, key,
-            [guardedResponse](AssetOutcome<QImage> result) mutable {
-              if (!guardedResponse) {
-                return;
-              }
-              QMetaObject::invokeMethod(
-                  guardedResponse,
-                  [guardedResponse, result = std::move(result)]() mutable {
-                    if (guardedResponse) {
-                      guardedResponse->complete(std::move(result));
-                    }
-                  },
-                  Qt::QueuedConnection);
-            });
-      },
-      Qt::QueuedConnection);
+  {
+    std::lock_guard coordinatorLock(coordinatorHandle->mutex);
+    if (!coordinatorHandle->alive || !coordinatorHandle->coordinator) {
+      response->complete(
+          AssetError{AssetErrorCode::NetworkError,
+                     QStringLiteral("card image provider is not available")});
+      return response;
+    }
+    QMetaObject::invokeMethod(
+        coordinatorHandle->coordinator,
+        [coordinatorHandle, responseState, key = *key]() mutable {
+          AssetImageRequestCoordinator *coordinator = nullptr;
+          {
+            std::lock_guard coordinatorLock(coordinatorHandle->mutex);
+            if (!coordinatorHandle->alive || !coordinatorHandle->coordinator) {
+              return;
+            }
+            coordinator = coordinatorHandle->coordinator;
+          }
+
+          const quint64 requestId = coordinator->requestCardImage(
+              key, [responseState](AssetOutcome<QImage> result) mutable {
+                AssetCardImageResponse::completeState(responseState,
+                                                      std::move(result));
+              });
+
+          bool cancelImmediately = false;
+          {
+            std::lock_guard responseLock(responseState->mutex);
+            if (!responseState->alive || responseState->cancelled) {
+              cancelImmediately = true;
+            } else {
+              responseState->requestId = requestId;
+            }
+          }
+          if (cancelImmediately) {
+            coordinator->cancel(requestId);
+          }
+        },
+        Qt::QueuedConnection);
+  }
 
   return response;
 }
@@ -290,7 +365,7 @@ AssetCardImageProvider::parseImageId(const QString &id) {
     }
     mutationSuffix = normalizedMutationSuffix(
         query.queryItemValue(QStringLiteral("mutation")));
-    if (!isMutationSuffix(mutationSuffix)) {
+    if (!AssetLocator::isMutationSuffix(mutationSuffix)) {
       return invalidProviderId(
           QStringLiteral("mutation suffix must match _Mutated<N>"));
     }

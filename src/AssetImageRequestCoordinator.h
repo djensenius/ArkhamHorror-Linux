@@ -35,6 +35,7 @@ public:
     std::chrono::milliseconds fetchTimeout{
         AssetNetworkFetcher::kDefaultTimeout};
     std::chrono::milliseconds negativeCacheTtl{std::chrono::seconds(30)};
+    qsizetype negativeCacheMaxEntries{256};
   };
 
   explicit AssetImageRequestCoordinator(QObject *parent = nullptr);
@@ -44,9 +45,6 @@ public:
 
   [[nodiscard]] quint64 requestCardImage(const AssetLocator::CardImageKey &key,
                                          ImageCallback callback);
-  void requestCardImage(quint64 requestId,
-                        const AssetLocator::CardImageKey &key,
-                        ImageCallback callback);
   void cancel(quint64 requestId);
   void cancelAll();
 
@@ -69,7 +67,9 @@ private:
   void completeOne(ImageCallback callback, AssetOutcome<QImage> result);
   void completeWaiters(QList<Waiter> waiters, AssetOutcome<QImage> result);
   void handleFetchFinished(const QString &requestKey,
+                           AssetNetworkFetcher::RequestId fetchRequestId,
                            AssetOutcome<AssetFetchResult> result);
+  void pruneNegativeCache();
   [[nodiscard]] bool isNegativeCached(const QString &requestKey);
   void rememberNotFound(const QString &requestKey);
 

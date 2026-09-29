@@ -99,6 +99,7 @@ private slots:
   void failedOverwriteDropsStaleDiskEntry();
   void memoryHitsRefreshDiskEvictionOrder();
   void oversizedEntryDoesNotEvictExistingDiskCache();
+  void oversizedReplacementDropsOldDiskEntry();
   void startupRemovesUnindexedRegularFiles();
   void unwritableRootFallsBackToMemoryOnlyWithDiagnostic();
   void differentUrlsUseDifferentDiskEntries();
@@ -356,6 +357,50 @@ void AssetCacheTests::oversizedEntryDoesNotEvictExistingDiskCache() {
   QCOMPARE(cache.lookup(existing).source,
            Arkham::AssetCache::LookupSource::Disk);
   QCOMPARE(cache.lookup(oversized).source,
+           Arkham::AssetCache::LookupSource::Miss);
+}
+
+void AssetCacheTests::oversizedReplacementDropsOldDiskEntry() {
+  QTemporaryDir measuringRoot;
+  QVERIFY(measuringRoot.isValid());
+  const QByteArray smallPng = encodePng(QColor(12, 34, 56, 255));
+  const QByteArray largePng = encodePatternPng();
+  QVERIFY(!smallPng.isEmpty());
+  QVERIFY(!largePng.isEmpty());
+  QVERIFY(largePng.size() > smallPng.size());
+
+  qint64 smallEntryBytes = 0;
+  {
+    Arkham::AssetCache measuringCache({.memoryMaxCostBytes = 0,
+                                       .diskMaxBytes = 1024LL * 1024LL,
+                                       .rootDirectory = measuringRoot.path()});
+    expectStored(measuringCache.store(assetUrl(u"oversize-replace-measure"),
+                                      smallPng, QStringLiteral("image/png")));
+    smallEntryBytes = measuringCache.indexedDiskBytes();
+    QVERIFY(smallEntryBytes > 0);
+  }
+
+  QTemporaryDir root;
+  QVERIFY(root.isValid());
+  const QUrl url = assetUrl(u"oversize-replace");
+  {
+    Arkham::AssetCache cache({.memoryMaxCostBytes = 0,
+                              .diskMaxBytes = smallEntryBytes + 8,
+                              .rootDirectory = root.path()});
+    expectStored(cache.store(url, smallPng, QStringLiteral("image/png")));
+    QCOMPARE(cache.lookup(url).source, Arkham::AssetCache::LookupSource::Disk);
+    QCOMPARE(cache.indexedDiskBytes(), smallEntryBytes);
+
+    expectStored(cache.store(url, largePng, QStringLiteral("image/png")));
+    QVERIFY(!cache.diagnostic().isEmpty());
+    QCOMPARE(cache.indexedDiskBytes(), 0);
+  }
+
+  Arkham::AssetCache restarted({.memoryMaxCostBytes = 0,
+                                .diskMaxBytes = smallEntryBytes + 8,
+                                .rootDirectory = root.path()});
+  QCOMPARE(restarted.indexedDiskBytes(), 0);
+  QCOMPARE(restarted.lookup(url).source,
            Arkham::AssetCache::LookupSource::Miss);
 }
 

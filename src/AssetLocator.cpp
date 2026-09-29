@@ -120,22 +120,6 @@ QString stripOneServerCardPrefix(const QString &cardCode) {
   return cardCode;
 }
 
-bool isMutationSuffix(const QString &suffix) {
-  constexpr QStringView kPrefix = u"_Mutated";
-  if (suffix.isEmpty()) {
-    return true;
-  }
-  if (!suffix.startsWith(kPrefix) || suffix.size() == kPrefix.size()) {
-    return false;
-  }
-  for (qsizetype index = kPrefix.size(); index < suffix.size(); ++index) {
-    if (!isAsciiDigit(suffix.at(index))) {
-      return false;
-    }
-  }
-  return true;
-}
-
 QString imageFileName(QString artCode, AssetLocator::CardFace face,
                       const QString &mutationSuffix) {
   if (face == AssetLocator::CardFace::Back) {
@@ -225,6 +209,22 @@ QUrl defaultAssetBaseUrl() { return QUrl(kDefaultAssetBase.toString()); }
 
 AssetOutcome<QUrl> assetBaseUrlFromString(const QString &input) {
   return normalizeAssetBaseUrl(input);
+}
+
+bool isMutationSuffix(const QString &suffix) {
+  constexpr QStringView kPrefix = u"_Mutated";
+  if (suffix.isEmpty()) {
+    return true;
+  }
+  if (!suffix.startsWith(kPrefix) || suffix.size() == kPrefix.size()) {
+    return false;
+  }
+  for (qsizetype index = kPrefix.size(); index < suffix.size(); ++index) {
+    if (!isAsciiDigit(suffix.at(index))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,

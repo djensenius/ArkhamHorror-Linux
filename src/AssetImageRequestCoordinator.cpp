@@ -24,24 +24,18 @@ AssetImageRequestCoordinator::~AssetImageRequestCoordinator() { cancelAll(); }
 quint64 AssetImageRequestCoordinator::requestCardImage(
     const AssetLocator::CardImageKey &key, ImageCallback callback) {
   const quint64 requestId = nextRequestId();
-  requestCardImage(requestId, key, std::move(callback));
-  return requestId;
-}
-
-void AssetImageRequestCoordinator::requestCardImage(
-    quint64 requestId, const AssetLocator::CardImageKey &key,
-    ImageCallback callback) {
   if (!callback) {
-    return;
+    return requestId;
   }
 
   const auto url = AssetLocator::buildCardImageUrl(m_config.assetBaseUrl, key);
   if (!url) {
     completeOne(std::move(callback), url.error());
-    return;
+    return requestId;
   }
 
   requestUrl(*url, requestId, std::move(callback));
+  return requestId;
 }
 
 void AssetImageRequestCoordinator::cancel(quint64 requestId) {
@@ -140,10 +134,13 @@ void AssetImageRequestCoordinator::requestUrl(const QUrl &url,
   m_flights.insert(requestKey, std::move(flight));
 
   auto insertedFlightIt = m_flights.find(requestKey);
-  insertedFlightIt->fetchRequestId = m_fetcher->fetch(
-      url, [this, requestKey](AssetOutcome<AssetFetchResult> result) {
-        handleFetchFinished(requestKey, std::move(result));
+  auto fetchRequestId = std::make_shared<AssetNetworkFetcher::RequestId>(0);
+  *fetchRequestId =
+      m_fetcher->fetch(url, [this, requestKey, fetchRequestId](
+                                AssetOutcome<AssetFetchResult> result) {
+        handleFetchFinished(requestKey, *fetchRequestId, std::move(result));
       });
+  insertedFlightIt->fetchRequestId = *fetchRequestId;
 }
 
 void AssetImageRequestCoordinator::completeOne(ImageCallback callback,
@@ -162,9 +159,11 @@ void AssetImageRequestCoordinator::completeWaiters(
 }
 
 void AssetImageRequestCoordinator::handleFetchFinished(
-    const QString &requestKey, AssetOutcome<AssetFetchResult> result) {
+    const QString &requestKey, AssetNetworkFetcher::RequestId fetchRequestId,
+    AssetOutcome<AssetFetchResult> result) {
   auto flightIt = m_flights.find(requestKey);
-  if (flightIt == m_flights.end()) {
+  if (flightIt == m_flights.end() ||
+      flightIt->fetchRequestId != fetchRequestId) {
     return;
   }
 
@@ -190,7 +189,31 @@ void AssetImageRequestCoordinator::handleFetchFinished(
   completeWaiters(std::move(flight.waiters), *stored);
 }
 
+void AssetImageRequestCoordinator::pruneNegativeCache() {
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = m_negativeCache.begin(); it != m_negativeCache.end();) {
+    if (it.value() <= now) {
+      it = m_negativeCache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  while (m_config.negativeCacheMaxEntries >= 0 &&
+         m_negativeCache.size() > m_config.negativeCacheMaxEntries) {
+    auto oldest = m_negativeCache.begin();
+    for (auto it = m_negativeCache.begin(); it != m_negativeCache.end(); ++it) {
+      if (it.value() < oldest.value() ||
+          (it.value() == oldest.value() && it.key() < oldest.key())) {
+        oldest = it;
+      }
+    }
+    m_negativeCache.erase(oldest);
+  }
+}
+
 bool AssetImageRequestCoordinator::isNegativeCached(const QString &requestKey) {
+  pruneNegativeCache();
   const auto it = m_negativeCache.find(requestKey);
   if (it == m_negativeCache.end()) {
     return false;
@@ -203,11 +226,14 @@ bool AssetImageRequestCoordinator::isNegativeCached(const QString &requestKey) {
 }
 
 void AssetImageRequestCoordinator::rememberNotFound(const QString &requestKey) {
-  if (m_config.negativeCacheTtl <= std::chrono::milliseconds::zero()) {
+  if (m_config.negativeCacheTtl <= std::chrono::milliseconds::zero() ||
+      m_config.negativeCacheMaxEntries <= 0) {
     return;
   }
+  pruneNegativeCache();
   m_negativeCache.insert(requestKey, std::chrono::steady_clock::now() +
                                          m_config.negativeCacheTtl);
+  pruneNegativeCache();
 }
 
 } // namespace Arkham

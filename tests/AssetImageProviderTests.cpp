@@ -4,6 +4,8 @@
 #include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QEventLoop>
+#include <QQmlComponent>
+#include <QQmlEngine>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -11,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "AssetImageProvider.h"
 #include "AssetImageRequestCoordinator.h"
@@ -45,12 +48,15 @@ MockHttpServer::Response response(int status, QByteArray body = {}) {
   return result;
 }
 
-AssetImageRequestCoordinator::Config configFor(const MockHttpServer &server,
-                                               const QTemporaryDir &cacheRoot) {
+AssetImageRequestCoordinator::Config
+configFor(const MockHttpServer &server, const QTemporaryDir &cacheRoot,
+          std::chrono::milliseconds negativeCacheTtl = std::chrono::seconds(5),
+          qsizetype negativeCacheMaxEntries = 256) {
   AssetImageRequestCoordinator::Config config;
   config.assetBaseUrl = server.url(QString());
   config.cacheConfig.rootDirectory = cacheRoot.path();
-  config.negativeCacheTtl = std::chrono::seconds(5);
+  config.negativeCacheTtl = negativeCacheTtl;
+  config.negativeCacheMaxEntries = negativeCacheMaxEntries;
   return config;
 }
 
@@ -61,9 +67,16 @@ class AssetImageProviderTests final : public QObject {
 
 private slots:
   void coordinatorCoalescesInFlightRequestsAndUsesCache();
+  void coordinatorCancelOneCoalescedWaiterKeepsOtherWaiter();
   void coordinatorCachesNotFoundBriefly();
+  void coordinatorDoesNotCacheTransientFailures();
+  void coordinatorCapsNegativeCacheAndExpiresEntries();
   void coordinatorCancelDetachesWaiter();
+  void coordinatorRerequestAfterCancelCompletesNewFlight();
   void providerLoadsMutatedCardImage();
+  void providerRejectsInvalidIds();
+  void providerCancelAndTeardownWithInFlightRequestsDoesNotCrash();
+  void qmlImageLoadsFromProvider();
 };
 
 void AssetImageProviderTests::
@@ -108,6 +121,37 @@ void AssetImageProviderTests::
   QCOMPARE(server.requestCountForPath(path), 1);
 }
 
+void AssetImageProviderTests::
+    coordinatorCancelOneCoalescedWaiterKeepsOtherWaiter() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01005.avif");
+  auto delayed = response(200, tinyPng());
+  delayed.headerDelayMs = 75;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  bool firstCalled = false;
+  std::optional<AssetOutcome<QImage>> second;
+  const quint64 firstToken = coordinator.requestCardImage(
+      {QStringLiteral("01005")},
+      [&firstCalled](AssetOutcome<QImage>) { firstCalled = true; });
+  const quint64 secondToken = coordinator.requestCardImage(
+      {QStringLiteral("01005")}, [&second](AssetOutcome<QImage> result) {
+        second.emplace(std::move(result));
+      });
+  Q_UNUSED(secondToken);
+  coordinator.cancel(firstToken);
+
+  QVERIFY(waitUntil([&]() { return second.has_value(); }));
+  QVERIFY(*second);
+  QVERIFY(!firstCalled);
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
 void AssetImageProviderTests::coordinatorCachesNotFoundBriefly() {
   MockHttpServer server;
   QVERIFY(server.start());
@@ -143,6 +187,85 @@ void AssetImageProviderTests::coordinatorCachesNotFoundBriefly() {
   QCOMPARE(server.requestCountForPath(path), 1);
 }
 
+void AssetImageProviderTests::coordinatorDoesNotCacheTransientFailures() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString errorPath = QStringLiteral("/img/arkham/cards/01006.avif");
+  server.setResponse(errorPath, response(500, QByteArrayLiteral("error")));
+  const QString timeoutPath = QStringLiteral("/img/arkham/cards/01007.avif");
+  MockHttpServer::Response hanging = response(200);
+  hanging.hang = true;
+  server.setResponse(timeoutPath, hanging);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  auto config = configFor(server, cacheRoot);
+  config.fetchTimeout = std::chrono::milliseconds(40);
+  AssetImageRequestCoordinator coordinator(config);
+
+  auto run = [&coordinator](const QString &code) {
+    std::optional<AssetOutcome<QImage>> captured;
+    const quint64 token = coordinator.requestCardImage(
+        {code}, [&captured](AssetOutcome<QImage> result) {
+          captured.emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+    if (!waitUntil([&]() { return captured.has_value(); }, 1000)) {
+      return AssetOutcome<QImage>(
+          AssetError{AssetErrorCode::Timeout, QStringLiteral("test timeout")});
+    }
+    return std::move(*captured);
+  };
+
+  QVERIFY(!run(QStringLiteral("01006")));
+  QVERIFY(!run(QStringLiteral("01006")));
+  QCOMPARE(server.requestCountForPath(errorPath), 2);
+
+  QVERIFY(!run(QStringLiteral("01007")));
+  QVERIFY(!run(QStringLiteral("01007")));
+  QCOMPARE(server.requestCountForPath(timeoutPath), 2);
+}
+
+void AssetImageProviderTests::coordinatorCapsNegativeCacheAndExpiresEntries() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString firstPath = QStringLiteral("/img/arkham/cards/01008.avif");
+  const QString secondPath = QStringLiteral("/img/arkham/cards/01009.avif");
+  server.setResponse(firstPath, response(404, QByteArrayLiteral("missing")));
+  server.setResponse(secondPath, response(404, QByteArrayLiteral("missing")));
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(
+      configFor(server, cacheRoot, std::chrono::milliseconds(50), 1));
+
+  auto run = [&coordinator](const QString &code) {
+    std::optional<AssetOutcome<QImage>> captured;
+    const quint64 token = coordinator.requestCardImage(
+        {code}, [&captured](AssetOutcome<QImage> result) {
+          captured.emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+    if (!waitUntil([&]() { return captured.has_value(); })) {
+      return AssetOutcome<QImage>(
+          AssetError{AssetErrorCode::Timeout, QStringLiteral("test timeout")});
+    }
+    return std::move(*captured);
+  };
+
+  QVERIFY(!run(QStringLiteral("01008")));
+  QVERIFY(!run(QStringLiteral("01008")));
+  QCOMPARE(server.requestCountForPath(firstPath), 1);
+
+  QVERIFY(!run(QStringLiteral("01009")));
+  QVERIFY(!run(QStringLiteral("01008")));
+  QCOMPARE(server.requestCountForPath(firstPath), 2);
+
+  QTest::qWait(75);
+  QVERIFY(!run(QStringLiteral("01009")));
+  QCOMPARE(server.requestCountForPath(secondPath), 2);
+}
+
 void AssetImageProviderTests::coordinatorCancelDetachesWaiter() {
   MockHttpServer server;
   QVERIFY(server.start());
@@ -159,11 +282,46 @@ void AssetImageProviderTests::coordinatorCancelDetachesWaiter() {
   const quint64 token = coordinator.requestCardImage(
       {QStringLiteral("01003")},
       [&called](AssetOutcome<QImage>) { called = true; });
+  QVERIFY(waitUntil([&]() { return server.requestCountForPath(path) == 1; }));
   coordinator.cancel(token);
 
-  QTest::qWait(200);
+  QVERIFY(waitUntil([&server]() { return server.disconnectCount() > 0; }));
+  QTest::qWait(100);
   QVERIFY(!called);
-  QVERIFY(server.requestCountForPath(path) <= 1);
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::
+    coordinatorRerequestAfterCancelCompletesNewFlight() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01012.avif");
+  auto delayed = response(200, tinyPng());
+  delayed.headerDelayMs = 75;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  bool staleCalled = false;
+  const quint64 firstToken = coordinator.requestCardImage(
+      {QStringLiteral("01012")},
+      [&staleCalled](AssetOutcome<QImage>) { staleCalled = true; });
+  QVERIFY(waitUntil([&]() { return server.requestCountForPath(path) == 1; }));
+  coordinator.cancel(firstToken);
+
+  std::optional<AssetOutcome<QImage>> second;
+  const quint64 secondToken = coordinator.requestCardImage(
+      {QStringLiteral("01012")}, [&second](AssetOutcome<QImage> result) {
+        second.emplace(std::move(result));
+      });
+  Q_UNUSED(secondToken);
+
+  QVERIFY(waitUntil([&]() { return second.has_value(); }));
+  QVERIFY(*second);
+  QVERIFY(!staleCalled);
+  QCOMPARE(server.requestCountForPath(path), 2);
 }
 
 void AssetImageProviderTests::providerLoadsMutatedCardImage() {
@@ -178,13 +336,88 @@ void AssetImageProviderTests::providerLoadsMutatedCardImage() {
 
   std::unique_ptr<QQuickImageResponse> imageResponse(
       provider.requestImageResponse(QStringLiteral("01004?mutation=Mutated1"),
-                                    QSize()));
+                                    QSize(4, 0)));
   QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
   QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
   QCOMPARE(imageResponse->errorString(), QString());
   std::unique_ptr<QQuickTextureFactory> factory(
       imageResponse->textureFactory());
   QVERIFY(factory != nullptr);
+  QCOMPARE(factory->textureSize(), QSize(4, 4));
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::providerRejectsInvalidIds() {
+  AssetCardImageProvider provider;
+  const QStringList ids{
+      QStringLiteral("sideways/01001"),
+      QStringLiteral("01001_MutatedX"),
+      QStringLiteral("01001_Mutated1?mutation=Mutated2"),
+      QStringLiteral("front/01001/extra"),
+  };
+
+  for (const QString &id : ids) {
+    std::unique_ptr<QQuickImageResponse> response(
+        provider.requestImageResponse(id, QSize()));
+    QVERIFY2(!response->errorString().isEmpty(), qPrintable(id));
+  }
+}
+
+void AssetImageProviderTests::
+    providerCancelAndTeardownWithInFlightRequestsDoesNotCrash() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  MockHttpServer::Response hanging = response(200);
+  hanging.hang = true;
+  server.setResponse(QStringLiteral("/img/arkham/cards/01010.avif"), hanging);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  std::vector<std::unique_ptr<QQuickImageResponse>> responses;
+  {
+    AssetCardImageProvider provider(configFor(server, cacheRoot));
+    for (int index = 0; index < 50; ++index) {
+      std::unique_ptr<QQuickImageResponse> response(
+          provider.requestImageResponse(QStringLiteral("01010"), QSize()));
+      if ((index % 2) == 0) {
+        response->cancel();
+      }
+      responses.push_back(std::move(response));
+    }
+    QVERIFY(waitUntil([&server]() {
+      return server.requestCountForPath(
+                 QStringLiteral("/img/arkham/cards/01010.avif")) >= 1;
+    }));
+  }
+
+  for (auto &response : responses) {
+    response->cancel();
+    response.reset();
+  }
+  QVERIFY(true);
+}
+
+void AssetImageProviderTests::qmlImageLoadsFromProvider() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01011.avif");
+  server.setResponse(path, response(200, tinyPng()));
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  QQmlEngine engine;
+  engine.addImageProvider(
+      QStringLiteral("arkham-card"),
+      new AssetCardImageProvider(configFor(server, cacheRoot)));
+
+  QQmlComponent component(&engine);
+  component.setData(
+      "import QtQuick\nImage { source: 'image://arkham-card/01011' }", QUrl());
+  std::unique_ptr<QObject> object(component.create());
+  QVERIFY2(object != nullptr, qPrintable(component.errorString()));
+
+  QVERIFY(waitUntil(
+      [&object]() { return object->property("status").toInt() == 1; }, 3000));
   QCOMPARE(server.requestCountForPath(path), 1);
 }
 
