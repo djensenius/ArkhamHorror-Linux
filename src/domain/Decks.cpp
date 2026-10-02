@@ -359,24 +359,6 @@ ValueOrError<DeckList> decodeDeckListValue(const Json::Value &v,
   return DeckList::fromRawJson(v, path);
 }
 
-ValueOrError<Json::Value> requireLosslessRawField(const QJsonObject &obj,
-                                                  QLatin1StringView key,
-                                                  QStringView path) {
-  auto raw = Json::requireRawField(obj, key, path);
-  if (!raw)
-    return failure(raw.error());
-  auto lossless = toLosslessRaw(*raw);
-  if (!lossless)
-    return failure(QStringLiteral("%1: %2").arg(path, lossless.error()));
-  return *lossless;
-}
-
-ValueOrError<Json::Value> requireLosslessRawField(const Json::Value &obj,
-                                                  QLatin1StringView key,
-                                                  QStringView path) {
-  return Json::requireRawField(obj, key, path);
-}
-
 // Shared decode body for Deck::fromJson()/fromRawJson(): V is QJsonValue
 // or Json::Value. `list` decodes through decodeDeckListValue's Json::Value
 // overload for the fromRawJson()/fromRawBytes() path, so a numeric card
@@ -423,10 +405,13 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
       obj, "lastUsedAt"_L1, Json::joinPath(path, u"lastUsedAt"));
   if (!lastUsedAt)
     return failure(lastUsedAt.error());
-  auto overlay = requireLosslessRawField(obj, "overlay"_L1,
-                                         Json::joinPath(path, u"overlay"));
+  const QString overlayPath = Json::joinPath(path, u"overlay");
+  auto overlayRaw = Json::requireRawField(obj, "overlay"_L1, overlayPath);
+  if (!overlayRaw)
+    return failure(overlayRaw.error());
+  auto overlay = toLosslessRaw(*overlayRaw);
   if (!overlay)
-    return failure(overlay.error());
+    return failure(QStringLiteral("%1: %2").arg(overlayPath, overlay.error()));
   auto playList = Json::requireField(
       obj, "playList"_L1, Json::joinPath(path, u"playList"),
       [](const auto &v, QStringView p) { return decodeDeckListValue(v, p); });
