@@ -498,7 +498,7 @@ void DecksTests::deckFromRawBytesPreservesObjectOverlayExactly() {
                .literal(),
            QStringLiteral("1.123456789012345678901234567890"));
 
-  const auto reencoded = result->toJsonBytes();
+  const auto reencoded = result->toRawJson().toJsonBytes();
   if (!reencoded)
     QFAIL(qPrintable(reencoded.error()));
   QCOMPARE(*reencoded, bytes);
