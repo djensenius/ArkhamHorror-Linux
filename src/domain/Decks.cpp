@@ -405,6 +405,9 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
   auto overlay = toLosslessRaw(*overlayRaw);
   if (!overlay)
     return failure(QStringLiteral("%1: %2").arg(overlayPath, overlay.error()));
+  if (!overlay->isNull() && !overlay->isObject())
+    return failure(QStringLiteral("%1: expected object or null, got %2")
+                       .arg(overlayPath, Json::typeName(*overlay)));
   auto playList = Json::requireField(
       obj, "playList"_L1, Json::joinPath(path, u"playList"),
       [](const auto &v, QStringView p) { return decodeDeckListValue(v, p); });
