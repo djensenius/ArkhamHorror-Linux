@@ -31,6 +31,8 @@ private slots:
   // now decodes directly off the lossless AST end-to-end.
   void deckListFromRawBytesMatchesFromJsonOnSameFixture();
   void deckFromRawBytesMatchesFromJsonOnSameFixture();
+  void deckFromRawBytesPreservesObjectOverlayExactly();
+  void deckFromRawBytesRejectsScalarAndArrayOverlay();
   void deckFromRawBytesRejectsDuplicateObjectKey();
   void decodesValidationErrorsFromFixture();
   void decodesValidationSuccessFromFixture();
@@ -298,6 +300,25 @@ Json::Value objectMember(const Json::Value &obj, const QString &key) {
   return {};
 }
 
+QByteArray deckBytesWithOverlay(const QByteArray &overlay) {
+  return QByteArrayLiteral(
+             "{\"id\":\"00000000-0000-0000-0000-000000000017\","
+             "\"userId\":7,\"url\":null,\"name\":\"Contract deck\","
+             "\"investigatorName\":\"Roland Banks\","
+             "\"list\":{\"slots\":{},\"sideSlots\":{},"
+             "\"investigator_code\":\"c01001\","
+             "\"investigator_name\":\"Roland Banks\",\"meta\":null,"
+             "\"taboo_id\":null,\"url\":null,\"id\":null,"
+             "\"name\":null},\"lastUsedAt\":null,\"overlay\":") +
+         overlay +
+         QByteArrayLiteral(
+             ",\"playList\":{\"slots\":{},\"sideSlots\":{},"
+             "\"investigator_code\":\"c01001\","
+             "\"investigator_name\":\"Roland Banks\",\"meta\":null,"
+             "\"taboo_id\":null,\"url\":null,\"id\":null,"
+             "\"name\":null}}");
+}
+
 } // namespace
 
 void DecksTests::decodesCreateDeckRequestFromFixture() {
@@ -455,6 +476,63 @@ void DecksTests::deckFromRawBytesMatchesFromJsonOnSameFixture() {
   if (!viaRawBytes)
     QFAIL(qPrintable(viaRawBytes.error()));
   QVERIFY(*viaJson == *viaRawBytes);
+}
+
+void DecksTests::deckFromRawBytesPreservesObjectOverlayExactly() {
+  const QByteArray overlay = QByteArrayLiteral(
+      "{\"large\":9007199254740993,"
+      "\"fraction\":1.123456789012345678901234567890,"
+      "\"nested\":{\"keep\":true}}");
+  const QByteArray bytes = deckBytesWithOverlay(overlay);
+
+  const auto result = Deck::fromRawBytes(bytes, u"deck");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QVERIFY(result->overlay.isObject());
+  QCOMPARE(objectMember(result->overlay, QStringLiteral("large"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("9007199254740993"));
+  QCOMPARE(objectMember(result->overlay, QStringLiteral("fraction"))
+               .toRawNumber()
+               .literal(),
+           QStringLiteral("1.123456789012345678901234567890"));
+
+  const auto reencoded = result->toJsonBytes();
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded, bytes);
+
+  const auto originalValue = Json::Value::parse(bytes, u"deck");
+  if (!originalValue)
+    QFAIL(qPrintable(originalValue.error()));
+  const auto reencodedValue = Json::Value::parse(*reencoded, u"deck");
+  if (!reencodedValue)
+    QFAIL(qPrintable(reencodedValue.error()));
+  QCOMPARE(*reencodedValue, *originalValue);
+}
+
+void DecksTests::deckFromRawBytesRejectsScalarAndArrayOverlay() {
+  struct Case {
+    QByteArray overlay;
+    QString expectedType;
+  };
+  const std::array cases{
+      Case{QByteArrayLiteral("9007199254740993"), QStringLiteral("number")},
+      Case{QByteArrayLiteral("[]"), QStringLiteral("array")},
+  };
+
+  for (const Case &c : cases) {
+    const auto result = Deck::fromRawBytes(deckBytesWithOverlay(c.overlay),
+                                           u"deck");
+    QVERIFY(!result.has_value());
+    QVERIFY2(result.error().contains(QStringLiteral("overlay")),
+             qPrintable(result.error()));
+    QVERIFY2(result.error().contains(QStringLiteral("expected object or null")),
+             qPrintable(result.error()));
+    QVERIFY2(result.error().contains(c.expectedType),
+             qPrintable(result.error()));
+  }
 }
 
 void DecksTests::deckFromRawBytesRejectsDuplicateObjectKey() {
