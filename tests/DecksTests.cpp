@@ -509,7 +509,7 @@ void DecksTests::deckFromRawBytesPreservesObjectOverlayExactly() {
   const auto reencodedValue = Json::Value::parse(*reencoded, u"deck");
   if (!reencodedValue)
     QFAIL(qPrintable(reencodedValue.error()));
-  QCOMPARE(*reencodedValue, *originalValue);
+  QVERIFY(*reencodedValue == *originalValue);
 }
 
 void DecksTests::deckFromRawBytesRejectsScalarAndArrayOverlay() {
