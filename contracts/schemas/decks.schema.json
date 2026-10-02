@@ -224,7 +224,10 @@
         "url",
         "name",
         "investigatorName",
-        "list"
+        "list",
+        "lastUsedAt",
+        "overlay",
+        "playList"
       ],
       "properties": {
         "id": {
@@ -247,6 +250,22 @@
           "type": "string"
         },
         "list": {
+          "$ref": "#/$defs/deckList"
+        },
+        "lastUsedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "overlay": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "playList": {
           "$ref": "#/$defs/deckList"
         }
       }

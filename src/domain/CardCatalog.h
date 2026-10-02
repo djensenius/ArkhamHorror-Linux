@@ -235,7 +235,7 @@ public:
   anyMatchingCardCost(Json::Value contents);
   // Additionally requires `contents` to be a JSON array of exactly two
   // elements: the pinned backend's `MatchingEnemyFieldCost EnemyMatcher
-  // EnemyCostField` (Arkham.Card.Cost, backend commit 6a1befbd7b) is a
+  // EnemyCostField` (Arkham.Card.Cost, backend commit f3a0acbe2c) is a
   // genuine two-argument constructor, and Aeson's default TaggedObject
   // derivation for a multi-argument constructor encodes `contents` as a
   // JSON array of exactly that many elements -- so, unlike
@@ -334,7 +334,7 @@ public:
   [[nodiscard]] static GameValue staticWithPerPlayer(qint64 staticAmount,
                                                      qint64 perPlayerAmount);
   // The pinned backend's `ByPlayerCount Int Int Int Int` (Arkham.GameValue,
-  // backend commit 6a1befbd7b) is looked up by `fromGameValue` via an exact
+  // backend commit f3a0acbe2c) is looked up by `fromGameValue` via an exact
   // `case pc of 1 -> ...; 2 -> ...; 3 -> ...; 4 -> ...`, i.e. these are four
   // distinct positional values for exactly 1/2/3/4 players -- not the
   // "oneOrTwo/three/four/fiveOrMore" grouping an earlier revision of this

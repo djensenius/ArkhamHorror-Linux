@@ -53,24 +53,40 @@
   },
   "deck": {
     "id": "00000000-0000-0000-0000-000000000017",
-    "userId": 7,
-    "url": "https://arkhamdb.com/decklist/view/4242",
-    "name": "Contract deck",
     "investigatorName": "Roland Banks",
+    "lastUsedAt": null,
     "list": {
+      "id": "4242.0",
+      "investigator_code": "c01001",
+      "investigator_name": "Roland Banks",
+      "meta": "{\"alternate_front\":\"c90001\"}",
+      "name": "Contract deck",
+      "sideSlots": {},
       "slots": {
         "c01016": 2,
         "c01018": 1
       },
-      "sideSlots": {},
+      "taboo_id": null,
+      "url": "https://arkhamdb.com/decklist/view/4242"
+    },
+    "name": "Contract deck",
+    "overlay": null,
+    "playList": {
+      "id": "4242.0",
       "investigator_code": "c01001",
       "investigator_name": "Roland Banks",
       "meta": "{\"alternate_front\":\"c90001\"}",
+      "name": "Contract deck",
+      "sideSlots": {},
+      "slots": {
+        "c01016": 2,
+        "c01018": 1
+      },
       "taboo_id": null,
-      "url": "https://arkhamdb.com/decklist/view/4242",
-      "id": "4242.0",
-      "name": "Contract deck"
-    }
+      "url": "https://arkhamdb.com/decklist/view/4242"
+    },
+    "url": "https://arkhamdb.com/decklist/view/4242",
+    "userId": 7
   },
   "validationErrors": [
     {
