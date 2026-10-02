@@ -479,10 +479,10 @@ void DecksTests::deckFromRawBytesMatchesFromJsonOnSameFixture() {
 }
 
 void DecksTests::deckFromRawBytesPreservesObjectOverlayExactly() {
-  const QByteArray overlay = QByteArrayLiteral(
-      "{\"large\":9007199254740993,"
-      "\"fraction\":1.123456789012345678901234567890,"
-      "\"nested\":{\"keep\":true}}");
+  const QByteArray overlay =
+      QByteArrayLiteral("{\"large\":9007199254740993,"
+                        "\"fraction\":1.123456789012345678901234567890,"
+                        "\"nested\":{\"keep\":true}}");
   const QByteArray bytes = deckBytesWithOverlay(overlay);
 
   const auto result = Deck::fromRawBytes(bytes, u"deck");
@@ -523,8 +523,8 @@ void DecksTests::deckFromRawBytesRejectsScalarAndArrayOverlay() {
   };
 
   for (const Case &c : cases) {
-    const auto result = Deck::fromRawBytes(deckBytesWithOverlay(c.overlay),
-                                           u"deck");
+    const auto result =
+        Deck::fromRawBytes(deckBytesWithOverlay(c.overlay), u"deck");
     QVERIFY(!result.has_value());
     QVERIFY2(result.error().contains(QStringLiteral("overlay")),
              qPrintable(result.error()));
