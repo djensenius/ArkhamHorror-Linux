@@ -700,6 +700,7 @@ ALLOWLIST = tuple(
         ALLOWLIST,
         _FULL_SIGNATURE_SHA256,
         _PHYSICAL_OBSERVATION_SHA256,
+        strict=True,
     )
 )
 DOMAIN_ALLOWLIST = ALLOWLIST[: len(DOMAIN_ALLOWLIST)]
@@ -3822,7 +3823,8 @@ def _alias_reexported_encoders(
             argument_records.append(declaration)
 
     substitutions = {
-        name: argument for name, argument in zip(parameter_names, arguments)
+        name: argument
+        for name, argument in zip(parameter_names, arguments, strict=False)
     }
     for base in bases:
         exposed.extend(
