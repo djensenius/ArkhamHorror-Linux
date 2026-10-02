@@ -36,15 +36,16 @@ private slots:
   void decodesValidationSuccessFromFixture();
   void decodesOperationErrorFromFixture();
   // Round-10-cumulative-review item 5 kept exact-shape checks for narrow
-  // helper fragments. The saved Deck response itself now accepts additive
+  // helper fragments. DeckList and the saved Deck response now accept additive
   // server fields while preserving the 0.1.47 fields this client models.
   // The canonical raw-byte entry points DeckValidationError/
   // DeckValidationResult/DeckOperationError previously lacked entirely
   // (fromJson()-only before this round), proving they decode a fixture
   // identically through both paths and reject a duplicate/escape-
   // equivalent-duplicate key before any nested decode runs.
-  void deckListExtraTopLevelFieldRejected();
+  void deckListExtraTopLevelFieldIgnored();
   void deckExtraTopLevelFieldIgnored();
+  void deckNestedDeckListExtraTopLevelFieldsIgnored();
   void deckValidationErrorExtraTopLevelFieldRejected();
   void deckOperationErrorExtraTopLevelFieldRejected();
   void deckValidationErrorFromRawBytesMatchesFromJsonOnSameFixture();
@@ -518,14 +519,19 @@ void DecksTests::decodesOperationErrorFromFixture() {
   QCOMPARE(*reencoded, v.toObject());
 }
 
-void DecksTests::deckListExtraTopLevelFieldRejected() {
+void DecksTests::deckListExtraTopLevelFieldIgnored() {
   QJsonObject obj = decksFixture().value("normalizedDeckList"_L1).toObject();
   obj.insert(QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1);
   const auto result = DeckList::fromJson(obj, u"normalizedDeckList");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(
-               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
-           qPrintable(result.error()));
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  auto reencoded = Arkham::TestOnly::objectJson(*result);
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->contains(
+      QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")));
+  QCOMPARE(*reencoded,
+           withoutKey(obj, "aFutureFieldThisClientHasNeverHeardOf"_L1));
 }
 
 void DecksTests::deckExtraTopLevelFieldIgnored() {
@@ -539,6 +545,31 @@ void DecksTests::deckExtraTopLevelFieldIgnored() {
     QFAIL(qPrintable(reencoded.error()));
   QVERIFY(!reencoded->contains(
       QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")));
+}
+
+void DecksTests::deckNestedDeckListExtraTopLevelFieldsIgnored() {
+  QJsonObject obj = decksFixture().value("deck"_L1).toObject();
+  QJsonObject list = obj.value("list"_L1).toObject();
+  QJsonObject playList = obj.value("playList"_L1).toObject();
+  list.insert(QStringLiteral("aFutureListFieldThisClientHasNeverHeardOf"), 1);
+  playList.insert(
+      QStringLiteral("aFuturePlayListFieldThisClientHasNeverHeardOf"), 2);
+  obj.insert(QStringLiteral("list"), list);
+  obj.insert(QStringLiteral("playList"), playList);
+
+  const QByteArray bytes = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+  const auto result = Deck::fromRawBytes(bytes, u"deck");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  auto reencoded = Arkham::TestOnly::objectJson(*result);
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->value("list"_L1).toObject().contains(
+      QStringLiteral("aFutureListFieldThisClientHasNeverHeardOf")));
+  QVERIFY(!reencoded->value("playList"_L1)
+               .toObject()
+               .contains(QStringLiteral(
+                   "aFuturePlayListFieldThisClientHasNeverHeardOf")));
 }
 
 void DecksTests::deckValidationErrorExtraTopLevelFieldRejected() {

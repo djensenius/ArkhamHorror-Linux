@@ -85,18 +85,11 @@ ValueOrError<DeckList> decodeDeckList(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // decks.schema.json's `deckList` (the backend-normalized shape) is
-  // additionalProperties:false with exactly these nine keys, all
-  // `required` (round-10-cumulative-review item 5).
-  auto exactKeys = Json::requireExactKeys(
-      obj,
-      {"slots"_L1, "sideSlots"_L1, "investigator_code"_L1,
-       "investigator_name"_L1, "meta"_L1, "taboo_id"_L1, "url"_L1, "id"_L1,
-       "name"_L1},
-      path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Decode the normalized deck-list fields this client consumes, but do not
+  // enforce the server's complete key set here: the backend is the source of
+  // truth, and additive list/playList fields must not make a newer compatible
+  // server unreadable. Required fields remain required below because omitting
+  // one would leave this client without data it needs to render safely.
   auto cardSlots =
       decodeCardQuantityMap(obj, "slots"_L1, Json::joinPath(path, u"slots"));
   if (!cardSlots)

@@ -222,10 +222,9 @@ struct DeckListInput {
                          const DeckListInput &) = default;
 };
 
-// The backend-normalized deck-list shape: every one of decks.schema.json's
-// nine `deckList` fields is always present, so decode requires (rather than
-// merely permits) each key while still allowing several to carry an
-// explicit JSON null value.
+// The backend-normalized deck-list shape: every one of the fields this client
+// consumes is required, while unknown additive fields from a newer server are
+// ignored and dropped on re-encode.
 struct DeckList {
   QMap<CardCode, qint64> cardSlots;
   QMap<CardCode, qint64> sideSlots;
@@ -344,8 +343,7 @@ struct FetchDeckRequest {
   fromJson(const QJsonValue &v, QStringView path);
   // Canonical byte-level decode: identical logic to fromJson() above
   // (shared via a template, see Decks.cpp). fetchDeckRequest's own
-  // additionalProperties is explicitly `true` in decks.schema.json, unlike
-  // deckList/deck/deckValidationError/deckOperationError, so this
+  // additionalProperties is explicitly `true` in decks.schema.json, so this
   // deliberately does NOT enforce an exact key set here.
   [[nodiscard]] static ValueOrError<FetchDeckRequest>
   fromRawJson(const Json::Value &v, QStringView path);
