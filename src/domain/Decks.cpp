@@ -359,6 +359,24 @@ ValueOrError<DeckList> decodeDeckListValue(const Json::Value &v,
   return DeckList::fromRawJson(v, path);
 }
 
+ValueOrError<Json::Value> requireLosslessRawField(const QJsonObject &obj,
+                                                  QLatin1StringView key,
+                                                  QStringView path) {
+  auto raw = Json::requireRawField(obj, key, path);
+  if (!raw)
+    return failure(raw.error());
+  auto lossless = toLosslessRaw(*raw);
+  if (!lossless)
+    return failure(QStringLiteral("%1: %2").arg(path, lossless.error()));
+  return *lossless;
+}
+
+ValueOrError<Json::Value> requireLosslessRawField(const Json::Value &obj,
+                                                  QLatin1StringView key,
+                                                  QStringView path) {
+  return Json::requireRawField(obj, key, path);
+}
+
 // Shared decode body for Deck::fromJson()/fromRawJson(): V is QJsonValue
 // or Json::Value. `list` decodes through decodeDeckListValue's Json::Value
 // overload for the fromRawJson()/fromRawBytes() path, so a numeric card
@@ -371,16 +389,10 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // decks.schema.json's `deck` is additionalProperties:false with exactly
-  // these six required keys (round-10-cumulative-review item 5).
-  auto exactKeys =
-      Json::requireExactKeys(obj,
-                             {"id"_L1, "userId"_L1, "url"_L1, "name"_L1,
-                              "investigatorName"_L1, "list"_L1},
-                             path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Decode the fields this client consumes/preserves from the server-provided
+  // deck shape, but do not enforce the server's complete key set here: the
+  // backend is the source of truth, and additive fields must not make a newer
+  // compatible server unreadable.
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return DeckId::fromJson(v, p); });
@@ -407,6 +419,19 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
       [](const auto &v, QStringView p) { return decodeDeckListValue(v, p); });
   if (!list)
     return failure(list.error());
+  auto lastUsedAt = Json::requireNullableString(
+      obj, "lastUsedAt"_L1, Json::joinPath(path, u"lastUsedAt"));
+  if (!lastUsedAt)
+    return failure(lastUsedAt.error());
+  auto overlay = requireLosslessRawField(obj, "overlay"_L1,
+                                         Json::joinPath(path, u"overlay"));
+  if (!overlay)
+    return failure(overlay.error());
+  auto playList = Json::requireField(
+      obj, "playList"_L1, Json::joinPath(path, u"playList"),
+      [](const auto &v, QStringView p) { return decodeDeckListValue(v, p); });
+  if (!playList)
+    return failure(playList.error());
 
   return Deck{
       .id = *id,
@@ -415,6 +440,9 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
       .name = *name,
       .investigatorName = *investigatorName,
       .list = *list,
+      .lastUsedAt = *lastUsedAt,
+      .overlay = *overlay,
+      .playList = *playList,
   };
 }
 
@@ -656,6 +684,11 @@ Json::Value Deck::toRawJson() const {
       {QStringLiteral("investigatorName"),
        Json::Value::makeString(investigatorName)},
       {QStringLiteral("list"), list.toRawJson()},
+      {QStringLiteral("lastUsedAt"), lastUsedAt
+                                         ? Json::Value::makeString(*lastUsedAt)
+                                         : Json::Value::makeNull()},
+      {QStringLiteral("overlay"), overlay},
+      {QStringLiteral("playList"), playList.toRawJson()},
   };
   return Json::Value::makeObject(std::move(members));
 }

@@ -35,17 +35,16 @@ private slots:
   void decodesValidationErrorsFromFixture();
   void decodesValidationSuccessFromFixture();
   void decodesOperationErrorFromFixture();
-  // Round-10-cumulative-review item 5: decks.schema.json's deckList/deck/
-  // deckValidationError/deckOperationError are each additionalProperties:
-  // false; an unrecognized top-level key on any of them is now a hard
-  // decode failure rather than silently accepted-and-discarded. Also adds
-  // the canonical raw-byte entry points DeckValidationError/
+  // Round-10-cumulative-review item 5 kept exact-shape checks for narrow
+  // helper fragments. The saved Deck response itself now accepts additive
+  // server fields while preserving the 0.1.47 fields this client models.
+  // The canonical raw-byte entry points DeckValidationError/
   // DeckValidationResult/DeckOperationError previously lacked entirely
   // (fromJson()-only before this round), proving they decode a fixture
   // identically through both paths and reject a duplicate/escape-
   // equivalent-duplicate key before any nested decode runs.
   void deckListExtraTopLevelFieldRejected();
-  void deckExtraTopLevelFieldRejected();
+  void deckExtraTopLevelFieldIgnored();
   void deckValidationErrorExtraTopLevelFieldRejected();
   void deckOperationErrorExtraTopLevelFieldRejected();
   void deckValidationErrorFromRawBytesMatchesFromJsonOnSameFixture();
@@ -417,6 +416,9 @@ void DecksTests::decodesDeckFromFixture() {
   QCOMPARE(result->name, QStringLiteral("Contract deck"));
   QCOMPARE(result->investigatorName, QStringLiteral("Roland Banks"));
   QCOMPARE(result->list.investigatorCode.value(), QStringLiteral("c01001"));
+  QVERIFY(!result->lastUsedAt.has_value());
+  QVERIFY(result->overlay.isNull());
+  QCOMPARE(result->playList.investigatorCode.value(), QStringLiteral("c01001"));
 
   auto reencoded = Arkham::TestOnly::objectJson(*result);
   if (!reencoded)
@@ -526,14 +528,17 @@ void DecksTests::deckListExtraTopLevelFieldRejected() {
            qPrintable(result.error()));
 }
 
-void DecksTests::deckExtraTopLevelFieldRejected() {
+void DecksTests::deckExtraTopLevelFieldIgnored() {
   QJsonObject obj = decksFixture().value("deck"_L1).toObject();
   obj.insert(QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1);
   const auto result = Deck::fromJson(obj, u"deck");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(
-               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
-           qPrintable(result.error()));
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  auto reencoded = Arkham::TestOnly::objectJson(*result);
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QVERIFY(!reencoded->contains(
+      QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")));
 }
 
 void DecksTests::deckValidationErrorExtraTopLevelFieldRejected() {
@@ -1317,6 +1322,21 @@ void DecksTests::deckNullUrlRoundTripsAsExplicitNullNotOmitted() {
            {QStringLiteral("id"), QJsonValue()},
            {QStringLiteral("name"), QJsonValue()},
        }},
+      {QStringLiteral("lastUsedAt"), QJsonValue()},
+      {QStringLiteral("overlay"), QJsonValue()},
+      {QStringLiteral("playList"),
+       QJsonObject{
+           {QStringLiteral("slots"), QJsonObject{}},
+           {QStringLiteral("sideSlots"), QJsonObject{}},
+           {QStringLiteral("investigator_code"), QStringLiteral("c01001")},
+           {QStringLiteral("investigator_name"),
+            QStringLiteral("Roland Banks")},
+           {QStringLiteral("meta"), QJsonValue()},
+           {QStringLiteral("taboo_id"), QJsonValue()},
+           {QStringLiteral("url"), QJsonValue()},
+           {QStringLiteral("id"), QJsonValue()},
+           {QStringLiteral("name"), QJsonValue()},
+       }},
   };
   const auto result = Deck::fromJson(obj, u"deck");
   if (!result)
@@ -1932,13 +1952,16 @@ void DecksTests::deckToJsonRejectsLoneSurrogateInName() {
     QFAIL(qPrintable(deckId.error()));
   QString lone;
   lone += QChar(0xD800);
+  const DeckList list{.investigatorCode =
+                          *CardCode::parse(QStringLiteral("c01001")),
+                      .investigatorName = QStringLiteral("Name")};
   const Deck deck{
       .id = *deckId,
       .name = lone,
       .investigatorName = QStringLiteral("Name"),
-      .list = DeckList{.investigatorCode =
-                           *CardCode::parse(QStringLiteral("c01001")),
-                       .investigatorName = QStringLiteral("Name")},
+      .list = list,
+      .overlay = Json::Value::makeNull(),
+      .playList = list,
   };
   const auto encoded = Arkham::TestOnly::objectJson(deck);
   QVERIFY(!encoded.has_value());
@@ -1953,14 +1976,17 @@ void DecksTests::deckToJsonRejectsLoneSurrogateInUrl() {
     QFAIL(qPrintable(deckId.error()));
   QString lone;
   lone += QChar(0xDC00);
+  const DeckList list{.investigatorCode =
+                          *CardCode::parse(QStringLiteral("c01001")),
+                      .investigatorName = QStringLiteral("Name")};
   const Deck deck{
       .id = *deckId,
       .url = lone,
       .name = QStringLiteral("Name"),
       .investigatorName = QStringLiteral("Name"),
-      .list = DeckList{.investigatorCode =
-                           *CardCode::parse(QStringLiteral("c01001")),
-                       .investigatorName = QStringLiteral("Name")},
+      .list = list,
+      .overlay = Json::Value::makeNull(),
+      .playList = list,
   };
   const auto encoded = Arkham::TestOnly::objectJson(deck);
   QVERIFY(!encoded.has_value());
