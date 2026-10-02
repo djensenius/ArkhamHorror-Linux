@@ -185,8 +185,8 @@ void ContractTests::strictAsciiOnlyParsing() {
 
 void ContractTests::parsesVendoredFixture() {
   // Load from the vendored fixture, not from an inline duplicate string.
-  // This fixture is git-show 6a1befb:contracts/fixtures/capabilities.json,
-  // pinned to the PR#24 backend commit.
+  // This fixture is git-show f3a0acb:contracts/fixtures/capabilities.json,
+  // pinned to the PR#101 backend commit.
   const auto fileResult =
       openContractFile(QStringLiteral("/fixtures/capabilities.json"));
   if (!fileResult.has_value())
@@ -198,13 +198,14 @@ void ContractTests::parsesVendoredFixture() {
   if (!result.has_value())
     QFAIL(qPrintable(result.error()));
 
-  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 12}));
+  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 47}));
   QCOMPARE(result->status, QStringLiteral("baseline-incomplete"));
   QCOMPARE(result->apiBasePath, QStringLiteral("/api/v1"));
   QCOMPARE(result->nativeClientMinimumRevision, (ContractRevision{0, 1, 0}));
-  QCOMPARE(result->capabilities.size(), 4);
+  QCOMPARE(result->capabilities.size(), 5);
   QVERIFY(result->hasCapability(u"events.shared-state-versioning"));
   QVERIFY(result->hasCapability(u"games.step-probe"));
+  QVERIFY(result->hasCapability(u"questions.semantic-presentation.v2"));
   QVERIFY(result->hasCapability(u"websockets.authorization-header"));
   QVERIFY(result->hasCapability(u"websockets.spectator-read-only"));
   QVERIFY(!result->hasCapability(u"nonexistent.capability"));

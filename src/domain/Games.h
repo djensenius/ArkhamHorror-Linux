@@ -34,7 +34,7 @@ enum class Difficulty { Easy, Standard, Hard, Expert };
 enum class MultiplayerVariant { Solo, WithFriends };
 
 // `currentCampaignMode` enum (nullable; only The Dream-Eaters' two parts
-// exist as of schema revision 0.1.12). Closed: the backend's own FromJSON
+// exist as of schema revision 0.1.47). Closed: the backend's own FromJSON
 // (Generic-derived over CampaignPart) hard-fails on any other string, so a
 // permissive client would only ever mask a genuine backend/client mismatch.
 enum class CampaignPart { TheDreamQuest, TheWebOfDreams };
@@ -86,7 +86,7 @@ enum class UltimatumOrBoon {
 // One entry of gameDetails.investigators/otherInvestigators. `id` is
 // game-list.schema.json's plain, unconstrained `investigator.id` string --
 // but the backend's actual InvestigatorDetails.id field (Api.Arkham.Types.
-// Game, backend commit 6a1befbd7b) is typed Arkham.Id.InvestigatorId, a
+// Game, backend commit f3a0acbe2c) is typed Arkham.Id.InvestigatorId, a
 // newtype directly wrapping (and `deriving newtype` its ToJSON/FromJSON
 // from) Arkham.Card.CardCode -- so every value on the wire is genuinely
 // "c"-prefixed despite the schema not encoding that pattern. CardCode here
@@ -180,7 +180,7 @@ struct CampaignSummary {
 };
 
 // game-state.schema.json's GameState, decoded forward-compatibly: the four
-// known tags are exhaustive as of schema revision 0.1.12, but this is a
+// known tags are exhaustive as of schema revision 0.1.47, but this is a
 // live state machine a future backend release can extend, so an unrecognized
 // tag decodes to Kind::Unknown (preserving its wire spelling and complete
 // raw "contents") rather than failing the whole containing GameListRow.

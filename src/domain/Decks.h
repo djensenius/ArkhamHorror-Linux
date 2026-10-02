@@ -222,10 +222,9 @@ struct DeckListInput {
                          const DeckListInput &) = default;
 };
 
-// The backend-normalized deck-list shape: every one of decks.schema.json's
-// nine `deckList` fields is always present, so decode requires (rather than
-// merely permits) each key while still allowing several to carry an
-// explicit JSON null value.
+// The backend-normalized deck-list shape: every one of the fields this client
+// consumes is required, while unknown additive fields from a newer server are
+// ignored and dropped on re-encode.
 struct DeckList {
   QMap<CardCode, qint64> cardSlots;
   QMap<CardCode, qint64> sideSlots;
@@ -273,13 +272,16 @@ struct Deck {
   QString name;
   QString investigatorName;
   DeckList list;
+  std::optional<QString> lastUsedAt;
+  Json::Value overlay;
+  DeckList playList;
 
   [[nodiscard]] static ValueOrError<Deck> fromJson(const QJsonValue &v,
                                                    QStringView path);
   // Canonical byte-level decode overload: identical logic (shared via a
   // private template, see Decks.cpp), operating directly on the lossless
-  // AST (see RawJson.h) so this deck's list.cardSlots/sideSlots quantities
-  // (and any future unconstrained field) survive undamaged end-to-end.
+  // AST (see RawJson.h) so this deck's list/playList card quantities and
+  // overlay field survive undamaged end-to-end.
   [[nodiscard]] static ValueOrError<Deck> fromRawJson(const Json::Value &v,
                                                       QStringView path);
   // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
@@ -287,11 +289,11 @@ struct Deck {
   [[nodiscard]] static ValueOrError<Deck> fromRawBytes(QByteArrayView bytes,
                                                        QStringView path);
   // The lossless Json::Value AST for this response DTO (see RawJson.h);
-  // composes list.toRawJson() above directly rather than via any
-  // QJsonObject/QJsonValue intermediary. No public toJson()/QJsonObject-
-  // returning encoder is exposed here; every caller composes this raw
-  // AST with the single central Value::toExactQJsonObject() adapter (see
-  // RawJson.h) instead.
+  // composes list/playList.toRawJson() and preserves overlay directly rather
+  // than via any QJsonObject/QJsonValue intermediary. No public toJson()/
+  // QJsonObject-returning encoder is exposed here; every caller composes
+  // this raw AST with the single central Value::toExactQJsonObject()
+  // adapter (see RawJson.h) instead.
   [[nodiscard]] Json::Value toRawJson() const;
 
   friend bool operator==(const Deck &, const Deck &) = default;
@@ -341,8 +343,7 @@ struct FetchDeckRequest {
   fromJson(const QJsonValue &v, QStringView path);
   // Canonical byte-level decode: identical logic to fromJson() above
   // (shared via a template, see Decks.cpp). fetchDeckRequest's own
-  // additionalProperties is explicitly `true` in decks.schema.json, unlike
-  // deckList/deck/deckValidationError/deckOperationError, so this
+  // additionalProperties is explicitly `true` in decks.schema.json, so this
   // deliberately does NOT enforce an exact key set here.
   [[nodiscard]] static ValueOrError<FetchDeckRequest>
   fromRawJson(const Json::Value &v, QStringView path);

@@ -85,18 +85,11 @@ ValueOrError<DeckList> decodeDeckList(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // decks.schema.json's `deckList` (the backend-normalized shape) is
-  // additionalProperties:false with exactly these nine keys, all
-  // `required` (round-10-cumulative-review item 5).
-  auto exactKeys = Json::requireExactKeys(
-      obj,
-      {"slots"_L1, "sideSlots"_L1, "investigator_code"_L1,
-       "investigator_name"_L1, "meta"_L1, "taboo_id"_L1, "url"_L1, "id"_L1,
-       "name"_L1},
-      path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Decode the normalized deck-list fields this client consumes, but do not
+  // enforce the server's complete key set here: the backend is the source of
+  // truth, and additive list/playList fields must not make a newer compatible
+  // server unreadable. Required fields remain required below because omitting
+  // one would leave this client without data it needs to render safely.
   auto cardSlots =
       decodeCardQuantityMap(obj, "slots"_L1, Json::joinPath(path, u"slots"));
   if (!cardSlots)
@@ -371,16 +364,10 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // decks.schema.json's `deck` is additionalProperties:false with exactly
-  // these six required keys (round-10-cumulative-review item 5).
-  auto exactKeys =
-      Json::requireExactKeys(obj,
-                             {"id"_L1, "userId"_L1, "url"_L1, "name"_L1,
-                              "investigatorName"_L1, "list"_L1},
-                             path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Decode the fields this client consumes/preserves from the server-provided
+  // deck shape, but do not enforce the server's complete key set here: the
+  // backend is the source of truth, and additive fields must not make a newer
+  // compatible server unreadable.
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return DeckId::fromJson(v, p); });
@@ -407,6 +394,25 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
       [](const auto &v, QStringView p) { return decodeDeckListValue(v, p); });
   if (!list)
     return failure(list.error());
+  auto lastUsedAt = Json::requireNullableString(
+      obj, "lastUsedAt"_L1, Json::joinPath(path, u"lastUsedAt"));
+  if (!lastUsedAt)
+    return failure(lastUsedAt.error());
+  const QString overlayPath = Json::joinPath(path, u"overlay");
+  auto overlayRaw = Json::requireRawField(obj, "overlay"_L1, overlayPath);
+  if (!overlayRaw)
+    return failure(overlayRaw.error());
+  auto overlay = toLosslessRaw(*overlayRaw);
+  if (!overlay)
+    return failure(QStringLiteral("%1: %2").arg(overlayPath, overlay.error()));
+  if (!overlay->isNull() && !overlay->isObject())
+    return failure(QStringLiteral("%1: expected object or null, got %2")
+                       .arg(overlayPath, Json::typeName(*overlay)));
+  auto playList = Json::requireField(
+      obj, "playList"_L1, Json::joinPath(path, u"playList"),
+      [](const auto &v, QStringView p) { return decodeDeckListValue(v, p); });
+  if (!playList)
+    return failure(playList.error());
 
   return Deck{
       .id = *id,
@@ -415,6 +421,9 @@ ValueOrError<Deck> decodeDeck(const V &v, QStringView path) {
       .name = *name,
       .investigatorName = *investigatorName,
       .list = *list,
+      .lastUsedAt = *lastUsedAt,
+      .overlay = *overlay,
+      .playList = *playList,
   };
 }
 
@@ -656,6 +665,11 @@ Json::Value Deck::toRawJson() const {
       {QStringLiteral("investigatorName"),
        Json::Value::makeString(investigatorName)},
       {QStringLiteral("list"), list.toRawJson()},
+      {QStringLiteral("lastUsedAt"), lastUsedAt
+                                         ? Json::Value::makeString(*lastUsedAt)
+                                         : Json::Value::makeNull()},
+      {QStringLiteral("overlay"), overlay},
+      {QStringLiteral("playList"), playList.toRawJson()},
   };
   return Json::Value::makeObject(std::move(members));
 }

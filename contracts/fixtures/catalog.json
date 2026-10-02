@@ -51,6 +51,11 @@
         "Creature",
         "Monster"
       ],
+      "keywords": [
+        {
+          "tag": "Hunter"
+        }
+      ],
       "encounterSet": ":dark-matter:in_the_shadow_of_earth",
       "encounterSetQuantity": 3,
       "art": ":dark-matter:151",
