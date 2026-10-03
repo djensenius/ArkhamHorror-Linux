@@ -1,8 +1,7 @@
 #include "SiteSettingsAssetHostFetcher.h"
 
 #include "AssetLocator.h"
-#include "JsonDecode.h"
-#include "RawJson.h"
+#include "SiteSettings.h"
 
 #include <QByteArray>
 #include <QMetaObject>
@@ -25,18 +24,12 @@ namespace Arkham {
 namespace {
 
 std::optional<QUrl> decodeAssetHost(QByteArrayView body) {
-  auto parsed = Json::Value::parse(body, QStringLiteral("site-settings"));
-  if (!parsed || !parsed->isObject()) {
+  const std::optional<QString> assetHost = decodeSiteSettingsAssetHost(body);
+  if (!assetHost.has_value()) {
     return std::nullopt;
   }
 
-  auto assetHost = Json::optionalString(
-      *parsed, "assetHost"_L1, QStringLiteral("site-settings.assetHost"));
-  if (!assetHost || !*assetHost) {
-    return std::nullopt;
-  }
-
-  auto url = AssetLocator::assetBaseUrlFromString(**assetHost);
+  auto url = AssetLocator::assetBaseUrlFromString(*assetHost);
   if (!url) {
     return std::nullopt;
   }

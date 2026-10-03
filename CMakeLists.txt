@@ -169,6 +169,7 @@ set(ARKHAM_DOMAIN_HEADERS
     src/domain/Identifiers.h
     src/domain/JsonDecode.h
     src/domain/RawJson.h
+    src/domain/SiteSettings.h
     src/domain/ValueOrError.h
 )
 
