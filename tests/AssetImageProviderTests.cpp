@@ -5,6 +5,7 @@
 #include <QDeadlineTimer>
 #include <QEvent>
 #include <QEventLoop>
+#include <QNetworkAccessManager>
 #include <QQmlComponent>
 #include <QQmlEngine>
 #include <QSignalSpy>
@@ -19,6 +20,8 @@
 
 #include "AssetImageProvider.h"
 #include "AssetImageRequestCoordinator.h"
+#include "ServerProfile.h"
+#include "SiteSettingsAssetHostFetcher.h"
 
 using namespace Arkham;
 
@@ -64,6 +67,41 @@ configFor(const MockHttpServer &server, const QTemporaryDir &cacheRoot,
   return config;
 }
 
+AssetImageRequestCoordinator::Config configForUrl(
+    QUrl assetBaseUrl, const QTemporaryDir &cacheRoot,
+    std::chrono::milliseconds negativeCacheTtl = std::chrono::seconds(5),
+    qsizetype negativeCacheMaxEntries = 256) {
+  AssetImageRequestCoordinator::Config config;
+  config.assetBaseUrl = std::move(assetBaseUrl);
+  config.cacheConfig.rootDirectory = cacheRoot.path();
+  config.negativeCacheTtl = negativeCacheTtl;
+  config.negativeCacheMaxEntries = negativeCacheMaxEntries;
+  return config;
+}
+
+ServerProfile profileFor(const MockHttpServer &server) {
+  auto profile = ServerProfile::custom(QStringLiteral("Test Server"),
+                                       server.url(QString()).toString());
+  if (!profile) {
+    qFatal("profileFor failed: %s", qPrintable(profile.error()));
+  }
+  return *profile;
+}
+
+bool fetchSettingsIntoProvider(AssetCardImageProvider &provider,
+                               const ServerProfile &profile) {
+  QNetworkAccessManager networkAccessManager;
+  SiteSettingsAssetHostFetcher fetcher(networkAccessManager,
+                                       std::chrono::milliseconds(1000));
+  QObject::connect(&fetcher, &SiteSettingsAssetHostFetcher::assetHostAvailable,
+                   &fetcher, [&provider](const QUrl &assetHost) {
+                     provider.setAssetBaseUrl(assetHost);
+                   });
+  QSignalSpy finishedSpy(&fetcher, &SiteSettingsAssetHostFetcher::finished);
+  fetcher.fetch(profile);
+  return finishedSpy.wait(2000) || finishedSpy.count() == 1;
+}
+
 bool waitForPendingResponseDrain(const AssetCardImageResponse &response,
                                  int timeoutMs = 2000) {
   const QDeadlineTimer deadline(timeoutMs);
@@ -95,6 +133,9 @@ private slots:
   void coordinatorCancelDetachesWaiter();
   void coordinatorRerequestAfterCancelCompletesNewFlight();
   void providerLoadsMutatedCardImage();
+  void providerUsesSiteSettingsAssetHost();
+  void providerFallsBackWhenSiteSettingsAssetHostUnavailable_data();
+  void providerFallsBackWhenSiteSettingsAssetHostUnavailable();
   void providerRejectsInvalidIds();
   void providerCancelAndTeardownWithInFlightRequestsDoesNotCrash();
   void providerCancelWithImmediateCompletionsDoesNotEmitFinished();
@@ -415,6 +456,105 @@ void AssetImageProviderTests::providerLoadsMutatedCardImage() {
   QVERIFY(heightOnlyFactory != nullptr);
   QCOMPARE(heightOnlyFactory->textureSize(), QSize(5, 5));
   QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::providerUsesSiteSettingsAssetHost() {
+  MockHttpServer settingsServer;
+  QVERIFY(settingsServer.start());
+  MockHttpServer defaultAssetServer;
+  QVERIFY(defaultAssetServer.start());
+  MockHttpServer configuredAssetServer;
+  QVERIFY(configuredAssetServer.start());
+
+  const QString defaultPath =
+      QStringLiteral("/default-assets/img/arkham/cards/01014.avif");
+  defaultAssetServer.setResponse(defaultPath,
+                                 response(200, pngBytes(QSize(1, 1), Qt::red)));
+  const QString configuredPath =
+      QStringLiteral("/configured-assets/img/arkham/cards/01014.avif");
+  configuredAssetServer.setResponse(
+      configuredPath, response(200, pngBytes(QSize(2, 2), Qt::blue)));
+
+  const QByteArray settingsBody =
+      QByteArrayLiteral("{\"assetHost\":\"") +
+      configuredAssetServer.url(QStringLiteral("/configured-assets"))
+          .toString()
+          .toUtf8() +
+      QByteArrayLiteral("\",\"ignoredAdditiveField\":true}");
+  MockHttpServer::Response settings = response(200, settingsBody);
+  settings.contentType = QByteArrayLiteral("application/json");
+  settingsServer.setResponse(QStringLiteral("/api/v1/site-settings"), settings);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetCardImageProvider provider(configForUrl(
+      defaultAssetServer.url(QStringLiteral("/default-assets")), cacheRoot));
+
+  QVERIFY(fetchSettingsIntoProvider(provider, profileFor(settingsServer)));
+
+  std::unique_ptr<QQuickImageResponse> imageResponse(
+      provider.requestImageResponse(QStringLiteral("01014"), QSize()));
+  QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
+  QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+  QCOMPARE(imageResponse->errorString(), QString());
+  std::unique_ptr<QQuickTextureFactory> factory(
+      imageResponse->textureFactory());
+  QVERIFY(factory != nullptr);
+  QCOMPARE(factory->textureSize(), QSize(2, 2));
+  QCOMPARE(configuredAssetServer.requestCountForPath(configuredPath), 1);
+  QCOMPARE(defaultAssetServer.requestCountForPath(defaultPath), 0);
+}
+
+void AssetImageProviderTests::
+    providerFallsBackWhenSiteSettingsAssetHostUnavailable_data() {
+  QTest::addColumn<int>("settingsStatus");
+  QTest::addColumn<QByteArray>("settingsBody");
+
+  QTest::newRow("missing") << 200 << QByteArrayLiteral("{}");
+  QTest::newRow("null") << 200 << QByteArrayLiteral("{\"assetHost\":null}");
+  QTest::newRow("empty") << 200 << QByteArrayLiteral("{\"assetHost\":\"\"}");
+  QTest::newRow("invalid") << 200
+                           << QByteArrayLiteral(
+                                  "{\"assetHost\":\"ftp://assets.example\"}");
+  QTest::newRow("failed") << 500 << QByteArrayLiteral("server error");
+}
+
+void AssetImageProviderTests::
+    providerFallsBackWhenSiteSettingsAssetHostUnavailable() {
+  QFETCH(int, settingsStatus);
+  QFETCH(QByteArray, settingsBody);
+
+  MockHttpServer settingsServer;
+  QVERIFY(settingsServer.start());
+  MockHttpServer defaultAssetServer;
+  QVERIFY(defaultAssetServer.start());
+
+  const QString defaultPath =
+      QStringLiteral("/default-assets/img/arkham/cards/01015.avif");
+  defaultAssetServer.setResponse(
+      defaultPath, response(200, pngBytes(QSize(3, 3), Qt::green)));
+
+  MockHttpServer::Response settings = response(settingsStatus, settingsBody);
+  settings.contentType = QByteArrayLiteral("application/json");
+  settingsServer.setResponse(QStringLiteral("/api/v1/site-settings"), settings);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetCardImageProvider provider(configForUrl(
+      defaultAssetServer.url(QStringLiteral("/default-assets")), cacheRoot));
+
+  QVERIFY(fetchSettingsIntoProvider(provider, profileFor(settingsServer)));
+
+  std::unique_ptr<QQuickImageResponse> imageResponse(
+      provider.requestImageResponse(QStringLiteral("01015"), QSize()));
+  QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
+  QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+  QCOMPARE(imageResponse->errorString(), QString());
+  std::unique_ptr<QQuickTextureFactory> factory(
+      imageResponse->textureFactory());
+  QVERIFY(factory != nullptr);
+  QCOMPARE(factory->textureSize(), QSize(3, 3));
+  QCOMPARE(defaultAssetServer.requestCountForPath(defaultPath), 1);
 }
 
 void AssetImageProviderTests::providerRejectsInvalidIds() {

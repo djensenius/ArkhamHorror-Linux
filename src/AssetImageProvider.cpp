@@ -230,6 +230,29 @@ AssetCardImageProvider::~AssetCardImageProvider() {
   m_workerThread.wait();
 }
 
+void AssetCardImageProvider::setAssetBaseUrl(QUrl assetBaseUrl) {
+  const std::shared_ptr<CoordinatorHandle> coordinatorHandle =
+      m_coordinatorHandle;
+  std::lock_guard coordinatorLock(coordinatorHandle->mutex);
+  if (!coordinatorHandle->alive || !coordinatorHandle->coordinator) {
+    return;
+  }
+  QMetaObject::invokeMethod(
+      coordinatorHandle->coordinator,
+      [coordinatorHandle, assetBaseUrl = std::move(assetBaseUrl)]() mutable {
+        AssetImageRequestCoordinator *coordinator = nullptr;
+        {
+          std::lock_guard coordinatorLock(coordinatorHandle->mutex);
+          if (!coordinatorHandle->alive || !coordinatorHandle->coordinator) {
+            return;
+          }
+          coordinator = coordinatorHandle->coordinator;
+        }
+        coordinator->setAssetBaseUrl(std::move(assetBaseUrl));
+      },
+      Qt::QueuedConnection);
+}
+
 QQuickImageResponse *
 AssetCardImageProvider::requestImageResponse(const QString &id,
                                              const QSize &requestedSize) {

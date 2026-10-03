@@ -38,6 +38,13 @@ quint64 AssetImageRequestCoordinator::requestCardImage(
   return requestId;
 }
 
+void AssetImageRequestCoordinator::setAssetBaseUrl(QUrl assetBaseUrl) {
+  const auto normalized = AssetLocator::assetBaseUrlFromString(
+      assetBaseUrl.toString(QUrl::FullyEncoded));
+  m_config.assetBaseUrl =
+      normalized ? *normalized : AssetLocator::defaultAssetBaseUrl();
+}
+
 void AssetImageRequestCoordinator::cancel(quint64 requestId) {
   const auto keyIt = m_requestKeys.find(requestId);
   if (keyIt == m_requestKeys.end()) {

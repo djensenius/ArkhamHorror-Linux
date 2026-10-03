@@ -245,6 +245,7 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/ServerCapabilities.h
     src/ServerProfile.h
     src/SessionCoordinator.h
+    src/SiteSettingsAssetHostFetcher.h
     src/TokenEnvelope.h
     src/TokenValidation.h
     src/UrlValidator.h
@@ -277,6 +278,7 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/ServerCapabilities.cpp
     src/ServerProfile.cpp
     src/SessionCoordinator.cpp
+    src/SiteSettingsAssetHostFetcher.cpp
     src/TokenEnvelope.cpp
     src/TokenValidation.cpp
     src/UrlValidator.cpp

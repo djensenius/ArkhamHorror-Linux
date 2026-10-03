@@ -45,6 +45,7 @@ public:
 
   [[nodiscard]] quint64 requestCardImage(const AssetLocator::CardImageKey &key,
                                          ImageCallback callback);
+  void setAssetBaseUrl(QUrl assetBaseUrl);
   void cancel(quint64 requestId);
   void cancelAll();
 
