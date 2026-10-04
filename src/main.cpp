@@ -1,6 +1,7 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QGuiApplication>
+#include <QNetworkAccessManager>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickWindow>
@@ -13,6 +14,7 @@
 #include "AppSessionComposition.h"
 #include "AssetImageProvider.h"
 #include "ServerProfile.h"
+#include "SiteSettingsAssetHostFetcher.h"
 
 namespace {
 
@@ -53,6 +55,8 @@ int main(int argc, char *argv[]) {
   parser.process(app);
 
   const bool smokeTest = parser.isSet(smokeTestOption);
+  const Arkham::ProcessMode mode =
+      smokeTest ? Arkham::ProcessMode::SmokeTest : Arkham::ProcessMode::Normal;
 
   const Arkham::ServerProfile profile = Arkham::ServerProfile::hostedDefault();
 
@@ -67,23 +71,38 @@ int main(int argc, char *argv[]) {
   std::unique_ptr<Arkham::ProductionSession> session;
 
   QQmlApplicationEngine engine;
-  // TODO(A5): fetch /site-settings.assetHost and inject it into the card
-  // image provider config. A4 intentionally keeps the production provider on
-  // AssetLocator::defaultAssetBaseUrl() until the server settings wiring lands.
-  engine.addImageProvider(QStringLiteral("arkham-card"),
-                          new Arkham::AssetCardImageProvider());
+  auto *cardImageProvider = new Arkham::AssetCardImageProvider();
+  engine.addImageProvider(QStringLiteral("arkham-card"), cardImageProvider);
   engine.setInitialProperties(
       {{QStringLiteral("configuredServer"), profile.baseUrl().toString()}});
 
-  // The entire hermetic guarantee for --smoke-test lives in
+  // Declared after |engine| so any in-flight request is cancelled before the
+  // engine destroys the image provider it owns. The request starts only in
+  // normal mode so --smoke-test remains a hermetic startup/rendering check.
+  std::unique_ptr<QNetworkAccessManager> siteSettingsNetwork;
+  std::unique_ptr<Arkham::SiteSettingsAssetHostFetcher>
+      siteSettingsAssetHostFetcher;
+  if (mode == Arkham::ProcessMode::Normal) {
+    siteSettingsNetwork = std::make_unique<QNetworkAccessManager>();
+    siteSettingsAssetHostFetcher =
+        std::make_unique<Arkham::SiteSettingsAssetHostFetcher>(
+            *siteSettingsNetwork);
+    QObject::connect(siteSettingsAssetHostFetcher.get(),
+                     &Arkham::SiteSettingsAssetHostFetcher::assetHostAvailable,
+                     &app, [cardImageProvider](const QUrl &assetHost) {
+                       cardImageProvider->setAssetBaseUrl(assetHost);
+                     });
+    siteSettingsAssetHostFetcher->fetch(profile);
+  }
+
+  // The session side of the hermetic guarantee for --smoke-test lives in
   // bootstrapSession(): composeProductionSession() (which touches
   // QSettings, constructs a QNetworkAccessManager, and initializes the
   // QtKeychain backend) and SessionCoordinator::start() (which begins real
   // network/keychain I/O) are only ever reached through this callback, and
-  // only when |mode| is ProcessMode::Normal. See AppBootstrap.h and
+  // only when |mode| is ProcessMode::Normal. The site-settings request above
+  // is guarded by the same mode check. See AppBootstrap.h and
   // AppBootstrapTests.cpp.
-  const Arkham::ProcessMode mode =
-      smokeTest ? Arkham::ProcessMode::SmokeTest : Arkham::ProcessMode::Normal;
   Arkham::bootstrapSession(mode, [&] {
     session = Arkham::composeProductionSession();
     engine.rootContext()->setContextProperty(

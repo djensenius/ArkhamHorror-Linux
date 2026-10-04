@@ -65,6 +65,8 @@ public:
   explicit AssetCardImageProvider(AssetImageRequestCoordinator::Config config);
   ~AssetCardImageProvider() override;
 
+  void setAssetBaseUrl(QUrl assetBaseUrl);
+
   [[nodiscard]] QQuickImageResponse *
   requestImageResponse(const QString &id, const QSize &requestedSize) override;
 

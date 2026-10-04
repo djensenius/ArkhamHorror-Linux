@@ -1,5 +1,7 @@
 #include "JsonDecode.h"
 
+#include "SiteSettings.h"
+
 #include <QLatin1StringView>
 #include <charconv>
 #include <cmath>
@@ -817,3 +819,21 @@ ValueOrError<QString> scientificShow(double value, QStringView path) {
 }
 
 } // namespace Arkham::Json
+
+namespace Arkham {
+
+std::optional<QString> decodeSiteSettingsAssetHost(QByteArrayView body) {
+  auto parsed = Json::Value::parse(body, QStringLiteral("site-settings"));
+  if (!parsed || !parsed->isObject()) {
+    return std::nullopt;
+  }
+
+  const std::optional<Json::Value> assetHost = parsed->find("assetHost"_L1);
+  if (!assetHost.has_value() || assetHost->isNull() || !assetHost->isString()) {
+    return std::nullopt;
+  }
+
+  return assetHost->toString();
+}
+
+} // namespace Arkham
