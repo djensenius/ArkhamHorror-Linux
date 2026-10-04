@@ -2,17 +2,17 @@
 
 namespace Arkham {
 
-// Pinned to djensenius/ArkhamHorror#101 (commit
-// f3a0acbe2c6952c5fbb3f3374a3ef85f94f250e1), which published
-// schemaRevision 0.1.47 and nativeClientMinimumRevision 0.1.0. See
+// Pinned to djensenius/ArkhamHorror#130 (commit
+// f454ccb9fb789739c666a9cbd74d3fdc14a81fb9), which published
+// schemaRevision 0.1.48 and nativeClientMinimumRevision 0.1.0. See
 // contracts/contract-pin.json for the machine-readable record.
 const ContractPin &currentPin() {
   static const ContractPin pin{
       .backendCommit =
-          QStringLiteral("f3a0acbe2c6952c5fbb3f3374a3ef85f94f250e1"),
-      .sourceRef = QStringLiteral("djensenius/ArkhamHorror#101"),
-      .supportedSchemaRevision = {0, 1, 47},
-      .minimumServerSchemaRevision = {0, 1, 47},
+          QStringLiteral("f454ccb9fb789739c666a9cbd74d3fdc14a81fb9"),
+      .sourceRef = QStringLiteral("djensenius/ArkhamHorror#130"),
+      .supportedSchemaRevision = {0, 1, 48},
+      .minimumServerSchemaRevision = {0, 1, 48},
       .sourceNativeClientMinimumRevision = {0, 1, 0},
       .expectedApiBasePath = QStringLiteral("/api/v1"),
   };
@@ -21,18 +21,22 @@ const ContractPin &currentPin() {
 
 // SHA-256 digests of every contracts/ file this client's decoders are bound
 // to, captured from djensenius/ArkhamHorror commit
-// f3a0acbe2c6952c5fbb3f3374a3ef85f94f250e1. Recomputed and compared against
+// f454ccb9fb789739c666a9cbd74d3fdc14a81fb9. Recomputed and compared against
 // the vendored bytes by ContractDriftTests; see GovernedFixtureDigest.
 const QList<GovernedFixtureDigest> &governedFixtureDigests() {
   static const QList<GovernedFixtureDigest> digests{
       {QStringLiteral("manifest.json"),
        QStringLiteral(
-           "496675d91ca082c9f7f3aef4bbf60a2a59f0298d394c2e95a3a206be64d1b23"
-           "f")},
+           "ce186e7c7a448bb411d6cb21fee6d5f8a6e46c7c05b34e6b556489981bebb34"
+           "e")},
       {QStringLiteral("fixtures/capabilities.json"),
        QStringLiteral(
-           "d4ee241a69b4d8bbb79bcc20823cf3568d69f70ae05ee44b254c8a10ab8500e"
-           "8")},
+           "56a02493c3b3495797bac45f84d3b6de0926645f243a2a71fc66fa85b3ff6fa"
+           "c")},
+      {QStringLiteral("fixtures/answer-rejected.json"),
+       QStringLiteral(
+           "ad8069b02586f3cfe4677dc6fa25d2297d9f2f6cbd3366c6954845446a0440d"
+           "c")},
       {QStringLiteral("fixtures/catalog.json"),
        QStringLiteral(
            "481f42cbac1fcb208cdb1b626a3cc6951c35531383e7439dc3c0d7c02a9044a"

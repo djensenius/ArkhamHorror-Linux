@@ -50,6 +50,7 @@ MANIFEST = (
     b']}'
 )
 CAPABILITIES = b'{"schemaRevision": "0.1.12"}'
+ANSWER_REJECTED = b'{"tag":"AnswerRejected","reason":"Stale question","questionVersion":8}'
 CATALOG_FIXTURE = b'{"cards": []}'
 DECKS_FIXTURE = b'{"decks": []}'
 
@@ -63,6 +64,7 @@ def _baseline_blobs() -> dict[str, bytes]:
         "contracts/schemas/game-state.schema.json": b"{}",
         "contracts/manifest.json": MANIFEST,
         "contracts/fixtures/capabilities.json": CAPABILITIES,
+        "contracts/fixtures/answer-rejected.json": ANSWER_REJECTED,
         "contracts/fixtures/catalog.json": CATALOG_FIXTURE,
         "contracts/fixtures/decks.json": DECKS_FIXTURE,
     }
@@ -75,6 +77,7 @@ class ClosureTests(unittest.TestCase):
         self.assertIn("contracts/schemas/catalog.schema.json", governed)
         self.assertIn("contracts/manifest.json", governed)
         self.assertIn("contracts/fixtures/capabilities.json", governed)
+        self.assertIn("contracts/fixtures/answer-rejected.json", governed)
         self.assertIn("contracts/fixtures/catalog.json", governed)
         self.assertIn("contracts/fixtures/decks.json", governed)
         # account.json's schema (account.schema.json) is not in the
