@@ -92,6 +92,7 @@ void SiteSettingsAssetHostFetcher::fetch(const ServerProfile &profile) {
                        QNetworkRequest::SameOriginRedirectPolicy);
 
   QNetworkReply *reply = m_nam.get(request);
+  reply->setReadBufferSize(kMaxSiteSettingsResponseBytes + 1);
 
   QTimer *timer = nullptr;
   if (m_timeout.count() > 0) {
