@@ -694,7 +694,8 @@ void AssetImageProviderTests::
       configuredAssetServer.url(QStringLiteral("/configured-assets"))
           .toString()
           .toUtf8() +
-      QByteArrayLiteral("\",\"pad\":\"") + QByteArray(70 * 1024, 'x') +
+      QByteArrayLiteral("\",\"padA\":\"") + QByteArray(35 * 1024, 'x') +
+      QByteArrayLiteral("\",\"padB\":\"") + QByteArray(35 * 1024, 'y') +
       QByteArrayLiteral("\"}");
 
   MockHttpServer::Response streaming = response(200);
