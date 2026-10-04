@@ -54,7 +54,7 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
-      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+      - uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive.
@@ -72,7 +72,7 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
-      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+      - uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
@@ -90,7 +90,7 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
-      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+      - uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
@@ -110,7 +110,7 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
-      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+      - uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
@@ -215,7 +215,7 @@ jobs:
             echo "Changed files considered for encoder hygiene:"
             sed 's/^/  /' "$changed_files"
           fi
-      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+      - uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125
         if: steps.encoder_hygiene_scope.outputs.run_full_policy == 'true'
         with:
           version: ${{ env.QT_VERSION }}
@@ -259,7 +259,7 @@ jobs:
         with:
           version: 2026.8.14
           cache: true
-      - uses: jurplel/install-qt-action@48d3ad6db93f3627c8ee7a0454bc6f3744f7e730
+      - uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125
         with:
           version: ${{ env.QT_VERSION }}
           modules: qtwebsockets # Qt Quick and QuickControls2 ship in the base archive. Qt6::DBus (used by QtKeychain's Linux Secret Service backend) ships in the base qtbase archive, so no extra module is needed.
