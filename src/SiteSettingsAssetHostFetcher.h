@@ -2,11 +2,13 @@
 
 #include "ServerProfile.h"
 
+#include <QByteArray>
 #include <QHash>
 #include <QObject>
 #include <QUrl>
 
 #include <chrono>
+#include <optional>
 
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -37,12 +39,21 @@ signals:
   void finished();
 
 private:
+  struct PendingReply {
+    QTimer *timer{nullptr};
+    QByteArray body;
+  };
+
   void handleReply(QNetworkReply *reply);
+  void handleMetadataChanged(QNetworkReply *reply);
+  bool readAvailable(QNetworkReply *reply);
+  void completeReply(QNetworkReply *reply, std::optional<QUrl> assetHost,
+                     bool abortReply);
   void emitFinishedQueued();
 
   QNetworkAccessManager &m_nam;
   std::chrono::milliseconds m_timeout;
-  QHash<QNetworkReply *, QTimer *> m_pendingReplies;
+  QHash<QNetworkReply *, PendingReply> m_pendingReplies;
 };
 
 } // namespace Arkham

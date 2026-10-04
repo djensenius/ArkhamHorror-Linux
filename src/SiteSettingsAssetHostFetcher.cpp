@@ -23,6 +23,8 @@ namespace Arkham {
 
 namespace {
 
+constexpr qsizetype kMaxSiteSettingsResponseBytes = 64 * 1024;
+
 std::optional<QUrl> decodeAssetHost(QByteArrayView body) {
   const std::optional<QString> assetHost = decodeSiteSettingsAssetHost(body);
   if (!assetHost.has_value()) {
@@ -34,6 +36,17 @@ std::optional<QUrl> decodeAssetHost(QByteArrayView body) {
     return std::nullopt;
   }
   return *url;
+}
+
+bool contentLengthExceedsCap(QNetworkReply *reply) {
+  const QVariant header = reply->header(QNetworkRequest::ContentLengthHeader);
+  if (!header.isValid()) {
+    return false;
+  }
+
+  bool ok = false;
+  const qlonglong contentLength = header.toLongLong(&ok);
+  return ok && contentLength > kMaxSiteSettingsResponseBytes;
 }
 
 } // namespace
@@ -50,7 +63,7 @@ SiteSettingsAssetHostFetcher::SiteSettingsAssetHostFetcher(
 
 SiteSettingsAssetHostFetcher::~SiteSettingsAssetHostFetcher() {
   for (auto it = m_pendingReplies.begin(); it != m_pendingReplies.end(); ++it) {
-    if (QTimer *timer = it.value()) {
+    if (QTimer *timer = it.value().timer) {
       timer->stop();
     }
     QNetworkReply *reply = it.key();
@@ -84,56 +97,108 @@ void SiteSettingsAssetHostFetcher::fetch(const ServerProfile &profile) {
   if (m_timeout.count() > 0) {
     timer = new QTimer(this);
     timer->setSingleShot(true);
-    connect(timer, &QTimer::timeout, this, [this, reply, timer]() {
-      if (!m_pendingReplies.contains(reply)) {
-        return;
-      }
-      QObject::disconnect(reply, nullptr, this, nullptr);
-      m_pendingReplies.remove(reply);
-      timer->deleteLater();
-      reply->abort();
-      reply->deleteLater();
-      emitFinishedQueued();
-    });
+    connect(timer, &QTimer::timeout, this,
+            [this, reply]() { completeReply(reply, std::nullopt, true); });
   }
-  m_pendingReplies.insert(reply, timer);
+  m_pendingReplies.insert(reply, PendingReply{timer, QByteArray{}});
 
-  connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-    if (QTimer *timer = m_pendingReplies.value(reply)) {
-      timer->stop();
-      timer->deleteLater();
-    }
-    m_pendingReplies.remove(reply);
-    reply->deleteLater();
-    handleReply(reply);
-  });
+  connect(reply, &QNetworkReply::metaDataChanged, this,
+          [this, reply]() { handleMetadataChanged(reply); });
+  connect(reply, &QNetworkReply::readyRead, this,
+          [this, reply]() { readAvailable(reply); });
+  connect(reply, &QNetworkReply::finished, this,
+          [this, reply]() { handleReply(reply); });
+
+  handleMetadataChanged(reply);
 
   if (timer) {
     timer->start(m_timeout);
   }
 }
 
+void SiteSettingsAssetHostFetcher::handleMetadataChanged(QNetworkReply *reply) {
+  if (!m_pendingReplies.contains(reply)) {
+    return;
+  }
+  if (contentLengthExceedsCap(reply)) {
+    completeReply(reply, std::nullopt, true);
+  }
+}
+
+bool SiteSettingsAssetHostFetcher::readAvailable(QNetworkReply *reply) {
+  while (reply->bytesAvailable() > 0) {
+    auto it = m_pendingReplies.find(reply);
+    if (it == m_pendingReplies.end()) {
+      return false;
+    }
+
+    const qsizetype remaining =
+        kMaxSiteSettingsResponseBytes - it.value().body.size();
+    const QByteArray chunk = reply->read(static_cast<qint64>(remaining) + 1);
+    if (chunk.isEmpty()) {
+      return true;
+    }
+    if (chunk.size() > remaining) {
+      completeReply(reply, std::nullopt, true);
+      return false;
+    }
+    it.value().body += chunk;
+  }
+  return true;
+}
+
 void SiteSettingsAssetHostFetcher::handleReply(QNetworkReply *reply) {
+  handleMetadataChanged(reply);
+  if (!m_pendingReplies.contains(reply) || !readAvailable(reply)) {
+    return;
+  }
+
   const QVariant statusAttr =
       reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
   if (!statusAttr.isValid()) {
-    emit finished();
+    completeReply(reply, std::nullopt, false);
     return;
   }
 
   const int status = statusAttr.toInt();
   if (status < 200 || status >= 300) {
-    emit finished();
+    completeReply(reply, std::nullopt, false);
     return;
   }
 
   if (reply->error() != QNetworkReply::NoError) {
-    emit finished();
+    completeReply(reply, std::nullopt, false);
     return;
   }
 
-  const QByteArray body = reply->readAll();
-  const std::optional<QUrl> assetHost = decodeAssetHost(body);
+  const auto it = m_pendingReplies.constFind(reply);
+  if (it == m_pendingReplies.constEnd()) {
+    return;
+  }
+  completeReply(reply, decodeAssetHost(it.value().body), false);
+}
+
+void SiteSettingsAssetHostFetcher::completeReply(QNetworkReply *reply,
+                                                 std::optional<QUrl> assetHost,
+                                                 bool abortReply) {
+  auto it = m_pendingReplies.find(reply);
+  if (it == m_pendingReplies.end()) {
+    return;
+  }
+
+  PendingReply pending = std::move(it.value());
+  m_pendingReplies.erase(it);
+
+  if (pending.timer) {
+    pending.timer->stop();
+    pending.timer->deleteLater();
+  }
+  QObject::disconnect(reply, nullptr, this, nullptr);
+  if (abortReply) {
+    reply->abort();
+  }
+  reply->deleteLater();
+
   if (assetHost.has_value()) {
     emit assetHostAvailable(*assetHost);
   }

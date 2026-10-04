@@ -137,6 +137,8 @@ private slots:
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable_data();
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable();
   void providerFallsBackWhenSiteSettingsRequestTimesOut();
+  void providerFallsBackWhenSiteSettingsContentLengthTooLarge();
+  void providerFallsBackWhenSiteSettingsStreamExceedsCap();
   void providerRejectsInvalidIds();
   void providerCancelAndTeardownWithInFlightRequestsDoesNotCrash();
   void providerCancelWithImmediateCompletionsDoesNotEmitFinished();
@@ -611,6 +613,123 @@ void AssetImageProviderTests::
       imageResponse->textureFactory());
   QVERIFY(factory != nullptr);
   QCOMPARE(factory->textureSize(), QSize(4, 4));
+  QCOMPARE(defaultAssetServer.requestCountForPath(defaultPath), 1);
+}
+
+void AssetImageProviderTests::
+    providerFallsBackWhenSiteSettingsContentLengthTooLarge() {
+  MockHttpServer settingsServer;
+  QVERIFY(settingsServer.start());
+  MockHttpServer defaultAssetServer;
+  QVERIFY(defaultAssetServer.start());
+
+  MockHttpServer::Response oversized = response(200);
+  oversized.contentType = QByteArrayLiteral("application/json");
+  oversized.contentLengthOverride = 65 * 1024;
+  oversized.hangAfterHeaders = true;
+  settingsServer.setResponse(QStringLiteral("/api/v1/site-settings"),
+                             oversized);
+
+  const QString defaultPath =
+      QStringLiteral("/default-assets/img/arkham/cards/01017.avif");
+  defaultAssetServer.setResponse(
+      defaultPath, response(200, pngBytes(QSize(5, 5), Qt::cyan)));
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetCardImageProvider provider(configForUrl(
+      defaultAssetServer.url(QStringLiteral("/default-assets")), cacheRoot));
+
+  QNetworkAccessManager networkAccessManager;
+  SiteSettingsAssetHostFetcher fetcher(networkAccessManager,
+                                       std::chrono::milliseconds(1000));
+  QObject::connect(&fetcher, &SiteSettingsAssetHostFetcher::assetHostAvailable,
+                   &fetcher, [&provider](const QUrl &assetHost) {
+                     provider.setAssetBaseUrl(assetHost);
+                   });
+  QSignalSpy finishedSpy(&fetcher, &SiteSettingsAssetHostFetcher::finished);
+
+  fetcher.fetch(profileFor(settingsServer));
+
+  QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+  QCOMPARE(finishedSpy.count(), 1);
+  QVERIFY(waitUntil(
+      [&settingsServer]() { return settingsServer.disconnectCount() > 0; }));
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QCOMPARE(finishedSpy.count(), 1);
+
+  std::unique_ptr<QQuickImageResponse> imageResponse(
+      provider.requestImageResponse(QStringLiteral("01017"), QSize()));
+  QSignalSpy imageFinishedSpy(imageResponse.get(),
+                              &QQuickImageResponse::finished);
+  QVERIFY(imageFinishedSpy.wait(2000) || imageFinishedSpy.count() == 1);
+  QCOMPARE(imageResponse->errorString(), QString());
+  std::unique_ptr<QQuickTextureFactory> factory(
+      imageResponse->textureFactory());
+  QVERIFY(factory != nullptr);
+  QCOMPARE(factory->textureSize(), QSize(5, 5));
+  QCOMPARE(defaultAssetServer.requestCountForPath(defaultPath), 1);
+}
+
+void AssetImageProviderTests::
+    providerFallsBackWhenSiteSettingsStreamExceedsCap() {
+  MockHttpServer settingsServer;
+  QVERIFY(settingsServer.start());
+  MockHttpServer defaultAssetServer;
+  QVERIFY(defaultAssetServer.start());
+
+  MockHttpServer::Response streaming = response(200);
+  streaming.contentType = QByteArrayLiteral("application/json");
+  streaming.includeContentLength = false;
+  streaming.chunkDelayMs = 100;
+  for (int index = 0; index < 100; ++index) {
+    streaming.chunks.append(QByteArray(33 * 1024, 'x'));
+  }
+  settingsServer.setResponse(QStringLiteral("/api/v1/site-settings"),
+                             streaming);
+
+  const QString defaultPath =
+      QStringLiteral("/default-assets/img/arkham/cards/01018.avif");
+  defaultAssetServer.setResponse(
+      defaultPath, response(200, pngBytes(QSize(6, 6), Qt::magenta)));
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetCardImageProvider provider(configForUrl(
+      defaultAssetServer.url(QStringLiteral("/default-assets")), cacheRoot));
+
+  QNetworkAccessManager networkAccessManager;
+  SiteSettingsAssetHostFetcher fetcher(networkAccessManager,
+                                       std::chrono::milliseconds(5000));
+  QObject::connect(&fetcher, &SiteSettingsAssetHostFetcher::assetHostAvailable,
+                   &fetcher, [&provider](const QUrl &assetHost) {
+                     provider.setAssetBaseUrl(assetHost);
+                   });
+  QSignalSpy finishedSpy(&fetcher, &SiteSettingsAssetHostFetcher::finished);
+
+  fetcher.fetch(profileFor(settingsServer));
+
+  QVERIFY(waitUntil([&settingsServer]() {
+    return settingsServer.requestCountForPath(
+               QStringLiteral("/api/v1/site-settings")) == 1;
+  }));
+  QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+  QCOMPARE(finishedSpy.count(), 1);
+  QVERIFY(waitUntil(
+      [&settingsServer]() { return settingsServer.disconnectCount() > 0; }));
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+  QCOMPARE(finishedSpy.count(), 1);
+
+  std::unique_ptr<QQuickImageResponse> imageResponse(
+      provider.requestImageResponse(QStringLiteral("01018"), QSize()));
+  QSignalSpy imageFinishedSpy(imageResponse.get(),
+                              &QQuickImageResponse::finished);
+  QVERIFY(imageFinishedSpy.wait(2000) || imageFinishedSpy.count() == 1);
+  QCOMPARE(imageResponse->errorString(), QString());
+  std::unique_ptr<QQuickTextureFactory> factory(
+      imageResponse->textureFactory());
+  QVERIFY(factory != nullptr);
+  QCOMPARE(factory->textureSize(), QSize(6, 6));
   QCOMPARE(defaultAssetServer.requestCountForPath(defaultPath), 1);
 }
 
