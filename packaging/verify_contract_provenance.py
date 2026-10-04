@@ -97,11 +97,15 @@ ROOT_DOCUMENTS: tuple[str, ...] = ("contracts/manifest.json",)
 # fixtures/capabilities.json is consumed directly by this client
 # (ServerCapabilities.cpp) without being schema-validated field-for-field;
 # capabilities.schema.json itself is deliberately NOT in ROOT_SCHEMAS since
-# no C++ type decodes strictly against it. It is still vendored/governed
-# because contract-pin.json/schemaRevision consistency is cross-checked
-# against it, so it is listed explicitly here rather than silently
-# excluded.
-ROOT_EXTRA_FIXTURES: tuple[str, ...] = ("contracts/fixtures/capabilities.json",)
+# no C++ type decodes strictly against it. fixtures/answer-rejected.json is
+# likewise consumed directly by the minimal ServerMessage decoder without
+# adopting the full public-game/server-message schema closure. Both are
+# still vendored/governed, so they are listed explicitly here rather than
+# silently excluded.
+ROOT_EXTRA_FIXTURES: tuple[str, ...] = (
+    "contracts/fixtures/capabilities.json",
+    "contracts/fixtures/answer-rejected.json",
+)
 
 # Directories scanned for *extra*, ungoverned files (see module docstring,
 # blind spot 2's counterpart: files present locally that the computed

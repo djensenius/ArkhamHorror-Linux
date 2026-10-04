@@ -39,7 +39,7 @@ private slots:
   void decodesOperationErrorFromFixture();
   // Round-10-cumulative-review item 5 kept exact-shape checks for narrow
   // helper fragments. DeckList and the saved Deck response now accept additive
-  // server fields while preserving the 0.1.47 fields this client models.
+  // server fields while preserving the 0.1.48 fields this client models.
   // The canonical raw-byte entry points DeckValidationError/
   // DeckValidationResult/DeckOperationError previously lacked entirely
   // (fromJson()-only before this round), proving they decode a fixture
