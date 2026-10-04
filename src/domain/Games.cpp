@@ -940,6 +940,82 @@ encodeGameListToJsonBytes(const QList<GameListRow> &rows) {
   return raw->toJsonBytes();
 }
 
+ValueOrError<ServerMessage> ServerMessage::fromRawJson(const Json::Value &v,
+                                                       QStringView path) {
+  return fromValueImpl(v, path);
+}
+
+ValueOrError<ServerMessage> ServerMessage::fromRawBytes(QByteArrayView bytes,
+                                                        QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+QString ServerMessage::displayText() const {
+  switch (m_kind) {
+  case Kind::GenericText:
+    return m_text;
+  case Kind::AnswerRejected:
+    return m_reason;
+  case Kind::Other:
+    return QString{};
+  }
+  return QString{};
+}
+
+template <typename V>
+ValueOrError<ServerMessage> ServerMessage::fromValueImpl(const V &v,
+                                                         QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  auto tag = Json::requireString(obj, "tag"_L1, Json::joinPath(path, u"tag"));
+  if (!tag)
+    return failure(tag.error());
+
+  if (*tag == "AnswerRejected"_L1) {
+    auto reason =
+        Json::requireString(obj, "reason"_L1, Json::joinPath(path, u"reason"));
+    if (!reason)
+      return failure(reason.error());
+    auto questionVersion = Json::requireNullableInt(
+        obj, "questionVersion"_L1, Json::joinPath(path, u"questionVersion"));
+    if (!questionVersion)
+      return failure(questionVersion.error());
+
+    ServerMessage result;
+    result.m_kind = Kind::AnswerRejected;
+    result.m_tag = *tag;
+    result.m_reason = *reason;
+    result.m_questionVersion = *questionVersion;
+    return result;
+  }
+
+  if (*tag == "GameMessage"_L1 || *tag == "GameError"_L1 ||
+      *tag == "GameUI"_L1 || *tag == "GameAudio"_L1 ||
+      *tag == "GameAchievement"_L1) {
+    auto text = Json::requireString(obj, "contents"_L1,
+                                    Json::joinPath(path, u"contents"));
+    if (!text)
+      return failure(text.error());
+
+    ServerMessage result;
+    result.m_kind = Kind::GenericText;
+    result.m_tag = *tag;
+    result.m_text = *text;
+    return result;
+  }
+
+  ServerMessage result;
+  result.m_kind = Kind::Other;
+  result.m_tag = *tag;
+  return result;
+}
+
 ValueOrError<CampaignOption>
 CampaignOption::knownOption(KnownCampaignOption option) {
   auto encoded = Json::encodeClosedEnum(option, kKnownCampaignOptionTable);
