@@ -167,6 +167,16 @@ private slots:
   void gameListRowNestedScenarioRejectsAdditiveField();
   void gameListRowNestedInvestigatorRejectsAdditiveField();
 
+  // server-message.json AnswerRejected/generic text ──────────────────────────
+  void answerRejectedFixtureDecodes();
+  void answerRejectedFromRawBytesDecodesQuestionVersionInt();
+  void answerRejectedFromRawBytesDecodesQuestionVersionNull();
+  void answerRejectedMissingQuestionVersionRejected();
+  void answerRejectedIgnoresAdditiveField();
+  void gameErrorStillDecodesAsGenericText();
+  void gameMessageStillDecodesAsGenericText();
+  void unmodeledServerMessageTagDecodesAsOther();
+
   // game-lifecycle.json fixture entries ──────────────────────────────────────
   void decodesCreateGameFromFixture();
   void decodesCreateGameDefaultsFromFixture();
@@ -980,6 +990,106 @@ void GamesTests::gameListRowNestedInvestigatorRejectsAdditiveField() {
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("futureField")),
            qPrintable(result.error()));
+}
+
+void GamesTests::answerRejectedFixtureDecodes() {
+  const QByteArray fixture =
+      loadFixtureBytes(QStringLiteral("answer-rejected.json"));
+  const auto result = ServerMessage::fromRawBytes(fixture, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::AnswerRejected);
+  QCOMPARE(result->tag(), QStringLiteral("AnswerRejected"));
+  QCOMPARE(result->reason(), QStringLiteral("Stale question"));
+  QVERIFY(result->questionVersion().has_value());
+  QCOMPARE(*result->questionVersion(), qint64{8});
+  QCOMPARE(result->displayText(), QStringLiteral("Stale question"));
+}
+
+void GamesTests::answerRejectedFromRawBytesDecodesQuestionVersionInt() {
+  const QByteArray bytes =
+      R"({"tag":"AnswerRejected","reason":"Stale question","questionVersion":8})";
+  const auto result = ServerMessage::fromRawBytes(bytes, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::AnswerRejected);
+  QCOMPARE(result->reason(), QStringLiteral("Stale question"));
+  QVERIFY(result->questionVersion().has_value());
+  QCOMPARE(*result->questionVersion(), qint64{8});
+}
+
+void GamesTests::answerRejectedFromRawBytesDecodesQuestionVersionNull() {
+  const QByteArray bytes =
+      R"({"tag":"AnswerRejected","reason":"No active question","questionVersion":null})";
+  const auto result = ServerMessage::fromRawBytes(bytes, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::AnswerRejected);
+  QCOMPARE(result->reason(), QStringLiteral("No active question"));
+  QVERIFY(!result->questionVersion().has_value());
+}
+
+void GamesTests::answerRejectedMissingQuestionVersionRejected() {
+  const QByteArray bytes =
+      R"({"tag":"AnswerRejected","reason":"Stale question"})";
+  const auto result = ServerMessage::fromRawBytes(bytes, u"message");
+  QVERIFY2(!result.has_value(), "missing required questionVersion must fail");
+  QVERIFY2(result.error().contains(QStringLiteral("missing required field")),
+           qPrintable(result.error()));
+  QVERIFY2(result.error().contains(QStringLiteral("questionVersion")),
+           qPrintable(result.error()));
+}
+
+void GamesTests::answerRejectedIgnoresAdditiveField() {
+  const QByteArray bytes =
+      R"({"tag":"AnswerRejected","reason":"Stale question","questionVersion":8,"future":{"nested":true}})";
+  const auto result = ServerMessage::fromRawBytes(bytes, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::AnswerRejected);
+  QCOMPARE(result->reason(), QStringLiteral("Stale question"));
+  QCOMPARE(*result->questionVersion(), qint64{8});
+}
+
+void GamesTests::gameErrorStillDecodesAsGenericText() {
+  const QByteArray bytes =
+      R"({"tag":"GameError","contents":"Room-wide error","future":true})";
+  const auto result = ServerMessage::fromRawBytes(bytes, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::GenericText);
+  QCOMPARE(result->tag(), QStringLiteral("GameError"));
+  QCOMPARE(result->text(), QStringLiteral("Room-wide error"));
+  QCOMPARE(result->displayText(), QStringLiteral("Room-wide error"));
+}
+
+void GamesTests::gameMessageStillDecodesAsGenericText() {
+  const QByteArray bytes =
+      R"({"tag":"GameMessage","contents":"Investigator drew a card"})";
+  const auto result = ServerMessage::fromRawBytes(bytes, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::GenericText);
+  QCOMPARE(result->tag(), QStringLiteral("GameMessage"));
+  QCOMPARE(result->text(), QStringLiteral("Investigator drew a card"));
+}
+
+void GamesTests::unmodeledServerMessageTagDecodesAsOther() {
+  const QByteArray bytes =
+      R"({"tag":"GameUpdate","contents":{"unmodeled":"public-game"}})";
+  const auto result = ServerMessage::fromRawBytes(bytes, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::Other);
+  QCOMPARE(result->tag(), QStringLiteral("GameUpdate"));
+  QVERIFY(result->displayText().isEmpty());
 }
 
 void GamesTests::decodesCreateGameFromFixture() {
