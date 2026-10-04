@@ -642,7 +642,7 @@ void AssetImageProviderTests::
 
   QNetworkAccessManager networkAccessManager;
   SiteSettingsAssetHostFetcher fetcher(networkAccessManager,
-                                       std::chrono::milliseconds(1000));
+                                       std::chrono::milliseconds(0));
   QObject::connect(&fetcher, &SiteSettingsAssetHostFetcher::assetHostAvailable,
                    &fetcher, [&provider](const QUrl &assetHost) {
                      provider.setAssetBaseUrl(assetHost);
@@ -651,7 +651,7 @@ void AssetImageProviderTests::
 
   fetcher.fetch(profileFor(settingsServer));
 
-  QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+  QVERIFY(finishedSpy.wait(1000) || finishedSpy.count() == 1);
   QCOMPARE(finishedSpy.count(), 1);
   QVERIFY(waitUntil(
       [&settingsServer]() { return settingsServer.disconnectCount() > 0; }));
