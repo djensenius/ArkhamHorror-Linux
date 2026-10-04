@@ -677,21 +677,37 @@ void AssetImageProviderTests::
   QVERIFY(settingsServer.start());
   MockHttpServer defaultAssetServer;
   QVERIFY(defaultAssetServer.start());
-
-  MockHttpServer::Response streaming = response(200);
-  streaming.contentType = QByteArrayLiteral("application/json");
-  streaming.includeContentLength = false;
-  streaming.chunkDelayMs = 100;
-  for (int index = 0; index < 100; ++index) {
-    streaming.chunks.append(QByteArray(33 * 1024, 'x'));
-  }
-  settingsServer.setResponse(QStringLiteral("/api/v1/site-settings"),
-                             streaming);
+  MockHttpServer configuredAssetServer;
+  QVERIFY(configuredAssetServer.start());
 
   const QString defaultPath =
       QStringLiteral("/default-assets/img/arkham/cards/01018.avif");
   defaultAssetServer.setResponse(
       defaultPath, response(200, pngBytes(QSize(6, 6), Qt::magenta)));
+  const QString configuredPath =
+      QStringLiteral("/configured-assets/img/arkham/cards/01018.avif");
+  configuredAssetServer.setResponse(
+      configuredPath, response(200, pngBytes(QSize(7, 7), Qt::blue)));
+
+  QByteArray body =
+      QByteArrayLiteral("{\"assetHost\":\"") +
+      configuredAssetServer.url(QStringLiteral("/configured-assets"))
+          .toString()
+          .toUtf8() +
+      QByteArrayLiteral("\",\"pad\":\"") + QByteArray(70 * 1024, 'x') +
+      QByteArrayLiteral("\"}");
+
+  MockHttpServer::Response streaming = response(200);
+  streaming.contentType = QByteArrayLiteral("application/json");
+  streaming.includeContentLength = false;
+  streaming.chunkDelayMs = 1;
+  while (!body.isEmpty()) {
+    const qsizetype chunkSize = qMin<qsizetype>(8192, body.size());
+    streaming.chunks.append(body.left(chunkSize));
+    body.remove(0, chunkSize);
+  }
+  settingsServer.setResponse(QStringLiteral("/api/v1/site-settings"),
+                             streaming);
 
   QTemporaryDir cacheRoot;
   QVERIFY(cacheRoot.isValid());
@@ -731,6 +747,7 @@ void AssetImageProviderTests::
   QVERIFY(factory != nullptr);
   QCOMPARE(factory->textureSize(), QSize(6, 6));
   QCOMPARE(defaultAssetServer.requestCountForPath(defaultPath), 1);
+  QCOMPARE(configuredAssetServer.requestCountForPath(configuredPath), 0);
 }
 
 void AssetImageProviderTests::providerRejectsInvalidIds() {
