@@ -478,57 +478,6 @@ encodeGameListToRawJson(const QList<GameListRow> &rows);
 [[nodiscard]] ValueOrError<QByteArray>
 encodeGameListToJsonBytes(const QList<GameListRow> &rows);
 
-// server-message.schema.json's envelope subset this client currently needs.
-// Linux has no gameplay WebSocket/session-answer model yet, so this class
-// keeps the boundary minimal: generic text messages (including GameError)
-// and AnswerRejected are decoded for display/status plumbing, while other
-// server-message tags remain recognized only by their tag so adding gameplay
-// wiring later does not require re-parsing raw socket bytes.
-class ServerMessage {
-public:
-  enum class Kind { GenericText, AnswerRejected, Other };
-
-  [[nodiscard]] static ValueOrError<ServerMessage>
-  fromRawJson(const Json::Value &v, QStringView path);
-  [[nodiscard]] static ValueOrError<ServerMessage>
-  fromRawBytes(QByteArrayView bytes, QStringView path);
-
-  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
-  [[nodiscard]] const QString &tag() const noexcept { return m_tag; }
-  // GenericText-only: GameMessage/GameError/GameUI/GameAudio/GameAchievement
-  // string contents. Empty for non-generic tags.
-  [[nodiscard]] const QString &text() const noexcept { return m_text; }
-  // AnswerRejected-only: human-readable server rejection reason. Exposed so
-  // future gameplay/status UI can surface it directly without treating it as
-  // a room-wide GameError.
-  [[nodiscard]] const QString &reason() const noexcept { return m_reason; }
-  // AnswerRejected-only: required key, nullable value. std::nullopt means the
-  // key was present with JSON null, not omitted.
-  [[nodiscard]] const std::optional<qint64> &questionVersion() const noexcept {
-    return m_questionVersion;
-  }
-  // Minimal user-visible status text for the modeled displayable branches:
-  // AnswerRejected shows its reason; generic messages show contents; other
-  // tags have no text at this layer.
-  [[nodiscard]] QString displayText() const;
-
-  friend bool operator==(const ServerMessage &,
-                         const ServerMessage &) = default;
-
-private:
-  ServerMessage() = default;
-
-  template <typename V>
-  [[nodiscard]] static ValueOrError<ServerMessage>
-  fromValueImpl(const V &v, QStringView path);
-
-  Kind m_kind{Kind::Other};
-  QString m_tag;
-  QString m_text;
-  QString m_reason;
-  std::optional<qint64> m_questionVersion;
-};
-
 // createGameRequest's known `options` entries (Arkham.Campaign.Option's
 // CampaignOption, minus its one payload-carrying constructor,
 // `CampaignVariant Text`, modeled separately below).
@@ -1034,5 +983,56 @@ struct ClaimSeatRequest {
 // "c"-prefixed) card codes of investigators still owed a seat.
 [[nodiscard]] ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
                                                             QStringView path);
+
+// server-message.schema.json's envelope subset this client currently needs.
+// Linux has no gameplay WebSocket/session-answer model yet, so this class
+// keeps the boundary minimal: generic text messages (including GameError)
+// and AnswerRejected are decoded for display/status plumbing, while other
+// server-message tags remain recognized only by their tag so adding gameplay
+// wiring later does not require re-parsing raw socket bytes.
+class ServerMessage {
+public:
+  enum class Kind { GenericText, AnswerRejected, Other };
+
+  [[nodiscard]] static ValueOrError<ServerMessage>
+  fromRawJson(const Json::Value &v, QStringView path);
+  [[nodiscard]] static ValueOrError<ServerMessage>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
+
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  [[nodiscard]] const QString &tag() const noexcept { return m_tag; }
+  // GenericText-only: GameMessage/GameError/GameUI/GameAudio/GameAchievement
+  // string contents. Empty for non-generic tags.
+  [[nodiscard]] const QString &text() const noexcept { return m_text; }
+  // AnswerRejected-only: human-readable server rejection reason. Exposed so
+  // future gameplay/status UI can surface it directly without treating it as
+  // a room-wide GameError.
+  [[nodiscard]] const QString &reason() const noexcept { return m_reason; }
+  // AnswerRejected-only: required key, nullable value. std::nullopt means the
+  // key was present with JSON null, not omitted.
+  [[nodiscard]] const std::optional<qint64> &questionVersion() const noexcept {
+    return m_questionVersion;
+  }
+  // Minimal user-visible status text for the modeled displayable branches:
+  // AnswerRejected shows its reason; generic messages show contents; other
+  // tags have no text at this layer.
+  [[nodiscard]] QString displayText() const;
+
+  friend bool operator==(const ServerMessage &,
+                         const ServerMessage &) = default;
+
+private:
+  ServerMessage() = default;
+
+  template <typename V>
+  [[nodiscard]] static ValueOrError<ServerMessage>
+  fromValueImpl(const V &v, QStringView path);
+
+  Kind m_kind{Kind::Other};
+  QString m_tag;
+  QString m_text;
+  QString m_reason;
+  std::optional<qint64> m_questionVersion;
+};
 
 } // namespace Arkham
