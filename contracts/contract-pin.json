@@ -1,9 +1,9 @@
 {
-  "backendCommit": "f454ccb9fb789739c666a9cbd74d3fdc14a81fb9",
-  "sourceRef": "djensenius/ArkhamHorror#130",
-  "schemaRevision": "0.1.48",
+  "backendCommit": "25a3eb8072d0b3a309a7090912c2a9c2b858c730",
+  "sourceRef": "djensenius/ArkhamHorror#152",
+  "schemaRevision": "0.1.52",
   "minimumServerSchemaRevision": "0.1.48",
-  "nativeClientMinimumRevision": "0.1.0",
+  "nativeClientMinimumRevision": "0.1.50",
   "apiBasePath": "/api/v1",
-  "note": "Minimum metadata pinned from backend PR #130. Not a full manifest. See djensenius/ArkhamHorror contracts/ for the authoritative full contract, vendored alongside this file for catalog/deck/game-lifecycle/game-list and AnswerRejected decoding."
+  "note": "Minimum server revision remains 0.1.48 while this client understands additive contract data through schema 0.1.52. See djensenius/ArkhamHorror contracts/ for the authoritative full contract, vendored alongside this file for catalog/deck/game-lifecycle/game-list, campaign catalog metadata, capabilities and AnswerRejected decoding."
 }

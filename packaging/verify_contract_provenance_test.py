@@ -40,10 +40,12 @@ class FakeTree(vcp.GitTree):
         return self._modes.get(path, ("100644", "blob"))
 
 
+CAMPAIGN_CATALOG_SCHEMA = b'{"$defs": {"campaign": {}}}'
 CATALOG_SCHEMA = b'{"$defs": {"cardCost": {"$ref": "#/$defs/nested"}}}'
 DECKS_SCHEMA = b'{"$defs": {"deckList": {}}}'
 MANIFEST = (
     b'{"fixtures": ['
+    b'{"path": "contracts/fixtures/campaign-catalog.json", "schema": "contracts/schemas/campaign-catalog.schema.json"},'
     b'{"path": "contracts/fixtures/catalog.json", "schema": "contracts/schemas/catalog.schema.json"},'
     b'{"path": "contracts/fixtures/decks.json", "schema": "contracts/schemas/decks.schema.json"},'
     b'{"path": "contracts/fixtures/account.json", "schema": "contracts/schemas/account.schema.json"}'
@@ -51,12 +53,14 @@ MANIFEST = (
 )
 CAPABILITIES = b'{"schemaRevision": "0.1.12"}'
 ANSWER_REJECTED = b'{"tag":"AnswerRejected","reason":"Stale question","questionVersion":8}'
+CAMPAIGN_CATALOG_FIXTURE = b'{"campaigns": []}'
 CATALOG_FIXTURE = b'{"cards": []}'
 DECKS_FIXTURE = b'{"decks": []}'
 
 
 def _baseline_blobs() -> dict[str, bytes]:
     return {
+        "contracts/schemas/campaign-catalog.schema.json": CAMPAIGN_CATALOG_SCHEMA,
         "contracts/schemas/catalog.schema.json": CATALOG_SCHEMA,
         "contracts/schemas/decks.schema.json": DECKS_SCHEMA,
         "contracts/schemas/game-lifecycle.schema.json": b"{}",
@@ -65,6 +69,7 @@ def _baseline_blobs() -> dict[str, bytes]:
         "contracts/manifest.json": MANIFEST,
         "contracts/fixtures/capabilities.json": CAPABILITIES,
         "contracts/fixtures/answer-rejected.json": ANSWER_REJECTED,
+        "contracts/fixtures/campaign-catalog.json": CAMPAIGN_CATALOG_FIXTURE,
         "contracts/fixtures/catalog.json": CATALOG_FIXTURE,
         "contracts/fixtures/decks.json": DECKS_FIXTURE,
     }
@@ -74,10 +79,12 @@ class ClosureTests(unittest.TestCase):
     def test_governed_paths_includes_roots_and_manifest_derived_fixtures(self):
         tree = FakeTree(_baseline_blobs())
         governed = vcp.compute_governed_paths(tree)
+        self.assertIn("contracts/schemas/campaign-catalog.schema.json", governed)
         self.assertIn("contracts/schemas/catalog.schema.json", governed)
         self.assertIn("contracts/manifest.json", governed)
         self.assertIn("contracts/fixtures/capabilities.json", governed)
         self.assertIn("contracts/fixtures/answer-rejected.json", governed)
+        self.assertIn("contracts/fixtures/campaign-catalog.json", governed)
         self.assertIn("contracts/fixtures/catalog.json", governed)
         self.assertIn("contracts/fixtures/decks.json", governed)
         # account.json's schema (account.schema.json) is not in the

@@ -1,0 +1,403 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arkhamhorror.app/contracts/campaign-catalog.schema.json",
+  "title": "Campaign and scenario catalog",
+  "description": "Generated native-client catalog for create-game campaign and scenario choices. Campaign, scenario, Return-to and side-story titles are i18n keys resolved through the locale catalog. Some web-authored English strings remain in v1 for deckRequirements, setting labels and Record keys where the web data has no typed locale key yet.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "catalogRevision",
+    "endpoint",
+    "digestAlgorithm",
+    "campaigns",
+    "scenarios",
+    "sideStories",
+    "provenance"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "catalogRevision": {
+      "type": "string",
+      "pattern": "^1\\.[0-9a-f]{32}(?![\\s\\S])"
+    },
+    "endpoint": {
+      "const": "/api/v1/arkham/campaign-catalog"
+    },
+    "digestAlgorithm": {
+      "const": "sha256"
+    },
+    "campaigns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/campaign"
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/scenario"
+      }
+    },
+    "sideStories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/sideStory"
+      }
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9:_-]+$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "i18nKey": {
+      "type": "string",
+      "pattern": "^catalogNames\\.(campaigns|scenarios|sideStories)\\.[A-Za-z0-9:_-]+(\\.returnTo|\\.parts\\.[A-Za-z0-9:_-]+)?\\.name$",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "difficulty": {
+      "enum": [
+        "Easy",
+        "Standard",
+        "Hard",
+        "Expert"
+      ]
+    },
+    "tokenFace": {
+      "enum": [
+        "AutoFail",
+        "BloodToken",
+        "Cultist",
+        "ElderSign",
+        "ElderThing",
+        "FrostToken",
+        "MinusEight",
+        "MinusFive",
+        "MinusFour",
+        "MinusOne",
+        "MinusSeven",
+        "MinusSix",
+        "MinusThree",
+        "MinusTwo",
+        "PlusOne",
+        "Skull",
+        "Tablet",
+        "Zero"
+      ]
+    },
+    "difficultyLevels": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/difficulty"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "$ref": "#/$defs/tokenFace"
+        }
+      }
+    },
+    "releaseFields": {
+      "type": "object",
+      "properties": {
+        "alpha": {
+          "type": "boolean"
+        },
+        "beta": {
+          "type": "boolean"
+        },
+        "dev": {
+          "type": "boolean"
+        }
+      }
+    },
+    "returnToCampaign": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/releaseFields"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "nameKey"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "nameKey": {
+              "$ref": "#/$defs/i18nKey"
+            },
+            "alpha": {
+              "type": "boolean"
+            },
+            "beta": {
+              "type": "boolean"
+            },
+            "dev": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "campaign": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/releaseFields"
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "id",
+            "nameKey"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "nameKey": {
+              "$ref": "#/$defs/i18nKey"
+            },
+            "difficultyLevels": {
+              "$ref": "#/$defs/difficultyLevels"
+            },
+            "returnTo": {
+              "$ref": "#/$defs/returnToCampaign"
+            },
+            "variants": {
+              "type": "array",
+              "description": "Untyped web create-game variant records in v1; label keys use create.fullCampaignOption.*."
+            },
+            "recommendedOptions": {
+              "type": "array",
+              "description": "Untyped web recommended-option records in v1; label keys use create.recommendedOption.*.title."
+            },
+            "settings": {
+              "type": "array",
+              "description": "Untyped web create-game setting records in v1; clients should preserve unknown shapes and render only recognized kinds."
+            },
+            "name": false
+          }
+        }
+      ]
+    },
+    "scenarioBase": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/releaseFields"
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "id",
+            "nameKey"
+          ],
+          "dependentRequired": {
+            "returnTo": [
+              "returnToNameKey"
+            ],
+            "returnToNameKey": [
+              "returnTo"
+            ],
+            "requiredInvestigator": [
+              "requiredInvestigatorCodes"
+            ],
+            "requiredInvestigatorCodes": [
+              "requiredInvestigator"
+            ]
+          },
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "nameKey": {
+              "$ref": "#/$defs/i18nKey"
+            },
+            "campaign": {
+              "$ref": "#/$defs/id"
+            },
+            "returnTo": {
+              "$ref": "#/$defs/id"
+            },
+            "returnToNameKey": {
+              "$ref": "#/$defs/i18nKey"
+            },
+            "standaloneDifficulties": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/difficulty"
+              },
+              "uniqueItems": true
+            },
+            "difficultyLevels": {
+              "$ref": "#/$defs/difficultyLevels"
+            },
+            "settings": {
+              "type": "array",
+              "description": "Untyped web create-game setting records in v1; clients should preserve unknown shapes and render only recognized kinds."
+            },
+            "requiredInvestigator": {
+              "type": "string",
+              "minLength": 1
+            },
+            "deckRequirements": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "name": false,
+            "requiredInvestigatorCodes": {
+              "description": "ArkhamDB/player-card codes accepted by the web deck restriction for the required investigator, including parallel and replacement fronts where the web allows them.",
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9]{5}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "scenario": {
+      "$ref": "#/$defs/scenarioBase"
+    },
+    "sideStoryPart": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "nameKey"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "nameKey": {
+          "$ref": "#/$defs/i18nKey"
+        },
+        "box": {
+          "$ref": "#/$defs/id"
+        },
+        "notAfter": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "name": false
+      }
+    },
+    "sideStory": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/scenarioBase"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scenarios": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/sideStoryPart"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sourceDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generator",
+        "generatorVersion",
+        "schemaVersion",
+        "dataSourcesSha256",
+        "generatorSha256",
+        "schemasSha256",
+        "sha256",
+        "sources",
+        "outputSha256"
+      ],
+      "properties": {
+        "generator": {
+          "const": "arkham-campaign-catalog"
+        },
+        "generatorVersion": {
+          "const": "1.0.0"
+        },
+        "schemaVersion": {
+          "const": "1.0.0"
+        },
+        "dataSourcesSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "generatorSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "schemasSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/sourceDigest"
+          }
+        },
+        "outputSha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

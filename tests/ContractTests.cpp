@@ -185,8 +185,8 @@ void ContractTests::strictAsciiOnlyParsing() {
 
 void ContractTests::parsesVendoredFixture() {
   // Load from the vendored fixture, not from an inline duplicate string.
-  // This fixture is git-show f454ccb:contracts/fixtures/capabilities.json,
-  // pinned to the PR#130 backend commit.
+  // This fixture is git-show 25a3eb8:contracts/fixtures/capabilities.json,
+  // pinned to the PR#152 backend commit.
   const auto fileResult =
       openContractFile(QStringLiteral("/fixtures/capabilities.json"));
   if (!fileResult.has_value())
@@ -194,15 +194,19 @@ void ContractTests::parsesVendoredFixture() {
   const QJsonDocument doc = QJsonDocument::fromJson(*fileResult);
   QVERIFY(doc.isObject());
 
-  const auto result = ServerCapabilities::fromJson(doc.object());
+  const QJsonObject obj = doc.object();
+  QVERIFY(obj.value(QStringLiteral("campaignCatalog")).isObject());
+
+  const auto result = ServerCapabilities::fromJson(obj);
   if (!result.has_value())
     QFAIL(qPrintable(result.error()));
 
-  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 48}));
+  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 52}));
   QCOMPARE(result->status, QStringLiteral("baseline-incomplete"));
   QCOMPARE(result->apiBasePath, QStringLiteral("/api/v1"));
-  QCOMPARE(result->nativeClientMinimumRevision, (ContractRevision{0, 1, 0}));
-  QCOMPARE(result->capabilities.size(), 5);
+  QCOMPARE(result->nativeClientMinimumRevision, (ContractRevision{0, 1, 50}));
+  QCOMPARE(result->capabilities.size(), 6);
+  QVERIFY(result->hasCapability(u"arkham.campaign-catalog.v1"));
   QVERIFY(result->hasCapability(u"events.shared-state-versioning"));
   QVERIFY(result->hasCapability(u"games.step-probe"));
   QVERIFY(result->hasCapability(u"questions.semantic-presentation.v2"));
