@@ -1,13 +1,20 @@
 {
-  "schemaRevision": "0.1.48",
+  "schemaRevision": "0.1.52",
   "status": "baseline-incomplete",
   "apiBasePath": "/api/v1",
-  "nativeClientMinimumRevision": "0.1.0",
+  "nativeClientMinimumRevision": "0.1.50",
   "capabilities": [
+    "arkham.campaign-catalog.v1",
     "events.shared-state-versioning",
     "games.step-probe",
     "questions.semantic-presentation.v2",
     "websockets.authorization-header",
     "websockets.spectator-read-only"
-  ]
+  ],
+  "campaignCatalog": {
+    "endpoint": "/api/v1/arkham/campaign-catalog",
+    "catalogRevision": "1.0123456789abcdef0123456789abcdef",
+    "schemaVersion": "1.0.0",
+    "digestAlgorithm": "sha256"
+  }
 }

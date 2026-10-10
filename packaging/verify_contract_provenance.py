@@ -76,12 +76,13 @@ DEFAULT_REMOTE = "https://github.com/djensenius/ArkhamHorror.git"
 
 # Explicit, human-reviewed root list of backend contract schemas this
 # client's C++ models are pinned to (catalog, decks, game-lifecycle,
-# game-list, game-state -- see CardCatalog.h/Decks.h/Games.h). This is the
-# ONE place a human reviewer must keep in sync with "what this client
-# actually implements decoders for"; every other governed path below is
-# discovered automatically from this root by walking the pinned BACKEND's
-# own git tree, never a local file.
+# game-list, game-state, and the vendored campaign-catalog endpoint
+# metadata). This is the ONE place a human reviewer must keep in sync with
+# "what this client actually implements decoders for"; every other
+# governed path below is discovered automatically from this root by walking
+# the pinned BACKEND's own git tree, never a local file.
 ROOT_SCHEMAS: tuple[str, ...] = (
+    "contracts/schemas/campaign-catalog.schema.json",
     "contracts/schemas/catalog.schema.json",
     "contracts/schemas/decks.schema.json",
     "contracts/schemas/game-lifecycle.schema.json",

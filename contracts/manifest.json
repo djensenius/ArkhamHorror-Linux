@@ -1,5 +1,5 @@
 {
-  "schemaRevision": "0.1.48",
+  "schemaRevision": "0.1.52",
   "status": "baseline-incomplete",
   "apiBasePath": "/api/v1",
   "documents": [
@@ -11,6 +11,7 @@
     "contracts/schemas/basic-choice-question.schema.json",
     "contracts/schemas/question-presentation.schema.json",
     "contracts/schemas/capabilities.schema.json",
+    "contracts/schemas/campaign-catalog.schema.json",
     "contracts/schemas/catalog.schema.json",
     "contracts/schemas/client-answer.schema.json",
     "contracts/schemas/decks.schema.json",
@@ -42,7 +43,7 @@
     "contracts/fixtures/locale-catalog-backend-registry.json",
     "contracts/fixtures/locale-catalog-chunk-2efb9d458b5dd9b7ae9a284c277ca68e47a40212c95ce85da5b50f598d9fc448.json",
     "contracts/fixtures/locale-catalog-chunk-309d63c6b0ab62a2fc4bc993860a820b05c156f2e7d67439a24b487839df1488.json",
-    "contracts/fixtures/locale-catalog-chunk-932fbfdd3570550d2bd7255599e7b54cb8ceac12d4597686613d97254b67c12d.json",
+    "contracts/fixtures/locale-catalog-chunk-9a30c62c45fb06a929d13506b454d5b9637c5bf3eeb986243ddb007a856cb1a5.json",
     "contracts/fixtures/locale-catalog-chunk-d951fedc2b5f0644bb126beb77f6e03a2abad3627c274985e9b8a42b09116693.json",
     "contracts/fixtures/locale-catalog-manifest.json",
     "contracts/fixtures/locale-catalog-owned-files.json",
@@ -68,6 +69,10 @@
     {
       "path": "contracts/fixtures/capabilities-locale-catalog.json",
       "schema": "contracts/schemas/capabilities.schema.json"
+    },
+    {
+      "path": "contracts/fixtures/campaign-catalog.json",
+      "schema": "contracts/schemas/campaign-catalog.schema.json"
     },
     {
       "path": "contracts/fixtures/catalog.json",
@@ -564,7 +569,7 @@
   ],
   "compatibility": {
     "webClient": "unchanged",
-    "nativeClientMinimumRevision": "0.1.0"
+    "nativeClientMinimumRevision": "0.1.50"
   },
   "canonicalIntegerChecks": [
     {
@@ -756,6 +761,172 @@
     }
   ],
   "negativeFixtures": [
+    {
+      "description": "Campaign catalog schemaVersion rejects unsupported versions so clients never guess at a changed catalog shape.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "replace",
+        "pointer": "/schemaVersion",
+        "value": "2.0.0"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "schemaVersion"
+          ],
+          "keyword": "const",
+          "messageContains": "was expected"
+        }
+      ]
+    },
+    {
+      "description": "Campaign catalog fixture rejects leaked English title fields so clients localize through nameKey.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "add",
+        "pointer": "/campaigns/0/name",
+        "value": "The Night of the Zealot"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "campaigns",
+            "0"
+          ],
+          "keyword": null,
+          "messageContains": "False schema does not allow"
+        }
+      ]
+    },
+    {
+      "description": "Campaign catalog fixture rejects malformed generated name keys so clients can resolve titles through catalogNames.*.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "replace",
+        "pointer": "/campaigns/0/nameKey",
+        "value": "campaigns.01.name"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "campaigns",
+            "0",
+            "nameKey"
+          ],
+          "keyword": "pattern",
+          "messageContains": "does not match"
+        }
+      ]
+    },
+    {
+      "description": "Campaign catalog fixture rejects unknown difficulty labels so native setup screens do not guess at chaos bag names.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "replace",
+        "pointer": "/sideStories/0/standaloneDifficulties/0",
+        "value": "Story"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "sideStories",
+            "0",
+            "standaloneDifficulties",
+            "0"
+          ],
+          "keyword": "enum",
+          "messageContains": "is not one of"
+        }
+      ]
+    },
+    {
+      "description": "Campaign catalog fixture rejects a required investigator without ArkhamDB card codes.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "remove",
+        "pointer": "/sideStories/0/requiredInvestigatorCodes"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "sideStories",
+            "0"
+          ],
+          "keyword": "dependentRequired",
+          "messageContains": "'requiredInvestigatorCodes' is a dependency of 'requiredInvestigator'"
+        }
+      ]
+    },
+    {
+      "description": "Campaign catalog fixture rejects required investigator card codes without the investigator name.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "remove",
+        "pointer": "/sideStories/0/requiredInvestigator"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "sideStories",
+            "0"
+          ],
+          "keyword": "dependentRequired",
+          "messageContains": "'requiredInvestigator' is a dependency of 'requiredInvestigatorCodes'"
+        }
+      ]
+    },
+    {
+      "description": "Campaign catalog fixture rejects Return-to scenario ids without a localized Return-to name key.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "remove",
+        "pointer": "/scenarios/0/returnToNameKey"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "scenarios",
+            "0"
+          ],
+          "keyword": "dependentRequired",
+          "messageContains": "'returnToNameKey' is a dependency of 'returnTo'"
+        }
+      ]
+    },
+    {
+      "description": "Campaign catalog fixture rejects Return-to name keys without the Return-to scenario id.",
+      "schema": "contracts/schemas/campaign-catalog.schema.json",
+      "basePositiveFixture": "contracts/fixtures/campaign-catalog.json",
+      "basePointer": "",
+      "mutation": {
+        "op": "remove",
+        "pointer": "/scenarios/0/returnTo"
+      },
+      "expectedErrors": [
+        {
+          "path": [
+            "scenarios",
+            "0"
+          ],
+          "keyword": "dependentRequired",
+          "messageContains": "'returnTo' is a dependency of 'returnToNameKey'"
+        }
+      ]
+    },
     {
       "description": "The encounter draw amount rejects negative integers.",
       "schema": "contracts/schemas/basic-choice-question.schema.json",
@@ -3511,7 +3682,7 @@
       "basePointer": "",
       "mutation": {
         "op": "remove",
-        "pointer": "/capabilities/2"
+        "pointer": "/capabilities/3"
       },
       "expectedErrors": [
         {
@@ -16137,8 +16308,9 @@
     "contracts/fixtures/answer-retire-investigator.json": "765180a79c83be002b4fd4c2879e6f3b84ad14df44bc986d70043dbd109708c2",
     "contracts/fixtures/answer-scenario-specific.json": "a63eb4b30df34bfb466f998155e0dcc36c910eb44bb6e492e40d46ae30d86dc4",
     "contracts/fixtures/answer-standalone-settings.json": "b59b8fbd200209b0966a75954aa5258e1f177f87c5fa1fba9243dee65cbf6066",
-    "contracts/fixtures/capabilities-locale-catalog.json": "1d573d2b4baebf6e9e155e0436d4401f27f6303a31b092532663e2b89b4e3178",
-    "contracts/fixtures/capabilities.json": "56a02493c3b3495797bac45f84d3b6de0926645f243a2a71fc66fa85b3ff6fac",
+    "contracts/fixtures/campaign-catalog.json": "1319f85f8d709c2e7134586621da42cb376048154cc5498e3f24a395c365c250",
+    "contracts/fixtures/capabilities-locale-catalog.json": "d9b61ece46e8bd7416f9c5cd1d7c16b9f84daaf09b898125e8892d44afb7d036",
+    "contracts/fixtures/capabilities.json": "38effc498e81e1cd5b9138476e4e8b1032663b4d9af4ed6fd9b19834308c7f25",
     "contracts/fixtures/card-code-entity-map.json": "970749b0970f629722515394068afb660b9168a8fbeea768afbbc1cf1ef66492",
     "contracts/fixtures/catalog.json": "481f42cbac1fcb208cdb1b626a3cc6951c35531383e7439dc3c0d7c02a9044ac",
     "contracts/fixtures/decks.json": "be1b19529d95386c6c2ed0b5c665aa25ae64a450c8a3f412d10b8523b966aaff",
@@ -16160,15 +16332,15 @@
     "contracts/fixtures/game-update.json": "1c72d670d73e20f7923c8abc8817a89f198418bde23d1f0577e25386638ef827",
     "contracts/fixtures/get-game.json": "9747de6984c2028a043f9fd5a20b29179ad0980705b010e5a196f9eb4cb8a80c",
     "contracts/fixtures/investigator-unhealed-horror-negative.json": "f251bd1a525fa0eb9508db084fbe7fb86928ec1ecb4472cf0c79cbaf9478762f",
-    "contracts/fixtures/locale-catalog-backend-registry.json": "3f39e0f443341bc194a2ba645584007a161875d2e1981bb9c16c8f466880c6c4",
+    "contracts/fixtures/locale-catalog-backend-registry.json": "dd5499efa098c6b99492115fc06f55bc21b8d46d4434f9b5fa94bb1aa104180e",
     "contracts/fixtures/locale-catalog-chunk-2efb9d458b5dd9b7ae9a284c277ca68e47a40212c95ce85da5b50f598d9fc448.json": "2efb9d458b5dd9b7ae9a284c277ca68e47a40212c95ce85da5b50f598d9fc448",
     "contracts/fixtures/locale-catalog-chunk-309d63c6b0ab62a2fc4bc993860a820b05c156f2e7d67439a24b487839df1488.json": "309d63c6b0ab62a2fc4bc993860a820b05c156f2e7d67439a24b487839df1488",
-    "contracts/fixtures/locale-catalog-chunk-932fbfdd3570550d2bd7255599e7b54cb8ceac12d4597686613d97254b67c12d.json": "932fbfdd3570550d2bd7255599e7b54cb8ceac12d4597686613d97254b67c12d",
+    "contracts/fixtures/locale-catalog-chunk-9a30c62c45fb06a929d13506b454d5b9637c5bf3eeb986243ddb007a856cb1a5.json": "9a30c62c45fb06a929d13506b454d5b9637c5bf3eeb986243ddb007a856cb1a5",
     "contracts/fixtures/locale-catalog-chunk-d951fedc2b5f0644bb126beb77f6e03a2abad3627c274985e9b8a42b09116693.json": "d951fedc2b5f0644bb126beb77f6e03a2abad3627c274985e9b8a42b09116693",
-    "contracts/fixtures/locale-catalog-manifest.json": "cad6e917a5d03a832eba09d74e08fbb07b93fed5b2264e974d31b1feec2ae788",
-    "contracts/fixtures/locale-catalog-owned-files.json": "139e69af182999d7a9164c87bb7395c702717b0afaf0dd7d1de1082b613f979e",
+    "contracts/fixtures/locale-catalog-manifest.json": "604f6619514e7562f8070977038a3a67fa9b0dc13f22200fb3603d3dc436118d",
+    "contracts/fixtures/locale-catalog-owned-files.json": "13924d3a1d159fabdd0aaf65a3701da379d8641fb9164089463e6281ddef6e6c",
     "contracts/fixtures/locale-catalog-source-de.json": "1d60ade53a4b4d7241c88ce8f0cab1b4027e81cd25f10f1ad815948e198fd0bb",
-    "contracts/fixtures/locale-catalog-source-en.json": "deeb7057a50a687039efdb42bb1484b0d67afb9c73ee670a39c67485f94e2a19",
+    "contracts/fixtures/locale-catalog-source-en.json": "879de3d794fa5da6202243d3c2b5a37f7e59f7e2582affc4c94d5e9ebb4ff2dd",
     "contracts/fixtures/locale-catalog-source-pt-BR.json": "cd7593ead3708918f8d8df4dea9775659a78351d90c485f3c82ad8fe69f4f241",
     "contracts/fixtures/location-enemy-view.json": "fd2cc29b6ea081cfa340b02c93194433542ee27ea50c9e841c94d6ed37f419b4",
     "contracts/fixtures/mode-campaign-only.json": "51162c3cbbd0e479f22f591639e7e8919a84aa3a7316be48f9aace545bf8e81f",
@@ -16245,18 +16417,19 @@
     "contracts/fixtures/question-round-end-forced-ability.json": "ccf51b1cd6d4f35a23d05c69d6009d47c8ca60f531d69c7c429a26beac412f5f",
     "contracts/fixtures/question-treachery-forced-ability.json": "e06cd3debf7b77313c4d4fcf8732944915022e2f99df4535a4177c1521cf899f",
     "contracts/fixtures/question-window-choose-one.json": "96058cb5e2bb8a1d3beb5107b08fb66b8b4be8eb648317d439c5859657e362f6",
-    "contracts/fixtures/replay-attestation.json": "00f40edb8c4d77337a7a3aa0ea2b658e41d5efbb206724b3c3164bf243bb65fe",
+    "contracts/fixtures/replay-attestation.json": "9530d53a5426c821913d78bff9c1d80e67a42e7dc4460916605df033cb92491f",
     "contracts/fixtures/shared-state-update.json": "c319bb83018ad037b9e0a6fd05be0829515c5adc70ddd474088db82d3f1123cc",
     "contracts/fixtures/uuid-entity-map.json": "09ebbcb0bffbcfac4060c878976570b965f10b70a2597111b162662b56b7763d",
-    "contracts/manifest.json": "40b1ba5417824d21f34c5c542db667898fb26bf71f60bae5d40d08f65d8032ce",
-    "contracts/openapi.yaml": "bd454feb5d64506b590d95380c3cd5229a5f676818534aeba9e35c4de1562d84",
-    "contracts/route-inventory.json": "090194fadafe52c853917f0367bce267a70aa99d41bed4fbd958b45b26730f92",
+    "contracts/manifest.json": "b3091327eb039aa6f8adbfe4facae9c1086f204c65db6f23526a5ab69d9220d5",
+    "contracts/openapi.yaml": "2b980ca05146de42cc4a7d8f6612d6fd2201195c0488dfb8df177c9c2186598d",
+    "contracts/route-inventory.json": "27e4c07708b1dd79a002ce0984375830a70a252a269d17e30f2082acfaf47244",
     "contracts/schemas/account.schema.json": "2c5ab4f223e76f6dbbad4766b60867610ae52edcc222db6eb850505f7f81fc29",
     "contracts/schemas/achievements.schema.json": "8945ad4292a8b93442ef54be8465661aa27ffc9e6e7f710a552d9566edf77bf3",
     "contracts/schemas/act.schema.json": "8cf088e64f0d2668fb158045501c1d5682ddf8956d5a76c9129322d68c636335",
     "contracts/schemas/agenda.schema.json": "c273d60d4d0a380428718f2b83d152b5e979c837705bbd4916a7ec6df40963e3",
     "contracts/schemas/basic-choice-question.schema.json": "b545376fafbd9dcc4aa47ad625d91bc96ddd2876ea5be6cbb7a5fc1ca0aa3649",
-    "contracts/schemas/capabilities.schema.json": "c0638d27e54ede08d37afaf77d2c6d063e1f46a5c44066bf361b22b5fe980103",
+    "contracts/schemas/campaign-catalog.schema.json": "e49e5000658288b4324280fe4164359b419a0c91fbbf7c16c045385060c23dc1",
+    "contracts/schemas/capabilities.schema.json": "a71638283a94b4e68c29c1a705dba0f007a3b5a28de324fecdcfdbd179430658",
     "contracts/schemas/card-code-entity-map.schema.json": "569bf8004632ed5226ef661a09cbc33fcdc1b73f177005e2e313cd28d126cb18",
     "contracts/schemas/catalog.schema.json": "7b4c692f0e151701b2588e18c51a1ce608fa5c36a77e4d695be4f383f39cecc9",
     "contracts/schemas/chaos-bag.schema.json": "45c9a42563b5e13d054f5689a8acf578df81f45746445020628335794fce4339",
@@ -16547,7 +16720,7 @@
     ]
   },
   "legacyCompatibilityChecks": {
-    "description": "The exact GET /api/v1/capabilities body this contract served at revision 0.1.22, before the optional locale-catalog pointer and later global semantic-question capability existed. A deployment that configures no catalog is NOT byte-identical to it, and must not be: issue #53 requires a monotonic contract bump, schemaRevision describes the backend contract bundle, and unknown capability identifiers are explicitly additive. What is guaranteed is the exact legacy field values and legacy identifiers after the current revision plus known additive capability identifiers are normalized away: no localeCatalog member and no i18n.locale-catalog.v1 identifier when the deployment publishes no catalog, while questions.semantic-presentation.v2 remains present in every current response. Clients compare the three numeric revision components and ignore unknown identifiers (see 'Capability negotiation'), so an older client reading a newer revision behaves exactly as it did at 0.1.22. scripts/validate-contract-fixtures.py and Arkham.Api.LocaleCatalogCapabilitySpec both compare the real response against this baseline with allowedDifferences normalized away.",
+    "description": "The exact GET /api/v1/capabilities body this contract served at revision 0.1.22, before the optional locale-catalog pointer and later global semantic-question capability existed. A deployment that configures no catalog is NOT byte-identical to it, and must not be: issue #53 requires a monotonic contract bump, schemaRevision describes the backend contract bundle, unknown capability identifiers are explicitly additive, and nativeClientMinimumRevision can rise when a revision contains client-visible catalog semantics older native clients cannot render. What is guaranteed is the exact legacy field values and legacy identifiers after the current revision plus known additive capability identifiers and compatibility-floor changes are normalized away: no localeCatalog member and no i18n.locale-catalog.v1 identifier when the deployment publishes no catalog, while questions.semantic-presentation.v2 remains present in every current response. Clients compare the three numeric revision components, honor nativeClientMinimumRevision, and ignore unknown identifiers (see 'Capability negotiation'), so a client below the advertised floor must update rather than render a catalog it cannot decode. scripts/validate-contract-fixtures.py and Arkham.Api.LocaleCatalogCapabilitySpec both compare the real response against this baseline with allowedDifferences normalized away.",
     "baselineRevision": "0.1.22",
     "baselineResponse": {
       "schemaRevision": "0.1.22",
@@ -16563,16 +16736,21 @@
     },
     "addedCapability": "i18n.locale-catalog.v1",
     "globalCapabilities": [
+      "arkham.campaign-catalog.v1",
       "questions.semantic-presentation.v2"
     ],
     "allowedDifferences": {
       "disabled": [
         "schemaRevision",
-        "capabilities"
+        "nativeClientMinimumRevision",
+        "capabilities",
+        "campaignCatalog"
       ],
       "advertised": [
         "schemaRevision",
+        "nativeClientMinimumRevision",
         "capabilities",
+        "campaignCatalog",
         "localeCatalog"
       ]
     }
