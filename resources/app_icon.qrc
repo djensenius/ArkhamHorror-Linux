@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="io.github.djensenius.ArkhamHorror.png">../packaging/hicolor/256x256/apps/io.github.djensenius.ArkhamHorror.png</file>
+  </qresource>
+</RCC>
