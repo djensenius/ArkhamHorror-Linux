@@ -11,6 +11,7 @@ ICONS="$ROOT/Icons"
 APP_ID="io.github.djensenius.ArkhamHorror"
 FONT_PATH="${1:-}"
 MAGICK="${MAGICK:-/opt/homebrew/bin/magick}"
+PNG_ARGS=(-define png:exclude-chunks=date,time)
 
 if [[ -z "$FONT_PATH" ]]; then
   echo "usage: $0 /path/to/arkham.ttf" >&2
@@ -28,8 +29,10 @@ if [[ ! -x "$MAGICK" ]]; then
     exit 1
   fi
 fi
-if [[ ! -f "$ICONS/AppIcon-background.png" ]]; then
-  echo "missing $ICONS/AppIcon-background.png" >&2
+
+BACKGROUND="$ICONS/AppIcon-background.png"
+if [[ ! -f "$BACKGROUND" ]]; then
+  echo "missing $BACKGROUND" >&2
   exit 1
 fi
 
@@ -37,6 +40,7 @@ mkdir -p "$ICONS"
 "$ICONS/render-elder-sign.swift" --font "$FONT_PATH" --output-dir "$ICONS"
 
 PATH_DATA="$(cat "$ICONS/AppIcon-foreground.path")"
+FOREGROUND="$ICONS/AppIcon-foreground.png"
 SVG="$ROOT/packaging/$APP_ID.svg"
 mkdir -p "$(dirname "$SVG")" "$ROOT/packaging/hicolor/scalable/apps"
 cat > "$SVG" <<SVG_EOF
@@ -47,11 +51,24 @@ cat > "$SVG" <<SVG_EOF
 SVG_EOF
 cp "$SVG" "$ROOT/packaging/hicolor/scalable/apps/$APP_ID.svg"
 
-"$MAGICK" -background none "$SVG" -resize 1024x1024 -depth 8 "$ICONS/AppIcon-composite.png"
+render_icon_png() {
+  local out="$1" size="$2"
+  local edge=$((size - 1))
+  local radius=$((size * 3 / 16))
+  mkdir -p "$(dirname "$out")"
+  "$MAGICK" \
+    \( "$BACKGROUND" -resize "${size}x${size}!" \) \
+    \( "$FOREGROUND" -resize "${size}x${size}!" \) \
+    -compose over -composite \
+    \( -size "${size}x${size}" xc:none -fill white -draw "roundrectangle 0,0 ${edge},${edge} ${radius},${radius}" \) \
+    -compose CopyOpacity -composite \
+    -depth 8 "${PNG_ARGS[@]}" "$out"
+}
+
+render_icon_png "$ICONS/AppIcon-composite.png" 1024
 for size in 16 24 32 48 64 128 256 512; do
   out="$ROOT/packaging/hicolor/${size}x${size}/apps/$APP_ID.png"
-  mkdir -p "$(dirname "$out")"
-  "$MAGICK" -background none "$SVG" -resize "${size}x${size}" -depth 8 "$out"
+  render_icon_png "$out" "$size"
   echo "  ${size}x${size} -> ${out#$ROOT/}"
 done
 

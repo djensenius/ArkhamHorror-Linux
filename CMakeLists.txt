@@ -604,18 +604,20 @@ install(TARGETS arkham-horror
     BUNDLE DESTINATION .
     RUNTIME DESTINATION bin
 )
-install(FILES packaging/io.github.djensenius.ArkhamHorror.desktop
-    DESTINATION share/applications
-)
-install(FILES packaging/io.github.djensenius.ArkhamHorror.svg
-    DESTINATION share/icons/hicolor/scalable/apps
-)
-foreach(_arkham_icon_size IN ITEMS 16 24 32 48 64 128 256 512)
-    install(FILES packaging/hicolor/${_arkham_icon_size}x${_arkham_icon_size}/apps/io.github.djensenius.ArkhamHorror.png
-        DESTINATION share/icons/hicolor/${_arkham_icon_size}x${_arkham_icon_size}/apps
+if(UNIX AND NOT APPLE)
+    install(FILES packaging/io.github.djensenius.ArkhamHorror.desktop
+        DESTINATION share/applications
     )
-endforeach()
-unset(_arkham_icon_size)
+    install(FILES packaging/io.github.djensenius.ArkhamHorror.svg
+        DESTINATION share/icons/hicolor/scalable/apps
+    )
+    foreach(_arkham_icon_size IN ITEMS 16 24 32 48 64 128 256 512)
+        install(FILES packaging/hicolor/${_arkham_icon_size}x${_arkham_icon_size}/apps/io.github.djensenius.ArkhamHorror.png
+            DESTINATION share/icons/hicolor/${_arkham_icon_size}x${_arkham_icon_size}/apps
+        )
+    endforeach()
+    unset(_arkham_icon_size)
+endif()
 
 if(BUILD_TESTING)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)

@@ -31,6 +31,8 @@ constexpr int kSmokeTestDeadlineMs = 20000;
 
 int main(int argc, char *argv[]) {
   QGuiApplication app(argc, argv);
+  QGuiApplication::setDesktopFileName(
+      QStringLiteral("io.github.djensenius.ArkhamHorror"));
   QGuiApplication::setWindowIcon(
       QIcon(QStringLiteral(":/icons/io.github.djensenius.ArkhamHorror.png")));
   QCoreApplication::setApplicationName(QStringLiteral("Arkham Horror"));
