@@ -88,13 +88,14 @@ void ContractDriftTests::everyGovernedFileMatchesItsPinnedDigest() {
 
 void ContractDriftTests::digestTableCoversAllPinnedContractFiles() {
   // Every file this client's decoders are bound to (manifest, capabilities,
-  // AnswerRejected, the campaign-catalog endpoint fixture, and the four
-  // existing domain fixtures + their six schemas) must appear -- an omission
-  // here would let that specific file drift completely unverified.
+  // AnswerRejected, RoomClosed, the campaign-catalog endpoint fixture, and
+  // the four existing domain fixtures + their six schemas) must appear -- an
+  // omission here would let that specific file drift completely unverified.
   const QSet<QString> expected{
       QStringLiteral("manifest.json"),
       QStringLiteral("fixtures/capabilities.json"),
       QStringLiteral("fixtures/answer-rejected.json"),
+      QStringLiteral("fixtures/room-closed.json"),
       QStringLiteral("fixtures/campaign-catalog.json"),
       QStringLiteral("fixtures/catalog.json"),
       QStringLiteral("fixtures/decks.json"),

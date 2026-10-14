@@ -19,9 +19,18 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "id",
+        "name",
         "error"
       ],
       "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "name": {
+          "type": "string"
+        },
         "error": {
           "type": "string"
         }
