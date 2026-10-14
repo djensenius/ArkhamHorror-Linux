@@ -113,6 +113,7 @@ private slots:
   void decodesActiveRowFromFixture();
   void decodesOverRowFromFixture();
   void decodesFailureRowFromFixture();
+  void decodeGameListFromRawBytesDecodesUpstreamFailureRowFromFixture();
   void decodeGameListRoundTripsWholeFixtureByteExact();
   // Round 3 (raw decoding not end-to-end): decodeGameList/GameListRow
   // previously had no raw-byte entry point -- proven here through the
@@ -157,8 +158,8 @@ private slots:
   void gameStateToJsonBytesPreservesAdditiveFieldBesideTagAndContentsOnEncode();
 
   // GameListRow success/error ambiguity ──────────────────────────────────────
-  void rowWithBareErrorKeyIsFailure();
-  void rowCombiningErrorWithAnyOtherKeyIsRejectedNotFailure();
+  void rowWithBareErrorKeyIsRejected();
+  void rowWithErrorButMissingFailureIdIsRejected();
   void rowWithoutErrorKeyAttemptsFullDecode();
   // Round-9 item 5: supersedes the prior tolerant behavior for this
   // specific closed, shape-discriminating success row (see
@@ -175,6 +176,7 @@ private slots:
   void answerRejectedIgnoresAdditiveField();
   void gameErrorStillDecodesAsGenericText();
   void gameMessageStillDecodesAsGenericText();
+  void roomClosedFixtureDecodesAsOther();
   void unmodeledServerMessageTagDecodesAsOther();
 
   // game-lifecycle.json fixture entries ──────────────────────────────────────
@@ -512,11 +514,32 @@ void GamesTests::decodesFailureRowFromFixture() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->kind(), GameListRow::Kind::Failure);
+  QVERIFY(result->id().has_value());
+  QCOMPARE(result->id()->value(),
+           QStringLiteral("00000000-0000-0000-0000-000000000007"));
+  QCOMPARE(result->name(), QStringLiteral("Broken contract fixture"));
   QCOMPARE(result->error(), QStringLiteral("Contract fixture failed to load."));
   auto encoded = Arkham::TestOnly::objectJson(*result);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows.at(4).toObject());
+}
+
+void GamesTests::
+    decodeGameListFromRawBytesDecodesUpstreamFailureRowFromFixture() {
+  const QByteArray bytes = loadFixtureBytes(QStringLiteral("game-list.json"));
+  const auto result = decodeGameListFromRawBytes(bytes, u"rows");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->size(), 5);
+
+  const GameListRow &failure = result->at(4);
+  QCOMPARE(failure.kind(), GameListRow::Kind::Failure);
+  QVERIFY(failure.id().has_value());
+  QCOMPARE(failure.id()->value(),
+           QStringLiteral("00000000-0000-0000-0000-000000000007"));
+  QCOMPARE(failure.name(), QStringLiteral("Broken contract fixture"));
+  QCOMPARE(failure.error(), QStringLiteral("Contract fixture failed to load."));
 }
 
 void GamesTests::decodeGameListRoundTripsWholeFixtureByteExact() {
@@ -896,26 +919,23 @@ void GamesTests::
       QStringLiteral("maintenance"));
 }
 
-void GamesTests::rowWithBareErrorKeyIsFailure() {
+void GamesTests::rowWithBareErrorKeyIsRejected() {
   const QJsonObject obj{{QStringLiteral("error"), QStringLiteral("boom")}};
   const auto result = GameListRow::fromJson(obj, u"row");
-  if (!result)
-    QFAIL(qPrintable(result.error()));
-  QCOMPARE(result->kind(), GameListRow::Kind::Failure);
-  QCOMPARE(result->error(), QStringLiteral("boom"));
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("id")),
+           qPrintable(result.error()));
 }
 
-void GamesTests::rowCombiningErrorWithAnyOtherKeyIsRejectedNotFailure() {
-  // failedGameDetails is additionalProperties:false with "error" as its
-  // only allowed key, so an object carrying "error" alongside any other
-  // key -- even one that isn't a recognized success field -- matches no
-  // valid shape at all. It must be a decode error, not a Kind::Failure row
-  // that silently discards the extra key(s).
+void GamesTests::rowWithErrorButMissingFailureIdIsRejected() {
+  // failedGameDetails is additionalProperties:false with id/name/error as its
+  // exact key set. A partial broken-row shape is malformed input, not a
+  // Kind::Failure row that silently invents or discards fields.
   const QJsonObject obj{{QStringLiteral("error"), QStringLiteral("boom")},
                         {QStringLiteral("name"), QStringLiteral("ignored")}};
   const auto result = GameListRow::fromJson(obj, u"row");
   QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(QStringLiteral("error")),
+  QVERIFY2(result.error().contains(QStringLiteral("id")),
            qPrintable(result.error()));
 }
 
@@ -1078,6 +1098,18 @@ void GamesTests::gameMessageStillDecodesAsGenericText() {
   QCOMPARE(result->kind(), ServerMessage::Kind::GenericText);
   QCOMPARE(result->tag(), QStringLiteral("GameMessage"));
   QCOMPARE(result->text(), QStringLiteral("Investigator drew a card"));
+}
+
+void GamesTests::roomClosedFixtureDecodesAsOther() {
+  const QByteArray fixture =
+      loadFixtureBytes(QStringLiteral("room-closed.json"));
+  const auto result = ServerMessage::fromRawBytes(fixture, u"message");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+
+  QCOMPARE(result->kind(), ServerMessage::Kind::Other);
+  QCOMPARE(result->tag(), QStringLiteral("RoomClosed"));
+  QVERIFY(result->displayText().isEmpty());
 }
 
 void GamesTests::unmodeledServerMessageTagDecodesAsOther() {
@@ -2913,23 +2945,37 @@ void GamesTests::gameListRowSuccessMoveConstructLeavesSourceFieldsIntact() {
 }
 
 void GamesTests::gameListRowFailureMoveConstructLeavesSourceErrorIntact() {
-  GameListRow source = GameListRow::failed(QStringLiteral("game not found"));
+  auto gameId =
+      GameId::parse(QStringLiteral("00000000-0000-0000-0000-000000000099"));
+  if (!gameId)
+    QFAIL(qPrintable(gameId.error()));
+  GameListRow source = GameListRow::failed(
+      *gameId, QStringLiteral("Broken Game"), QStringLiteral("game not found"));
   QCOMPARE(source.kind(), GameListRow::Kind::Failure);
+  QVERIFY(source.id().has_value());
+  QCOMPARE(source.id()->value(),
+           QStringLiteral("00000000-0000-0000-0000-000000000099"));
+  QCOMPARE(source.name(), QStringLiteral("Broken Game"));
   QCOMPARE(source.error(), QStringLiteral("game not found"));
 
   GameListRow moved(std::move(source));
   QCOMPARE(moved.kind(), GameListRow::Kind::Failure);
+  QCOMPARE(moved.name(), QStringLiteral("Broken Game"));
   QCOMPARE(moved.error(), QStringLiteral("game not found"));
 
   // The moved-from source must still independently report the complete
-  // original error string -- never silently desynchronized to
-  // Failure-with-an-empty-error, which would round-trip as a
-  // different, misleading message.
+  // original failure payload -- never silently desynchronized to
+  // Failure-with-an-empty-name-or-error, which would round-trip as a
+  // different, misleading row.
   QCOMPARE(source.kind(), GameListRow::Kind::Failure);
+  QCOMPARE(source.name(), QStringLiteral("Broken Game"));
   QCOMPARE(source.error(), QStringLiteral("game not found"));
   auto encoded = Arkham::TestOnly::objectJson(source);
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(encoded->value("id"_L1).toString(),
+           QStringLiteral("00000000-0000-0000-0000-000000000099"));
+  QCOMPARE(encoded->value("name"_L1).toString(), QStringLiteral("Broken Game"));
   QCOMPARE(encoded->value("error"_L1).toString(),
            QStringLiteral("game not found"));
 }
