@@ -348,10 +348,10 @@ class AllowlistEntry:
 # and local classes). Both are exact set pins: adding, removing, moving, or
 # observing a surface in one more context changes the digest and fails closed.
 _NAMED_ALLOWLIST_IDENTITY_SET_SHA256 = (
-    "ab5002c4d69d3fb1a843f9ae92092311045dbca0e1e1e1a9ab6236430e2e16d1"
+    "71d91a85f197d97a8cb9007d613a76f58cc2ea1759d59954b0736c693249b128"
 )
 _LOCAL_WIRE_SURFACE_SET_SHA256 = (
-    "3cecb9eb77e4e47fd0fb487957d2722ff4cbaec988caae01b6441fd81de7c77f"
+    "3128916735169d4062b47688fea094692ff42d7528647883f1ed81926c48ff6d"
 )
 
 
