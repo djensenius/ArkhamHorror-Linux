@@ -98,6 +98,8 @@
     "hasOpenSeats": false
   },
   {
+    "id": "00000000-0000-0000-0000-000000000007",
+    "name": "Broken contract fixture",
     "error": "Contract fixture failed to load."
   }
 ]

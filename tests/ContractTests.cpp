@@ -185,8 +185,8 @@ void ContractTests::strictAsciiOnlyParsing() {
 
 void ContractTests::parsesVendoredFixture() {
   // Load from the vendored fixture, not from an inline duplicate string.
-  // This fixture is git-show 25a3eb8:contracts/fixtures/capabilities.json,
-  // pinned to the PR#152 backend commit.
+  // This fixture is git-show 06d5df2:contracts/fixtures/capabilities.json,
+  // pinned to the PR#159 backend commit.
   const auto fileResult =
       openContractFile(QStringLiteral("/fixtures/capabilities.json"));
   if (!fileResult.has_value())
@@ -201,10 +201,10 @@ void ContractTests::parsesVendoredFixture() {
   if (!result.has_value())
     QFAIL(qPrintable(result.error()));
 
-  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 52}));
+  QCOMPARE(result->schemaRevision, (ContractRevision{0, 1, 53}));
   QCOMPARE(result->status, QStringLiteral("baseline-incomplete"));
   QCOMPARE(result->apiBasePath, QStringLiteral("/api/v1"));
-  QCOMPARE(result->nativeClientMinimumRevision, (ContractRevision{0, 1, 50}));
+  QCOMPARE(result->nativeClientMinimumRevision, (ContractRevision{0, 1, 53}));
   QCOMPARE(result->capabilities.size(), 6);
   QVERIFY(result->hasCapability(u"arkham.campaign-catalog.v1"));
   QVERIFY(result->hasCapability(u"events.shared-state-versioning"));
