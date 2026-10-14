@@ -558,11 +558,17 @@ qt_add_executable(arkham-horror
     src/main.cpp
 )
 
+set_source_files_properties(
+    packaging/hicolor/256x256/apps/io.github.djensenius.ArkhamHorror.png
+    PROPERTIES QT_RESOURCE_ALIAS app-icon.png
+)
 qt_add_qml_module(arkham-horror
     URI ArkhamHorror
     VERSION 1.0
     QML_FILES
         qml/Main.qml
+    RESOURCES
+        packaging/hicolor/256x256/apps/io.github.djensenius.ArkhamHorror.png
 )
 # Qt's command injects internal QT_* target-property generator expressions
 # for QML metadata/resources. These are the only accepted SCAN-target
@@ -603,6 +609,20 @@ install(TARGETS arkham-horror
     BUNDLE DESTINATION .
     RUNTIME DESTINATION bin
 )
+if(UNIX AND NOT APPLE)
+    install(FILES packaging/io.github.djensenius.ArkhamHorror.desktop
+        DESTINATION share/applications
+    )
+    install(FILES packaging/io.github.djensenius.ArkhamHorror.svg
+        DESTINATION share/icons/hicolor/scalable/apps
+    )
+    foreach(_arkham_icon_size IN ITEMS 16 24 32 48 64 128 256 512)
+        install(FILES packaging/hicolor/${_arkham_icon_size}x${_arkham_icon_size}/apps/io.github.djensenius.ArkhamHorror.png
+            DESTINATION share/icons/hicolor/${_arkham_icon_size}x${_arkham_icon_size}/apps
+        )
+    endforeach()
+    unset(_arkham_icon_size)
+endif()
 
 if(BUILD_TESTING)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)

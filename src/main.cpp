@@ -1,6 +1,7 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QGuiApplication>
+#include <QIcon>
 #include <QNetworkAccessManager>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -30,6 +31,10 @@ constexpr int kSmokeTestDeadlineMs = 20000;
 
 int main(int argc, char *argv[]) {
   QGuiApplication app(argc, argv);
+  QGuiApplication::setDesktopFileName(
+      QStringLiteral("io.github.djensenius.ArkhamHorror"));
+  QGuiApplication::setWindowIcon(
+      QIcon(QStringLiteral(":/qt/qml/ArkhamHorror/app-icon.png")));
   QCoreApplication::setApplicationName(QStringLiteral("Arkham Horror"));
   QCoreApplication::setOrganizationName(QStringLiteral("djensenius"));
 
