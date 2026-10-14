@@ -4,5 +4,6 @@ Name=Arkham Horror
 Comment=Controller-first client for the Arkham Horror LCG backend
 Exec=arkham-horror
 Icon=io.github.djensenius.ArkhamHorror
+StartupWMClass=Arkham Horror
 Categories=Game;CardGame;
 Terminal=false
