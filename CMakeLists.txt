@@ -556,14 +556,19 @@ arkham_append_encoder_hygiene_target(
 
 qt_add_executable(arkham-horror
     src/main.cpp
-    resources/app_icon.qrc
 )
 
+set_source_files_properties(
+    packaging/hicolor/256x256/apps/io.github.djensenius.ArkhamHorror.png
+    PROPERTIES QT_RESOURCE_ALIAS app-icon.png
+)
 qt_add_qml_module(arkham-horror
     URI ArkhamHorror
     VERSION 1.0
     QML_FILES
         qml/Main.qml
+    RESOURCES
+        packaging/hicolor/256x256/apps/io.github.djensenius.ArkhamHorror.png
 )
 # Qt's command injects internal QT_* target-property generator expressions
 # for QML metadata/resources. These are the only accepted SCAN-target

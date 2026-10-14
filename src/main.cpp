@@ -34,7 +34,7 @@ int main(int argc, char *argv[]) {
   QGuiApplication::setDesktopFileName(
       QStringLiteral("io.github.djensenius.ArkhamHorror"));
   QGuiApplication::setWindowIcon(
-      QIcon(QStringLiteral(":/icons/io.github.djensenius.ArkhamHorror.png")));
+      QIcon(QStringLiteral(":/qt/qml/ArkhamHorror/app-icon.png")));
   QCoreApplication::setApplicationName(QStringLiteral("Arkham Horror"));
   QCoreApplication::setOrganizationName(QStringLiteral("djensenius"));
 
