@@ -113,6 +113,8 @@ private slots:
   void decodesActiveRowFromFixture();
   void decodesOverRowFromFixture();
   void decodesFailureRowFromFixture();
+  void decodeGameListFromRawBytesDecodesLegacyFailureRow();
+  void decodeGameListFromRawBytesDecodesUpstreamFailureRow();
   void decodeGameListFromRawBytesDecodesUpstreamFailureRowFromFixture();
   void decodeGameListRoundTripsWholeFixtureByteExact();
   // Round 3 (raw decoding not end-to-end): decodeGameList/GameListRow
@@ -158,8 +160,8 @@ private slots:
   void gameStateToJsonBytesPreservesAdditiveFieldBesideTagAndContentsOnEncode();
 
   // GameListRow success/error ambiguity ──────────────────────────────────────
-  void rowWithBareErrorKeyIsRejected();
-  void rowWithErrorButMissingFailureIdIsRejected();
+  void gameListFailureRowsRejectMalformedShapes_data();
+  void gameListFailureRowsRejectMalformedShapes();
   void rowWithoutErrorKeyAttemptsFullDecode();
   // Round-9 item 5: supersedes the prior tolerant behavior for this
   // specific closed, shape-discriminating success row (see
@@ -523,6 +525,78 @@ void GamesTests::decodesFailureRowFromFixture() {
   if (!encoded)
     QFAIL(qPrintable(encoded.error()));
   QCOMPARE(*encoded, rows.at(4).toObject());
+}
+
+void GamesTests::decodeGameListFromRawBytesDecodesLegacyFailureRow() {
+  const QByteArray rowBytes =
+      QByteArrayLiteral("{\"error\":\"Legacy failed game\"}");
+  const auto row = GameListRow::fromRawBytes(rowBytes, u"row");
+  if (!row)
+    QFAIL(qPrintable(row.error()));
+  QCOMPARE(row->kind(), GameListRow::Kind::Failure);
+  QVERIFY(!row->id().has_value());
+  QCOMPARE(row->name(), QString());
+  QCOMPARE(row->error(), QStringLiteral("Legacy failed game"));
+  const auto encodedRow = row->toJsonBytes();
+  if (!encodedRow)
+    QFAIL(qPrintable(encodedRow.error()));
+  QCOMPARE(*encodedRow, rowBytes);
+
+  const QByteArray listBytes =
+      QByteArrayLiteral("[{\"error\":\"Legacy failed game\"}]");
+  const auto list = decodeGameListFromRawBytes(listBytes, u"rows");
+  if (!list)
+    QFAIL(qPrintable(list.error()));
+  QCOMPARE(list->size(), 1);
+  const GameListRow &failure = list->at(0);
+  QCOMPARE(failure.kind(), GameListRow::Kind::Failure);
+  QVERIFY(!failure.id().has_value());
+  QCOMPARE(failure.name(), QString());
+  QCOMPARE(failure.error(), QStringLiteral("Legacy failed game"));
+  const auto encodedList = encodeGameListToJsonBytes(*list);
+  if (!encodedList)
+    QFAIL(qPrintable(encodedList.error()));
+  QCOMPARE(*encodedList, listBytes);
+}
+
+void GamesTests::decodeGameListFromRawBytesDecodesUpstreamFailureRow() {
+  const QByteArray rowBytes =
+      QByteArrayLiteral("{\"id\":\"00000000-0000-0000-0000-000000000007\","
+                        "\"name\":\"Broken contract fixture\","
+                        "\"error\":\"Contract fixture failed to load.\"}");
+  const auto row = GameListRow::fromRawBytes(rowBytes, u"row");
+  if (!row)
+    QFAIL(qPrintable(row.error()));
+  QCOMPARE(row->kind(), GameListRow::Kind::Failure);
+  QVERIFY(row->id().has_value());
+  QCOMPARE(row->id()->value(),
+           QStringLiteral("00000000-0000-0000-0000-000000000007"));
+  QCOMPARE(row->name(), QStringLiteral("Broken contract fixture"));
+  QCOMPARE(row->error(), QStringLiteral("Contract fixture failed to load."));
+  const auto encodedRow = row->toJsonBytes();
+  if (!encodedRow)
+    QFAIL(qPrintable(encodedRow.error()));
+  QCOMPARE(*encodedRow, rowBytes);
+
+  const QByteArray listBytes =
+      QByteArrayLiteral("[{\"id\":\"00000000-0000-0000-0000-000000000007\","
+                        "\"name\":\"Broken contract fixture\","
+                        "\"error\":\"Contract fixture failed to load.\"}]");
+  const auto list = decodeGameListFromRawBytes(listBytes, u"rows");
+  if (!list)
+    QFAIL(qPrintable(list.error()));
+  QCOMPARE(list->size(), 1);
+  const GameListRow &failure = list->at(0);
+  QCOMPARE(failure.kind(), GameListRow::Kind::Failure);
+  QVERIFY(failure.id().has_value());
+  QCOMPARE(failure.id()->value(),
+           QStringLiteral("00000000-0000-0000-0000-000000000007"));
+  QCOMPARE(failure.name(), QStringLiteral("Broken contract fixture"));
+  QCOMPARE(failure.error(), QStringLiteral("Contract fixture failed to load."));
+  const auto encodedList = encodeGameListToJsonBytes(*list);
+  if (!encodedList)
+    QFAIL(qPrintable(encodedList.error()));
+  QCOMPARE(*encodedList, listBytes);
 }
 
 void GamesTests::
@@ -919,24 +993,37 @@ void GamesTests::
       QStringLiteral("maintenance"));
 }
 
-void GamesTests::rowWithBareErrorKeyIsRejected() {
-  const QJsonObject obj{{QStringLiteral("error"), QStringLiteral("boom")}};
-  const auto result = GameListRow::fromJson(obj, u"row");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(QStringLiteral("id")),
-           qPrintable(result.error()));
+void GamesTests::gameListFailureRowsRejectMalformedShapes_data() {
+  QTest::addColumn<QByteArray>("bytes");
+
+  QTest::newRow("mixed-id-without-name")
+      << QByteArrayLiteral("[{\"id\":\"00000000-0000-0000-0000-000000000007\","
+                           "\"error\":\"boom\"}]");
+  QTest::newRow("mixed-name-without-id")
+      << QByteArrayLiteral("[{\"name\":\"Broken\",\"error\":\"boom\"}]");
+  QTest::newRow("legacy-extra-key")
+      << QByteArrayLiteral("[{\"error\":\"boom\",\"future\":\"ignored\"}]");
+  QTest::newRow("upstream-extra-key")
+      << QByteArrayLiteral("[{\"id\":\"00000000-0000-0000-0000-000000000007\","
+                           "\"name\":\"Broken\",\"error\":\"boom\","
+                           "\"future\":\"ignored\"}]");
+  QTest::newRow("legacy-error-not-string")
+      << QByteArrayLiteral("[{\"error\":404}]");
+  QTest::newRow("upstream-id-not-uuid") << QByteArrayLiteral(
+      "[{\"id\":42,\"name\":\"Broken\",\"error\":\"boom\"}]");
+  QTest::newRow("upstream-name-not-string")
+      << QByteArrayLiteral("[{\"id\":\"00000000-0000-0000-0000-000000000007\","
+                           "\"name\":false,\"error\":\"boom\"}]");
+  QTest::newRow("upstream-error-not-string")
+      << QByteArrayLiteral("[{\"id\":\"00000000-0000-0000-0000-000000000007\","
+                           "\"name\":\"Broken\",\"error\":404}]");
 }
 
-void GamesTests::rowWithErrorButMissingFailureIdIsRejected() {
-  // failedGameDetails is additionalProperties:false with id/name/error as its
-  // exact key set. A partial broken-row shape is malformed input, not a
-  // Kind::Failure row that silently invents or discards fields.
-  const QJsonObject obj{{QStringLiteral("error"), QStringLiteral("boom")},
-                        {QStringLiteral("name"), QStringLiteral("ignored")}};
-  const auto result = GameListRow::fromJson(obj, u"row");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(QStringLiteral("id")),
-           qPrintable(result.error()));
+void GamesTests::gameListFailureRowsRejectMalformedShapes() {
+  QFETCH(QByteArray, bytes);
+
+  const auto result = decodeGameListFromRawBytes(bytes, u"rows");
+  QVERIFY2(!result.has_value(), qPrintable(QString::fromUtf8(bytes)));
 }
 
 void GamesTests::rowWithoutErrorKeyAttemptsFullDecode() {

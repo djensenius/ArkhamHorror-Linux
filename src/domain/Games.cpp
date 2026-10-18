@@ -643,6 +643,13 @@ GameListRow GameListRow::failed(GameId id, QString name, QString error) {
   return row;
 }
 
+GameListRow GameListRow::legacyFailed(QString error) {
+  GameListRow row;
+  row.m_kind = Kind::Failure;
+  row.m_error = std::move(error);
+  return row;
+}
+
 ValueOrError<GameListRow> GameListRow::fromJson(const QJsonValue &v,
                                                 QStringView path) {
   return fromValueImpl(v, path);
@@ -670,34 +677,55 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
   const auto &obj = *objResult;
 
   // Disambiguated by shape, not an explicit tag: the backend's hand-written
-  // GameDetailsEntry ToJSON encodes a failure as {"id", "name", "error"}
-  // and a success as the raw gameDetails object. Per the schema,
-  // failedGameDetails is additionalProperties:false, so an object carrying
-  // "error" with any key set other than exactly id/name/error matches neither
-  // def. Propagate that as a decode error instead of silently discarding data
-  // and declaring victory as Kind::Failure.
+  // GameDetailsEntry ToJSON encodes a current failure as exactly {"id",
+  // "name", "error"}, older servers still admitted by currentPin() encoded
+  // a legacy failure as exactly {"error"}, and a success as the raw
+  // gameDetails object. Any other object carrying "error" matches no branch;
+  // reject it instead of silently discarding fields or inventing id/name.
   if (obj.contains("error"_L1)) {
-    auto exactKeys =
-        Json::requireExactKeys(obj, {"id"_L1, "name"_L1, "error"_L1}, path);
-    if (!exactKeys)
-      return failure(exactKeys.error());
+    const bool hasId = obj.contains("id"_L1);
+    const bool hasName = obj.contains("name"_L1);
 
-    auto id = Json::requireField(
-        obj, "id"_L1, Json::joinPath(path, u"id"),
-        [](const auto &v, QStringView p) { return GameId::fromJson(v, p); });
-    if (!id)
-      return failure(id.error());
+    if (!hasId && !hasName) {
+      auto exactKeys = Json::requireExactKeys(obj, {"error"_L1}, path);
+      if (!exactKeys)
+        return failure(exactKeys.error());
 
-    auto name =
-        Json::requireString(obj, "name"_L1, Json::joinPath(path, u"name"));
-    if (!name)
-      return failure(name.error());
+      auto error =
+          Json::requireString(obj, "error"_L1, Json::joinPath(path, u"error"));
+      if (!error)
+        return failure(error.error());
+      return GameListRow::legacyFailed(*error);
+    }
 
-    auto error =
-        Json::requireString(obj, "error"_L1, Json::joinPath(path, u"error"));
-    if (!error)
-      return failure(error.error());
-    return GameListRow::failed(*id, *name, *error);
+    if (hasId && hasName) {
+      auto exactKeys =
+          Json::requireExactKeys(obj, {"id"_L1, "name"_L1, "error"_L1}, path);
+      if (!exactKeys)
+        return failure(exactKeys.error());
+
+      auto id = Json::requireField(
+          obj, "id"_L1, Json::joinPath(path, u"id"),
+          [](const auto &v, QStringView p) { return GameId::fromJson(v, p); });
+      if (!id)
+        return failure(id.error());
+
+      auto name =
+          Json::requireString(obj, "name"_L1, Json::joinPath(path, u"name"));
+      if (!name)
+        return failure(name.error());
+
+      auto error =
+          Json::requireString(obj, "error"_L1, Json::joinPath(path, u"error"));
+      if (!error)
+        return failure(error.error());
+      return GameListRow::failed(*id, *name, *error);
+    }
+
+    return failure(
+        QStringLiteral("%1: failed game row must be exactly {\"error\"} or "
+                       "{\"id\", \"name\", \"error\"}")
+            .arg(path));
   }
 
   // The pinned schema's `gameDetails` (success) def is
@@ -795,12 +823,18 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
 }
 
 ValueOrError<Json::Value> GameListRow::toRawJson() const {
-  if (m_kind == Kind::Failure)
+  if (m_kind == Kind::Failure) {
+    if (!m_id) {
+      return Json::Value::makeObject({
+          {QStringLiteral("error"), Json::Value::makeString(m_error)},
+      });
+    }
     return Json::Value::makeObject({
         {QStringLiteral("id"), m_id->toRawJson()},
         {QStringLiteral("name"), Json::Value::makeString(m_name)},
         {QStringLiteral("error"), Json::Value::makeString(m_error)},
     });
+  }
 
   // No invariant check is needed here: success() is the only way to build
   // a Kind::Success instance, and it always populates id/gameState/

@@ -312,19 +312,20 @@ private:
 };
 
 // One row of the top-level game-list.json array: either a gameDetails
-// object or a failedGameDetails `{"id": ..., "name": ..., "error": ...}`
-// object. The schema disambiguates the two by shape, not by an explicit tag
-// (mirroring the backend's hand-written `GameDetailsEntry` ToJSON:
-// `FailedGameDetails` encodes the broken game's id/name/error,
-// `SuccessGameDetails` as the raw GameDetails object), so decode does the
-// same: a top-level "error" key means Failure, otherwise a full gameDetails
-// decode is attempted.
+// object, the current failedGameDetails `{"id": ..., "name": ...,
+// "error": ...}` object, or the legacy failedGameDetails `{"error": ...}`
+// object emitted by servers still admitted by currentPin(). The schema
+// disambiguates success/failure by shape, not by an explicit tag
+// (mirroring the backend's hand-written `GameDetailsEntry` ToJSON), so
+// decode does the same: a top-level "error" key means Failure, otherwise a
+// full gameDetails decode is attempted.
 //
-// success()/failure() are the only ways to build one (mirroring
-// CampaignOrScenario above): the private constructor makes a Success row
-// with a missing id/gameState/multiplayerVariant unrepresentable, so
-// toRawJson() never needs to guard against -- or fail on -- an invalid
-// instance that was never possible to construct in the first place.
+// success()/failure() plus the decoder-only legacy failure path are the
+// only ways to build one (mirroring CampaignOrScenario above): the private
+// constructor makes a Success row with a missing id/gameState/
+// multiplayerVariant unrepresentable, so toRawJson() never needs to guard
+// against -- or fail on -- an invalid instance that was never possible to
+// construct in the first place.
 class GameListRow {
 public:
   enum class Kind { Success, Failure };
@@ -374,8 +375,9 @@ public:
   [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
 
   [[nodiscard]] Kind kind() const noexcept { return m_kind; }
-  // Present for both success and failure rows so broken rows can still be
-  // displayed by name and, if the UI wires it, deleted by id.
+  // Present for success rows and current failure rows so broken rows can
+  // still be displayed by name and, if the UI wires it, deleted by id.
+  // Legacy failure rows carry no id, which also prevents a delete action.
   [[nodiscard]] const std::optional<GameId> &id() const noexcept {
     return m_id;
   }
@@ -390,7 +392,8 @@ public:
   [[nodiscard]] const std::optional<GameState> &gameState() const noexcept {
     return m_gameState;
   }
-  // Present for both success and failure rows.
+  // Present for success rows and current failure rows; empty for legacy
+  // failure rows that carried only an error string.
   [[nodiscard]] const QString &name() const noexcept { return m_name; }
   // Success-only collection accessors (empty for Failure).
   [[nodiscard]] const QList<InvestigatorSummary> &
@@ -440,6 +443,7 @@ public:
 
 private:
   GameListRow() = default;
+  [[nodiscard]] static GameListRow legacyFailed(QString error);
 
   template <typename V>
   [[nodiscard]] static ValueOrError<GameListRow>
