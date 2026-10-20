@@ -53,6 +53,7 @@ MANIFEST = (
 )
 CAPABILITIES = b'{"schemaRevision": "0.1.12"}'
 ANSWER_REJECTED = b'{"tag":"AnswerRejected","reason":"Stale question","questionVersion":8}'
+ROOM_CLOSED = b'{"tag":"RoomClosed","contents":"deleted"}'
 CAMPAIGN_CATALOG_FIXTURE = b'{"campaigns": []}'
 CATALOG_FIXTURE = b'{"cards": []}'
 DECKS_FIXTURE = b'{"decks": []}'
@@ -69,6 +70,7 @@ def _baseline_blobs() -> dict[str, bytes]:
         "contracts/manifest.json": MANIFEST,
         "contracts/fixtures/capabilities.json": CAPABILITIES,
         "contracts/fixtures/answer-rejected.json": ANSWER_REJECTED,
+        "contracts/fixtures/room-closed.json": ROOM_CLOSED,
         "contracts/fixtures/campaign-catalog.json": CAMPAIGN_CATALOG_FIXTURE,
         "contracts/fixtures/catalog.json": CATALOG_FIXTURE,
         "contracts/fixtures/decks.json": DECKS_FIXTURE,
@@ -84,6 +86,7 @@ class ClosureTests(unittest.TestCase):
         self.assertIn("contracts/manifest.json", governed)
         self.assertIn("contracts/fixtures/capabilities.json", governed)
         self.assertIn("contracts/fixtures/answer-rejected.json", governed)
+        self.assertIn("contracts/fixtures/room-closed.json", governed)
         self.assertIn("contracts/fixtures/campaign-catalog.json", governed)
         self.assertIn("contracts/fixtures/catalog.json", governed)
         self.assertIn("contracts/fixtures/decks.json", governed)
