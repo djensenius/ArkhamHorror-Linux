@@ -681,7 +681,7 @@ jobs:
               timeout 60 /app/AppRun --smoke-test
             '
           echo "AppImage launched, entered the event loop, and rendered its first QML frame successfully in a minimal headless container."
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ArkhamHorror-Linux-AppImage
           path: "*.AppImage"
