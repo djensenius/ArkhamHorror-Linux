@@ -3,6 +3,7 @@
 #include "JsonDecode.h"
 
 #include <QJsonArray>
+#include <algorithm>
 #include <array>
 #include <utility>
 
@@ -612,6 +613,123 @@ ValueOrError<QByteArray> GameState::toJsonBytes() const {
   return toRawJson().toJsonBytes();
 }
 
+namespace {
+
+// Typed view of a gameOutcome object; std::nullopt when `v` does not have
+// that shape (GameOutcome::fromRawJson then keeps it as Unrecognized).
+// Additive members are tolerated: the raw value is what gets re-encoded.
+std::optional<GameOutcome::Ending> decodeOutcomeEnding(const Json::Value &v) {
+  if (!v.isObject())
+    return std::nullopt;
+  const auto scenario = v.find("scenario"_L1);
+  const auto resolution = v.find("resolution"_L1);
+  if (!scenario || !scenario->isString() || !resolution ||
+      !resolution->isObject())
+    return std::nullopt;
+  const auto tag = resolution->find("tag"_L1);
+  if (!tag || !tag->isString())
+    return std::nullopt;
+  if (tag->toString() == "NoResolution"_L1)
+    return GameOutcome::Ending{.scenario = scenario->toString(),
+                               .resolution = std::nullopt};
+  if (tag->toString() != "Resolution"_L1)
+    return std::nullopt;
+  const auto contents = resolution->find("contents"_L1);
+  if (!contents || !contents->isNumber())
+    return std::nullopt;
+  const auto n = contents->toRawNumber().toExactInt64();
+  if (!n)
+    return std::nullopt;
+  return GameOutcome::Ending{.scenario = scenario->toString(),
+                             .resolution = *n};
+}
+
+// JSON equality with object member order ignored (see GameOutcome's
+// operator== doc comment in Games.h).
+bool jsonEquivalentIgnoringMemberOrder(const Json::Value &a,
+                                       const Json::Value &b) {
+  if (a.kind() != b.kind())
+    return false;
+  if (a.isArray()) {
+    const auto &x = a.toArray();
+    const auto &y = b.toArray();
+    if (x.size() != y.size())
+      return false;
+    for (qsizetype i = 0; i < x.size(); ++i)
+      if (!jsonEquivalentIgnoringMemberOrder(x.at(i), y.at(i)))
+        return false;
+    return true;
+  }
+  if (a.isObject()) {
+    if (a.members().size() != b.members().size())
+      return false;
+    // Value::parse() rejects duplicate keys, so for any decoded value equal
+    // sizes plus every member of `a` matching one in `b` suffices.
+    const auto &others = b.members();
+    for (const auto &[key, value] : a.members()) {
+      const auto it = std::find_if(
+          others.cbegin(), others.cend(),
+          [&key](const auto &member) { return member.first == key; });
+      if (it == others.cend() ||
+          !jsonEquivalentIgnoringMemberOrder(value, it->second))
+        return false;
+    }
+    return true;
+  }
+  return a == b;
+}
+
+} // namespace
+
+bool operator==(const GameOutcome &a, const GameOutcome &b) {
+  return a.m_kind == b.m_kind && a.m_result == b.m_result &&
+         a.m_certainty == b.m_certainty && a.m_note == b.m_note &&
+         a.m_ending == b.m_ending && a.m_source == b.m_source &&
+         jsonEquivalentIgnoringMemberOrder(a.m_raw, b.m_raw);
+}
+
+GameOutcome GameOutcome::fromRawJson(const Json::Value &v) {
+  GameOutcome outcome;
+  outcome.m_raw = v;
+  if (!v.isObject())
+    return outcome;
+  const auto result = v.find("result"_L1);
+  const auto certainty = v.find("certainty"_L1);
+  const auto note = v.find("note"_L1);
+  const auto ending = v.find("ending"_L1);
+  const auto source = v.find("source"_L1);
+  if (!result || !result->isString() || !certainty || !certainty->isString() ||
+      !note || !(note->isNull() || note->isString()) || !ending || !source ||
+      !source->isString())
+    return outcome;
+  std::optional<Ending> decodedEnding;
+  if (!ending->isNull()) {
+    decodedEnding = decodeOutcomeEnding(*ending);
+    if (!decodedEnding)
+      return outcome;
+  }
+  outcome.m_kind = Kind::Known;
+  outcome.m_result = result->toString();
+  outcome.m_certainty = certainty->toString();
+  if (note->isString())
+    outcome.m_note = note->toString();
+  outcome.m_ending = std::move(decodedEnding);
+  outcome.m_source = source->toString();
+  return outcome;
+}
+
+ValueOrError<GameOutcome> GameOutcome::fromRawBytes(QByteArrayView bytes,
+                                                    QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed);
+}
+
+ValueOrError<QByteArray> GameOutcome::toJsonBytes() const {
+  return m_raw.toJsonBytes();
+}
+
 GameListRow GameListRow::success(GameId id,
                                  std::optional<ScenarioSummary> scenario,
                                  std::optional<CampaignSummary> campaign,
@@ -735,13 +853,24 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
   // disambiguate a success row from a failure row -- an additive/unknown
   // top-level field here is a contract violation, not a forward-compat
   // signal to tolerate (round-9 item 5; supersedes this file's prior
-  // additive-tolerant behavior for this specific shape).
-  auto exactKeys = Json::requireExactKeys(
-      obj,
-      {"id"_L1, "scenario"_L1, "campaign"_L1, "gameState"_L1, "name"_L1,
-       "investigators"_L1, "otherInvestigators"_L1, "multiplayerVariant"_L1,
-       "hasOpenSeats"_L1},
-      path);
+  // additive-tolerant behavior for this specific shape). The one exception
+  // is "outcome": required from schema 0.1.57, but servers 0.1.48-0.1.56
+  // (still admitted by currentPin()) omit it, so it alone is optional.
+  const bool hasOutcomeKey = obj.contains("outcome"_L1);
+  auto exactKeys =
+      hasOutcomeKey
+          ? Json::requireExactKeys(obj,
+                                   {"id"_L1, "scenario"_L1, "campaign"_L1,
+                                    "gameState"_L1, "outcome"_L1, "name"_L1,
+                                    "investigators"_L1, "otherInvestigators"_L1,
+                                    "multiplayerVariant"_L1, "hasOpenSeats"_L1},
+                                   path)
+          : Json::requireExactKeys(obj,
+                                   {"id"_L1, "scenario"_L1, "campaign"_L1,
+                                    "gameState"_L1, "name"_L1,
+                                    "investigators"_L1, "otherInvestigators"_L1,
+                                    "multiplayerVariant"_L1, "hasOpenSeats"_L1},
+                                   path);
   if (!exactKeys)
     return failure(exactKeys.error());
 
@@ -816,10 +945,26 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
   if (!hasOpenSeats)
     return failure(hasOpenSeats.error());
 
-  return GameListRow::success(*id, std::move(scenario), std::move(campaign),
-                              *gameState, *name, std::move(*investigators),
-                              std::move(*otherInvestigators),
-                              *multiplayerVariant, *hasOpenSeats);
+  // Decoded tolerantly: any present value is kept losslessly (see
+  // GameOutcome), so an unrecognised outcome never fails the row or the
+  // list around it.
+  const auto outcomePresence = Json::fieldPresence(obj, "outcome"_L1);
+  std::optional<GameOutcome> outcome;
+  if (outcomePresence == Json::FieldPresence::Present) {
+    auto raw = toLosslessRaw(obj.value("outcome"_L1));
+    if (!raw)
+      return failure(QStringLiteral("%1: %2").arg(
+          Json::joinPath(path, u"outcome"), raw.error()));
+    outcome = GameOutcome::fromRawJson(*raw);
+  }
+
+  auto row = GameListRow::success(*id, std::move(scenario), std::move(campaign),
+                                  *gameState, *name, std::move(*investigators),
+                                  std::move(*otherInvestigators),
+                                  *multiplayerVariant, *hasOpenSeats);
+  row.m_outcomePresence = outcomePresence;
+  row.m_outcome = std::move(outcome);
+  return row;
 }
 
 ValueOrError<Json::Value> GameListRow::toRawJson() const {
@@ -872,6 +1017,13 @@ ValueOrError<Json::Value> GameListRow::toRawJson() const {
   // double's exact-integer range survives an encode-then-reparse round
   // trip through this row, not merely through GameState in isolation.
   insert("gameState"_L1, m_gameState->toRawJson());
+  // Re-emitted exactly as received, in the position the backend's
+  // generated encoder (and the vendored fixture) uses: omitted for a
+  // pre-0.1.57 row, null, or the outcome's complete raw value.
+  if (m_outcomePresence == Json::FieldPresence::Null)
+    insert("outcome"_L1, Json::Value::makeNull());
+  else if (m_outcomePresence == Json::FieldPresence::Present && m_outcome)
+    insert("outcome"_L1, m_outcome->toRawJson());
   insert("name"_L1, Json::Value::makeString(m_name));
 
   QList<Json::Value> investigatorsArr;
@@ -1477,6 +1629,18 @@ createGameRequestFromValueImpl(const V &v, QStringView path) {
     achievementsEnabled = *result;
   }
 
+  // allowSpectators (schema 0.1.57): same absent-or-null-is-default rule as
+  // achievementsEnabled above, with a default of false.
+  bool allowSpectators = false;
+  const auto allowSpectatorsV = obj.value("allowSpectators"_L1);
+  if (!allowSpectatorsV.isUndefined() && !allowSpectatorsV.isNull()) {
+    auto result = Json::requireBoolValue(
+        allowSpectatorsV, Json::joinPath(path, u"allowSpectators"));
+    if (!result)
+      return failure(result.error());
+    allowSpectators = *result;
+  }
+
   return CreateGameRequest{
       .deckIds = std::move(deckIds),
       .playerCount = *playerCount,
@@ -1490,6 +1654,7 @@ createGameRequestFromValueImpl(const V &v, QStringView path) {
       .asIfRuling = *asIfRuling,
       .ultimatumsAndBoons = std::move(ultimatumsAndBoons),
       .achievementsEnabled = achievementsEnabled,
+      .allowSpectators = allowSpectators,
   };
 }
 
@@ -1584,6 +1749,8 @@ ValueOrError<Json::Value> CreateGameRequest::toRawJson() const {
                   Json::Value::makeArray(ultimatumsAndBoonsArr)});
   members.append({QStringLiteral("achievementsEnabled"),
                   Json::Value::makeBool(achievementsEnabled)});
+  members.append({QStringLiteral("allowSpectators"),
+                  Json::Value::makeBool(allowSpectators)});
   return Json::Value::makeObject(std::move(members));
 }
 

@@ -1245,6 +1245,7 @@ void GamesTests::decodesCreateGameFromFixture() {
   QCOMPARE(result->ultimatumsAndBoons.at(0), UltimatumOrBoon::BoonOfHades);
   QCOMPARE(result->ultimatumsAndBoons.at(1), UltimatumOrBoon::UltimatumOfChaos);
   QVERIFY(!result->achievementsEnabled);
+  QVERIFY(result->allowSpectators);
 
   // Fixture carries an additive "unknownField" this client does not model;
   // re-encoding correctly drops it.
@@ -1274,10 +1275,12 @@ void GamesTests::decodesCreateGameDefaultsFromFixture() {
   QVERIFY(!result->asIfRuling.has_value());
   QVERIFY(result->ultimatumsAndBoons.isEmpty());
   QVERIFY(result->achievementsEnabled); // default true.
+  QVERIFY(!result->allowSpectators);    // default false.
 
   // strictAsIfAt/asIfRuling are omitted (not merely null) on re-encode, but
-  // ultimatumsAndBoons/achievementsEnabled are always emitted (already
-  // resolved to their default) even though the fixture itself omits them.
+  // ultimatumsAndBoons/achievementsEnabled/allowSpectators are always
+  // emitted (already resolved to their default) even though the fixture
+  // itself omits them.
   const auto reencodedResult = Arkham::TestOnly::objectJson(*result);
   if (!reencodedResult)
     QFAIL(qPrintable(reencodedResult.error()));
@@ -1287,6 +1290,7 @@ void GamesTests::decodesCreateGameDefaultsFromFixture() {
   QJsonObject expected = v.toObject();
   expected.insert(QStringLiteral("ultimatumsAndBoons"), QJsonArray{});
   expected.insert(QStringLiteral("achievementsEnabled"), true);
+  expected.insert(QStringLiteral("allowSpectators"), false);
   QCOMPARE(reencoded, expected);
 }
 
