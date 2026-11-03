@@ -279,6 +279,7 @@ private slots:
   void probeMalformedJsonNotObject();
   void probeMalformedJsonBadSchema();
   void probeNonSuccessStatus();
+  void probeMaintenance503IsHttpErrorNotIncompatible();
   void probeIncompatible();
   void probeTransportFailure();
   void probeRejectsInvalidProfile();
@@ -1398,6 +1399,27 @@ void NetworkTests::probeNonSuccessStatus() {
   QCOMPARE(r->outcome, ProbeOutcome::HttpError);
   QCOMPARE(r->httpStatus, 503);
   QVERIFY(r->diagnostic.contains(QStringLiteral("503")));
+}
+
+void NetworkTests::probeMaintenance503IsHttpErrorNotIncompatible() {
+  // A server in maintenance mode (schema 0.1.57) answers every API route,
+  // including /capabilities, with 503 and this body. It is a transient
+  // HTTP failure, never a compatibility verdict: the body is not a
+  // capabilities document and must not be evaluated as one.
+  StubNetworkAccessManager nam;
+  nam.enqueue(
+      503,
+      QByteArrayLiteral(
+          R"({"maintenance":true,"since":"2026-11-03T22:15:00Z","message":"Arkham is down for maintenance."})"),
+      QNetworkReply::ServiceUnavailableError);
+
+  NetworkCapabilityProbe probe(nam);
+  const auto r = runProbe(probe, ServerProfile::hostedDefault());
+  QVERIFY2(r.has_value(), qPrintable(r.error()));
+  QCOMPARE(r->outcome, ProbeOutcome::HttpError);
+  QCOMPARE(r->httpStatus, 503);
+  QCOMPARE(r->diagnostic, QStringLiteral("unexpected HTTP status 503"));
+  QVERIFY(!r->compatibility.has_value());
 }
 
 void NetworkTests::probeIncompatible() {

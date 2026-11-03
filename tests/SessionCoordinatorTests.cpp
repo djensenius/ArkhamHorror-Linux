@@ -799,6 +799,7 @@ private slots:
   void legacyFallbackProbeProceedsToCredentialRestore();
   void incompatibleProbeSetsIncompatibleStateAndIsRetryable();
   void probeNetworkErrorSetsRecoverableFailureAndIsRetryable();
+  void probeMaintenance503SetsRecoverableFailureAndIsRetryable();
 
   // Credential restore
   void missingTokenBecomesSignedOut();
@@ -1144,6 +1145,37 @@ void SessionCoordinatorTests::
     return h.probeFactory.totalCreated() > createdBefore;
   }));
   QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
+}
+
+void SessionCoordinatorTests::
+    probeMaintenance503SetsRecoverableFailureAndIsRetryable() {
+  // The ProbeResult NetworkCapabilityProbe emits for a maintenance-mode
+  // 503 (see NetworkTests::probeMaintenance503IsHttpErrorNotIncompatible):
+  // it must be a retryable failure, not Incompatible.
+  Harness h;
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  ProbeResult maintenance;
+  maintenance.outcome = ProbeOutcome::HttpError;
+  maintenance.diagnostic = QStringLiteral("unexpected HTTP status 503");
+  maintenance.httpStatus = 503;
+  h.probeFactory.current()->complete(maintenance);
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RecoverableFailure;
+  }));
+  QCOMPARE(h.coordinator->diagnostic(),
+           QStringLiteral("unexpected HTTP status 503"));
+
+  const int createdBefore = h.probeFactory.totalCreated();
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
+    return h.probeFactory.totalCreated() > createdBefore;
+  }));
+  QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
 }
 
 // ─── Credential restore ──────────────────────────────────────────────────
