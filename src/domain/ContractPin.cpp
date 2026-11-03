@@ -2,18 +2,18 @@
 
 namespace Arkham {
 
-// Pinned to djensenius/ArkhamHorror#159 (commit
-// 06d5df29d991cc69c83637b1833be81045e8b113), which published
-// schemaRevision 0.1.53 and nativeClientMinimumRevision 0.1.53. See
+// Pinned to djensenius/ArkhamHorror#247 (commit
+// 4db9946179ef8b7a242bd7e40c0a2d74990cf3e9), which published
+// schemaRevision 0.1.57 and nativeClientMinimumRevision 0.1.57. See
 // contracts/contract-pin.json for the machine-readable record.
 const ContractPin &currentPin() {
   static const ContractPin pin{
       .backendCommit =
-          QStringLiteral("06d5df29d991cc69c83637b1833be81045e8b113"),
-      .sourceRef = QStringLiteral("djensenius/ArkhamHorror#159"),
-      .supportedSchemaRevision = {0, 1, 53},
+          QStringLiteral("4db9946179ef8b7a242bd7e40c0a2d74990cf3e9"),
+      .sourceRef = QStringLiteral("djensenius/ArkhamHorror#247"),
+      .supportedSchemaRevision = {0, 1, 57},
       .minimumServerSchemaRevision = {0, 1, 48},
-      .sourceNativeClientMinimumRevision = {0, 1, 53},
+      .sourceNativeClientMinimumRevision = {0, 1, 57},
       .expectedApiBasePath = QStringLiteral("/api/v1"),
   };
   return pin;
@@ -21,18 +21,18 @@ const ContractPin &currentPin() {
 
 // SHA-256 digests of every contracts/ file this client's decoders are bound
 // to, captured from djensenius/ArkhamHorror commit
-// 06d5df29d991cc69c83637b1833be81045e8b113. Recomputed and compared against
+// 4db9946179ef8b7a242bd7e40c0a2d74990cf3e9. Recomputed and compared against
 // the vendored bytes by ContractDriftTests; see GovernedFixtureDigest.
 const QList<GovernedFixtureDigest> &governedFixtureDigests() {
   static const QList<GovernedFixtureDigest> digests{
       {QStringLiteral("manifest.json"),
        QStringLiteral(
-           "5c74d543a47fa244a36e320460193f09eac9a906da7c365ea1dbab30d1b5373"
-           "9")},
+           "75e58dcb69d945ecbc8983092b9a6fb47dd4bcfdbea3213588384502c62c0b4"
+           "c")},
       {QStringLiteral("fixtures/capabilities.json"),
        QStringLiteral(
-           "096e253b657ebbe286c080f3b4aca7def50861764959d56715da3e3e7c339f6"
-           "1")},
+           "7843a3d789287d6bdec92bca841fc05a479c4e0c4dd6451d264f3a8ddfca8ee"
+           "4")},
       {QStringLiteral("fixtures/answer-rejected.json"),
        QStringLiteral(
            "ad8069b02586f3cfe4677dc6fa25d2297d9f2f6cbd3366c6954845446a0440d"
@@ -55,12 +55,12 @@ const QList<GovernedFixtureDigest> &governedFixtureDigests() {
            "ff")},
       {QStringLiteral("fixtures/game-lifecycle.json"),
        QStringLiteral(
-           "436fa9aea0e0e256b68b7f6038c15692e66af2677293b41bca25c691ab60120"
-           "4")},
+           "f813d04108cd223575c76a75c2b0ab822adbbb7302dd1655711f960cdf4af3f"
+           "3")},
       {QStringLiteral("fixtures/game-list.json"),
        QStringLiteral(
-           "eb3d06e26059c20225389e22a945088899c4433480a39602818f4003365a1fb"
-           "f")},
+           "15a68bfc25bdb5e73b4876ef4e7bbf97c66666bf2e185a6fbbb117ab6fe6ca8"
+           "0")},
       {QStringLiteral("schemas/campaign-catalog.schema.json"),
        QStringLiteral(
            "e49e5000658288b4324280fe4164359b419a0c91fbbf7c16c045385060c23dc"
@@ -75,12 +75,12 @@ const QList<GovernedFixtureDigest> &governedFixtureDigests() {
            "0")},
       {QStringLiteral("schemas/game-lifecycle.schema.json"),
        QStringLiteral(
-           "894ce38d078fe0857e824033578972bacab4744595ca1741250c2813f2fd682"
-           "d")},
+           "e8e42f6e1d32d1da310da0aa65bfa9187ef2dba42f217e157fa93b3e03fc0b4"
+           "2")},
       {QStringLiteral("schemas/game-list.schema.json"),
        QStringLiteral(
-           "a8b8154d4d7dff3549240664df584db036930e57e6c65805da9981543bc4c92"
-           "b")},
+           "fe412ca6e7efe8f23445582b1e4611cfecfe480051bdaf8e887588e8f766cda"
+           "3")},
       {QStringLiteral("schemas/game-state.schema.json"),
        QStringLiteral(
            "b193923d9d272df08adad5d2a3845b04171756edb1edb304f21fc774996a306"

@@ -259,6 +259,14 @@
             "null"
           ],
           "default": true
+        },
+        "allowSpectators": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": false,
+          "description": "List the new game on the public watch list. Absent or null means false. It controls advertising only: the spectate route stays reachable by game id either way, and spectators can never answer."
         }
       }
     },

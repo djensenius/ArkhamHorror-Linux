@@ -27,6 +27,7 @@
       "UltimatumOfChaos"
     ],
     "achievementsEnabled": false,
+    "allowSpectators": true,
     "unknownField": "ignored by the decoder"
   },
   "createGameDefaults": {
@@ -53,7 +54,8 @@
     "strictAsIfAt": null,
     "asIfRuling": null,
     "ultimatumsAndBoons": null,
-    "achievementsEnabled": null
+    "achievementsEnabled": null,
+    "allowSpectators": null
   },
   "chooseDeck": {
     "investigatorId": "01001",

@@ -15,6 +15,7 @@
       "tag": "IsPending",
       "contents": []
     },
+    "outcome": null,
     "name": "Contract fixture game",
     "investigators": [],
     "otherInvestigators": [],
@@ -35,6 +36,7 @@
         "00000000-0000-0000-0000-000000000001"
       ]
     },
+    "outcome": null,
     "name": "Campaign contract fixture",
     "investigators": [
       {
@@ -70,6 +72,7 @@
     "gameState": {
       "tag": "IsActive"
     },
+    "outcome": null,
     "name": "Active contract fixture",
     "investigators": [],
     "otherInvestigators": [],
@@ -90,6 +93,19 @@
     "campaign": null,
     "gameState": {
       "tag": "IsOver"
+    },
+    "outcome": {
+      "result": "Won",
+      "certainty": "Certain",
+      "note": null,
+      "ending": {
+        "scenario": "c01104",
+        "resolution": {
+          "tag": "Resolution",
+          "contents": 1
+        }
+      },
+      "source": "Recorded"
     },
     "name": "Completed contract fixture",
     "investigators": [],
