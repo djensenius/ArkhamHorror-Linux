@@ -37,15 +37,21 @@ namespace {
 
 // ─── Stub QNetworkReply ─────────────────────────────────────────────────
 
+// Raw response headers set on a stub reply (e.g. Retry-After).
+using RawHeaders = QList<std::pair<QByteArray, QByteArray>>;
+
 class StubNetworkReply final : public QNetworkReply {
   Q_OBJECT
 public:
   StubNetworkReply(int statusCode, QByteArray body,
                    QNetworkReply::NetworkError netError, bool hanging,
-                   QObject *parent)
+                   const RawHeaders &headers, QObject *parent)
       : QNetworkReply(parent), m_body(std::move(body)), m_hanging(hanging) {
     if (statusCode > 0) {
       setAttribute(QNetworkRequest::HttpStatusCodeAttribute, statusCode);
+    }
+    for (const auto &[name, value] : headers) {
+      setRawHeader(name, value);
     }
     if (netError != NoError) {
       setError(netError, QStringLiteral("simulated network error"));
@@ -96,11 +102,13 @@ public:
       : QNetworkAccessManager(parent) {}
 
   void enqueue(int statusCode, QByteArray body,
-               QNetworkReply::NetworkError err = QNetworkReply::NoError) {
-    m_queue.enqueue({statusCode, std::move(body), err, false});
+               QNetworkReply::NetworkError err = QNetworkReply::NoError,
+               RawHeaders headers = {}) {
+    m_queue.enqueue(
+        {statusCode, std::move(body), err, false, std::move(headers)});
   }
   void enqueueHanging() {
-    m_queue.enqueue({0, {}, QNetworkReply::NoError, true});
+    m_queue.enqueue({0, {}, QNetworkReply::NoError, true, {}});
   }
 
   const QList<QNetworkRequest> &requests() const { return m_requests; }
@@ -115,9 +123,9 @@ protected:
     if (m_queue.isEmpty()) {
       qFatal("StubNetworkAccessManager: no canned response enqueued");
     }
-    const auto [status, body, err, hanging] = m_queue.dequeue();
-    auto *reply =
-        new StubNetworkReply(status, std::move(body), err, hanging, this);
+    const auto [status, body, err, hanging, headers] = m_queue.dequeue();
+    auto *reply = new StubNetworkReply(status, std::move(body), err, hanging,
+                                       headers, this);
     m_lastReply = reply;
     if (!hanging) {
       reply->scheduleFinished();
@@ -131,6 +139,7 @@ private:
     QByteArray body;
     QNetworkReply::NetworkError err;
     bool hanging{false};
+    RawHeaders headers;
   };
   QQueue<Canned> m_queue;
   QList<QNetworkRequest> m_requests;
