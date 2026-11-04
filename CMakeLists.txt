@@ -973,6 +973,20 @@ if(BUILD_TESTING)
     )
     add_test(NAME semantic_input_fixture COMMAND arkham-semantic-input-fixture-tests)
 
+    qt_add_executable(arkham-main-qml-tests
+        tests/MainQmlTests.cpp
+    )
+    target_compile_definitions(arkham-main-qml-tests PRIVATE
+        ARKHAM_TEST_QML_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml"
+    )
+    target_link_libraries(arkham-main-qml-tests PRIVATE
+        Qt6::Gui
+        Qt6::Quick
+        Qt6::QuickControls2
+        Qt6::Test
+    )
+    add_test(NAME main_qml COMMAND arkham-main-qml-tests)
+
     # QtKeychain's kwallet5 backend (the two downstream hardening patches'
     # target) only exists in keychain_unix.cpp, compiled solely for
     # Unix-like, non-Apple platforms, and this test requires a session D-Bus

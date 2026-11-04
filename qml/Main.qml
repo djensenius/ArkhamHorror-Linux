@@ -180,23 +180,47 @@ ApplicationWindow {
             font.pixelSize: 16
         }
 
-        Label {
+        ScrollView {
+            id: maintenanceNotice
+
             // The server's maintenance notice (its own user-facing message
-            // plus when to try again); shown only in ServerMaintenance.
-            // qmllint disable unqualified
-            text: typeof sessionCoordinator !== "undefined" && sessionCoordinator && sessionCoordinator.serverMaintenance ? sessionCoordinator.diagnostic : ""
-            // qmllint enable unqualified
-            visible: text.length > 0
-            // Server-written free text: never render it as markup (no
-            // remote images or links from the message).
-            textFormat: Text.PlainText
+            // plus when to try again); shown only in ServerMaintenance. A
+            // valid message can hold many lines, so the notice is height-
+            // bounded and scrolls instead of pushing the layout off-screen;
+            // the whole text, including "Try again ...", stays reachable.
+            objectName: "maintenanceNotice"
+            visible: maintenanceText.text.length > 0
+            clip: true
+            Layout.fillWidth: true
             Layout.maximumWidth: 720
-            wrapMode: Text.WordWrap
-            color: root.bone
-            font.pixelSize: 16
+            // Grows into the free space (shared with the spacer above) up to
+            // a fifth of the window, and never below about two lines.
+            Layout.fillHeight: true
+            Layout.minimumHeight: Math.min(maintenanceText.implicitHeight, maintenanceText.font.pixelSize * 2.5)
+            Layout.preferredHeight: Layout.minimumHeight
+            Layout.maximumHeight: Math.min(maintenanceText.implicitHeight, root.height * 0.2)
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            Label {
+                id: maintenanceText
+
+                objectName: "maintenanceNoticeText"
+                width: maintenanceNotice.availableWidth
+                // qmllint disable unqualified
+                text: typeof sessionCoordinator !== "undefined" && sessionCoordinator && sessionCoordinator.serverMaintenance ? sessionCoordinator.diagnostic : ""
+                // qmllint enable unqualified
+                // Server-written free text: never render it as markup (no
+                // remote images or links from the message).
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: root.bone
+                font.pixelSize: 16
+            }
         }
 
         Label {
+            objectName: "inputHint"
             text: qsTr("Directional input moves focus | Enter / A selects | Escape / B returns")
             color: "#a9a189"
             font.pixelSize: 17
