@@ -4123,6 +4123,10 @@ def _allowlist_mismatch_lines(
             f"{finding.physical_identity_sha256 or entry.physical_identity_sha256} "
             f"{finding.observation_set_sha256 or entry.observation_set_sha256}"
         )
+        details.append(
+            "  this also changes the named set digest; take set digests from "
+            "`mise run contracts:print-encoder-hygiene-pins` (--print-pins)"
+        )
     if counts is not None and counts[finding.key()] != entry.expected_count:
         mismatched.append("occurrence count")
         details.append(

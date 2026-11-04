@@ -338,6 +338,10 @@ class ViolationDiagnosticsTests(unittest.TestCase):
         '"spelling_file":"src/domain/RawJson.h","spelling_offset":1834,'
         '"usr":"c:@N@Arkham@N@Json@S@Value@F@toExactQJson#1"}'
     )
+    _SET_DIGEST_HINT = (
+        "  this also changes the named set digest; take set digests from "
+        "`mise run contracts:print-encoder-hygiene-pins` (--print-pins)"
+    )
 
     def _pinned_allowlisted_finding(self) -> ceh.Finding:
         entry = ceh.ALLOWLIST[0]
@@ -405,9 +409,10 @@ class ViolationDiagnosticsTests(unittest.TestCase):
                 "spelling_offset=1834",
                 "  observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
                 f"{new_hash} {entry.observation_set_sha256}",
+                self._SET_DIGEST_HINT,
             ],
         )
-        pin_line = lines[-1].split("pin line: ", 1)[1]
+        pin_line = lines[-2].split("pin line: ", 1)[1]
         self.assertEqual(
             tuple(pin_line.split()), (new_hash, entry.observation_set_sha256)
         )
@@ -430,8 +435,49 @@ class ViolationDiagnosticsTests(unittest.TestCase):
                 f"observed {'f' * 64}",
                 "  observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
                 f"{entry.physical_identity_sha256} {'f' * 64}",
+                self._SET_DIGEST_HINT,
             ],
         )
+
+    def test_physical_and_observation_mismatch_pin_line_uses_both_observed(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = replace(self._relocated_finding(), observation_set_sha256="e" * 64)
+        new_hash = hashlib.sha256(self._RELOCATED_PAYLOAD.encode("utf-8")).hexdigest()
+        self.assertEqual(ceh.classify(finding), "violation")
+
+        lines = ceh._allowlist_mismatch_lines(finding)
+
+        self.assertEqual(
+            lines,
+            [
+                "mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+                "physical identity, observation set",
+                f"physical identity: pinned {entry.physical_identity_sha256}, "
+                f"observed {new_hash}",
+                "  observed position: file=src/domain/RawJson.h line=57 "
+                "offset=1834 spelling_file=src/domain/RawJson.h "
+                "spelling_offset=1834",
+                f"observation set: pinned {entry.observation_set_sha256}, "
+                f"observed {'e' * 64}",
+                "  observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
+                f"{new_hash} {'e' * 64}",
+                self._SET_DIGEST_HINT,
+            ],
+        )
+
+    def test_non_qjson_and_exact_set_allowed_findings_explain_nothing(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        relocated = self._relocated_finding()
+        self.assertTrue(ceh._allowlist_mismatch_lines(relocated))
+        non_qjson = replace(
+            relocated, canonical_return_type="Arkham::ValueOrError<QString>"
+        )
+        set_allowed = replace(relocated, exact_set_allowed=True)
+        counts = Counter({entry.key(): 2})
+        for finding in (non_qjson, set_allowed):
+            with self.subTest(finding=finding):
+                self.assertEqual(ceh.classify(finding, counts), "allowed")
+                self.assertEqual(ceh._allowlist_mismatch_lines(finding, counts), [])
 
     def test_signature_access_linkage_and_count_mismatches_are_named(self) -> None:
         entry = ceh.ALLOWLIST[0]
@@ -564,6 +610,40 @@ class ViolationDiagnosticsTests(unittest.TestCase):
                 "error: the per-entry allowlist checks from this same run found "
                 "no violations; only the set digest(s) reported above changed.\n"
             )
+        )
+
+    def test_stale_count_failure_still_reports_per_entry_violations(self) -> None:
+        relocated = self._relocated_finding()
+
+        def fake_run_check(*_args: object, **_kwargs: object) -> list[ceh.Finding]:
+            return [relocated]
+
+        result, stdout, stderr = self._run_main_with(fake_run_check)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        self.assertNotIn("continuing with the per-entry allowlist checks", stderr)
+        stale = stderr.index("the allowlist itself has gone stale")
+        missing_entry = ceh.ALLOWLIST[1]
+        self.assertIn(
+            f"  {missing_entry.file}: {missing_entry.usr} (expected 1, found 0)\n",
+            stderr,
+        )
+        violations = stderr.index(
+            "error: 1 forbidden Qt wire-type surface(s) are not in the exact "
+            "positive allowlist"
+        )
+        per_entry = stderr.index(
+            "      mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+            "physical identity\n"
+        )
+        self.assertLess(stale, violations)
+        self.assertLess(violations, per_entry)
+        self.assertIn(
+            "        observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
+            f"{relocated.physical_identity_sha256} "
+            f"{ceh.ALLOWLIST[0].observation_set_sha256}\n",
+            stderr,
         )
 
 
