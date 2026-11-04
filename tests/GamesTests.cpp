@@ -1586,13 +1586,14 @@ void GamesTests::roomClosedFixtureDecodesAsOther() {
 
 void GamesTests::unmodeledServerMessageTagDecodesAsOther() {
   const QByteArray bytes =
-      R"({"tag":"GameUpdate","contents":{"unmodeled":"public-game"}})";
+      R"({"tag":"GameCard","title":"Drawn","card":{"unmodeled":"card"}})";
   const auto result = ServerMessage::fromRawBytes(bytes, u"message");
   if (!result)
     QFAIL(qPrintable(result.error()));
 
   QCOMPARE(result->kind(), ServerMessage::Kind::Other);
-  QCOMPARE(result->tag(), QStringLiteral("GameUpdate"));
+  QCOMPARE(result->tag(), QStringLiteral("GameCard"));
+  QVERIFY(!result->game().has_value());
   QVERIFY(result->displayText().isEmpty());
 }
 

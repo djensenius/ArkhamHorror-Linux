@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "Board.h"
+#include "Games.h"
 #include "RawJson.h"
 
 using namespace Arkham;
@@ -110,6 +111,25 @@ constexpr auto kInvestigator =
     R"("contents":"782de537-8f5d-4eda-b849-2362e28402e5"},)"
     R"("connectedLocations":["00000000-0000-0000-0000-000000000032"]})";
 
+// A standalone scenario at turn zero with an empty chaos bag.
+constexpr auto kMode = R"({"That":{"id":"c01104","turn":0,)"
+                       R"("chaosBag":{"chaosTokens":[],)"
+                       R"("revealedChaosTokens":[]}}})";
+
+// A minimal PublicGame: the mode above, no running phase step and one entry
+// in each modeled map, keyed by that entry's own id.
+QByteArray publicGameJson() {
+  return QByteArray(R"({"tag":"PublicGame",)"
+                    R"("id":"00000000-0000-0000-0000-000000000003",)"
+                    R"("name":"Contract fixture game","mode":)") +
+         kMode +
+         R"(,"encounterDeckSize":26,"phase":"InvestigationPhase",)"
+         R"("phaseStep":null,"locations":{")" +
+         kStudyId + R"(":)" + kLocation + R"(},"investigators":{"c01001":)" +
+         kInvestigator + R"(},"acts":{"c01108":)" + kAct +
+         R"(},"agendas":{"c01105":)" + kAgenda + "}}";
+}
+
 QByteArray validJson(const QString &type) {
   if (type == "token"_L1)
     return kToken;
@@ -132,6 +152,10 @@ QByteArray validJson(const QString &type) {
     return kEnemyLocation;
   if (type == "investigator"_L1)
     return kInvestigator;
+  if (type == "mode"_L1)
+    return kMode;
+  if (type == "game"_L1)
+    return publicGameJson();
   qFatal("unknown test type: %s", qPrintable(type));
 }
 
@@ -169,6 +193,10 @@ QString decodeError(const QString &type, const QByteArray &json) {
     return errorOf(Location::fromRawBytes(json, u"x"));
   if (type == "investigator"_L1)
     return errorOf(Investigator::fromRawBytes(json, u"x"));
+  if (type == "mode"_L1)
+    return errorOf(GameMode::fromRawBytes(json, u"x"));
+  if (type == "game"_L1)
+    return errorOf(PublicGame::fromRawBytes(json, u"x"));
   auto parsed = Json::Value::parse(json, u"x");
   if (!parsed)
     return parsed.error();
@@ -615,6 +643,333 @@ private slots:
     QCOMPARE(investigatorB->health(), 9);
   }
 
+  // The whole CORE snapshot through PublicGame, with exact fixture values.
+  void publicGameDecodesGetGameFixture() {
+    const auto game = PublicGame::fromRawJson(getGamePublicGame(), u"game");
+    QVERIFY2(game, qPrintable(game ? QString() : game.error()));
+
+    QCOMPARE(game->id().value(), u"00000000-0000-0000-0000-000000000003"_s);
+    QCOMPARE(game->name(), u"Contract fixture game"_s);
+    QCOMPARE(game->encounterDeckSize(), 26);
+    QCOMPARE(game->phase(), Phase::InvestigationPhase);
+    QVERIFY(game->phaseStep().has_value());
+    QCOMPARE(game->phaseStep()->kind(),
+             PhaseStep::Kind::InvestigationPhaseStep);
+    QCOMPARE(game->phaseStep()->step(),
+             PhaseStep::Step::InvestigatorTakesActionStep);
+
+    QCOMPARE(game->mode().kind(), GameMode::Kind::ScenarioOnly);
+    QVERIFY(!game->mode().campaign().has_value());
+    QVERIFY(game->mode().scenario().has_value());
+    QCOMPARE(game->mode().scenario()->id().value(), u"c01104"_s);
+    QCOMPARE(game->mode().scenario()->turn(), 1);
+
+    const ChaosBag *bag = game->chaosBag();
+    QVERIFY(bag != nullptr);
+    QCOMPARE(bag, &game->mode().scenario()->chaosBag());
+    QCOMPARE(bag->chaosTokens().size(), 16);
+    QCOMPARE(bag->chaosTokens().first().face(), u"MinusTwo"_s);
+    QCOMPARE(bag->chaosTokens().first().id().value(),
+             u"22e6cf42-cc5c-4a9c-b9d1-f71e594e0d60"_s);
+    QCOMPARE(bag->chaosTokens().last().face(), u"Cultist"_s);
+    QVERIFY(bag->revealedChaosTokens().isEmpty());
+
+    QCOMPARE(game->locations().size(), 1);
+    const auto studyId = LocationId::parse(QString::fromLatin1(kStudyId));
+    QVERIFY(studyId);
+    const Location *study = game->location(*studyId);
+    QVERIFY(study != nullptr);
+    QCOMPARE(study, &game->locations().first());
+    QCOMPARE(study->label(), u"study"_s);
+    QCOMPARE(study->cardCode().value(), u"c01111"_s);
+    QCOMPARE(study->clues(), 2);
+    const auto otherId =
+        LocationId::parse(u"00000000-0000-0000-0000-000000000032"_s);
+    QVERIFY(otherId);
+    QCOMPARE(game->location(*otherId), nullptr);
+
+    const auto rolandCode = CardCode::parse(u"c01001"_s);
+    QVERIFY(rolandCode);
+    QCOMPARE(game->investigators().size(), 1);
+    const Investigator *roland = game->investigator(*rolandCode);
+    QVERIFY(roland != nullptr);
+    QCOMPARE(roland->name().title, u"Roland Banks"_s);
+    QCOMPARE(roland->health(), 9);
+    QCOMPARE(roland->sanity(), 5);
+    QCOMPARE(roland->placementLocation(), std::optional<LocationId>(*studyId));
+    QCOMPARE(study->investigators(), QList<CardCode>{*rolandCode});
+
+    const auto actCode = CardCode::parse(u"c01108"_s);
+    QVERIFY(actCode);
+    QCOMPARE(game->acts().size(), 1);
+    const Act *act = game->act(*actCode);
+    QVERIFY(act != nullptr);
+    QCOMPARE(act->sequenceStep(), 1);
+    QCOMPARE(act->sequenceSide(), ActSide::A);
+    QCOMPARE(act->advanceCost().value("tag"_L1).toString(), u"GroupClueCost"_s);
+    QCOMPARE(game->act(*rolandCode), nullptr);
+
+    const auto agendaCode = CardCode::parse(u"c01105"_s);
+    QVERIFY(agendaCode);
+    QCOMPARE(game->agendas().size(), 1);
+    const Agenda *agenda = game->agenda(*agendaCode);
+    QVERIFY(agenda != nullptr);
+    QCOMPARE(agenda->doom(), 0);
+    QVERIFY(agenda->doomThreshold().has_value());
+    QVERIFY(*agenda->doomThreshold() == GameValue::staticValue(3));
+  }
+
+  // The GetGame REST envelope around that PublicGame.
+  void getGameEnvelopeDecodes() {
+    const auto getGame =
+        GetGame::fromRawBytes(loadFixtureBytes(u"get-game.json"_s), u"getGame");
+    QVERIFY2(getGame, qPrintable(getGame ? QString() : getGame.error()));
+    QVERIFY(getGame->playerId().has_value());
+    QCOMPARE(getGame->playerId()->value(),
+             u"00000000-0000-0000-0000-000000000001"_s);
+    QCOMPARE(getGame->multiplayerMode(), MultiplayerVariant::Solo);
+    QVERIFY(!getGame->eventId().has_value());
+
+    const auto game = PublicGame::fromRawJson(getGamePublicGame(), u"game");
+    QVERIFY(game);
+    QVERIFY(getGame->game() == *game);
+    QCOMPARE(getGame->game().encounterDeckSize(), 26);
+  }
+
+  void getGameEnvelopeNullableAndRejected_data() {
+    QTest::addColumn<QByteArray>("from");
+    QTest::addColumn<QByteArray>("to");
+    // Empty: the mutated envelope must decode.
+    QTest::addColumn<QString>("expectedError");
+    QTest::newRow("spectator playerId null") << QByteArray(R"("Solo",
+  "playerId": "00000000-0000-0000-0000-000000000001")")
+                                             << QByteArray(R"("Solo",
+  "playerId": null)") << QString();
+    QTest::newRow("eventId uuid")
+        << QByteArray(R"("eventId": null)")
+        << QByteArray(R"("eventId": "00000000-0000-0000-0000-000000000005")")
+        << QString();
+    QTest::newRow("WithFriends")
+        << QByteArray(R"("multiplayerMode": "Solo")")
+        << QByteArray(R"("multiplayerMode": "WithFriends")") << QString();
+    QTest::newRow("unknown multiplayerMode")
+        << QByteArray(R"("multiplayerMode": "Solo")")
+        << QByteArray(R"("multiplayerMode": "Party")")
+        << uR"(getGame.multiplayerMode: unrecognized value "Party")"_s;
+    QTest::newRow("missing eventId")
+        << QByteArray(R"("eventId": null,)") << QByteArray()
+        << uR"(getGame.eventId: missing required field "eventId")"_s;
+    QTest::newRow("bad playerId") << QByteArray(R"("Solo",
+  "playerId": "00000000-0000-0000-0000-000000000001")")
+                                  << QByteArray(R"("Solo",
+  "playerId": 1)") << u"getGame.playerId"_s;
+    QTest::newRow("game error path")
+        << QByteArray(R"("encounterDeckSize": 26)")
+        << QByteArray(R"("encounterDeckSize": -26)")
+        << u"getGame.game.encounterDeckSize: must not be negative, got -26"_s;
+    QTest::newRow("missing playerId") << QByteArray(R"("Solo",
+  "playerId")") << QByteArray(R"("Solo",
+  "playerIdX")") << uR"(getGame.playerId: missing required field "playerId")"_s;
+    QTest::newRow("missing game")
+        << QByteArray(R"("game": {)") << QByteArray(R"("gameX": {)")
+        << uR"(getGame.game: missing required field "game")"_s;
+    QTest::newRow("missing multiplayerMode")
+        << QByteArray(R"("multiplayerMode": "Solo")")
+        << QByteArray(R"("multiplayerModeX": "Solo")")
+        << uR"(getGame.multiplayerMode: missing required field "multiplayerMode")"_s;
+  }
+
+  void getGameEnvelopeNullableAndRejected() {
+    QFETCH(QByteArray, from);
+    QFETCH(QByteArray, to);
+    QFETCH(QString, expectedError);
+    QByteArray json = loadFixtureBytes(u"get-game.json"_s);
+    const qsizetype at = json.indexOf(from);
+    QVERIFY2(at >= 0, from.constData());
+    json.replace(at, from.size(), to);
+    const auto getGame = GetGame::fromRawBytes(json, u"getGame");
+    if (expectedError.isEmpty()) {
+      QVERIFY2(getGame, qPrintable(getGame ? QString() : getGame.error()));
+      return;
+    }
+    QVERIFY2(!getGame, "mutated envelope must not decode");
+    QVERIFY2(getGame.error().contains(expectedError),
+             qPrintable(getGame.error()));
+  }
+
+  // REST and WebSocket decode to the same snapshot.
+  void gameUpdateServerMessageMatchesGetGame() {
+    const auto message = ServerMessage::fromRawBytes(
+        loadFixtureBytes(u"game-update.json"_s), u"message");
+    QVERIFY2(message, qPrintable(message ? QString() : message.error()));
+    QCOMPARE(message->kind(), ServerMessage::Kind::GameUpdate);
+    QCOMPARE(message->tag(), u"GameUpdate"_s);
+    QVERIFY(message->displayText().isEmpty());
+    QVERIFY(message->game().has_value());
+
+    const auto getGame =
+        GetGame::fromRawBytes(loadFixtureBytes(u"get-game.json"_s), u"getGame");
+    QVERIFY(getGame);
+    QVERIFY(*message->game() == getGame->game());
+    QCOMPARE(message->game()->encounterDeckSize(), 26);
+    QCOMPARE(message->game()->chaosBag()->chaosTokens().first().face(),
+             u"MinusTwo"_s);
+  }
+
+  void gameUpdateWithBadContentsFails() {
+    const auto missing =
+        ServerMessage::fromRawBytes(R"({"tag":"GameUpdate"})", u"message");
+    QVERIFY(!missing);
+    QCOMPARE(missing.error(),
+             uR"(message.contents: missing required field "contents")"_s);
+
+    const auto unmodeled = ServerMessage::fromRawBytes(
+        R"({"tag":"GameUpdate","contents":{"unmodeled":"public-game"}})",
+        u"message");
+    QVERIFY(!unmodeled);
+    QCOMPARE(unmodeled.error(),
+             uR"(message.contents.tag: missing required field "tag")"_s);
+  }
+
+  // Every message kind other than GameUpdate carries no snapshot.
+  void nonGameUpdateMessagesHaveNoGame() {
+    const auto message = ServerMessage::fromRawBytes(
+        R"({"tag":"GameMessage","contents":"hi"})", u"message");
+    QVERIFY(message);
+    QVERIFY(!message->game().has_value());
+  }
+
+  // mode.schema.json's three sibling-key branches.
+  void gameModeVariants() {
+    const QByteArray scenario =
+        R"({"id":"c01104","turn":0,"chaosBag":{"chaosTokens":[],)"
+        R"("revealedChaosTokens":[]}})";
+    const QByteArray campaign = R"({"continueOptions":[],"other":1})";
+
+    const auto campaignOnly =
+        GameMode::fromRawBytes("{\"This\":" + campaign + "}", u"mode");
+    QVERIFY2(campaignOnly,
+             qPrintable(campaignOnly ? QString() : campaignOnly.error()));
+    QCOMPARE(campaignOnly->kind(), GameMode::Kind::CampaignOnly);
+    QVERIFY(campaignOnly->campaign().has_value());
+    QCOMPARE(campaignOnly->campaign()->keys(),
+             (QStringList{u"continueOptions"_s, u"other"_s}));
+    QVERIFY(!campaignOnly->scenario().has_value());
+
+    const auto both = GameMode::fromRawBytes(
+        "{\"This\":" + campaign + ",\"That\":" + scenario + "}", u"mode");
+    QVERIFY2(both, qPrintable(both ? QString() : both.error()));
+    QCOMPARE(both->kind(), GameMode::Kind::CampaignAndScenario);
+    QVERIFY(both->campaign().has_value());
+    QVERIFY(both->scenario().has_value());
+    QCOMPARE(both->scenario()->turn(), 0);
+    QCOMPARE(both->scenario()->id().value(), u"c01104"_s);
+
+    const auto scenarioOnly =
+        GameMode::fromRawBytes("{\"That\":" + scenario + "}", u"mode");
+    QVERIFY(scenarioOnly);
+    QCOMPARE(scenarioOnly->kind(), GameMode::Kind::ScenarioOnly);
+    QVERIFY(!scenarioOnly->campaign().has_value());
+    QVERIFY(scenarioOnly->scenario()->chaosBag().chaosTokens().isEmpty());
+
+    // A between-scenario snapshot has no chaos bag.
+    const QByteArray game =
+        mutated(u"game"_s, validJson(u"mode"_s), "{\"This\":" + campaign + "}");
+    const auto campaignGame = PublicGame::fromRawBytes(game, u"game");
+    QVERIFY2(campaignGame,
+             qPrintable(campaignGame ? QString() : campaignGame.error()));
+    QCOMPARE(campaignGame->chaosBag(), nullptr);
+  }
+
+  // Map entries keep wire order even when their keys are in descending
+  // order, and each lookup returns that entry's own element.
+  void publicGameMapsKeepWireOrder() {
+    const QByteArray secondLocation =
+        QByteArray(kLocation)
+            .replace(R"("id":"782de537-8f5d-4eda-b849-2362e28402e5")",
+                     R"("id":"00000000-0000-0000-0000-000000000032")")
+            .replace(R"("label":"study")", R"("label":"hallway")");
+    const QByteArray secondInvestigator =
+        QByteArray(kInvestigator)
+            .replace(R"("id":"c01001","cardCode":"c01001")",
+                     R"("id":"c00002","cardCode":"c00002")")
+            .replace(R"("title":"Roland Banks")", R"("title":"Second")");
+    QByteArray json = mutated(u"game"_s, R"(}},"investigators":{)",
+                              R"(},"00000000-0000-0000-0000-000000000032":)" +
+                                  secondLocation + R"(},"investigators":{)");
+    const QByteArray actsFrom = R"(}},"acts":{)";
+    const qsizetype at = json.indexOf(actsFrom);
+    QVERIFY(at >= 0);
+    json.replace(at, actsFrom.size(),
+                 R"(},"c00002":)" + secondInvestigator + R"(},"acts":{)");
+
+    const auto game = PublicGame::fromRawBytes(json, u"game");
+    QVERIFY2(game, qPrintable(game ? QString() : game.error()));
+
+    QCOMPARE(game->locations().size(), 2);
+    QCOMPARE(game->locations()[0].id().value(),
+             u"782de537-8f5d-4eda-b849-2362e28402e5"_s);
+    QCOMPARE(game->locations()[1].id().value(),
+             u"00000000-0000-0000-0000-000000000032"_s);
+    for (const Location &location : game->locations()) {
+      const Location *found = game->location(location.id());
+      QCOMPARE(found, &location);
+    }
+    QCOMPARE(game->location(game->locations()[0].id())->label(), u"study"_s);
+    QCOMPARE(game->location(game->locations()[1].id())->label(), u"hallway"_s);
+
+    QCOMPARE(game->investigators().size(), 2);
+    QCOMPARE(game->investigators()[0].id().value(), u"c01001"_s);
+    QCOMPARE(game->investigators()[1].id().value(), u"c00002"_s);
+    for (const Investigator &investigator : game->investigators()) {
+      const Investigator *found = game->investigator(investigator.id());
+      QCOMPARE(found, &investigator);
+    }
+    QCOMPARE(game->investigator(game->investigators()[0].id())->name().title,
+             u"Roland Banks"_s);
+    QCOMPARE(game->investigator(game->investigators()[1].id())->name().title,
+             u"Second"_s);
+  }
+
+  // Tolerated mode shapes: an extra "These" key beside "That" is an ignored
+  // additive key, so the mode is still ScenarioOnly.
+  void gameModeToleratesExtraTheseKey() {
+    const auto mode = GameMode::fromRawBytes(
+        mutated(u"mode"_s, R"({"That":)", R"({"These":{"x":1},"That":)"),
+        u"mode");
+    QVERIFY2(mode, qPrintable(mode ? QString() : mode.error()));
+    QCOMPARE(mode->kind(), GameMode::Kind::ScenarioOnly);
+    QVERIFY(!mode->campaign().has_value());
+    QVERIFY(mode->scenario().has_value());
+    QCOMPARE(mode->scenario()->id().value(), u"c01104"_s);
+  }
+
+  // The minimal document: turn zero, a null phase step, and an uppercase
+  // UUID key that canonicalizes to the location's own id.
+  void publicGameMinimalDocument() {
+    const auto game = PublicGame::fromRawBytes(validJson(u"game"_s), u"game");
+    QVERIFY2(game, qPrintable(game ? QString() : game.error()));
+    QVERIFY(!game->phaseStep().has_value());
+    QCOMPARE(game->mode().scenario()->turn(), 0);
+    QVERIFY(game->chaosBag()->chaosTokens().isEmpty());
+
+    const auto upper = PublicGame::fromRawBytes(
+        mutated(u"game"_s,
+                R"("locations":{"782de537-8f5d-4eda-b849-2362e28402e5")",
+                R"("locations":{"782DE537-8F5D-4EDA-B849-2362E28402E5")"),
+        u"game");
+    QVERIFY2(upper, qPrintable(upper ? QString() : upper.error()));
+    QVERIFY(*upper == *game);
+
+    const auto empty = PublicGame::fromRawBytes(
+        mutated(u"game"_s,
+                R"("agendas":{"c01105":)" + QByteArray(kAgenda) + "}",
+                R"("agendas":{})"),
+        u"game");
+    QVERIFY2(empty, qPrintable(empty ? QString() : empty.error()));
+    QVERIFY(empty->agendas().isEmpty());
+  }
+
   void chaosTokenOpenFaceAndRevealedBy() {
     const auto token = ChaosToken::fromRawBytes(
         R"({"chaosTokenId":"22e6cf42-cc5c-4a9c-b9d1-f71e594e0d60",)"
@@ -873,7 +1228,7 @@ private slots:
     QTest::addColumn<QString>("type");
     for (const auto *type :
          {"token", "bag", "step", "act", "agenda", "phase", "tokens",
-          "location", "enemyLocation", "investigator"})
+          "location", "enemyLocation", "investigator", "mode", "game"})
       QTest::newRow(type) << QString::fromLatin1(type);
   }
 
@@ -890,8 +1245,9 @@ private slots:
     QTest::addColumn<QByteArray>("to");
 
     const QByteArray extra = R"({"futureField":[1,{"nested":null}],)";
-    for (const auto *type : {"token", "bag", "step", "act", "agenda",
-                             "location", "enemyLocation", "investigator"})
+    for (const auto *type :
+         {"token", "bag", "step", "act", "agenda", "location", "enemyLocation",
+          "investigator", "mode", "game"})
       QTest::newRow(type) << QString::fromLatin1(type) << QByteArray("{")
                           << extra;
     QTest::newRow("token nested in bag")
@@ -906,6 +1262,12 @@ private slots:
     QTest::newRow("investigator placement")
         << u"investigator"_s << QByteArray(R"({"tag":"AtLocation")")
         << QByteArray(R"({"futureField":true,"tag":"AtLocation")");
+    QTest::newRow("mode scenario")
+        << u"mode"_s << QByteArray(R"({"id":"c01104")")
+        << QByteArray(R"({"futureField":true,"id":"c01104")");
+    QTest::newRow("game entity nested in map")
+        << u"game"_s << QByteArray(R"({"id":"c01108")")
+        << QByteArray(R"({"futureField":true,"id":"c01108")");
   }
 
   void unknownKeysAreIgnored() {
@@ -1185,6 +1547,132 @@ private slots:
     row("investigator missing connectedLocations", u"investigator"_s,
         R"(,"connectedLocations":["00000000-0000-0000-0000-000000000032"])", "",
         uR"(x.connectedLocations: missing required field "connectedLocations")"_s);
+
+    // GameMode: an object with neither "This" nor "That" (including a
+    // wrapping "These" key) is an unsupported variant.
+    row("mode wrapping These key", u"mode"_s, R"({"That":)", R"({"These":)",
+        uR"(x: unsupported mode: expected a "This" and/or "That" key)"_s);
+    row("mode empty", u"mode"_s, validJson(u"mode"_s), "{}",
+        uR"(x: unsupported mode: expected a "This" and/or "That" key)"_s);
+    row("mode not an object", u"mode"_s, validJson(u"mode"_s), "[]",
+        u"x: expected object, got array"_s);
+    row("mode This null", u"mode"_s, R"({"That":)", R"({"This":null,"That":)",
+        u"x.This: expected object, got null"_s);
+    row("mode That null", u"mode"_s, R"({"That":{"id":"c01104",)",
+        R"({"That":null,"x":{"id":"c01104",)",
+        u"x.That: expected object, got null"_s);
+    row("scenario negative turn", u"mode"_s, R"("turn":0)", R"("turn":-1)",
+        u"x.That.turn: must not be negative, got -1"_s);
+    row("scenario missing turn", u"mode"_s, R"("turn":0,)", "",
+        uR"(x.That.turn: missing required field "turn")"_s);
+    row("scenario bad id", u"mode"_s, R"("id":"c01104")", R"("id":"cBAD")",
+        u"x.That.id: card code must match"_s);
+    row("scenario missing chaosBag", u"mode"_s, R"("chaosBag":)",
+        R"("chaosBagX":)",
+        uR"(x.That.chaosBag: missing required field "chaosBag")"_s);
+
+    // PublicGame.
+    row("game wrong tag", u"game"_s, R"("tag":"PublicGame")",
+        R"("tag":"PrivateGame")",
+        uR"(x.tag: expected "PublicGame", got "PrivateGame")"_s);
+    row("game nil id", u"game"_s, "00000000-0000-0000-0000-000000000003",
+        "00000000-0000-0000-0000-000000000000",
+        u"x.id: not a valid non-null uuid"_s);
+    row("game missing mode", u"game"_s, R"("mode":)", R"("modeX":)",
+        uR"(x.mode: missing required field "mode")"_s);
+    row("game mode wrapping These key", u"game"_s, R"({"That":)",
+        R"({"These":)", u"x.mode: unsupported mode"_s);
+    row("game negative encounterDeckSize", u"game"_s,
+        R"("encounterDeckSize":26)", R"("encounterDeckSize":-1)",
+        u"x.encounterDeckSize: must not be negative, got -1"_s);
+    row("game unknown phase", u"game"_s, R"("phase":"InvestigationPhase")",
+        R"("phase":"LunchPhase")",
+        uR"(x.phase: unrecognized value "LunchPhase")"_s);
+    row("game missing phaseStep", u"game"_s, R"("phaseStep":null,)", "",
+        uR"(x.phaseStep: missing required field "phaseStep")"_s);
+    row("game phaseStep unknown tag", u"game"_s, R"("phaseStep":null)",
+        R"("phaseStep":{"tag":"LunchPhaseStep","contents":"X"})",
+        uR"(x.phaseStep.tag: unrecognized value "LunchPhaseStep")"_s);
+    row("game locations not an object", u"game"_s, R"("locations":{)",
+        R"("locations":[],"x":{)",
+        u"x.locations: expected object, got array"_s);
+    row("game location key not a uuid", u"game"_s,
+        R"("locations":{"782de537-8f5d-4eda-b849-2362e28402e5")",
+        R"("locations":{"not-a-uuid")",
+        u"x.locations.not-a-uuid: not a valid non-null uuid"_s);
+    row("game location key nil uuid", u"game"_s,
+        R"("locations":{"782de537-8f5d-4eda-b849-2362e28402e5")",
+        R"("locations":{"00000000-0000-0000-0000-000000000000")",
+        u"x.locations.00000000-0000-0000-0000-000000000000: not a valid "
+        u"non-null uuid"_s);
+    row("game location key does not match id", u"game"_s,
+        R"("locations":{"782de537-8f5d-4eda-b849-2362e28402e5")",
+        R"("locations":{"00000000-0000-0000-0000-000000000099")",
+        uR"(x.locations.00000000-0000-0000-0000-000000000099: map key )"
+        uR"("00000000-0000-0000-0000-000000000099" does not match the entry's )"
+        uR"(id "782de537-8f5d-4eda-b849-2362e28402e5")"_s);
+    row("game location key duplicate spelling", u"game"_s,
+        R"(}},"investigators":{)",
+        QByteArray(R"(},"782DE537-8F5D-4EDA-B849-2362E28402E5":)") + kLocation +
+            R"(},"investigators":{)",
+        uR"(x.locations.782DE537-8F5D-4EDA-B849-2362E28402E5: duplicate key "782de537-8f5d-4eda-b849-2362e28402e5")"_s);
+    row("game location literal duplicate key", u"game"_s,
+        R"(}},"investigators":{)",
+        QByteArray(R"(},"782de537-8f5d-4eda-b849-2362e28402e5":)") + kLocation +
+            R"(},"investigators":{)",
+        u"duplicate object key"_s);
+    row("game location entry error path", u"game"_s, R"("label":"study")",
+        R"("label":7)",
+        u"x.locations.782de537-8f5d-4eda-b849-2362e28402e5.label: expected string, got number"_s);
+    row("game investigator key not a board card code", u"game"_s,
+        R"("investigators":{"c01001":)", R"("investigators":{"01001":)",
+        u"x.investigators.01001: card code must start with 'c'"_s);
+    row("game investigator key grammar", u"game"_s,
+        R"("investigators":{"c01001":)", R"("investigators":{"cBAD":)",
+        u"x.investigators.cBAD: card code must match ^c[0-9a-z:._-]+$"_s);
+    row("game investigator key does not match id", u"game"_s,
+        R"("investigators":{"c01001":)", R"("investigators":{"c01002":)",
+        uR"(x.investigators.c01002: map key "c01002" does not match the )"
+        uR"(entry's id "c01001")"_s);
+    row("game investigator entry error path", u"game"_s, R"("health":9)",
+        R"("health":-9)",
+        u"x.investigators.c01001.health: must not be negative, got -9"_s);
+    row("game act key does not match id", u"game"_s, R"("acts":{"c01108":)",
+        R"("acts":{"c01109":)",
+        uR"(x.acts.c01109: map key "c01109" does not match the entry's id )"
+        uR"("c01108")"_s);
+    row("game act entry error path", u"game"_s, R"("sequence":[1,"A"])",
+        R"("sequence":[1,"Z"])",
+        uR"(x.acts.c01108.sequence[1]: unrecognized value "Z")"_s);
+    row("game agenda key does not match id", u"game"_s,
+        R"("agendas":{"c01105":)", R"("agendas":{"c01106":)",
+        uR"(x.agendas.c01106: map key "c01106" does not match the entry's id )"
+        uR"("c01105")"_s);
+    row("game agenda entry error path", u"game"_s, R"("doom":0)",
+        R"("doom":-1)",
+        u"x.agendas.c01105.doom: must not be negative, got -1"_s);
+    row("game missing agendas", u"game"_s, R"("agendas":)", R"("agendasX":)",
+        uR"(x.agendas: missing required field "agendas")"_s);
+    row("game missing tag", u"game"_s, R"("tag":"PublicGame",)", "",
+        uR"(x.tag: missing required field "tag")"_s);
+    row("game non-string tag", u"game"_s, R"("tag":"PublicGame")", R"("tag":1)",
+        u"x.tag: expected string, got number"_s);
+    row("game FailedToLoadGame tag", u"game"_s, R"("tag":"PublicGame")",
+        R"("tag":"FailedToLoadGame")",
+        uR"(x.tag: expected "PublicGame", got "FailedToLoadGame")"_s);
+    row("game missing id", u"game"_s,
+        R"("id":"00000000-0000-0000-0000-000000000003",)", "",
+        uR"(x.id: missing required field "id")"_s);
+    row("game missing name", u"game"_s, R"("name":"Contract fixture game",)",
+        "", uR"(x.name: missing required field "name")"_s);
+    row("game missing locations", u"game"_s, R"("locations":{)",
+        R"("locationsX":{)",
+        uR"(x.locations: missing required field "locations")"_s);
+    row("game missing investigators", u"game"_s,
+        R"("investigators":{"c01001":)", R"("investigatorsX":{"c01001":)",
+        uR"(x.investigators: missing required field "investigators")"_s);
+    row("game missing acts", u"game"_s, R"("acts":{)", R"("actsX":{)",
+        uR"(x.acts: missing required field "acts")"_s);
   }
 
   void malformedInputIsRejected() {
