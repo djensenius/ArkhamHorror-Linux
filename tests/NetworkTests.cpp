@@ -1472,6 +1472,7 @@ void NetworkTests::probeNonMaintenance503IsHttpError() {
       QByteArrayLiteral("<html><body>503 Service Unavailable</body></html>"),
       QByteArrayLiteral(R"({"maintenance":false,"message":"no"})"),
       QByteArrayLiteral(R"({"maintenance":"true","message":"no"})"),
+      QByteArrayLiteral(R"({"maintenance":false,"maintenance":true})"),
   };
   for (const QByteArray &body : bodies) {
     StubNetworkAccessManager nam;
@@ -1584,6 +1585,12 @@ void NetworkTests::serverMaintenanceParsesBodyVariants() {
        straddling.left(999),
        {}},
       {"invalid JSON", 503, R"({"maintenance":true)", false, {}, {}},
+      {"duplicate key",
+       503,
+       R"({"maintenance":false,"maintenance":true})",
+       false,
+       {},
+       {}},
       {"array body", 503, R"([{"maintenance":true}])", false, {}, {}},
       {"empty body", 503, {}, false, {}, {}},
       {"not 503", 500, kMaintenanceBody, false, {}, {}},

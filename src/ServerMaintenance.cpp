@@ -1,10 +1,10 @@
 #include "ServerMaintenance.h"
 
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonParseError>
-#include <QJsonValue>
+#include "RawJson.h"
+
 #include <algorithm>
+
+using namespace Qt::StringLiterals;
 
 namespace Arkham {
 
@@ -14,28 +14,30 @@ ServerMaintenance::fromResponse(int status, const QByteArray &body,
   if (status != 503 || body.isEmpty()) {
     return std::nullopt;
   }
-  QJsonParseError parseError;
-  const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
-  if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+  // The lossless parser rejects duplicate keys, matching Apple's
+  // LosslessJSONParser (Qt's parser would silently keep the last one).
+  const auto parsed = Json::Value::parse(body, QStringLiteral("maintenance"));
+  if (!parsed || !parsed->isObject()) {
     return std::nullopt;
   }
-  const QJsonObject object = doc.object();
-  const QJsonValue flag = object.value(QLatin1String("maintenance"));
-  if (!flag.isBool() || !flag.toBool()) {
+  const std::optional<Json::Value> flag = parsed->find("maintenance"_L1);
+  if (!flag || !flag->isBool() || !flag->toBool()) {
     return std::nullopt;
   }
 
   ServerMaintenance result;
-  const QJsonValue since = object.value(QLatin1String("since"));
-  if (since.isString()) {
-    result.since = since.toString();
+  if (const auto since = parsed->find("since"_L1); since && since->isString()) {
+    result.since = since->toString();
   }
-  const QJsonValue message = object.value(QLatin1String("message"));
-  if (message.isString()) {
-    QString trimmed = message.toString().trimmed();
+  if (const auto message = parsed->find("message"_L1);
+      message && message->isString()) {
+    QString trimmed = message->toString().trimmed();
     if (trimmed.size() > maximumMessageLength) {
+      // The cap counts UTF-16 code units (Apple's prefix counts Characters),
+      // so a long message may be cut slightly differently there. Stepping
+      // back one unit when the cap would end on a high surrogate keeps a
+      // surrogate pair from being split.
       qsizetype length = maximumMessageLength;
-      // Never split a surrogate pair at the cap.
       if (trimmed.at(length - 1).isHighSurrogate()) {
         --length;
       }

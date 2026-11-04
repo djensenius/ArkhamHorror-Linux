@@ -187,6 +187,9 @@ ApplicationWindow {
             text: typeof sessionCoordinator !== "undefined" && sessionCoordinator && sessionCoordinator.serverMaintenance ? sessionCoordinator.diagnostic : ""
             // qmllint enable unqualified
             visible: text.length > 0
+            // Server-written free text: never render it as markup (no
+            // remote images or links from the message).
+            textFormat: Text.PlainText
             Layout.maximumWidth: 720
             wrapMode: Text.WordWrap
             color: root.bone
