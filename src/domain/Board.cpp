@@ -118,13 +118,34 @@ ValueOrError<PhaseStep::Step> decodeStepForKind(PhaseStep::Kind kind,
   return failure(QStringLiteral("%1: unsupported phase step kind").arg(path));
 }
 
-ValueOrError<CardCode> requireCardCode(const Json::Value &obj,
-                                       QLatin1StringView key,
-                                       QStringView path) {
-  return Json::requireField(obj, key, path,
-                            [](const Json::Value &v, QStringView p) {
-                              return CardCode::fromJson(v, p);
-                            });
+// act.schema.json/agenda.schema.json `id` and chaos-token.schema.json
+// `chaosTokenRevealedBy` narrow a card code to `^c[0-9a-z:._-]+$`, stricter
+// than CardCode's catalog grammar (`^c.+$`), which stays unchanged for the
+// catalog. Decodes through CardCode::fromJson() (string type, 'c' prefix,
+// non-empty tail) and then checks the board character set: ASCII digits,
+// lowercase ASCII letters and ':', '.', '_', '-'.
+ValueOrError<CardCode> decodeBoardCardCode(const Json::Value &v,
+                                           QStringView path) {
+  auto code = CardCode::fromJson(v, path);
+  if (!code)
+    return failure(code.error());
+  const QString &text = code->value();
+  for (qsizetype i = 1; i < text.size(); ++i) {
+    const char16_t c = text.at(i).unicode();
+    const bool allowed = (c >= u'0' && c <= u'9') || (c >= u'a' && c <= u'z') ||
+                         c == u':' || c == u'.' || c == u'_' || c == u'-';
+    if (!allowed)
+      return failure(
+          QStringLiteral("%1: card code must match ^c[0-9a-z:._-]+$: \"%2\"")
+              .arg(path, text));
+  }
+  return code;
+}
+
+ValueOrError<CardCode> requireBoardCardCode(const Json::Value &obj,
+                                            QLatin1StringView key,
+                                            QStringView path) {
+  return Json::requireField(obj, key, path, decodeBoardCardCode);
 }
 
 ValueOrError<CardId> requireCardId(const Json::Value &obj,
@@ -189,7 +210,7 @@ ValueOrError<ChaosToken> ChaosToken::fromRawJson(const Json::Value &v,
          QStringView p) -> ValueOrError<std::optional<CardCode>> {
         if (value.isNull())
           return std::optional<CardCode>{};
-        auto code = CardCode::fromJson(value, p);
+        auto code = decodeBoardCardCode(value, p);
         if (!code)
           return failure(code.error());
         return std::optional<CardCode>{*code};
@@ -303,7 +324,7 @@ ValueOrError<Act> Act::fromRawJson(const Json::Value &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  auto id = requireCardCode(obj, "id"_L1, Json::joinPath(path, u"id"));
+  auto id = requireBoardCardCode(obj, "id"_L1, Json::joinPath(path, u"id"));
   if (!id)
     return failure(id.error());
 
@@ -376,7 +397,7 @@ ValueOrError<Agenda> Agenda::fromRawJson(const Json::Value &v,
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  auto id = requireCardCode(obj, "id"_L1, Json::joinPath(path, u"id"));
+  auto id = requireBoardCardCode(obj, "id"_L1, Json::joinPath(path, u"id"));
   if (!id)
     return failure(id.error());
 

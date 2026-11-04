@@ -542,6 +542,81 @@ private slots:
     QVERIFY2(!error.isEmpty(), "malformed input must not decode");
     QVERIFY2(error.contains(expectedError), qPrintable(error));
   }
+
+  // act/agenda `id` and a non-null chaosTokenRevealedBy follow the pinned
+  // board schemas' `^c[0-9a-z:._-]+$` (act.schema.json, agenda.schema.json,
+  // chaos-token.schema.json), not CardCode's broader catalog grammar.
+  // chaosTokenRevealedBy: null stays accepted (see getGameFixtureChaosBag).
+  void boardCardCodeGrammar_data() {
+    QTest::addColumn<QString>("type");
+    QTest::addColumn<QByteArray>("from");
+    QTest::addColumn<QByteArray>("key");
+    QTest::addColumn<QByteArray>("value");
+    // Empty: the value must decode verbatim.
+    QTest::addColumn<QString>("expectedError");
+
+    struct Field {
+      const char *type;
+      const char *key;
+      const char *from;
+    };
+    const Field fields[] = {
+        {"act", "id", R"("id":"c01108")"},
+        {"agenda", "id", R"("id":"c01105")"},
+        {"token", "chaosTokenRevealedBy", R"("chaosTokenRevealedBy":null)"},
+    };
+    const char *const grammar = "card code must match ^c[0-9a-z:._-]+$";
+    const char *const prefix = "card code must start with 'c'";
+    const std::initializer_list<std::pair<const char *, const char *>> values{
+        {"c01108", nullptr}, {"c01108:b", nullptr}, {"c:hb_1.2-x", nullptr},
+        {"c bad", grammar},  {"cBAD", grammar},     {"c/01108", grammar},
+        {"c", prefix},       {"", prefix},          {"01108", prefix},
+    };
+    for (const Field &field : fields) {
+      for (const auto &[value, error] : values) {
+        const QString expected = error
+                                     ? u"x."_s + QLatin1StringView(field.key) +
+                                           u": "_s + QLatin1StringView(error)
+                                     : QString();
+        QTest::addRow("%s.%s \"%s\"", field.type, field.key, value)
+            << QString::fromLatin1(field.type) << QByteArray(field.from)
+            << QByteArray(field.key) << QByteArray(value) << expected;
+      }
+    }
+  }
+
+  void boardCardCodeGrammar() {
+    QFETCH(QString, type);
+    QFETCH(QByteArray, from);
+    QFETCH(QByteArray, key);
+    QFETCH(QByteArray, value);
+    QFETCH(QString, expectedError);
+    const QByteArray json =
+        mutated(type, from, '"' + key + "\":\"" + value + '"');
+
+    if (!expectedError.isEmpty()) {
+      const QString error = decodeError(type, json);
+      QVERIFY2(!error.isEmpty(), "invalid board card code must not decode");
+      QVERIFY2(error.contains(expectedError), qPrintable(error));
+      return;
+    }
+    QString decoded;
+    if (type == "act"_L1) {
+      const auto act = Act::fromRawBytes(json, u"x");
+      QVERIFY2(act, qPrintable(act ? QString() : act.error()));
+      decoded = act->id().value();
+    } else if (type == "agenda"_L1) {
+      const auto agenda = Agenda::fromRawBytes(json, u"x");
+      QVERIFY2(agenda, qPrintable(agenda ? QString() : agenda.error()));
+      decoded = agenda->id().value();
+    } else {
+      const auto token = ChaosToken::fromRawBytes(json, u"x");
+      QVERIFY2(token, qPrintable(token ? QString() : token.error()));
+      QVERIFY(token->revealedBy().has_value());
+      decoded = token->revealedBy()->value();
+    }
+    QCOMPARE(decoded, QString::fromLatin1(value));
+  }
 };
 
 QTEST_APPLESS_MAIN(BoardTests)

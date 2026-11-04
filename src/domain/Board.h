@@ -25,7 +25,9 @@
 // not model are ignored, so additive server fields never break decoding.
 // Modeled fields stay strict: required keys, JSON types, closed enums,
 // UUIDs, card codes and value ranges are all validated. Broad fields the
-// board does not need yet are not parsed at all.
+// board does not need yet are not parsed at all. Board card codes (act and
+// agenda `id`, a non-null chaosTokenRevealedBy) use the board schemas'
+// `^c[0-9a-z:._-]+$`, which is narrower than CardCode's catalog grammar.
 
 namespace Arkham {
 
