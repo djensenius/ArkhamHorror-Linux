@@ -403,7 +403,8 @@ private slots:
              qPrintable(investigator ? QString() : investigator.error()));
     QCOMPARE(investigator->id().value(), u"c01001"_s);
     QCOMPARE(investigator->cardCode().value(), u"c01001"_s);
-    QCOMPARE(investigator->playerId().value(),
+    QVERIFY(investigator->playerId().has_value());
+    QCOMPARE(investigator->playerId()->value(),
              u"00000000-0000-0000-0000-000000000001"_s);
     QCOMPARE(investigator->name().title, u"Roland Banks"_s);
     QCOMPARE(investigator->name().subtitle, std::optional(u"The Fed"_s));
@@ -468,6 +469,20 @@ private slots:
     QCOMPARE(investigator->unhealedHorrorThisRound(), -3);
     QCOMPARE(investigator->willpower(), -1);
     QCOMPARE(investigator->remainingActions(), 0);
+  }
+
+  // The backend publishes killed and other-campaign investigators with
+  // `PlayerId nil` (Arkham.Game's lookupInvestigator iid (PlayerId nil)).
+  void investigatorNilPlayerIdDecodesToNullopt() {
+    const auto investigator = Investigator::fromRawBytes(
+        mutated(u"investigator"_s,
+                R"("playerId":"00000000-0000-0000-0000-000000000001")",
+                R"("playerId":"00000000-0000-0000-0000-000000000000")"),
+        u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QVERIFY(!investigator->playerId().has_value());
+    QCOMPARE(investigator->id().value(), u"c01001"_s);
   }
 
   void investigatorStatusFlags() {
@@ -1048,7 +1063,18 @@ private slots:
         uR"(x.playerId: missing required field "playerId")"_s);
     row("investigator playerId not a uuid", u"investigator"_s,
         R"("playerId":"00000000-0000-0000-0000-000000000001")",
-        R"("playerId":"player-1")", u"x.playerId"_s);
+        R"("playerId":"player-1")", u"x.playerId: not a valid non-null uuid"_s);
+    // The nil exemption is exact: a short all-zero string is still malformed.
+    row("investigator playerId short zeros", u"investigator"_s,
+        R"("playerId":"00000000-0000-0000-0000-000000000001")",
+        R"("playerId":"00000000-0000-0000-0000-00000000000")",
+        u"x.playerId: not a valid non-null uuid"_s);
+    row("investigator playerId null", u"investigator"_s,
+        R"("playerId":"00000000-0000-0000-0000-000000000001")",
+        R"("playerId":null)", u"x.playerId: expected uuid string, got null"_s);
+    row("investigator playerId wrong type", u"investigator"_s,
+        R"("playerId":"00000000-0000-0000-0000-000000000001")",
+        R"("playerId":0)", u"x.playerId: expected uuid string, got number"_s);
     row("investigator missing name", u"investigator"_s,
         R"("name":{"title":"Roland Banks","subtitle":"The Fed"},)", "",
         uR"(x.name: missing required field "name")"_s);

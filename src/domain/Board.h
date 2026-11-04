@@ -414,7 +414,13 @@ public:
   // The InvestigatorId (a board card code, e.g. "c01001").
   [[nodiscard]] const CardCode &id() const noexcept { return m_id; }
   [[nodiscard]] const CardCode &cardCode() const noexcept { return m_cardCode; }
-  [[nodiscard]] const PlayerId &playerId() const noexcept { return m_playerId; }
+  // The seated player. std::nullopt when the wire carries the all-zero
+  // UUID: the backend builds killed and other-campaign investigators with
+  // `PlayerId nil` (Arkham.Game's lookupInvestigator iid (PlayerId nil)).
+  // A malformed UUID or a non-string value still fails to decode.
+  [[nodiscard]] const std::optional<PlayerId> &playerId() const noexcept {
+    return m_playerId;
+  }
   [[nodiscard]] const CardName &name() const noexcept { return m_name; }
   [[nodiscard]] ClassSymbol classSymbol() const noexcept {
     return m_classSymbol;
@@ -469,12 +475,11 @@ public:
   friend bool operator==(const Investigator &, const Investigator &) = default;
 
 private:
-  Investigator(CardCode id, CardCode cardCode, PlayerId playerId,
-               TokenCounts tokens);
+  Investigator(CardCode id, CardCode cardCode, TokenCounts tokens);
 
   CardCode m_id;
   CardCode m_cardCode;
-  PlayerId m_playerId;
+  std::optional<PlayerId> m_playerId;
   CardName m_name;
   ClassSymbol m_classSymbol = ClassSymbol::Neutral;
   qint64 m_health = 0;

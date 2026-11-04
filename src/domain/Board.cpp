@@ -141,6 +141,9 @@ constexpr auto kDamageToken = u"Damage";
 constexpr auto kHorrorToken = u"Horror";
 constexpr auto kResourceToken = u"Resource";
 
+// The all-zero UUID, the only spelling the backend's UUID grammar gives it.
+constexpr auto kNilUuid = "00000000-0000-0000-0000-000000000000"_L1;
+
 ValueOrError<PhaseStep::Step> decodeStepForKind(PhaseStep::Kind kind,
                                                 const Json::Value &v,
                                                 QStringView path) {
@@ -788,10 +791,9 @@ ValueOrError<Location> Location::fromRawBytes(QByteArrayView bytes,
   return fromRawJson(*parsed, path);
 }
 
-Investigator::Investigator(CardCode id, CardCode cardCode, PlayerId playerId,
-                           TokenCounts tokens)
+Investigator::Investigator(CardCode id, CardCode cardCode, TokenCounts tokens)
     : m_id(std::move(id)), m_cardCode(std::move(cardCode)),
-      m_playerId(std::move(playerId)), m_tokens(std::move(tokens)) {}
+      m_tokens(std::move(tokens)) {}
 
 qint64 Investigator::damage() const noexcept {
   return m_tokens.count(kDamageToken);
@@ -825,11 +827,21 @@ ValueOrError<Investigator> Investigator::fromRawJson(const Json::Value &v,
   if (!cardCode)
     return failure(cardCode.error());
 
-  auto playerId =
-      Json::requireField(obj, "playerId"_L1, Json::joinPath(path, u"playerId"),
-                         [](const Json::Value &value, QStringView p) {
-                           return PlayerId::fromJson(value, p);
-                         });
+  // The all-zero UUID is the backend's deliberate "no player" marker here
+  // (PlayerId nil), so it decodes to std::nullopt; the backend's UUID
+  // grammar spells it only this way. Anything else must be a valid
+  // non-null UUID.
+  auto playerId = Json::requireField(
+      obj, "playerId"_L1, Json::joinPath(path, u"playerId"),
+      [](const Json::Value &value,
+         QStringView p) -> ValueOrError<std::optional<PlayerId>> {
+        if (value.isString() && value.toString() == kNilUuid)
+          return std::optional<PlayerId>{};
+        auto id = PlayerId::fromJson(value, p);
+        if (!id)
+          return failure(id.error());
+        return std::optional<PlayerId>{*id};
+      });
   if (!playerId)
     return failure(playerId.error());
 
@@ -935,7 +947,8 @@ ValueOrError<Investigator> Investigator::fromRawJson(const Json::Value &v,
   if (!connectedLocations)
     return failure(connectedLocations.error());
 
-  Investigator result(*id, *cardCode, *playerId, *tokens);
+  Investigator result(*id, *cardCode, *tokens);
+  result.m_playerId = *playerId;
   result.m_name = *name;
   result.m_classSymbol = *classSymbol;
   result.m_health = *health;
