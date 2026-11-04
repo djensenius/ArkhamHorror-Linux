@@ -311,6 +311,88 @@ private:
   Json::Value m_unknownRaw;
 };
 
+// game-list.schema.json's gameOutcome (schema 0.1.57): how a finished game
+// ended. Decoded tolerantly: the complete raw value is always kept and is
+// the only source of truth for encoding. Through the raw-bytes path
+// (fromRawBytes()/fromRawJson(), and GameListRow/decodeGameList's raw
+// entry points) it re-encodes byte-exact, in wire key order. Through the
+// QJsonValue path (GameListRow::fromJson()/decodeGameList()) the wire order
+// is already lost, so the outcome re-encodes with its object keys sorted
+// (QJsonObject's order). When the value has the gameOutcome
+// shape it is Kind::Known and the typed accessors below are filled in; the
+// enum-like strings (result/certainty/source) are kept open, so an
+// unrecognised spelling from a newer server is preserved rather than
+// rejected (mirroring the Apple client's GameOutcome). Anything else (not an
+// object, a missing or wrong-typed member, an unrecognised resolution tag)
+// is Kind::Unrecognized: only raw() is meaningful, and the containing
+// GameListRow still decodes. Decoder-only: there is no public factory.
+class GameOutcome {
+public:
+  enum class Kind { Known, Unrecognized };
+
+  // gameOutcome.ending: the scenario and resolution the verdict was reached
+  // in. `resolution` is empty for {"tag":"NoResolution"} and holds n for
+  // {"tag":"Resolution","contents":n}.
+  struct Ending {
+    QString scenario;
+    std::optional<qint64> resolution;
+
+    friend bool operator==(const Ending &, const Ending &) = default;
+  };
+
+  // Never fails for well-formed JSON: an unrecognised shape decodes to
+  // Kind::Unrecognized instead.
+  [[nodiscard]] static GameOutcome fromRawJson(const Json::Value &v);
+  // Parses `bytes` through the canonical raw-byte parser (see RawJson.h)
+  // and decodes via fromRawJson() above; fails only if the bytes do not
+  // parse.
+  [[nodiscard]] static ValueOrError<GameOutcome>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
+  // Canonical encode: the complete raw value as decoded.
+  [[nodiscard]] const Json::Value &toRawJson() const noexcept { return m_raw; }
+  [[nodiscard]] ValueOrError<QByteArray> toJsonBytes() const;
+
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  // Known only (empty for Unrecognized). Open strings: "Won"/"Lost",
+  // "Certain"/"Uncertain" and "Recorded"/"Inferred" as of schema 0.1.57.
+  [[nodiscard]] const QString &result() const noexcept { return m_result; }
+  [[nodiscard]] const QString &certainty() const noexcept {
+    return m_certainty;
+  }
+  [[nodiscard]] const std::optional<QString> &note() const noexcept {
+    return m_note;
+  }
+  [[nodiscard]] const std::optional<Ending> &ending() const noexcept {
+    return m_ending;
+  }
+  [[nodiscard]] const QString &source() const noexcept { return m_source; }
+  // The complete value as received (same as toRawJson()).
+  [[nodiscard]] const Json::Value &raw() const noexcept { return m_raw; }
+
+  // Compares kind, the typed view and the raw value as JSON values with
+  // object keys in any order (numbers compared by their literal text), so
+  // a row decoded via fromJson() equals the same row decoded from raw
+  // bytes. Two equal outcomes can still encode to different bytes: each
+  // re-emits its raw value in its stored key order (wire order for the
+  // raw-bytes path, sorted for the QJsonValue path).
+  friend bool operator==(const GameOutcome &a, const GameOutcome &b);
+
+  // Copy-only, for the same moved-from-invariant reason as GameState above.
+  GameOutcome(const GameOutcome &) = default;
+  GameOutcome &operator=(const GameOutcome &) = default;
+
+private:
+  GameOutcome() = default;
+
+  Kind m_kind{Kind::Unrecognized};
+  QString m_result;
+  QString m_certainty;
+  std::optional<QString> m_note;
+  std::optional<Ending> m_ending;
+  QString m_source;
+  Json::Value m_raw;
+};
+
 // One row of the top-level game-list.json array: either a gameDetails
 // object, the current failedGameDetails `{"id": ..., "name": ...,
 // "error": ...}` object, or the legacy failedGameDetails `{"error": ...}`
@@ -409,6 +491,18 @@ public:
     return m_multiplayerVariant;
   }
   [[nodiscard]] bool hasOpenSeats() const noexcept { return m_hasOpenSeats; }
+  // Success-only: the gameDetails "outcome" key (required from schema
+  // 0.1.57). Absent when an older server (0.1.48-0.1.56) omitted the key,
+  // Null for an explicit JSON null, Present when it carried a value. The
+  // row re-encodes the key exactly as it was received (omitted, null or
+  // the outcome's raw value). Always Absent for Failure rows.
+  [[nodiscard]] Json::FieldPresence outcomePresence() const noexcept {
+    return m_outcomePresence;
+  }
+  // Engaged only when outcomePresence() is Present.
+  [[nodiscard]] const std::optional<GameOutcome> &outcome() const noexcept {
+    return m_outcome;
+  }
   // Failure-only accessor (Kind::Failure only; empty for Success).
   [[nodiscard]] const QString &error() const noexcept { return m_error; }
 
@@ -459,6 +553,8 @@ private:
   QList<InvestigatorSummary> m_otherInvestigators;
   std::optional<MultiplayerVariant> m_multiplayerVariant;
   bool m_hasOpenSeats{false};
+  Json::FieldPresence m_outcomePresence{Json::FieldPresence::Absent};
+  std::optional<GameOutcome> m_outcome;
   QString m_error;
 };
 
@@ -853,9 +949,10 @@ private:
   std::optional<ScenarioId> m_scenarioId;
 };
 
-// game-lifecycle.schema.json's createGameRequest. `ultimatumsAndBoons` and
-// `achievementsEnabled` are stored already resolved to their backend
-// default (empty list / true respectively) rather than as optionals: the
+// game-lifecycle.schema.json's createGameRequest. `ultimatumsAndBoons`,
+// `achievementsEnabled` and `allowSpectators` (schema 0.1.57) are stored
+// already resolved to their backend default (empty list / true / false
+// respectively) rather than as optionals: the
 // backend's own hand-written FromJSON parses both with `.:? ... .!= <default>`,
 // which -- like plain `.:?` -- folds an absent key and an explicit JSON
 // null to the exact same value, so there is nothing left for this client to
@@ -875,6 +972,7 @@ struct CreateGameRequest {
   std::optional<AsIfRulingValue> asIfRuling;
   QList<UltimatumOrBoon> ultimatumsAndBoons;
   bool achievementsEnabled{true};
+  bool allowSpectators{false};
 
   [[nodiscard]] static ValueOrError<CreateGameRequest>
   fromJson(const QJsonValue &v, QStringView path);

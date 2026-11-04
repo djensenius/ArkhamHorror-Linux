@@ -44,6 +44,7 @@
         "scenario",
         "campaign",
         "gameState",
+        "outcome",
         "name",
         "investigators",
         "otherInvestigators",
@@ -119,6 +120,17 @@
         "gameState": {
           "$ref": "./game-state.schema.json"
         },
+        "outcome": {
+          "description": "How a finished game ended: null while the game is unfinished, or when no verdict was recorded and none can be inferred.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/gameOutcome"
+            }
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -139,6 +151,97 @@
         },
         "hasOpenSeats": {
           "type": "boolean"
+        }
+      }
+    },
+    "gameOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "result",
+        "certainty",
+        "note",
+        "ending",
+        "source"
+      ],
+      "properties": {
+        "result": {
+          "enum": [
+            "Won",
+            "Lost"
+          ]
+        },
+        "certainty": {
+          "enum": [
+            "Certain",
+            "Uncertain"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "An i18n key for the clause the Campaign Guide attaches to the verdict, if any."
+        },
+        "ending": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "scenario",
+                "resolution"
+              ],
+              "properties": {
+                "scenario": {
+                  "type": "string"
+                },
+                "resolution": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "tag"
+                      ],
+                      "properties": {
+                        "tag": {
+                          "const": "NoResolution"
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "tag",
+                        "contents"
+                      ],
+                      "properties": {
+                        "tag": {
+                          "const": "Resolution"
+                        },
+                        "contents": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "source": {
+          "enum": [
+            "Recorded",
+            "Inferred"
+          ],
+          "description": "Recorded verdicts were declared by the ending itself; Inferred ones were reconstructed afterwards and can be wrong."
         }
       }
     },
