@@ -3,6 +3,7 @@
 #include "CompatibilityEvaluator.h"
 #include "ContractPin.h"
 #include "ServerCapabilities.h"
+#include "ServerMaintenance.h"
 
 #include <QByteArray>
 #include <QJsonDocument>
@@ -179,6 +180,19 @@ void NetworkCapabilityProbe::handleReply(QNetworkReply *reply) {
         status,
     });
     return;
+  }
+
+  // 503 with the server's maintenance body → Maintenance.  Checked before
+  // the generic HttpError branch so a maintenance window is reported
+  // distinctly; any other 503 stays HttpError.
+  if (status == 503) {
+    if (auto maintenance = ServerMaintenance::fromResponse(
+            status, reply->readAll(), reply->rawHeader("Retry-After"))) {
+      const QString notice = maintenance->notice();
+      emit finished(ProbeResult{ProbeOutcome::Maintenance, notice, std::nullopt,
+                                status, std::move(maintenance)});
+      return;
+    }
   }
 
   // Any non-2xx (except the 404 already handled) → HttpError.

@@ -244,6 +244,7 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/QtKeychainTokenStore.h
     src/SemanticCommand.h
     src/ServerCapabilities.h
+    src/ServerMaintenance.h
     src/ServerProfile.h
     src/SessionCoordinator.h
     src/SiteSettingsAssetHostFetcher.h
@@ -277,6 +278,7 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/QtKeychainTokenStore.cpp
     src/SemanticCommand.cpp
     src/ServerCapabilities.cpp
+    src/ServerMaintenance.cpp
     src/ServerProfile.cpp
     src/SessionCoordinator.cpp
     src/SiteSettingsAssetHostFetcher.cpp
@@ -859,6 +861,7 @@ if(BUILD_TESTING)
 
     qt_add_executable(arkham-network-tests
         tests/NetworkTests.cpp
+        tests/MockHttpServer.cpp
     )
     target_compile_definitions(arkham-network-tests PRIVATE
         ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"

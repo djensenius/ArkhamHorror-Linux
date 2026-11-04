@@ -40,7 +40,10 @@ namespace Arkham {
 // QNetworkReply::errorString()/QJsonParseError::errorString() wording -- so
 // diagnostic()'s exact text can vary with the underlying failure while
 // never containing request/response bodies, credentials, or an
-// Authorization header.
+// Authorization header. The one deliberate exception is ServerMaintenance:
+// its diagnostic is the server's own user-facing maintenance message
+// (trimmed and length-capped by ServerMaintenance), which exists to be
+// shown to players.
 //
 // Threading/lifetime: every dependency is borrowed by reference and must
 // outlive this coordinator (see composeProductionSession() in
@@ -71,6 +74,10 @@ class SessionCoordinator final : public QObject {
   Q_PROPERTY(State state READ state NOTIFY stateChanged)
   Q_PROPERTY(QString stateDescription READ stateDescription NOTIFY stateChanged)
   Q_PROPERTY(QString diagnostic READ diagnostic NOTIFY stateChanged)
+  // QML has no registered State enum, so the maintenance notice binds to
+  // this instead of comparing state against a bare integer.
+  Q_PROPERTY(
+      bool serverMaintenance READ isServerMaintenance NOTIFY stateChanged)
   Q_PROPERTY(QString selectedProfileId READ selectedProfileId NOTIFY
                  selectedProfileChanged)
   Q_PROPERTY(QString selectedProfileDisplayName READ selectedProfileDisplayName
@@ -93,9 +100,9 @@ public:
   // configuration/network/HTTP/malformed-JSON errors (including a null/
   // empty ProbeFactory) and restored-credential whoami transport/malformed/
   // non-HTTP errors. It is not limited to network/transport problems.
-  // Incompatible and SecureStorageUnavailable and ProfileStorageFailure are
-  // kept distinct because their retry action and user-facing meaning
-  // differ.
+  // Incompatible, ServerMaintenance, SecureStorageUnavailable and
+  // ProfileStorageFailure are kept distinct because their retry action and
+  // user-facing meaning differ.
   enum class State {
     Loading,                  ///< Initial boot: loading profiles/selection.
     ProbingCapabilities,      ///< Capability probe in flight for the current
@@ -131,6 +138,9 @@ public:
     RecoverableFailure,       ///< A retryable transport failure (capability
                               ///< probe network error, or a restored
                               ///< credential's /whoami transport error).
+    ServerMaintenance,        ///< The capability probe got the server's
+                              ///< maintenance 503; diagnostic() holds the
+                              ///< maintenance notice. Retried manually.
   };
   Q_ENUM(State)
 
@@ -173,11 +183,15 @@ public:
   // QNetworkReply/QJsonParseError errorString()) already sanitized by
   // IAuthenticationClient/ITokenStore/ICapabilityProbe. Never contains a
   // response body, request body, password, token, or Authorization
-  // header. Subject to the same orphan-cleanup override as state() above
-  // (see hasBlockingOrphanCleanup()): while it applies, this reports the
-  // oldest unresolved obligation's own static diagnostic instead of
-  // m_diagnostic.
+  // header, except that ServerMaintenance reports the server's own
+  // maintenance message (see the class comment). Subject to the same
+  // orphan-cleanup override as state() above (see hasBlockingOrphanCleanup()):
+  // while it applies, this reports the oldest unresolved obligation's own
+  // static diagnostic instead of m_diagnostic.
   [[nodiscard]] QString diagnostic() const;
+  [[nodiscard]] bool isServerMaintenance() const {
+    return state() == State::ServerMaintenance;
+  }
 
   [[nodiscard]] QString selectedProfileId() const {
     return m_selectedProfileId;

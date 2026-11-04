@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CompatibilityEvaluator.h"
+#include "ServerMaintenance.h"
 
 #include <QMetaType>
 #include <QString>
@@ -18,7 +19,10 @@ enum class ProbeOutcome {
                   ///< used when a 2xx reply carries a transport-level error
                   ///< (e.g. connection reset mid-transfer).
   MalformedJson,  ///< 2xx received but body is not valid ServerCapabilities.
-  HttpError,      ///< Non-2xx and non-404 HTTP status.
+  HttpError,      ///< Non-2xx and non-404 HTTP status that is not a
+                  ///< maintenance 503.
+  Maintenance,    ///< 503 whose body is the server's maintenance object;
+                  ///< see the maintenance field.
   InvalidProfile, ///< The supplied ServerProfile failed isValid() before any
                   ///< request was issued.
 };
@@ -39,6 +43,10 @@ struct ProbeResult {
   // HTTP response (including 2xx and 404).  Zero when no HTTP response was
   // received (NetworkError, InvalidProfile).
   int httpStatus{0};
+
+  // Populated only when outcome is Maintenance; diagnostic then holds its
+  // user-facing notice().
+  std::optional<ServerMaintenance> maintenance;
 };
 
 } // namespace Arkham

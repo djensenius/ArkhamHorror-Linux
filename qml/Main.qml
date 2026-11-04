@@ -181,6 +181,19 @@ ApplicationWindow {
         }
 
         Label {
+            // The server's maintenance notice (its own user-facing message
+            // plus when to try again); shown only in ServerMaintenance.
+            // qmllint disable unqualified
+            text: typeof sessionCoordinator !== "undefined" && sessionCoordinator && sessionCoordinator.serverMaintenance ? sessionCoordinator.diagnostic : ""
+            // qmllint enable unqualified
+            visible: text.length > 0
+            Layout.maximumWidth: 720
+            wrapMode: Text.WordWrap
+            color: root.bone
+            font.pixelSize: 16
+        }
+
+        Label {
             text: qsTr("Directional input moves focus | Enter / A selects | Escape / B returns")
             color: "#a9a189"
             font.pixelSize: 17
