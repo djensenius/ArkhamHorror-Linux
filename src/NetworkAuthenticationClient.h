@@ -31,6 +31,8 @@ namespace Arkham {
 // (CacheSaveControlAttribute = false), and sets
 // QNetworkRequest::ManualRedirectPolicy so no 3xx response is ever
 // auto-followed; every 3xx is reported as AuthOutcome::UnexpectedStatus.
+// A 503 whose body is the server's maintenance object is reported as
+// AuthOutcome::Maintenance (parsed by ServerMaintenance::fromResponse()).
 // authenticate()/registerAccount() never add an Authorization header;
 // whoAmI() adds exactly "Authorization: Token <token>".
 //

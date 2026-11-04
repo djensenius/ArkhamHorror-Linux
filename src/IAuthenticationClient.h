@@ -26,6 +26,9 @@ struct AuthRequestHandle {
 //   - Automatic redirects are never followed; every 3xx response is reported
 //     as AuthOutcome::UnexpectedStatus without replaying the request body or
 //     any Authorization header to another origin.
+//   - A 503 carrying the server's maintenance body is reported as
+//     AuthOutcome::Maintenance with AuthResult::maintenance set (message
+//     and Retry-After); any other 503 is AuthOutcome::UnexpectedStatus.
 //   - Public requests (authenticate, registerAccount) never carry an
 //     Authorization header. whoAmI carries exactly
 //     "Authorization: Token <token>".

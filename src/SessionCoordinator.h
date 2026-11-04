@@ -138,9 +138,13 @@ public:
     RecoverableFailure,       ///< A retryable transport failure (capability
                               ///< probe network error, or a restored
                               ///< credential's /whoami transport error).
-    ServerMaintenance,        ///< The capability probe got the server's
-                              ///< maintenance 503; diagnostic() holds the
-                              ///< maintenance notice. Retried manually.
+    ServerMaintenance,        ///< The capability probe, sign-in, sign-up
+                              ///< or a whoami (restored or fresh token)
+                              ///< got the server's maintenance 503;
+                              ///< diagnostic() holds the maintenance
+                              ///< notice. A restored token is kept and a
+                              ///< fresh one is not saved. Retried manually
+                              ///< by re-probing.
   };
   Q_ENUM(State)
 
@@ -500,6 +504,14 @@ private:
 
   void handleFreshTokenResult(quint64 generation, const QString &profileId,
                               const AuthResult<AuthToken> &result);
+
+  // Shared by sign-in/sign-up and both whoami purposes when the server
+  // answered with its maintenance 503: settles to ServerMaintenance with
+  // the notice as the diagnostic and installs the same retry as the
+  // probe's maintenance outcome (startProbe(), whose Compatible result
+  // re-runs startCredentialRestore()). Touches no stored token.
+  void enterServerMaintenance(quint64 generation,
+                              const ServerMaintenance &maintenance);
 
   void handleSignOutDeletionResult(quint64 generation, const QString &profileId,
                                    const TokenStoreResult &result);

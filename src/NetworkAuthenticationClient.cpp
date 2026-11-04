@@ -1,6 +1,7 @@
 #include "NetworkAuthenticationClient.h"
 
 #include "AuthTransportSecurity.h"
+#include "ServerMaintenance.h"
 #include "TokenValidation.h"
 
 #include <QJsonDocument>
@@ -60,6 +61,18 @@ AuthResult<T> classifyReply(QNetworkReply *reply, Decode decode) {
         QStringLiteral(
             "server responded with a redirect; redirects are never followed"),
         status, std::nullopt};
+  }
+
+  // 503 with the server's maintenance body → Maintenance, mirroring
+  // NetworkCapabilityProbe. The body is parsed only into ServerMaintenance;
+  // the diagnostic stays static. Any other 503 stays UnexpectedStatus.
+  if (status == 503) {
+    if (auto maintenance = ServerMaintenance::fromResponse(
+            status, reply->readAll(), reply->rawHeader("Retry-After"))) {
+      return AuthResult<T>{AuthOutcome::Maintenance,
+                           QStringLiteral("server is down for maintenance"),
+                           status, std::nullopt, std::move(maintenance)};
+    }
   }
 
   if (status < 200 || status >= 300) {
