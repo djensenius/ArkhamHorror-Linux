@@ -700,6 +700,14 @@ void SessionCoordinator::handleWhoAmIResult(
     return;
   }
 
+  if (result.outcome == AuthOutcome::Maintenance && result.maintenance) {
+    // The server answers whoami with 503 (never 401) during maintenance:
+    // a restored token is kept (it is not proven invalid) and a fresh one
+    // is not saved (it was never validated).
+    enterServerMaintenance(generation, *result.maintenance);
+    return;
+  }
+
   // Transport / NonHttpResponse / MalformedPayload / UnexpectedStatus /
   // Cancelled / InvalidInput.
   if (purpose == WhoAmIPurpose::RestoreExisting) {
@@ -716,6 +724,19 @@ void SessionCoordinator::handleWhoAmIResult(
     clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut,
                                          result.diagnostic);
   }
+}
+
+void SessionCoordinator::enterServerMaintenance(
+    quint64 generation, const ServerMaintenance &maintenance) {
+  if (generation != m_generation) {
+    return;
+  }
+  // Same retry as the probe's maintenance outcome: startProbe() re-probes
+  // and, once compatible, startCredentialRestore() re-reads the kept token
+  // and re-issues its whoami (or settles SignedOut when none is stored).
+  m_retryAction = [this] { startProbe(); };
+  clearCurrentUserAndSetStateIfCurrent(generation, State::ServerMaintenance,
+                                       maintenance.notice());
 }
 
 // A freshly obtained (validated by /whoami) token must be durably saved
@@ -891,6 +912,10 @@ void SessionCoordinator::registerAccount(const QString &email,
 void SessionCoordinator::handleFreshTokenResult(
     quint64 generation, const QString &profileId,
     const AuthResult<AuthToken> &result) {
+  if (result.outcome == AuthOutcome::Maintenance && result.maintenance) {
+    enterServerMaintenance(generation, *result.maintenance);
+    return;
+  }
   if (result.outcome != AuthOutcome::Success) {
     clearCurrentUserAndSetStateIfCurrent(generation, State::SignedOut,
                                          result.diagnostic);

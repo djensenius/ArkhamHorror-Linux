@@ -744,6 +744,30 @@ AuthResult<CurrentUser> userTransport() {
   return result;
 }
 
+// The fork server's maintenance 503 body and message, as captured for
+// NetworkTests.cpp and AuthClientTests.cpp. The server sends this with
+// `Retry-After: 120` on /authenticate, /register and /whoami.
+const QByteArray kMaintenanceBody = QByteArrayLiteral(
+    R"({"maintenance":true,"message":"Arkham Horror is down for scheduled )"
+    R"(database maintenance. Games in progress are saved and will be exactly )"
+    R"(where you left them.","since":"2026-11-03T22:15:00.123456Z"})");
+const QString kMaintenanceNotice = QStringLiteral(
+    "Arkham Horror is down for scheduled database maintenance. Games in "
+    "progress are saved and will be exactly where you left them. Try again "
+    "in about 2 minutes.");
+
+// The AuthResult NetworkAuthenticationClient returns for that response
+// (see AuthClientTests::maintenance503OnSignInIsMaintenance).
+template <typename T> AuthResult<T> maintenanceAuthResult() {
+  AuthResult<T> result;
+  result.outcome = AuthOutcome::Maintenance;
+  result.httpStatus = 503;
+  result.diagnostic = QStringLiteral("server is down for maintenance");
+  result.maintenance = ServerMaintenance::fromResponse(
+      503, kMaintenanceBody, QByteArrayLiteral("120"));
+  return result;
+}
+
 // ─── Test harness ─────────────────────────────────────────────────────────
 //
 // Field order matters exactly as it does in production
@@ -809,11 +833,15 @@ private slots:
   void unauthorizedRestoredTokenDeletesThenSignedOut();
   void unauthorizedRestoredTokenDeletionFailureIsSecureStorageUnavailable();
   void whoAmITransportFailureDuringRestoreIsRecoverableAndDoesNotDeleteToken();
+  void restoreWhoAmIMaintenanceKeepsTokenAndRetryRestoresIt();
   void tokenStoreAccessDeniedDuringRestoreIsSecureStorageUnavailable();
 
   // Sign in / register
   void signInSuccessValidatesThenSavesThenSignedIn();
   void signInAuthFailureReturnsSignedOut();
+  void signInMaintenanceIsServerMaintenance();
+  void registerMaintenanceIsServerMaintenance();
+  void signInWhoAmIMaintenanceDoesNotSaveToken();
   void signInWhoAmIUnauthorizedDoesNotSaveAndReturnsSignedOut();
   void signInSaveFailureIsSecureStorageUnavailable();
   void
@@ -1358,6 +1386,73 @@ void SessionCoordinatorTests::
 }
 
 void SessionCoordinatorTests::
+    restoreWhoAmIMaintenanceKeepsTokenAndRetryRestoresIt() {
+  // During maintenance the server answers whoami with 503, not 401: the
+  // stored token is not proven invalid, so it must never be deleted, and
+  // retry() must re-probe and then re-validate that same stored token.
+  const QString storedToken = QStringLiteral("kept-token-abc");
+  Harness h;
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  const QString profileId = h.coordinator->selectedProfileId();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, successReadResult(storedToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::WhoAmI);
+
+  const auto maintenance = maintenanceAuthResult<CurrentUser>();
+  QVERIFY(maintenance.maintenance.has_value());
+  h.authClient.completeUser(1, maintenance);
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::ServerMaintenance;
+  }));
+  QCOMPARE(h.coordinator->diagnostic(), kMaintenanceNotice);
+  QCOMPARE(h.coordinator->property("serverMaintenance"), QVariant(true));
+  QVERIFY(h.coordinator->currentUsername().isEmpty());
+  // Only the restore read: no delete of the stored token.
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+  QCOMPARE(h.tokenStore.calls.first().kind, QStringLiteral("read"));
+  QTest::qWait(50);
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  // retry() re-probes like the probe's maintenance outcome; once the
+  // server is compatible again the stored token is re-read and whoami is
+  // re-issued with it.
+  const int createdBefore = h.probeFactory.totalCreated();
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
+    return h.probeFactory.totalCreated() == createdBefore + 1;
+  }));
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+  QVERIFY(!h.coordinator->isServerMaintenance());
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId, successReadResult(storedToken));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
+  QCOMPARE(h.authClient.calls.last().kind, FakeAuthClient::CallKind::WhoAmI);
+  const QString reissuedToken = h.authClient.calls.last().token;
+  QVERIFY(reissuedToken == storedToken);
+
+  const QString expectedUsername = QStringLiteral("bob");
+  h.authClient.completeUser(
+      2, userSuccess(expectedUsername, QStringLiteral("bob@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+  QCOMPARE(h.coordinator->currentUsername(), expectedUsername);
+  // Still never deleted or re-saved.
+  QCOMPARE(h.tokenStore.calls.size(), 2);
+}
+
+void SessionCoordinatorTests::
     tokenStoreAccessDeniedDuringRestoreIsSecureStorageUnavailable() {
   Harness h;
   h.coordinator->start();
@@ -1426,6 +1521,78 @@ void SessionCoordinatorTests::signInAuthFailureReturnsSignedOut() {
   }));
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
   QVERIFY(!h.coordinator->diagnostic().isEmpty());
+}
+
+void SessionCoordinatorTests::signInMaintenanceIsServerMaintenance() {
+  Harness h;
+  h.bootToSignedOut();
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  const auto maintenance = maintenanceAuthResult<AuthToken>();
+  QVERIFY(maintenance.maintenance.has_value());
+  h.authClient.completeToken(1, maintenance);
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::ServerMaintenance;
+  }));
+  QCOMPARE(h.coordinator->stateDescription(),
+           QStringLiteral("Server maintenance"));
+  QCOMPARE(h.coordinator->diagnostic(), kMaintenanceNotice);
+  QCOMPARE(h.coordinator->property("serverMaintenance"), QVariant(true));
+  // No whoami and no save after a maintenance sign-in.
+  QCOMPARE(h.authClient.calls.size(), 1);
+  QCOMPARE(h.tokenStore.calls.size(), 1); // only the earlier restore read
+
+  // retry() re-probes, exactly like the probe's maintenance outcome.
+  const int createdBefore = h.probeFactory.totalCreated();
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
+    return h.probeFactory.totalCreated() == createdBefore + 1;
+  }));
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+}
+
+void SessionCoordinatorTests::registerMaintenanceIsServerMaintenance() {
+  Harness h;
+  h.bootToSignedOut();
+  h.coordinator->registerAccount(QStringLiteral("new@example.test"),
+                                 QStringLiteral("newuser"),
+                                 QStringLiteral("s3cret"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  QCOMPARE(h.authClient.calls.first().kind, FakeAuthClient::CallKind::Register);
+  h.authClient.completeToken(1, maintenanceAuthResult<AuthToken>());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::ServerMaintenance;
+  }));
+  QCOMPARE(h.coordinator->diagnostic(), kMaintenanceNotice);
+  QCOMPARE(h.authClient.calls.size(), 1);
+  QCOMPARE(h.tokenStore.calls.size(), 1);
+}
+
+void SessionCoordinatorTests::signInWhoAmIMaintenanceDoesNotSaveToken() {
+  // A fresh token whose whoami hit maintenance was never validated, so it
+  // must never be saved.
+  Harness h;
+  h.bootToSignedOut();
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  h.authClient.completeToken(1, tokenSuccess(QStringLiteral("fresh-token")));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 2; }));
+  QCOMPARE(h.authClient.calls.last().kind, FakeAuthClient::CallKind::WhoAmI);
+  h.authClient.completeUser(2, maintenanceAuthResult<CurrentUser>());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::ServerMaintenance;
+  }));
+  QCOMPARE(h.coordinator->diagnostic(), kMaintenanceNotice);
+  QCOMPARE(h.coordinator->property("serverMaintenance"), QVariant(true));
+  QVERIFY(h.coordinator->currentUsername().isEmpty());
+  QTest::qWait(50);
+  QCOMPARE(h.tokenStore.calls.size(), 1); // only the earlier restore read
 }
 
 void SessionCoordinatorTests::
