@@ -398,4 +398,100 @@ private:
   QList<CardCode> m_investigators;
 };
 
+// investigator.schema.json: one entry of PublicGame.investigators. Only the
+// core fields a board view needs are modeled: identity, printed health and
+// sanity, base skills, token counts (damage and horror are tokens), the
+// action and elimination state, the placement and the server-computed
+// connections. Deck, hand, discard, slots, modifiers, prohibitions, art and
+// per-scenario fields are not parsed.
+class Investigator {
+public:
+  [[nodiscard]] static ValueOrError<Investigator>
+  fromRawJson(const Json::Value &v, QStringView path);
+  [[nodiscard]] static ValueOrError<Investigator>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
+
+  // The InvestigatorId (a board card code, e.g. "c01001").
+  [[nodiscard]] const CardCode &id() const noexcept { return m_id; }
+  [[nodiscard]] const CardCode &cardCode() const noexcept { return m_cardCode; }
+  [[nodiscard]] const PlayerId &playerId() const noexcept { return m_playerId; }
+  [[nodiscard]] const CardName &name() const noexcept { return m_name; }
+  [[nodiscard]] ClassSymbol classSymbol() const noexcept {
+    return m_classSymbol;
+  }
+  // Printed maxima; never negative. Current damage and horror are tokens.
+  [[nodiscard]] qint64 health() const noexcept { return m_health; }
+  [[nodiscard]] qint64 sanity() const noexcept { return m_sanity; }
+  // Base skill values, before modifiers.
+  [[nodiscard]] qint64 willpower() const noexcept { return m_willpower; }
+  [[nodiscard]] qint64 intellect() const noexcept { return m_intellect; }
+  [[nodiscard]] qint64 combat() const noexcept { return m_combat; }
+  [[nodiscard]] qint64 agility() const noexcept { return m_agility; }
+  [[nodiscard]] const TokenCounts &tokens() const noexcept { return m_tokens; }
+  // Token counts by name (Arkham.Investigator.Types' investigatorDamage and
+  // so on).
+  [[nodiscard]] qint64 damage() const noexcept;
+  [[nodiscard]] qint64 horror() const noexcept;
+  [[nodiscard]] qint64 resources() const noexcept;
+  [[nodiscard]] qint64 clues() const noexcept;
+  [[nodiscard]] qint64 doom() const noexcept;
+  [[nodiscard]] qint64 remainingActions() const noexcept {
+    return m_remainingActions;
+  }
+  // Can be negative: investigator.schema.json documents that healing more
+  // horror in a round than was assigned produces a negative wire value.
+  [[nodiscard]] qint64 unhealedHorrorThisRound() const noexcept {
+    return m_unhealedHorrorThisRound;
+  }
+  [[nodiscard]] bool defeated() const noexcept { return m_defeated; }
+  [[nodiscard]] bool resigned() const noexcept { return m_resigned; }
+  [[nodiscard]] bool eliminated() const noexcept { return m_eliminated; }
+  // placement.schema.json's {tag, contents} object, kept raw: `contents`
+  // varies by tag and the backend's Arkham.Placement has tags the schema's
+  // enum does not list yet, so any string tag is accepted.
+  [[nodiscard]] const Json::Value &placement() const noexcept {
+    return m_placement;
+  }
+  // The placement's location when its tag is "AtLocation"; std::nullopt for
+  // every other tag. The backend also places investigators through other
+  // means (e.g. in a vehicle), so Location::investigators() is the source of
+  // truth for occupancy.
+  [[nodiscard]] const std::optional<LocationId> &
+  placementLocation() const noexcept {
+    return m_placementLocation;
+  }
+  // Server-computed when the snapshot is built: the locations currently
+  // reachable from this investigator, in wire order.
+  [[nodiscard]] const QList<LocationId> &connectedLocations() const noexcept {
+    return m_connectedLocations;
+  }
+
+  friend bool operator==(const Investigator &, const Investigator &) = default;
+
+private:
+  Investigator(CardCode id, CardCode cardCode, PlayerId playerId,
+               TokenCounts tokens);
+
+  CardCode m_id;
+  CardCode m_cardCode;
+  PlayerId m_playerId;
+  CardName m_name;
+  ClassSymbol m_classSymbol = ClassSymbol::Neutral;
+  qint64 m_health = 0;
+  qint64 m_sanity = 0;
+  qint64 m_willpower = 0;
+  qint64 m_intellect = 0;
+  qint64 m_combat = 0;
+  qint64 m_agility = 0;
+  TokenCounts m_tokens;
+  qint64 m_remainingActions = 0;
+  qint64 m_unhealedHorrorThisRound = 0;
+  bool m_defeated = false;
+  bool m_resigned = false;
+  bool m_eliminated = false;
+  Json::Value m_placement;
+  std::optional<LocationId> m_placementLocation;
+  QList<LocationId> m_connectedLocations;
+};
+
 } // namespace Arkham

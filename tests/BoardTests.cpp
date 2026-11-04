@@ -54,6 +54,11 @@ Json::Value studyOf(const Json::Value &game) {
   return game.value("locations"_L1).value(QLatin1StringView(kStudyId));
 }
 
+// The fixtures' only investigator (Roland Banks), keyed by its card code.
+Json::Value rolandOf(const Json::Value &game) {
+  return game.value("investigators"_L1).value("c01001"_L1);
+}
+
 // One valid document per decoder; the data-driven cases below mutate it.
 constexpr auto kToken =
     R"({"chaosTokenId":"22e6cf42-cc5c-4a9c-b9d1-f71e594e0d60",)"
@@ -90,6 +95,20 @@ constexpr auto kEnemyLocation =
     R"("placement":null,"revealed":true,"scarletKeys":[],)"
     R"("sealedChaosTokens":[],"seals":[],)"
     R"("shroud":{"contents":4,"tag":"Static"},"tokens":[],"treacheries":[]})";
+// get-game.json's Roland Banks, trimmed to the modeled keys, with tokens and
+// a connection added.
+constexpr auto kInvestigator =
+    R"({"id":"c01001","cardCode":"c01001",)"
+    R"("playerId":"00000000-0000-0000-0000-000000000001",)"
+    R"("name":{"title":"Roland Banks","subtitle":"The Fed"},)"
+    R"("class":"Guardian","health":9,"sanity":5,"willpower":3,)"
+    R"("intellect":3,"combat":4,"agility":2,)"
+    R"("tokens":[["Damage",1],["Horror",2],["Resource",5],["Clue",1]],)"
+    R"("remainingActions":3,"unhealedHorrorThisRound":0,)"
+    R"("defeated":false,"resigned":false,"eliminated":false,)"
+    R"("placement":{"tag":"AtLocation",)"
+    R"("contents":"782de537-8f5d-4eda-b849-2362e28402e5"},)"
+    R"("connectedLocations":["00000000-0000-0000-0000-000000000032"]})";
 
 QByteArray validJson(const QString &type) {
   if (type == "token"_L1)
@@ -111,6 +130,8 @@ QByteArray validJson(const QString &type) {
     return kLocation;
   if (type == "enemyLocation"_L1)
     return kEnemyLocation;
+  if (type == "investigator"_L1)
+    return kInvestigator;
   qFatal("unknown test type: %s", qPrintable(type));
 }
 
@@ -146,6 +167,8 @@ QString decodeError(const QString &type, const QByteArray &json) {
     return errorOf(TokenCounts::fromRawBytes(json, u"x"));
   if (type == "location"_L1 || type == "enemyLocation"_L1)
     return errorOf(Location::fromRawBytes(json, u"x"));
+  if (type == "investigator"_L1)
+    return errorOf(Investigator::fromRawBytes(json, u"x"));
   auto parsed = Json::Value::parse(json, u"x");
   if (!parsed)
     return parsed.error();
@@ -371,6 +394,134 @@ private slots:
     QCOMPARE(zero->count(u"Clue"), 0);
   }
 
+  void getGameFixtureInvestigator() {
+    const auto game = getGamePublicGame();
+    QCOMPARE(game.value("investigators"_L1).keys(), QStringList{u"c01001"_s});
+    const auto investigator =
+        Investigator::fromRawJson(rolandOf(game), u"investigator");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->id().value(), u"c01001"_s);
+    QCOMPARE(investigator->cardCode().value(), u"c01001"_s);
+    QCOMPARE(investigator->playerId().value(),
+             u"00000000-0000-0000-0000-000000000001"_s);
+    QCOMPARE(investigator->name().title, u"Roland Banks"_s);
+    QCOMPARE(investigator->name().subtitle, std::optional(u"The Fed"_s));
+    QCOMPARE(investigator->classSymbol(), ClassSymbol::Guardian);
+    QCOMPARE(investigator->health(), 9);
+    QCOMPARE(investigator->sanity(), 5);
+    QCOMPARE(investigator->willpower(), 3);
+    QCOMPARE(investigator->intellect(), 3);
+    QCOMPARE(investigator->combat(), 4);
+    QCOMPARE(investigator->agility(), 2);
+    QVERIFY(investigator->tokens().entries().isEmpty());
+    QCOMPARE(investigator->damage(), 0);
+    QCOMPARE(investigator->horror(), 0);
+    QCOMPARE(investigator->resources(), 0);
+    QCOMPARE(investigator->clues(), 0);
+    QCOMPARE(investigator->doom(), 0);
+    QCOMPARE(investigator->remainingActions(), 3);
+    QCOMPARE(investigator->unhealedHorrorThisRound(), 0);
+    QCOMPARE(investigator->defeated(), false);
+    QCOMPARE(investigator->resigned(), false);
+    QCOMPARE(investigator->eliminated(), false);
+    QCOMPARE(investigator->placement().value("tag"_L1).toString(),
+             u"AtLocation"_s);
+    QVERIFY(investigator->placementLocation().has_value());
+    QCOMPARE(investigator->placementLocation()->value(),
+             QLatin1StringView(kStudyId));
+    QVERIFY(investigator->connectedLocations().isEmpty());
+
+    // The Study lists Roland as its occupant.
+    const auto study = Location::fromRawJson(studyOf(game), u"location");
+    QVERIFY(study);
+    QVERIFY(study->investigators().contains(investigator->id()));
+    QVERIFY(study->id() == *investigator->placementLocation());
+  }
+
+  void investigatorDecodes() {
+    const auto investigator =
+        Investigator::fromRawBytes(validJson(u"investigator"_s), u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->damage(), 1);
+    QCOMPARE(investigator->horror(), 2);
+    QCOMPARE(investigator->resources(), 5);
+    QCOMPARE(investigator->clues(), 1);
+    QCOMPARE(investigator->doom(), 0);
+    QCOMPARE(investigator->connectedLocations().size(), 1);
+    QCOMPARE(investigator->connectedLocations().first().value(),
+             u"00000000-0000-0000-0000-000000000032"_s);
+  }
+
+  // Unbounded integers: the fork's investigator-unhealed-horror-negative.json
+  // carries -3, and the base skills have no schema minimum.
+  void investigatorAcceptsNegativeUnboundedIntegers() {
+    const QByteArray json =
+        mutated(u"investigator"_s, R"("unhealedHorrorThisRound":0)",
+                R"("unhealedHorrorThisRound":-3)")
+            .replace(R"("willpower":3)", R"("willpower":-1)")
+            .replace(R"("remainingActions":3)", R"("remainingActions":0)");
+    const auto investigator = Investigator::fromRawBytes(json, u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->unhealedHorrorThisRound(), -3);
+    QCOMPARE(investigator->willpower(), -1);
+    QCOMPARE(investigator->remainingActions(), 0);
+  }
+
+  void investigatorStatusFlags() {
+    const QByteArray json =
+        mutated(u"investigator"_s,
+                R"("defeated":false,"resigned":false,"eliminated":false)",
+                R"("defeated":true,"resigned":false,"eliminated":true)")
+            .replace(R"("subtitle":"The Fed")", R"("subtitle":null)");
+    const auto investigator = Investigator::fromRawBytes(json, u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->defeated(), true);
+    QCOMPARE(investigator->resigned(), false);
+    QCOMPARE(investigator->eliminated(), true);
+    QVERIFY(!investigator->name().subtitle.has_value());
+  }
+
+  // Only "AtLocation" yields a placementLocation. Any other string tag is
+  // accepted and kept raw, including backend tags placement.schema.json's
+  // enum does not list (AtLocations, BetweenLocations).
+  void investigatorPlacementTags_data() {
+    QTest::addColumn<QByteArray>("placement");
+    QTest::addColumn<QString>("tag");
+    QTest::newRow("InVehicle")
+        << QByteArray(R"({"tag":"InVehicle","contents":)"
+                      R"("0c3cfd0c-1b5e-4f43-9d9a-0b1c2d3e4f50"})")
+        << u"InVehicle"_s;
+    QTest::newRow("Unplaced")
+        << QByteArray(R"({"tag":"Unplaced"})") << u"Unplaced"_s;
+    QTest::newRow("Limbo") << QByteArray(R"({"tag":"Limbo"})") << u"Limbo"_s;
+    QTest::newRow("AtLocations")
+        << QByteArray(R"({"tag":"AtLocations","contents":[)"
+                      R"("782de537-8f5d-4eda-b849-2362e28402e5"]})")
+        << u"AtLocations"_s;
+    QTest::newRow("BetweenLocations")
+        << QByteArray(R"({"tag":"BetweenLocations","contents":{"x":1}})")
+        << u"BetweenLocations"_s;
+  }
+
+  void investigatorPlacementTags() {
+    QFETCH(QByteArray, placement);
+    QFETCH(QString, tag);
+    const auto investigator = Investigator::fromRawBytes(
+        mutated(u"investigator"_s,
+                R"({"tag":"AtLocation",)"
+                R"("contents":"782de537-8f5d-4eda-b849-2362e28402e5"})",
+                placement),
+        u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->placement().value("tag"_L1).toString(), tag);
+    QVERIFY(!investigator->placementLocation().has_value());
+  }
+
   // The GameUpdate WebSocket message carries the same PublicGame shape:
   // every leaf decodes, and to exactly what get-game.json decodes to.
   void gameUpdateFixtureMatchesGetGame() {
@@ -413,6 +564,14 @@ private slots:
     QVERIFY(locationA && locationB);
     QVERIFY(*locationA == *locationB);
     QCOMPARE(locationB->clues(), 2);
+
+    const auto investigatorA =
+        Investigator::fromRawJson(rolandOf(getGame), u"a");
+    const auto investigatorB =
+        Investigator::fromRawJson(rolandOf(update), u"b");
+    QVERIFY(investigatorA && investigatorB);
+    QVERIFY(*investigatorA == *investigatorB);
+    QCOMPARE(investigatorB->health(), 9);
   }
 
   void chaosTokenOpenFaceAndRevealedBy() {
@@ -644,10 +803,36 @@ private slots:
              std::optional<LocationSymbol>(expected));
   }
 
+  void classSymbolDecodesEveryValue_data() {
+    QTest::addColumn<QByteArray>("wire");
+    QTest::addColumn<ClassSymbol>("expected");
+    const std::initializer_list<std::pair<const char *, ClassSymbol>> rows{
+        {"Guardian", ClassSymbol::Guardian}, {"Seeker", ClassSymbol::Seeker},
+        {"Survivor", ClassSymbol::Survivor}, {"Rogue", ClassSymbol::Rogue},
+        {"Mystic", ClassSymbol::Mystic},     {"Neutral", ClassSymbol::Neutral},
+        {"Mythos", ClassSymbol::Mythos},
+    };
+    for (const auto &[wire, expected] : rows)
+      QTest::newRow(wire) << QByteArray(wire) << expected;
+  }
+
+  void classSymbolDecodesEveryValue() {
+    QFETCH(QByteArray, wire);
+    QFETCH(ClassSymbol, expected);
+    const auto investigator = Investigator::fromRawBytes(
+        mutated(u"investigator"_s, R"("class":"Guardian")",
+                "\"class\":\"" + wire + '"'),
+        u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->classSymbol(), expected);
+  }
+
   void validDocumentsDecode_data() {
     QTest::addColumn<QString>("type");
-    for (const auto *type : {"token", "bag", "step", "act", "agenda", "phase",
-                             "tokens", "location", "enemyLocation"})
+    for (const auto *type :
+         {"token", "bag", "step", "act", "agenda", "phase", "tokens",
+          "location", "enemyLocation", "investigator"})
       QTest::newRow(type) << QString::fromLatin1(type);
   }
 
@@ -664,8 +849,8 @@ private slots:
     QTest::addColumn<QByteArray>("to");
 
     const QByteArray extra = R"({"futureField":[1,{"nested":null}],)";
-    for (const auto *type :
-         {"token", "bag", "step", "act", "agenda", "location", "enemyLocation"})
+    for (const auto *type : {"token", "bag", "step", "act", "agenda",
+                             "location", "enemyLocation", "investigator"})
       QTest::newRow(type) << QString::fromLatin1(type) << QByteArray("{")
                           << extra;
     QTest::newRow("token nested in bag")
@@ -674,6 +859,12 @@ private slots:
     QTest::newRow("agenda sequence")
         << u"agenda"_s << QByteArray(R"({"agendaSequenceSide")")
         << QByteArray(R"({"futureField":true,"agendaSequenceSide")");
+    QTest::newRow("investigator name")
+        << u"investigator"_s << QByteArray(R"({"title")")
+        << QByteArray(R"({"futureField":true,"title")");
+    QTest::newRow("investigator placement")
+        << u"investigator"_s << QByteArray(R"({"tag":"AtLocation")")
+        << QByteArray(R"({"futureField":true,"tag":"AtLocation")");
   }
 
   void unknownKeysAreIgnored() {
@@ -849,6 +1040,87 @@ private slots:
     row("enemy location missing shroud", u"enemyLocation"_s,
         R"("shroud":{"contents":4,"tag":"Static"},)", "",
         uR"(x.shroud: missing required field "shroud")"_s);
+
+    row("investigator null", u"investigator"_s, kInvestigator, "null",
+        u"x: expected object, got null"_s);
+    row("investigator missing playerId", u"investigator"_s,
+        R"("playerId":"00000000-0000-0000-0000-000000000001",)", "",
+        uR"(x.playerId: missing required field "playerId")"_s);
+    row("investigator playerId not a uuid", u"investigator"_s,
+        R"("playerId":"00000000-0000-0000-0000-000000000001")",
+        R"("playerId":"player-1")", u"x.playerId"_s);
+    row("investigator missing name", u"investigator"_s,
+        R"("name":{"title":"Roland Banks","subtitle":"The Fed"},)", "",
+        uR"(x.name: missing required field "name")"_s);
+    row("investigator name not an object", u"investigator"_s,
+        R"({"title":"Roland Banks","subtitle":"The Fed"})", R"("Roland Banks")",
+        u"x.name: expected object, got string"_s);
+    row("investigator name missing subtitle", u"investigator"_s,
+        R"(,"subtitle":"The Fed")", "",
+        uR"(x.name.subtitle: missing required field "subtitle")"_s);
+    row("investigator name subtitle wrong type", u"investigator"_s,
+        R"("subtitle":"The Fed")", R"("subtitle":7)", u"x.name.subtitle"_s);
+    row("investigator class unknown", u"investigator"_s,
+        R"("class":"Guardian")", R"("class":"Wizard")",
+        uR"(x.class: unrecognized value "Wizard")"_s);
+    row("investigator class wrong case", u"investigator"_s,
+        R"("class":"Guardian")", R"("class":"guardian")",
+        uR"(x.class: unrecognized value "guardian")"_s);
+    row("investigator negative health", u"investigator"_s, R"("health":9)",
+        R"("health":-1)", u"x.health: must not be negative, got -1"_s);
+    row("investigator negative sanity", u"investigator"_s, R"("sanity":5)",
+        R"("sanity":-2)", u"x.sanity: must not be negative, got -2"_s);
+    row("investigator sanity wrong type", u"investigator"_s, R"("sanity":5)",
+        R"("sanity":"5")", u"x.sanity: expected integer, got string"_s);
+    row("investigator missing combat", u"investigator"_s, R"("combat":4,)", "",
+        uR"(x.combat: missing required field "combat")"_s);
+    row("investigator missing tokens", u"investigator"_s,
+        R"("tokens":[["Damage",1],["Horror",2],["Resource",5],["Clue",1]],)",
+        "", uR"(x.tokens: missing required field "tokens")"_s);
+    row("investigator duplicate token", u"investigator"_s, R"(["Clue",1])",
+        R"(["Damage",3])", uR"(x.tokens[3][0]: duplicate token "Damage")"_s);
+    row("investigator remainingActions wrong type", u"investigator"_s,
+        R"("remainingActions":3)", R"("remainingActions":null)",
+        u"x.remainingActions: expected integer, got null"_s);
+    row("investigator unhealedHorror fractional", u"investigator"_s,
+        R"("unhealedHorrorThisRound":0)", R"("unhealedHorrorThisRound":0.5)",
+        u"x.unhealedHorrorThisRound: expected integer"_s);
+    row("investigator defeated wrong type", u"investigator"_s,
+        R"("defeated":false)", R"("defeated":0)",
+        u"x.defeated: expected bool, got number"_s);
+    row("investigator missing eliminated", u"investigator"_s,
+        R"(,"eliminated":false)", "",
+        uR"(x.eliminated: missing required field "eliminated")"_s);
+    row("investigator missing placement", u"investigator"_s,
+        R"("placement":{"tag":"AtLocation",)"
+        R"("contents":"782de537-8f5d-4eda-b849-2362e28402e5"},)",
+        "", uR"(x.placement: missing required field "placement")"_s);
+    row("investigator placement null", u"investigator"_s,
+        R"({"tag":"AtLocation",)"
+        R"("contents":"782de537-8f5d-4eda-b849-2362e28402e5"})",
+        "null", u"x.placement: expected object, got null"_s);
+    row("investigator placement missing tag", u"investigator"_s,
+        R"("tag":"AtLocation",)", "",
+        uR"(x.placement.tag: missing required field "tag")"_s);
+    row("investigator placement tag wrong type", u"investigator"_s,
+        R"("tag":"AtLocation")", R"("tag":1)",
+        u"x.placement.tag: expected string, got number"_s);
+    row("investigator AtLocation missing contents", u"investigator"_s,
+        R"(,"contents":"782de537-8f5d-4eda-b849-2362e28402e5")", "",
+        uR"(x.placement.contents: missing required field "contents")"_s);
+    row("investigator AtLocation contents not a uuid", u"investigator"_s,
+        R"("contents":"782de537-8f5d-4eda-b849-2362e28402e5")",
+        R"("contents":"study")", u"x.placement.contents"_s);
+    row("investigator AtLocation nil uuid", u"investigator"_s,
+        R"("contents":"782de537-8f5d-4eda-b849-2362e28402e5")",
+        R"("contents":"00000000-0000-0000-0000-000000000000")",
+        u"x.placement.contents"_s);
+    row("investigator connectedLocations not a uuid", u"investigator"_s,
+        R"(["00000000-0000-0000-0000-000000000032"])", R"([1])",
+        u"x.connectedLocations[0]"_s);
+    row("investigator missing connectedLocations", u"investigator"_s,
+        R"(,"connectedLocations":["00000000-0000-0000-0000-000000000032"])", "",
+        uR"(x.connectedLocations: missing required field "connectedLocations")"_s);
   }
 
   void malformedInputIsRejected() {
@@ -861,9 +1133,10 @@ private slots:
     QVERIFY2(error.contains(expectedError), qPrintable(error));
   }
 
-  // act/agenda `id` and a non-null chaosTokenRevealedBy follow the pinned
-  // board schemas' `^c[0-9a-z:._-]+$` (act.schema.json, agenda.schema.json,
-  // chaos-token.schema.json), not CardCode's broader catalog grammar.
+  // act/agenda/investigator `id`, location/investigator `cardCode` and a
+  // non-null chaosTokenRevealedBy follow the pinned board schemas'
+  // `^c[0-9a-z:._-]+$` (act, agenda, location, investigator and chaos-token
+  // schemas), not CardCode's broader catalog grammar.
   // chaosTokenRevealedBy: null stays accepted (see getGameFixtureChaosBag).
   void boardCardCodeGrammar_data() {
     QTest::addColumn<QString>("type");
@@ -882,6 +1155,9 @@ private slots:
         {"act", "id", R"("id":"c01108")"},
         {"agenda", "id", R"("id":"c01105")"},
         {"token", "chaosTokenRevealedBy", R"("chaosTokenRevealedBy":null)"},
+        {"location", "cardCode", R"("cardCode":"c01111")"},
+        {"investigator", "id", R"("id":"c01001")"},
+        {"investigator", "cardCode", R"("cardCode":"c01001")"},
     };
     const char *const grammar = "card code must match ^c[0-9a-z:._-]+$";
     const char *const prefix = "card code must start with 'c'";
@@ -927,6 +1203,16 @@ private slots:
       const auto agenda = Agenda::fromRawBytes(json, u"x");
       QVERIFY2(agenda, qPrintable(agenda ? QString() : agenda.error()));
       decoded = agenda->id().value();
+    } else if (type == "location"_L1) {
+      const auto location = Location::fromRawBytes(json, u"x");
+      QVERIFY2(location, qPrintable(location ? QString() : location.error()));
+      decoded = location->cardCode().value();
+    } else if (type == "investigator"_L1) {
+      const auto investigator = Investigator::fromRawBytes(json, u"x");
+      QVERIFY2(investigator,
+               qPrintable(investigator ? QString() : investigator.error()));
+      decoded = key == "id" ? investigator->id().value()
+                            : investigator->cardCode().value();
     } else {
       const auto token = ChaosToken::fromRawBytes(json, u"x");
       QVERIFY2(token, qPrintable(token ? QString() : token.error()));

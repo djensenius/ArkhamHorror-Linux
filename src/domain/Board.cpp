@@ -122,6 +122,18 @@ constexpr std::array<std::pair<QLatin1StringView, LocationSymbol>, 16>
         {"NoSymbol"_L1, LocationSymbol::NoSymbol},
     }};
 
+// investigator.schema.json's `class` enum (Arkham.ClassSymbol).
+constexpr std::array<std::pair<QLatin1StringView, ClassSymbol>, 7>
+    kClassSymbolTable{{
+        {"Guardian"_L1, ClassSymbol::Guardian},
+        {"Seeker"_L1, ClassSymbol::Seeker},
+        {"Survivor"_L1, ClassSymbol::Survivor},
+        {"Rogue"_L1, ClassSymbol::Rogue},
+        {"Mystic"_L1, ClassSymbol::Mystic},
+        {"Neutral"_L1, ClassSymbol::Neutral},
+        {"Mythos"_L1, ClassSymbol::Mythos},
+    }};
+
 // Arkham.Token core names the board reads counts for.
 constexpr auto kClueToken = u"Clue";
 constexpr auto kDoomToken = u"Doom";
@@ -279,6 +291,19 @@ ValueOrError<TokenCounts> requireTokenCounts(const Json::Value &obj,
                             [](const Json::Value &value, QStringView p) {
                               return TokenCounts::fromRawJson(value, p);
                             });
+}
+
+ValueOrError<qint64> requireNonNegativeInt(const Json::Value &obj,
+                                           QLatin1StringView key,
+                                           QStringView path) {
+  auto value = Json::requireInt(obj, key, path);
+  if (!value)
+    return failure(value.error());
+  if (*value < 0)
+    return failure(QStringLiteral("%1: must not be negative, got %2")
+                       .arg(path)
+                       .arg(*value));
+  return *value;
 }
 
 } // namespace
@@ -757,6 +782,181 @@ ValueOrError<Location> Location::fromRawJson(const Json::Value &v,
 
 ValueOrError<Location> Location::fromRawBytes(QByteArrayView bytes,
                                               QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+Investigator::Investigator(CardCode id, CardCode cardCode, PlayerId playerId,
+                           TokenCounts tokens)
+    : m_id(std::move(id)), m_cardCode(std::move(cardCode)),
+      m_playerId(std::move(playerId)), m_tokens(std::move(tokens)) {}
+
+qint64 Investigator::damage() const noexcept {
+  return m_tokens.count(kDamageToken);
+}
+qint64 Investigator::horror() const noexcept {
+  return m_tokens.count(kHorrorToken);
+}
+qint64 Investigator::resources() const noexcept {
+  return m_tokens.count(kResourceToken);
+}
+qint64 Investigator::clues() const noexcept {
+  return m_tokens.count(kClueToken);
+}
+qint64 Investigator::doom() const noexcept {
+  return m_tokens.count(kDoomToken);
+}
+
+ValueOrError<Investigator> Investigator::fromRawJson(const Json::Value &v,
+                                                     QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  auto id = requireBoardCardCode(obj, "id"_L1, Json::joinPath(path, u"id"));
+  if (!id)
+    return failure(id.error());
+
+  auto cardCode = requireBoardCardCode(obj, "cardCode"_L1,
+                                       Json::joinPath(path, u"cardCode"));
+  if (!cardCode)
+    return failure(cardCode.error());
+
+  auto playerId =
+      Json::requireField(obj, "playerId"_L1, Json::joinPath(path, u"playerId"),
+                         [](const Json::Value &value, QStringView p) {
+                           return PlayerId::fromJson(value, p);
+                         });
+  if (!playerId)
+    return failure(playerId.error());
+
+  auto name = Json::requireField(obj, "name"_L1, Json::joinPath(path, u"name"),
+                                 [](const Json::Value &value, QStringView p) {
+                                   return CardName::fromJson(value, p);
+                                 });
+  if (!name)
+    return failure(name.error());
+
+  auto classSymbol = Json::requireField(
+      obj, "class"_L1, Json::joinPath(path, u"class"),
+      [](const Json::Value &value, QStringView p) {
+        return Json::decodeClosedEnum(value, p, kClassSymbolTable);
+      });
+  if (!classSymbol)
+    return failure(classSymbol.error());
+
+  auto health =
+      requireNonNegativeInt(obj, "health"_L1, Json::joinPath(path, u"health"));
+  if (!health)
+    return failure(health.error());
+
+  auto sanity =
+      requireNonNegativeInt(obj, "sanity"_L1, Json::joinPath(path, u"sanity"));
+  if (!sanity)
+    return failure(sanity.error());
+
+  auto willpower =
+      Json::requireInt(obj, "willpower"_L1, Json::joinPath(path, u"willpower"));
+  if (!willpower)
+    return failure(willpower.error());
+
+  auto intellect =
+      Json::requireInt(obj, "intellect"_L1, Json::joinPath(path, u"intellect"));
+  if (!intellect)
+    return failure(intellect.error());
+
+  auto combat =
+      Json::requireInt(obj, "combat"_L1, Json::joinPath(path, u"combat"));
+  if (!combat)
+    return failure(combat.error());
+
+  auto agility =
+      Json::requireInt(obj, "agility"_L1, Json::joinPath(path, u"agility"));
+  if (!agility)
+    return failure(agility.error());
+
+  auto tokens =
+      requireTokenCounts(obj, "tokens"_L1, Json::joinPath(path, u"tokens"));
+  if (!tokens)
+    return failure(tokens.error());
+
+  auto remainingActions = Json::requireInt(
+      obj, "remainingActions"_L1, Json::joinPath(path, u"remainingActions"));
+  if (!remainingActions)
+    return failure(remainingActions.error());
+
+  auto unhealedHorror =
+      Json::requireInt(obj, "unhealedHorrorThisRound"_L1,
+                       Json::joinPath(path, u"unhealedHorrorThisRound"));
+  if (!unhealedHorror)
+    return failure(unhealedHorror.error());
+
+  auto defeated =
+      Json::requireBool(obj, "defeated"_L1, Json::joinPath(path, u"defeated"));
+  if (!defeated)
+    return failure(defeated.error());
+
+  auto resigned =
+      Json::requireBool(obj, "resigned"_L1, Json::joinPath(path, u"resigned"));
+  if (!resigned)
+    return failure(resigned.error());
+
+  auto eliminated = Json::requireBool(obj, "eliminated"_L1,
+                                      Json::joinPath(path, u"eliminated"));
+  if (!eliminated)
+    return failure(eliminated.error());
+
+  const QString placementPath = Json::joinPath(path, u"placement");
+  auto placement = Json::requireObjectField(obj, "placement"_L1, placementPath);
+  if (!placement)
+    return failure(placement.error());
+  auto placementTag = Json::requireString(
+      *placement, "tag"_L1, Json::joinPath(placementPath, u"tag"));
+  if (!placementTag)
+    return failure(placementTag.error());
+  std::optional<LocationId> placementLocation;
+  if (*placementTag == "AtLocation"_L1) {
+    auto location = Json::requireField(
+        *placement, "contents"_L1, Json::joinPath(placementPath, u"contents"),
+        [](const Json::Value &value, QStringView p) {
+          return LocationId::fromJson(value, p);
+        });
+    if (!location)
+      return failure(location.error());
+    placementLocation = *location;
+  }
+
+  auto connectedLocations =
+      requireIdArray<LocationId>(obj, "connectedLocations"_L1,
+                                 Json::joinPath(path, u"connectedLocations"));
+  if (!connectedLocations)
+    return failure(connectedLocations.error());
+
+  Investigator result(*id, *cardCode, *playerId, *tokens);
+  result.m_name = *name;
+  result.m_classSymbol = *classSymbol;
+  result.m_health = *health;
+  result.m_sanity = *sanity;
+  result.m_willpower = *willpower;
+  result.m_intellect = *intellect;
+  result.m_combat = *combat;
+  result.m_agility = *agility;
+  result.m_remainingActions = *remainingActions;
+  result.m_unhealedHorrorThisRound = *unhealedHorror;
+  result.m_defeated = *defeated;
+  result.m_resigned = *resigned;
+  result.m_eliminated = *eliminated;
+  result.m_placement = *placement;
+  result.m_placementLocation = placementLocation;
+  result.m_connectedLocations = *connectedLocations;
+  return result;
+}
+
+ValueOrError<Investigator> Investigator::fromRawBytes(QByteArrayView bytes,
+                                                      QStringView path) {
   auto parsed = Json::Value::parse(bytes, path);
   if (!parsed)
     return failure(parsed.error());
