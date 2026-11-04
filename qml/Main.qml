@@ -213,7 +213,10 @@ ApplicationWindow {
                 // Server-written free text: never render it as markup (no
                 // remote images or links from the message).
                 textFormat: Text.PlainText
-                wrapMode: Text.WordWrap
+                // Wrap (not WordWrap): an over-wide word such as a long URL
+                // also breaks inside the viewport, which never scrolls
+                // horizontally.
+                wrapMode: Text.Wrap
                 color: root.bone
                 font.pixelSize: 16
             }

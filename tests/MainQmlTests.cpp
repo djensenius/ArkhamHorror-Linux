@@ -11,6 +11,7 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QString>
+#include <QTextOption>
 #include <QUrl>
 #include <QtTest>
 #include <memory>
@@ -58,6 +59,7 @@ private slots:
   void longMaintenanceNoticeIsBoundedAndScrollable_data();
   void longMaintenanceNoticeIsBoundedAndScrollable();
   void shortMaintenanceNoticeIsShownWhole();
+  void unbrokenMaintenanceNoticeWrapsWithinWidth();
 
 private:
   QQuickWindow *load(const QString &diagnostic, int height);
@@ -152,6 +154,35 @@ void MainQmlTests::shortMaintenanceNoticeIsShownWhole() {
   QCOMPARE(text->property("text").toString(), diagnostic);
   // No clipping for a notice that fits.
   QCOMPARE(notice->height(), text->height());
+}
+
+void MainQmlTests::unbrokenMaintenanceNoticeWrapsWithinWidth() {
+  // A message the parser accepts at its 1000-unit cap with no word
+  // boundary (e.g. a long URL) must still wrap inside the notice, which
+  // never scrolls horizontally.
+  const QString diagnostic = QStringLiteral("x").repeated(1000) +
+                             QStringLiteral(" Try again in about 2 minutes.");
+  QQuickWindow *window = load(diagnostic, 800);
+  QVERIFY(window != nullptr);
+  auto *notice =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNotice"));
+  auto *text =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNoticeText"));
+  QVERIFY(notice != nullptr);
+  QVERIFY(text != nullptr);
+  QTRY_VERIFY(notice->height() > 0);
+  QCOMPARE(text->property("text").toString(), diagnostic);
+  // Text.Wrap == WrapAtWordBoundaryOrAnywhere.
+  QCOMPARE(text->property("wrapMode").toInt(),
+           int(QTextOption::WrapAtWordBoundaryOrAnywhere));
+  QVERIFY(text->width() > 0);
+  QCOMPARE(text->width(), notice->property("availableWidth").toReal());
+  const qreal contentWidth = text->property("contentWidth").toReal();
+  QVERIFY2(contentWidth <= text->width() + 0.5,
+           qPrintable(QStringLiteral("content width %1 > label width %2")
+                          .arg(contentWidth)
+                          .arg(text->width())));
+  QVERIFY(text->property("lineCount").toInt() > 2);
 }
 
 QTEST_MAIN(MainQmlTests)
