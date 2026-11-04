@@ -33,14 +33,16 @@ class FakeCoordinator final : public QObject {
   Q_PROPERTY(QString diagnostic READ diagnostic CONSTANT)
 
 public:
-  explicit FakeCoordinator(QString diagnostic)
-      : m_diagnostic(std::move(diagnostic)) {}
+  explicit FakeCoordinator(
+      QString diagnostic, QString displayName = QStringLiteral("Arkham Horror"))
+      : m_diagnostic(std::move(diagnostic)),
+        m_displayName(std::move(displayName)) {}
 
   [[nodiscard]] QString stateDescription() const {
     return QStringLiteral("Server maintenance");
   }
   [[nodiscard]] QString selectedProfileDisplayName() const {
-    return QStringLiteral("Arkham Horror");
+    return m_displayName;
   }
   [[nodiscard]] QString selectedProfileBaseUrl() const {
     return QStringLiteral("https://arkhamhorror.app");
@@ -50,6 +52,7 @@ public:
 
 private:
   QString m_diagnostic;
+  QString m_displayName;
 };
 
 } // namespace
@@ -64,17 +67,21 @@ private slots:
   void shortMaintenanceNoticeIsShownWhole();
   void unbrokenMaintenanceNoticeWrapsWithinWidth();
   void maintenanceNoticeRetryTimeIsReachableWithKeysAlone();
+  void longProfileNameStaysInsideTheStatusLabel();
 
 private:
-  QQuickWindow *load(const QString &diagnostic, int height);
+  QQuickWindow *
+  load(const QString &diagnostic, int height,
+       const QString &displayName = QStringLiteral("Arkham Horror"));
 
   std::unique_ptr<FakeCoordinator> m_coordinator;
   std::unique_ptr<QQmlApplicationEngine> m_engine;
 };
 
-QQuickWindow *MainQmlTests::load(const QString &diagnostic, int height) {
+QQuickWindow *MainQmlTests::load(const QString &diagnostic, int height,
+                                 const QString &displayName) {
   m_engine.reset();
-  m_coordinator = std::make_unique<FakeCoordinator>(diagnostic);
+  m_coordinator = std::make_unique<FakeCoordinator>(diagnostic, displayName);
   m_engine = std::make_unique<QQmlApplicationEngine>();
   m_engine->rootContext()->setContextProperty(
       QStringLiteral("sessionCoordinator"), m_coordinator.get());
@@ -266,6 +273,48 @@ void MainQmlTests::maintenanceNoticeRetryTimeIsReachableWithKeysAlone() {
   }
   QCOMPARE(flickable->property("contentY").toReal(), 0.0);
   QTRY_VERIFY(firstCard->hasActiveFocus());
+}
+
+void MainQmlTests::longProfileNameStaysInsideTheStatusLabel() {
+  // A custom profile's display name has no length limit; the status label
+  // ("<state> — <profile>") must stay on one line inside the window and
+  // keep its full text for assistive technology.
+  const QString displayName =
+      QStringLiteral("My very long custom server profile ")
+          .repeated(9)
+          .left(300);
+  QCOMPARE(displayName.size(), 300);
+  QQuickWindow *window =
+      load(QStringLiteral("Back soon. Try again in about 2 minutes."), 800,
+           displayName);
+  QVERIFY(window != nullptr);
+
+  auto *status = window->findChild<QQuickItem *>(QStringLiteral("statusLabel"));
+  QVERIFY(status != nullptr);
+  QTRY_VERIFY(status->width() > 0);
+  const QString expected =
+      QStringLiteral("Server maintenance — %1").arg(displayName);
+  QCOMPARE(status->property("text").toString(), expected);
+  QVERIFY(status->isVisible());
+  QCOMPARE(status->property("elide").toInt(), int(Qt::ElideRight));
+  QVERIFY(status->property("truncated").toBool());
+  QCOMPARE(status->property("lineCount").toInt(), 1);
+
+  // The label (and its drawn text) fits the layout column, which itself
+  // sits inside the window.
+  QQuickItem *column = status->parentItem();
+  QVERIFY(column != nullptr);
+  QVERIFY(column->width() > 0);
+  QVERIFY(column->width() <= window->width());
+  QVERIFY2(status->x() + status->width() <= column->width() + 0.5,
+           qPrintable(QStringLiteral("label right %1 > column width %2")
+                          .arg(status->x() + status->width())
+                          .arg(column->width())));
+  QVERIFY(status->property("contentWidth").toReal() <= status->width() + 0.5);
+
+  QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(status);
+  QVERIFY(iface != nullptr);
+  QCOMPARE(iface->text(QAccessible::Name), expected);
 }
 
 QTEST_MAIN(MainQmlTests)

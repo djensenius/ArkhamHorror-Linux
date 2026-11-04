@@ -183,9 +183,17 @@ ApplicationWindow {
             // qmllint disable unqualified
             text: typeof sessionCoordinator !== "undefined" && sessionCoordinator ? qsTr("%1 — %2").arg(sessionCoordinator.stateDescription).arg(sessionCoordinator.selectedProfileDisplayName) : ""
             // qmllint enable unqualified
+            objectName: "statusLabel"
             visible: text.length > 0
+            // A custom profile name can be arbitrarily long: keep it to one
+            // line inside the window and expose the full text to assistive
+            // technology (a controller cannot reach a tooltip).
+            Layout.fillWidth: true
+            elide: Text.ElideRight
+            maximumLineCount: 1
             color: root.gold
             font.pixelSize: 16
+            Accessible.name: text
         }
 
         ScrollView {
