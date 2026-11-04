@@ -814,6 +814,18 @@ class EncoderHygieneError(RuntimeError):
     not left passing for the wrong reason)."""
 
 
+class IdentityPinMismatchError(EncoderHygieneError):
+    """An exact identity-set digest no longer matches its pin. Raised only
+    after every finding of the run has been collected and pinned, so it
+    carries those findings: main() still reports this failure, then runs
+    the per-entry allowlist checks on the same findings instead of letting
+    the set-digest failure hide them."""
+
+    def __init__(self, message: str, findings: Sequence["Finding"]) -> None:
+        super().__init__(message)
+        self.findings = list(findings)
+
+
 # --- Minimal ctypes bindings for libclang's stable C ABI -------------------
 
 
@@ -1589,6 +1601,25 @@ class Finding:
 
 def _full_signature_digest(finding: Finding) -> str:
     return hashlib.sha256(finding.canonical_return_type.encode("utf-8")).hexdigest()
+
+
+def _physical_identity_sha256(finding: Finding) -> str:
+    """The canonical physical-identity (position) pin run_check() stores on
+    every finding and _PHYSICAL_OBSERVATION_SHA256 pins."""
+
+    physical_payload = json.dumps(
+        {
+            "file": finding.file,
+            "line": finding.line,
+            "offset": finding.offset,
+            "spelling_file": finding.spelling_file,
+            "spelling_offset": finding.spelling_offset,
+            "usr": finding.usr,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(physical_payload.encode("utf-8")).hexdigest()
 
 
 def _identity_set_digest(entries: Sequence[Finding]) -> str:
@@ -4016,6 +4047,98 @@ def classify(finding: Finding, counts: Counter[tuple[str, str]] | None = None) -
     if counts is not None and counts[finding.key()] != entry.expected_count:
         return "violation"
     return "allowed"
+
+
+def _allowlist_mismatch_lines(
+    finding: Finding, counts: Counter[tuple[str, str]] | None = None
+) -> list[str]:
+    """Explain a classify() violation field by field against the allowlist
+    entry with the same file + USR (keys are unique, so that entry is the
+    nearest one). Mirrors classify()'s comparisons exactly and never
+    changes the outcome. Returns [] when no entry shares the finding's
+    file + USR or nothing mismatched; the caller then keeps the generic
+    message. Observed hashes are the finding's own pins, computed by
+    run_check() with the same canonical payloads --print-pins uses, so a
+    deliberate repin can copy them directly."""
+
+    if not _is_qjson_family(finding.canonical_return_type):
+        return []
+    if finding.exact_set_allowed:
+        return []
+    entry = ALLOWLIST_BY_KEY.get(finding.key())
+    if entry is None:
+        return []
+    index = ALLOWLIST.index(entry)
+    observed_signature = _full_signature_digest(finding)
+    mismatched: list[str] = []
+    details: list[str] = []
+    if (
+        entry.full_signature_sha256 is None
+        or entry.full_signature_sha256 != observed_signature
+    ):
+        mismatched.append("signature")
+        details.append(
+            f"signature: pinned _FULL_SIGNATURE_SHA256[{index}] "
+            f"{entry.full_signature_sha256 or '<unpinned>'}, "
+            f"observed {observed_signature}"
+        )
+    if entry.access is None or entry.access != finding.access:
+        mismatched.append("access")
+        details.append(f"access: pinned {entry.access}, observed {finding.access}")
+    if entry.linkage is None or entry.linkage != finding.linkage:
+        mismatched.append("linkage")
+        details.append(
+            f"linkage: pinned {entry.linkage}, observed {finding.linkage}"
+        )
+    physical_mismatch = (
+        bool(finding.physical_identity_sha256)
+        and entry.physical_identity_sha256 != finding.physical_identity_sha256
+    )
+    observation_mismatch = (
+        bool(finding.observation_set_sha256)
+        and entry.observation_set_sha256 != finding.observation_set_sha256
+    )
+    if physical_mismatch:
+        mismatched.append("physical identity")
+        details.append(
+            "physical identity: pinned "
+            f"{entry.physical_identity_sha256 or '<unpinned>'}, observed "
+            f"{finding.physical_identity_sha256}"
+        )
+        details.append(
+            f"  observed position: file={finding.file} line={finding.line} "
+            f"offset={finding.offset} spelling_file={finding.spelling_file} "
+            f"spelling_offset={finding.spelling_offset}"
+        )
+    if observation_mismatch:
+        mismatched.append("observation set")
+        details.append(
+            "observation set: pinned "
+            f"{entry.observation_set_sha256 or '<unpinned>'}, observed "
+            f"{finding.observation_set_sha256}"
+        )
+    if physical_mismatch or observation_mismatch:
+        details.append(
+            f"  observed _PHYSICAL_OBSERVATION_SHA256[{index}] pin line: "
+            f"{finding.physical_identity_sha256 or entry.physical_identity_sha256} "
+            f"{finding.observation_set_sha256 or entry.observation_set_sha256}"
+        )
+        details.append(
+            "  this also changes the named set digest; take set digests from "
+            "`mise run contracts:print-encoder-hygiene-pins` (--print-pins)"
+        )
+    if counts is not None and counts[finding.key()] != entry.expected_count:
+        mismatched.append("occurrence count")
+        details.append(
+            f"occurrence count: expected {entry.expected_count}, "
+            f"found {counts[finding.key()]}"
+        )
+    if not mismatched:
+        return []
+    return [
+        f"mismatched field(s) vs ALLOWLIST[{index}] (same file + USR): "
+        + ", ".join(mismatched)
+    ] + details
 
 
 def _sanitize_compile_args(command: str | Sequence[str], source_file: str) -> list[str]:
@@ -7269,18 +7392,6 @@ def run_check(
 
     pinned_findings: list[Finding] = []
     for physical_key, finding in physical_findings.items():
-        physical_payload = json.dumps(
-            {
-                "file": finding.file,
-                "line": finding.line,
-                "offset": finding.offset,
-                "spelling_file": finding.spelling_file,
-                "spelling_offset": finding.spelling_offset,
-                "usr": finding.usr,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         observation_payload = json.dumps(
             sorted(observed_contexts.get(physical_key, set())),
             separators=(",", ":"),
@@ -7288,14 +7399,23 @@ def run_check(
         pinned_findings.append(
             replace(
                 finding,
-                physical_identity_sha256=hashlib.sha256(
-                    physical_payload.encode("utf-8")
-                ).hexdigest(),
+                physical_identity_sha256=_physical_identity_sha256(finding),
                 observation_set_sha256=hashlib.sha256(
                     observation_payload.encode("utf-8")
                 ).hexdigest(),
             )
         )
+
+    return _apply_identity_set_pins(pinned_findings, enforce_identity_pins)
+
+
+def _apply_identity_set_pins(
+    pinned_findings: list[Finding], enforce_identity_pins: bool
+) -> list[Finding]:
+    """Compare the named-allowlist and function-body identity-set digests
+    with their pins. With enforce_identity_pins, a mismatch raises
+    IdentityPinMismatchError carrying the same findings a passing run would
+    return, so main() can still run the per-entry checks from this run."""
 
     named_findings = [
         finding
@@ -7322,21 +7442,23 @@ def run_check(
             f"(expected {_LOCAL_WIRE_SURFACE_SET_SHA256}, found "
             f"{local_digest}; {len(body_findings)} physical occurrences)"
         )
-    if enforce_identity_pins and identity_errors:
-        raise EncoderHygieneError(
-            "Exact forbidden-type physical identity/observation allowance "
-            "mismatch. A declaration, macro expansion, local construction, or "
-            "target/configuration/TU observation was added, removed, or moved; "
-            "review the full production surface before deliberately repinning:\n"
-            + "\n".join(f"  {error}" for error in identity_errors)
-        )
     if enforce_identity_pins:
-        return [
+        set_pinned_findings = [
             replace(finding, exact_set_allowed=True)
             if finding.key() not in ALLOWLIST_BY_KEY and finding.body_surface
             else finding
             for finding in pinned_findings
         ]
+        if identity_errors:
+            raise IdentityPinMismatchError(
+                "Exact forbidden-type physical identity/observation allowance "
+                "mismatch. A declaration, macro expansion, local construction, or "
+                "target/configuration/TU observation was added, removed, or moved; "
+                "review the full production surface before deliberately repinning:\n"
+                + "\n".join(f"  {error}" for error in identity_errors),
+                set_pinned_findings,
+            )
+        return set_pinned_findings
     return pinned_findings
 
 
@@ -7390,6 +7512,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         or (repo_root / "build-encoder-hygiene-matrix")
     ).resolve()
 
+    identity_pin_failure = False
     try:
         findings = run_check(
             repo_root,
@@ -7397,6 +7520,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.skip_configure,
             enforce_identity_pins=not (args.list or args.print_pins),
         )
+    except IdentityPinMismatchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(
+            "error: continuing with the per-entry allowlist checks from this "
+            "same run so every mismatch is reported together; this run fails "
+            "regardless. Function-body wire surfaces have no per-entry pins and "
+            "are covered only by the set digest above.",
+            file=sys.stderr,
+        )
+        identity_pin_failure = True
+        findings = exc.findings
     except EncoderHygieneError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -7449,7 +7583,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"(expected {entry.expected_count}, found {found})",
                 file=sys.stderr,
             )
-        return 1
 
     if violations:
         # De-duplicate for reporting (a genuinely duplicated declaration
@@ -7459,7 +7592,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"error: {len(violations)} forbidden Qt wire-type surface(s) are "
             "not in the exact positive allowlist (file + USR + canonical "
-            "semantic signature + access + occurrence count):",
+            "semantic signature + access + linkage + physical identity + "
+            "observation set + occurrence count):",
             file=sys.stderr,
         )
         for v in sorted(violations, key=lambda f: (f.file, f.line)):
@@ -7470,6 +7604,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  {v.file}:{v.line}  {v.display_name}", file=sys.stderr)
             print(f"      canonical return type: {v.canonical_return_type}", file=sys.stderr)
             print(f"      USR: {v.usr}", file=sys.stderr)
+            for detail in _allowlist_mismatch_lines(v, counts):
+                print(f"      {detail}", file=sys.stderr)
+
+    if identity_pin_failure or missing_or_wrong_count_entries or violations:
+        if identity_pin_failure and not (
+            missing_or_wrong_count_entries or violations
+        ):
+            print(
+                "error: the per-entry allowlist checks from this same run found "
+                "no violations; only the set digest(s) reported above changed.",
+                file=sys.stderr,
+            )
         return 1
 
     print(

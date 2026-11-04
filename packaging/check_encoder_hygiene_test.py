@@ -22,6 +22,7 @@ Run directly: `python3 packaging/check_encoder_hygiene_test.py`
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import sys
@@ -323,6 +324,327 @@ class ExactIdentitySetTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("# WARNING: generated pin set is incomplete or ambiguous", stdout.getvalue())
         self.assertIn("refusing to print a successful pin regeneration", stderr.getvalue())
+
+
+class ViolationDiagnosticsTests(unittest.TestCase):
+    """Per-entry violations name the mismatched field(s) against the same
+    file + USR allowlist entry, and a set-digest failure no longer hides
+    the per-entry violations from the same run."""
+
+    # The exact canonical physical-identity payload run_check() hashes for
+    # the relocated finding below (sorted keys, compact separators).
+    _RELOCATED_PAYLOAD = (
+        '{"file":"src/domain/RawJson.h","line":57,"offset":1834,'
+        '"spelling_file":"src/domain/RawJson.h","spelling_offset":1834,'
+        '"usr":"c:@N@Arkham@N@Json@S@Value@F@toExactQJson#1"}'
+    )
+    _SET_DIGEST_HINT = (
+        "  this also changes the named set digest; take set digests from "
+        "`mise run contracts:print-encoder-hygiene-pins` (--print-pins)"
+    )
+
+    def _pinned_allowlisted_finding(self) -> ceh.Finding:
+        entry = ceh.ALLOWLIST[0]
+        return replace(
+            _finding(
+                file=entry.file,
+                usr=entry.usr,
+                canonical_return_type=_FIRST_ALLOWLIST_FULL_SIGNATURE,
+                access=entry.access,
+                linkage=entry.linkage,
+            ),
+            physical_identity_sha256=entry.physical_identity_sha256 or "",
+            observation_set_sha256=entry.observation_set_sha256 or "",
+        )
+
+    def _relocated_finding(self) -> ceh.Finding:
+        finding = replace(
+            self._pinned_allowlisted_finding(),
+            line=57,
+            offset=1834,
+            spelling_file="src/domain/RawJson.h",
+            spelling_offset=1834,
+        )
+        return replace(
+            finding, physical_identity_sha256=ceh._physical_identity_sha256(finding)
+        )
+
+    def _run_main_with(self, fake_run_check) -> tuple[int, str, str]:
+        original_run_check = ceh.run_check
+        ceh.run_check = fake_run_check
+        try:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                result = ceh.main([])
+        finally:
+            ceh.run_check = original_run_check
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_physical_identity_hash_uses_the_canonical_pin_payload(self) -> None:
+        expected = hashlib.sha256(self._RELOCATED_PAYLOAD.encode("utf-8")).hexdigest()
+        self.assertEqual(
+            self._relocated_finding().physical_identity_sha256, expected
+        )
+
+    def test_position_mismatch_names_field_position_and_repin_line(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        relocated = self._relocated_finding()
+        new_hash = hashlib.sha256(self._RELOCATED_PAYLOAD.encode("utf-8")).hexdigest()
+        self.assertNotEqual(new_hash, entry.physical_identity_sha256)
+        counts = Counter({entry.key(): 1})
+        self.assertEqual(ceh.classify(relocated, counts), "violation")
+
+        lines = ceh._allowlist_mismatch_lines(relocated, counts)
+
+        self.assertEqual(
+            lines,
+            [
+                "mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+                "physical identity",
+                f"physical identity: pinned {entry.physical_identity_sha256}, "
+                f"observed {new_hash}",
+                "  observed position: file=src/domain/RawJson.h line=57 "
+                "offset=1834 spelling_file=src/domain/RawJson.h "
+                "spelling_offset=1834",
+                "  observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
+                f"{new_hash} {entry.observation_set_sha256}",
+                self._SET_DIGEST_HINT,
+            ],
+        )
+        pin_line = lines[-2].split("pin line: ", 1)[1]
+        self.assertEqual(
+            tuple(pin_line.split()), (new_hash, entry.observation_set_sha256)
+        )
+
+    def test_observation_set_mismatch_is_named_with_both_hashes(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = replace(
+            self._pinned_allowlisted_finding(), observation_set_sha256="f" * 64
+        )
+        self.assertEqual(ceh.classify(finding), "violation")
+
+        lines = ceh._allowlist_mismatch_lines(finding)
+
+        self.assertEqual(
+            lines,
+            [
+                "mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+                "observation set",
+                f"observation set: pinned {entry.observation_set_sha256}, "
+                f"observed {'f' * 64}",
+                "  observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
+                f"{entry.physical_identity_sha256} {'f' * 64}",
+                self._SET_DIGEST_HINT,
+            ],
+        )
+
+    def test_physical_and_observation_mismatch_pin_line_uses_both_observed(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = replace(self._relocated_finding(), observation_set_sha256="e" * 64)
+        new_hash = hashlib.sha256(self._RELOCATED_PAYLOAD.encode("utf-8")).hexdigest()
+        self.assertEqual(ceh.classify(finding), "violation")
+
+        lines = ceh._allowlist_mismatch_lines(finding)
+
+        self.assertEqual(
+            lines,
+            [
+                "mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+                "physical identity, observation set",
+                f"physical identity: pinned {entry.physical_identity_sha256}, "
+                f"observed {new_hash}",
+                "  observed position: file=src/domain/RawJson.h line=57 "
+                "offset=1834 spelling_file=src/domain/RawJson.h "
+                "spelling_offset=1834",
+                f"observation set: pinned {entry.observation_set_sha256}, "
+                f"observed {'e' * 64}",
+                "  observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
+                f"{new_hash} {'e' * 64}",
+                self._SET_DIGEST_HINT,
+            ],
+        )
+
+    def test_non_qjson_and_exact_set_allowed_findings_explain_nothing(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        relocated = self._relocated_finding()
+        self.assertTrue(ceh._allowlist_mismatch_lines(relocated))
+        non_qjson = replace(
+            relocated, canonical_return_type="Arkham::ValueOrError<QString>"
+        )
+        set_allowed = replace(relocated, exact_set_allowed=True)
+        counts = Counter({entry.key(): 2})
+        for finding in (non_qjson, set_allowed):
+            with self.subTest(finding=finding):
+                self.assertEqual(ceh.classify(finding, counts), "allowed")
+                self.assertEqual(ceh._allowlist_mismatch_lines(finding, counts), [])
+
+    def test_signature_access_linkage_and_count_mismatches_are_named(self) -> None:
+        entry = ceh.ALLOWLIST[0]
+        finding = replace(
+            self._pinned_allowlisted_finding(),
+            canonical_return_type="result=const QJsonObject &",
+            access=2,
+            linkage=2,
+        )
+        counts = Counter({entry.key(): 2})
+        self.assertEqual(ceh.classify(finding, counts), "violation")
+        observed_signature = hashlib.sha256(
+            b"result=const QJsonObject &"
+        ).hexdigest()
+
+        lines = ceh._allowlist_mismatch_lines(finding, counts)
+
+        self.assertEqual(
+            lines,
+            [
+                "mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+                "signature, access, linkage, occurrence count",
+                "signature: pinned _FULL_SIGNATURE_SHA256[0] "
+                f"{entry.full_signature_sha256}, observed {observed_signature}",
+                f"access: pinned {entry.access}, observed 2",
+                f"linkage: pinned {entry.linkage}, observed 2",
+                "occurrence count: expected 1, found 2",
+            ],
+        )
+
+    def test_no_same_file_and_usr_entry_keeps_generic_message(self) -> None:
+        unknown = _finding(
+            file="src/domain/Decks.h",
+            usr="c:@N@Arkham@S@DeckOperationError@F@sneaky#1",
+            canonical_return_type="QJsonObject",
+        )
+        self.assertEqual(ceh.classify(unknown), "violation")
+        self.assertEqual(ceh._allowlist_mismatch_lines(unknown), [])
+        self.assertEqual(
+            ceh._allowlist_mismatch_lines(self._pinned_allowlisted_finding()), []
+        )
+
+    def test_set_digest_error_carries_this_runs_findings(self) -> None:
+        relocated = self._relocated_finding()
+        body = replace(
+            _finding(
+                file="src/domain/Games.cpp",
+                usr="c:@N@Arkham@F@localBody#1",
+                canonical_return_type="QJsonObject",
+            ),
+            body_surface=True,
+        )
+        with self.assertRaises(ceh.IdentityPinMismatchError) as raised:
+            ceh._apply_identity_set_pins([relocated, body], True)
+
+        self.assertIsInstance(raised.exception, ceh.EncoderHygieneError)
+        self.assertIn(
+            "named allowlist physical/observation set changed",
+            str(raised.exception),
+        )
+        self.assertEqual(
+            raised.exception.findings,
+            [relocated, replace(body, exact_set_allowed=True)],
+        )
+        self.assertEqual(
+            ceh._apply_identity_set_pins([relocated, body], False),
+            [relocated, body],
+        )
+
+    def test_set_digest_mismatch_still_reports_per_entry_violations(self) -> None:
+        relocated = self._relocated_finding()
+        new_hash = relocated.physical_identity_sha256
+
+        def fake_run_check(*_args: object, **_kwargs: object) -> list[ceh.Finding]:
+            raise ceh.IdentityPinMismatchError(
+                "Exact forbidden-type physical identity/observation allowance "
+                "mismatch:\n  named allowlist physical/observation set changed",
+                [relocated],
+            )
+
+        result, stdout, stderr = self._run_main_with(fake_run_check)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        set_digest = stderr.index("named allowlist physical/observation set changed")
+        continuing = stderr.index(
+            "continuing with the per-entry allowlist checks from this same run"
+        )
+        per_entry = stderr.index(
+            "      mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+            "physical identity\n"
+        )
+        self.assertLess(set_digest, continuing)
+        self.assertLess(continuing, per_entry)
+        self.assertIn(
+            "      physical identity: pinned "
+            f"{ceh.ALLOWLIST[0].physical_identity_sha256}, observed {new_hash}\n",
+            stderr,
+        )
+        self.assertIn(
+            "        observed position: file=src/domain/RawJson.h line=57 "
+            "offset=1834 spelling_file=src/domain/RawJson.h spelling_offset=1834\n",
+            stderr,
+        )
+        self.assertNotIn("Encoder hygiene:", stderr)
+
+    def test_set_digest_only_mismatch_says_per_entry_checks_found_nothing(self) -> None:
+        pinned = self._pinned_allowlisted_finding()
+
+        def fake_run_check(*_args: object, **_kwargs: object) -> list[ceh.Finding]:
+            raise ceh.IdentityPinMismatchError(
+                "Exact forbidden-type physical identity/observation allowance "
+                "mismatch:\n  function-body wire surface set changed",
+                [pinned],
+            )
+
+        original_allowlist = ceh.ALLOWLIST
+        ceh.ALLOWLIST = (original_allowlist[0],)
+        try:
+            result, stdout, stderr = self._run_main_with(fake_run_check)
+        finally:
+            ceh.ALLOWLIST = original_allowlist
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("function-body wire surface set changed", stderr)
+        self.assertNotIn("not in the exact positive allowlist", stderr)
+        self.assertTrue(
+            stderr.endswith(
+                "error: the per-entry allowlist checks from this same run found "
+                "no violations; only the set digest(s) reported above changed.\n"
+            )
+        )
+
+    def test_stale_count_failure_still_reports_per_entry_violations(self) -> None:
+        relocated = self._relocated_finding()
+
+        def fake_run_check(*_args: object, **_kwargs: object) -> list[ceh.Finding]:
+            return [relocated]
+
+        result, stdout, stderr = self._run_main_with(fake_run_check)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        self.assertNotIn("continuing with the per-entry allowlist checks", stderr)
+        stale = stderr.index("the allowlist itself has gone stale")
+        missing_entry = ceh.ALLOWLIST[1]
+        self.assertIn(
+            f"  {missing_entry.file}: {missing_entry.usr} (expected 1, found 0)\n",
+            stderr,
+        )
+        violations = stderr.index(
+            "error: 1 forbidden Qt wire-type surface(s) are not in the exact "
+            "positive allowlist"
+        )
+        per_entry = stderr.index(
+            "      mismatched field(s) vs ALLOWLIST[0] (same file + USR): "
+            "physical identity\n"
+        )
+        self.assertLess(stale, violations)
+        self.assertLess(violations, per_entry)
+        self.assertIn(
+            "        observed _PHYSICAL_OBSERVATION_SHA256[0] pin line: "
+            f"{relocated.physical_identity_sha256} "
+            f"{ceh.ALLOWLIST[0].observation_set_sha256}\n",
+            stderr,
+        )
 
 
 class QJsonFamilyWrappedFormsAreDetectedTests(unittest.TestCase):
