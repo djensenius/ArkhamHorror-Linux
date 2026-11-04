@@ -17,6 +17,8 @@ QByteArray reasonPhrase(int status) {
     return QByteArrayLiteral("Not Found");
   case 500:
     return QByteArrayLiteral("Internal Server Error");
+  case 503:
+    return QByteArrayLiteral("Service Unavailable");
   default:
     return QByteArrayLiteral("Status");
   }
@@ -114,6 +116,9 @@ void MockHttpServer::writeResponse(QTcpSocket *socket,
   }
   if (!response.location.isEmpty()) {
     header += "Location: " + response.location + "\r\n";
+  }
+  for (const auto &[name, value] : response.extraHeaders) {
+    header += name + ": " + value + "\r\n";
   }
   if (response.includeContentLength) {
     qint64 length = response.contentLengthOverride;

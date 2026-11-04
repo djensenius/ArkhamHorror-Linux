@@ -28,9 +28,11 @@
 #include "ContractPin.h"
 #include "ICapabilityProbe.h"
 #include "IProfileStore.h"
+#include "MockHttpServer.h"
 #include "NetworkCapabilityProbe.h"
 #include "ProbeResult.h"
 #include "QSettingsProfileStore.h"
+#include "ServerMaintenance.h"
 #include "ServerProfile.h"
 #include "StrictLoopbackUrlTable.h"
 #include "UrlValidator.h"
@@ -43,6 +45,8 @@ using namespace Arkham;
 // Schedules finished() on the next event-loop iteration so that probe tests
 // exercise the same async delivery path as production code.
 
+using RawHeaders = QList<std::pair<QByteArray, QByteArray>>;
+
 class StubNetworkReply final : public QNetworkReply {
   Q_OBJECT
 public:
@@ -51,10 +55,13 @@ public:
   // called; used to test probe timeout behaviour.
   StubNetworkReply(int statusCode, QByteArray body,
                    QNetworkReply::NetworkError netError, bool hanging,
-                   QObject *parent)
+                   const RawHeaders &headers, QObject *parent)
       : QNetworkReply(parent), m_body(std::move(body)), m_hanging(hanging) {
     if (statusCode > 0) {
       setAttribute(QNetworkRequest::HttpStatusCodeAttribute, statusCode);
+    }
+    for (const auto &[name, value] : headers) {
+      setRawHeader(name, value);
     }
     if (netError != NoError) {
       setError(netError, QStringLiteral("simulated network error"));
@@ -105,14 +112,16 @@ public:
       : QNetworkAccessManager(parent) {}
 
   void enqueue(int statusCode, QByteArray body,
-               QNetworkReply::NetworkError err = QNetworkReply::NoError) {
-    m_queue.enqueue({statusCode, std::move(body), err, false});
+               QNetworkReply::NetworkError err = QNetworkReply::NoError,
+               RawHeaders headers = {}) {
+    m_queue.enqueue(
+        {statusCode, std::move(body), err, false, std::move(headers)});
   }
 
   // Enqueue a reply that never emits finished() until abort() is called.
   // Used to test probe timeout behaviour.
   void enqueueHanging() {
-    m_queue.enqueue({0, {}, QNetworkReply::NoError, true});
+    m_queue.enqueue({0, {}, QNetworkReply::NoError, true, {}});
   }
 
   QUrl lastUrl() const { return m_lastUrl; }
@@ -130,9 +139,9 @@ protected:
     if (m_queue.isEmpty()) {
       qFatal("StubNetworkAccessManager: no canned response enqueued");
     }
-    const auto [status, body, err, hanging] = m_queue.dequeue();
-    auto *reply =
-        new StubNetworkReply(status, std::move(body), err, hanging, this);
+    const auto [status, body, err, hanging, headers] = m_queue.dequeue();
+    auto *reply = new StubNetworkReply(status, std::move(body), err, hanging,
+                                       headers, this);
     m_lastReply = reply;
     if (!hanging) {
       reply->scheduleFinished();
@@ -146,6 +155,7 @@ private:
     QByteArray body;
     QNetworkReply::NetworkError err;
     bool hanging{false};
+    RawHeaders headers;
   };
   QQueue<Canned> m_queue;
   QUrl m_lastUrl;
@@ -279,7 +289,13 @@ private slots:
   void probeMalformedJsonNotObject();
   void probeMalformedJsonBadSchema();
   void probeNonSuccessStatus();
-  void probeMaintenance503IsHttpErrorNotIncompatible();
+  void probeMaintenance503WithRetryAfterIsMaintenance();
+  void probeMaintenance503WithoutRetryAfterIsMaintenance();
+  void probeNonMaintenance503IsHttpError();
+  void probeMaintenance503OverSocketReadsRetryAfter();
+  void serverMaintenanceParsesBodyVariants();
+  void serverMaintenanceParsesRetryAfterValues();
+  void serverMaintenanceNoticeWording();
   void probeIncompatible();
   void probeTransportFailure();
   void probeRejectsInvalidProfile();
@@ -1401,25 +1417,246 @@ void NetworkTests::probeNonSuccessStatus() {
   QVERIFY(r->diagnostic.contains(QStringLiteral("503")));
 }
 
-void NetworkTests::probeMaintenance503IsHttpErrorNotIncompatible() {
-  // A server in maintenance mode (schema 0.1.57) answers every API route,
-  // including /capabilities, with 503 and this body. It is a transient
-  // HTTP failure, never a compatibility verdict: the body is not a
-  // capabilities document and must not be evaluated as one.
+// Bytes shaped exactly like the fork server's maintenance 503 (backend
+// Foundation.hs maintenanceMiddleware, aeson object keys in sorted order,
+// the default Api/Arkham/Maintenance.hs message) plus its Retry-After.
+static const QByteArray kMaintenanceBody = QByteArrayLiteral(
+    R"({"maintenance":true,"message":"Arkham Horror is down for scheduled )"
+    R"(database maintenance. Games in progress are saved and will be exactly )"
+    R"(where you left them.","since":"2026-11-03T22:15:00.123456Z"})");
+static const QString kMaintenanceMessage = QStringLiteral(
+    "Arkham Horror is down for scheduled database maintenance. Games in "
+    "progress are saved and will be exactly where you left them.");
+
+void NetworkTests::probeMaintenance503WithRetryAfterIsMaintenance() {
+  // A maintenance 503 is neither a compatibility verdict nor a generic HTTP
+  // error: the body is decoded as the maintenance notice, never as
+  // capabilities.
   StubNetworkAccessManager nam;
-  nam.enqueue(
-      503,
-      QByteArrayLiteral(
-          R"({"maintenance":true,"since":"2026-11-03T22:15:00Z","message":"Arkham is down for maintenance."})"),
-      QNetworkReply::ServiceUnavailableError);
+  nam.enqueue(503, kMaintenanceBody, QNetworkReply::ServiceUnavailableError,
+              {{QByteArrayLiteral("Retry-After"), QByteArrayLiteral("120")}});
 
   NetworkCapabilityProbe probe(nam);
   const auto r = runProbe(probe, ServerProfile::hostedDefault());
   QVERIFY2(r.has_value(), qPrintable(r.error()));
-  QCOMPARE(r->outcome, ProbeOutcome::HttpError);
+  QCOMPARE(r->outcome, ProbeOutcome::Maintenance);
   QCOMPARE(r->httpStatus, 503);
-  QCOMPARE(r->diagnostic, QStringLiteral("unexpected HTTP status 503"));
   QVERIFY(!r->compatibility.has_value());
+  QVERIFY(r->maintenance.has_value());
+  QCOMPARE(r->maintenance->message, std::optional(kMaintenanceMessage));
+  QCOMPARE(r->maintenance->since,
+           std::optional(QStringLiteral("2026-11-03T22:15:00.123456Z")));
+  QCOMPARE(r->maintenance->retryAfterSeconds, std::optional(120));
+  QCOMPARE(r->diagnostic, kMaintenanceMessage +
+                              QStringLiteral(" Try again in about 2 minutes."));
+}
+
+void NetworkTests::probeMaintenance503WithoutRetryAfterIsMaintenance() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(503, kMaintenanceBody, QNetworkReply::ServiceUnavailableError);
+
+  NetworkCapabilityProbe probe(nam);
+  const auto r = runProbe(probe, ServerProfile::hostedDefault());
+  QVERIFY2(r.has_value(), qPrintable(r.error()));
+  QCOMPARE(r->outcome, ProbeOutcome::Maintenance);
+  QVERIFY(r->maintenance.has_value());
+  QCOMPARE(r->maintenance->retryAfterSeconds, std::nullopt);
+  QCOMPARE(r->diagnostic,
+           kMaintenanceMessage + QStringLiteral(" Try again later."));
+}
+
+void NetworkTests::probeNonMaintenance503IsHttpError() {
+  // A proxy/ingress 503 (even with Retry-After) and a body whose
+  // maintenance flag is not JSON true stay generic HTTP errors.
+  const QList<QByteArray> bodies{
+      QByteArrayLiteral("<html><body>503 Service Unavailable</body></html>"),
+      QByteArrayLiteral(R"({"maintenance":false,"message":"no"})"),
+      QByteArrayLiteral(R"({"maintenance":"true","message":"no"})"),
+      QByteArrayLiteral(R"({"maintenance":false,"maintenance":true})"),
+  };
+  for (const QByteArray &body : bodies) {
+    StubNetworkAccessManager nam;
+    nam.enqueue(503, body, QNetworkReply::ServiceUnavailableError,
+                {{QByteArrayLiteral("Retry-After"), QByteArrayLiteral("120")}});
+    NetworkCapabilityProbe probe(nam);
+    const auto r = runProbe(probe, ServerProfile::hostedDefault());
+    QVERIFY2(r.has_value(), qPrintable(r.error()));
+    QCOMPARE(r->outcome, ProbeOutcome::HttpError);
+    QCOMPARE(r->httpStatus, 503);
+    QCOMPARE(r->diagnostic, QStringLiteral("unexpected HTTP status 503"));
+    QVERIFY(!r->maintenance.has_value());
+  }
+}
+
+void NetworkTests::probeMaintenance503OverSocketReadsRetryAfter() {
+  // End to end over a real socket: MockHttpServer writes the extra
+  // Retry-After header and QNetworkAccessManager exposes it to the probe.
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const auto profile = ServerProfile::custom(
+      QStringLiteral("Mock"),
+      QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+  QVERIFY2(profile.has_value(), qPrintable(profile.error()));
+  MockHttpServer::Response response;
+  response.status = 503;
+  response.contentType = QByteArrayLiteral("application/json; charset=utf-8");
+  response.body = kMaintenanceBody;
+  response.extraHeaders = {
+      {QByteArrayLiteral("Retry-After"), QByteArrayLiteral("300")}};
+  server.setResponse(profile->apiUrl(u"capabilities").path(), response);
+
+  QNetworkAccessManager nam;
+  NetworkCapabilityProbe probe(nam);
+  const auto r = runProbe(probe, *profile);
+  QVERIFY2(r.has_value(), qPrintable(r.error()));
+  QCOMPARE(server.requestCount(), 1);
+  QCOMPARE(r->outcome, ProbeOutcome::Maintenance);
+  QVERIFY(r->maintenance.has_value());
+  QCOMPARE(r->maintenance->retryAfterSeconds, std::optional(300));
+  QCOMPARE(r->diagnostic, kMaintenanceMessage +
+                              QStringLiteral(" Try again in about 5 minutes."));
+}
+
+void NetworkTests::serverMaintenanceParsesBodyVariants() {
+  struct Case {
+    const char *name;
+    int status;
+    QByteArray body;
+    bool present;
+    std::optional<QString> message;
+    std::optional<QString> since;
+  };
+  const QString longMessage(1500, QLatin1Char('x'));
+  // 999 units then a surrogate pair straddling the 1000-unit cap.
+  const QString straddling = QString(999, QLatin1Char('y')) +
+                             QStringLiteral("\U0001F600") + QStringLiteral("z");
+  const auto object = [](const QString &message) {
+    return QStringLiteral(R"({"maintenance":true,"message":"%1"})")
+        .arg(message)
+        .toUtf8();
+  };
+  const QList<Case> cases{
+      {"server bytes", 503, kMaintenanceBody, true, kMaintenanceMessage,
+       QStringLiteral("2026-11-03T22:15:00.123456Z")},
+      {"flag only", 503, R"({"maintenance":true})", true, {}, {}},
+      {"flag false",
+       503,
+       R"({"maintenance":false,"message":"m"})",
+       false,
+       {},
+       {}},
+      {"flag missing", 503, R"({"message":"m"})", false, {}, {}},
+      {"flag string", 503, R"({"maintenance":"true"})", false, {}, {}},
+      {"flag number", 503, R"({"maintenance":1})", false, {}, {}},
+      {"non-string fields",
+       503,
+       R"({"maintenance":true,"since":5,"message":["m"]})",
+       true,
+       {},
+       {}},
+      {"null message",
+       503,
+       R"({"maintenance":true,"message":null})",
+       true,
+       {},
+       {}},
+      {"blank message",
+       503,
+       R"({"maintenance":true,"message":" \n\t "})",
+       true,
+       {},
+       {}},
+      {"trimmed message",
+       503,
+       R"({"maintenance":true,"message":"  Back soon \n"})",
+       true,
+       QStringLiteral("Back soon"),
+       {}},
+      {"long message",
+       503,
+       object(longMessage),
+       true,
+       longMessage.left(1000),
+       {}},
+      {"surrogate at cap",
+       503,
+       object(straddling),
+       true,
+       straddling.left(999),
+       {}},
+      {"invalid JSON", 503, R"({"maintenance":true)", false, {}, {}},
+      {"duplicate key",
+       503,
+       R"({"maintenance":false,"maintenance":true})",
+       false,
+       {},
+       {}},
+      {"array body", 503, R"([{"maintenance":true}])", false, {}, {}},
+      {"empty body", 503, {}, false, {}, {}},
+      {"not 503", 500, kMaintenanceBody, false, {}, {}},
+  };
+  for (const Case &c : cases) {
+    const auto parsed =
+        ServerMaintenance::fromResponse(c.status, c.body, QByteArray());
+    QVERIFY2(parsed.has_value() == c.present, c.name);
+    if (!parsed) {
+      continue;
+    }
+    QVERIFY2(parsed->message == c.message, c.name);
+    QVERIFY2(parsed->since == c.since, c.name);
+    QVERIFY2(!parsed->retryAfterSeconds.has_value(), c.name);
+  }
+}
+
+void NetworkTests::serverMaintenanceParsesRetryAfterValues() {
+  const QList<std::pair<QByteArray, std::optional<int>>> cases{
+      {"120", 120},
+      {"0", 0},
+      {" 120 ", 120},
+      {"000000120", 120},
+      {"604800", 604800},
+      {"604801", std::nullopt},
+      {"123456789", std::nullopt},
+      {"1234567890", std::nullopt},
+      {"", std::nullopt},
+      {"-1", std::nullopt},
+      {"+5", std::nullopt},
+      {"abc", std::nullopt},
+      {"1.5", std::nullopt},
+      {"Wed, 21 Oct 2015 07:28:00 GMT", std::nullopt},
+  };
+  for (const auto &[header, expected] : cases) {
+    QVERIFY2(ServerMaintenance::parseRetryAfter(header) == expected,
+             header.constData());
+    const auto parsed = ServerMaintenance::fromResponse(
+        503, QByteArrayLiteral(R"({"maintenance":true})"), header);
+    QVERIFY2(parsed.has_value(), header.constData());
+    QVERIFY2(parsed->retryAfterSeconds == expected, header.constData());
+  }
+}
+
+void NetworkTests::serverMaintenanceNoticeWording() {
+  const QString fallback = QStringLiteral(
+      "This server is temporarily down, most likely for maintenance.");
+  const QList<std::pair<ServerMaintenance, QString>> cases{
+      {{QStringLiteral("Down."), std::nullopt, std::nullopt},
+       QStringLiteral("Down. Try again later.")},
+      {{std::nullopt, std::nullopt, std::nullopt},
+       fallback + QStringLiteral(" Try again later.")},
+      {{std::nullopt, std::nullopt, 0},
+       fallback + QStringLiteral(" Try again in about a minute.")},
+      {{QStringLiteral("Down."), std::nullopt, 60},
+       QStringLiteral("Down. Try again in about a minute.")},
+      {{QStringLiteral("Down."), std::nullopt, 61},
+       QStringLiteral("Down. Try again in about 2 minutes.")},
+      {{QStringLiteral("Down %1."), std::nullopt, 120},
+       QStringLiteral("Down %1. Try again in about 2 minutes.")},
+      {{QStringLiteral("Down."), std::nullopt, 604800},
+       QStringLiteral("Down. Try again in about 10080 minutes.")},
+  };
+  for (const auto &[maintenance, expected] : cases) {
+    QCOMPARE(maintenance.notice(), expected);
+  }
 }
 
 void NetworkTests::probeIncompatible() {

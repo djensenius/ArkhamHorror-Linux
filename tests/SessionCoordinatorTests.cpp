@@ -32,6 +32,7 @@
 #include "ITokenStore.h"
 #include "ProbeResult.h"
 #include "QtKeychainTokenStore.h"
+#include "ServerMaintenance.h"
 #include "ServerProfile.h"
 #include "SessionCoordinator.h"
 #include "TokenContentTestData.h"
@@ -799,7 +800,8 @@ private slots:
   void legacyFallbackProbeProceedsToCredentialRestore();
   void incompatibleProbeSetsIncompatibleStateAndIsRetryable();
   void probeNetworkErrorSetsRecoverableFailureAndIsRetryable();
-  void probeMaintenance503SetsRecoverableFailureAndIsRetryable();
+  void probeMaintenanceSetsServerMaintenanceAndIsRetryable();
+  void probeMaintenanceWithoutRetryAfterSaysTryAgainLater();
 
   // Credential restore
   void missingTokenBecomesSignedOut();
@@ -1147,28 +1149,52 @@ void SessionCoordinatorTests::
   QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
 }
 
+// The ProbeResult NetworkCapabilityProbe emits for the server's maintenance
+// 503 (see NetworkTests::probeMaintenance503WithRetryAfterIsMaintenance),
+// built from the same server-shaped bytes and Retry-After value.
+static ProbeResult maintenanceProbeResult(const QByteArray &retryAfter) {
+  ProbeResult result;
+  result.outcome = ProbeOutcome::Maintenance;
+  result.httpStatus = 503;
+  result.maintenance = ServerMaintenance::fromResponse(
+      503,
+      QByteArrayLiteral(
+          R"({"maintenance":true,"message":"Back after the vacuum.",)"
+          R"("since":"2026-11-03T22:15:00Z"})"),
+      retryAfter);
+  if (result.maintenance) {
+    result.diagnostic = result.maintenance->notice();
+  }
+  return result;
+}
+
 void SessionCoordinatorTests::
-    probeMaintenance503SetsRecoverableFailureAndIsRetryable() {
-  // The ProbeResult NetworkCapabilityProbe emits for a maintenance-mode
-  // 503 (see NetworkTests::probeMaintenance503IsHttpErrorNotIncompatible):
-  // it must be a retryable failure, not Incompatible.
+    probeMaintenanceSetsServerMaintenanceAndIsRetryable() {
+  // Maintenance is its own state, never Incompatible or the generic
+  // RecoverableFailure, and carries the notice with the retry time.
   Harness h;
   h.coordinator->start();
   QVERIFY(
       pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
-  ProbeResult maintenance;
-  maintenance.outcome = ProbeOutcome::HttpError;
-  maintenance.diagnostic = QStringLiteral("unexpected HTTP status 503");
-  maintenance.httpStatus = 503;
+  const ProbeResult maintenance = maintenanceProbeResult("120");
+  QVERIFY(maintenance.maintenance.has_value());
   h.probeFactory.current()->complete(maintenance);
   QVERIFY(pumpEventsUntil([&h] {
     return h.coordinator->state() ==
-           SessionCoordinator::State::RecoverableFailure;
+           SessionCoordinator::State::ServerMaintenance;
   }));
-  QCOMPARE(h.coordinator->diagnostic(),
-           QStringLiteral("unexpected HTTP status 503"));
+  QCOMPARE(h.coordinator->stateDescription(),
+           QStringLiteral("Server maintenance"));
+  QCOMPARE(
+      h.coordinator->diagnostic(),
+      QStringLiteral("Back after the vacuum. Try again in about 2 minutes."));
+  QVERIFY(h.coordinator->isServerMaintenance());
+  QCOMPARE(h.coordinator->property("serverMaintenance"), QVariant(true));
 
+  // No automatic retry: nothing new is probed until retry() is called.
   const int createdBefore = h.probeFactory.totalCreated();
+  QTest::qWait(50);
+  QCOMPARE(h.probeFactory.totalCreated(), createdBefore);
   h.coordinator->retry();
   QVERIFY(pumpEventsUntil([&h, createdBefore] {
     return h.probeFactory.totalCreated() > createdBefore;
@@ -1176,6 +1202,22 @@ void SessionCoordinatorTests::
   QCOMPARE(h.probeFactory.totalCreated(), createdBefore + 1);
   QCOMPARE(h.coordinator->state(),
            SessionCoordinator::State::ProbingCapabilities);
+  QVERIFY(!h.coordinator->isServerMaintenance());
+}
+
+void SessionCoordinatorTests::
+    probeMaintenanceWithoutRetryAfterSaysTryAgainLater() {
+  Harness h;
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(maintenanceProbeResult(QByteArray()));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::ServerMaintenance;
+  }));
+  QCOMPARE(h.coordinator->diagnostic(),
+           QStringLiteral("Back after the vacuum. Try again later."));
 }
 
 // ─── Credential restore ──────────────────────────────────────────────────

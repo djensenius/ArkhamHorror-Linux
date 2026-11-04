@@ -244,6 +244,7 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/QtKeychainTokenStore.h
     src/SemanticCommand.h
     src/ServerCapabilities.h
+    src/ServerMaintenance.h
     src/ServerProfile.h
     src/SessionCoordinator.h
     src/SiteSettingsAssetHostFetcher.h
@@ -277,6 +278,7 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/QtKeychainTokenStore.cpp
     src/SemanticCommand.cpp
     src/ServerCapabilities.cpp
+    src/ServerMaintenance.cpp
     src/ServerProfile.cpp
     src/SessionCoordinator.cpp
     src/SiteSettingsAssetHostFetcher.cpp
@@ -859,6 +861,7 @@ if(BUILD_TESTING)
 
     qt_add_executable(arkham-network-tests
         tests/NetworkTests.cpp
+        tests/MockHttpServer.cpp
     )
     target_compile_definitions(arkham-network-tests PRIVATE
         ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
@@ -969,6 +972,20 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME semantic_input_fixture COMMAND arkham-semantic-input-fixture-tests)
+
+    qt_add_executable(arkham-main-qml-tests
+        tests/MainQmlTests.cpp
+    )
+    target_compile_definitions(arkham-main-qml-tests PRIVATE
+        ARKHAM_TEST_QML_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml"
+    )
+    target_link_libraries(arkham-main-qml-tests PRIVATE
+        Qt6::Gui
+        Qt6::Quick
+        Qt6::QuickControls2
+        Qt6::Test
+    )
+    add_test(NAME main_qml COMMAND arkham-main-qml-tests)
 
     # QtKeychain's kwallet5 backend (the two downstream hardening patches'
     # target) only exists in keychain_unix.cpp, compiled solely for

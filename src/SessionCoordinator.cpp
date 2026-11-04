@@ -76,6 +76,8 @@ QString SessionCoordinator::stateDescription() const {
     return QStringLiteral("Profile storage error");
   case State::RecoverableFailure:
     return QStringLiteral("Temporary problem");
+  case State::ServerMaintenance:
+    return QStringLiteral("Server maintenance");
   }
   return QStringLiteral("Unknown");
 }
@@ -467,6 +469,12 @@ void SessionCoordinator::onProbeFinished(quint64 generation,
   case ProbeOutcome::Incompatible:
     m_retryAction = [this] { startProbe(); };
     setState(State::Incompatible, result.diagnostic);
+    return;
+  case ProbeOutcome::Maintenance:
+    // No automatic retry timer: the notice carries the retry time and the
+    // user retries manually.
+    m_retryAction = [this] { startProbe(); };
+    setState(State::ServerMaintenance, result.diagnostic);
     return;
   case ProbeOutcome::NetworkError:
   case ProbeOutcome::MalformedJson:
