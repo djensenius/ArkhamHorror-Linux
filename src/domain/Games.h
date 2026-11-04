@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Board.h"
 #include "CardCatalog.h"
 #include "Decks.h"
 #include "Identifiers.h"
@@ -18,9 +19,9 @@
 
 // Models for contracts/schemas/game-list.schema.json and
 // game-lifecycle.schema.json: the list of in-progress games and the
-// lifecycle requests a client sends to create/join/staff one. PublicGame
-// (the full per-game state snapshot returned by GET /games/:id) and all
-// networking/caching layers are out of scope; see game-list.schema.json's
+// lifecycle requests a client sends to create/join/staff one, plus the
+// get-game.schema.json envelope around the PublicGame snapshot (Board.h).
+// Networking/caching layers are out of scope; see game-list.schema.json's
 // gameDetails/failedGameDetails and game-lifecycle.schema.json's
 // createGameRequest/chooseDeckRequest/claimSeatRequest/openSeats.
 
@@ -1091,15 +1092,50 @@ struct ClaimSeatRequest {
 [[nodiscard]] ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
                                                             QStringView path);
 
+// get-game.schema.json: the participant or spectator view GET /games/:id
+// returns. Response-only.
+class GetGame {
+public:
+  [[nodiscard]] static ValueOrError<GetGame> fromRawJson(const Json::Value &v,
+                                                         QStringView path);
+  [[nodiscard]] static ValueOrError<GetGame> fromRawBytes(QByteArrayView bytes,
+                                                          QStringView path);
+
+  // The viewer's seat. Required key; JSON null (a spectator) decodes to
+  // std::nullopt.
+  [[nodiscard]] const std::optional<PlayerId> &playerId() const noexcept {
+    return m_playerId;
+  }
+  [[nodiscard]] MultiplayerVariant multiplayerMode() const noexcept {
+    return m_multiplayerMode;
+  }
+  [[nodiscard]] const PublicGame &game() const noexcept { return m_game; }
+  // Required key; JSON null decodes to std::nullopt.
+  [[nodiscard]] const std::optional<QUuid> &eventId() const noexcept {
+    return m_eventId;
+  }
+
+  friend bool operator==(const GetGame &, const GetGame &) = default;
+
+private:
+  explicit GetGame(PublicGame game) : m_game(std::move(game)) {}
+
+  std::optional<PlayerId> m_playerId;
+  MultiplayerVariant m_multiplayerMode = MultiplayerVariant::Solo;
+  PublicGame m_game;
+  std::optional<QUuid> m_eventId;
+};
+
 // server-message.schema.json's envelope subset this client currently needs.
 // Linux has no gameplay WebSocket/session-answer model yet, so this class
 // keeps the boundary minimal: generic text messages (including GameError)
-// and AnswerRejected are decoded for display/status plumbing, while other
-// server-message tags remain recognized only by their tag so adding gameplay
-// wiring later does not require re-parsing raw socket bytes.
+// and AnswerRejected are decoded for display/status plumbing, GameUpdate
+// decodes its PublicGame snapshot (the same model GetGame::game() carries),
+// while other server-message tags remain recognized only by their tag so
+// adding gameplay wiring later does not require re-parsing raw socket bytes.
 class ServerMessage {
 public:
-  enum class Kind { GenericText, AnswerRejected, Other };
+  enum class Kind { GenericText, AnswerRejected, GameUpdate, Other };
 
   [[nodiscard]] static ValueOrError<ServerMessage>
   fromRawJson(const Json::Value &v, QStringView path);
@@ -1120,9 +1156,15 @@ public:
   [[nodiscard]] const std::optional<qint64> &questionVersion() const noexcept {
     return m_questionVersion;
   }
+  // GameUpdate-only: the decoded `contents` snapshot; std::nullopt for
+  // every other kind. A GameUpdate whose contents fail to decode fails the
+  // whole message.
+  [[nodiscard]] const std::optional<PublicGame> &game() const noexcept {
+    return m_game;
+  }
   // Minimal user-visible status text for the modeled displayable branches:
   // AnswerRejected shows its reason; generic messages show contents; other
-  // tags have no text at this layer.
+  // tags (including GameUpdate) have no text at this layer.
   [[nodiscard]] QString displayText() const;
 
   friend bool operator==(const ServerMessage &,
@@ -1140,6 +1182,7 @@ private:
   QString m_text;
   QString m_reason;
   std::optional<qint64> m_questionVersion;
+  std::optional<PublicGame> m_game;
 };
 
 } // namespace Arkham

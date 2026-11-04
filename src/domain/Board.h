@@ -15,13 +15,13 @@
 // Models of the board snapshot that GET /games/:id (get-game.schema.json)
 // and the GameUpdate WebSocket message (server-message.schema.json) both
 // carry inside PublicGame: the chaos bag and its tokens, the current phase
-// and phase step, the act and agenda entities, and the core subset of the
-// location and investigator entities. These are response-only, read-only
-// types. Each one exposes only the canonical raw entry points
-// (fromRawJson()/fromRawBytes(), or decodePhase() for the bare Phase enum);
-// there are no QJsonValue overloads. PublicGame itself (including its
-// UUID-keyed `locations` and CardCode-keyed `investigators` maps) and the
-// GetGame/GameUpdate envelopes are decoded by a later stage.
+// and phase step, the act and agenda entities, the core subset of the
+// location and investigator entities, the game mode and the PublicGame
+// aggregate itself. These are response-only, read-only types. Each one
+// exposes only the canonical raw entry points (fromRawJson()/fromRawBytes(),
+// or decodePhase() for the bare Phase enum); there are no QJsonValue
+// overloads. The GetGame envelope and ServerMessage's GameUpdate branch
+// (Games.h) both decode their PublicGame through PublicGame::fromRawJson().
 //
 // Response decoding policy (see JsonDecode.h): object keys these types do
 // not model are ignored, so additive server fields never break decoding.
@@ -497,6 +497,144 @@ private:
   Json::Value m_placement;
   std::optional<LocationId> m_placementLocation;
   QList<LocationId> m_connectedLocations;
+};
+
+// mode.schema.json's $defs/scenario: the running scenario (ScenarioAttrs).
+// Only the core fields a board view needs are modeled: the scenario's card
+// code, its turn and its chaos bag. Decks, stacks, the grid, the campaign
+// log and the other broad fields are not parsed.
+class ScenarioSnapshot {
+public:
+  [[nodiscard]] static ValueOrError<ScenarioSnapshot>
+  fromRawJson(const Json::Value &v, QStringView path);
+  [[nodiscard]] static ValueOrError<ScenarioSnapshot>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
+
+  // The scenario's card code, e.g. "c01104" (board card code grammar).
+  [[nodiscard]] const CardCode &id() const noexcept { return m_id; }
+  // ScenarioAttrs.scenarioTurn: 0 before the first turn begins; never
+  // negative.
+  [[nodiscard]] qint64 turn() const noexcept { return m_turn; }
+  [[nodiscard]] const ChaosBag &chaosBag() const noexcept { return m_chaosBag; }
+
+  friend bool operator==(const ScenarioSnapshot &,
+                         const ScenarioSnapshot &) = default;
+
+private:
+  ScenarioSnapshot(CardCode id, qint64 turn, ChaosBag chaosBag);
+
+  CardCode m_id;
+  qint64 m_turn;
+  ChaosBag m_chaosBag;
+};
+
+// mode.schema.json: PublicGame.mode, a `These Campaign Scenario` encoded as
+// sibling keys of one object: {"This": campaign} (between-scenario campaign
+// screen), {"That": scenario} (standalone scenario) or both (a campaign's
+// running scenario). There is never a wrapping "These" key. An object with
+// neither "This" nor "That" is an unsupported variant and fails to decode;
+// other keys are ignored.
+class GameMode {
+public:
+  enum class Kind { CampaignOnly, ScenarioOnly, CampaignAndScenario };
+
+  [[nodiscard]] static ValueOrError<GameMode> fromRawJson(const Json::Value &v,
+                                                          QStringView path);
+  [[nodiscard]] static ValueOrError<GameMode> fromRawBytes(QByteArrayView bytes,
+                                                           QStringView path);
+
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  // The "This" campaign object, kept verbatim (its schema is broad and out
+  // of scope); std::nullopt for Kind::ScenarioOnly.
+  [[nodiscard]] const std::optional<Json::Value> &campaign() const noexcept {
+    return m_campaign;
+  }
+  // The "That" scenario; std::nullopt for Kind::CampaignOnly.
+  [[nodiscard]] const std::optional<ScenarioSnapshot> &
+  scenario() const noexcept {
+    return m_scenario;
+  }
+
+  friend bool operator==(const GameMode &, const GameMode &) = default;
+
+private:
+  GameMode() = default;
+
+  Kind m_kind = Kind::ScenarioOnly;
+  std::optional<Json::Value> m_campaign;
+  std::optional<ScenarioSnapshot> m_scenario;
+};
+
+// public-game.schema.json: the authoritative game snapshot that GET
+// /games/:id (GetGame.game) and the GameUpdate WebSocket message
+// (ServerMessage contents) both carry. Only the CORE board slice is
+// modeled: identity, mode, phase and phase step, encounter deck size and
+// the location, investigator, act and agenda maps. The question, history,
+// settings, log and other entity maps are not parsed.
+//
+// Every modeled map is a JSON object keyed by its entity's identity:
+// `locations` by LocationId (a UUID), `investigators`, `acts` and `agendas`
+// by board card code. Each key must decode as that identity type, must be
+// unique after decoding (so two spellings of one UUID are a duplicate) and
+// must equal the entry's own `id`; any violation fails with the entry's
+// path. Entries keep wire order.
+class PublicGame {
+public:
+  [[nodiscard]] static ValueOrError<PublicGame>
+  fromRawJson(const Json::Value &v, QStringView path);
+  [[nodiscard]] static ValueOrError<PublicGame>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
+
+  [[nodiscard]] const GameId &id() const noexcept { return m_id; }
+  [[nodiscard]] const QString &name() const noexcept { return m_name; }
+  [[nodiscard]] const GameMode &mode() const noexcept { return m_mode; }
+  // The running scenario's chaos bag, or nullptr when the mode has no
+  // scenario (GameMode::Kind::CampaignOnly). Valid while *this is alive.
+  [[nodiscard]] const ChaosBag *chaosBag() const noexcept;
+  // Never negative.
+  [[nodiscard]] qint64 encounterDeckSize() const noexcept {
+    return m_encounterDeckSize;
+  }
+  [[nodiscard]] Phase phase() const noexcept { return m_phase; }
+  // Required key; JSON null (no running phase step) decodes to
+  // std::nullopt.
+  [[nodiscard]] const std::optional<PhaseStep> &phaseStep() const noexcept {
+    return m_phaseStep;
+  }
+  // In wire order.
+  [[nodiscard]] const QList<Location> &locations() const noexcept {
+    return m_locations;
+  }
+  [[nodiscard]] const QList<Investigator> &investigators() const noexcept {
+    return m_investigators;
+  }
+  [[nodiscard]] const QList<Act> &acts() const noexcept { return m_acts; }
+  [[nodiscard]] const QList<Agenda> &agendas() const noexcept {
+    return m_agendas;
+  }
+  // Lookups by stable identity; nullptr when absent. Valid while *this is
+  // alive.
+  [[nodiscard]] const Location *location(const LocationId &id) const noexcept;
+  [[nodiscard]] const Investigator *
+  investigator(const CardCode &id) const noexcept;
+  [[nodiscard]] const Act *act(const CardCode &id) const noexcept;
+  [[nodiscard]] const Agenda *agenda(const CardCode &id) const noexcept;
+
+  friend bool operator==(const PublicGame &, const PublicGame &) = default;
+
+private:
+  PublicGame(GameId id, GameMode mode);
+
+  GameId m_id;
+  QString m_name;
+  GameMode m_mode;
+  qint64 m_encounterDeckSize = 0;
+  Phase m_phase = Phase::MythosPhase;
+  std::optional<PhaseStep> m_phaseStep;
+  QList<Location> m_locations;
+  QList<Investigator> m_investigators;
+  QList<Act> m_acts;
+  QList<Agenda> m_agendas;
 };
 
 } // namespace Arkham

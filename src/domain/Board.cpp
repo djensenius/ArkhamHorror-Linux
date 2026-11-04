@@ -310,6 +310,56 @@ ValueOrError<qint64> requireNonNegativeInt(const Json::Value &obj,
   return *value;
 }
 
+// A required JSON object mapping each entity's identity (the member name,
+// decoded by `decodeKey`) to the entity itself (Entity::fromRawJson). Every
+// decoded key must be unique, so two spellings of one UUID are rejected,
+// and must equal the entity's own id (`idOf`). Returns the entities in wire
+// order.
+template <typename Entity, typename KeyDecoder, typename IdOf>
+ValueOrError<QList<Entity>>
+requireEntityMap(const Json::Value &obj, QLatin1StringView key,
+                 QStringView path, KeyDecoder decodeKey, IdOf idOf) {
+  auto map = Json::requireObjectField(obj, key, path);
+  if (!map)
+    return failure(map.error());
+  const auto &members = map->members();
+  QList<Entity> entities;
+  entities.reserve(members.size());
+  // Decoded keys seen so far, for an amortized O(1) duplicate check.
+  QSet<QString> seen;
+  seen.reserve(members.size());
+  for (const auto &[name, value] : members) {
+    const QString entryPath = Json::joinPath(path, name);
+    auto id = decodeKey(Json::Value::makeString(name), entryPath);
+    if (!id)
+      return failure(id.error());
+    if (seen.contains(id->value()))
+      return failure(QStringLiteral("%1: duplicate key \"%2\"")
+                         .arg(entryPath, id->value()));
+    seen.insert(id->value());
+    auto entity = Entity::fromRawJson(value, entryPath);
+    if (!entity)
+      return failure(entity.error());
+    if (!(idOf(*entity) == *id))
+      return failure(
+          QStringLiteral("%1: map key \"%2\" does not match the entry's id "
+                         "\"%3\"")
+              .arg(entryPath, name, idOf(*entity).value()));
+    entities.append(*entity);
+  }
+  return entities;
+}
+
+// Linear lookup by id; the board maps are small (a scenario's locations).
+template <typename Entity, typename Id>
+const Entity *findById(const QList<Entity> &entities, const Id &id) noexcept {
+  for (const Entity &entity : entities) {
+    if (entity.id() == id)
+      return &entity;
+  }
+  return nullptr;
+}
+
 } // namespace
 
 ChaosToken::ChaosToken(ChaosTokenId id, QString face,
@@ -975,6 +1025,220 @@ ValueOrError<Investigator> Investigator::fromRawJson(const Json::Value &v,
 
 ValueOrError<Investigator> Investigator::fromRawBytes(QByteArrayView bytes,
                                                       QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+ScenarioSnapshot::ScenarioSnapshot(CardCode id, qint64 turn, ChaosBag chaosBag)
+    : m_id(std::move(id)), m_turn(turn), m_chaosBag(std::move(chaosBag)) {}
+
+ValueOrError<ScenarioSnapshot>
+ScenarioSnapshot::fromRawJson(const Json::Value &v, QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  auto id = requireBoardCardCode(obj, "id"_L1, Json::joinPath(path, u"id"));
+  if (!id)
+    return failure(id.error());
+
+  auto turn =
+      requireNonNegativeInt(obj, "turn"_L1, Json::joinPath(path, u"turn"));
+  if (!turn)
+    return failure(turn.error());
+
+  auto chaosBag =
+      Json::requireField(obj, "chaosBag"_L1, Json::joinPath(path, u"chaosBag"),
+                         [](const Json::Value &value, QStringView p) {
+                           return ChaosBag::fromRawJson(value, p);
+                         });
+  if (!chaosBag)
+    return failure(chaosBag.error());
+
+  return ScenarioSnapshot(*id, *turn, *chaosBag);
+}
+
+ValueOrError<ScenarioSnapshot>
+ScenarioSnapshot::fromRawBytes(QByteArrayView bytes, QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+ValueOrError<GameMode> GameMode::fromRawJson(const Json::Value &v,
+                                             QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  const auto campaign = obj.find("This"_L1);
+  const auto scenario = obj.find("That"_L1);
+  if (!campaign && !scenario)
+    return failure(QStringLiteral("%1: unsupported mode: expected a \"This\" "
+                                  "and/or \"That\" key")
+                       .arg(path));
+
+  GameMode result;
+  if (campaign) {
+    auto campaignObj =
+        Json::requireObject(*campaign, Json::joinPath(path, u"This"));
+    if (!campaignObj)
+      return failure(campaignObj.error());
+    result.m_campaign = *campaignObj;
+  }
+  if (scenario) {
+    auto decoded =
+        ScenarioSnapshot::fromRawJson(*scenario, Json::joinPath(path, u"That"));
+    if (!decoded)
+      return failure(decoded.error());
+    result.m_scenario = *decoded;
+  }
+  if (campaign && scenario)
+    result.m_kind = Kind::CampaignAndScenario;
+  else if (campaign)
+    result.m_kind = Kind::CampaignOnly;
+  else
+    result.m_kind = Kind::ScenarioOnly;
+  return result;
+}
+
+ValueOrError<GameMode> GameMode::fromRawBytes(QByteArrayView bytes,
+                                              QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+PublicGame::PublicGame(GameId id, GameMode mode)
+    : m_id(std::move(id)), m_mode(std::move(mode)) {}
+
+const ChaosBag *PublicGame::chaosBag() const noexcept {
+  return m_mode.scenario() ? &m_mode.scenario()->chaosBag() : nullptr;
+}
+
+const Location *PublicGame::location(const LocationId &id) const noexcept {
+  return findById(m_locations, id);
+}
+
+const Investigator *
+PublicGame::investigator(const CardCode &id) const noexcept {
+  return findById(m_investigators, id);
+}
+
+const Act *PublicGame::act(const CardCode &id) const noexcept {
+  return findById(m_acts, id);
+}
+
+const Agenda *PublicGame::agenda(const CardCode &id) const noexcept {
+  return findById(m_agendas, id);
+}
+
+ValueOrError<PublicGame> PublicGame::fromRawJson(const Json::Value &v,
+                                                 QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  const QString tagPath = Json::joinPath(path, u"tag");
+  auto tag = Json::requireString(obj, "tag"_L1, tagPath);
+  if (!tag)
+    return failure(tag.error());
+  if (*tag != "PublicGame"_L1)
+    return failure(QStringLiteral("%1: expected \"PublicGame\", got \"%2\"")
+                       .arg(tagPath, *tag));
+
+  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
+                               [](const Json::Value &value, QStringView p) {
+                                 return GameId::fromJson(value, p);
+                               });
+  if (!id)
+    return failure(id.error());
+
+  auto name =
+      Json::requireString(obj, "name"_L1, Json::joinPath(path, u"name"));
+  if (!name)
+    return failure(name.error());
+
+  auto mode = Json::requireField(obj, "mode"_L1, Json::joinPath(path, u"mode"),
+                                 [](const Json::Value &value, QStringView p) {
+                                   return GameMode::fromRawJson(value, p);
+                                 });
+  if (!mode)
+    return failure(mode.error());
+
+  auto encounterDeckSize = requireNonNegativeInt(
+      obj, "encounterDeckSize"_L1, Json::joinPath(path, u"encounterDeckSize"));
+  if (!encounterDeckSize)
+    return failure(encounterDeckSize.error());
+
+  auto phase = Json::requireField(obj, "phase"_L1,
+                                  Json::joinPath(path, u"phase"), decodePhase);
+  if (!phase)
+    return failure(phase.error());
+
+  auto phaseStep = Json::requireField(
+      obj, "phaseStep"_L1, Json::joinPath(path, u"phaseStep"),
+      [](const Json::Value &value,
+         QStringView p) -> ValueOrError<std::optional<PhaseStep>> {
+        if (value.isNull())
+          return std::optional<PhaseStep>{};
+        auto step = PhaseStep::fromRawJson(value, p);
+        if (!step)
+          return failure(step.error());
+        return std::optional<PhaseStep>{*step};
+      });
+  if (!phaseStep)
+    return failure(phaseStep.error());
+
+  const auto decodeLocationId = [](const Json::Value &value, QStringView p) {
+    return LocationId::fromJson(value, p);
+  };
+  const auto idOf = [](const auto &entity) { return entity.id(); };
+
+  auto locations = requireEntityMap<Location>(
+      obj, "locations"_L1, Json::joinPath(path, u"locations"), decodeLocationId,
+      idOf);
+  if (!locations)
+    return failure(locations.error());
+
+  auto investigators = requireEntityMap<Investigator>(
+      obj, "investigators"_L1, Json::joinPath(path, u"investigators"),
+      decodeBoardCardCode, idOf);
+  if (!investigators)
+    return failure(investigators.error());
+
+  auto acts = requireEntityMap<Act>(
+      obj, "acts"_L1, Json::joinPath(path, u"acts"), decodeBoardCardCode, idOf);
+  if (!acts)
+    return failure(acts.error());
+
+  auto agendas = requireEntityMap<Agenda>(obj, "agendas"_L1,
+                                          Json::joinPath(path, u"agendas"),
+                                          decodeBoardCardCode, idOf);
+  if (!agendas)
+    return failure(agendas.error());
+
+  PublicGame result(*id, *mode);
+  result.m_name = *name;
+  result.m_encounterDeckSize = *encounterDeckSize;
+  result.m_phase = *phase;
+  result.m_phaseStep = *phaseStep;
+  result.m_locations = *locations;
+  result.m_investigators = *investigators;
+  result.m_acts = *acts;
+  result.m_agendas = *agendas;
+  return result;
+}
+
+ValueOrError<PublicGame> PublicGame::fromRawBytes(QByteArrayView bytes,
+                                                  QStringView path) {
   auto parsed = Json::Value::parse(bytes, path);
   if (!parsed)
     return failure(parsed.error());

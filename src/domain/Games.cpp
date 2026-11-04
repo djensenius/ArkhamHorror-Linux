@@ -1909,6 +1909,65 @@ ValueOrError<QList<CardCode>> decodeOpenSeats(const QJsonValue &v,
   return result;
 }
 
+ValueOrError<GetGame> GetGame::fromRawJson(const Json::Value &v,
+                                           QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  auto playerId = Json::requireField(
+      obj, "playerId"_L1, Json::joinPath(path, u"playerId"),
+      [](const Json::Value &value,
+         QStringView p) -> ValueOrError<std::optional<PlayerId>> {
+        if (value.isNull())
+          return std::optional<PlayerId>{};
+        auto id = PlayerId::fromJson(value, p);
+        if (!id)
+          return failure(id.error());
+        return std::optional<PlayerId>{*id};
+      });
+  if (!playerId)
+    return failure(playerId.error());
+
+  auto multiplayerMode = Json::requireField(
+      obj, "multiplayerMode"_L1, Json::joinPath(path, u"multiplayerMode"),
+      [](const Json::Value &value, QStringView p) {
+        return Json::decodeClosedEnum(value, p, kMultiplayerVariantTable);
+      });
+  if (!multiplayerMode)
+    return failure(multiplayerMode.error());
+
+  auto game = Json::requireField(obj, "game"_L1, Json::joinPath(path, u"game"),
+                                 [](const Json::Value &value, QStringView p) {
+                                   return PublicGame::fromRawJson(value, p);
+                                 });
+  if (!game)
+    return failure(game.error());
+
+  auto eventId =
+      Json::requireField(obj, "eventId"_L1, Json::joinPath(path, u"eventId"),
+                         [](const Json::Value &value, QStringView p) {
+                           return Json::decodeNullableUuid(value, p);
+                         });
+  if (!eventId)
+    return failure(eventId.error());
+
+  GetGame result(*game);
+  result.m_playerId = *playerId;
+  result.m_multiplayerMode = *multiplayerMode;
+  result.m_eventId = *eventId;
+  return result;
+}
+
+ValueOrError<GetGame> GetGame::fromRawBytes(QByteArrayView bytes,
+                                            QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
 ValueOrError<ServerMessage> ServerMessage::fromRawJson(const Json::Value &v,
                                                        QStringView path) {
   return fromValueImpl(v, path);
@@ -1928,6 +1987,7 @@ QString ServerMessage::displayText() const {
     return m_text;
   case Kind::AnswerRejected:
     return m_reason;
+  case Kind::GameUpdate:
   case Kind::Other:
     return QString{};
   }
@@ -1961,6 +2021,22 @@ ValueOrError<ServerMessage> ServerMessage::fromValueImpl(const V &v,
     result.m_tag = *tag;
     result.m_reason = *reason;
     result.m_questionVersion = *questionVersion;
+    return result;
+  }
+
+  if (*tag == "GameUpdate"_L1) {
+    auto game = Json::requireField(obj, "contents"_L1,
+                                   Json::joinPath(path, u"contents"),
+                                   [](const Json::Value &value, QStringView p) {
+                                     return PublicGame::fromRawJson(value, p);
+                                   });
+    if (!game)
+      return failure(game.error());
+
+    ServerMessage result;
+    result.m_kind = Kind::GameUpdate;
+    result.m_tag = *tag;
+    result.m_game = *game;
     return result;
   }
 
