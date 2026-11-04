@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ServerMaintenance.h"
 #include "ValueOrError.h"
 
 #include <QJsonObject>
@@ -69,7 +70,10 @@ enum class AuthOutcome {
   MalformedPayload, ///< 2xx but the JSON body did not match the expected
                     ///< shape.
   UnexpectedStatus, ///< Any other status, including every 3xx redirect
-                    ///< (redirects are never followed).
+                    ///< (redirects are never followed) and any 503 that
+                    ///< is not the server's maintenance response.
+  Maintenance,      ///< HTTP 503 whose body is the server's maintenance
+                    ///< object; see AuthResult::maintenance.
   Cancelled,        ///< The request was explicitly cancelled.
 };
 
@@ -78,7 +82,9 @@ enum class AuthOutcome {
 // diagnostic is always a static, human-readable string. It never contains
 // the response body, the request body, a password, a token, an
 // Authorization header, or any low-level exception/error text that might
-// echo request details.
+// echo request details. For AuthOutcome::Maintenance the server's
+// user-facing message and retry time are carried separately in
+// |maintenance| (see ServerMaintenance::notice()), never in diagnostic.
 template <typename T> struct AuthResult {
   AuthOutcome outcome{AuthOutcome::Transport};
   QString diagnostic;
@@ -88,6 +94,9 @@ template <typename T> struct AuthResult {
   int httpStatus{0};
   // Populated only when outcome == Success.
   std::optional<T> value;
+  // Populated only when outcome == Maintenance. Kept last so existing
+  // four-field aggregate initializers leave it empty.
+  std::optional<ServerMaintenance> maintenance;
 };
 
 } // namespace Arkham
