@@ -114,6 +114,14 @@ ApplicationWindow {
 
                     KeyNavigation.left: index > 0 ? destinations.itemAt(index - 1) : null
                     KeyNavigation.right: index + 1 < destinations.count ? destinations.itemAt(index + 1) : null
+                    // A shown maintenance notice joins the directional chain
+                    // so a controller can scroll it (see maintenanceNotice).
+                    KeyNavigation.down: maintenanceNotice.visible ? maintenanceNotice : null
+
+                    onActiveFocusChanged: {
+                        if (activeFocus)
+                            maintenanceNotice.returnFocusItem = destination;
+                    }
 
                     contentItem: Column {
                         anchors {
@@ -188,7 +196,56 @@ ApplicationWindow {
             // valid message can hold many lines, so the notice is height-
             // bounded and scrolls instead of pushing the layout off-screen;
             // the whole text, including "Try again ...", stays reachable.
+            // It is also reachable without a pointer: Down from a
+            // destination card focuses it, Down/Up then scroll it, and Up at
+            // the top returns focus to the card it was entered from.
             objectName: "maintenanceNotice"
+            // The destination card that last had focus (Up at the top goes
+            // back to it).
+            property Item returnFocusItem: null
+            // Keeps a few lines of overlap between successive steps.
+            readonly property real scrollStep: Math.max(maintenanceText.font.pixelSize * 2, availableHeight * 0.75)
+
+            function scrollNotice(delta: real): bool {
+                const flick = contentItem as Flickable;
+                if (!flick)
+                    return false;
+                const maximumY = Math.max(0, flick.contentHeight - flick.height);
+                const nextY = Math.min(maximumY, Math.max(0, flick.contentY + delta));
+                if (nextY === flick.contentY)
+                    return false;
+                flick.contentY = nextY;
+                return true;
+            }
+
+            activeFocusOnTab: true
+            focusPolicy: Qt.StrongFocus
+            Keys.onDownPressed: event => {
+                maintenanceNotice.scrollNotice(maintenanceNotice.scrollStep);
+                event.accepted = true;
+            }
+            Keys.onUpPressed: event => {
+                if (!maintenanceNotice.scrollNotice(-maintenanceNotice.scrollStep)) {
+                    const target = maintenanceNotice.returnFocusItem ?? destinations.itemAt(0);
+                    if (target)
+                        target.forceActiveFocus();
+                }
+                event.accepted = true;
+            }
+            Accessible.role: Accessible.StaticText
+            Accessible.name: maintenanceText.text
+            Accessible.focusable: true
+
+            // Visible focus indicator, matching the destination cards'
+            // focused border colour.
+            background: Rectangle {
+                color: "transparent"
+                radius: 6
+                border {
+                    color: root.bone
+                    width: maintenanceNotice.activeFocus ? 2 : 0
+                }
+            }
             visible: maintenanceText.text.length > 0
             clip: true
             Layout.fillWidth: true

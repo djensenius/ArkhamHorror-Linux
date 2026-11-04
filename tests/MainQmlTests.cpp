@@ -4,6 +4,8 @@
 // trailing "Try again ..." sentence), and never pushes the input hint below
 // the window.
 
+#include <QAccessible>
+#include <QAccessibleInterface>
 #include <QGuiApplication>
 #include <QObject>
 #include <QQmlApplicationEngine>
@@ -14,6 +16,7 @@
 #include <QTextOption>
 #include <QUrl>
 #include <QtTest>
+#include <algorithm>
 #include <memory>
 
 namespace {
@@ -60,6 +63,7 @@ private slots:
   void longMaintenanceNoticeIsBoundedAndScrollable();
   void shortMaintenanceNoticeIsShownWhole();
   void unbrokenMaintenanceNoticeWrapsWithinWidth();
+  void maintenanceNoticeRetryTimeIsReachableWithKeysAlone();
 
 private:
   QQuickWindow *load(const QString &diagnostic, int height);
@@ -183,6 +187,85 @@ void MainQmlTests::unbrokenMaintenanceNoticeWrapsWithinWidth() {
                           .arg(contentWidth)
                           .arg(text->width())));
   QVERIFY(text->property("lineCount").toInt() > 2);
+}
+
+void MainQmlTests::maintenanceNoticeRetryTimeIsReachableWithKeysAlone() {
+  // A server message at the parser's 1000-character cap, followed by the
+  // retry sentence the way ServerMaintenance::notice() composes it
+  // ("%1 Try again in %2."), overflows the notice; without a pointer the
+  // retry time must still be reachable from the destination cards.
+  const QString reason =
+      QStringLiteral("The server is down for planned maintenance. ")
+          .repeated(30)
+          .left(1000)
+          .trimmed();
+  QVERIFY(reason.size() > 990);
+  const QString diagnostic =
+      reason + QStringLiteral(" Try again in about 2 minutes.");
+  QQuickWindow *window = load(diagnostic, 800);
+  QVERIFY(window != nullptr);
+  window->requestActivate();
+  QVERIFY(QTest::qWaitForWindowActive(window));
+
+  auto *notice =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNotice"));
+  auto *text =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNoticeText"));
+  QVERIFY(notice != nullptr);
+  QVERIFY(text != nullptr);
+  QTRY_VERIFY(notice->height() > 0);
+  QCOMPARE(text->property("text").toString(), diagnostic);
+  auto *flickable = notice->property("contentItem").value<QQuickItem *>();
+  QVERIFY(flickable != nullptr);
+  // The retry sentence starts below the fold.
+  QVERIFY(text->height() > flickable->height());
+  QCOMPARE(flickable->property("contentY").toReal(), 0.0);
+
+  // The first destination card starts focused (a Button, not the notice).
+  QTRY_VERIFY(window->activeFocusItem() != nullptr);
+  QQuickItem *firstCard = window->activeFocusItem();
+  QVERIFY(firstCard->inherits("QQuickButton"));
+  QCOMPARE(firstCard->property("text").toString(), QStringLiteral("Connect"));
+
+  // Down from a card focuses the notice.
+  QTest::keyClick(window, Qt::Key_Down);
+  QTRY_VERIFY(notice->hasActiveFocus());
+  QCOMPARE(notice->property("activeFocusOnTab").toBool(), true);
+
+  // Down then scrolls it until the end of the text (the retry sentence) is
+  // inside the viewport.
+  const auto atEnd = [&] {
+    return flickable->property("contentY").toReal() + flickable->height() >=
+           text->height() - 0.5;
+  };
+  // Each press moves by the notice's own explicit step (not a style's
+  // built-in arrow handling).
+  const qreal step = notice->property("scrollStep").toReal();
+  QVERIFY(step > 0);
+  QTest::keyClick(window, Qt::Key_Down);
+  QCOMPARE(flickable->property("contentY").toReal(),
+           std::min(step, text->height() - flickable->height()));
+  for (int presses = 0; presses < 50 && !atEnd(); ++presses) {
+    QTest::keyClick(window, Qt::Key_Down);
+  }
+  QVERIFY2(atEnd(),
+           qPrintable(QStringLiteral("contentY %1 + height %2 < text %3")
+                          .arg(flickable->property("contentY").toReal())
+                          .arg(flickable->height())
+                          .arg(text->height())));
+  QVERIFY(notice->hasActiveFocus());
+  QVERIFY(flickable->property("contentY").toReal() > 0);
+  // A screen reader gets the whole text, retry sentence included.
+  QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(notice);
+  QVERIFY(iface != nullptr);
+  QCOMPARE(iface->text(QAccessible::Name), diagnostic);
+
+  // Up scrolls back to the top and then returns focus to the card.
+  for (int presses = 0; presses < 50 && notice->hasActiveFocus(); ++presses) {
+    QTest::keyClick(window, Qt::Key_Up);
+  }
+  QCOMPARE(flickable->property("contentY").toReal(), 0.0);
+  QTRY_VERIFY(firstCard->hasActiveFocus());
 }
 
 QTEST_MAIN(MainQmlTests)
