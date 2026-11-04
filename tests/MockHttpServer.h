@@ -6,6 +6,7 @@
 #include <QTcpServer>
 #include <QUrl>
 #include <QVector>
+#include <utility>
 
 class QTcpSocket;
 
@@ -23,6 +24,8 @@ public:
     int chunkDelayMs{10};
     bool hang{false};
     bool hangAfterHeaders{false};
+    // Extra raw response headers, written verbatim as "name: value".
+    QList<std::pair<QByteArray, QByteArray>> extraHeaders;
   };
 
   explicit MockHttpServer(QObject *parent = nullptr);
