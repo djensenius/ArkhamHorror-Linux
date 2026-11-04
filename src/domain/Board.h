@@ -10,24 +10,28 @@
 #include <QString>
 #include <QStringView>
 #include <optional>
+#include <utility>
 
-// Leaf models of the board snapshot that GET /games/:id
-// (get-game.schema.json) and the GameUpdate WebSocket message
-// (server-message.schema.json) both carry inside PublicGame: the chaos bag
-// and its tokens, the current phase and phase step, and the act and agenda
-// entities. These are response-only, read-only types. Each one exposes only
-// the canonical raw entry points (fromRawJson()/fromRawBytes(), or
-// decodePhase() for the bare Phase enum); there are no QJsonValue
-// overloads. Locations, investigators, PublicGame itself and the
-// GetGame/GameUpdate envelopes are decoded by later stages.
+// Models of the board snapshot that GET /games/:id (get-game.schema.json)
+// and the GameUpdate WebSocket message (server-message.schema.json) both
+// carry inside PublicGame: the chaos bag and its tokens, the current phase
+// and phase step, the act and agenda entities, and the core subset of the
+// location and investigator entities. These are response-only, read-only
+// types. Each one exposes only the canonical raw entry points
+// (fromRawJson()/fromRawBytes(), or decodePhase() for the bare Phase enum);
+// there are no QJsonValue overloads. PublicGame itself (including its
+// UUID-keyed `locations` and CardCode-keyed `investigators` maps) and the
+// GetGame/GameUpdate envelopes are decoded by a later stage.
 //
 // Response decoding policy (see JsonDecode.h): object keys these types do
 // not model are ignored, so additive server fields never break decoding.
 // Modeled fields stay strict: required keys, JSON types, closed enums,
 // UUIDs, card codes and value ranges are all validated. Broad fields the
-// board does not need yet are not parsed at all. Board card codes (act and
-// agenda `id`, a non-null chaosTokenRevealedBy) use the board schemas'
-// `^c[0-9a-z:._-]+$`, which is narrower than CardCode's catalog grammar.
+// board does not need yet are not parsed at all. Board card codes (act,
+// agenda and investigator `id`, location and investigator `cardCode`, a
+// location's `investigators`, a non-null chaosTokenRevealedBy) use the
+// board schemas' `^c[0-9a-z:._-]+$`, which is narrower than CardCode's
+// catalog grammar.
 
 namespace Arkham {
 
@@ -258,6 +262,140 @@ private:
   qint64 m_doom;
   std::optional<GameValue> m_doomThreshold;
   bool m_flipped;
+};
+
+// Arkham.Token.Tokens (a `Map Token Int`): the tokens on a location or an
+// investigator, encoded as an array of [tokenName, count] pairs. Token
+// names are an open string set: the core names (Clue, Doom, Damage, Horror,
+// Resource, and so on) plus "custom:<slug>" for a custom set's own tokens.
+// Every count must be a non-negative integer, and a token name may appear
+// only once, as in the backend's Map.
+class TokenCounts {
+public:
+  [[nodiscard]] static ValueOrError<TokenCounts>
+  fromRawJson(const Json::Value &v, QStringView path);
+  [[nodiscard]] static ValueOrError<TokenCounts>
+  fromRawBytes(QByteArrayView bytes, QStringView path);
+
+  // [name, count] pairs, in wire order.
+  [[nodiscard]] const QList<std::pair<QString, qint64>> &
+  entries() const noexcept {
+    return m_entries;
+  }
+  // The count for `name`, or 0 when it is absent (the backend drops a token
+  // from the map when its count reaches 0).
+  [[nodiscard]] qint64 count(QStringView name) const noexcept;
+
+  friend bool operator==(const TokenCounts &, const TokenCounts &) = default;
+
+private:
+  TokenCounts() = default;
+
+  QList<std::pair<QString, qint64>> m_entries;
+};
+
+// location.schema.json's locationSymbol (Arkham.LocationSymbol). Closed: an
+// unrecognized string fails to decode.
+enum class LocationSymbol {
+  Circle,
+  Square,
+  Triangle,
+  Plus,
+  Diamond,
+  Squiggle,
+  Moon,
+  Hourglass,
+  T,
+  Equals,
+  Heart,
+  Star,
+  Droplet,
+  Trefoil,
+  Spade,
+  NoSymbol,
+};
+
+// location.schema.json: one entry of PublicGame.locations. The map holds two
+// disjoint shapes, both decoded here. An ordinary location (LocationAttrs
+// plus the server-computed connection and occupant fields) has no
+// `enemyLocation` key. An enemy-spawned pseudo-location carries
+// `"enemyLocation": true` and `exhausted`, and has no `revealClues`,
+// `symbol` or `revealedSymbol`. Only the core fields a board view needs are
+// modeled; cost, matcher, placement, card and per-scenario fields are not
+// parsed.
+class Location {
+public:
+  enum class Kind { Ordinary, EnemyLocation };
+
+  [[nodiscard]] static ValueOrError<Location> fromRawJson(const Json::Value &v,
+                                                          QStringView path);
+  [[nodiscard]] static ValueOrError<Location> fromRawBytes(QByteArrayView bytes,
+                                                           QStringView path);
+
+  [[nodiscard]] Kind kind() const noexcept { return m_kind; }
+  [[nodiscard]] const LocationId &id() const noexcept { return m_id; }
+  [[nodiscard]] const CardCode &cardCode() const noexcept { return m_cardCode; }
+  [[nodiscard]] const CardId &cardId() const noexcept { return m_cardId; }
+  // The scenario's label for this location, e.g. "study".
+  [[nodiscard]] const QString &label() const noexcept { return m_label; }
+  [[nodiscard]] bool revealed() const noexcept { return m_revealed; }
+  [[nodiscard]] const TokenCounts &tokens() const noexcept { return m_tokens; }
+  // Token counts by name (Arkham.Location.Base's locationClues and so on).
+  [[nodiscard]] qint64 clues() const noexcept;
+  [[nodiscard]] qint64 doom() const noexcept;
+  [[nodiscard]] qint64 damage() const noexcept;
+  [[nodiscard]] qint64 horror() const noexcept;
+  [[nodiscard]] qint64 resources() const noexcept;
+  // Required key; JSON null decodes to std::nullopt.
+  [[nodiscard]] const std::optional<GameValue> &shroud() const noexcept {
+    return m_shroud;
+  }
+  // Kind::Ordinary only (required there); std::nullopt for an enemy
+  // location.
+  [[nodiscard]] const std::optional<GameValue> &revealClues() const noexcept {
+    return m_revealClues;
+  }
+  [[nodiscard]] std::optional<LocationSymbol> symbol() const noexcept {
+    return m_symbol;
+  }
+  [[nodiscard]] std::optional<LocationSymbol> revealedSymbol() const noexcept {
+    return m_revealedSymbol;
+  }
+  // Kind::EnemyLocation only (required there); std::nullopt for an
+  // ordinary location.
+  [[nodiscard]] std::optional<bool> exhausted() const noexcept {
+    return m_exhausted;
+  }
+  // Server-computed when the snapshot is built: the locations currently
+  // reachable from here, in wire order.
+  [[nodiscard]] const QList<LocationId> &connectedLocations() const noexcept {
+    return m_connectedLocations;
+  }
+  // Server-computed: the investigators currently at this location, in wire
+  // order. This is the board's source of truth for occupancy.
+  [[nodiscard]] const QList<CardCode> &investigators() const noexcept {
+    return m_investigators;
+  }
+
+  friend bool operator==(const Location &, const Location &) = default;
+
+private:
+  Location(LocationId id, CardCode cardCode, CardId cardId, TokenCounts tokens);
+
+  Kind m_kind = Kind::Ordinary;
+  LocationId m_id;
+  CardCode m_cardCode;
+  CardId m_cardId;
+  QString m_label;
+  bool m_revealed = false;
+  TokenCounts m_tokens;
+  std::optional<GameValue> m_shroud;
+  std::optional<GameValue> m_revealClues;
+  std::optional<LocationSymbol> m_symbol;
+  std::optional<LocationSymbol> m_revealedSymbol;
+  std::optional<bool> m_exhausted;
+  QList<LocationId> m_connectedLocations;
+  QList<CardCode> m_investigators;
 };
 
 } // namespace Arkham

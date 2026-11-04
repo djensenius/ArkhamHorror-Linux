@@ -47,6 +47,13 @@ Json::Value chaosBagOf(const Json::Value &game) {
   return game.value("mode"_L1).value("That"_L1).value("chaosBag"_L1);
 }
 
+// The fixtures' only location (the Study), keyed by its UUID.
+constexpr auto kStudyId = "782de537-8f5d-4eda-b849-2362e28402e5";
+
+Json::Value studyOf(const Json::Value &game) {
+  return game.value("locations"_L1).value(QLatin1StringView(kStudyId));
+}
+
 // One valid document per decoder; the data-driven cases below mutate it.
 constexpr auto kToken =
     R"({"chaosTokenId":"22e6cf42-cc5c-4a9c-b9d1-f71e594e0d60",)"
@@ -60,6 +67,29 @@ constexpr auto kAgenda =
     R"("sequence":{"agendaSequenceSide":"A","agendaSequenceStep":1},)"
     R"("deckId":1,"doom":0,"doomThreshold":{"tag":"Static","contents":3},)"
     R"("flipped":false})";
+constexpr auto kTokens = R"([["Clue",2],["Doom",1],["custom:sigil",3]])";
+// get-game.json's Study, trimmed to the modeled keys, with one connection.
+constexpr auto kLocation =
+    R"({"id":"782de537-8f5d-4eda-b849-2362e28402e5","cardCode":"c01111",)"
+    R"("cardId":"4db426b4-641e-4812-8d10-27fc6470ef6e","label":"study",)"
+    R"("revealed":true,"tokens":[["Clue",2]],)"
+    R"("shroud":{"tag":"Static","contents":2},)"
+    R"("revealClues":{"tag":"PerPlayer","contents":2},)"
+    R"("symbol":"Circle","revealedSymbol":"Circle",)"
+    R"("connectedLocations":["00000000-0000-0000-0000-000000000032"],)"
+    R"("investigators":["c01001"]})";
+// The fork's location-enemy-view.json fixture at the pinned commit.
+constexpr auto kEnemyLocation =
+    R"({"assets":[],"brazier":null,"breaches":null,"cardCode":"c10547",)"
+    R"("cardId":"00000000-0000-0000-0000-000000000033",)"
+    R"("cardsUnderneath":[],"concealedCards":[],"connectedLocations":[],)"
+    R"("enemies":[],"enemyLocation":true,"events":[],"exhausted":false,)"
+    R"("floodLevel":null,"grantedConnections":[],"group":null,)"
+    R"("id":"00000000-0000-0000-0000-000000000032","investigators":[],)"
+    R"("keys":[],"label":"shapeless_cellar","modifiers":[],)"
+    R"("placement":null,"revealed":true,"scarletKeys":[],)"
+    R"("sealedChaosTokens":[],"seals":[],)"
+    R"("shroud":{"contents":4,"tag":"Static"},"tokens":[],"treacheries":[]})";
 
 QByteArray validJson(const QString &type) {
   if (type == "token"_L1)
@@ -75,6 +105,12 @@ QByteArray validJson(const QString &type) {
     return kAgenda;
   if (type == "phase"_L1)
     return R"("InvestigationPhase")";
+  if (type == "tokens"_L1)
+    return kTokens;
+  if (type == "location"_L1)
+    return kLocation;
+  if (type == "enemyLocation"_L1)
+    return kEnemyLocation;
   qFatal("unknown test type: %s", qPrintable(type));
 }
 
@@ -106,6 +142,10 @@ QString decodeError(const QString &type, const QByteArray &json) {
     return errorOf(Act::fromRawBytes(json, u"x"));
   if (type == "agenda"_L1)
     return errorOf(Agenda::fromRawBytes(json, u"x"));
+  if (type == "tokens"_L1)
+    return errorOf(TokenCounts::fromRawBytes(json, u"x"));
+  if (type == "location"_L1 || type == "enemyLocation"_L1)
+    return errorOf(Location::fromRawBytes(json, u"x"));
   auto parsed = Json::Value::parse(json, u"x");
   if (!parsed)
     return parsed.error();
@@ -206,6 +246,131 @@ private slots:
     QVERIFY(*agenda->doomThreshold() == GameValue::staticValue(3));
   }
 
+  void getGameFixtureLocation() {
+    const auto game = getGamePublicGame();
+    QCOMPARE(game.value("locations"_L1).keys(),
+             QStringList{QLatin1StringView(kStudyId)});
+    const auto location = Location::fromRawJson(studyOf(game), u"location");
+    QVERIFY2(location, qPrintable(location ? QString() : location.error()));
+    QCOMPARE(location->kind(), Location::Kind::Ordinary);
+    QCOMPARE(location->id().value(), QLatin1StringView(kStudyId));
+    QCOMPARE(location->cardCode().value(), u"c01111"_s);
+    QCOMPARE(location->cardId().value(),
+             u"4db426b4-641e-4812-8d10-27fc6470ef6e"_s);
+    QCOMPARE(location->label(), u"study"_s);
+    QCOMPARE(location->revealed(), true);
+    const QList<std::pair<QString, qint64>> expectedTokens{{u"Clue"_s, 2}};
+    QCOMPARE(location->tokens().entries(), expectedTokens);
+    QCOMPARE(location->clues(), 2);
+    QCOMPARE(location->doom(), 0);
+    QCOMPARE(location->damage(), 0);
+    QCOMPARE(location->horror(), 0);
+    QCOMPARE(location->resources(), 0);
+    QVERIFY(location->shroud().has_value());
+    QVERIFY(*location->shroud() == GameValue::staticValue(2));
+    QVERIFY(location->revealClues().has_value());
+    QCOMPARE(location->revealClues()->tag(), GameValueTag::PerPlayer);
+    QCOMPARE(location->revealClues()->singleAmount(), std::optional<qint64>(2));
+    QCOMPARE(location->symbol(),
+             std::optional<LocationSymbol>(LocationSymbol::Circle));
+    QCOMPARE(location->revealedSymbol(),
+             std::optional<LocationSymbol>(LocationSymbol::Circle));
+    QVERIFY(!location->exhausted().has_value());
+    QVERIFY(location->connectedLocations().isEmpty());
+    QCOMPARE(location->investigators().size(), 1);
+    QCOMPARE(location->investigators().first().value(), u"c01001"_s);
+  }
+
+  // The enemy-spawned pseudo-location shape (location.schema.json's
+  // enemyLocation branch), from the fork's location-enemy-view.json.
+  void enemyLocationDecodes() {
+    const auto location =
+        Location::fromRawBytes(validJson(u"enemyLocation"_s), u"location");
+    QVERIFY2(location, qPrintable(location ? QString() : location.error()));
+    QCOMPARE(location->kind(), Location::Kind::EnemyLocation);
+    QCOMPARE(location->id().value(), u"00000000-0000-0000-0000-000000000032"_s);
+    QCOMPARE(location->cardCode().value(), u"c10547"_s);
+    QCOMPARE(location->cardId().value(),
+             u"00000000-0000-0000-0000-000000000033"_s);
+    QCOMPARE(location->label(), u"shapeless_cellar"_s);
+    QCOMPARE(location->revealed(), true);
+    QCOMPARE(location->exhausted(), std::optional<bool>(false));
+    QVERIFY(location->shroud().has_value());
+    QVERIFY(*location->shroud() == GameValue::staticValue(4));
+    QVERIFY(!location->revealClues().has_value());
+    QVERIFY(!location->symbol().has_value());
+    QVERIFY(!location->revealedSymbol().has_value());
+    QVERIFY(location->tokens().entries().isEmpty());
+    QCOMPARE(location->clues(), 0);
+    QVERIFY(location->connectedLocations().isEmpty());
+    QVERIFY(location->investigators().isEmpty());
+
+    const auto exhausted = Location::fromRawBytes(
+        mutated(u"enemyLocation"_s, R"("exhausted":false)",
+                R"("exhausted":true)"),
+        u"location");
+    QVERIFY2(exhausted, qPrintable(exhausted ? QString() : exhausted.error()));
+    QCOMPARE(exhausted->exhausted(), std::optional<bool>(true));
+  }
+
+  void locationListsKeepWireOrder() {
+    const auto location = Location::fromRawBytes(
+        mutated(u"location"_s, R"("00000000-0000-0000-0000-000000000032"])",
+                R"("00000000-0000-0000-0000-000000000032",)"
+                R"("0c3cfd0c-1b5e-4f43-9d9a-0b1c2d3e4f50"])")
+            .replace(R"(["c01001"])", R"(["c01002","c01001"])"),
+        u"location");
+    QVERIFY2(location, qPrintable(location ? QString() : location.error()));
+    QCOMPARE(location->connectedLocations().size(), 2);
+    QCOMPARE(location->connectedLocations()[0].value(),
+             u"00000000-0000-0000-0000-000000000032"_s);
+    QCOMPARE(location->connectedLocations()[1].value(),
+             u"0c3cfd0c-1b5e-4f43-9d9a-0b1c2d3e4f50"_s);
+    QCOMPARE(location->investigators().size(), 2);
+    QCOMPARE(location->investigators()[0].value(), u"c01002"_s);
+    QCOMPARE(location->investigators()[1].value(), u"c01001"_s);
+  }
+
+  // Each count accessor reads its own Arkham.Token core name.
+  void locationTokenCountAccessors() {
+    const auto location = Location::fromRawBytes(
+        mutated(u"location"_s, R"([["Clue",2]])",
+                R"([["Resource",6],["Horror",5],["Damage",4],)"
+                R"(["Doom",3],["Clue",2],["custom:sigil",9]])"),
+        u"location");
+    QVERIFY2(location, qPrintable(location ? QString() : location.error()));
+    QCOMPARE(location->clues(), 2);
+    QCOMPARE(location->doom(), 3);
+    QCOMPARE(location->damage(), 4);
+    QCOMPARE(location->horror(), 5);
+    QCOMPARE(location->resources(), 6);
+    QCOMPARE(location->tokens().count(u"custom:sigil"), 9);
+    QCOMPARE(location->tokens().entries().size(), 6);
+  }
+
+  void tokenCountsDecode() {
+    const auto tokens = TokenCounts::fromRawBytes(kTokens, u"tokens");
+    QVERIFY2(tokens, qPrintable(tokens ? QString() : tokens.error()));
+    const QList<std::pair<QString, qint64>> expected{
+        {u"Clue"_s, 2}, {u"Doom"_s, 1}, {u"custom:sigil"_s, 3}};
+    QCOMPARE(tokens->entries(), expected);
+    QCOMPARE(tokens->count(u"Clue"), 2);
+    QCOMPARE(tokens->count(u"Doom"), 1);
+    QCOMPARE(tokens->count(u"custom:sigil"), 3);
+    // Absent names read as 0; names are case-sensitive.
+    QCOMPARE(tokens->count(u"Horror"), 0);
+    QCOMPARE(tokens->count(u"clue"), 0);
+
+    const auto empty = TokenCounts::fromRawBytes("[]", u"tokens");
+    QVERIFY(empty);
+    QVERIFY(empty->entries().isEmpty());
+    QCOMPARE(empty->count(u"Clue"), 0);
+
+    const auto zero = TokenCounts::fromRawBytes(R"([["Clue",0]])", u"tokens");
+    QVERIFY2(zero, qPrintable(zero ? QString() : zero.error()));
+    QCOMPARE(zero->count(u"Clue"), 0);
+  }
+
   // The GameUpdate WebSocket message carries the same PublicGame shape:
   // every leaf decodes, and to exactly what get-game.json decodes to.
   void gameUpdateFixtureMatchesGetGame() {
@@ -242,6 +407,12 @@ private slots:
         update.value("agendas"_L1).value("c01105"_L1), u"b");
     QVERIFY(agendaA && agendaB);
     QVERIFY(*agendaA == *agendaB);
+
+    const auto locationA = Location::fromRawJson(studyOf(getGame), u"a");
+    const auto locationB = Location::fromRawJson(studyOf(update), u"b");
+    QVERIFY(locationA && locationB);
+    QVERIFY(*locationA == *locationB);
+    QCOMPARE(locationB->clues(), 2);
   }
 
   void chaosTokenOpenFaceAndRevealedBy() {
@@ -280,6 +451,13 @@ private slots:
     QVERIFY(act->advanceCost().isNull());
     QCOMPARE(act->sequenceStep(), 3);
     QCOMPARE(act->sequenceSide(), ActSide::H);
+
+    const auto location = Location::fromRawBytes(
+        mutated(u"location"_s, R"("shroud":{"tag":"Static","contents":2})",
+                R"("shroud":null)"),
+        u"location");
+    QVERIFY2(location, qPrintable(location ? QString() : location.error()));
+    QVERIFY(!location->shroud().has_value());
   }
 
   // Every hand-written wire string decodes to its own value. The rows are
@@ -426,9 +604,50 @@ private slots:
     QCOMPARE(agenda->sequenceSide(), expected);
   }
 
+  void locationSymbolDecodesEveryValue_data() {
+    QTest::addColumn<QByteArray>("wire");
+    QTest::addColumn<LocationSymbol>("expected");
+    using L = LocationSymbol;
+    const std::initializer_list<std::pair<const char *, L>> rows{
+        {"Circle", L::Circle},
+        {"Square", L::Square},
+        {"Triangle", L::Triangle},
+        {"Plus", L::Plus},
+        {"Diamond", L::Diamond},
+        {"Squiggle", L::Squiggle},
+        {"Moon", L::Moon},
+        {"Hourglass", L::Hourglass},
+        {"T", L::T},
+        {"Equals", L::Equals},
+        {"Heart", L::Heart},
+        {"Star", L::Star},
+        {"Droplet", L::Droplet},
+        {"Trefoil", L::Trefoil},
+        {"Spade", L::Spade},
+        {"NoSymbol", L::NoSymbol},
+    };
+    for (const auto &[wire, expected] : rows)
+      QTest::newRow(wire) << QByteArray(wire) << expected;
+  }
+
+  void locationSymbolDecodesEveryValue() {
+    QFETCH(QByteArray, wire);
+    QFETCH(LocationSymbol, expected);
+    const auto location = Location::fromRawBytes(
+        mutated(u"location"_s, R"("symbol":"Circle","revealedSymbol":"Circle")",
+                "\"symbol\":\"" + wire + "\",\"revealedSymbol\":\"" + wire +
+                    '"'),
+        u"location");
+    QVERIFY2(location, qPrintable(location ? QString() : location.error()));
+    QCOMPARE(location->symbol(), std::optional<LocationSymbol>(expected));
+    QCOMPARE(location->revealedSymbol(),
+             std::optional<LocationSymbol>(expected));
+  }
+
   void validDocumentsDecode_data() {
     QTest::addColumn<QString>("type");
-    for (const auto *type : {"token", "bag", "step", "act", "agenda", "phase"})
+    for (const auto *type : {"token", "bag", "step", "act", "agenda", "phase",
+                             "tokens", "location", "enemyLocation"})
       QTest::newRow(type) << QString::fromLatin1(type);
   }
 
@@ -445,7 +664,8 @@ private slots:
     QTest::addColumn<QByteArray>("to");
 
     const QByteArray extra = R"({"futureField":[1,{"nested":null}],)";
-    for (const auto *type : {"token", "bag", "step", "act", "agenda"})
+    for (const auto *type :
+         {"token", "bag", "step", "act", "agenda", "location", "enemyLocation"})
       QTest::newRow(type) << QString::fromLatin1(type) << QByteArray("{")
                           << extra;
     QTest::newRow("token nested in bag")
@@ -531,6 +751,104 @@ private slots:
     row("agenda side out of range", u"agenda"_s, R"("agendaSequenceSide":"A")",
         R"("agendaSequenceSide":"E")",
         uR"(x.sequence.agendaSequenceSide: unrecognized value "E")"_s);
+
+    row("tokens not an array", u"tokens"_s, kTokens, "{}",
+        u"x: expected array, got object"_s);
+    row("tokens entry not an array", u"tokens"_s, R"(["Clue",2])",
+        R"({"Clue":2})", u"x[0]: expected array, got object"_s);
+    row("tokens entry arity", u"tokens"_s, R"(["Clue",2])", R"(["Clue",2,3])",
+        u"x[0]: expected a 2-element array, got 3 elements"_s);
+    row("tokens entry short", u"tokens"_s, R"(["Clue",2])", R"(["Clue"])",
+        u"x[0]: expected a 2-element array, got 1 elements"_s);
+    row("tokens name wrong type", u"tokens"_s, R"(["Clue",2])", "[2,2]",
+        u"x[0][0]: expected string, got number"_s);
+    row("tokens count wrong type", u"tokens"_s, R"(["Clue",2])",
+        R"(["Clue","2"])", u"x[0][1]: expected integer, got string"_s);
+    row("tokens count fractional", u"tokens"_s, R"(["Clue",2])",
+        R"(["Clue",2.5])", u"x[0][1]: expected integer"_s);
+    row("tokens count negative", u"tokens"_s, R"(["Clue",2])", R"(["Clue",-1])",
+        u"x[0][1]: must not be negative, got -1"_s);
+    row("tokens duplicate name", u"tokens"_s, R"(["Doom",1])", R"(["Clue",1])",
+        uR"(x[1][0]: duplicate token "Clue")"_s);
+
+    row("location null", u"location"_s, kLocation, "null",
+        u"x: expected object, got null"_s);
+    row("location id not a uuid", u"location"_s,
+        R"("id":"782de537-8f5d-4eda-b849-2362e28402e5")", R"("id":"c01111")",
+        u"x.id"_s);
+    row("location missing id", u"location"_s,
+        R"("id":"782de537-8f5d-4eda-b849-2362e28402e5",)", "",
+        uR"(x.id: missing required field "id")"_s);
+    row("location cardCode not a card code", u"location"_s,
+        R"("cardCode":"c01111")", R"("cardCode":"01111")",
+        u"x.cardCode: card code must start with 'c'"_s);
+    row("location cardId not a uuid", u"location"_s,
+        R"("cardId":"4db426b4-641e-4812-8d10-27fc6470ef6e")",
+        R"("cardId":"study")", u"x.cardId"_s);
+    row("location missing label", u"location"_s, R"("label":"study",)", "",
+        uR"(x.label: missing required field "label")"_s);
+    row("location label wrong type", u"location"_s, R"("label":"study")",
+        R"("label":null)", u"x.label: expected string, got null"_s);
+    row("location revealed wrong type", u"location"_s, R"("revealed":true)",
+        R"("revealed":"yes")", u"x.revealed: expected bool, got string"_s);
+    row("location missing tokens", u"location"_s, R"("tokens":[["Clue",2]],)",
+        "", uR"(x.tokens: missing required field "tokens")"_s);
+    row("location negative clues", u"location"_s, R"([["Clue",2]])",
+        R"([["Clue",-2]])", u"x.tokens[0][1]: must not be negative, got -2"_s);
+    row("location missing shroud", u"location"_s,
+        R"("shroud":{"tag":"Static","contents":2},)", "",
+        uR"(x.shroud: missing required field "shroud")"_s);
+    row("location shroud wrong type", u"location"_s,
+        R"("shroud":{"tag":"Static","contents":2})", R"("shroud":2)",
+        u"x.shroud"_s);
+    row("location missing revealClues", u"location"_s,
+        R"("revealClues":{"tag":"PerPlayer","contents":2},)", "",
+        uR"(x.revealClues: missing required field "revealClues")"_s);
+    row("location revealClues null", u"location"_s,
+        R"("revealClues":{"tag":"PerPlayer","contents":2})",
+        R"("revealClues":null)", u"x.revealClues"_s);
+    row("location missing symbol", u"location"_s, R"("symbol":"Circle",)", "",
+        uR"(x.symbol: missing required field "symbol")"_s);
+    row("location symbol unknown", u"location"_s, R"("symbol":"Circle")",
+        R"("symbol":"Pentagon")",
+        uR"(x.symbol: unrecognized value "Pentagon")"_s);
+    row("location revealedSymbol wrong case", u"location"_s,
+        R"("revealedSymbol":"Circle")", R"("revealedSymbol":"circle")",
+        uR"(x.revealedSymbol: unrecognized value "circle")"_s);
+    row("location missing connectedLocations", u"location"_s,
+        R"("connectedLocations":["00000000-0000-0000-0000-000000000032"],)", "",
+        uR"(x.connectedLocations: missing required field "connectedLocations")"_s);
+    row("location connectedLocations not a uuid", u"location"_s,
+        R"(["00000000-0000-0000-0000-000000000032"])", R"(["study"])",
+        u"x.connectedLocations[0]"_s);
+    row("location connectedLocations nil uuid", u"location"_s,
+        R"(["00000000-0000-0000-0000-000000000032"])",
+        R"(["00000000-0000-0000-0000-000000000000"])",
+        u"x.connectedLocations[0]"_s);
+    row("location missing investigators", u"location"_s,
+        R"(,"investigators":["c01001"])", "",
+        uR"(x.investigators: missing required field "investigators")"_s);
+    row("location investigators not a card code", u"location"_s,
+        R"(["c01001"])", R"(["01001"])",
+        u"x.investigators[0]: card code must start with 'c'"_s);
+    row("location enemyLocation false", u"location"_s, R"({"id")",
+        R"({"enemyLocation":false,"id")",
+        u"x.enemyLocation: expected true or absent, got false"_s);
+    row("location enemyLocation null", u"location"_s, R"({"id")",
+        R"({"enemyLocation":null,"id")",
+        u"x.enemyLocation: expected bool, got null"_s);
+    row("enemy location missing exhausted", u"enemyLocation"_s,
+        R"("exhausted":false,)", "",
+        uR"(x.exhausted: missing required field "exhausted")"_s);
+    row("enemy location exhausted wrong type", u"enemyLocation"_s,
+        R"("exhausted":false)", R"("exhausted":0)",
+        u"x.exhausted: expected bool, got number"_s);
+    row("enemy location enemyLocation string", u"enemyLocation"_s,
+        R"("enemyLocation":true)", R"("enemyLocation":"true")",
+        u"x.enemyLocation: expected bool, got string"_s);
+    row("enemy location missing shroud", u"enemyLocation"_s,
+        R"("shroud":{"contents":4,"tag":"Static"},)", "",
+        uR"(x.shroud: missing required field "shroud")"_s);
   }
 
   void malformedInputIsRejected() {

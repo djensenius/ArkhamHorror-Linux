@@ -102,6 +102,33 @@ constexpr std::array<std::pair<QLatin1StringView, AgendaSide>, 4>
         {"D"_L1, AgendaSide::D},
     }};
 
+constexpr std::array<std::pair<QLatin1StringView, LocationSymbol>, 16>
+    kLocationSymbolTable{{
+        {"Circle"_L1, LocationSymbol::Circle},
+        {"Square"_L1, LocationSymbol::Square},
+        {"Triangle"_L1, LocationSymbol::Triangle},
+        {"Plus"_L1, LocationSymbol::Plus},
+        {"Diamond"_L1, LocationSymbol::Diamond},
+        {"Squiggle"_L1, LocationSymbol::Squiggle},
+        {"Moon"_L1, LocationSymbol::Moon},
+        {"Hourglass"_L1, LocationSymbol::Hourglass},
+        {"T"_L1, LocationSymbol::T},
+        {"Equals"_L1, LocationSymbol::Equals},
+        {"Heart"_L1, LocationSymbol::Heart},
+        {"Star"_L1, LocationSymbol::Star},
+        {"Droplet"_L1, LocationSymbol::Droplet},
+        {"Trefoil"_L1, LocationSymbol::Trefoil},
+        {"Spade"_L1, LocationSymbol::Spade},
+        {"NoSymbol"_L1, LocationSymbol::NoSymbol},
+    }};
+
+// Arkham.Token core names the board reads counts for.
+constexpr auto kClueToken = u"Clue";
+constexpr auto kDoomToken = u"Doom";
+constexpr auto kDamageToken = u"Damage";
+constexpr auto kHorrorToken = u"Horror";
+constexpr auto kResourceToken = u"Resource";
+
 ValueOrError<PhaseStep::Step> decodeStepForKind(PhaseStep::Kind kind,
                                                 const Json::Value &v,
                                                 QStringView path) {
@@ -172,6 +199,86 @@ ValueOrError<QList<ChaosToken>> requireChaosTokens(const Json::Value &obj,
     tokens.append(*token);
   }
   return tokens;
+}
+
+// A required JSON array of TypedId UUIDs (e.g. LocationId), in wire order.
+template <typename Id>
+ValueOrError<QList<Id>> requireIdArray(const Json::Value &obj,
+                                       QLatin1StringView key,
+                                       QStringView path) {
+  auto arr = Json::requireArrayField(obj, key, path);
+  if (!arr)
+    return failure(arr.error());
+  QList<Id> ids;
+  ids.reserve(arr->size());
+  for (qsizetype i = 0; i < arr->size(); ++i) {
+    auto id = Id::fromJson((*arr)[i], Json::indexPath(path, i));
+    if (!id)
+      return failure(id.error());
+    ids.append(*id);
+  }
+  return ids;
+}
+
+// A required JSON array of board card codes, in wire order.
+ValueOrError<QList<CardCode>> requireBoardCardCodeArray(const Json::Value &obj,
+                                                        QLatin1StringView key,
+                                                        QStringView path) {
+  auto arr = Json::requireArrayField(obj, key, path);
+  if (!arr)
+    return failure(arr.error());
+  QList<CardCode> codes;
+  codes.reserve(arr->size());
+  for (qsizetype i = 0; i < arr->size(); ++i) {
+    auto code = decodeBoardCardCode((*arr)[i], Json::indexPath(path, i));
+    if (!code)
+      return failure(code.error());
+    codes.append(*code);
+  }
+  return codes;
+}
+
+// A required key whose value is a GameValue or JSON null.
+ValueOrError<std::optional<GameValue>>
+requireNullableGameValue(const Json::Value &obj, QLatin1StringView key,
+                         QStringView path) {
+  return Json::requireField(obj, key, path,
+                            [](const Json::Value &value, QStringView p)
+                                -> ValueOrError<std::optional<GameValue>> {
+                              if (value.isNull())
+                                return std::optional<GameValue>{};
+                              auto gameValue = GameValue::fromRawJson(value, p);
+                              if (!gameValue)
+                                return failure(gameValue.error());
+                              return std::optional<GameValue>{*gameValue};
+                            });
+}
+
+ValueOrError<GameValue> requireGameValue(const Json::Value &obj,
+                                         QLatin1StringView key,
+                                         QStringView path) {
+  return Json::requireField(obj, key, path,
+                            [](const Json::Value &value, QStringView p) {
+                              return GameValue::fromRawJson(value, p);
+                            });
+}
+
+ValueOrError<LocationSymbol> requireLocationSymbol(const Json::Value &obj,
+                                                   QLatin1StringView key,
+                                                   QStringView path) {
+  return Json::requireField(
+      obj, key, path, [](const Json::Value &value, QStringView p) {
+        return Json::decodeClosedEnum(value, p, kLocationSymbolTable);
+      });
+}
+
+ValueOrError<TokenCounts> requireTokenCounts(const Json::Value &obj,
+                                             QLatin1StringView key,
+                                             QStringView path) {
+  return Json::requireField(obj, key, path,
+                            [](const Json::Value &value, QStringView p) {
+                              return TokenCounts::fromRawJson(value, p);
+                            });
 }
 
 } // namespace
@@ -463,6 +570,193 @@ ValueOrError<Agenda> Agenda::fromRawJson(const Json::Value &v,
 
 ValueOrError<Agenda> Agenda::fromRawBytes(QByteArrayView bytes,
                                           QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+ValueOrError<TokenCounts> TokenCounts::fromRawJson(const Json::Value &v,
+                                                   QStringView path) {
+  auto arr = Json::requireArray(v, path);
+  if (!arr)
+    return failure(arr.error());
+
+  TokenCounts result;
+  result.m_entries.reserve(arr->size());
+  for (qsizetype i = 0; i < arr->size(); ++i) {
+    const QString pairPath = Json::indexPath(path, i);
+    auto pair = Json::requireArray((*arr)[i], pairPath);
+    if (!pair)
+      return failure(pair.error());
+    if (pair->size() != 2)
+      return failure(QStringLiteral("%1: expected a 2-element array, got %2 "
+                                    "elements")
+                         .arg(pairPath)
+                         .arg(pair->size()));
+    auto name =
+        Json::requireStringValue((*pair)[0], Json::indexPath(pairPath, 0));
+    if (!name)
+      return failure(name.error());
+    const QString countPath = Json::indexPath(pairPath, 1);
+    auto count = Json::requireIntValue((*pair)[1], countPath);
+    if (!count)
+      return failure(count.error());
+    if (*count < 0)
+      return failure(QStringLiteral("%1: must not be negative, got %2")
+                         .arg(countPath)
+                         .arg(*count));
+    for (const auto &entry : std::as_const(result.m_entries)) {
+      if (entry.first == *name)
+        return failure(QStringLiteral("%1: duplicate token \"%2\"")
+                           .arg(Json::indexPath(pairPath, 0), *name));
+    }
+    result.m_entries.append({*name, *count});
+  }
+  return result;
+}
+
+ValueOrError<TokenCounts> TokenCounts::fromRawBytes(QByteArrayView bytes,
+                                                    QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  return fromRawJson(*parsed, path);
+}
+
+qint64 TokenCounts::count(QStringView name) const noexcept {
+  for (const auto &[entryName, entryCount] : m_entries) {
+    if (entryName == name)
+      return entryCount;
+  }
+  return 0;
+}
+
+Location::Location(LocationId id, CardCode cardCode, CardId cardId,
+                   TokenCounts tokens)
+    : m_id(std::move(id)), m_cardCode(std::move(cardCode)),
+      m_cardId(std::move(cardId)), m_tokens(std::move(tokens)) {}
+
+qint64 Location::clues() const noexcept { return m_tokens.count(kClueToken); }
+qint64 Location::doom() const noexcept { return m_tokens.count(kDoomToken); }
+qint64 Location::damage() const noexcept {
+  return m_tokens.count(kDamageToken);
+}
+qint64 Location::horror() const noexcept {
+  return m_tokens.count(kHorrorToken);
+}
+qint64 Location::resources() const noexcept {
+  return m_tokens.count(kResourceToken);
+}
+
+ValueOrError<Location> Location::fromRawJson(const Json::Value &v,
+                                             QStringView path) {
+  auto objResult = Json::requireObject(v, path);
+  if (!objResult)
+    return failure(objResult.error());
+  const auto &obj = *objResult;
+
+  // The enemy-location branch's literal discriminator: absent for an
+  // ordinary location, `true` for an enemy location.
+  const QString enemyLocationPath = Json::joinPath(path, u"enemyLocation");
+  auto enemyLocation =
+      Json::optionalNonNullBool(obj, "enemyLocation"_L1, enemyLocationPath);
+  if (!enemyLocation)
+    return failure(enemyLocation.error());
+  if (enemyLocation->has_value() && !**enemyLocation)
+    return failure(QStringLiteral("%1: expected true or absent, got false")
+                       .arg(enemyLocationPath));
+  const Kind kind =
+      enemyLocation->has_value() ? Kind::EnemyLocation : Kind::Ordinary;
+
+  auto id = Json::requireField(obj, "id"_L1, Json::joinPath(path, u"id"),
+                               [](const Json::Value &value, QStringView p) {
+                                 return LocationId::fromJson(value, p);
+                               });
+  if (!id)
+    return failure(id.error());
+
+  auto cardCode = requireBoardCardCode(obj, "cardCode"_L1,
+                                       Json::joinPath(path, u"cardCode"));
+  if (!cardCode)
+    return failure(cardCode.error());
+
+  auto cardId =
+      requireCardId(obj, "cardId"_L1, Json::joinPath(path, u"cardId"));
+  if (!cardId)
+    return failure(cardId.error());
+
+  auto label =
+      Json::requireString(obj, "label"_L1, Json::joinPath(path, u"label"));
+  if (!label)
+    return failure(label.error());
+
+  auto revealed =
+      Json::requireBool(obj, "revealed"_L1, Json::joinPath(path, u"revealed"));
+  if (!revealed)
+    return failure(revealed.error());
+
+  auto tokens =
+      requireTokenCounts(obj, "tokens"_L1, Json::joinPath(path, u"tokens"));
+  if (!tokens)
+    return failure(tokens.error());
+
+  auto shroud = requireNullableGameValue(obj, "shroud"_L1,
+                                         Json::joinPath(path, u"shroud"));
+  if (!shroud)
+    return failure(shroud.error());
+
+  auto connectedLocations =
+      requireIdArray<LocationId>(obj, "connectedLocations"_L1,
+                                 Json::joinPath(path, u"connectedLocations"));
+  if (!connectedLocations)
+    return failure(connectedLocations.error());
+
+  auto investigators = requireBoardCardCodeArray(
+      obj, "investigators"_L1, Json::joinPath(path, u"investigators"));
+  if (!investigators)
+    return failure(investigators.error());
+
+  Location result(*id, *cardCode, *cardId, *tokens);
+  result.m_kind = kind;
+  result.m_label = *label;
+  result.m_revealed = *revealed;
+  result.m_shroud = *shroud;
+  result.m_connectedLocations = *connectedLocations;
+  result.m_investigators = *investigators;
+
+  if (kind == Kind::EnemyLocation) {
+    auto exhausted = Json::requireBool(obj, "exhausted"_L1,
+                                       Json::joinPath(path, u"exhausted"));
+    if (!exhausted)
+      return failure(exhausted.error());
+    result.m_exhausted = *exhausted;
+    return result;
+  }
+
+  auto revealClues = requireGameValue(obj, "revealClues"_L1,
+                                      Json::joinPath(path, u"revealClues"));
+  if (!revealClues)
+    return failure(revealClues.error());
+  result.m_revealClues = *revealClues;
+
+  auto symbol =
+      requireLocationSymbol(obj, "symbol"_L1, Json::joinPath(path, u"symbol"));
+  if (!symbol)
+    return failure(symbol.error());
+  result.m_symbol = *symbol;
+
+  auto revealedSymbol = requireLocationSymbol(
+      obj, "revealedSymbol"_L1, Json::joinPath(path, u"revealedSymbol"));
+  if (!revealedSymbol)
+    return failure(revealedSymbol.error());
+  result.m_revealedSymbol = *revealedSymbol;
+
+  return result;
+}
+
+ValueOrError<Location> Location::fromRawBytes(QByteArrayView bytes,
+                                              QStringView path) {
   auto parsed = Json::Value::parse(bytes, path);
   if (!parsed)
     return failure(parsed.error());

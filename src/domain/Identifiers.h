@@ -118,6 +118,10 @@ struct CardIdTag {};
 // The UUID of one physical card instance in a game (e.g. an act's or
 // agenda's `cardId`), as opposed to the CardCode naming which card it is.
 using CardId = TypedId<CardIdTag>;
+struct LocationIdTag {};
+// A location's UUID: location.schema.json's `id`, the PublicGame.locations
+// map key and the elements of `connectedLocations`.
+using LocationId = TypedId<LocationIdTag>;
 
 // A non-empty wire string, distinguished at compile time by Tag. Used for
 // identifiers the backend deliberately keeps as open/unvalidated strings
