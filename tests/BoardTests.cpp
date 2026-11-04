@@ -394,6 +394,32 @@ private slots:
     QCOMPARE(zero->count(u"Clue"), 0);
   }
 
+  // A large list of distinct names decodes in wire order, and a duplicate
+  // far from its first occurrence is still caught.
+  void tokenCountsLargeDistinctList() {
+    constexpr int kCount = 5'000;
+    QByteArray json = "[";
+    for (int i = 0; i < kCount; ++i) {
+      if (i > 0)
+        json += ',';
+      json +=
+          "[\"t" + QByteArray::number(i) + "\"," + QByteArray::number(i) + ']';
+    }
+    json += ']';
+
+    const auto tokens = TokenCounts::fromRawBytes(json, u"tokens");
+    QVERIFY2(tokens, qPrintable(tokens ? QString() : tokens.error()));
+    QCOMPARE(tokens->entries().size(), kCount);
+    QCOMPARE(tokens->entries().first(), std::pair(u"t0"_s, qint64{0}));
+    QCOMPARE(tokens->entries().last(), std::pair(u"t4999"_s, qint64{4999}));
+    QCOMPARE(tokens->count(u"t2500"), 2500);
+
+    json.chop(1);
+    json += R"(,["t0",1]])";
+    QCOMPARE(decodeError(u"tokens"_s, json),
+             uR"(x[5000][0]: duplicate token "t0")"_s);
+  }
+
   void getGameFixtureInvestigator() {
     const auto game = getGamePublicGame();
     QCOMPARE(game.value("investigators"_L1).keys(), QStringList{u"c01001"_s});

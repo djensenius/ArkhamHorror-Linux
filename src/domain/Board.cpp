@@ -2,6 +2,7 @@
 
 #include "JsonDecode.h"
 
+#include <QSet>
 #include <array>
 #include <utility>
 
@@ -612,6 +613,11 @@ ValueOrError<TokenCounts> TokenCounts::fromRawJson(const Json::Value &v,
 
   TokenCounts result;
   result.m_entries.reserve(arr->size());
+  // Names seen so far, so the duplicate check is amortized O(1) per entry
+  // instead of a rescan of m_entries (O(n^2) up to the parser's 20,000
+  // array elements); m_entries itself keeps wire order.
+  QSet<QString> seen;
+  seen.reserve(arr->size());
   for (qsizetype i = 0; i < arr->size(); ++i) {
     const QString pairPath = Json::indexPath(path, i);
     auto pair = Json::requireArray((*arr)[i], pairPath);
@@ -634,11 +640,10 @@ ValueOrError<TokenCounts> TokenCounts::fromRawJson(const Json::Value &v,
       return failure(QStringLiteral("%1: must not be negative, got %2")
                          .arg(countPath)
                          .arg(*count));
-    for (const auto &entry : std::as_const(result.m_entries)) {
-      if (entry.first == *name)
-        return failure(QStringLiteral("%1: duplicate token \"%2\"")
-                           .arg(Json::indexPath(pairPath, 0), *name));
-    }
+    if (seen.contains(*name))
+      return failure(QStringLiteral("%1: duplicate token \"%2\"")
+                         .arg(Json::indexPath(pairPath, 0), *name));
+    seen.insert(*name);
     result.m_entries.append({*name, *count});
   }
   return result;
