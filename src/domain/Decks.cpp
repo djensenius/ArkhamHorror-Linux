@@ -769,8 +769,8 @@ ValueOrError<DeckValidationError> decodeDeckValidationError(const V &v,
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // decks.schema.json's deckValidationError is additionalProperties:false
-  // with exactly {"tag","contents"} (round-10-cumulative-review item 5).
+  // A known tagged-union branch: its exact {"tag","contents"} shape stays
+  // strict (see requireExactKeys's doc comment in JsonDecode.h).
   auto exactKeys = Json::requireExactKeys(obj, {"tag"_L1, "contents"_L1}, path);
   if (!exactKeys)
     return failure(exactKeys.error());
@@ -904,12 +904,8 @@ ValueOrError<DeckOperationError> decodeDeckOperationError(const V &v,
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // decks.schema.json's deckOperationError is additionalProperties:false
-  // with exactly {"errorMsg"} (round-10-cumulative-review item 5).
-  auto exactKeys = Json::requireExactKeys(obj, {"errorMsg"_L1}, path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Response object: unknown keys are ignored (see JsonDecode.h's response
+  // decoding policy); "errorMsg" stays required and strictly typed.
   auto errorMsg = Json::requireString(obj, "errorMsg"_L1,
                                       Json::joinPath(path, u"errorMsg"));
   if (!errorMsg)

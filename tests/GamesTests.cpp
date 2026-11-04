@@ -151,7 +151,7 @@ private slots:
   void gameOutcomeUnknownStringsPreservedAndRoundTrip();
   void malformedOutcomesPreservedWithoutFailingList();
   void decodeGameListFromRawBytesRoundTripsWholeFixtureByteExact();
-  void gameListRowWithOutcomeStillRejectsAdditiveTopLevelField();
+  void gameListRowWithOutcomeIgnoresAdditiveTopLevelField();
   void gameOutcomeEqualAcrossDecodePathsButEncodesInStoredKeyOrder();
 
   // GameState forward compatibility ─────────────────────────────────────────
@@ -172,12 +172,15 @@ private slots:
   void gameListFailureRowsRejectMalformedShapes_data();
   void gameListFailureRowsRejectMalformedShapes();
   void rowWithoutErrorKeyAttemptsFullDecode();
-  // Round-9 item 5: supersedes the prior tolerant behavior for this
-  // specific closed, shape-discriminating success row (see
-  // gameListRowSuccessRejectsAdditiveTopLevelField below).
-  void gameListRowSuccessRejectsAdditiveTopLevelField();
-  void gameListRowNestedScenarioRejectsAdditiveField();
-  void gameListRowNestedInvestigatorRejectsAdditiveField();
+  // TASK-3.2.5 response decoding policy (see JsonDecode.h): unknown keys on
+  // a game-list row and its nested summaries are ignored, and re-encoding
+  // drops them; modeled fields stay strict.
+  void gameListFailureRowsIgnoreAdditiveFields();
+  void gameListRowSuccessIgnoresAdditiveTopLevelField();
+  void gameListRowNestedScenarioIgnoresAdditiveFields();
+  void gameListRowNestedCampaignAndInvestigatorIgnoreAdditiveFields();
+  void gameListRowWithErrorAndGameStateRejected();
+  void gameListRowAdditiveKeyDoesNotMaskMissingRequiredField();
 
   // server-message.json AnswerRejected/generic text ──────────────────────────
   void answerRejectedFixtureDecodes();
@@ -969,14 +972,22 @@ void GamesTests::decodeGameListFromRawBytesRoundTripsWholeFixtureByteExact() {
   QCOMPARE(*encoded, *expected);
 }
 
-void GamesTests::gameListRowWithOutcomeStillRejectsAdditiveTopLevelField() {
-  QByteArray bytes = gameListRowBytesWithOutcome("null");
+void GamesTests::gameListRowWithOutcomeIgnoresAdditiveTopLevelField() {
+  const QByteArray original = gameListRowBytesWithOutcome("null");
+  QByteArray bytes = original;
   bytes.chop(1);
   bytes += ",\"verdict\":\"Won\"}";
   const auto row = GameListRow::fromRawBytes(bytes, u"row");
-  QVERIFY2(!row.has_value(), "an unknown top-level key must still fail");
-  QVERIFY2(row.error().contains(QStringLiteral("verdict")),
-           qPrintable(row.error()));
+  if (!row)
+    QFAIL(qPrintable(row.error()));
+  QCOMPARE(row->kind(), GameListRow::Kind::Success);
+  QCOMPARE(row->outcomePresence(), Json::FieldPresence::Null);
+  QCOMPARE(row->name(), QStringLiteral("Finished"));
+  const auto encoded = row->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  // Re-encoding a response DTO drops the unknown key.
+  QCOMPARE(*encoded, original);
 }
 
 void GamesTests::gameOutcomeEqualAcrossDecodePathsButEncodesInStoredKeyOrder() {
@@ -1265,12 +1276,6 @@ void GamesTests::gameListFailureRowsRejectMalformedShapes_data() {
                            "\"error\":\"boom\"}]");
   QTest::newRow("mixed-name-without-id")
       << QByteArrayLiteral("[{\"name\":\"Broken\",\"error\":\"boom\"}]");
-  QTest::newRow("legacy-extra-key")
-      << QByteArrayLiteral("[{\"error\":\"boom\",\"future\":\"ignored\"}]");
-  QTest::newRow("upstream-extra-key")
-      << QByteArrayLiteral("[{\"id\":\"00000000-0000-0000-0000-000000000007\","
-                           "\"name\":\"Broken\",\"error\":\"boom\","
-                           "\"future\":\"ignored\"}]");
   QTest::newRow("legacy-error-not-string")
       << QByteArrayLiteral("[{\"error\":404}]");
   QTest::newRow("upstream-id-not-uuid") << QByteArrayLiteral(
@@ -1300,66 +1305,182 @@ void GamesTests::rowWithoutErrorKeyAttemptsFullDecode() {
            qPrintable(result.error()));
 }
 
-void GamesTests::gameListRowSuccessRejectsAdditiveTopLevelField() {
-  // Round-9 item 5 supersedes round-8 item 7 for this specific shape: the
-  // pinned schema's gameDetails def is additionalProperties:false, and
-  // this closed shape is what positively disambiguates a success row from
-  // a failure row -- unlike CardDef's genuinely evolving named entity, an
-  // additive/unknown top-level key here must be rejected, not tolerated.
-  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
-  QJsonObject withExtra = rows.at(0).toObject();
-  withExtra.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
-  const auto result = GameListRow::fromJson(withExtra, u"row");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(QStringLiteral("futureField")),
-           qPrintable(result.error()));
+void GamesTests::gameListFailureRowsIgnoreAdditiveFields() {
+  const QByteArray bytes = QByteArrayLiteral(
+      "[{\"error\":\"boom\",\"future\":{\"nested\":[1,2]}},"
+      "{\"id\":\"00000000-0000-0000-0000-000000000007\","
+      "\"name\":\"Broken\",\"error\":\"boom\",\"future\":\"ignored\"}]");
+  const auto list = decodeGameListFromRawBytes(bytes, u"rows");
+  if (!list)
+    QFAIL(qPrintable(list.error()));
+  QCOMPARE(list->size(), 2);
+
+  const GameListRow &legacy = list->at(0);
+  QCOMPARE(legacy.kind(), GameListRow::Kind::Failure);
+  QVERIFY(!legacy.id().has_value());
+  QCOMPARE(legacy.name(), QString());
+  QCOMPARE(legacy.error(), QStringLiteral("boom"));
+
+  const GameListRow &upstream = list->at(1);
+  QCOMPARE(upstream.kind(), GameListRow::Kind::Failure);
+  QVERIFY(upstream.id().has_value());
+  QCOMPARE(upstream.id()->value(),
+           QStringLiteral("00000000-0000-0000-0000-000000000007"));
+  QCOMPARE(upstream.name(), QStringLiteral("Broken"));
+  QCOMPARE(upstream.error(), QStringLiteral("boom"));
+
+  const auto encoded = encodeGameListToJsonBytes(*list);
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded,
+           QByteArrayLiteral("[{\"error\":\"boom\"},"
+                             "{\"id\":\"00000000-0000-0000-0000-000000000007\","
+                             "\"name\":\"Broken\",\"error\":\"boom\"}]"));
 }
 
-void GamesTests::gameListRowNestedScenarioRejectsAdditiveField() {
+void GamesTests::gameListRowSuccessIgnoresAdditiveTopLevelField() {
   const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
-  // Find a row with a non-null scenario to attach the extra field to.
-  QJsonObject withExtra;
-  for (const auto &rowValue : rows) {
-    QJsonObject row = rowValue.toObject();
-    if (row.value(QStringLiteral("scenario")).isObject()) {
-      withExtra = row;
-      break;
-    }
+  const QJsonObject original = rows.at(0).toObject();
+  QJsonObject withExtra = original;
+  withExtra.insert(
+      QStringLiteral("futureField"),
+      QJsonObject{{QStringLiteral("nested"), QJsonArray{1, 2, 3}}});
+
+  const auto viaQJson = GameListRow::fromJson(withExtra, u"row");
+  const auto viaRawBytes = GameListRow::fromRawBytes(
+      QJsonDocument(withExtra).toJson(QJsonDocument::Compact), u"row");
+  if (!viaQJson)
+    QFAIL(qPrintable(viaQJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+
+  for (const auto *row : {&*viaQJson, &*viaRawBytes}) {
+    QCOMPARE(row->kind(), GameListRow::Kind::Success);
+    QCOMPARE(row->id()->value(),
+             QStringLiteral("00000000-0000-0000-0000-000000000003"));
+    QCOMPARE(row->scenario()->id.value(), QStringLiteral("c01104"));
+    QCOMPARE(row->gameState()->kind(), GameState::Kind::Pending);
+    QCOMPARE(row->name(), QStringLiteral("Contract fixture game"));
+    QCOMPARE(*row->multiplayerVariant(), MultiplayerVariant::Solo);
+    QVERIFY(!row->hasOpenSeats());
+    auto encoded = Arkham::TestOnly::objectJson(*row);
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    // Re-encoding a response DTO drops the unknown key.
+    QCOMPARE(*encoded, original);
   }
-  QVERIFY2(!withExtra.isEmpty(),
-           "fixture must contain at least one row with a non-null scenario");
+}
+
+void GamesTests::gameListRowNestedScenarioIgnoresAdditiveFields() {
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  const QJsonObject original = rows.at(0).toObject();
+  QVERIFY2(original.value(QStringLiteral("scenario")).isObject(),
+           "fixture row 0 must carry a non-null scenario");
+  QJsonObject withExtra = original;
   QJsonObject scenario = withExtra.value(QStringLiteral("scenario")).toObject();
+  QJsonObject scenarioName = scenario.value(QStringLiteral("name")).toObject();
+  scenarioName.insert(QStringLiteral("futureNameField"), true);
+  scenario.insert(QStringLiteral("name"), scenarioName);
   scenario.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
   withExtra.insert(QStringLiteral("scenario"), scenario);
-  const auto result = GameListRow::fromJson(withExtra, u"row");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(QStringLiteral("futureField")),
-           qPrintable(result.error()));
+
+  const auto viaQJson = GameListRow::fromJson(withExtra, u"row");
+  const auto viaRawBytes = GameListRow::fromRawBytes(
+      QJsonDocument(withExtra).toJson(QJsonDocument::Compact), u"row");
+  if (!viaQJson)
+    QFAIL(qPrintable(viaQJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+
+  for (const auto *row : {&*viaQJson, &*viaRawBytes}) {
+    QVERIFY(row->scenario().has_value());
+    QCOMPARE(row->scenario()->id.value(), QStringLiteral("c01104"));
+    QCOMPARE(row->scenario()->difficulty, Difficulty::Easy);
+    QCOMPARE(row->scenario()->name.title, QStringLiteral("The Gathering"));
+    QVERIFY(!row->scenario()->name.subtitle.has_value());
+    QVERIFY(!row->scenario()->variant.has_value());
+    auto encoded = Arkham::TestOnly::objectJson(*row);
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    QCOMPARE(*encoded, original);
+  }
 }
 
-void GamesTests::gameListRowNestedInvestigatorRejectsAdditiveField() {
+void GamesTests::
+    gameListRowNestedCampaignAndInvestigatorIgnoreAdditiveFields() {
   const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
-  QJsonObject withExtra;
-  for (const auto &rowValue : rows) {
-    QJsonObject row = rowValue.toObject();
-    if (!row.value(QStringLiteral("investigators")).toArray().isEmpty()) {
-      withExtra = row;
-      break;
-    }
-  }
-  QVERIFY2(
-      !withExtra.isEmpty(),
-      "fixture must contain at least one row with a non-empty investigators "
-      "array");
+  const QJsonObject original = rows.at(1).toObject();
+  QJsonObject withExtra = original;
+
+  QJsonObject campaign = withExtra.value(QStringLiteral("campaign")).toObject();
+  QVERIFY2(!campaign.isEmpty(), "fixture row 1 must carry a campaign");
+  campaign.insert(QStringLiteral("futureField"), 7);
+  withExtra.insert(QStringLiteral("campaign"), campaign);
+
   QJsonArray investigators =
       withExtra.value(QStringLiteral("investigators")).toArray();
+  QCOMPARE(investigators.size(), 2);
   QJsonObject investigator = investigators.at(0).toObject();
   investigator.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
   investigators.replace(0, investigator);
   withExtra.insert(QStringLiteral("investigators"), investigators);
-  const auto result = GameListRow::fromJson(withExtra, u"row");
+
+  const auto viaQJson = GameListRow::fromJson(withExtra, u"row");
+  const auto viaRawBytes = GameListRow::fromRawBytes(
+      QJsonDocument(withExtra).toJson(QJsonDocument::Compact), u"row");
+  if (!viaQJson)
+    QFAIL(qPrintable(viaQJson.error()));
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+
+  for (const auto *row : {&*viaQJson, &*viaRawBytes}) {
+    QCOMPARE(row->campaign()->id.value(), QStringLiteral("06"));
+    QCOMPARE(row->campaign()->difficulty, Difficulty::Easy);
+    QCOMPARE(*row->campaign()->currentCampaignMode,
+             CampaignPart::TheDreamQuest);
+    QCOMPARE(row->investigators().size(), 2);
+    QCOMPARE(row->investigators().at(0).id.value(), QStringLiteral("c06001"));
+    QCOMPARE(row->investigators().at(0).classSymbol, ClassSymbol::Guardian);
+    QCOMPARE(row->investigators().at(1).id.value(), QStringLiteral("c06002"));
+    QCOMPARE(row->investigators().at(1).classSymbol, ClassSymbol::Seeker);
+    auto encoded = Arkham::TestOnly::objectJson(*row);
+    if (!encoded)
+      QFAIL(qPrintable(encoded.error()));
+    QCOMPARE(*encoded, original);
+  }
+}
+
+void GamesTests::gameListRowWithErrorAndGameStateRejected() {
+  // A full success row plus an additive "error" string must not be
+  // reclassified as a failure row (which would silently drop every success
+  // field); "error" beside "gameState" is malformed on both decode paths.
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  QJsonObject mixed = rows.at(0).toObject();
+  mixed.insert(QStringLiteral("error"), QStringLiteral("boom"));
+
+  const auto viaQJson = GameListRow::fromJson(mixed, u"row");
+  const auto viaRawBytes = GameListRow::fromRawBytes(
+      QJsonDocument(mixed).toJson(QJsonDocument::Compact), u"row");
+  for (const auto *result : {&viaQJson, &viaRawBytes}) {
+    QVERIFY(!result->has_value());
+    QCOMPARE(result->error(),
+             QStringLiteral("row: game row carries both \"error\" and "
+                            "\"gameState\"; it is neither a failure nor a "
+                            "success row"));
+  }
+}
+
+void GamesTests::gameListRowAdditiveKeyDoesNotMaskMissingRequiredField() {
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  QJsonObject obj = rows.at(0).toObject();
+  obj.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
+  obj.remove(QStringLiteral("hasOpenSeats"));
+
+  const auto result = GameListRow::fromJson(obj, u"row");
   QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(QStringLiteral("futureField")),
+  QVERIFY2(result.error().contains(QStringLiteral("hasOpenSeats")),
+           qPrintable(result.error()));
+  QVERIFY2(!result.error().contains(QStringLiteral("futureField")),
            qPrintable(result.error()));
 }
 

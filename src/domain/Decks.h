@@ -492,10 +492,9 @@ struct DeckOperationError {
 
   [[nodiscard]] static ValueOrError<DeckOperationError>
   fromJson(const QJsonValue &v, QStringView path);
-  // Canonical byte-level decode: enforces decks.schema.json's
-  // deckOperationError's exact {"errorMsg"} shape
-  // (additionalProperties:false) rather than accepting-and-discarding an
-  // extra key (round-10-cumulative-review item 5).
+  // Canonical byte-level decode: identical logic to fromJson(). Unknown
+  // keys are ignored (response decoding policy, see JsonDecode.h) and
+  // dropped again by toRawJson(); "errorMsg" stays required.
   [[nodiscard]] static ValueOrError<DeckOperationError>
   fromRawJson(const Json::Value &v, QStringView path);
   // Parses `bytes` through the canonical raw-byte parser (see RawJson.h),

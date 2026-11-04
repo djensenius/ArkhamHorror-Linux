@@ -81,30 +81,24 @@ private slots:
   void nullaryCardCostTagWithContentsRejected();
   void nullaryGameValueTagWithContentsRejected();
   void nullarySkillIconTagWithContentsRejected();
-  // Round-8 item 7 / round-9 item 5: additionalProperties:false on a known
-  // tagged-union branch's exact {"tag","contents"}/{"tag"} shape means an
-  // extra sibling key is malformed input, not a forward-compat additive
-  // field. GameListRow's success shape and its nested summary objects are
-  // ALSO exact-key-enforced (round-9 item 5), since that closed shape is
-  // what positively disambiguates a success row from a failure row; see
-  // gameListRowSuccessRejectsAdditiveTopLevelField in GamesTests.cpp. As of
-  // round-10-cumulative-review item 4, CardDef/CardName are exact-key-
-  // enforced too (see extraTopLevelFieldOnCardDefRejected below),
-  // superseding this type's own earlier additive-tolerant policy.
+  // A known tagged-union branch's exact {"tag","contents"}/{"tag"} shape
+  // stays strict: an extra sibling key is malformed input, not an additive
+  // field (see requireExactKeys's doc comment in JsonDecode.h). Plain
+  // response objects (CardDef/CardName, game-list rows) ignore unknown keys
+  // instead (TASK-3.2.5 response decoding policy).
   void extraKeyOnKnownCardCostBranchRejected();
   void extraKeyOnKnownGameValueBranchRejected();
   void extraKeyOnKnownSkillIconBranchRejected();
 
-  // Forward compatibility / exact-key enforcement ─────────────────────────────
-  void extraTopLevelFieldOnCardDefRejected();
-  void extraTopLevelFieldOnCardNameRejected();
-  // Round-10-cumulative-review item 4's own wording: prove the check runs
-  // on the canonical raw-byte decode path with an extra-key value that
+  // Forward compatibility: unknown keys ignored ───────────────────────────────
+  void extraTopLevelFieldOnCardDefIgnored();
+  void extraTopLevelFieldOnCardNameIgnored();
+  // The canonical raw-byte decode path ignores an extra key whose value
   // cannot survive a QJson-collapsed representation intact (an exact
-  // integer outside qint64's positive range), and that CardDef's required
-  // "art" key participates in the same escape-equivalent-duplicate-key
-  // protection every other aggregate gets for free from Json::Value::parse().
-  void extraTopLevelFieldWithExactNumberRejectedThroughRawBytes();
+  // integer outside qint64's positive range), while CardDef's required
+  // "art" key still participates in the escape-equivalent-duplicate-key
+  // protection every aggregate gets from Json::Value::parse().
+  void extraTopLevelFieldWithExactNumberIgnoredThroughRawBytes();
   void escapeEquivalentDuplicateTopLevelKeyRejectedForCardDef();
   void unconstrainedFieldsPreservedVerbatim();
 
@@ -1091,56 +1085,66 @@ void CardCatalogTests::rawPayloadCardCostFactoriesValidateContents() {
   }
 }
 
-void CardCatalogTests::extraTopLevelFieldOnCardDefRejected() {
-  // Round-10-cumulative-review item 4: catalog.schema.json's cardDef
-  // definition is additionalProperties:false; an unrecognized top-level
-  // key is now a hard decode failure rather than silently ignored (see
-  // CardCatalog.h's updated doc comment) -- this inverts the previous
-  // "ignored" acceptance test of the same name.
+void CardCatalogTests::extraTopLevelFieldOnCardDefIgnored() {
+  // TASK-3.2.5 response decoding policy (see JsonDecode.h): an
+  // unrecognized top-level key (and one nested inside the modeled "name")
+  // is ignored, every modeled field still decodes exactly, and re-encoding
+  // drops the unknown keys.
   const QJsonObject obj = parseJson(R"({
     "cardCode": "c00001",
-    "name": {"title": "X", "subtitle": null},
+    "name": {"title": "X", "subtitle": null, "futureNameField": 1},
     "cardType": "AssetType",
     "art": "1",
     "aFutureFieldThisClientHasNeverHeardOf": {"anything": [1, 2, 3]}
   })"_L1);
   const auto result = CardDef::fromJson(obj, u"card");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(
-               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
-           qPrintable(result.error()));
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->cardCode.value(), QStringLiteral("c00001"));
+  QCOMPARE(result->name.title, QStringLiteral("X"));
+  QVERIFY(!result->name.subtitle.has_value());
+  QCOMPARE(result->cardType, CardType::AssetType);
+  QCOMPARE(result->art, QStringLiteral("1"));
+  auto encoded = Arkham::TestOnly::objectJson(*result);
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QCOMPARE(*encoded, parseJson(R"({
+    "cardCode": "c00001",
+    "name": {"title": "X", "subtitle": null},
+    "cardType": "AssetType",
+    "art": "1"
+  })"_L1));
 }
 
-void CardCatalogTests::extraTopLevelFieldOnCardNameRejected() {
-  // catalog.schema.json's `name` definition is additionalProperties:false
-  // with exactly {"title","subtitle"} -- reused verbatim wherever this
-  // client decodes a card name, including CardDef's own name/revealedName
-  // fields and (per the round-10 finding's own text) game-list's
-  // scenario/investigator summaries; asserted directly on
-  // CardName::fromJson() here so the check is proven at its single source
-  // of truth rather than only transitively through CardDef.
+void CardCatalogTests::extraTopLevelFieldOnCardNameIgnored() {
+  // Asserted directly on CardName::fromJson(), the single decoder reused
+  // for CardDef's name/revealedName and game-list scenario summaries.
   const QJsonObject obj{
       {QStringLiteral("title"), QStringLiteral("X")},
-      {QStringLiteral("subtitle"), QJsonValue()},
+      {QStringLiteral("subtitle"), QStringLiteral("Y")},
       {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"),
        QStringLiteral("anything")},
   };
   const auto result = CardName::fromJson(obj, u"name");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(
-               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
-           qPrintable(result.error()));
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->title, QStringLiteral("X"));
+  QCOMPARE(result->subtitle, std::optional<QString>(QStringLiteral("Y")));
+
+  // Modeled fields stay strict: an unknown key does not mask a wrong type.
+  QJsonObject wrongType = obj;
+  wrongType.insert(QStringLiteral("title"), 7);
+  const auto rejected = CardName::fromJson(wrongType, u"name");
+  QVERIFY(!rejected.has_value());
+  QVERIFY2(rejected.error().contains(QStringLiteral("name.title")),
+           qPrintable(rejected.error()));
 }
 
 void CardCatalogTests::
-    extraTopLevelFieldWithExactNumberRejectedThroughRawBytes() {
-  // Proves the exact-key check runs on the canonical raw-byte decode path
-  // (never a QJsonValue-collapsed copy first): the extra key's value,
-  // 9223372036854775809, is one past qint64::max and therefore cannot be
-  // represented exactly as either a QJsonValue::Double or a qint64. If
-  // this rejection somehow ran against a QJson-collapsed representation
-  // instead of the lossless raw AST, the conversion itself would already
-  // have failed or silently rounded before this check ever saw the key.
+    extraTopLevelFieldWithExactNumberIgnoredThroughRawBytes() {
+  // The canonical raw-byte decode path ignores the extra key without ever
+  // converting its value: 9223372036854775809 is one past qint64::max and
+  // cannot be represented exactly as a QJsonValue::Double or a qint64.
   const QByteArray bytes = R"({
     "cardCode": "c00001",
     "name": {"title": "X", "subtitle": null},
@@ -1149,10 +1153,25 @@ void CardCatalogTests::
     "aFutureFieldThisClientHasNeverHeardOf": 9223372036854775809
   })";
   const auto result = CardDef::fromRawBytes(bytes, u"card");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(
-               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
-           qPrintable(result.error()));
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->cardCode.value(), QStringLiteral("c00001"));
+  QCOMPARE(result->name.title, QStringLiteral("X"));
+  QCOMPARE(result->cardType, CardType::AssetType);
+  QCOMPARE(result->art, QStringLiteral("1"));
+  const auto encoded = result->toJsonBytes();
+  if (!encoded)
+    QFAIL(qPrintable(encoded.error()));
+  QVERIFY2(!encoded->contains("aFutureFieldThisClientHasNeverHeardOf"),
+           encoded->constData());
+
+  // A missing required field still fails even with an unknown key present.
+  QByteArray missingArt = bytes;
+  missingArt.replace("\"art\": \"1\",", "");
+  const auto rejected = CardDef::fromRawBytes(missingArt, u"card");
+  QVERIFY(!rejected.has_value());
+  QVERIFY2(rejected.error().contains(QStringLiteral("art")),
+           qPrintable(rejected.error()));
 }
 
 void CardCatalogTests::
@@ -2039,9 +2058,10 @@ void CardCatalogTests::
   // levels deep inside CardDef's top-level "name" object -- covering both
   // the "nullable" and "nested" categories in one repro. A stored
   // Undefined here is distinct from both an absent "subtitle" key (which
-  // requireNullableString would reject as missing, since it is not itself
-  // optional -- CardName's exact-keys check demands exactly {title,
-  // subtitle}) and an explicit JSON null (a legitimate empty subtitle);
+  // requireNullableString would reject as missing, since "subtitle" is
+  // required even though its value may be null; unknown sibling keys are
+  // ignored, there is no exact-keys check) and an explicit JSON null (a
+  // legitimate empty subtitle);
   // it must fail with its own distinct message, not be silently treated
   // as either.
   const Json::Value base = minimalCardRawObject();

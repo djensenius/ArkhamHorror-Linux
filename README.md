@@ -299,6 +299,36 @@ The AppImage task runs on x86_64 Linux:
 mise run package:appimage
 ```
 
+## Response decoding policy
+
+The backend is the source of truth and evolves additively, so the client
+decodes server data tolerantly:
+
+- Decoders for data the server sends (REST response bodies and WebSocket
+  server messages) ignore object keys they do not model. A newer server that
+  adds a field does not break decoding.
+- Everything the client does model stays strict: required fields must be
+  present, JSON types and values are validated, and duplicate object keys
+  (including escape-equivalent ones) are rejected.
+- Exact-keyed shapes are a closed list: the known branches of the catalog's
+  `SkillIcon`/`CardCost`/`GameValue` tagged unions, the known `GameState`
+  branches, `DeckValidationError`, and `CampaignOptionRequest` (including
+  narrowing a `CampaignOption` to one). These reject an extra sibling key or
+  the wrong arity. Server WebSocket messages (`ServerMessage`, including its
+  `{"tag","contents"}` messages and `AnswerRejected`) ignore additive keys
+  like other responses. An unknown tag keeps its existing handling: it is
+  preserved verbatim where the type is forward-compatible, and fails
+  otherwise.
+- Request-side values (what the client sends) are outside this policy and
+  keep their existing per-type rules. In particular a campaign option is never
+  narrowed to a request if that would silently drop a key it carries.
+- Re-encoding a decoded response DTO emits only the fields the client models,
+  so unknown fields are dropped. Types that must round-trip unknown data
+  verbatim (such as an unrecognized `GameState` tag) say so explicitly.
+
+`Json::requireExactKeys` in `src/domain/JsonDecode.h` is reserved for the
+exact tagged-union branches and the campaign-option request case above.
+
 ## Architecture
 
 - `src/`: C++ application, server profile, secure token store, and

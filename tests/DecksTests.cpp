@@ -48,8 +48,9 @@ private slots:
   void deckListExtraTopLevelFieldIgnored();
   void deckExtraTopLevelFieldIgnored();
   void deckNestedDeckListExtraTopLevelFieldsIgnored();
+  // Known tagged-union branch: exact {"tag","contents"} stays strict.
   void deckValidationErrorExtraTopLevelFieldRejected();
-  void deckOperationErrorExtraTopLevelFieldRejected();
+  void deckOperationErrorExtraTopLevelFieldIgnored();
   void deckValidationErrorFromRawBytesMatchesFromJsonOnSameFixture();
   void deckValidationResultFromRawBytesMatchesFromJsonOnErrorsFixture();
   void deckOperationErrorFromRawBytesMatchesFromJsonOnSameFixture();
@@ -663,16 +664,52 @@ void DecksTests::deckValidationErrorExtraTopLevelFieldRejected() {
            qPrintable(result.error()));
 }
 
-void DecksTests::deckOperationErrorExtraTopLevelFieldRejected() {
+void DecksTests::deckOperationErrorExtraTopLevelFieldIgnored() {
+  // TASK-3.2.5 response decoding policy (see JsonDecode.h): an unknown key
+  // is ignored on both decode paths and dropped again on re-encode, while
+  // "errorMsg" stays required and strictly typed.
   const QJsonObject obj{
       {QStringLiteral("errorMsg"), QStringLiteral("Could not sync deck")},
       {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1},
   };
   const auto result = DeckOperationError::fromJson(obj, u"operationError");
-  QVERIFY(!result.has_value());
-  QVERIFY2(result.error().contains(
-               QStringLiteral("aFutureFieldThisClientHasNeverHeardOf")),
-           qPrintable(result.error()));
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->errorMsg, QStringLiteral("Could not sync deck"));
+
+  const auto viaRawBytes = DeckOperationError::fromRawBytes(
+      QByteArrayLiteral("{\"errorMsg\":\"Could not sync deck\","
+                        "\"aFutureFieldThisClientHasNeverHeardOf\":"
+                        "9223372036854775809}"),
+      u"operationError");
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  QCOMPARE(viaRawBytes->errorMsg, QStringLiteral("Could not sync deck"));
+  auto reencoded = Arkham::TestOnly::objectJson(*viaRawBytes);
+  if (!reencoded)
+    QFAIL(qPrintable(reencoded.error()));
+  QCOMPARE(*reencoded,
+           withoutKey(obj, "aFutureFieldThisClientHasNeverHeardOf"_L1));
+
+  const QJsonObject wrongType{
+      {QStringLiteral("errorMsg"), 404},
+      {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1},
+  };
+  const auto rejected =
+      DeckOperationError::fromJson(wrongType, u"operationError");
+  QVERIFY(!rejected.has_value());
+  QVERIFY2(rejected.error().contains(QStringLiteral("errorMsg")),
+           qPrintable(rejected.error()));
+
+  // An unknown key does not mask a missing required "errorMsg".
+  const QJsonObject missing{
+      {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1},
+  };
+  const auto missingResult =
+      DeckOperationError::fromJson(missing, u"operationError");
+  QVERIFY(!missingResult.has_value());
+  QVERIFY2(missingResult.error().contains(QStringLiteral("errorMsg")),
+           qPrintable(missingResult.error()));
 }
 
 void DecksTests::deckValidationErrorFromRawBytesMatchesFromJsonOnSameFixture() {
