@@ -437,13 +437,11 @@ private:
 // Required fields are cardCode, name, cardType, and art; every other field is
 // optional, decoding to std::nullopt / an empty container when absent.
 //
-// Exact-key policy (round-10-cumulative-review item 4, superseding this
-// type's earlier, now-removed leniency): a top-level object key this type
-// does not itself model is a hard decode failure, not silently ignored --
-// matching the vendored catalog.schema.json's own `additionalProperties:
-// false` for cardDef literally rather than pre-emptively working around a
-// hypothetical future backend field this client has not yet modeled. Every
-// field this type does model is likewise still validated exactly: a known
+// Unknown-key policy (TASK-3.2.5, superseding round-10-cumulative-review
+// item 4): a top-level object key this type does not model is ignored, so
+// an additive backend field never breaks catalog decoding (see
+// JsonDecode.h's response decoding policy); re-encoding drops it. Every
+// field this type does model is still validated exactly: a known
 // field's wrong JSON type, a required field's absence, or a malformed value
 // for a field with real constraints (duplicate uniqueItems entries, wrong
 // outer array/object shape, etc.) is a hard decode failure, never silently

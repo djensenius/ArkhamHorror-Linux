@@ -270,14 +270,8 @@ investigatorSummaryFromValueImpl(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // The pinned schema's `investigator` def is additionalProperties:false;
-  // unlike CardDef's deliberate forward-compat leniency, this closed,
-  // fixed-shape summary object enforces its exact key set (round-9 item 5).
-  auto exactKeys =
-      Json::requireExactKeys(obj, {"id"_L1, "classSymbol"_L1}, path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Response object: unknown keys are ignored (see JsonDecode.h's response
+  // decoding policy); every modeled field below is still strictly decoded.
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return CardCode::fromJson(v, p); });
@@ -303,13 +297,8 @@ ValueOrError<ScenarioSummary> scenarioSummaryFromValueImpl(const V &v,
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // Closed, fixed-shape summary object (additionalProperties:false in the
-  // pinned schema) -- enforce its exact key set (round-9 item 5).
-  auto exactKeys = Json::requireExactKeys(
-      obj, {"id"_L1, "difficulty"_L1, "name"_L1, "variant"_L1}, path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Response object: unknown keys are ignored (see JsonDecode.h's response
+  // decoding policy).
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return CardCode::fromJson(v, p); });
@@ -347,13 +336,8 @@ ValueOrError<CampaignSummary> campaignSummaryFromValueImpl(const V &v,
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // Closed, fixed-shape summary object (additionalProperties:false in the
-  // pinned schema) -- enforce its exact key set (round-9 item 5).
-  auto exactKeys = Json::requireExactKeys(
-      obj, {"id"_L1, "difficulty"_L1, "currentCampaignMode"_L1}, path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Response object: unknown keys are ignored (see JsonDecode.h's response
+  // decoding policy).
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return CampaignId::fromJson(v, p); });
@@ -795,20 +779,18 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
   const auto &obj = *objResult;
 
   // Disambiguated by shape, not an explicit tag: the backend's hand-written
-  // GameDetailsEntry ToJSON encodes a current failure as exactly {"id",
-  // "name", "error"}, older servers still admitted by currentPin() encoded
-  // a legacy failure as exactly {"error"}, and a success as the raw
-  // gameDetails object. Any other object carrying "error" matches no branch;
-  // reject it instead of silently discarding fields or inventing id/name.
+  // GameDetailsEntry ToJSON encodes a current failure as {"id", "name",
+  // "error"}, older servers still admitted by currentPin() encoded a legacy
+  // failure as {"error"}, and a success as the raw gameDetails object. The
+  // shape is decided by which of the modeled keys are present; any other
+  // key is ignored (response decoding policy, see JsonDecode.h). An "error"
+  // row carrying only one of id/name matches no branch and is rejected
+  // rather than inventing the missing id/name.
   if (obj.contains("error"_L1)) {
     const bool hasId = obj.contains("id"_L1);
     const bool hasName = obj.contains("name"_L1);
 
     if (!hasId && !hasName) {
-      auto exactKeys = Json::requireExactKeys(obj, {"error"_L1}, path);
-      if (!exactKeys)
-        return failure(exactKeys.error());
-
       auto error =
           Json::requireString(obj, "error"_L1, Json::joinPath(path, u"error"));
       if (!error)
@@ -817,11 +799,6 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
     }
 
     if (hasId && hasName) {
-      auto exactKeys =
-          Json::requireExactKeys(obj, {"id"_L1, "name"_L1, "error"_L1}, path);
-      if (!exactKeys)
-        return failure(exactKeys.error());
-
       auto id = Json::requireField(
           obj, "id"_L1, Json::joinPath(path, u"id"),
           [](const auto &v, QStringView p) { return GameId::fromJson(v, p); });
@@ -841,39 +818,16 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
     }
 
     return failure(
-        QStringLiteral("%1: failed game row must be exactly {\"error\"} or "
-                       "{\"id\", \"name\", \"error\"}")
+        QStringLiteral("%1: failed game row must carry both \"id\" and "
+                       "\"name\" beside \"error\", or neither")
             .arg(path));
   }
 
-  // The pinned schema's `gameDetails` (success) def is
-  // additionalProperties:false. Unlike CardDef's deliberate forward-compat
-  // additive-field leniency (a documented policy choice for evolving card
-  // data), this is a fixed, closed contract shape used to positively
-  // disambiguate a success row from a failure row -- an additive/unknown
-  // top-level field here is a contract violation, not a forward-compat
-  // signal to tolerate (round-9 item 5; supersedes this file's prior
-  // additive-tolerant behavior for this specific shape). The one exception
-  // is "outcome": required from schema 0.1.57, but servers 0.1.48-0.1.56
-  // (still admitted by currentPin()) omit it, so it alone is optional.
-  const bool hasOutcomeKey = obj.contains("outcome"_L1);
-  auto exactKeys =
-      hasOutcomeKey
-          ? Json::requireExactKeys(obj,
-                                   {"id"_L1, "scenario"_L1, "campaign"_L1,
-                                    "gameState"_L1, "outcome"_L1, "name"_L1,
-                                    "investigators"_L1, "otherInvestigators"_L1,
-                                    "multiplayerVariant"_L1, "hasOpenSeats"_L1},
-                                   path)
-          : Json::requireExactKeys(obj,
-                                   {"id"_L1, "scenario"_L1, "campaign"_L1,
-                                    "gameState"_L1, "name"_L1,
-                                    "investigators"_L1, "otherInvestigators"_L1,
-                                    "multiplayerVariant"_L1, "hasOpenSeats"_L1},
-                                   path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Success row (gameDetails). Unknown top-level keys are ignored (response
+  // decoding policy, see JsonDecode.h); every modeled field below is still
+  // required and strictly typed, except "outcome": required from schema
+  // 0.1.57, but servers 0.1.48-0.1.56 (still admitted by currentPin()) omit
+  // it, so it alone is optional.
   auto id = Json::requireField(
       obj, "id"_L1, Json::joinPath(path, u"id"),
       [](const auto &v, QStringView p) { return GameId::fromJson(v, p); });

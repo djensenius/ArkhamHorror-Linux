@@ -951,82 +951,10 @@ ValueOrError<CardDef> decodeCardDef(const V &v, QStringView path) {
     return failure(objResult.error());
   const auto &obj = *objResult;
 
-  // catalog.schema.json's `cardDef` is additionalProperties:false with
-  // exactly these 62 properties (round-10-cumulative-review item 4:
-  // reversing this client's earlier policy of silently ignoring an
-  // unrecognized top-level key here -- this pinned contract slice treats
-  // CardDef as fully closed, matching the schema's explicit `false`,
-  // rather than pre-emptively tolerating a hypothetical future field this
-  // client has not yet modeled; see extraTopLevelFieldOnCardDefRejected in
-  // CardCatalogTests.cpp).
-  auto exactKeys =
-      Json::requireExactKeys(obj,
-                             {"cardCode"_L1,
-                              "name"_L1,
-                              "revealedName"_L1,
-                              "cost"_L1,
-                              "additionalCost"_L1,
-                              "level"_L1,
-                              "cardType"_L1,
-                              "cardSubType"_L1,
-                              "classSymbols"_L1,
-                              "skills"_L1,
-                              "cardTraits"_L1,
-                              "revealedCardTraits"_L1,
-                              "keywords"_L1,
-                              "fastWindow"_L1,
-                              "actions"_L1,
-                              "revelation"_L1,
-                              "victoryPoints"_L1,
-                              "vengeancePoints"_L1,
-                              "criteria"_L1,
-                              "overrideActionPlayableIfCriteriaMet"_L1,
-                              "commitRestrictions"_L1,
-                              "attackOfOpportunityModifiers"_L1,
-                              "permanent"_L1,
-                              "encounterSet"_L1,
-                              "encounterSetQuantity"_L1,
-                              "unique"_L1,
-                              "doubleSided"_L1,
-                              "limits"_L1,
-                              "exceptional"_L1,
-                              "uses"_L1,
-                              "playableFromDiscard"_L1,
-                              "stage"_L1,
-                              "slots"_L1,
-                              "alternateCardCodes"_L1,
-                              "art"_L1,
-                              "locationSymbol"_L1,
-                              "locationRevealedSymbol"_L1,
-                              "locationConnections"_L1,
-                              "locationRevealedConnections"_L1,
-                              "purchaseTrauma"_L1,
-                              "grantedXp"_L1,
-                              "canReplace"_L1,
-                              "deckRestrictions"_L1,
-                              "bondedWith"_L1,
-                              "skipPlayWindows"_L1,
-                              "beforeEffect"_L1,
-                              "customizations"_L1,
-                              "otherSide"_L1,
-                              "whenDiscarded"_L1,
-                              "canCommitWhenNoIcons"_L1,
-                              "commitTrigger"_L1,
-                              "meta"_L1,
-                              "tags"_L1,
-                              "outOfPlayEffects"_L1,
-                              "health"_L1,
-                              "fight"_L1,
-                              "evade"_L1,
-                              "healthDamage"_L1,
-                              "sanityDamage"_L1,
-                              "alternateSkills"_L1,
-                              "alternateErrata"_L1,
-                              "errata"_L1},
-                             path);
-  if (!exactKeys)
-    return failure(exactKeys.error());
-
+  // Response object: an unrecognized top-level key is ignored (see
+  // JsonDecode.h's response decoding policy and
+  // extraTopLevelFieldOnCardDefIgnored in CardCatalogTests.cpp); every
+  // modeled field below is still strictly decoded.
   auto cardCode = Json::requireField(
       obj, "cardCode"_L1, Json::joinPath(path, u"cardCode"),
       [](const auto &v, QStringView p) { return decodeCardCodeValue(v, p); });

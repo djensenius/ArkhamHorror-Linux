@@ -439,21 +439,22 @@ objectMembers(const Json::Value &obj);
 [[nodiscard]] ValueOrError<Json::Value> toLosslessRaw(const QJsonValue &v);
 [[nodiscard]] ValueOrError<Json::Value> toLosslessRaw(const Json::Value &v);
 
-// Fails if `obj` carries any key other than those listed in `allowed`.
-// For a schema branch whose additionalProperties is false -- specifically
-// a known tagged union's exact "tag"/"contents" shape (SkillIcon/CardCost/
-// GameValue/GameState's known branches), closed/fixed-shape summary
-// objects used to positively disambiguate a response's shape (GameListRow's
-// success row and its nested scenario/campaign/investigator summaries),
-// and every other pinned-contract shape whose schema likewise declares
-// `additionalProperties: false` (CardDef/CardName -- as of
-// round-10-cumulative-review item 4, superseding this client's earlier
-// policy of tolerating an unknown key on those two specifically; a future
-// backend field not yet modeled here is now a hard decode error, matching
-// the pinned schema literally rather than pre-emptively working around a
-// hypothetical future revision) -- this rejects an unexpected extra key
-// rather than silently accepting it and then re-emitting only the keys
-// this client models, dropping the rest. Generic over Obj (QJsonObject or
+// Response decoding policy (TASK-3.2.5; see README "Response decoding
+// policy"): decoders for data the server sends (REST response bodies and
+// WebSocket server messages) ignore object keys they do not model, so an
+// additive field in a newer server release never breaks decoding. Required
+// fields, JSON types, value validation and duplicate-key rejection stay
+// strict, and re-encoding a response DTO drops the ignored keys.
+//
+// requireExactKeys() is the deliberate exception: it fails if `obj` carries
+// any key other than those listed in `allowed`, and applies ONLY to (a) the
+// exact "tag"/"contents" (or bare "tag") shape of a known tagged-union
+// branch (SkillIcon/CardCost/GameValue/GameState/DeckValidationError known
+// branches), where an extra sibling key means the branch itself has changed
+// shape, and (b) request-side CampaignOptionRequest values (decoding one,
+// or narrowing a response CampaignOption to one), which must never silently
+// drop a key. Unknown tags keep their own handling. Do not
+// use it on a plain response object. Generic over Obj (QJsonObject or
 // Json::Value, see RawJson.h) via objectMembers() above.
 template <typename Obj>
 [[nodiscard]] ValueOrError<bool>
