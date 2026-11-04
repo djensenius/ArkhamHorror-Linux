@@ -228,6 +228,15 @@ ApplicationWindow {
 
             activeFocusOnTab: true
             focusPolicy: Qt.StrongFocus
+            // When maintenance ends while the notice holds focus, hand focus
+            // back to a card instead of stranding it on a hidden item.
+            onVisibleChanged: {
+                if (!visible && activeFocus) {
+                    const target = maintenanceNotice.returnFocusItem ?? destinations.itemAt(0);
+                    if (target)
+                        target.forceActiveFocus();
+                }
+            }
             Keys.onDownPressed: event => {
                 maintenanceNotice.scrollNotice(maintenanceNotice.scrollStep);
                 event.accepted = true;
@@ -278,6 +287,9 @@ ApplicationWindow {
                 // Server-written free text: never render it as markup (no
                 // remote images or links from the message).
                 textFormat: Text.PlainText
+                // The notice itself announces the whole text; don't read it
+                // twice.
+                Accessible.ignored: true
                 // Wrap (not WordWrap): an over-wide word such as a long URL
                 // also breaks inside the viewport, which never scrolls
                 // horizontally.
