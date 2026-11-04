@@ -999,6 +999,9 @@ private slots:
         R"("revealed":"yes")", u"x.revealed: expected bool, got string"_s);
     row("location missing tokens", u"location"_s, R"("tokens":[["Clue",2]],)",
         "", uR"(x.tokens: missing required field "tokens")"_s);
+    row("location tokens not an array", u"location"_s,
+        R"("tokens":[["Clue",2]])", R"("tokens":{"Clue":2})",
+        u"x.tokens: expected array, got object"_s);
     row("location negative clues", u"location"_s, R"([["Clue",2]])",
         R"([["Clue",-2]])", u"x.tokens[0][1]: must not be negative, got -2"_s);
     row("location missing shroud", u"location"_s,
@@ -1055,6 +1058,12 @@ private slots:
     row("enemy location missing shroud", u"enemyLocation"_s,
         R"("shroud":{"contents":4,"tag":"Static"},)", "",
         uR"(x.shroud: missing required field "shroud")"_s);
+    row("enemy location missing cardId", u"enemyLocation"_s,
+        R"("cardId":"00000000-0000-0000-0000-000000000033",)", "",
+        uR"(x.cardId: missing required field "cardId")"_s);
+    row("enemy location missing label", u"enemyLocation"_s,
+        R"("label":"shapeless_cellar",)", "",
+        uR"(x.label: missing required field "label")"_s);
 
     row("investigator null", u"investigator"_s, kInvestigator, "null",
         u"x: expected object, got null"_s);
@@ -1086,6 +1095,9 @@ private slots:
         uR"(x.name.subtitle: missing required field "subtitle")"_s);
     row("investigator name subtitle wrong type", u"investigator"_s,
         R"("subtitle":"The Fed")", R"("subtitle":7)", u"x.name.subtitle"_s);
+    row("investigator name title not a string", u"investigator"_s,
+        R"("title":"Roland Banks")", R"("title":42)",
+        u"x.name.title: expected string, got number"_s);
     row("investigator class unknown", u"investigator"_s,
         R"("class":"Guardian")", R"("class":"Wizard")",
         uR"(x.class: unrecognized value "Wizard")"_s);
