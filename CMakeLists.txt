@@ -161,6 +161,7 @@ endif()
 # three canonical toExactQJson*() adapters, and JsonDecode.h's
 # decode-direction field/array/object helpers).
 set(ARKHAM_DOMAIN_HEADERS
+    src/domain/Board.h
     src/domain/CardCatalog.h
     src/domain/ContractPin.h
     src/domain/ContractRevision.h
@@ -174,6 +175,7 @@ set(ARKHAM_DOMAIN_HEADERS
 )
 
 set(ARKHAM_DOMAIN_SOURCES
+    src/domain/Board.cpp
     src/domain/CardCatalog.cpp
     src/domain/ContractPin.cpp
     src/domain/ContractRevision.cpp
@@ -739,6 +741,18 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME games COMMAND arkham-games-tests)
+
+    qt_add_executable(arkham-board-tests
+        tests/BoardTests.cpp
+    )
+    target_compile_definitions(arkham-board-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-board-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME board COMMAND arkham-board-tests)
 
     qt_add_executable(arkham-raw-json-tests
         tests/RawJsonTests.cpp
