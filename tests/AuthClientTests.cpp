@@ -198,6 +198,23 @@ runAndWait(std::function<AuthRequestHandle(std::function<void(AuthResult<T>)>)>
   return captured;
 }
 
+// Bytes shaped exactly like the fork server's maintenance 503 (backend
+// Foundation.hs maintenanceMiddleware, aeson object keys in sorted order,
+// the default Api/Arkham/Maintenance.hs message), as captured for
+// NetworkTests.cpp's probe tests. The server answers /authenticate,
+// /register and /whoami with this same response and `Retry-After: 120`.
+const QByteArray kMaintenanceBody = QByteArrayLiteral(
+    R"({"maintenance":true,"message":"Arkham Horror is down for scheduled )"
+    R"(database maintenance. Games in progress are saved and will be exactly )"
+    R"(where you left them.","since":"2026-11-03T22:15:00.123456Z"})");
+const QString kMaintenanceMessage = QStringLiteral(
+    "Arkham Horror is down for scheduled database maintenance. Games in "
+    "progress are saved and will be exactly where you left them.");
+const RawHeaders kMaintenanceHeaders{
+    {QByteArrayLiteral("Retry-After"), QByteArrayLiteral("120")}};
+const QString kMaintenanceDiagnostic =
+    QStringLiteral("server is down for maintenance");
+
 } // namespace
 
 class AuthClientTests final : public QObject {
@@ -229,6 +246,11 @@ private slots:
   void threeXxMapsToUnexpectedStatus();
   void twoXxDecodesSuccessfully();
   void unauthorizedMapsTo401();
+  void maintenance503OnSignInIsMaintenance();
+  void maintenance503OnSignUpIsMaintenance();
+  void maintenance503OnWhoAmIIsMaintenance();
+  void maintenance503WithoutRetryAfterSaysTryLater();
+  void nonMaintenance503IsUnexpectedStatus();
   void malformedJsonMapsToMalformedPayload();
   void malformedShapeMapsToMalformedPayload();
   void nonHttpTransportErrorMapsToTransport();
@@ -956,6 +978,165 @@ void AuthClientTests::unauthorizedMapsTo401() {
   QCOMPARE(result->outcome, AuthOutcome::Unauthorized);
   QCOMPARE(result->httpStatus, 401);
   QVERIFY(!result->diagnostic.contains(serverMessage));
+}
+
+void AuthClientTests::maintenance503OnSignInIsMaintenance() {
+  // See authenticateSendsExpectedRequest() above for why this is bound to
+  // a named variable before use in the QVERIFY expression below.
+  const QString sentinelPassword = QStringLiteral("sentinel-pw-maint-31");
+
+  StubNetworkAccessManager nam;
+  nam.enqueue(503, kMaintenanceBody, QNetworkReply::ServiceUnavailableError,
+              kMaintenanceHeaders);
+  NetworkAuthenticationClient client(nam);
+
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            ServerProfile::hostedDefault(),
+            AuthenticateRequest{QStringLiteral("a@b.com"), sentinelPassword},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Maintenance);
+  QCOMPARE(result->httpStatus, 503);
+  QVERIFY(!result->value.has_value());
+  QVERIFY(result->maintenance.has_value());
+  QCOMPARE(result->maintenance->message, std::optional(kMaintenanceMessage));
+  QCOMPARE(result->maintenance->since,
+           std::optional(QStringLiteral("2026-11-03T22:15:00.123456Z")));
+  QCOMPARE(result->maintenance->retryAfterSeconds, std::optional(120));
+  QCOMPARE(result->maintenance->notice(),
+           kMaintenanceMessage +
+               QStringLiteral(" Try again in about 2 minutes."));
+  // The diagnostic stays static: never the response body or the password.
+  QCOMPARE(result->diagnostic, kMaintenanceDiagnostic);
+  QVERIFY(!result->diagnostic.contains(kMaintenanceMessage));
+  QVERIFY(!result->diagnostic.contains(sentinelPassword));
+}
+
+void AuthClientTests::maintenance503OnSignUpIsMaintenance() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(503, kMaintenanceBody, QNetworkReply::ServiceUnavailableError,
+              kMaintenanceHeaders);
+  NetworkAuthenticationClient client(nam);
+
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.registerAccount(ServerProfile::hostedDefault(),
+                                      RegisterRequest{QStringLiteral("a@b.com"),
+                                                      QStringLiteral("u"),
+                                                      QStringLiteral("pw")},
+                                      std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(nam.requests().first().url().path(),
+           QStringLiteral("/api/v1/register"));
+  QCOMPARE(result->outcome, AuthOutcome::Maintenance);
+  QCOMPARE(result->httpStatus, 503);
+  QVERIFY(result->maintenance.has_value());
+  QCOMPARE(result->maintenance->retryAfterSeconds, std::optional(120));
+  QCOMPARE(result->maintenance->notice(),
+           kMaintenanceMessage +
+               QStringLiteral(" Try again in about 2 minutes."));
+  QCOMPARE(result->diagnostic, kMaintenanceDiagnostic);
+}
+
+void AuthClientTests::maintenance503OnWhoAmIIsMaintenance() {
+  // During maintenance the server answers whoami with this 503, not 401,
+  // so a stored token must be reported as maintenance, never unauthorized.
+  const QString sentinelToken = QStringLiteral("sentinel-token-maint-77");
+
+  StubNetworkAccessManager nam;
+  nam.enqueue(503, kMaintenanceBody, QNetworkReply::ServiceUnavailableError,
+              kMaintenanceHeaders);
+  NetworkAuthenticationClient client(nam);
+
+  const auto result = runAndWait<CurrentUser>(
+      [&](std::function<void(AuthResult<CurrentUser>)> cb) {
+        return client.whoAmI(ServerProfile::hostedDefault(), sentinelToken,
+                             std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Maintenance);
+  QCOMPARE(result->httpStatus, 503);
+  QVERIFY(!result->value.has_value());
+  QVERIFY(result->maintenance.has_value());
+  QCOMPARE(result->maintenance->message, std::optional(kMaintenanceMessage));
+  QCOMPARE(result->maintenance->retryAfterSeconds, std::optional(120));
+  QCOMPARE(result->maintenance->notice(),
+           kMaintenanceMessage +
+               QStringLiteral(" Try again in about 2 minutes."));
+  QCOMPARE(result->diagnostic, kMaintenanceDiagnostic);
+  QVERIFY(!result->diagnostic.contains(sentinelToken));
+}
+
+void AuthClientTests::maintenance503WithoutRetryAfterSaysTryLater() {
+  StubNetworkAccessManager nam;
+  nam.enqueue(503, kMaintenanceBody, QNetworkReply::ServiceUnavailableError);
+  NetworkAuthenticationClient client(nam);
+
+  const auto result =
+      runAndWait<AuthToken>([&](std::function<void(AuthResult<AuthToken>)> cb) {
+        return client.authenticate(
+            ServerProfile::hostedDefault(),
+            AuthenticateRequest{QStringLiteral("a@b.com"),
+                                QStringLiteral("pw")},
+            std::move(cb));
+      });
+
+  QVERIFY(result.has_value());
+  QCOMPARE(result->outcome, AuthOutcome::Maintenance);
+  QVERIFY(result->maintenance.has_value());
+  QCOMPARE(result->maintenance->retryAfterSeconds, std::nullopt);
+  QCOMPARE(result->maintenance->notice(),
+           kMaintenanceMessage + QStringLiteral(" Try again later."));
+}
+
+void AuthClientTests::nonMaintenance503IsUnexpectedStatus() {
+  // A proxy/ingress 503 (even with Retry-After) and a body whose
+  // maintenance flag is not JSON true stay generic unexpected statuses.
+  const QList<QByteArray> bodies{
+      QByteArrayLiteral("<html><body>503 Service Unavailable</body></html>"),
+      QByteArrayLiteral(R"({"maintenance":false,"message":"no"})"),
+      QByteArrayLiteral(R"({"maintenance":"true","message":"no"})"),
+  };
+  for (const QByteArray &body : bodies) {
+    StubNetworkAccessManager nam;
+    nam.enqueue(503, body, QNetworkReply::ServiceUnavailableError,
+                kMaintenanceHeaders);
+    nam.enqueue(503, body, QNetworkReply::ServiceUnavailableError,
+                kMaintenanceHeaders);
+    NetworkAuthenticationClient client(nam);
+
+    const auto signIn = runAndWait<AuthToken>(
+        [&](std::function<void(AuthResult<AuthToken>)> cb) {
+          return client.authenticate(
+              ServerProfile::hostedDefault(),
+              AuthenticateRequest{QStringLiteral("a@b.com"),
+                                  QStringLiteral("pw")},
+              std::move(cb));
+        });
+    QVERIFY(signIn.has_value());
+    QCOMPARE(signIn->outcome, AuthOutcome::UnexpectedStatus);
+    QCOMPARE(signIn->httpStatus, 503);
+    QCOMPARE(signIn->diagnostic,
+             QStringLiteral("server responded with an unexpected HTTP status"));
+    QVERIFY(!signIn->maintenance.has_value());
+
+    const auto whoAmI = runAndWait<CurrentUser>(
+        [&](std::function<void(AuthResult<CurrentUser>)> cb) {
+          return client.whoAmI(ServerProfile::hostedDefault(),
+                               QStringLiteral("tok"), std::move(cb));
+        });
+    QVERIFY(whoAmI.has_value());
+    QCOMPARE(whoAmI->outcome, AuthOutcome::UnexpectedStatus);
+    QCOMPARE(whoAmI->httpStatus, 503);
+    QVERIFY(!whoAmI->maintenance.has_value());
+  }
 }
 
 void AuthClientTests::malformedJsonMapsToMalformedPayload() {
