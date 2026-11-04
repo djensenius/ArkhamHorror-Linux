@@ -111,6 +111,13 @@ struct PlayerIdTag {};
 using PlayerId = TypedId<PlayerIdTag>;
 struct DeckIdTag {};
 using DeckId = TypedId<DeckIdTag>;
+struct ChaosTokenIdTag {};
+// chaos-token.schema.json's chaosTokenId.
+using ChaosTokenId = TypedId<ChaosTokenIdTag>;
+struct CardIdTag {};
+// The UUID of one physical card instance in a game (e.g. an act's or
+// agenda's `cardId`), as opposed to the CardCode naming which card it is.
+using CardId = TypedId<CardIdTag>;
 
 // A non-empty wire string, distinguished at compile time by Tag. Used for
 // identifiers the backend deliberately keeps as open/unvalidated strings

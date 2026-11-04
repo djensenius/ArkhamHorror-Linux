@@ -29,14 +29,6 @@
 
 namespace Arkham {
 
-struct ChaosTokenIdTag {};
-// chaos-token.schema.json's chaosTokenId.
-using ChaosTokenId = TypedId<ChaosTokenIdTag>;
-struct CardIdTag {};
-// The UUID of one physical card instance (an act's or agenda's `cardId`),
-// as opposed to the CardCode naming which card it is.
-using CardId = TypedId<CardIdTag>;
-
 // chaos-token.schema.json: one physical chaos token.
 class ChaosToken {
 public:

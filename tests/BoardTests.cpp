@@ -1,6 +1,9 @@
 #include <QFile>
 #include <QtTest>
 
+#include <initializer_list>
+#include <utility>
+
 #include "Board.h"
 #include "RawJson.h"
 
@@ -277,6 +280,150 @@ private slots:
     QVERIFY(act->advanceCost().isNull());
     QCOMPARE(act->sequenceStep(), 3);
     QCOMPARE(act->sequenceSide(), ActSide::H);
+  }
+
+  // Every hand-written wire string decodes to its own value. The rows are
+  // copied from the pinned schemas (public-game, phase-step, act, agenda),
+  // never generated from Board.cpp's tables, so a typo on either side fails.
+  void phaseDecodesEveryValue_data() {
+    QTest::addColumn<QByteArray>("wire");
+    QTest::addColumn<Phase>("expected");
+    const std::initializer_list<std::pair<const char *, Phase>> rows{
+        {"MythosPhase", Phase::MythosPhase},
+        {"InvestigationPhase", Phase::InvestigationPhase},
+        {"EnemyPhase", Phase::EnemyPhase},
+        {"UpkeepPhase", Phase::UpkeepPhase},
+        {"ResolutionPhase", Phase::ResolutionPhase},
+        {"CampaignPhase", Phase::CampaignPhase},
+    };
+    for (const auto &[wire, expected] : rows)
+      QTest::newRow(wire) << QByteArray(wire) << expected;
+  }
+
+  void phaseDecodesEveryValue() {
+    QFETCH(QByteArray, wire);
+    QFETCH(Phase, expected);
+    const auto parsed =
+        Json::Value::parse(QByteArray('"' + wire + '"'), u"phase");
+    QVERIFY(parsed);
+    const auto phase = decodePhase(*parsed, u"phase");
+    QVERIFY2(phase, qPrintable(phase ? QString() : phase.error()));
+    QCOMPARE(*phase, expected);
+  }
+
+  void phaseStepDecodesEveryValue_data() {
+    using K = PhaseStep::Kind;
+    using S = PhaseStep::Step;
+    QTest::addColumn<QByteArray>("tag");
+    QTest::addColumn<QByteArray>("contents");
+    QTest::addColumn<K>("kind");
+    QTest::addColumn<S>("step");
+    const auto rows =
+        [](const char *tag, K kind,
+           std::initializer_list<std::pair<const char *, S>> steps) {
+          for (const auto &[wire, step] : steps)
+            QTest::addRow("%s/%s", tag, wire)
+                << QByteArray(tag) << QByteArray(wire) << kind << step;
+        };
+    rows("MythosPhaseStep", K::MythosPhaseStep,
+         {
+             {"MythosPhaseBeginsStep", S::MythosPhaseBeginsStep},
+             {"PlaceDoomOnAgendaStep", S::PlaceDoomOnAgendaStep},
+             {"CheckDoomThresholdStep", S::CheckDoomThresholdStep},
+             {"EachInvestigatorDrawsEncounterCardStep",
+              S::EachInvestigatorDrawsEncounterCardStep},
+             {"MythosPhaseWindow", S::MythosPhaseWindow},
+             {"MythosPhaseEndsStep", S::MythosPhaseEndsStep},
+         });
+    rows("InvestigationPhaseStep", K::InvestigationPhaseStep,
+         {
+             {"InvestigationPhaseBeginsStep", S::InvestigationPhaseBeginsStep},
+             {"InvestigationPhaseBeginsWindow",
+              S::InvestigationPhaseBeginsWindow},
+             {"NextInvestigatorsTurnBeginsStep",
+              S::NextInvestigatorsTurnBeginsStep},
+             {"NextInvestigatorsTurnBeginsWindow",
+              S::NextInvestigatorsTurnBeginsWindow},
+             {"InvestigatorTakesActionStep", S::InvestigatorTakesActionStep},
+             {"InvestigatorsTurnEndsStep", S::InvestigatorsTurnEndsStep},
+             {"InvestigationPhaseEndsStep", S::InvestigationPhaseEndsStep},
+         });
+    rows("EnemyPhaseStep", K::EnemyPhaseStep,
+         {
+             {"EnemyPhaseBeginsStep", S::EnemyPhaseBeginsStep},
+             {"HunterEnemiesMoveStep", S::HunterEnemiesMoveStep},
+             {"ResolveAttacksWindow", S::ResolveAttacksWindow},
+             {"ResolveAttacksStep", S::ResolveAttacksStep},
+             {"AfterResolveAttacksWindow", S::AfterResolveAttacksWindow},
+             {"EnemyPhaseEndsStep", S::EnemyPhaseEndsStep},
+         });
+    rows("UpkeepPhaseStep", K::UpkeepPhaseStep,
+         {
+             {"UpkeepPhaseBeginsStep", S::UpkeepPhaseBeginsStep},
+             {"UpkeepPhaseBeginsWindow", S::UpkeepPhaseBeginsWindow},
+             {"ResetActionsStep", S::ResetActionsStep},
+             {"ReadyExhaustedStep", S::ReadyExhaustedStep},
+             {"DrawCardAndGainResourceStep", S::DrawCardAndGainResourceStep},
+             {"CheckHandSizeStep", S::CheckHandSizeStep},
+             {"UpkeepPhaseEndsStep", S::UpkeepPhaseEndsStep},
+         });
+  }
+
+  void phaseStepDecodesEveryValue() {
+    QFETCH(QByteArray, tag);
+    QFETCH(QByteArray, contents);
+    QFETCH(PhaseStep::Kind, kind);
+    QFETCH(PhaseStep::Step, step);
+    const auto decoded = PhaseStep::fromRawBytes(
+        "{\"tag\":\"" + tag + "\",\"contents\":\"" + contents + "\"}", u"step");
+    QVERIFY2(decoded, qPrintable(decoded ? QString() : decoded.error()));
+    QCOMPARE(decoded->kind(), kind);
+    QCOMPARE(decoded->step(), step);
+  }
+
+  void actSideDecodesEveryValue_data() {
+    QTest::addColumn<QByteArray>("wire");
+    QTest::addColumn<ActSide>("expected");
+    const std::initializer_list<std::pair<const char *, ActSide>> rows{
+        {"A", ActSide::A}, {"B", ActSide::B}, {"C", ActSide::C},
+        {"D", ActSide::D}, {"E", ActSide::E}, {"F", ActSide::F},
+        {"G", ActSide::G}, {"H", ActSide::H},
+    };
+    for (const auto &[wire, expected] : rows)
+      QTest::newRow(wire) << QByteArray(wire) << expected;
+  }
+
+  void actSideDecodesEveryValue() {
+    QFETCH(QByteArray, wire);
+    QFETCH(ActSide, expected);
+    const auto act = Act::fromRawBytes(
+        mutated(u"act"_s, R"([1,"A"])", "[1,\"" + wire + "\"]"), u"act");
+    QVERIFY2(act, qPrintable(act ? QString() : act.error()));
+    QCOMPARE(act->sequenceSide(), expected);
+  }
+
+  void agendaSideDecodesEveryValue_data() {
+    QTest::addColumn<QByteArray>("wire");
+    QTest::addColumn<AgendaSide>("expected");
+    const std::initializer_list<std::pair<const char *, AgendaSide>> rows{
+        {"A", AgendaSide::A},
+        {"B", AgendaSide::B},
+        {"C", AgendaSide::C},
+        {"D", AgendaSide::D},
+    };
+    for (const auto &[wire, expected] : rows)
+      QTest::newRow(wire) << QByteArray(wire) << expected;
+  }
+
+  void agendaSideDecodesEveryValue() {
+    QFETCH(QByteArray, wire);
+    QFETCH(AgendaSide, expected);
+    const auto agenda =
+        Agenda::fromRawBytes(mutated(u"agenda"_s, R"("agendaSequenceSide":"A")",
+                                     "\"agendaSequenceSide\":\"" + wire + '"'),
+                             u"agenda");
+    QVERIFY2(agenda, qPrintable(agenda ? QString() : agenda.error()));
+    QCOMPARE(agenda->sequenceSide(), expected);
   }
 
   void validDocumentsDecode_data() {

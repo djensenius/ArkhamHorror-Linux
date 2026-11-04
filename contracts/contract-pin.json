@@ -5,5 +5,5 @@
   "minimumServerSchemaRevision": "0.1.48",
   "nativeClientMinimumRevision": "0.1.57",
   "apiBasePath": "/api/v1",
-  "note": "Minimum server revision remains 0.1.48 while this client understands additive contract data through schema 0.1.57. See djensenius/ArkhamHorror contracts/ for the authoritative full contract, vendored alongside this file for catalog/deck/game-lifecycle/game-list (including the game outcome and allowSpectators), campaign catalog metadata, capabilities, AnswerRejected and RoomClosed decoding."
+  "note": "Minimum server revision remains 0.1.48 while this client understands additive contract data through schema 0.1.57. See djensenius/ArkhamHorror contracts/ for the authoritative full contract, vendored alongside this file for catalog/deck/game-lifecycle/game-list (including the game outcome and allowSpectators), campaign catalog metadata, capabilities, AnswerRejected and RoomClosed decoding, plus the GetGame/GameUpdate board snapshot fixtures (get-game.json, game-update.json) for board leaf decoding."
 }
