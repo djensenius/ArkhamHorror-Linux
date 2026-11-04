@@ -310,10 +310,15 @@ decodes server data tolerantly:
 - Everything the client does model stays strict: required fields must be
   present, JSON types and values are validated, and duplicate object keys
   (including escape-equivalent ones) are rejected.
-- Tagged unions stay exact. A known `tag`'s `{"tag","contents"}` (or bare
-  `{"tag"}`) shape rejects an extra sibling key or the wrong arity. An unknown
-  tag keeps its existing handling: it is preserved verbatim where the type is
-  forward-compatible, and fails otherwise.
+- Exact-keyed shapes are a closed list: the known branches of the catalog's
+  `SkillIcon`/`CardCost`/`GameValue` tagged unions, the known `GameState`
+  branches, `DeckValidationError`, and `CampaignOptionRequest` (including
+  narrowing a `CampaignOption` to one). These reject an extra sibling key or
+  the wrong arity. Server WebSocket messages (`ServerMessage`, including its
+  `{"tag","contents"}` messages and `AnswerRejected`) ignore additive keys
+  like other responses. An unknown tag keeps its existing handling: it is
+  preserved verbatim where the type is forward-compatible, and fails
+  otherwise.
 - Request-side values (what the client sends) are outside this policy and
   keep their existing per-type rules. In particular a campaign option is never
   narrowed to a request if that would silently drop a key it carries.

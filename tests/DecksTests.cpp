@@ -700,6 +700,16 @@ void DecksTests::deckOperationErrorExtraTopLevelFieldIgnored() {
   QVERIFY(!rejected.has_value());
   QVERIFY2(rejected.error().contains(QStringLiteral("errorMsg")),
            qPrintable(rejected.error()));
+
+  // An unknown key does not mask a missing required "errorMsg".
+  const QJsonObject missing{
+      {QStringLiteral("aFutureFieldThisClientHasNeverHeardOf"), 1},
+  };
+  const auto missingResult =
+      DeckOperationError::fromJson(missing, u"operationError");
+  QVERIFY(!missingResult.has_value());
+  QVERIFY2(missingResult.error().contains(QStringLiteral("errorMsg")),
+           qPrintable(missingResult.error()));
 }
 
 void DecksTests::deckValidationErrorFromRawBytesMatchesFromJsonOnSameFixture() {

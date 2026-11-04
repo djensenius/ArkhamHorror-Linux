@@ -2058,9 +2058,10 @@ void CardCatalogTests::
   // levels deep inside CardDef's top-level "name" object -- covering both
   // the "nullable" and "nested" categories in one repro. A stored
   // Undefined here is distinct from both an absent "subtitle" key (which
-  // requireNullableString would reject as missing, since it is not itself
-  // optional -- CardName's exact-keys check demands exactly {title,
-  // subtitle}) and an explicit JSON null (a legitimate empty subtitle);
+  // requireNullableString would reject as missing, since "subtitle" is
+  // required even though its value may be null; unknown sibling keys are
+  // ignored, there is no exact-keys check) and an explicit JSON null (a
+  // legitimate empty subtitle);
   // it must fail with its own distinct message, not be silently treated
   // as either.
   const Json::Value base = minimalCardRawObject();

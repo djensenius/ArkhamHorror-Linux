@@ -785,8 +785,16 @@ ValueOrError<GameListRow> GameListRow::fromValueImpl(const V &v,
   // shape is decided by which of the modeled keys are present; any other
   // key is ignored (response decoding policy, see JsonDecode.h). An "error"
   // row carrying only one of id/name matches no branch and is rejected
-  // rather than inventing the missing id/name.
+  // rather than inventing the missing id/name. A row carrying both "error"
+  // and "gameState" mixes the failure and success shapes; it is rejected
+  // rather than reclassified, so success fields are never silently dropped.
   if (obj.contains("error"_L1)) {
+    if (obj.contains("gameState"_L1))
+      return failure(
+          QStringLiteral("%1: game row carries both \"error\" and "
+                         "\"gameState\"; it is neither a failure nor a "
+                         "success row")
+              .arg(path));
     const bool hasId = obj.contains("id"_L1);
     const bool hasName = obj.contains("name"_L1);
 

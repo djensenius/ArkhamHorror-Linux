@@ -179,6 +179,8 @@ private slots:
   void gameListRowSuccessIgnoresAdditiveTopLevelField();
   void gameListRowNestedScenarioIgnoresAdditiveFields();
   void gameListRowNestedCampaignAndInvestigatorIgnoreAdditiveFields();
+  void gameListRowWithErrorAndGameStateRejected();
+  void gameListRowAdditiveKeyDoesNotMaskMissingRequiredField();
 
   // server-message.json AnswerRejected/generic text ──────────────────────────
   void answerRejectedFixtureDecodes();
@@ -1446,6 +1448,40 @@ void GamesTests::
       QFAIL(qPrintable(encoded.error()));
     QCOMPARE(*encoded, original);
   }
+}
+
+void GamesTests::gameListRowWithErrorAndGameStateRejected() {
+  // A full success row plus an additive "error" string must not be
+  // reclassified as a failure row (which would silently drop every success
+  // field); "error" beside "gameState" is malformed on both decode paths.
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  QJsonObject mixed = rows.at(0).toObject();
+  mixed.insert(QStringLiteral("error"), QStringLiteral("boom"));
+
+  const auto viaQJson = GameListRow::fromJson(mixed, u"row");
+  const auto viaRawBytes = GameListRow::fromRawBytes(
+      QJsonDocument(mixed).toJson(QJsonDocument::Compact), u"row");
+  for (const auto *result : {&viaQJson, &viaRawBytes}) {
+    QVERIFY(!result->has_value());
+    QCOMPARE(result->error(),
+             QStringLiteral("row: game row carries both \"error\" and "
+                            "\"gameState\"; it is neither a failure nor a "
+                            "success row"));
+  }
+}
+
+void GamesTests::gameListRowAdditiveKeyDoesNotMaskMissingRequiredField() {
+  const QJsonArray rows = loadFixtureArray(QStringLiteral("game-list.json"));
+  QJsonObject obj = rows.at(0).toObject();
+  obj.insert(QStringLiteral("futureField"), QStringLiteral("ignored"));
+  obj.remove(QStringLiteral("hasOpenSeats"));
+
+  const auto result = GameListRow::fromJson(obj, u"row");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("hasOpenSeats")),
+           qPrintable(result.error()));
+  QVERIFY2(!result.error().contains(QStringLiteral("futureField")),
+           qPrintable(result.error()));
 }
 
 void GamesTests::answerRejectedFixtureDecodes() {
