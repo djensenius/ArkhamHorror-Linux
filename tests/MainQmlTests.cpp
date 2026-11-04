@@ -4,6 +4,8 @@
 // trailing "Try again ..." sentence), and never pushes the input hint below
 // the window.
 
+#include <QAccessible>
+#include <QAccessibleInterface>
 #include <QGuiApplication>
 #include <QObject>
 #include <QQmlApplicationEngine>
@@ -14,6 +16,7 @@
 #include <QTextOption>
 #include <QUrl>
 #include <QtTest>
+#include <algorithm>
 #include <memory>
 
 namespace {
@@ -26,27 +29,41 @@ class FakeCoordinator final : public QObject {
                  CONSTANT)
   Q_PROPERTY(
       QString selectedProfileBaseUrl READ selectedProfileBaseUrl CONSTANT)
-  Q_PROPERTY(bool serverMaintenance READ serverMaintenance CONSTANT)
+  Q_PROPERTY(bool serverMaintenance READ serverMaintenance NOTIFY
+                 serverMaintenanceChanged)
   Q_PROPERTY(QString diagnostic READ diagnostic CONSTANT)
 
 public:
-  explicit FakeCoordinator(QString diagnostic)
-      : m_diagnostic(std::move(diagnostic)) {}
+  explicit FakeCoordinator(
+      QString diagnostic, QString displayName = QStringLiteral("Arkham Horror"))
+      : m_diagnostic(std::move(diagnostic)),
+        m_displayName(std::move(displayName)) {}
 
   [[nodiscard]] QString stateDescription() const {
     return QStringLiteral("Server maintenance");
   }
   [[nodiscard]] QString selectedProfileDisplayName() const {
-    return QStringLiteral("Arkham Horror");
+    return m_displayName;
   }
   [[nodiscard]] QString selectedProfileBaseUrl() const {
     return QStringLiteral("https://arkhamhorror.app");
   }
-  [[nodiscard]] bool serverMaintenance() const { return true; }
+  [[nodiscard]] bool serverMaintenance() const { return m_serverMaintenance; }
+  void setServerMaintenance(bool serverMaintenance) {
+    if (m_serverMaintenance != serverMaintenance) {
+      m_serverMaintenance = serverMaintenance;
+      emit serverMaintenanceChanged();
+    }
+  }
   [[nodiscard]] QString diagnostic() const { return m_diagnostic; }
+
+signals:
+  void serverMaintenanceChanged();
 
 private:
   QString m_diagnostic;
+  QString m_displayName;
+  bool m_serverMaintenance = true;
 };
 
 } // namespace
@@ -60,17 +77,26 @@ private slots:
   void longMaintenanceNoticeIsBoundedAndScrollable();
   void shortMaintenanceNoticeIsShownWhole();
   void unbrokenMaintenanceNoticeWrapsWithinWidth();
+  void maintenanceNoticeRetryTimeIsReachableWithKeysAlone();
+  void longProfileNameStaysInsideTheStatusLabel();
+  void maintenanceNoticeReturnsFocusToTheCardItWasEnteredFrom();
+  void endingMaintenanceReturnsFocusFromTheNoticeToACard();
 
 private:
-  QQuickWindow *load(const QString &diagnostic, int height);
+  QQuickItem *focusNoticeFromThirdCard(QQuickWindow *window,
+                                       QQuickItem *notice);
+  QQuickWindow *
+  load(const QString &diagnostic, int height,
+       const QString &displayName = QStringLiteral("Arkham Horror"));
 
   std::unique_ptr<FakeCoordinator> m_coordinator;
   std::unique_ptr<QQmlApplicationEngine> m_engine;
 };
 
-QQuickWindow *MainQmlTests::load(const QString &diagnostic, int height) {
+QQuickWindow *MainQmlTests::load(const QString &diagnostic, int height,
+                                 const QString &displayName) {
   m_engine.reset();
-  m_coordinator = std::make_unique<FakeCoordinator>(diagnostic);
+  m_coordinator = std::make_unique<FakeCoordinator>(diagnostic, displayName);
   m_engine = std::make_unique<QQmlApplicationEngine>();
   m_engine->rootContext()->setContextProperty(
       QStringLiteral("sessionCoordinator"), m_coordinator.get());
@@ -183,6 +209,204 @@ void MainQmlTests::unbrokenMaintenanceNoticeWrapsWithinWidth() {
                           .arg(contentWidth)
                           .arg(text->width())));
   QVERIFY(text->property("lineCount").toInt() > 2);
+}
+
+void MainQmlTests::maintenanceNoticeRetryTimeIsReachableWithKeysAlone() {
+  // A server message at the parser's 1000-character cap, followed by the
+  // retry sentence the way ServerMaintenance::notice() composes it
+  // ("%1 Try again in %2."), overflows the notice; without a pointer the
+  // retry time must still be reachable from the destination cards.
+  const QString reason =
+      QStringLiteral("The server is down for planned maintenance. ")
+          .repeated(30)
+          .left(1000)
+          .trimmed();
+  QVERIFY(reason.size() > 990);
+  const QString diagnostic =
+      reason + QStringLiteral(" Try again in about 2 minutes.");
+  QQuickWindow *window = load(diagnostic, 800);
+  QVERIFY(window != nullptr);
+  window->requestActivate();
+  QVERIFY(QTest::qWaitForWindowActive(window));
+
+  auto *notice =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNotice"));
+  auto *text =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNoticeText"));
+  QVERIFY(notice != nullptr);
+  QVERIFY(text != nullptr);
+  QTRY_VERIFY(notice->height() > 0);
+  QCOMPARE(text->property("text").toString(), diagnostic);
+  auto *flickable = notice->property("contentItem").value<QQuickItem *>();
+  QVERIFY(flickable != nullptr);
+  // The retry sentence starts below the fold.
+  QVERIFY(text->height() > flickable->height());
+  QCOMPARE(flickable->property("contentY").toReal(), 0.0);
+
+  // The first destination card starts focused (a Button, not the notice).
+  QTRY_VERIFY(window->activeFocusItem() != nullptr);
+  QQuickItem *firstCard = window->activeFocusItem();
+  QVERIFY(firstCard->inherits("QQuickButton"));
+  QCOMPARE(firstCard->property("text").toString(), QStringLiteral("Connect"));
+
+  // Down from a card focuses the notice.
+  QTest::keyClick(window, Qt::Key_Down);
+  QTRY_VERIFY(notice->hasActiveFocus());
+  QCOMPARE(notice->property("activeFocusOnTab").toBool(), true);
+
+  // Down then scrolls it until the end of the text (the retry sentence) is
+  // inside the viewport.
+  const auto atEnd = [&] {
+    return flickable->property("contentY").toReal() + flickable->height() >=
+           text->height() - 0.5;
+  };
+  // Each press moves by the notice's own explicit step (not a style's
+  // built-in arrow handling).
+  const qreal step = notice->property("scrollStep").toReal();
+  QVERIFY(step > 0);
+  QTest::keyClick(window, Qt::Key_Down);
+  QCOMPARE(flickable->property("contentY").toReal(),
+           std::min(step, text->height() - flickable->height()));
+  for (int presses = 0; presses < 50 && !atEnd(); ++presses) {
+    QTest::keyClick(window, Qt::Key_Down);
+  }
+  QVERIFY2(atEnd(),
+           qPrintable(QStringLiteral("contentY %1 + height %2 < text %3")
+                          .arg(flickable->property("contentY").toReal())
+                          .arg(flickable->height())
+                          .arg(text->height())));
+  QVERIFY(notice->hasActiveFocus());
+  QVERIFY(flickable->property("contentY").toReal() > 0);
+  // A screen reader gets the whole text, retry sentence included.
+  QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(notice);
+  QVERIFY(iface != nullptr);
+  QCOMPARE(iface->text(QAccessible::Name), diagnostic);
+
+  // Up scrolls back to the top and then returns focus to the card.
+  for (int presses = 0; presses < 50 && notice->hasActiveFocus(); ++presses) {
+    QTest::keyClick(window, Qt::Key_Up);
+  }
+  QCOMPARE(flickable->property("contentY").toReal(), 0.0);
+  QTRY_VERIFY(firstCard->hasActiveFocus());
+}
+
+void MainQmlTests::longProfileNameStaysInsideTheStatusLabel() {
+  // A custom profile's display name has no length limit; the status label
+  // ("<state> — <profile>") must stay on one line inside the window and
+  // keep its full text for assistive technology.
+  const QString displayName =
+      QStringLiteral("My very long custom server profile ")
+          .repeated(9)
+          .left(300);
+  QCOMPARE(displayName.size(), 300);
+  QQuickWindow *window =
+      load(QStringLiteral("Back soon. Try again in about 2 minutes."), 800,
+           displayName);
+  QVERIFY(window != nullptr);
+
+  auto *status = window->findChild<QQuickItem *>(QStringLiteral("statusLabel"));
+  QVERIFY(status != nullptr);
+  QTRY_VERIFY(status->width() > 0);
+  const QString expected =
+      QStringLiteral("Server maintenance — %1").arg(displayName);
+  QCOMPARE(status->property("text").toString(), expected);
+  QVERIFY(status->isVisible());
+  QCOMPARE(status->property("elide").toInt(), int(Qt::ElideRight));
+  QVERIFY(status->property("truncated").toBool());
+  QCOMPARE(status->property("lineCount").toInt(), 1);
+
+  // The label (and its drawn text) fits the layout column, which itself
+  // sits inside the window.
+  QQuickItem *column = status->parentItem();
+  QVERIFY(column != nullptr);
+  QVERIFY(column->width() > 0);
+  QVERIFY(column->width() <= window->width());
+  QVERIFY2(status->x() + status->width() <= column->width() + 0.5,
+           qPrintable(QStringLiteral("label right %1 > column width %2")
+                          .arg(status->x() + status->width())
+                          .arg(column->width())));
+  QVERIFY(status->property("contentWidth").toReal() <= status->width() + 0.5);
+
+  // Label already exposes its text, so this only shows the full text stays
+  // available; the elide/truncation checks above guard the elision.
+  QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(status);
+  QVERIFY(iface != nullptr);
+  QCOMPARE(iface->text(QAccessible::Name), expected);
+}
+
+// Moves from the first card to the third ("Input guide") and then Down into
+// the notice with real key events; returns the third card (nullptr on
+// failure, with the failure already recorded).
+QQuickItem *MainQmlTests::focusNoticeFromThirdCard(QQuickWindow *window,
+                                                   QQuickItem *notice) {
+  window->requestActivate();
+  if (!QTest::qWaitForWindowActive(window)) {
+    QTest::qFail("window never became active", __FILE__, __LINE__);
+    return nullptr;
+  }
+  if (!QTest::qWaitFor([&] { return window->activeFocusItem() != nullptr; })) {
+    QTest::qFail("no initial focus", __FILE__, __LINE__);
+    return nullptr;
+  }
+  QTest::keyClick(window, Qt::Key_Right);
+  QTest::keyClick(window, Qt::Key_Right);
+  QQuickItem *thirdCard = window->activeFocusItem();
+  if (thirdCard == nullptr || !thirdCard->inherits("QQuickButton") ||
+      thirdCard->property("text").toString() != QStringLiteral("Input guide")) {
+    QTest::qFail("Right, Right did not reach the Input guide card", __FILE__,
+                 __LINE__);
+    return nullptr;
+  }
+  QTest::keyClick(window, Qt::Key_Down);
+  if (!QTest::qWaitFor([&] { return notice->hasActiveFocus(); })) {
+    QTest::qFail("Down from the Input guide card did not focus the notice",
+                 __FILE__, __LINE__);
+    return nullptr;
+  }
+  return thirdCard;
+}
+
+void MainQmlTests::maintenanceNoticeReturnsFocusToTheCardItWasEnteredFrom() {
+  QQuickWindow *window =
+      load(QStringLiteral("Back soon. Try again in about 2 minutes."), 800);
+  QVERIFY(window != nullptr);
+  auto *notice =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNotice"));
+  QVERIFY(notice != nullptr);
+  QTRY_VERIFY(notice->isVisible());
+
+  QQuickItem *thirdCard = focusNoticeFromThirdCard(window, notice);
+  QVERIFY(thirdCard != nullptr);
+  // A short notice is already at the top: one Up returns to that same card,
+  // not the first one.
+  QTest::keyClick(window, Qt::Key_Up);
+  QTRY_VERIFY(thirdCard->hasActiveFocus());
+  QVERIFY(!notice->hasActiveFocus());
+}
+
+void MainQmlTests::endingMaintenanceReturnsFocusFromTheNoticeToACard() {
+  QQuickWindow *window =
+      load(QStringLiteral("Back soon. Try again in about 2 minutes."), 800);
+  QVERIFY(window != nullptr);
+  auto *notice =
+      window->findChild<QQuickItem *>(QStringLiteral("maintenanceNotice"));
+  QVERIFY(notice != nullptr);
+  QTRY_VERIFY(notice->isVisible());
+
+  QQuickItem *thirdCard = focusNoticeFromThirdCard(window, notice);
+  QVERIFY(thirdCard != nullptr);
+
+  // Maintenance ends while the notice holds focus: the notice hides and
+  // focus goes back to the card it was entered from, so directional input
+  // keeps working.
+  m_coordinator->setServerMaintenance(false);
+  QTRY_VERIFY(!notice->isVisible());
+  QTRY_VERIFY(thirdCard->hasActiveFocus());
+  QVERIFY(!notice->hasActiveFocus());
+  QTest::keyClick(window, Qt::Key_Left);
+  QTRY_VERIFY(window->activeFocusItem() != nullptr);
+  QCOMPARE(window->activeFocusItem()->property("text").toString(),
+           QStringLiteral("Browse fixtures"));
 }
 
 QTEST_MAIN(MainQmlTests)
