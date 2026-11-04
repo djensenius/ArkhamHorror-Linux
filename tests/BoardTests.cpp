@@ -767,6 +767,16 @@ private slots:
         << QByteArray(R"("encounterDeckSize": 26)")
         << QByteArray(R"("encounterDeckSize": -26)")
         << u"getGame.game.encounterDeckSize: must not be negative, got -26"_s;
+    QTest::newRow("missing playerId") << QByteArray(R"("Solo",
+  "playerId")") << QByteArray(R"("Solo",
+  "playerIdX")") << uR"(getGame.playerId: missing required field "playerId")"_s;
+    QTest::newRow("missing game")
+        << QByteArray(R"("game": {)") << QByteArray(R"("gameX": {)")
+        << uR"(getGame.game: missing required field "game")"_s;
+    QTest::newRow("missing multiplayerMode")
+        << QByteArray(R"("multiplayerMode": "Solo")")
+        << QByteArray(R"("multiplayerModeX": "Solo")")
+        << uR"(getGame.multiplayerMode: missing required field "multiplayerMode")"_s;
   }
 
   void getGameEnvelopeNullableAndRejected() {
@@ -869,6 +879,69 @@ private slots:
     QVERIFY2(campaignGame,
              qPrintable(campaignGame ? QString() : campaignGame.error()));
     QCOMPARE(campaignGame->chaosBag(), nullptr);
+  }
+
+  // Map entries keep wire order even when their keys are in descending
+  // order, and each lookup returns that entry's own element.
+  void publicGameMapsKeepWireOrder() {
+    const QByteArray secondLocation =
+        QByteArray(kLocation)
+            .replace(R"("id":"782de537-8f5d-4eda-b849-2362e28402e5")",
+                     R"("id":"00000000-0000-0000-0000-000000000032")")
+            .replace(R"("label":"study")", R"("label":"hallway")");
+    const QByteArray secondInvestigator =
+        QByteArray(kInvestigator)
+            .replace(R"("id":"c01001","cardCode":"c01001")",
+                     R"("id":"c00002","cardCode":"c00002")")
+            .replace(R"("title":"Roland Banks")", R"("title":"Second")");
+    QByteArray json = mutated(u"game"_s, R"(}},"investigators":{)",
+                              R"(},"00000000-0000-0000-0000-000000000032":)" +
+                                  secondLocation + R"(},"investigators":{)");
+    const QByteArray actsFrom = R"(}},"acts":{)";
+    const qsizetype at = json.indexOf(actsFrom);
+    QVERIFY(at >= 0);
+    json.replace(at, actsFrom.size(),
+                 R"(},"c00002":)" + secondInvestigator + R"(},"acts":{)");
+
+    const auto game = PublicGame::fromRawBytes(json, u"game");
+    QVERIFY2(game, qPrintable(game ? QString() : game.error()));
+
+    QCOMPARE(game->locations().size(), 2);
+    QCOMPARE(game->locations()[0].id().value(),
+             u"782de537-8f5d-4eda-b849-2362e28402e5"_s);
+    QCOMPARE(game->locations()[1].id().value(),
+             u"00000000-0000-0000-0000-000000000032"_s);
+    for (const Location &location : game->locations()) {
+      const Location *found = game->location(location.id());
+      QCOMPARE(found, &location);
+    }
+    QCOMPARE(game->location(game->locations()[0].id())->label(), u"study"_s);
+    QCOMPARE(game->location(game->locations()[1].id())->label(), u"hallway"_s);
+
+    QCOMPARE(game->investigators().size(), 2);
+    QCOMPARE(game->investigators()[0].id().value(), u"c01001"_s);
+    QCOMPARE(game->investigators()[1].id().value(), u"c00002"_s);
+    for (const Investigator &investigator : game->investigators()) {
+      const Investigator *found = game->investigator(investigator.id());
+      QCOMPARE(found, &investigator);
+    }
+    QCOMPARE(game->investigator(game->investigators()[0].id())->name().title,
+             u"Roland Banks"_s);
+    QCOMPARE(game->investigator(game->investigators()[1].id())->name().title,
+             u"Second"_s);
+  }
+
+  // Tolerated mode shapes: an extra "These" key beside "That" is an ignored
+  // additive key, so the mode is still ScenarioOnly.
+  void gameModeToleratesExtraTheseKey() {
+    const auto mode = GameMode::fromRawBytes(
+        mutated(u"mode"_s, R"({"That":)", R"({"These":{"x":1},"That":)"),
+        u"mode");
+    QVERIFY2(mode, qPrintable(mode ? QString() : mode.error()));
+    QCOMPARE(mode->kind(), GameMode::Kind::ScenarioOnly);
+    QVERIFY(!mode->campaign().has_value());
+    QVERIFY(mode->scenario().has_value());
+    QCOMPARE(mode->scenario()->id().value(), u"c01104"_s);
   }
 
   // The minimal document: turn zero, a null phase step, and an uppercase
@@ -1580,6 +1653,26 @@ private slots:
         u"x.agendas.c01105.doom: must not be negative, got -1"_s);
     row("game missing agendas", u"game"_s, R"("agendas":)", R"("agendasX":)",
         uR"(x.agendas: missing required field "agendas")"_s);
+    row("game missing tag", u"game"_s, R"("tag":"PublicGame",)", "",
+        uR"(x.tag: missing required field "tag")"_s);
+    row("game non-string tag", u"game"_s, R"("tag":"PublicGame")", R"("tag":1)",
+        u"x.tag: expected string, got number"_s);
+    row("game FailedToLoadGame tag", u"game"_s, R"("tag":"PublicGame")",
+        R"("tag":"FailedToLoadGame")",
+        uR"(x.tag: expected "PublicGame", got "FailedToLoadGame")"_s);
+    row("game missing id", u"game"_s,
+        R"("id":"00000000-0000-0000-0000-000000000003",)", "",
+        uR"(x.id: missing required field "id")"_s);
+    row("game missing name", u"game"_s, R"("name":"Contract fixture game",)",
+        "", uR"(x.name: missing required field "name")"_s);
+    row("game missing locations", u"game"_s, R"("locations":{)",
+        R"("locationsX":{)",
+        uR"(x.locations: missing required field "locations")"_s);
+    row("game missing investigators", u"game"_s,
+        R"("investigators":{"c01001":)", R"("investigatorsX":{"c01001":)",
+        uR"(x.investigators: missing required field "investigators")"_s);
+    row("game missing acts", u"game"_s, R"("acts":{)", R"("actsX":{)",
+        uR"(x.acts: missing required field "acts")"_s);
   }
 
   void malformedInputIsRejected() {

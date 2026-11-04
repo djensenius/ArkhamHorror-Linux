@@ -1139,6 +1139,10 @@ public:
 
   [[nodiscard]] static ValueOrError<ServerMessage>
   fromRawJson(const Json::Value &v, QStringView path);
+  // A GameUpdate whose `contents` fail to decode as PublicGame fails the
+  // whole message (there is no partial snapshot). Callers should treat that
+  // as a non-fatal frame error: log it and resync through GetGame, without
+  // closing the connection.
   [[nodiscard]] static ValueOrError<ServerMessage>
   fromRawBytes(QByteArrayView bytes, QStringView path);
 
