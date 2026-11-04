@@ -41,6 +41,14 @@ const QList<GovernedFixtureDigest> &governedFixtureDigests() {
        QStringLiteral(
            "fabfe52fd38ab86c7c210c681205d6aa2c992200a798063b982ba0a0aefcfae"
            "6")},
+      {QStringLiteral("fixtures/get-game.json"),
+       QStringLiteral(
+           "21ede54dd82f648d1487b8aae3299f9f37e5b4e2085f6c269d5cb9f5a706289"
+           "2")},
+      {QStringLiteral("fixtures/game-update.json"),
+       QStringLiteral(
+           "d53eb5492e82698f393921d3d8d033f13f5d54df50453d0b2095bec043a6757"
+           "e")},
       {QStringLiteral("fixtures/campaign-catalog.json"),
        QStringLiteral(
            "1319f85f8d709c2e7134586621da42cb376048154cc5498e3f24a395c365c25"

@@ -101,12 +101,17 @@ ROOT_DOCUMENTS: tuple[str, ...] = ("contracts/manifest.json",)
 # no C++ type decodes strictly against it. fixtures/answer-rejected.json and
 # fixtures/room-closed.json are likewise consumed directly by the minimal
 # ServerMessage decoder without adopting the full public-game/server-message
-# schema closure. These files are still vendored/governed, so they are
-# listed explicitly here rather than silently excluded.
+# schema closure. fixtures/get-game.json and fixtures/game-update.json are
+# the REST and WebSocket board snapshots the Board.h leaf decoders (chaos
+# bag, phase, act, agenda) are tested against, again without adopting the
+# public-game schema closure. These files are still vendored/governed, so
+# they are listed explicitly here rather than silently excluded.
 ROOT_EXTRA_FIXTURES: tuple[str, ...] = (
     "contracts/fixtures/capabilities.json",
     "contracts/fixtures/answer-rejected.json",
     "contracts/fixtures/room-closed.json",
+    "contracts/fixtures/get-game.json",
+    "contracts/fixtures/game-update.json",
 )
 
 # Directories scanned for *extra*, ungoverned files (see module docstring,

@@ -1,0 +1,1676 @@
+{
+  "contents": {
+    "activeCard": null,
+    "activeInvestigatorId": "c01001",
+    "activePlayerId": "00000000-0000-0000-0000-000000000001",
+    "acts": {
+      "c01108": {
+        "advanceCost": {
+          "contents": [
+            {
+              "contents": 2,
+              "tag": "PerPlayer"
+            },
+            {
+              "tag": "Anywhere"
+            }
+          ],
+          "tag": "GroupClueCost"
+        },
+        "breaches": null,
+        "cardId": "419015cc-abb7-41d0-9795-7ec1d981955f",
+        "cardsUnderneath": [],
+        "deckId": 1,
+        "flipped": false,
+        "id": "c01108",
+        "keys": [],
+        "meta": null,
+        "modifiers": [],
+        "sequence": [
+          1,
+          "A"
+        ],
+        "tokens": [],
+        "treacheries": [],
+        "usedWheelOfFortuneX": false
+      }
+    },
+    "agendas": {
+      "c01105": {
+        "cardId": "d96ae83d-bf74-48e1-8233-78b565f30716",
+        "cardsUnderneath": [],
+        "deckId": 1,
+        "doom": 0,
+        "doomThreshold": {
+          "contents": 3,
+          "tag": "Static"
+        },
+        "flipped": false,
+        "id": "c01105",
+        "meta": null,
+        "modifiers": [],
+        "removeDoomMatchers": {
+          "removeDoomActs": {
+            "tag": "AnyAct"
+          },
+          "removeDoomAgendas": {
+            "tag": "AnyAgenda"
+          },
+          "removeDoomAssets": {
+            "tag": "AnyAsset"
+          },
+          "removeDoomEnemies": {
+            "tag": "AnyEnemy"
+          },
+          "removeDoomEvents": {
+            "tag": "AnyEvent"
+          },
+          "removeDoomInvestigators": {
+            "tag": "Anyone"
+          },
+          "removeDoomLocations": {
+            "tag": "Anywhere"
+          },
+          "removeDoomSkills": {
+            "tag": "AnySkill"
+          },
+          "removeDoomTreacheries": {
+            "tag": "AnyTreachery"
+          }
+        },
+        "sequence": {
+          "agendaSequenceSide": "A",
+          "agendaSequenceStep": 1
+        },
+        "tokens": [],
+        "treacheries": [],
+        "usedWheelOfFortuneX": false
+      }
+    },
+    "assets": {},
+    "cards": {},
+    "concealed": {},
+    "encounterDeckSize": 26,
+    "enemies": {},
+    "enemyAttackTargets": [],
+    "events": {},
+    "focusedCards": [],
+    "focusedChaosTokens": [],
+    "focusedTarotCards": [],
+    "foundCards": {},
+    "gameSettings": {
+      "settingsAbilitiesCannotReactToThemselves": true,
+      "settingsAchievementsEnabled": true,
+      "settingsAsIfRuling": "chapter1",
+      "settingsCustomRandomWeaknessPools": {},
+      "settingsRolledUltimatumOrBoon": null,
+      "settingsScreamedAllies": [],
+      "settingsStrictAsIfAt": false,
+      "settingsUltimatumsAndBoons": [],
+      "settingsUltimatumsAndBoonsEnabled": true
+    },
+    "gameState": {
+      "tag": "IsActive"
+    },
+    "git": "contract-fixture",
+    "highlightedCards": [],
+    "id": "00000000-0000-0000-0000-000000000003",
+    "inAction": false,
+    "inSetup": false,
+    "investigators": {
+      "c01001": {
+        "actionsPerformed": [],
+        "actionsTaken": [],
+        "additionalActions": [],
+        "agility": 2,
+        "art": "c01001",
+        "assets": [],
+        "assignedHealthDamage": 0,
+        "assignedHealthHeal": [],
+        "assignedSanityDamage": 0,
+        "assignedSanityHeal": [],
+        "beganRoundAt": "782de537-8f5d-4eda-b849-2362e28402e5",
+        "bondedCards": [],
+        "cannotDiscoverClues": null,
+        "cannotSpendClues": null,
+        "cardCode": "c01001",
+        "cardsUnderneath": [],
+        "class": "Guardian",
+        "combat": 4,
+        "commitProhibitions": [],
+        "connectedLocations": [],
+        "deck": [],
+        "deckBuildingAdjustments": [],
+        "deckSize": 0,
+        "deckUrl": null,
+        "decks": [],
+        "defeated": false,
+        "discard": [],
+        "discarding": null,
+        "discover": null,
+        "drawing": null,
+        "drawnCards": [],
+        "drivenInsane": false,
+        "eliminated": false,
+        "endedTurn": false,
+        "engagedEnemies": [],
+        "events": [],
+        "excludeFromMulligan": [],
+        "form": {
+          "tag": "RegularForm"
+        },
+        "formMeta": null,
+        "hand": [],
+        "handSize": 8,
+        "health": 9,
+        "horrorHealed": 0,
+        "id": "c01001",
+        "ignoredPerformedActions": [],
+        "intellect": 3,
+        "keys": [],
+        "killed": false,
+        "log": {
+          "crossedOut": [],
+          "options": [],
+          "orderedKeys": [],
+          "partners": {},
+          "recorded": [],
+          "recordedCounts": [],
+          "recordedSets": []
+        },
+        "mentalTrauma": 0,
+        "meta": null,
+        "modifiers": [],
+        "movement": null,
+        "mulligansTaken": 0,
+        "mutated": null,
+        "name": {
+          "subtitle": "The Fed",
+          "title": "Roland Banks"
+        },
+        "physicalTrauma": 0,
+        "placement": {
+          "contents": "782de537-8f5d-4eda-b849-2362e28402e5",
+          "tag": "AtLocation"
+        },
+        "playProhibitions": [],
+        "playerId": "00000000-0000-0000-0000-000000000001",
+        "previousLocation": null,
+        "remainingActions": 3,
+        "resigned": false,
+        "sanity": 5,
+        "scarletKeys": [],
+        "sealedChaosTokens": [],
+        "seals": [],
+        "search": null,
+        "settings": {
+          "globalSettings": {
+            "ignoreUnrelatedSkillTestTriggers": true
+          },
+          "perCardSettings": {}
+        },
+        "sideDeck": null,
+        "skills": [],
+        "skippedWindow": false,
+        "slots": [
+          [
+            "HandSlot",
+            [
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              },
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              }
+            ]
+          ],
+          [
+            "BodySlot",
+            [
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              }
+            ]
+          ],
+          [
+            "AllySlot",
+            [
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              }
+            ]
+          ],
+          [
+            "AccessorySlot",
+            [
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              }
+            ]
+          ],
+          [
+            "ArcaneSlot",
+            [
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              },
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              }
+            ]
+          ],
+          [
+            "TarotSlot",
+            [
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              }
+            ]
+          ],
+          [
+            "HeadSlot",
+            [
+              {
+                "assets": [],
+                "source": {
+                  "contents": "c01001",
+                  "tag": "InvestigatorSource"
+                },
+                "tag": "Slot"
+              }
+            ]
+          ]
+        ],
+        "spentXp": 0,
+        "startsWith": [],
+        "startsWithInHand": [],
+        "supplies": [],
+        "taboo": null,
+        "tokens": [],
+        "traits": [
+          "Agency",
+          "Detective"
+        ],
+        "treacheries": [],
+        "unhealedHorrorThisRound": 0,
+        "usedAbilities": [],
+        "usedAdditionalActions": [],
+        "willpower": 3,
+        "xp": 0
+      }
+    },
+    "killedInvestigators": {},
+    "leadInvestigatorId": "c01001",
+    "locations": {
+      "782de537-8f5d-4eda-b849-2362e28402e5": {
+        "assets": [],
+        "beingRemoved": false,
+        "brazier": null,
+        "breaches": null,
+        "canBeFlipped": false,
+        "cardCode": "c01111",
+        "cardId": "4db426b4-641e-4812-8d10-27fc6470ef6e",
+        "cardsUnderneath": [],
+        "concealedCards": [],
+        "connectedLocations": [],
+        "connectedMatchers": [],
+        "connectsTo": [],
+        "costToEnterUnrevealed": {
+          "tag": "Free"
+        },
+        "directions": [],
+        "enemies": [],
+        "events": [],
+        "floodLevel": null,
+        "globalMeta": {},
+        "grantedConnections": [],
+        "group": null,
+        "id": "782de537-8f5d-4eda-b849-2362e28402e5",
+        "investigateSkill": "SkillIntellect",
+        "investigators": [
+          "c01001"
+        ],
+        "keys": [],
+        "label": "study",
+        "meta": null,
+        "modifiers": [],
+        "outOfGame": false,
+        "placedChaosTokens": [],
+        "placement": null,
+        "position": null,
+        "revealClues": {
+          "contents": 2,
+          "tag": "PerPlayer"
+        },
+        "revealed": true,
+        "revealedConnectedMatchers": [],
+        "revealedSymbol": "Circle",
+        "scarletKeys": [],
+        "sealedChaosTokens": [],
+        "seals": [],
+        "shroud": {
+          "contents": 2,
+          "tag": "Static"
+        },
+        "symbol": "Circle",
+        "tokens": [
+          [
+            "Clue",
+            2
+          ]
+        ],
+        "treacheries": [],
+        "withoutClues": false
+      }
+    },
+    "log": [
+      {
+        "contents": [
+          "Contract fixture log entry.",
+          null
+        ],
+        "tag": "LogRowLegacy"
+      }
+    ],
+    "mode": {
+      "That": {
+        "actStack": [
+          [
+            1,
+            [
+              {
+                "contents": {
+                  "addedPeril": false,
+                  "cardCode": "c01108",
+                  "facedown": null,
+                  "id": "419015cc-abb7-41d0-9795-7ec1d981955f",
+                  "isFlipped": false,
+                  "originalCardCode": "c01108",
+                  "owner": null
+                },
+                "tag": "EncounterCard"
+              },
+              {
+                "contents": {
+                  "addedPeril": false,
+                  "cardCode": "c01109",
+                  "facedown": null,
+                  "id": "80612d10-ed14-4078-ae89-d9e1a969eefb",
+                  "isFlipped": false,
+                  "originalCardCode": "c01109",
+                  "owner": null
+                },
+                "tag": "EncounterCard"
+              },
+              {
+                "contents": {
+                  "addedPeril": false,
+                  "cardCode": "c01110",
+                  "facedown": null,
+                  "id": "c6d9557a-3dc1-4a84-9fd3-2c2d2e6074d0",
+                  "isFlipped": false,
+                  "originalCardCode": "c01110",
+                  "owner": null
+                },
+                "tag": "EncounterCard"
+              }
+            ]
+          ]
+        ],
+        "activeEncounterDeck": "RegularEncounterDeck",
+        "additionalReferences": [],
+        "agendaStack": [
+          [
+            1,
+            [
+              {
+                "contents": {
+                  "addedPeril": false,
+                  "cardCode": "c01105",
+                  "facedown": null,
+                  "id": "d96ae83d-bf74-48e1-8233-78b565f30716",
+                  "isFlipped": false,
+                  "originalCardCode": "c01105",
+                  "owner": null
+                },
+                "tag": "EncounterCard"
+              },
+              {
+                "contents": {
+                  "addedPeril": false,
+                  "cardCode": "c01106",
+                  "facedown": null,
+                  "id": "ab818618-eff8-423d-add8-73f7319e42d3",
+                  "isFlipped": false,
+                  "originalCardCode": "c01106",
+                  "owner": null
+                },
+                "tag": "EncounterCard"
+              },
+              {
+                "contents": {
+                  "addedPeril": false,
+                  "cardCode": "c01107",
+                  "facedown": null,
+                  "id": "9b8374d5-f7a0-498c-b41a-d029f4809929",
+                  "isFlipped": false,
+                  "originalCardCode": "c01107",
+                  "owner": null
+                },
+                "tag": "EncounterCard"
+              }
+            ]
+          ]
+        ],
+        "campaignStep": null,
+        "cardsNextToActDeck": [],
+        "cardsNextToAgendaDeck": [],
+        "cardsUnderActDeck": [],
+        "cardsUnderAgendaDeck": [],
+        "cardsUnderScenarioReference": [],
+        "chaosBag": {
+          "chaosTokens": [
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "MinusTwo",
+              "chaosTokenId": "22e6cf42-cc5c-4a9c-b9d1-f71e594e0d60",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "PlusOne",
+              "chaosTokenId": "7de287c6-46a5-4424-98a2-1d0f053c17c9",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "Zero",
+              "chaosTokenId": "834075fe-f952-4cdb-a3d8-19ac55027ac0",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "MinusOne",
+              "chaosTokenId": "8c3b094c-6b83-4439-ba8d-e552083d0c41",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "PlusOne",
+              "chaosTokenId": "97eabd27-7b4b-4019-95fa-14b2b2bdff29",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "MinusOne",
+              "chaosTokenId": "99b57d77-bf24-4795-b735-560aa377048c",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "Skull",
+              "chaosTokenId": "a8f4fc20-8001-48a1-84ac-8a86f65e4c7f",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "ElderSign",
+              "chaosTokenId": "b2821253-31ae-4578-9820-01ceb70ff1f4",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "MinusTwo",
+              "chaosTokenId": "b6307786-5c79-42ad-a2d2-c039348aa3bc",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "Zero",
+              "chaosTokenId": "c07cac59-2153-411f-8ba6-0a88ce64f998",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "Tablet",
+              "chaosTokenId": "c6097c8b-b3eb-4315-9a25-3b6844209d92",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "AutoFail",
+              "chaosTokenId": "e021c642-e1f7-4da1-9e62-01093ca44fba",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "Skull",
+              "chaosTokenId": "e0c5521a-6863-4537-bf24-4a55cf4f5007",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "MinusOne",
+              "chaosTokenId": "f6381138-5e55-469a-b8ef-98928a0ea9d9",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "Zero",
+              "chaosTokenId": "f809e472-5e4f-40f5-9180-a90f3c37f874",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "Cultist",
+              "chaosTokenId": "fe1ebefe-cb12-4529-84e3-5dcc2b4f7258",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            }
+          ],
+          "choice": null,
+          "debugRevealedChaosTokens": [],
+          "forceDraw": [],
+          "pendingRequests": [],
+          "revealedChaosTokens": [],
+          "setAsideChaosTokens": [],
+          "tokenPool": [
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "21abd79b-fbff-4fe2-998d-1fd8358cab5f",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "ad208601-9150-4e38-880d-d505a205332c",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "247e3ee7-9586-4758-b17d-b3f67374cef8",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "7eeabffa-7b55-4856-82a7-c07dc9f01e06",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "c76a2f28-f8c1-409d-b935-685b2561d3bd",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "bb9ba068-f670-4cbe-a21d-649c128b7bb6",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "1353e60c-9e48-45c4-8c59-dd3c49773d76",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "2cb54173-56c8-457d-8173-cd6fca9e52d0",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "71646569-0e1d-42fd-a605-538598930d22",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BlessToken",
+              "chaosTokenId": "61f25e1e-e14f-4cd6-bcb3-8953baa361b8",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "0282e92e-b7e7-4c29-8f73-c1d3829a3e3f",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "f96492d2-93fc-40f8-98e7-c1c4c76fc4cd",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "1b1db2d6-f12c-42dc-9646-2e8a0a2d8168",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "0e9562fa-6030-46a7-86e6-3bb1a75ef0d9",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "6e3ed21e-2003-4eb9-92ec-43cedafefc05",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "08bdf750-b40b-48ca-a788-ee50e827063d",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "69d30622-0a20-4a86-91dc-eed6ffc63018",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "eba6294e-d3c9-4b82-8fdd-f900ceaf8730",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "fc10c06b-24d6-41af-80fc-6a672eb73f6a",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "CurseToken",
+              "chaosTokenId": "28b90616-6df1-4da8-8801-485b92c8cd4e",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "ceb1975c-5f39-48d4-9c62-d91ead090e51",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "d56e5d05-eb91-4c54-8d60-a7e3500b3458",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "903e9601-4552-4c02-87ed-32b3881e356d",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "7c31d332-2cad-4bc5-a2ca-e2c4320d7d85",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "8c9538c1-cd2a-49cd-9e76-c2130315b9dd",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "30d03361-7c24-4b87-ab4f-b2010673d89d",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "8ff115ea-b6b4-4170-b912-9d402689333a",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "FrostToken",
+              "chaosTokenId": "5bee362a-aa80-41a9-a26b-1e33b52ad0a1",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "366ad45d-accd-42d1-bc21-136333443154",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "152ad408-e8da-4200-bf3e-c9eef9040a5d",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "753c2ede-e8da-4b19-a147-b7b264664493",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "79d23bfb-42c4-4642-947e-d666ef1262d1",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "8cbf34ba-ef1c-4457-85eb-ef5f1d1d1982",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "c171cc24-e6bb-421c-8e64-2a386354a857",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "edaf4c59-4641-477c-a668-9b16e0d90503",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "ce18cedd-06f0-44d8-8fb3-b0dd60c717e0",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "32dacf59-b919-4ea3-828f-3c60fc511771",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "2daa9202-c96b-48f6-aa0b-28ce96f38d53",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "5e4116f0-9c10-4a50-aa6f-eca0c5c821c3",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            },
+            {
+              "chaosTokenCancelled": false,
+              "chaosTokenFace": "BloodToken",
+              "chaosTokenId": "a7c6a0f6-d22e-4bb5-95dd-330e174948b8",
+              "chaosTokenRevealedBy": null,
+              "chaosTokenSealed": false
+            }
+          ],
+          "totalRevealedChaosTokens": []
+        },
+        "completedActStack": [],
+        "completedAgendaStack": [],
+        "counts": [],
+        "customChaosBags": {},
+        "deckDiscards": [],
+        "decks": [],
+        "decksLayout": [
+          "agenda1 act1"
+        ],
+        "defeatedEnemies": {},
+        "difficulty": "Easy",
+        "discard": [],
+        "encounterDeck": [
+          {
+            "addedPeril": false,
+            "cardCode": "c01162",
+            "facedown": null,
+            "id": "99b08055-2c9a-40c3-8a92-b5daf18362dd",
+            "isFlipped": false,
+            "originalCardCode": "c01162",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01164",
+            "facedown": null,
+            "id": "b1835259-eed0-471b-85bf-274ed9a73ff2",
+            "isFlipped": false,
+            "originalCardCode": "c01164",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01168",
+            "facedown": null,
+            "id": "4a27d0c3-3aef-4f30-b62b-38aa786360b8",
+            "isFlipped": false,
+            "originalCardCode": "c01168",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01163",
+            "facedown": null,
+            "id": "4ed3bce6-2603-41d8-a857-884fb80cc766",
+            "isFlipped": false,
+            "originalCardCode": "c01163",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01166",
+            "facedown": null,
+            "id": "00848caf-8b40-49f4-ad6d-7a255ef89bba",
+            "isFlipped": false,
+            "originalCardCode": "c01166",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01160",
+            "facedown": null,
+            "id": "068ee14e-1462-4cac-8959-79256132c80c",
+            "isFlipped": false,
+            "originalCardCode": "c01160",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01166",
+            "facedown": null,
+            "id": "383140d2-0def-4605-9d59-7e5a3e9588f7",
+            "isFlipped": false,
+            "originalCardCode": "c01166",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01165",
+            "facedown": null,
+            "id": "a409897d-57c8-4601-9ef8-cc8a628d1e9f",
+            "isFlipped": false,
+            "originalCardCode": "c01165",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01162",
+            "facedown": null,
+            "id": "2e908900-c390-439d-88d5-62d1695a9dd8",
+            "isFlipped": false,
+            "originalCardCode": "c01162",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01162",
+            "facedown": null,
+            "id": "b63ec5e3-7de1-410b-b2a8-0f1e78fe6f8a",
+            "isFlipped": false,
+            "originalCardCode": "c01162",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01161",
+            "facedown": null,
+            "id": "53915cdf-0e0a-4789-b648-80efcd09e176",
+            "isFlipped": false,
+            "originalCardCode": "c01161",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01119",
+            "facedown": null,
+            "id": "07f42c16-f9e7-4295-b542-9b7099f00194",
+            "isFlipped": false,
+            "originalCardCode": "c01119",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01167",
+            "facedown": null,
+            "id": "607fc845-f312-4045-b010-ebf0f5f757e9",
+            "isFlipped": false,
+            "originalCardCode": "c01167",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01164",
+            "facedown": null,
+            "id": "5d82cf71-0d75-49b3-929c-b5eee2fb9c98",
+            "isFlipped": false,
+            "originalCardCode": "c01164",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01160",
+            "facedown": null,
+            "id": "be86285f-5dbc-4548-82cd-d2d49d83245a",
+            "isFlipped": false,
+            "originalCardCode": "c01160",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01163",
+            "facedown": null,
+            "id": "89db5132-ab9c-4a70-8ba4-3384faa9b61a",
+            "isFlipped": false,
+            "originalCardCode": "c01163",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01163",
+            "facedown": null,
+            "id": "a8f37ec5-2273-488f-9e0c-58a059702402",
+            "isFlipped": false,
+            "originalCardCode": "c01163",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01160",
+            "facedown": null,
+            "id": "d8f13744-5939-4729-a04d-62db35bf6724",
+            "isFlipped": false,
+            "originalCardCode": "c01160",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01159",
+            "facedown": null,
+            "id": "7482d579-f5a4-4889-b254-587bf247cd0e",
+            "isFlipped": false,
+            "originalCardCode": "c01159",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01166",
+            "facedown": null,
+            "id": "5e523351-e8cc-4b39-998a-3397175dd253",
+            "isFlipped": false,
+            "originalCardCode": "c01166",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01165",
+            "facedown": null,
+            "id": "2c8edfb4-bb91-46be-88c6-eacc9abd3ece",
+            "isFlipped": false,
+            "originalCardCode": "c01165",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01168",
+            "facedown": null,
+            "id": "83829770-92c1-422c-933b-b9c289bee414",
+            "isFlipped": false,
+            "originalCardCode": "c01168",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01159",
+            "facedown": null,
+            "id": "dad693e5-9a0a-4b0c-bfb8-a30c1b73bebd",
+            "isFlipped": false,
+            "originalCardCode": "c01159",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01118",
+            "facedown": null,
+            "id": "04972ef0-4040-4c62-9675-a3651bbe3f11",
+            "isFlipped": false,
+            "originalCardCode": "c01118",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01159",
+            "facedown": null,
+            "id": "ac2f6193-82e5-4b07-b7b3-5ae26d597b2a",
+            "isFlipped": false,
+            "originalCardCode": "c01159",
+            "owner": null
+          },
+          {
+            "addedPeril": false,
+            "cardCode": "c01167",
+            "facedown": null,
+            "id": "65fa101a-e3df-4d2d-8b4b-fa49daf635e8",
+            "isFlipped": false,
+            "originalCardCode": "c01167",
+            "owner": null
+          }
+        ],
+        "encounterDecks": [],
+        "grid": {
+          "gridAbove": [
+            [
+              [
+                null
+              ],
+              null,
+              [
+                null
+              ]
+            ]
+          ],
+          "gridBelow": [
+            [
+              [
+                null
+              ],
+              null,
+              [
+                null
+              ]
+            ]
+          ],
+          "gridCenter": [
+            [
+              null
+            ],
+            null,
+            [
+              null
+            ]
+          ]
+        },
+        "hasEncounterDeck": true,
+        "id": "c01104",
+        "inResolution": false,
+        "inShuffle": false,
+        "isPrelude": false,
+        "isSideStory": false,
+        "keys": [],
+        "locationGroups": [],
+        "locationLayout": [
+          "   .   attic   .     ",
+          " study hallway parlor",
+          "   .   cellar  .     "
+        ],
+        "log": [],
+        "meta": null,
+        "name": {
+          "subtitle": null,
+          "title": "The Gathering"
+        },
+        "noRemainingInvestigatorsHandler": {
+          "tag": "ScenarioTarget"
+        },
+        "options": null,
+        "playerDecks": {},
+        "reference": "c01104",
+        "resignedCardCodes": [],
+        "resolvedStories": [],
+        "scope": "theGathering",
+        "sealedChaosTokens": [],
+        "search": null,
+        "setAsideCards": [
+          {
+            "contents": {
+              "addedPeril": false,
+              "cardCode": "c01116",
+              "facedown": null,
+              "id": "fe84f4a2-4f27-4e0f-bbe8-932b2f204383",
+              "isFlipped": false,
+              "originalCardCode": "c01116",
+              "owner": null
+            },
+            "tag": "EncounterCard"
+          },
+          {
+            "contents": {
+              "cardCode": "c01117",
+              "chained": null,
+              "customizations": [],
+              "errata": null,
+              "facedown": null,
+              "id": "20708e99-71a5-46c4-bf16-c3cb294f8e48",
+              "meta": null,
+              "mutated": null,
+              "originalCardCode": "c01117",
+              "owner": null,
+              "tabooList": null
+            },
+            "tag": "PlayerCard"
+          },
+          {
+            "contents": {
+              "addedPeril": false,
+              "cardCode": "c01113",
+              "facedown": null,
+              "id": "08cede8e-791b-405b-956e-aeac627e77ed",
+              "isFlipped": true,
+              "originalCardCode": "c01113",
+              "owner": null
+            },
+            "tag": "EncounterCard"
+          },
+          {
+            "contents": {
+              "addedPeril": false,
+              "cardCode": "c01114",
+              "facedown": null,
+              "id": "135d3e24-8e3e-462d-89be-8c1e464e4016",
+              "isFlipped": true,
+              "originalCardCode": "c01114",
+              "owner": null
+            },
+            "tag": "EncounterCard"
+          },
+          {
+            "contents": {
+              "addedPeril": false,
+              "cardCode": "c01115",
+              "facedown": null,
+              "id": "fffd93df-f739-40cf-bcbb-d0d003409306",
+              "isFlipped": true,
+              "originalCardCode": "c01115",
+              "owner": null
+            },
+            "tag": "EncounterCard"
+          },
+          {
+            "contents": {
+              "addedPeril": false,
+              "cardCode": "c01112",
+              "facedown": null,
+              "id": "6a3e92a1-d253-4194-9612-53c284a6b2ca",
+              "isFlipped": true,
+              "originalCardCode": "c01112",
+              "owner": null
+            },
+            "tag": "EncounterCard"
+          }
+        ],
+        "setAsideKeys": [],
+        "standaloneCampaignLog": {
+          "crossedOut": [],
+          "options": [],
+          "orderedKeys": [],
+          "partners": {},
+          "recorded": [],
+          "recordedCounts": [],
+          "recordedSets": []
+        },
+        "started": false,
+        "storyCards": {},
+        "substitutions": {},
+        "tarotCards": [],
+        "tarotDeck": [],
+        "timesPlayed": 0,
+        "tokens": [],
+        "turn": 1,
+        "useHardExpertReference": false,
+        "usesGrid": false,
+        "victoryDisplay": [],
+        "xpBreakdown": null
+      }
+    },
+    "modifiers": [],
+    "name": "Contract fixture game",
+    "otherInvestigators": {},
+    "outcome": null,
+    "phase": "InvestigationPhase",
+    "phaseHistory": {
+      "c01001": {
+        "historyActionsCompleted": 0,
+        "historyActionsSpent": 0,
+        "historyAttacksOfOpportunity": 0,
+        "historyCardsDrawn": 0,
+        "historyCluesDiscovered": {},
+        "historyDealtDamageTo": [],
+        "historyEnemiesAttackedBy": [],
+        "historyEnemiesDefeated": [],
+        "historyEnemiesDrawn": [],
+        "historyLocationsRevealed": [
+          "782de537-8f5d-4eda-b849-2362e28402e5"
+        ],
+        "historyLocationsSuccessfullyInvestigated": [],
+        "historyMoved": 0,
+        "historyMovedTo": [],
+        "historyPlayedCards": [],
+        "historyResourcesGained": 0,
+        "historySkillTestsPerformed": [],
+        "historySuccessfulAttacks": 0,
+        "historySuccessfulEvasions": 0,
+        "historySuccessfulExplore": false,
+        "historySuccessfulInvestigations": 0,
+        "historyTreacheriesDrawn": []
+      }
+    },
+    "phaseStep": {
+      "contents": "InvestigatorTakesActionStep",
+      "tag": "InvestigationPhaseStep"
+    },
+    "playerCount": 1,
+    "playerOrder": [
+      "c01001"
+    ],
+    "question": {
+      "00000000-0000-0000-0000-000000000001": {
+        "choices": [
+          {
+            "component": {
+              "investigatorId": "c01001",
+              "tag": "InvestigatorComponent",
+              "tokenType": "ResourceToken"
+            },
+            "messages": [
+              {
+                "contents": [
+                  "c01001",
+                  1,
+                  {
+                    "contents": "c01001",
+                    "tag": "ResourceSource"
+                  },
+                  true
+                ],
+                "tag": "TakeResources"
+              }
+            ],
+            "tag": "ComponentLabel"
+          },
+          {
+            "component": {
+              "investigatorId": "c01001",
+              "tag": "InvestigatorDeckComponent"
+            },
+            "messages": [
+              {
+                "contents": [
+                  "c01001",
+                  {
+                    "cardDrawAction": true,
+                    "cardDrawAlreadyDrawn": [],
+                    "cardDrawAmount": 1,
+                    "cardDrawAndThen": null,
+                    "cardDrawDeck": {
+                      "contents": "c01001",
+                      "tag": "InvestigatorDeck"
+                    },
+                    "cardDrawDiscard": null,
+                    "cardDrawKind": "StandardCardDraw",
+                    "cardDrawPosition": "DrawFromTop",
+                    "cardDrawRules": [],
+                    "cardDrawSource": {
+                      "contents": "c01001",
+                      "tag": "InvestigatorSource"
+                    },
+                    "cardDrawState": {
+                      "tag": "UnresolvedCardDraw"
+                    },
+                    "cardDrawTarget": null
+                  }
+                ],
+                "tag": "DrawCards"
+              }
+            ],
+            "tag": "ComponentLabel"
+          },
+          {
+            "investigatorId": "c01001",
+            "messages": [
+              {
+                "contents": "c01001",
+                "tag": "ChooseEndTurn"
+              }
+            ],
+            "tag": "EndTurnButton"
+          },
+          {
+            "ability": {
+              "additionalCosts": [],
+              "basic": true,
+              "blocksIn": null,
+              "canBeCancelled": true,
+              "cardCode": "c01111",
+              "chaosTokenEffects": [],
+              "criteria": {
+                "contents": [
+                  {
+                    "contents": {
+                      "contents": "782de537-8f5d-4eda-b849-2362e28402e5",
+                      "tag": "LocationWithId"
+                    },
+                    "tag": "OnLocation"
+                  },
+                  {
+                    "contents": {
+                      "contents": [
+                        {
+                          "contents": "782de537-8f5d-4eda-b849-2362e28402e5",
+                          "tag": "LocationWithId"
+                        },
+                        {
+                          "tag": "InvestigatableLocation"
+                        }
+                      ],
+                      "tag": "LocationMatchAll"
+                    },
+                    "tag": "LocationExists"
+                  }
+                ],
+                "tag": "Criteria"
+              },
+              "delayAdditionalCosts": null,
+              "displayAs": null,
+              "doesNotProvokeAttacksOfOpportunity": null,
+              "evadeCriteriaOverride": null,
+              "fightCriteriaOverride": null,
+              "highlightFromWindow": false,
+              "ignoreAllCosts": false,
+              "index": 103,
+              "limit": {
+                "tag": "NoLimit"
+              },
+              "metadata": null,
+              "nonBlocking": false,
+              "requestor": {
+                "contents": "782de537-8f5d-4eda-b849-2362e28402e5",
+                "tag": "LocationSource"
+              },
+              "resultLabel": null,
+              "skipForAll": false,
+              "source": {
+                "contents": "782de537-8f5d-4eda-b849-2362e28402e5",
+                "tag": "LocationSource"
+              },
+              "target": null,
+              "tooltip": null,
+              "triggersSkillTest": true,
+              "type": {
+                "actions": {
+                  "contents": "Investigate",
+                  "tag": "SingleAction"
+                },
+                "cost": {
+                  "contents": 1,
+                  "tag": "ActionCost"
+                },
+                "skillTypes": {
+                  "contents": "SkillIntellect",
+                  "tag": "AbilitySkill"
+                },
+                "tag": "ActionAbility"
+              },
+              "wantsSkillTest": null,
+              "window": {
+                "contents": {
+                  "tag": "You"
+                },
+                "tag": "DuringYourAction"
+              }
+            },
+            "before": [],
+            "investigatorId": "c01001",
+            "messages": [],
+            "tag": "AbilityLabel",
+            "windows": [
+              {
+                "windowBatchId": null,
+                "windowConditionTick": null,
+                "windowTiming": "When",
+                "windowType": {
+                  "contents": "c01001",
+                  "tag": "DuringTurn"
+                }
+              },
+              {
+                "windowBatchId": null,
+                "windowConditionTick": null,
+                "windowTiming": "When",
+                "windowType": {
+                  "tag": "FastPlayerWindow"
+                }
+              },
+              {
+                "windowBatchId": null,
+                "windowConditionTick": null,
+                "windowTiming": "When",
+                "windowType": {
+                  "tag": "NonFast"
+                }
+              }
+            ]
+          }
+        ],
+        "tag": "PlayerWindowChooseOne"
+      }
+    },
+    "questionPresentation": {
+      "00000000-0000-0000-0000-000000000001": {
+        "answer": {
+          "kind": "singleChoice",
+          "tag": "Answer"
+        },
+        "choiceCount": 4,
+        "choices": [
+          {
+            "actorId": "c01001",
+            "kind": "gainResource",
+            "selectable": true,
+            "sourceIndex": 0
+          },
+          {
+            "actorId": "c01001",
+            "kind": "drawCard",
+            "selectable": true,
+            "sourceIndex": 1
+          },
+          {
+            "actorId": "c01001",
+            "kind": "endTurn",
+            "selectable": true,
+            "sourceIndex": 2
+          },
+          {
+            "ability": {
+              "actions": [
+                "investigate"
+              ],
+              "canBeCancelled": true,
+              "cardCode": "c01111",
+              "index": 103,
+              "type": "action"
+            },
+            "actorId": "c01001",
+            "cost": {
+              "amount": 1,
+              "kind": "action"
+            },
+            "entity": {
+              "id": "782de537-8f5d-4eda-b849-2362e28402e5",
+              "kind": "location"
+            },
+            "kind": "investigate",
+            "selectable": true,
+            "sourceIndex": 3
+          }
+        ],
+        "protocolVersion": 2,
+        "questionKind": "playerWindowChooseOne",
+        "questionVersion": 3
+      }
+    },
+    "removedFromPlay": [],
+    "retiredInvestigators": {},
+    "roundHistory": {},
+    "scarletKeys": {},
+    "scenarioSteps": 3,
+    "settings": {
+      "settingsAbilitiesCannotReactToThemselves": true,
+      "settingsAchievementsEnabled": true,
+      "settingsAsIfRuling": "chapter1",
+      "settingsCustomRandomWeaknessPools": {},
+      "settingsRolledUltimatumOrBoon": null,
+      "settingsScreamedAllies": [],
+      "settingsStrictAsIfAt": false,
+      "settingsUltimatumsAndBoons": [],
+      "settingsUltimatumsAndBoonsEnabled": true
+    },
+    "skillTest": null,
+    "skillTestChaosTokens": [],
+    "skillTestResults": null,
+    "skills": {},
+    "stories": {},
+    "tag": "PublicGame",
+    "totalClues": 0,
+    "totalDoom": 0,
+    "treacheries": {},
+    "turnHistory": {
+      "c01001": {
+        "historyActionsCompleted": 0,
+        "historyActionsSpent": 0,
+        "historyAttacksOfOpportunity": 0,
+        "historyCardsDrawn": 0,
+        "historyCluesDiscovered": {},
+        "historyDealtDamageTo": [],
+        "historyEnemiesAttackedBy": [],
+        "historyEnemiesDefeated": [],
+        "historyEnemiesDrawn": [],
+        "historyLocationsRevealed": [
+          "782de537-8f5d-4eda-b849-2362e28402e5"
+        ],
+        "historyLocationsSuccessfullyInvestigated": [],
+        "historyMoved": 0,
+        "historyMovedTo": [],
+        "historyPlayedCards": [],
+        "historyResourcesGained": 0,
+        "historySkillTestsPerformed": [],
+        "historySuccessfulAttacks": 0,
+        "historySuccessfulEvasions": 0,
+        "historySuccessfulExplore": false,
+        "historySuccessfulInvestigations": 0,
+        "historyTreacheriesDrawn": []
+      }
+    },
+    "turnPlayerInvestigatorId": "c01001",
+    "undoActionStep": null,
+    "undoPhaseStep": 3,
+    "undoRoundStep": 3,
+    "undoTurnStep": 3
+  },
+  "tag": "GameUpdate"
+}
