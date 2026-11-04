@@ -554,7 +554,15 @@ public:
     return handle;
   }
 
+  // When true, cancel() leaves the request pending, modelling a reply that
+  // was already on its way when the coordinator cancelled it; the test can
+  // then deliver that stale reply with completeToken()/completeUser().
+  bool keepPendingOnCancel{false};
+
   void cancel(AuthRequestHandle handle) override {
+    if (keepPendingOnCancel) {
+      return;
+    }
     if (auto it = m_pendingToken.find(handle.id); it != m_pendingToken.end()) {
       AuthTokenCallback callback = it.value();
       m_pendingToken.erase(it);
@@ -841,6 +849,8 @@ private slots:
   void signInAuthFailureReturnsSignedOut();
   void signInMaintenanceIsServerMaintenance();
   void registerMaintenanceIsServerMaintenance();
+  void staleSignInMaintenanceReplyIsIgnoredAfterSwitch();
+  void staleRestoreMaintenanceReplyIsIgnoredAfterSwitch();
   void signInWhoAmIMaintenanceDoesNotSaveToken();
   void signInWhoAmIUnauthorizedDoesNotSaveAndReturnsSignedOut();
   void signInSaveFailureIsSecureStorageUnavailable();
@@ -1570,6 +1580,116 @@ void SessionCoordinatorTests::registerMaintenanceIsServerMaintenance() {
   QCOMPARE(h.coordinator->diagnostic(), kMaintenanceNotice);
   QCOMPARE(h.authClient.calls.size(), 1);
   QCOMPARE(h.tokenStore.calls.size(), 1);
+
+  // retry() re-probes, exactly like sign-in's maintenance outcome.
+  const int createdBefore = h.probeFactory.totalCreated();
+  h.coordinator->retry();
+  QVERIFY(pumpEventsUntil([&h, createdBefore] {
+    return h.probeFactory.totalCreated() == createdBefore + 1;
+  }));
+  QCOMPARE(h.coordinator->state(),
+           SessionCoordinator::State::ProbingCapabilities);
+}
+
+// Loads hosted plus a custom profile, with hosted selected. Returns the
+// custom profile's id.
+static QString configureHostedAndCustomProfiles(Harness &h) {
+  const ServerProfile hosted = ServerProfile::hostedDefault();
+  const auto customProfile = ServerProfile::custom(
+      QStringLiteral("Custom"), QStringLiteral("https://example.test"));
+  if (!customProfile.has_value()) {
+    qFatal("custom profile did not validate");
+  }
+  h.profileStore.profiles = {hosted, *customProfile};
+  h.profileStore.selectedId = hosted.profileId();
+  return customProfile->profileId();
+}
+
+// Settles the newly selected profile at SignedOut (probe compatible, no
+// stored token).
+static bool settleSelectedProfileSignedOut(Harness &h, int probesBefore) {
+  if (!pumpEventsUntil([&h, probesBefore] {
+        return h.probeFactory.totalCreated() > probesBefore &&
+               h.probeFactory.current() != nullptr;
+      })) {
+    return false;
+  }
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  const QString profileId = h.coordinator->selectedProfileId();
+  if (!pumpEventsUntil(
+          [&h, profileId] { return h.tokenStore.hasPending(profileId); })) {
+    return false;
+  }
+  h.tokenStore.complete(profileId, notFoundResult());
+  return pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  });
+}
+
+void SessionCoordinatorTests::
+    staleSignInMaintenanceReplyIsIgnoredAfterSwitch() {
+  // A maintenance reply for a sign-in on the profile the user switched
+  // away from must never put the new profile into ServerMaintenance.
+  Harness h;
+  const QString customId = configureHostedAndCustomProfiles(h);
+  h.bootToSignedOut();
+  h.coordinator->signIn(QStringLiteral("bob@example.test"),
+                        QStringLiteral("hunter2"));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 1; }));
+  QVERIFY(h.authClient.hasPendingToken(1));
+
+  h.authClient.keepPendingOnCancel = true;
+  const int probesBefore = h.probeFactory.totalCreated();
+  h.coordinator->switchProfile(customId);
+  QVERIFY(settleSelectedProfileSignedOut(h, probesBefore));
+  QVERIFY(h.authClient.hasPendingToken(1));
+  const QString diagnosticBefore = h.coordinator->diagnostic();
+
+  QSignalSpy stateSpy(h.coordinator.get(), &SessionCoordinator::stateChanged);
+  h.authClient.completeToken(1, maintenanceAuthResult<AuthToken>());
+  QTest::qWait(50);
+  QVERIFY(!h.authClient.hasPendingToken(1));
+  QCOMPARE(stateSpy.count(), 0);
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
+  QVERIFY(!h.coordinator->isServerMaintenance());
+  QCOMPARE(h.coordinator->diagnostic(), diagnosticBefore);
+  QVERIFY(h.coordinator->currentUsername().isEmpty());
+  QCOMPARE(h.coordinator->selectedProfileId(), customId);
+}
+
+void SessionCoordinatorTests::
+    staleRestoreMaintenanceReplyIsIgnoredAfterSwitch() {
+  // The same for a restored token's whoami on the abandoned profile.
+  Harness h;
+  const QString customId = configureHostedAndCustomProfiles(h);
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  const QString hostedId = h.coordinator->selectedProfileId();
+  QVERIFY(pumpEventsUntil(
+      [&h, hostedId] { return h.tokenStore.hasPending(hostedId); }));
+  h.tokenStore.complete(hostedId,
+                        successReadResult(QStringLiteral("old-token")));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.hasPendingUser(1); }));
+
+  h.authClient.keepPendingOnCancel = true;
+  const int probesBefore = h.probeFactory.totalCreated();
+  h.coordinator->switchProfile(customId);
+  QVERIFY(settleSelectedProfileSignedOut(h, probesBefore));
+  QVERIFY(h.authClient.hasPendingUser(1));
+  const QString diagnosticBefore = h.coordinator->diagnostic();
+
+  QSignalSpy stateSpy(h.coordinator.get(), &SessionCoordinator::stateChanged);
+  h.authClient.completeUser(1, maintenanceAuthResult<CurrentUser>());
+  QTest::qWait(50);
+  QVERIFY(!h.authClient.hasPendingUser(1));
+  QCOMPARE(stateSpy.count(), 0);
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
+  QVERIFY(!h.coordinator->isServerMaintenance());
+  QCOMPARE(h.coordinator->diagnostic(), diagnosticBefore);
+  QVERIFY(h.coordinator->currentUsername().isEmpty());
+  QCOMPARE(h.coordinator->selectedProfileId(), customId);
 }
 
 void SessionCoordinatorTests::signInWhoAmIMaintenanceDoesNotSaveToken() {
