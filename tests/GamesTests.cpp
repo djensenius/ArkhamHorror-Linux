@@ -152,6 +152,7 @@ private slots:
   void malformedOutcomesPreservedWithoutFailingList();
   void decodeGameListFromRawBytesRoundTripsWholeFixtureByteExact();
   void gameListRowWithOutcomeStillRejectsAdditiveTopLevelField();
+  void gameOutcomeEqualAcrossDecodePathsButEncodesInStoredKeyOrder();
 
   // GameState forward compatibility ─────────────────────────────────────────
   void unknownGameStateTagPreservedAndRoundTrips();
@@ -976,6 +977,42 @@ void GamesTests::gameListRowWithOutcomeStillRejectsAdditiveTopLevelField() {
   QVERIFY2(!row.has_value(), "an unknown top-level key must still fail");
   QVERIFY2(row.error().contains(QStringLiteral("verdict")),
            qPrintable(row.error()));
+}
+
+void GamesTests::gameOutcomeEqualAcrossDecodePathsButEncodesInStoredKeyOrder() {
+  // Pins the documented trade-off (see GameOutcome in Games.h): both decode
+  // paths give == rows, but each re-encodes the outcome in its stored key
+  // order -- wire order for raw bytes, sorted for QJsonValue.
+  const QByteArray outcomeJson = QByteArrayLiteral(
+      "{\"result\":\"Won\",\"certainty\":\"Certain\",\"note\":null,"
+      "\"ending\":{\"scenario\":\"c01104\",\"resolution\":{\"tag\":"
+      "\"Resolution\",\"contents\":1}},\"source\":\"Recorded\"}");
+  const QByteArray bytes = gameListRowBytesWithOutcome(outcomeJson);
+
+  const auto viaRawBytes = GameListRow::fromRawBytes(bytes, u"row");
+  const auto viaQJson =
+      GameListRow::fromJson(QJsonDocument::fromJson(bytes).object(), u"row");
+  if (!viaRawBytes)
+    QFAIL(qPrintable(viaRawBytes.error()));
+  if (!viaQJson)
+    QFAIL(qPrintable(viaQJson.error()));
+  QVERIFY(*viaRawBytes == *viaQJson);
+  QVERIFY(*viaRawBytes->outcome() == *viaQJson->outcome());
+
+  const auto rawEncoded = viaRawBytes->outcome()->toJsonBytes();
+  const auto qjsonEncoded = viaQJson->outcome()->toJsonBytes();
+  if (!rawEncoded)
+    QFAIL(qPrintable(rawEncoded.error()));
+  if (!qjsonEncoded)
+    QFAIL(qPrintable(qjsonEncoded.error()));
+  QCOMPARE(*rawEncoded, outcomeJson);
+  QCOMPARE(*qjsonEncoded,
+           QByteArrayLiteral(
+               "{\"certainty\":\"Certain\",\"ending\":{\"resolution\":{"
+               "\"contents\":1,\"tag\":\"Resolution\"},\"scenario\":"
+               "\"c01104\"},\"note\":null,\"result\":\"Won\",\"source\":"
+               "\"Recorded\"}"));
+  QVERIFY(*rawEncoded != *qjsonEncoded);
 }
 
 void GamesTests::decodeGameListFromRawBytesRejectsDuplicateObjectKey() {

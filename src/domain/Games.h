@@ -312,9 +312,13 @@ private:
 };
 
 // game-list.schema.json's gameOutcome (schema 0.1.57): how a finished game
-// ended. Decoded tolerantly and losslessly: the complete raw value is always
-// kept and is the only source of truth for encoding, so a decoded outcome
-// re-encodes byte-exact whatever it held. When the value has the gameOutcome
+// ended. Decoded tolerantly: the complete raw value is always kept and is
+// the only source of truth for encoding. Through the raw-bytes path
+// (fromRawBytes()/fromRawJson(), and GameListRow/decodeGameList's raw
+// entry points) it re-encodes byte-exact, in wire key order. Through the
+// QJsonValue path (GameListRow::fromJson()/decodeGameList()) the wire order
+// is already lost, so the outcome re-encodes with its object keys sorted
+// (QJsonObject's order). When the value has the gameOutcome
 // shape it is Kind::Known and the typed accessors below are filled in; the
 // enum-like strings (result/certainty/source) are kept open, so an
 // unrecognised spelling from a newer server is preserved rather than
@@ -365,11 +369,12 @@ public:
   // The complete value as received (same as toRawJson()).
   [[nodiscard]] const Json::Value &raw() const noexcept { return m_raw; }
 
-  // Compares kind, the typed view and the raw value, treating JSON object
-  // member order as insignificant: the QJsonValue decode path has already
-  // lost the wire order (QJsonObject sorts its keys), so a row decoded via
-  // fromJson() must still equal the same row decoded from raw bytes.
-  // Encoding always uses the raw value with its decoded order.
+  // Compares kind, the typed view and the raw value as JSON values with
+  // object keys in any order (numbers compared by their literal text), so
+  // a row decoded via fromJson() equals the same row decoded from raw
+  // bytes. Two equal outcomes can still encode to different bytes: each
+  // re-emits its raw value in its stored key order (wire order for the
+  // raw-bytes path, sorted for the QJsonValue path).
   friend bool operator==(const GameOutcome &a, const GameOutcome &b);
 
   // Copy-only, for the same moved-from-invariant reason as GameState above.
