@@ -17,7 +17,9 @@
 
 #include <functional>
 #include <optional>
+#include <utility>
 
+#include "BoardCardsModel.h"
 #include "GameBoardController.h"
 #include "GameClient.h"
 #include "MockHttpServer.h"
@@ -95,6 +97,43 @@ const QStringList kCodeLabels{u"c01105"_s, u"c01108"_s, u"c01111"_s,
                               u"Roland Banks"_s};
 const QStringList kNameLabels{u"What's Going On?!"_s, u"Trapped"_s, u"Study"_s,
                               u"Roland Banks"_s};
+
+// Counts the controller's "catalog unavailable" warnings while alive, and
+// passes every message on to QtTest's own handler (so
+// QTest::ignoreMessage() still applies). Lets a test wait for a failed
+// catalog reply to be handled instead of guessing how long it takes.
+class CatalogWarningCounter {
+public:
+  CatalogWarningCounter() {
+    s_count = 0;
+    s_previous = qInstallMessageHandler(&handle);
+  }
+  ~CatalogWarningCounter() { qInstallMessageHandler(s_previous); }
+  CatalogWarningCounter(const CatalogWarningCounter &) = delete;
+  CatalogWarningCounter &operator=(const CatalogWarningCounter &) = delete;
+  [[nodiscard]] int count() const { return s_count; }
+
+private:
+  static void handle(QtMsgType type, const QMessageLogContext &context,
+                     const QString &message) {
+    if (type == QtWarningMsg &&
+        message.startsWith("Card catalog unavailable"_L1))
+      ++s_count;
+    if (s_previous)
+      s_previous(type, context, message);
+  }
+  static inline int s_count = 0;
+  static inline QtMessageHandler s_previous = nullptr;
+};
+
+const char kCatalog500Warning[] =
+    "Card catalog unavailable; board cards show card codes: The server "
+    "returned HTTP 500.";
+
+MockHttpServer::Response held(MockHttpServer::Response response) {
+  response.hold = true;
+  return response;
+}
 
 bool waitUntil(const std::function<bool()> &condition, int timeoutMs = 5000) {
   const QDeadlineTimer deadline(timeoutMs);
@@ -471,39 +510,49 @@ private slots:
     QVERIFY(waitUntil([this] { return catalogRequests() == 2; }));
   }
 
-  // A catalog slower than the board relabels the open board in place.
+  // A catalog that answers after the board relabels the open board in
+  // place. The catalog reply is held until the board has loaded.
   void lateCatalogRelabelsTheBoard() {
-    MockHttpServer::Response slow = jsonResponse(200, catalogBody());
-    slow.headerDelayMs = 300;
-    m_server->setResponse(cardsTarget(), slow);
+    m_server->setResponse(cardsTarget(),
+                          held(jsonResponse(200, catalogBody())));
     m_server->setResponse(gamePath(),
                           jsonResponse(200, fixture(u"get-game.json"_s)));
     GameBoardController c(*m_client, tokenSource());
     QVERIFY(loadList(c));
     c.openGame(0);
     QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
     QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
+
+    QSignalSpy changed(c.boardCards(), &QAbstractItemModel::dataChanged);
+    QSignalSpy reset(c.boardCards(), &QAbstractItemModel::modelReset);
+    m_server->releaseHeld();
     QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
+    // In place: one dataChanged per renamed card, no reset.
+    QCOMPARE(changed.count(), 3);
+    QCOMPARE(reset.count(), 0);
   }
 
   // A failed catalog is logged, never shown: the board loads with card
   // codes, and a later list fetch tries the catalog again.
   void catalogFailureKeepsCodeLabels() {
-    m_server->setResponse(cardsTarget(), jsonResponse(500, "{}"_ba));
+    CatalogWarningCounter warnings;
+    m_server->setResponse(cardsTarget(), held(jsonResponse(500, "{}"_ba)));
     m_server->setResponse(gamePath(),
                           jsonResponse(200, fixture(u"get-game.json"_s)));
     GameBoardController c(*m_client, tokenSource());
-    QTest::ignoreMessage(QtWarningMsg,
-                         "Card catalog unavailable; board cards show card "
-                         "codes: The server returned HTTP 500.");
     QVERIFY(loadList(c));
-    QVERIFY(waitUntil([this] { return catalogRequests() == 1; }));
     c.openGame(0);
     QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
-    QTest::qWait(100);
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
+
+    QTest::ignoreMessage(QtWarningMsg, kCatalog500Warning);
+    m_server->releaseHeld();
+    QVERIFY(waitUntil([&warnings] { return warnings.count() == 1; }));
     QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
     QVERIFY(c.errorText().isEmpty());
     QCOMPARE(c.listStatus(), Status::Loaded);
+    QCOMPARE(c.boardStatus(), Status::Loaded);
 
     m_server->setResponse(cardsTarget(), jsonResponse(200, catalogBody()));
     c.closeGame();
@@ -514,27 +563,30 @@ private slots:
     QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
   }
 
-  // A catalog reply that lands after reset() names nothing.
+  // A catalog reply that lands after reset() names nothing. The first
+  // reply is held until after reset(); the next session's catalog fails,
+  // so any name on the board could only have come from the dropped reply.
   void lateCatalogAfterResetIsDropped() {
-    MockHttpServer::Response slow = jsonResponse(200, catalogBody());
-    slow.headerDelayMs = 150;
-    m_server->setResponse(cardsTarget(), slow);
+    CatalogWarningCounter warnings;
+    m_server->setResponse(cardsTarget(),
+                          held(jsonResponse(200, catalogBody())));
     m_server->setResponse(gamePath(),
                           jsonResponse(200, fixture(u"get-game.json"_s)));
     GameBoardController c(*m_client, tokenSource());
     QVERIFY(loadList(c));
-    QVERIFY(waitUntil([this] { return catalogRequests() == 1; }));
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
     c.reset();
-    QTest::qWait(400);
-    m_server->setResponse(cardsTarget(), jsonResponse(500, "{}"_ba));
-    QTest::ignoreMessage(QtWarningMsg,
-                         "Card catalog unavailable; board cards show card "
-                         "codes: The server returned HTTP 500.");
+    m_server->releaseHeld();
+
+    m_server->setResponse(cardsTarget(), held(jsonResponse(500, "{}"_ba)));
     QVERIFY(loadList(c));
-    QVERIFY(waitUntil([this] { return catalogRequests() == 2; }));
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
+    QCOMPARE(catalogRequests(), 2);
     c.openGame(0);
     QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
-    QTest::qWait(100);
+    QTest::ignoreMessage(QtWarningMsg, kCatalog500Warning);
+    m_server->releaseHeld();
+    QVERIFY(waitUntil([&warnings] { return warnings.count() == 1; }));
     QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
   }
 

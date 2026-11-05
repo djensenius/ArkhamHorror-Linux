@@ -1,6 +1,5 @@
 #pragma once
 
-#include "BoardCardsModel.h"
 #include "GameClient.h"
 #include "SessionCoordinator.h"
 
@@ -14,6 +13,8 @@
 #include <memory>
 
 namespace Arkham {
+
+class BoardCardsModel;
 
 // Drives qml/BoardScreen.qml: the signed-in user's games list, then one
 // selected game's board (a BoardCardsModel of its card art).
@@ -111,9 +112,9 @@ private:
   QString m_errorText;
   quint64 m_listGeneration{0};
   quint64 m_boardGeneration{0};
-  // The card catalog's names, cached for the session (see the class
-  // comment); reset() drops them and any catalog reply still in flight.
-  BoardCardsModel::CardNameTable m_cardNames;
+  // Whether the card catalog's names (kept by m_board, which holds them
+  // across clear()) are loaded for this session; reset() drops them and
+  // any catalog reply still in flight.
   CatalogStatus m_catalogStatus{CatalogStatus::None};
   quint64 m_catalogGeneration{0};
   bool m_signedIn{false};

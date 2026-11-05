@@ -161,9 +161,9 @@ void GameBoardController::fetchCatalog(
               << describe(status);
           return;
         }
-        self->m_cardNames = BoardCardsModel::cardNamesFromCatalog(*cards);
         self->m_catalogStatus = CatalogStatus::Loaded;
-        self->m_board->setCardNames(self->m_cardNames);
+        self->m_board->setCardNames(
+            BoardCardsModel::cardNamesFromCatalog(*cards));
       });
 }
 
@@ -232,7 +232,6 @@ void GameBoardController::reset() {
   ++m_boardGeneration;
   ++m_catalogGeneration;
   m_catalogStatus = CatalogStatus::None;
-  m_cardNames.clear();
   m_board->clear();
   m_board->setCardNames({});
   m_games.clear();
