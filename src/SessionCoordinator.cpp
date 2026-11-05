@@ -2,6 +2,7 @@
 
 #include "TokenValidation.h"
 
+#include <QMetaObject>
 #include <QPointer>
 #include <QSet>
 
@@ -584,6 +585,7 @@ void SessionCoordinator::startCredentialRestore() {
     const quint64 currentEndpointEpoch = profileEndpointEpoch(profileId);
     for (int i = 0; i < queueIt->size(); ++i) {
       if ((*queueIt)[i].kind == TokenOpKind::Read &&
+          (*queueIt)[i].restoreEligible &&
           (*queueIt)[i].admissionEndpointEpoch == currentEndpointEpoch) {
         (*queueIt)[i].onComplete = std::move(onComplete);
         return;
@@ -628,6 +630,56 @@ void SessionCoordinator::handleRestoreReadResult(
     setState(State::SecureStorageUnavailable, result.diagnostic);
     return;
   }
+}
+
+// ─── Access token for one authenticated request ─────────────────────────
+
+void SessionCoordinator::requestAccessToken(AccessTokenCallback callback) {
+  if (!callback) {
+    return;
+  }
+  QPointer<SessionCoordinator> self(this);
+  if (state() != State::SignedIn || !m_currentProfile.has_value()) {
+    QMetaObject::invokeMethod(
+        this,
+        [self, callback = std::move(callback)]() {
+          if (self) {
+            callback(std::nullopt, QStringLiteral("Not signed in."));
+          }
+        },
+        Qt::QueuedConnection);
+    return;
+  }
+  // The read is bound to this exact session: a sign-out, restart or profile
+  // switch bumps m_generation, and the result is then withheld even if the
+  // store still returns the old token.
+  const quint64 generation = m_generation;
+  const ServerProfile profile = *m_currentProfile;
+  enqueueTokenOp(
+      profile.profileId(), TokenOpKind::Read, QString(),
+      profile.credentialEndpointIdentity(),
+      [self, generation, profile,
+       callback = std::move(callback)](TokenStoreResult result) {
+        if (!self) {
+          return;
+        }
+        if (generation != self->m_generation ||
+            self->state() != State::SignedIn) {
+          callback(std::nullopt,
+                   QStringLiteral("The session changed before the request "
+                                  "could be sent."));
+          return;
+        }
+        if (result.outcome != TokenStoreOutcome::Success) {
+          callback(std::nullopt,
+                   result.diagnostic.isEmpty()
+                       ? QStringLiteral("The saved sign-in could not be read.")
+                       : result.diagnostic);
+          return;
+        }
+        callback(AccessToken{profile, std::move(result.token)}, QString());
+      },
+      /*restoreEligible=*/false);
 }
 
 // ─── whoami validation (shared by restore and fresh sign-in/register) ───
@@ -1075,12 +1127,15 @@ void SessionCoordinator::cancelPendingAuthRequest() {
 
 // ─── Per-profile FIFO token-store queue ─────────────────────────────────
 
-void SessionCoordinator::enqueueTokenOp(
-    const QString &profileId, TokenOpKind kind, QString token,
-    QString endpointIdentity, ITokenStore::ResultCallback onComplete) {
+void SessionCoordinator::enqueueTokenOp(const QString &profileId,
+                                        TokenOpKind kind, QString token,
+                                        QString endpointIdentity,
+                                        ITokenStore::ResultCallback onComplete,
+                                        bool restoreEligible) {
   auto &queue = m_tokenQueues[profileId];
   const bool wasEmpty = queue.isEmpty();
   TokenOp op{kind, std::move(token), std::move(onComplete)};
+  op.restoreEligible = restoreEligible;
   op.admissionEpoch = profileCredentialEpoch(profileId);
   op.admissionEndpointEpoch = profileEndpointEpoch(profileId);
   op.opId = m_nextTokenOpId++;

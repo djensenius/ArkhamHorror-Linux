@@ -233,6 +233,7 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/CompatibilityEvaluator.h
     src/ControllerGlyphs.h
     src/FocusController.h
+    src/GameClient.h
     src/IAuthenticationClient.h
     src/ICapabilityProbe.h
     src/IKeychainJobFactory.h
@@ -275,6 +276,7 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/CompatibilityEvaluator.cpp
     src/ControllerGlyphs.cpp
     src/FocusController.cpp
+    src/GameClient.cpp
     src/InputMapper.cpp
     src/InputRouter.cpp
     src/NetworkAuthenticationClient.cpp
@@ -930,6 +932,20 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME network COMMAND arkham-network-tests)
+
+    qt_add_executable(arkham-game-client-tests
+        tests/GameClientTests.cpp
+        tests/MockHttpServer.cpp
+    )
+    target_compile_definitions(arkham-game-client-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-game-client-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME game_client COMMAND arkham-game-client-tests)
 
     qt_add_executable(arkham-token-store-tests
         tests/TokenStoreTests.cpp

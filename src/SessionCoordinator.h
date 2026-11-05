@@ -214,6 +214,31 @@ public:
     return m_profiles;
   }
 
+  // The signed-in profile and its access token, for exactly one
+  // authenticated request. Callers pass it straight to that request and
+  // must not store it; the coordinator itself never keeps the token in
+  // memory either (it is re-read from the secure store for every call).
+  struct AccessToken {
+    ServerProfile profile;
+    QString token;
+  };
+  // |token| is engaged on success; otherwise |diagnostic| is a secret-free
+  // reason (not signed in, session changed, or the secure-store error).
+  using AccessTokenCallback = std::function<void(
+      std::optional<AccessToken> token, const QString &diagnostic)>;
+
+  // Reads the current profile's token through the same per-profile
+  // token-store FIFO as credential restore (so it is ordered behind any
+  // pending save/delete), only while state() is SignedIn. The callback runs
+  // asynchronously, exactly once when the store answers: with the token
+  // only if the session is still the same SignedIn session when the read
+  // completes, otherwise with std::nullopt. A failed read never changes the
+  // session state. A later start()/switchProfile() restore never takes
+  // over this read (it queues its own), so a restart while the read is
+  // pending still runs the callback, with std::nullopt. The only case in
+  // which it does not run is when this coordinator is destroyed first.
+  void requestAccessToken(AccessTokenCallback callback);
+
 public slots:
   // Loads profiles and the selected profile ID, seeding and persisting
   // hostedDefault()+its selection on a genuinely empty first run (and
@@ -361,6 +386,10 @@ private:
     // this field is the durable, cross-process, cross-restart identity
     // that ITokenStore itself authoritatively enforces.
     QString endpointIdentity;
+    // False only for a requestAccessToken() Read: startCredentialRestore()
+    // must never take over that op's onComplete (which would silently drop
+    // the access-token callback), so its dedup only rebinds restore Reads.
+    bool restoreEligible{true};
   };
 
   // Per-profile bookkeeping for the single ITokenStore operation (if any)
@@ -552,7 +581,8 @@ private:
   // class's existing single-profile behavior exactly.
   void enqueueTokenOp(const QString &profileId, TokenOpKind kind, QString token,
                       QString endpointIdentity,
-                      ITokenStore::ResultCallback onComplete);
+                      ITokenStore::ResultCallback onComplete,
+                      bool restoreEligible = true);
   void startFrontTokenOp(const QString &profileId);
   void retryStuckProfileTokenOp(const QString &profileId);
 
