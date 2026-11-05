@@ -5,6 +5,8 @@
 #include <QTcpSocket>
 #include <QTimer>
 
+#include <utility>
+
 namespace {
 
 QByteArray reasonPhrase(int status) {
@@ -59,6 +61,15 @@ void MockHttpServer::setResponse(const QString &path, Response response) {
   m_routes.insert(path, std::move(response));
 }
 
+void MockHttpServer::releaseHeld() {
+  const auto held = std::exchange(m_held, {});
+  for (const auto &[socket, response] : held) {
+    if (socket) {
+      writeResponse(socket, response);
+    }
+  }
+}
+
 void MockHttpServer::incomingConnection(qintptr socketDescriptor) {
   auto *socket = new QTcpSocket(this);
   if (!socket->setSocketDescriptor(socketDescriptor)) {
@@ -91,6 +102,10 @@ void MockHttpServer::handleRequest(QTcpSocket *socket) {
       m_routes.value(path, Response{404, QByteArrayLiteral("text/plain"),
                                     QByteArrayLiteral("missing")});
   if (response.hang) {
+    return;
+  }
+  if (response.hold) {
+    m_held.append({QPointer<QTcpSocket>(socket), response});
     return;
   }
   if (response.headerDelayMs > 0) {

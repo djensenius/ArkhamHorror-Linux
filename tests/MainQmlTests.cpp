@@ -456,6 +456,7 @@ void MainQmlTests::destinationsFitAtTheMinimumWidth_data() {
   QTest::addColumn<int>("width"); // 0: the window's minimum width
   QTest::addColumn<int>("height");
   QTest::newRow("minimum width") << 0 << 600;
+  QTest::newRow("1280x600") << 1280 << 600;
   QTest::newRow("Steam Deck") << 1280 << 800;
   QTest::newRow("wide") << 1700 << 600;
 }
@@ -506,7 +507,10 @@ void MainQmlTests::destinationsFitAtTheMinimumWidth() {
   const qreal cardWidth = designWidth(cards.constFirst());
   const qreal spacing =
       cards.constFirst()->parentItem()->property("spacing").toReal();
-  QVERIFY(cardWidth > 0 && spacing > 0);
+  // Pinned, so a change to Main.qml's design constants fails here rather
+  // than silently moving what "fits" means.
+  QCOMPARE(cardWidth, 280.0);
+  QCOMPARE(spacing, 20.0);
 
   const QRectF bounds(QPointF(0, 0), window->contentItem()->size());
   const auto inside = [](const QRectF &outer, const QRectF &inner) {
@@ -546,6 +550,23 @@ void MainQmlTests::destinationsFitAtTheMinimumWidth() {
                             .arg(titleRect.right())
                             .arg(cardRect.left())
                             .arg(cardRect.right())));
+    // The detail line wraps (up to two lines) rather than eliding, and
+    // stays inside the card.
+    QQuickItem *detail = content->childItems().value(1);
+    QVERIFY(detail != nullptr);
+    QVERIFY2(!detail->property("truncated").toBool(),
+             qPrintable(QStringLiteral("%1 detail \"%2\" is elided")
+                            .arg(name, detail->property("text").toString())));
+    const QRectF detailRect = detail->mapRectToScene(QRectF(
+        0, 0, qMin(detail->width(), detail->property("contentWidth").toReal()),
+        detail->property("contentHeight").toReal()));
+    QVERIFY2(inside(cardRect, detailRect),
+             qPrintable(QStringLiteral("%1 detail %2..%3 outside card %4..%5")
+                            .arg(name)
+                            .arg(detailRect.top())
+                            .arg(detailRect.bottom())
+                            .arg(cardRect.top())
+                            .arg(cardRect.bottom())));
   }
 
   // The cards stay packed left to right with the row's spacing.

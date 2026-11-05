@@ -9,25 +9,63 @@ namespace Arkham {
 BoardCardsModel::BoardCardsModel(QObject *parent)
     : QAbstractListModel(parent) {}
 
+BoardCardsModel::CardNameTable
+BoardCardsModel::cardNamesFromCatalog(const QList<CardDef> &cards) {
+  CardNameTable names;
+  names.reserve(cards.size());
+  for (const CardDef &card : cards)
+    names.insert(card.cardCode.value(), {card.name, card.revealedName});
+  return names;
+}
+
 void BoardCardsModel::setGame(const PublicGame &game) {
   QList<Row> rows;
   for (const Agenda &agenda : game.agendas())
-    rows.append({u"agenda"_s, agenda.id().value(),
+    rows.append({u"agenda"_s, agenda.id().value(), false, QString(),
                  CardArt::imageSource(CardArt::agendaImageId(agenda))});
   for (const Act &act : game.acts())
-    rows.append({u"act"_s, act.id().value(),
+    rows.append({u"act"_s, act.id().value(), false, QString(),
                  CardArt::imageSource(CardArt::actImageId(act))});
   for (const Location &location : game.locations())
-    rows.append({u"location"_s, location.label(),
+    rows.append({u"location"_s, location.cardCode().value(),
+                 location.revealed(), QString(),
                  CardArt::imageSource(CardArt::locationImageId(location))});
   for (const Investigator &investigator : game.investigators())
     rows.append(
-        {u"investigator"_s, investigator.name().title,
+        {u"investigator"_s, QString(), false, investigator.name().title,
          CardArt::imageSource(CardArt::investigatorImageId(investigator))});
+  for (Row &row : rows) {
+    if (!row.code.isEmpty())
+      row.label = labelFor(row);
+  }
 
   beginResetModel();
   m_rows = std::move(rows);
   endResetModel();
+}
+
+void BoardCardsModel::setCardNames(CardNameTable names) {
+  m_names = std::move(names);
+  for (qsizetype i = 0; i < m_rows.size(); ++i) {
+    Row &row = m_rows[i];
+    if (row.code.isEmpty())
+      continue;
+    QString label = labelFor(row);
+    if (label == row.label)
+      continue;
+    row.label = std::move(label);
+    const QModelIndex at = index(static_cast<int>(i));
+    emit dataChanged(at, at, {Qt::DisplayRole, LabelRole});
+  }
+}
+
+QString BoardCardsModel::labelFor(const Row &row) const {
+  const auto it = m_names.constFind(row.code);
+  if (it == m_names.cend())
+    return row.code;
+  const CardName &name =
+      row.revealed && it->revealedName ? *it->revealedName : it->name;
+  return name.title.isEmpty() ? row.code : name.title;
 }
 
 void BoardCardsModel::clear() {

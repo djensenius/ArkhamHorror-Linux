@@ -6,6 +6,9 @@
 #include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QTimer>
@@ -17,6 +20,7 @@
 #include <new>
 #include <optional>
 
+#include "CardCatalog.h"
 #include "GameClient.h"
 #include "Games.h"
 #include "MockHttpServer.h"
@@ -65,6 +69,23 @@ struct GameCall {
   GameRequestStatus status;
   std::optional<GetGame> game;
 };
+
+struct CardsCall {
+  int calls{0};
+  GameRequestStatus status;
+  std::optional<QList<CardDef>> cards;
+};
+
+// catalog.json's "cards" array: the bare GET /arkham/cards response shape.
+QByteArray catalogCards() {
+  const QJsonArray cards = QJsonDocument::fromJson(fixture(u"catalog.json"_s))
+                               .object()
+                               .value("cards"_L1)
+                               .toArray();
+  if (cards.isEmpty())
+    qFatal("catalog.json has no cards");
+  return QJsonDocument(cards).toJson(QJsonDocument::Compact);
+}
 
 struct ListCall {
   int calls{0};
@@ -155,6 +176,29 @@ private:
                        if (rows)
                          result.rows = *rows;
                      });
+    if (!waitUntil([&result] { return result.calls > 0; }))
+      qWarning("GameClient callback never ran");
+    return result;
+  }
+
+  // The request target, query included, as MockHttpServer keys it.
+  QString cardsTarget() const {
+    return m_profile->apiUrl(u"arkham/cards").path() + u"?cardPool=campaign"_s;
+  }
+
+  CardsCall fetchCards() {
+    GameClient client(*m_nam);
+    CardsCall result;
+    client.listCampaignCards(*m_profile, kToken,
+                             [&result](const GameRequestStatus &status,
+                                       const QList<CardDef> *cards) {
+                               ++result.calls;
+                               result.status = status;
+                               if (cards)
+                                 result.cards = *cards;
+                             });
+    if (result.calls != 0)
+      qFatal("GameClient invoked its callback synchronously");
     if (!waitUntil([&result] { return result.calls > 0; }))
       qWarning("GameClient callback never ran");
     return result;
@@ -357,6 +401,41 @@ private slots:
     const ListCall call = fetchList();
     QCOMPARE(call.status.outcome, GameRequestOutcome::NotFound);
     QCOMPARE(call.status.diagnostic, u"games list not found"_s);
+  }
+
+  void listCampaignCardsDecodesTheCatalog() {
+    QCOMPARE(cardsTarget(), u"/api/v1/arkham/cards?cardPool=campaign"_s);
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogCards()));
+    const CardsCall call = fetchCards();
+    QCOMPARE(call.calls, 1);
+    QCOMPARE(call.status.outcome, GameRequestOutcome::Success);
+    QVERIFY(call.cards.has_value());
+    QCOMPARE(call.cards->size(), 1);
+    QCOMPARE(call.cards->first().cardCode.value(), u"c01020"_s);
+    QCOMPARE(call.cards->first().name.title, u"Machete"_s);
+
+    const QByteArray request = m_server->lastRequest();
+    QVERIFY2(request.startsWith(
+                 "GET /api/v1/arkham/cards?cardPool=campaign HTTP/1.1\r\n"),
+             request.constData());
+    QVERIFY(request.contains("\r\nAuthorization: Token test-token-123\r\n"));
+    QCOMPARE(m_server->requestCountForPath(cardsTarget()), 1);
+  }
+
+  void listCampaignCardsFailures() {
+    // The bundle fixture is an object, not the endpoint's bare array.
+    m_server->setResponse(cardsTarget(),
+                          jsonResponse(200, fixture(u"catalog.json"_s)));
+    const CardsCall bad = fetchCards();
+    QCOMPARE(bad.status.outcome, GameRequestOutcome::DecodeFailed);
+    QCOMPARE(bad.status.diagnostic, u"cards: expected array, got object"_s);
+    QVERIFY(!bad.cards.has_value());
+
+    m_server->setResponse(cardsTarget(), jsonResponse(404, "{}"_ba));
+    const CardsCall missing = fetchCards();
+    QCOMPARE(missing.status.outcome, GameRequestOutcome::NotFound);
+    QCOMPARE(missing.status.diagnostic, u"card catalog not found"_s);
+    QVERIFY(!missing.cards.has_value());
   }
 
   void streamedBodyOverCapWithoutContentLength() {

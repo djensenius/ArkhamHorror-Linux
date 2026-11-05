@@ -178,6 +178,11 @@ ApplicationWindow {
                             width: parent.width
                             text: destination.modelData.detail
                             color: destination.activeFocus ? "#153332" : "#c1b99f"
+                            // Like the title: wraps (a server URL has no
+                            // spaces, so anywhere) to two lines at the
+                            // minimum width before it elides.
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 2
                             elide: Text.ElideRight
                             font.pixelSize: 16
                         }

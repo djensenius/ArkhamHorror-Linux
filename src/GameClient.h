@@ -16,9 +16,11 @@
 class QNetworkAccessManager;
 class QNetworkReply;
 class QTimer;
+class QUrlQuery;
 
 namespace Arkham {
 
+struct CardDef;
 class GameListRow;
 class GetGame;
 
@@ -45,12 +47,14 @@ struct GameRequestStatus {
 };
 
 // Authenticated REST client for the game endpoints a player needs to see
-// their board: GET /arkham/games (the caller's games) and
-// GET /arkham/games/{id} (one game). Each call sends
+// their board: GET /arkham/games (the caller's games),
+// GET /arkham/games/{id} (one game) and GET /arkham/cards?cardPool=campaign
+// (the encounter-card catalog the board's card names come from). Each call
+// sends
 // "Authorization: Token <token>" for exactly that request; the token is not
 // kept after the request is issued. Responses are decoded only through the
-// existing raw-bytes decoders (decodeGameListFromRawBytes and
-// GetGame::fromRawBytes).
+// existing raw-bytes decoders (decodeGameListFromRawBytes,
+// GetGame::fromRawBytes and decodeCatalogFromRawBytes).
 //
 // Every callback runs exactly once, asynchronously, unless this client is
 // destroyed first (pending requests are then aborted and their callbacks
@@ -72,6 +76,8 @@ public:
                                               const QList<GameListRow> *)>;
   using GameCallback =
       std::function<void(const GameRequestStatus &, const GetGame *)>;
+  using CardListCallback =
+      std::function<void(const GameRequestStatus &, const QList<CardDef> *)>;
 
   explicit GameClient(QNetworkAccessManager &nam,
                       std::chrono::milliseconds timeout = kDefaultTimeout,
@@ -92,6 +98,11 @@ public:
                  GameListCallback callback);
   void getGame(const ServerProfile &profile, const QString &gameId,
                const QString &token, GameCallback callback);
+  // The campaign card pool (agendas, acts, locations and the rest of the
+  // encounter cards), with English names. The endpoint is public; the
+  // token is sent like every other request to this server.
+  void listCampaignCards(const ServerProfile &profile, const QString &token,
+                         CardListCallback callback);
 
 private:
   using Completion =
@@ -107,8 +118,8 @@ private:
   };
 
   void issue(const ServerProfile &profile, const QString &path,
-             const QString &token, QString notFoundDiagnostic,
-             Completion completion);
+             const QUrlQuery &query, const QString &token,
+             QString notFoundDiagnostic, Completion completion);
   void rejectQueued(Completion completion, QString diagnostic);
   void handleMetadataChanged(QNetworkReply *reply);
   bool readAvailable(QNetworkReply *reply);

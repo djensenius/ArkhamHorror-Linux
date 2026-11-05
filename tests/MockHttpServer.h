@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QList>
+#include <QPointer>
 #include <QTcpServer>
 #include <QUrl>
 #include <QVector>
@@ -23,6 +24,9 @@ public:
     int headerDelayMs{0};
     int chunkDelayMs{10};
     bool hang{false};
+    // Answered only when the test calls releaseHeld(), so a test can order
+    // this reply after other events without relying on timing.
+    bool hold{false};
     bool hangAfterHeaders{false};
     // Extra raw response headers, written verbatim as "name: value".
     QList<std::pair<QByteArray, QByteArray>> extraHeaders;
@@ -40,6 +44,10 @@ public:
     return m_requestCounts.value(path);
   }
   int disconnectCount() const { return m_disconnectCount; }
+  // Requests whose Response had |hold| set and are not yet answered.
+  int heldCount() const { return static_cast<int>(m_held.size()); }
+  // Answers every held request (still connected) with its Response.
+  void releaseHeld();
 
 protected:
   void incomingConnection(qintptr socketDescriptor) override;
@@ -49,6 +57,7 @@ private:
   void writeResponse(QTcpSocket *socket, const Response &response);
 
   QHash<QString, Response> m_routes;
+  QList<std::pair<QPointer<QTcpSocket>, Response>> m_held;
   QList<QTcpSocket *> m_sockets;
   QHash<QTcpSocket *, QByteArray> m_buffers;
   QByteArray m_lastRequest;

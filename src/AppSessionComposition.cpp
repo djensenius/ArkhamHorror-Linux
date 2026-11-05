@@ -36,8 +36,11 @@ std::unique_ptr<ProductionSession> composeProductionSession() {
           coordinator->requestAccessToken(std::move(callback));
         }
       });
+  // The board fetches the card catalog for its card names through the same
+  // GameClient and token source, once per signed-in session.
   // Leaving SignedIn (sign-out, restart, profile switch) clears the board
-  // and drops every fetch still in flight; returning reloads an open screen.
+  // and its cached card names and drops every fetch still in flight;
+  // returning reloads an open screen.
   GameBoardController::bindToSession(*session->coordinator,
                                      *session->gameBoard);
 

@@ -26,6 +26,11 @@ class BoardCardsModel;
 // token or HTTP reply that lands after reset() (which setSignedIn(false)
 // calls whenever the session leaves SignedIn; see bindToSession()) is
 // dropped rather than shown.
+//
+// The first games-list fetch of a session also fetches the card catalog
+// (GameClient::listCampaignCards) with the same token, for the board's
+// card names. It is cached until reset() and fetched again only if it
+// failed; a failure is logged and the board keeps its card-code labels.
 class GameBoardController final : public QObject {
   Q_OBJECT
   // "idle", "loading", "loaded" or "error".
@@ -88,7 +93,10 @@ private:
     QString title;
   };
 
+  enum class CatalogStatus { None, Loading, Loaded };
+
   void fetchBoard();
+  void fetchCatalog(const SessionCoordinator::AccessToken &token);
   void failList(const QString &text);
   void failBoard(const QString &text);
   [[nodiscard]] QString tokenFailureText(const QString &diagnostic) const;
@@ -104,6 +112,11 @@ private:
   QString m_errorText;
   quint64 m_listGeneration{0};
   quint64 m_boardGeneration{0};
+  // Whether the card catalog's names (kept by m_board, which holds them
+  // across clear()) are loaded for this session; reset() drops them and
+  // any catalog reply still in flight.
+  CatalogStatus m_catalogStatus{CatalogStatus::None};
+  quint64 m_catalogGeneration{0};
   bool m_signedIn{false};
 };
 

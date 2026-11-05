@@ -2,10 +2,13 @@
 // BoardCardsModel decoded from the vendored get-game fixture, with the
 // image://arkham-card provider pointed at a mock asset server, and checks
 // that the board's cards are requested at their exact asset paths,
-// including mutated investigator art.
+// including mutated investigator art, a form override and a side-B act,
+// and that every card's accessible name is its catalog card name.
 
 #include "MockHttpServer.h"
 
+#include <QAccessible>
+#include <QAccessibleInterface>
 #include <QBuffer>
 #include <QCoreApplication>
 #include <QDeadlineTimer>
@@ -49,19 +52,16 @@ bool waitUntil(const std::function<bool()> &condition, int timeoutMs = 3000) {
   return condition();
 }
 
-// get-game.json's PublicGame with Roland's art mutated and the Study
-// unrevealed.
-PublicGame mutatedGame() {
+// get-game.json's PublicGame with each `edits` pair's first occurrence
+// replaced.
+PublicGame
+editedGame(std::initializer_list<std::pair<QByteArray, QByteArray>> edits) {
   QFile f(QStringLiteral(ARKHAM_TEST_CONTRACTS_DIR) +
           u"/fixtures/get-game.json");
   if (!f.open(QIODevice::ReadOnly))
     qFatal("missing fixture: get-game.json");
   QByteArray bytes = f.readAll();
-  for (const auto &[from, to] :
-       {std::pair{QByteArray(R"("mutated": null)"),
-                  QByteArray(R"("mutated": "Mutated21")")},
-        std::pair{QByteArray(R"("revealed": true)"),
-                  QByteArray(R"("revealed": false)")}}) {
+  for (const auto &[from, to] : edits) {
     const qsizetype at = bytes.indexOf(from);
     if (at < 0)
       qFatal("fixture edit target not found: %s", from.constData());
@@ -74,6 +74,36 @@ PublicGame mutatedGame() {
   if (!game)
     qFatal("fixture must decode: %s", qPrintable(game.error()));
   return *game;
+}
+
+// get-game.json's PublicGame with Roland's art mutated and the Study
+// unrevealed.
+PublicGame mutatedGame() {
+  return editedGame({{R"("mutated": null)", R"("mutated": "Mutated21")"},
+                     {R"("revealed": true)", R"("revealed": false)"}});
+}
+
+std::unique_ptr<QObject> createBoardWindow(QQmlEngine &engine,
+                                           BoardCardsModel &model) {
+  engine.rootContext()->setContextProperty(u"boardCards"_s, &model);
+  QQmlComponent component(&engine);
+  component.setData("import QtQuick\n"
+                    "Window {\n"
+                    "  width: 800; height: 600; visible: true\n"
+                    "  BoardCardsView { anchors.fill: parent;"
+                    " model: boardCards }\n"
+                    "}\n",
+                    QUrl::fromLocalFile(QStringLiteral(ARKHAM_TEST_QML_DIR
+                                                       "/BoardCardsTest.qml")));
+  std::unique_ptr<QObject> window(component.create());
+  if (!window)
+    qWarning("%s", qPrintable(component.errorString()));
+  return window;
+}
+
+QString accessibleName(QObject *item) {
+  QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(item);
+  return iface ? iface->text(QAccessible::Name) : u"<no interface>"_s;
 }
 
 // The view's delegates, found through the visual item tree (delegates are
@@ -183,6 +213,110 @@ private slots:
     QVERIFY(investigatorPlaceholder && actPlaceholder);
     QVERIFY(!investigatorPlaceholder->isVisible());
     QVERIFY(actPlaceholder->isVisible());
+  }
+
+  // Model to provider: a Shattered investigator requests the form's art
+  // and a side-B act its back, at the web's paths.
+  void formOverrideAndSideBActReachTheProvider() {
+    MockHttpServer server;
+    QVERIFY(server.start());
+    const QString shatteredPath = u"/img/arkham/cards/10661.avif"_s;
+    const QString actBackPath = u"/img/arkham/cards/01108b.avif"_s;
+    MockHttpServer::Response png;
+    png.status = 200;
+    png.contentType = "image/png"_ba;
+    png.body = tinyPng();
+    server.setResponse(shatteredPath, png);
+    server.setResponse(actBackPath, png);
+
+    QTemporaryDir cacheRoot;
+    QVERIFY(cacheRoot.isValid());
+    AssetImageRequestCoordinator::Config config;
+    config.assetBaseUrl = server.url(QString());
+    config.cacheConfig.rootDirectory = cacheRoot.path();
+
+    BoardCardsModel model;
+    model.setGame(editedGame({
+        {R"("tag": "RegularForm")", R"("tag": "ShatteredForm")"},
+        {"\"sequence\": [\n          1,\n          \"A\"",
+         "\"sequence\": [\n          1,\n          \"B\""},
+    }));
+
+    QQmlEngine engine;
+    engine.addImageProvider(u"arkham-card"_s,
+                            new AssetCardImageProvider(config));
+    std::unique_ptr<QObject> window = createBoardWindow(engine, model);
+    QVERIFY(window != nullptr);
+    QVERIFY(
+        waitUntil([&window] { return boardCards(window.get()).size() == 4; }));
+
+    QQuickItem *investigator = cardOfKind(window.get(), u"investigator"_s);
+    QQuickItem *act = cardOfKind(window.get(), u"act"_s);
+    QVERIFY(investigator && act);
+    QCOMPARE(investigator->property("imageSource").toString(),
+             u"image://arkham-card/c10661"_s);
+    QCOMPARE(act->property("imageSource").toString(),
+             u"image://arkham-card/c01108b"_s);
+    // Image.Ready == 1.
+    QVERIFY(waitUntil([&] {
+      return investigator->property("status").toInt() == 1 &&
+             act->property("status").toInt() == 1;
+    }));
+    QCOMPARE(server.requestCountForPath(shatteredPath), 1);
+    QCOMPARE(server.requestCountForPath(actBackPath), 1);
+    QCOMPARE(server.requestCountForPath(u"/img/arkham/cards/01001.avif"_s), 0);
+    QCOMPARE(server.requestCountForPath(u"/img/arkham/cards/01108.avif"_s), 0);
+  }
+
+  // Each card's accessible name, and its placeholder text, is its catalog
+  // card name, or its card code when the catalog has none; names arriving
+  // later reach the delegates too.
+  void accessibleNamesAreCatalogCardNames() {
+    BoardCardsModel model;
+    model.setCardNames({
+        {u"c01105"_s, {CardName{u"What's Going On?!"_s, std::nullopt}, {}}},
+        {u"c01111"_s,
+         {CardName{u"Study (unrevealed)"_s, std::nullopt},
+          CardName{u"Study"_s, std::nullopt}}},
+    });
+    model.setGame(editedGame({}));
+
+    // No image provider: every card stays on its placeholder.
+    QQmlEngine engine;
+    std::unique_ptr<QObject> window = createBoardWindow(engine, model);
+    QVERIFY(window != nullptr);
+    QVERIFY(
+        waitUntil([&window] { return boardCards(window.get()).size() == 4; }));
+
+    const QList<std::pair<QString, QString>> expected{
+        {u"agenda"_s, u"What's Going On?!"_s},
+        {u"act"_s, u"c01108"_s},
+        {u"location"_s, u"Study"_s},
+        {u"investigator"_s, u"Roland Banks"_s},
+    };
+    const auto check = [&window](const QString &kind, const QString &name) {
+      QQuickItem *card = cardOfKind(window.get(), kind);
+      if (!card)
+        return u"no %1 card"_s.arg(kind);
+      const QString cardName = accessibleName(card);
+      auto *image = card->childItems().value(0);
+      const QString imageName = image ? accessibleName(image) : QString();
+      auto *text = card->findChild<QQuickItem *>(u"cardLabel"_s);
+      const QString shown =
+          text ? text->property("text").toString() : QString();
+      if (cardName != name || imageName != name || !shown.startsWith(name))
+        return u"%1: card %2, image %3, text %4"_s.arg(kind, cardName,
+                                                       imageName, shown);
+      return QString();
+    };
+    for (const auto &[kind, name] : expected)
+      QVERIFY2(check(kind, name).isEmpty(), qPrintable(check(kind, name)));
+
+    model.setCardNames({{u"c01108"_s, {CardName{u"Trapped"_s, {}}, {}}}});
+    QTRY_VERIFY2(check(u"act"_s, u"Trapped"_s).isEmpty(),
+                 qPrintable(check(u"act"_s, u"Trapped"_s)));
+    QVERIFY2(check(u"agenda"_s, u"c01105"_s).isEmpty(),
+             qPrintable(check(u"agenda"_s, u"c01105"_s)));
   }
 
   // Refilling the model while the grid has focus leaves a current card, so
