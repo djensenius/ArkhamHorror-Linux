@@ -188,9 +188,9 @@ void GameClient::issue(const ServerProfile &profile, const QString &path,
                true);
     });
   }
-  m_pendingReplies.insert(reply, PendingReply{timer, QByteArray{},
-                                              std::move(notFoundDiagnostic),
-                                              std::move(completion)});
+  m_pendingReplies.insert(
+      reply, PendingReply{timer, QByteArray{}, std::move(notFoundDiagnostic),
+                          std::move(completion), m_maxResponseBytes});
 
   connect(reply, &QNetworkReply::metaDataChanged, this,
           [this, reply]() { handleMetadataChanged(reply); });
@@ -220,8 +220,9 @@ void GameClient::rejectQueued(Completion completion, QString diagnostic) {
 }
 
 void GameClient::handleMetadataChanged(QNetworkReply *reply) {
-  if (m_pendingReplies.contains(reply) &&
-      contentLengthExceedsCap(reply, m_maxResponseBytes)) {
+  const auto it = m_pendingReplies.constFind(reply);
+  if (it != m_pendingReplies.cend() &&
+      contentLengthExceedsCap(reply, it.value().maxResponseBytes)) {
     complete(reply, oversizedResponse(), true);
   }
 }
@@ -232,7 +233,8 @@ bool GameClient::readAvailable(QNetworkReply *reply) {
     if (it == m_pendingReplies.end()) {
       return false;
     }
-    const qsizetype remaining = m_maxResponseBytes - it.value().body.size();
+    const qsizetype remaining =
+        it.value().maxResponseBytes - it.value().body.size();
     const QByteArray chunk = reply->read(static_cast<qint64>(remaining) + 1);
     if (chunk.isEmpty()) {
       return true;

@@ -78,8 +78,10 @@ public:
                       QObject *parent = nullptr);
   ~GameClient() override;
 
-  // Lowers (or raises) the response-body cap; defaults to
-  // kMaxResponseBytes. Applies to requests issued afterwards.
+  // Test-only: lowers the response-body cap (default kMaxResponseBytes) so
+  // tests can exercise the size limit cheaply. Each request snapshots the
+  // cap when it is issued, so this applies only to requests issued
+  // afterwards; production code never calls it.
   void setMaxResponseBytes(qsizetype maxResponseBytes);
 
   void listGames(const ServerProfile &profile, const QString &token,
@@ -96,6 +98,8 @@ private:
     QByteArray body;
     QString notFoundDiagnostic;
     Completion completion;
+    // The cap in force when the request was issued.
+    qsizetype maxResponseBytes{kMaxResponseBytes};
   };
 
   void issue(const ServerProfile &profile, const QString &path,

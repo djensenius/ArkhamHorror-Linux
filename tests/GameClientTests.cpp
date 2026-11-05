@@ -340,6 +340,30 @@ private slots:
              u"response body exceeds the size limit"_s);
   }
 
+  void capChangeAfterIssueDoesNotAffectPendingRequest() {
+    // Issued under a 64-byte cap; raising the cap afterwards must not let
+    // the 80-byte streamed body through.
+    MockHttpServer::Response response = jsonResponse(200, QByteArray{});
+    response.includeContentLength = false;
+    response.chunks = {QByteArray(40, 'a'), QByteArray(40, 'b')};
+    response.headerDelayMs = 50;
+    m_server->setResponse(gamePath(), response);
+    GameClient client(*m_nam);
+    client.setMaxResponseBytes(64);
+    GameCall result;
+    client.getGame(*m_profile, kGameId, kToken,
+                   [&result](const GameRequestStatus &status, const GetGame *) {
+                     ++result.calls;
+                     result.status = status;
+                   });
+    client.setMaxResponseBytes(GameClient::kMaxResponseBytes);
+    QVERIFY(waitUntil([&result] { return result.calls > 0; }));
+    QCOMPARE(result.calls, 1);
+    QCOMPARE(result.status.outcome, GameRequestOutcome::Transport);
+    QCOMPARE(result.status.diagnostic,
+             u"response body exceeds the size limit"_s);
+  }
+
   void truncatedSuccessBodyIsTransportFailure() {
     // A 200 whose connection closes before the declared length arrives.
     MockHttpServer::Response response = jsonResponse(200, R"({"id":)"_ba);
