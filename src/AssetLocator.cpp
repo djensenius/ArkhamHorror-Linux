@@ -1,6 +1,7 @@
 #include "AssetLocator.h"
 
 #include "AuthTransportSecurity.h"
+#include "CardArt.h"
 
 #include <QStringList>
 
@@ -120,13 +121,15 @@ QString stripOneServerCardPrefix(const QString &cardCode) {
   return cardCode;
 }
 
-QString imageFileName(QString artCode, const AssetLocator::CardImageKey &key) {
+// The file name without ".avif": the whole art the web's imgsrc and
+// cardImgPath match their reprint and homebrew rules against.
+QString imageFileStem(QString artCode, const AssetLocator::CardImageKey &key) {
   if (key.face == AssetLocator::CardFace::Back) {
     artCode += u'b';
   }
   artCode += key.classVariantSuffix;
   artCode += key.mutationSuffix;
-  return artCode + ".avif"_L1;
+  return artCode;
 }
 
 QUrl appendPathSegments(QUrl base, const QStringList &segments) {
@@ -270,13 +273,17 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
           "homebrew card art id contains an invalid campaign or code segment"));
     }
     pathSegments << QStringLiteral("homebrew") << campaign
-                 << QStringLiteral("cards") << imageFileName(code, key);
+                 << QStringLiteral("cards")
+                 << CardArt::homebrewArt(campaign, imageFileStem(code, key)) +
+                        ".avif"_L1;
   } else {
     if (!isOfficialCardCodeSegment(artId)) {
       return invalidKey(
           QStringLiteral("card code is not a valid asset code segment"));
     }
-    pathSegments << QStringLiteral("cards") << imageFileName(artId, key);
+    pathSegments << QStringLiteral("cards")
+                 << CardArt::reprintedArt(imageFileStem(artId, key)) +
+                        ".avif"_L1;
   }
 
   return appendPathSegments(assetBaseUrl, pathSegments);

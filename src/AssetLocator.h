@@ -37,7 +37,9 @@ namespace Arkham::AssetLocator {
 // /img/arkham/cards/<code>b.avif after stripping one leading 'c' from the
 // card code. Homebrew compound art ids of the form :<campaign>:<code> map to
 // /img/arkham/homebrew/<campaign>/cards/<code>.avif. Both shapes match the
-// web client's cardArt/cardImgPath helpers.
+// web client's cardArt/cardImgPath helpers, including the Revised Core
+// reprint and Ages Unwound act file names (CardArt::reprintedArt and
+// CardArt::homebrewArt).
 enum class CardFace { Front = 1, Back };
 
 struct CardImageKey {
