@@ -107,6 +107,8 @@ private slots:
   void sizedEntriesForOneUrlDoNotCollide();
   void diskHitDecodesAtLookedUpBound();
   void storingNewBytesDropsOtherSizedEntries();
+  void restoringSameBytesKeepsOtherSizedEntries();
+  void restoringChangedBytesDropsEverySizedEntry();
   void sizedBoardDecodesCostAtMostATenthOfFullResolution();
 };
 
@@ -619,6 +621,77 @@ void AssetCacheTests::storingNewBytesDropsOtherSizedEntries() {
   QCOMPARE(fullHit.source, Arkham::AssetCache::LookupSource::Memory);
   QVERIFY(firstPixelMatches(fullHit.image, blue));
   QCOMPARE(cache.memoryCostBytes(), 60 * 84 * 4);
+}
+
+void AssetCacheTests::restoringSameBytesKeepsOtherSizedEntries() {
+  // Without a disk cache every new bound is a new fetch of the same bytes;
+  // storing them again must not evict the sizes already decoded.
+  const QByteArray png = encodePatternPng(QSize(600, 840));
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"sized-same-bytes");
+  const QSize small(150, 210);
+  const QSize large(300, 420);
+
+  Arkham::AssetCache cache({.diskMaxBytes = 0});
+  QCOMPARE(cache.diskStatus(), Arkham::AssetCache::DiskStatus::MemoryOnly);
+  const auto smallStored =
+      cache.store(url, png, QStringLiteral("image/png"), small);
+  expectStored(smallStored);
+  QCOMPARE(smallStored->size(), small);
+  const auto largeStored =
+      cache.store(url, QByteArray(png), QStringLiteral("image/png"), large);
+  expectStored(largeStored);
+  QCOMPARE(largeStored->size(), large);
+
+  const auto smallHit = cache.lookup(url, small);
+  QCOMPARE(smallHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(smallHit.image.size(), small);
+  const auto largeHit = cache.lookup(url, large);
+  QCOMPARE(largeHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(largeHit.image.size(), large);
+  QCOMPARE(cache.memoryCostBytes(), 150 * 210 * 4 + 300 * 420 * 4);
+}
+
+void AssetCacheTests::restoringChangedBytesDropsEverySizedEntry() {
+  const QColor red(220, 20, 20, 255);
+  const QColor blue(20, 20, 220, 255);
+  const QByteArray redPng = encodePng(red, QSize(60, 84));
+  const QByteArray bluePng = encodePng(blue, QSize(60, 84));
+  QVERIFY(!redPng.isEmpty());
+  QVERIFY(!bluePng.isEmpty());
+  QVERIFY(redPng != bluePng);
+  const QUrl url = assetUrl(u"sized-changed-bytes");
+  const QSize small(15, 21);
+  const QSize large(30, 42);
+
+  Arkham::AssetCache cache({.diskMaxBytes = 0});
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), small));
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), large));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(cache.memoryCostBytes(), 15 * 21 * 4 + 30 * 42 * 4);
+
+  // New bytes at a third bound make both red sizes stale.
+  expectStored(cache.store(url, bluePng, QStringLiteral("image/png")));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  QCOMPARE(cache.lookup(url, large).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  const auto fullHit = cache.lookup(url);
+  QCOMPARE(fullHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(fullHit.image, blue));
+  QCOMPARE(cache.memoryCostBytes(), 60 * 84 * 4);
+
+  // clearMemory() also forgets the digests; changed bytes still evict after
+  // it.
+  cache.clearMemory();
+  expectStored(cache.store(url, bluePng, QStringLiteral("image/png"), small));
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), large));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  const auto largeHit = cache.lookup(url, large);
+  QCOMPARE(largeHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(largeHit.image, red));
 }
 
 void AssetCacheTests::sizedBoardDecodesCostAtMostATenthOfFullResolution() {

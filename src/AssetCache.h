@@ -66,8 +66,10 @@ public:
                                     const QSize &bound = QSize());
   // Decodes encodedBytes at bound, caches the decode in memory, and writes
   // the encoded bytes to disk. Bytes that fail to decode never reach disk.
-  // Memory entries for the same URL at other bounds are dropped because they
-  // were decoded from the bytes this call replaces.
+  // Memory entries for the same URL at other bounds are dropped when
+  // encodedBytes differ from the bytes the last store() for that URL decoded,
+  // because those entries came from bytes this call replaces. Storing the
+  // same bytes again keeps them.
   [[nodiscard]] AssetDecodeOutcome<QImage>
   store(const QUrl &url, const QByteArray &encodedBytes,
         const QString &contentType = {}, const QSize &bound = QSize());
@@ -119,6 +121,10 @@ private:
 
   Config m_config;
   QCache<QString, QImage> m_memoryCache;
+  // SHA-256 of the bytes the last store() decoded, keyed by canonical URL.
+  // A URL without a digest is treated as changed. Cleared with the memory
+  // cache, and reset when it reaches kMaxMemoryPayloadDigests entries.
+  QHash<QString, QByteArray> m_memoryPayloadDigests;
   QHash<QString, DiskEntry> m_index;
   std::multimap<quint64, QString> m_lruQueue;
   std::map<QString, std::multimap<quint64, QString>::iterator> m_lruPositions;

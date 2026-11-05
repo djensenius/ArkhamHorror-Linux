@@ -21,6 +21,7 @@ namespace {
 
 constexpr qsizetype kMaxHeaderBytes = 4096;
 constexpr auto kFileMagic = "ARKHAM-ASSET-CACHE 1";
+constexpr qsizetype kMaxMemoryPayloadDigests = 4096;
 
 [[nodiscard]] bool isLowerHexSha256FileName(const QString &fileName) {
   if (fileName.size() != 64) {
@@ -166,7 +167,23 @@ AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
     return decoded.error();
   }
 
-  removeMemoryEntriesForUrl(url);
+  // Only bytes that differ from the last stored payload make the URL's other
+  // sized entries stale; identical bytes (a refetch for a new bound with no
+  // disk cache) keep them.
+  const QString urlKey = QString::fromLatin1(canonicalUrlBytes(url));
+  const QByteArray digest =
+      QCryptographicHash::hash(encodedBytes, QCryptographicHash::Sha256);
+  const auto knownDigest = m_memoryPayloadDigests.constFind(urlKey);
+  if (knownDigest == m_memoryPayloadDigests.cend() ||
+      knownDigest.value() != digest) {
+    removeMemoryEntriesForUrl(url);
+    if (knownDigest == m_memoryPayloadDigests.cend() &&
+        m_memoryPayloadDigests.size() >= kMaxMemoryPayloadDigests) {
+      // Forgetting digests is safe: a URL without one is treated as changed.
+      m_memoryPayloadDigests.clear();
+    }
+    m_memoryPayloadDigests.insert(urlKey, digest);
+  }
   promoteToMemory(memoryKeyFor(url, bound), *decoded);
 
   if (m_diskStatus == DiskStatus::Enabled) {
@@ -187,7 +204,10 @@ AssetCache::storeMemoryOnly(const QUrl &url, const QByteArray &encodedBytes,
   return decoded;
 }
 
-void AssetCache::clearMemory() { m_memoryCache.clear(); }
+void AssetCache::clearMemory() {
+  m_memoryCache.clear();
+  m_memoryPayloadDigests.clear();
+}
 
 QByteArray AssetCache::canonicalUrlBytes(const QUrl &url) {
   const QUrl canonical = url.adjusted(QUrl::NormalizePathSegments);
