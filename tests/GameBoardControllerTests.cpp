@@ -652,6 +652,41 @@ private slots:
     QCOMPARE(degraded.count(), 1);
   }
 
+  // A reply with both a skipped and a degraded entry still logs exactly one
+  // warning, naming both.
+  void skippedAndDegradedEntriesShareOneWarning() {
+    CatalogWarningCounter warnings(kCatalogEntryPrefix);
+    QByteArray body = catalogBody();
+    const QByteArray trappedName = R"({"subtitle":null,"title":"Trapped"})"_ba;
+    const QByteArray studyName = R"({"subtitle":null,"title":"Study"})"_ba;
+    QCOMPARE(body.count(trappedName), 1);
+    QCOMPARE(body.count(studyName), 1);
+    body.replace(trappedName, "null"_ba);
+    body.replace(studyName, R"("Study")"_ba);
+    m_server->setResponse(cardsTarget(), held(jsonResponse(200, body)));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
+
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        "Card catalog: skipped 1 unreadable entry; those cards show card "
+        "codes (first: cards[1].name: expected object, got null); ignored "
+        "the malformed revealedName of 1 entry (first: cards[2].revealedName: "
+        "expected object, got string)");
+    m_server->releaseHeld();
+    QVERIFY(waitUntil([&warnings] { return warnings.count() == 1; }));
+    QCOMPARE(labelsOf(c.boardCards()),
+             QStringList({u"What's Going On?!"_s, u"c01108"_s,
+                          u"Study (unrevealed)"_s, u"Roland Banks"_s}));
+    QTest::qWait(100);
+    QCOMPARE(warnings.count(), 1);
+  }
+
   // A catalog reply that lands after reset() names nothing. The first
   // reply is held until after reset(); the next session's catalog fails,
   // so any name on the board could only have come from the dropped reply.
