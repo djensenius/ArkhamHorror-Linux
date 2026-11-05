@@ -13,6 +13,7 @@
 #include <QJsonObject>
 #include <QMetaObject>
 #include <QNetworkAccessManager>
+#include <QNetworkReply>
 #include <QtTest>
 
 #include <functional>
@@ -576,7 +577,28 @@ private slots:
     QVERIFY(loadList(c));
     QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
     c.reset();
+    // Wait for the client to finish the stale reply before the next
+    // session starts, so the drop path is exercised rather than raced.
+    // GameClient handles QNetworkReply::finished directly, in the same
+    // emission as the manager's finished signal, so once that has fired
+    // and control is back here the controller has seen (and must have
+    // dropped) the reply. The reply is read inside the emission because
+    // the client deletes it afterwards.
+    int staleFinished = 0;
+    QString stalePath;
+    QNetworkReply::NetworkError staleError = QNetworkReply::UnknownNetworkError;
+    QObject staleWatch;
+    connect(m_nam, &QNetworkAccessManager::finished, &staleWatch,
+            [&](QNetworkReply *reply) {
+              ++staleFinished;
+              stalePath = reply->url().path();
+              staleError = reply->error();
+            });
     m_server->releaseHeld();
+    QVERIFY(waitUntil([&staleFinished] { return staleFinished == 1; }));
+    QCoreApplication::processEvents();
+    QCOMPARE(stalePath, m_profile->apiUrl(u"arkham/cards").path());
+    QCOMPARE(staleError, QNetworkReply::NoError);
 
     m_server->setResponse(cardsTarget(), held(jsonResponse(500, "{}"_ba)));
     QVERIFY(loadList(c));
