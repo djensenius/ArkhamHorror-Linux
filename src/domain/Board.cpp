@@ -123,18 +123,6 @@ constexpr std::array<std::pair<QLatin1StringView, LocationSymbol>, 16>
         {"NoSymbol"_L1, LocationSymbol::NoSymbol},
     }};
 
-// investigator.schema.json's `class` enum (Arkham.ClassSymbol).
-constexpr std::array<std::pair<QLatin1StringView, ClassSymbol>, 7>
-    kClassSymbolTable{{
-        {"Guardian"_L1, ClassSymbol::Guardian},
-        {"Seeker"_L1, ClassSymbol::Seeker},
-        {"Survivor"_L1, ClassSymbol::Survivor},
-        {"Rogue"_L1, ClassSymbol::Rogue},
-        {"Mystic"_L1, ClassSymbol::Mystic},
-        {"Neutral"_L1, ClassSymbol::Neutral},
-        {"Mythos"_L1, ClassSymbol::Mythos},
-    }};
-
 // Arkham.Token core names the board reads counts for.
 constexpr auto kClueToken = u"Clue";
 constexpr auto kDoomToken = u"Doom";

@@ -7,10 +7,12 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QLatin1StringView>
 #include <QList>
 #include <QMap>
 #include <QString>
 #include <QStringList>
+#include <array>
 #include <optional>
 #include <utility>
 
@@ -57,6 +59,20 @@ enum class ClassSymbol {
   Neutral,
   Mythos,
 };
+
+// Wire table for the backend's `Arkham.ClassSymbol`: every decoder and
+// encoder of a class symbol uses this one table. Matching is exact and
+// case-sensitive; an unlisted value is rejected.
+inline constexpr std::array<std::pair<QLatin1StringView, ClassSymbol>, 7>
+    kClassSymbolTable{{
+        {QLatin1StringView("Guardian"), ClassSymbol::Guardian},
+        {QLatin1StringView("Seeker"), ClassSymbol::Seeker},
+        {QLatin1StringView("Survivor"), ClassSymbol::Survivor},
+        {QLatin1StringView("Rogue"), ClassSymbol::Rogue},
+        {QLatin1StringView("Mystic"), ClassSymbol::Mystic},
+        {QLatin1StringView("Neutral"), ClassSymbol::Neutral},
+        {QLatin1StringView("Mythos"), ClassSymbol::Mythos},
+    }};
 
 // `revelation` enum.
 enum class Revelation {

@@ -35,20 +35,6 @@ constexpr std::array<std::pair<QLatin1StringView, MultiplayerVariant>, 2>
         {"WithFriends"_L1, MultiplayerVariant::WithFriends},
     }};
 
-// Duplicated from CardCatalog.cpp's file-local table (both derive from the
-// backend's single `Arkham.ClassSymbol` type): keeping each module's wire
-// table private avoids coupling CardCatalog's internal layout to Games.cpp.
-constexpr std::array<std::pair<QLatin1StringView, ClassSymbol>, 7>
-    kClassSymbolTable{{
-        {"Guardian"_L1, ClassSymbol::Guardian},
-        {"Seeker"_L1, ClassSymbol::Seeker},
-        {"Survivor"_L1, ClassSymbol::Survivor},
-        {"Rogue"_L1, ClassSymbol::Rogue},
-        {"Mystic"_L1, ClassSymbol::Mystic},
-        {"Neutral"_L1, ClassSymbol::Neutral},
-        {"Mythos"_L1, ClassSymbol::Mythos},
-    }};
-
 constexpr std::array<std::pair<QLatin1StringView, CampaignPart>, 2>
     kCampaignPartTable{{
         {"TheDreamQuest"_L1, CampaignPart::TheDreamQuest},
