@@ -20,7 +20,7 @@ class QUrlQuery;
 
 namespace Arkham {
 
-struct CardDef;
+struct CatalogNames;
 class GameListRow;
 class GetGame;
 
@@ -54,7 +54,7 @@ struct GameRequestStatus {
 // "Authorization: Token <token>" for exactly that request; the token is not
 // kept after the request is issued. Responses are decoded only through the
 // existing raw-bytes decoders (decodeGameListFromRawBytes,
-// GetGame::fromRawBytes and decodeCatalogFromRawBytes).
+// GetGame::fromRawBytes and decodeCatalogNamesFromRawBytes).
 //
 // Every callback runs exactly once, asynchronously, unless this client is
 // destroyed first (pending requests are then aborted and their callbacks
@@ -76,8 +76,8 @@ public:
                                               const QList<GameListRow> *)>;
   using GameCallback =
       std::function<void(const GameRequestStatus &, const GetGame *)>;
-  using CardListCallback =
-      std::function<void(const GameRequestStatus &, const QList<CardDef> *)>;
+  using CatalogNamesCallback =
+      std::function<void(const GameRequestStatus &, const CatalogNames *)>;
 
   explicit GameClient(QNetworkAccessManager &nam,
                       std::chrono::milliseconds timeout = kDefaultTimeout,
@@ -98,11 +98,13 @@ public:
                  GameListCallback callback);
   void getGame(const ServerProfile &profile, const QString &gameId,
                const QString &token, GameCallback callback);
-  // The campaign card pool (agendas, acts, locations and the rest of the
-  // encounter cards), with English names. The endpoint is public; the
-  // token is sent like every other request to this server.
+  // The English names of the campaign card pool (agendas, acts, locations
+  // and the rest of the encounter cards). Only names are decoded, entry by
+  // entry: an entry without a readable code or name is skipped and counted
+  // in the result rather than failing the whole pool. The endpoint is
+  // public; the token is sent like every other request to this server.
   void listCampaignCards(const ServerProfile &profile, const QString &token,
-                         CardListCallback callback);
+                         CatalogNamesCallback callback);
 
 private:
   using Completion =

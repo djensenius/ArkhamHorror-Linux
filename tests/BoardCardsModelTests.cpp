@@ -229,9 +229,10 @@ private slots:
     QVERIFY2(bundle.has_value(), qPrintable(bundle.error()));
     const auto cardsBytes = bundle->value("cards"_L1).toJsonBytes();
     QVERIFY2(cardsBytes.has_value(), qPrintable(cardsBytes.error()));
-    auto cards = decodeCatalogFromRawBytes(*cardsBytes, u"cards");
-    QVERIFY2(cards.has_value(), qPrintable(cards.error()));
-    const auto table = BoardCardsModel::cardNamesFromCatalog(*cards);
+    auto catalog = decodeCatalogNamesFromRawBytes(*cardsBytes, u"cards");
+    QVERIFY2(catalog.has_value(), qPrintable(catalog.error()));
+    QCOMPARE(catalog->skippedCount, 0);
+    const auto table = BoardCardsModel::cardNamesFromCatalog(*catalog);
     QCOMPARE(table.size(), 1);
     QCOMPARE(table.value(u"c01020"_s).name.title, u"Machete"_s);
     QVERIFY(!table.value(u"c01020"_s).revealedName.has_value());

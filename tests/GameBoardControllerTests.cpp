@@ -99,14 +99,17 @@ const QStringList kCodeLabels{u"c01105"_s, u"c01108"_s, u"c01111"_s,
 const QStringList kNameLabels{u"What's Going On?!"_s, u"Trapped"_s, u"Study"_s,
                               u"Roland Banks"_s};
 
-// Counts the controller's "catalog unavailable" warnings while alive, and
-// passes every message on to QtTest's own handler (so
-// QTest::ignoreMessage() still applies). Lets a test wait for a failed
-// catalog reply to be handled instead of guessing how long it takes.
+// Counts the controller's "catalog unavailable" warnings (or those with
+// another |prefix|) while alive, and passes every message on to QtTest's
+// own handler (so QTest::ignoreMessage() still applies). Lets a test wait
+// for a failed catalog reply to be handled instead of guessing how long it
+// takes.
 class CatalogWarningCounter {
 public:
-  CatalogWarningCounter() {
+  explicit CatalogWarningCounter(
+      QLatin1StringView prefix = "Card catalog unavailable"_L1) {
     s_count = 0;
+    s_prefix = prefix;
     s_previous = qInstallMessageHandler(&handle);
   }
   ~CatalogWarningCounter() { qInstallMessageHandler(s_previous); }
@@ -117,15 +120,19 @@ public:
 private:
   static void handle(QtMsgType type, const QMessageLogContext &context,
                      const QString &message) {
-    if (type == QtWarningMsg &&
-        message.startsWith("Card catalog unavailable"_L1))
+    if (type == QtWarningMsg && message.startsWith(s_prefix))
       ++s_count;
     if (s_previous)
       s_previous(type, context, message);
   }
   static inline int s_count = 0;
+  static inline QLatin1StringView s_prefix;
   static inline QtMessageHandler s_previous = nullptr;
 };
+
+// The controller's one warning per catalog reply with skipped or degraded
+// entries.
+const QLatin1StringView kCatalogEntryPrefix = "Card catalog:"_L1;
 
 const char kCatalog500Warning[] =
     "Card catalog unavailable; board cards show card codes: The server "
@@ -562,6 +569,122 @@ private slots:
     c.openGame(0);
     QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
     QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
+  }
+
+  // TASK-3.3.6: a catalog value this client has no enum case for (here a
+  // new cardType) costs no card its name, and nothing is logged.
+  void oneUnknownCatalogValueKeepsOtherNames() {
+    // Both "Card catalog unavailable" and "Card catalog:" warnings.
+    CatalogWarningCounter catalogWarnings("Card catalog"_L1);
+    QByteArray body = catalogBody();
+    QCOMPARE(body.count(R"("cardType":"AgendaType")"_ba), 1);
+    body.replace(R"("cardType":"AgendaType")"_ba,
+                 R"("cardType":"FutureType")"_ba);
+    m_server->setResponse(cardsTarget(), jsonResponse(200, body));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
+    QCOMPARE(catalogWarnings.count(), 0);
+  }
+
+  // An entry without a readable name is skipped with one warning; that card
+  // keeps its code and every other card is named.
+  void unreadableCatalogEntryIsSkippedAndLogged() {
+    CatalogWarningCounter skipped(kCatalogEntryPrefix);
+    QByteArray body = catalogBody();
+    const QByteArray trappedName = R"({"subtitle":null,"title":"Trapped"})"_ba;
+    QCOMPARE(body.count(trappedName), 1);
+    body.replace(trappedName, "null"_ba);
+    m_server->setResponse(cardsTarget(), held(jsonResponse(200, body)));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
+
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        "Card catalog: skipped 1 unreadable entry; those cards show card "
+        "codes (first: cards[1].name: expected object, got null)");
+    m_server->releaseHeld();
+    QVERIFY(waitUntil([&skipped] { return skipped.count() == 1; }));
+    QCOMPARE(labelsOf(c.boardCards()),
+             QStringList({u"What's Going On?!"_s, u"c01108"_s, u"Study"_s,
+                          u"Roland Banks"_s}));
+    QTest::qWait(100);
+    QCOMPARE(skipped.count(), 1);
+    QVERIFY(c.errorText().isEmpty());
+  }
+
+  // A malformed revealedName keeps the card's name (so the revealed
+  // location shows its unrevealed name) and is logged once.
+  void malformedRevealedNameIsLogged() {
+    CatalogWarningCounter degraded(kCatalogEntryPrefix);
+    QByteArray body = catalogBody();
+    const QByteArray studyName = R"({"subtitle":null,"title":"Study"})"_ba;
+    QCOMPARE(body.count(studyName), 1);
+    body.replace(studyName, R"("Study")"_ba);
+    m_server->setResponse(cardsTarget(), held(jsonResponse(200, body)));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
+
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        "Card catalog: ignored the malformed revealedName of 1 entry (first: "
+        "cards[2].revealedName: expected object, got string)");
+    m_server->releaseHeld();
+    QVERIFY(waitUntil([&degraded] { return degraded.count() == 1; }));
+    QCOMPARE(labelsOf(c.boardCards()),
+             QStringList({u"What's Going On?!"_s, u"Trapped"_s,
+                          u"Study (unrevealed)"_s, u"Roland Banks"_s}));
+    QTest::qWait(100);
+    QCOMPARE(degraded.count(), 1);
+  }
+
+  // A reply with both a skipped and a degraded entry still logs exactly one
+  // warning, naming both.
+  void skippedAndDegradedEntriesShareOneWarning() {
+    CatalogWarningCounter warnings(kCatalogEntryPrefix);
+    QByteArray body = catalogBody();
+    const QByteArray trappedName = R"({"subtitle":null,"title":"Trapped"})"_ba;
+    const QByteArray studyName = R"({"subtitle":null,"title":"Study"})"_ba;
+    QCOMPARE(body.count(trappedName), 1);
+    QCOMPARE(body.count(studyName), 1);
+    body.replace(trappedName, "null"_ba);
+    body.replace(studyName, R"("Study")"_ba);
+    m_server->setResponse(cardsTarget(), held(jsonResponse(200, body)));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
+
+    QTest::ignoreMessage(
+        QtWarningMsg,
+        "Card catalog: skipped 1 unreadable entry; those cards show card "
+        "codes (first: cards[1].name: expected object, got null); ignored "
+        "the malformed revealedName of 1 entry (first: cards[2].revealedName: "
+        "expected object, got string)");
+    m_server->releaseHeld();
+    QVERIFY(waitUntil([&warnings] { return warnings.count() == 1; }));
+    QCOMPARE(labelsOf(c.boardCards()),
+             QStringList({u"What's Going On?!"_s, u"c01108"_s,
+                          u"Study (unrevealed)"_s, u"Roland Banks"_s}));
+    QTest::qWait(100);
+    QCOMPARE(warnings.count(), 1);
   }
 
   // A catalog reply that lands after reset() names nothing. The first

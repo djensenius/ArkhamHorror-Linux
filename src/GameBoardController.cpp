@@ -29,6 +29,28 @@ QString statusName(GameBoardController::Status status) {
 
 const QString kSignedOutText = QStringLiteral("Sign in to see your games.");
 
+// "1 <adjective>entry" or "N <adjective>entries".
+QString entryCount(qsizetype count, QStringView adjective = {}) {
+  return count == 1 ? QStringLiteral("1 %1entry").arg(adjective)
+                    : QStringLiteral("%1 %2entries").arg(count).arg(adjective);
+}
+
+// One warning for every catalog entry that lost its name or revealed name.
+QString catalogEntryWarning(const CatalogNames &catalog) {
+  QStringList parts;
+  if (catalog.skippedCount > 0)
+    parts.append(QStringLiteral("skipped %1; those cards show card codes "
+                                "(first: %2)")
+                     .arg(entryCount(catalog.skippedCount, u"unreadable "),
+                          catalog.firstSkipDiagnostic));
+  if (catalog.degradedCount > 0)
+    parts.append(QStringLiteral("ignored the malformed revealedName of %1 "
+                                "(first: %2)")
+                     .arg(entryCount(catalog.degradedCount),
+                          catalog.firstDegradeDiagnostic));
+  return QStringLiteral("Card catalog: ") + parts.join(QStringLiteral("; "));
+}
+
 } // namespace
 
 GameBoardController::GameBoardController(GameClient &client,
@@ -150,10 +172,10 @@ void GameBoardController::fetchCatalog(
   m_client.listCampaignCards(
       token.profile, token.token,
       [self, generation](const GameRequestStatus &status,
-                         const QList<CardDef> *cards) {
+                         const CatalogNames *catalog) {
         if (!self || generation != self->m_catalogGeneration)
           return;
-        if (status.outcome != GameRequestOutcome::Success || !cards) {
+        if (status.outcome != GameRequestOutcome::Success || !catalog) {
           // Not shown: the board still works, labelled with card codes.
           self->m_catalogStatus = CatalogStatus::None;
           qWarning().noquote()
@@ -161,9 +183,11 @@ void GameBoardController::fetchCatalog(
               << describe(status);
           return;
         }
+        if (catalog->skippedCount > 0 || catalog->degradedCount > 0)
+          qWarning().noquote() << catalogEntryWarning(*catalog);
         self->m_catalogStatus = CatalogStatus::Loaded;
         self->m_board->setCardNames(
-            BoardCardsModel::cardNamesFromCatalog(*cards));
+            BoardCardsModel::cardNamesFromCatalog(*catalog));
       });
 }
 

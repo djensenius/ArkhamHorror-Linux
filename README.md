@@ -326,6 +326,15 @@ decodes server data tolerantly:
   so unknown fields are dropped. Types that must round-trip unknown data
   verbatim (such as an unrecognized `GameState` tag) say so explicitly.
 
+The board's card-name lookup is a deliberate exception: it reads
+`GET /arkham/cards` with a lenient names-only decoder
+(`decodeCatalogNamesFromRawBytes`). Unknown enum values are ignored because
+only `cardCode`, `name` and `revealedName` are read. An entry that is not an
+object, or has no readable code or name, is skipped, and a malformed
+`revealedName` is dropped; both counts are reported in one warning per
+catalog response. Everything else the client models stays strict, including
+the full catalog decoder.
+
 `Json::requireExactKeys` in `src/domain/JsonDecode.h` is reserved for the
 exact tagged-union branches and the campaign-option request case above.
 

@@ -1448,6 +1448,59 @@ ValueOrError<QList<CardDef>> decodeCatalogFromRawBytes(QByteArrayView bytes,
   return result;
 }
 
+ValueOrError<CatalogNames> decodeCatalogNamesFromRawBytes(QByteArrayView bytes,
+                                                          QStringView path) {
+  auto parsed = Json::Value::parse(bytes, path);
+  if (!parsed)
+    return failure(parsed.error());
+  if (!parsed->isArray())
+    return failure(QStringLiteral("%1: expected array, got %2")
+                       .arg(path, Json::typeName(*parsed)));
+  const QList<Json::Value> &elements = parsed->toArray();
+  CatalogNames result;
+  result.cards.reserve(elements.size());
+  const auto skip = [&result](const QString &diagnostic) {
+    if (result.skippedCount++ == 0)
+      result.firstSkipDiagnostic = diagnostic;
+  };
+  for (qsizetype i = 0; i < elements.size(); ++i) {
+    const QString itemPath = Json::indexPath(path, i);
+    auto objResult = Json::requireObject(elements[i], itemPath);
+    if (!objResult) {
+      skip(objResult.error());
+      continue;
+    }
+    const Json::Value &obj = *objResult;
+    auto cardCode = Json::requireField(
+        obj, "cardCode"_L1, Json::joinPath(itemPath, u"cardCode"),
+        [](const auto &v, QStringView p) { return decodeCardCodeValue(v, p); });
+    if (!cardCode) {
+      skip(cardCode.error());
+      continue;
+    }
+    auto name = Json::requireField(
+        obj, "name"_L1, Json::joinPath(itemPath, u"name"),
+        [](const auto &v, QStringView p) { return decodeCardNameValue(v, p); });
+    if (!name) {
+      skip(name.error());
+      continue;
+    }
+    std::optional<CardName> revealedName;
+    if (Json::fieldPresence(obj, "revealedName"_L1) !=
+        Json::FieldPresence::Absent) {
+      // Malformed: the card keeps its name.
+      auto r = decodeCardNameValue(obj.value("revealedName"_L1),
+                                   Json::joinPath(itemPath, u"revealedName"));
+      if (r)
+        revealedName = *r;
+      else if (result.degradedCount++ == 0)
+        result.firstDegradeDiagnostic = r.error();
+    }
+    result.cards.append({*cardCode, *name, revealedName});
+  }
+  return result;
+}
+
 ValueOrError<Json::Value> CardDef::toRawJson() const {
   QList<std::pair<QString, Json::Value>> members;
   const auto insert = [&members](QLatin1StringView key, Json::Value value) {
