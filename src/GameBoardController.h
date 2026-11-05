@@ -31,6 +31,9 @@ class BoardCardsModel;
 // (GameClient::listCampaignCards) with the same token, for the board's
 // card names. It is cached until reset() and fetched again only if it
 // failed; a failure is logged and the board keeps its card-code labels.
+// GameClient decodes it off the GUI thread, so it can land well after the
+// reply; one from before reset() is dropped by its generation, while
+// opening or closing a game leaves a catalog in flight to name the board.
 class GameBoardController final : public QObject {
   Q_OBJECT
   // "idle", "loading", "loaded" or "error".
