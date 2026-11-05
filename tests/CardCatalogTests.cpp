@@ -586,6 +586,7 @@ void CardCatalogTests::classSymbolTableIsTheSevenWireNames() {
 void CardCatalogTests::classSymbolsRoundTripEveryValue_data() {
   QTest::addColumn<QString>("wire");
   QTest::addColumn<ClassSymbol>("expected");
+  // Hand-copied on purpose: rows generated from kClassSymbolTable always pass.
   const std::initializer_list<std::pair<const char *, ClassSymbol>> rows{
       {"Guardian", ClassSymbol::Guardian}, {"Seeker", ClassSymbol::Seeker},
       {"Survivor", ClassSymbol::Survivor}, {"Rogue", ClassSymbol::Rogue},

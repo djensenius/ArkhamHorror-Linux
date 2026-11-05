@@ -60,12 +60,9 @@ enum class ClassSymbol {
   Mythos,
 };
 
-// The single wire table for the backend's `Arkham.ClassSymbol` type, shared
-// by every decoder/encoder that reads or writes a class symbol: the catalog's
-// `classSymbols` array (CardCatalog.cpp), the board investigator's `class`
-// (Board.cpp) and the game-list InvestigatorSummary's `classSymbol`
-// (Games.cpp). Matching is exact and case-sensitive via
-// Json::decodeClosedEnum()/encodeClosedEnum(); an unlisted value is rejected.
+// Wire table for the backend's `Arkham.ClassSymbol`: every decoder and
+// encoder of a class symbol uses this one table. Matching is exact and
+// case-sensitive; an unlisted value is rejected.
 inline constexpr std::array<std::pair<QLatin1StringView, ClassSymbol>, 7>
     kClassSymbolTable{{
         {QLatin1StringView("Guardian"), ClassSymbol::Guardian},
