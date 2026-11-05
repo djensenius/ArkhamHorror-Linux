@@ -133,6 +133,7 @@ private slots:
   void coordinatorCancelDetachesWaiter();
   void coordinatorRerequestAfterCancelCompletesNewFlight();
   void providerLoadsMutatedCardImage();
+  void providerLoadsClassVariantCardImage();
   void providerUsesSiteSettingsAssetHost();
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable_data();
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable();
@@ -461,6 +462,30 @@ void AssetImageProviderTests::providerLoadsMutatedCardImage() {
   QCOMPARE(server.requestCountForPath(path), 1);
 }
 
+void AssetImageProviderTests::providerLoadsClassVariantCardImage() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path =
+      QStringLiteral("/img/arkham/cards/03006_Seeker_Mutated20.avif");
+  server.setResponse(path, response(200, tinyPng()));
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetCardImageProvider provider(configFor(server, cacheRoot));
+
+  std::unique_ptr<QQuickImageResponse> imageResponse(
+      provider.requestImageResponse(
+          QStringLiteral("c03006?variant=Seeker&mutation=Mutated20"),
+          QSize(4, 0)));
+  QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
+  QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+  QCOMPARE(imageResponse->errorString(), QString());
+  std::unique_ptr<QQuickTextureFactory> factory(
+      imageResponse->textureFactory());
+  QVERIFY(factory != nullptr);
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
 void AssetImageProviderTests::providerUsesSiteSettingsAssetHost() {
   MockHttpServer settingsServer;
   QVERIFY(settingsServer.start());
@@ -758,6 +783,10 @@ void AssetImageProviderTests::providerRejectsInvalidIds() {
       QStringLiteral("01001_MutatedX"),
       QStringLiteral("01001_Mutated1?mutation=Mutated2"),
       QStringLiteral("01001?mutation="),
+      QStringLiteral("01001?variant="),
+      QStringLiteral("01001?variant=Neutral"),
+      QStringLiteral("01001?variant=Mythos"),
+      QStringLiteral("01001?variant=seeker"),
       QStringLiteral("front/01001/extra"),
   };
 

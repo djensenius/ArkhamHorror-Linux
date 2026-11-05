@@ -10,7 +10,7 @@ namespace {
 
 // Small valid board entities; each test row edits one field.
 constexpr auto kInvestigator =
-    R"({"id":"c01001","cardCode":"c01001",%1)"
+    R"({"id":"%1","cardCode":"%1",%2)"
     R"("playerId":"00000000-0000-0000-0000-000000000001",)"
     R"("name":{"title":"Roland Banks","subtitle":"The Fed"},)"
     R"("class":"Guardian","health":9,"sanity":5,"willpower":3,)"
@@ -53,27 +53,88 @@ class CardArtTests : public QObject {
 
 private slots:
   void investigator_data() {
+    QTest::addColumn<QString>("cardCode");
     QTest::addColumn<QString>("fields");
     QTest::addColumn<QString>("imageId");
+    const auto roland = u"c01001"_s;
+    const auto lola = u"c03006"_s;
     QTest::newRow("plain art")
-        << uR"("art":"c01001","mutated":null,)"_s << u"c01001"_s;
-    QTest::newRow("art absent falls back to id") << QString() << u"c01001"_s;
-    QTest::newRow("mutated") << uR"("art":"c01001","mutated":"Mutated21",)"_s
-                             << u"c01001?mutation=Mutated21"_s;
+        << roland << uR"("art":"c01001","mutated":null,)"_s << u"c01001"_s;
+    QTest::newRow("art absent falls back to id")
+        << roland << QString() << u"c01001"_s;
+    QTest::newRow("mutated")
+        << roland << uR"("art":"c01001","mutated":"Mutated21",)"_s
+        << u"c01001?mutation=Mutated21"_s;
     QTest::newRow("art differs from id")
-        << uR"("art":"c98001","mutated":"Mutated3",)"_s
+        << roland << uR"("art":"c98001","mutated":"Mutated3",)"_s
         << u"c98001?mutation=Mutated3"_s;
     QTest::newRow("homebrew art")
-        << uR"("art":":fan:12345",)"_s << u":fan:12345"_s;
+        << roland << uR"("art":":fan:12345",)"_s << u":fan:12345"_s;
     QTest::newRow("malformed mutation shows plain art")
-        << uR"("art":"c01001","mutated":"Mutated",)"_s << u"c01001"_s;
+        << roland << uR"("art":"c01001","mutated":"Mutated",)"_s << u"c01001"_s;
+
+    // Art that is not a valid asset id would change the provider id's
+    // path, query or fragment, so the id is shown instead.
+    QTest::newRow("art with '/' falls back to id")
+        << roland << uR"("art":"c01001/../c02002",)"_s << u"c01001"_s;
+    QTest::newRow("art with '?' falls back to id")
+        << roland << uR"("art":"c02002?face=back",)"_s << u"c01001"_s;
+    QTest::newRow("art with '#' falls back to id")
+        << roland << uR"("art":"c02002#x",)"_s << u"c01001"_s;
+    QTest::newRow("art with '%' falls back to id")
+        << roland << uR"("art":"c02002%2Fx",)"_s << u"c01001"_s;
+    QTest::newRow("invalid art keeps the mutation")
+        << roland << uR"("art":"c02002/x","mutated":"Mutated21",)"_s
+        << u"c01001?mutation=Mutated21"_s;
+
+    // The form override comes first and ignores the mutation and variant.
+    QTest::newRow("regular form")
+        << roland << uR"("form":{"tag":"RegularForm"},)"_s << u"c01001"_s;
+    QTest::newRow("Yithian form")
+        << roland << uR"("form":{"tag":"YithianForm"},"mutated":"Mutated2",)"_s
+        << u"c04244"_s;
+    QTest::newRow("Homunculus form")
+        << roland << uR"("form":{"tag":"HomunculusForm"},)"_s << u"c11068b"_s;
+    QTest::newRow("Shattered form")
+        << roland << uR"("form":{"tag":"ShatteredForm"},)"_s << u"c10661"_s;
+    QTest::newRow("Transfigured form")
+        << roland
+        << uR"("form":{"tag":"TransfiguredForm","contents":"c10016a"},)"
+           R"("mutated":"Mutated2",)"_s
+        << u"c10016a"_s;
+    QTest::newRow("Transfigured into an invalid asset id shows the art")
+        << roland
+        << uR"("form":{"tag":"TransfiguredForm","contents":"c10016.a"},)"_s
+        << u"c01001"_s;
+    QTest::newRow("unknown form shows the art")
+        << roland << uR"("form":{"tag":"MoonForm"},)"_s << u"c01001"_s;
+    QTest::newRow("form beats the class variant")
+        << lola << uR"("form":{"tag":"ShatteredForm"},"meta":"Seeker",)"_s
+        << u"c10661"_s;
+
+    // Lola Hayes' role art, keyed on cardCode.
+    QTest::newRow("c03006 Seeker")
+        << lola << uR"("art":"c03006","meta":"Seeker",)"_s
+        << u"c03006?variant=Seeker"_s;
+    QTest::newRow("c90087 Mystic, mutated")
+        << u"c90087"_s << uR"("meta":"Mystic","mutated":"Mutated20",)"_s
+        << u"c90087?variant=Mystic&mutation=Mutated20"_s;
+    QTest::newRow("c03006 Neutral has no variant")
+        << lola << uR"("meta":"Neutral",)"_s << u"c03006"_s;
+    QTest::newRow("c03006 Mythos has no variant")
+        << lola << uR"("meta":"Mythos",)"_s << u"c03006"_s;
+    QTest::newRow("c03006 without meta has no variant")
+        << lola << uR"("meta":null,)"_s << u"c03006"_s;
+    QTest::newRow("other investigators ignore meta")
+        << roland << uR"("meta":"Seeker",)"_s << u"c01001"_s;
   }
 
   void investigator() {
+    QFETCH(QString, cardCode);
     QFETCH(QString, fields);
     QFETCH(QString, imageId);
-    const auto investigator =
-        decode<Investigator>(QString::fromUtf8(kInvestigator).arg(fields));
+    const auto investigator = decode<Investigator>(
+        QString::fromUtf8(kInvestigator).arg(cardCode, fields));
     QCOMPARE(CardArt::investigatorImageId(investigator), imageId);
   }
 
@@ -124,20 +185,54 @@ private slots:
     QCOMPARE(CardArt::agendaImageId(agenda), imageId);
   }
 
-  // Acts show their front only, whatever their side or flip state.
+  // Act.vue's sequence-side art; the act's flip state does not matter.
   void act_data() {
+    QTest::addColumn<QString>("id");
     QTest::addColumn<QString>("side");
     QTest::addColumn<bool>("flipped");
-    QTest::newRow("A") << u"A"_s << false;
-    QTest::newRow("B flipped") << u"B"_s << true;
+    QTest::addColumn<QString>("imageId");
+    const auto row = [](const char *name, const QString &id,
+                        const QString &side, const QString &imageId,
+                        bool flipped = false) {
+      QTest::newRow(name) << id << side << flipped << imageId;
+    };
+    row("A", u"c01108"_s, u"A"_s, u"c01108"_s);
+    row("A flipped", u"c01108"_s, u"A"_s, u"c01108"_s, true);
+    row("B", u"c01108"_s, u"B"_s, u"c01108b"_s);
+    row("B flipped", u"c01108"_s, u"B"_s, u"c01108b"_s, true);
+    row("id already ends with the side", u"c50000c"_s, u"C"_s, u"c50000c"_s);
+    row("c10607a on side A", u"c10607a"_s, u"A"_s, u"c10607a"_s);
+    row("c10607a on side B", u"c10607a"_s, u"B"_s, u"c10607b"_s);
+    row("D strips a trailing c", u"c50000c"_s, u"D"_s, u"c50000d"_s);
+    row("D keeps another letter", u"c50000a"_s, u"D"_s, u"c50000ad"_s);
+    row("F strips a trailing e", u"c50000e"_s, u"F"_s, u"c50000f"_s);
+    row("H strips a trailing g", u"c50000g"_s, u"H"_s, u"c50000h"_s);
+    row("homebrew B", u"c:fan:123"_s, u"B"_s, u"c:fan:123b"_s);
+    // Threads of Fate (4117-4140): C and E show the front, D and F the back.
+    row("ToF B", u"c04117"_s, u"B"_s, u"c04117b"_s);
+    row("ToF C", u"c04117"_s, u"C"_s, u"c04117"_s);
+    row("ToF D", u"c04118"_s, u"D"_s, u"c04118b"_s);
+    row("ToF D strips c first", u"c04122c"_s, u"D"_s, u"c04122b"_s);
+    row("ToF E", u"c04133"_s, u"E"_s, u"c04133"_s);
+    row("ToF F", u"c04140"_s, u"F"_s, u"c04140b"_s);
+    row("below ToF", u"c04116"_s, u"D"_s, u"c04116d"_s);
+    row("above ToF", u"c04141"_s, u"D"_s, u"c04141d"_s);
+    // Return to Threads of Fate (53029-53036): G front, H back.
+    row("RtToF G", u"c53029"_s, u"G"_s, u"c53029"_s);
+    row("RtToF H", u"c53036"_s, u"H"_s, u"c53036b"_s);
+    row("RtToF B", u"c53030"_s, u"B"_s, u"c53030b"_s);
+    row("below RtToF", u"c53028"_s, u"H"_s, u"c53028h"_s);
+    row("above RtToF", u"c53037"_s, u"H"_s, u"c53037h"_s);
   }
 
   void act() {
+    QFETCH(QString, id);
     QFETCH(QString, side);
     QFETCH(bool, flipped);
+    QFETCH(QString, imageId);
     const auto act = decode<Act>(QString::fromUtf8(kAct).arg(
-        u"c01108"_s, side, flipped ? "true"_L1 : "false"_L1));
-    QCOMPARE(CardArt::actImageId(act), u"c01108"_s);
+        id, side, flipped ? "true"_L1 : "false"_L1));
+    QCOMPARE(CardArt::actImageId(act), imageId);
   }
 
   void imageSource() {

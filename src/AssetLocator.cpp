@@ -120,12 +120,12 @@ QString stripOneServerCardPrefix(const QString &cardCode) {
   return cardCode;
 }
 
-QString imageFileName(QString artCode, AssetLocator::CardFace face,
-                      const QString &mutationSuffix) {
-  if (face == AssetLocator::CardFace::Back) {
+QString imageFileName(QString artCode, const AssetLocator::CardImageKey &key) {
+  if (key.face == AssetLocator::CardFace::Back) {
     artCode += u'b';
   }
-  artCode += mutationSuffix;
+  artCode += key.classVariantSuffix;
+  artCode += key.mutationSuffix;
   return artCode + ".avif"_L1;
 }
 
@@ -227,6 +227,16 @@ bool isMutationSuffix(const QString &suffix) {
   return true;
 }
 
+bool isClassVariantSuffix(const QString &suffix) {
+  return suffix.isEmpty() || suffix == "_Guardian"_L1 ||
+         suffix == "_Seeker"_L1 || suffix == "_Rogue"_L1 ||
+         suffix == "_Mystic"_L1 || suffix == "_Survivor"_L1;
+}
+
+bool isCardArtId(const QString &cardCode) {
+  return buildCardImageUrl(defaultAssetBaseUrl(), {cardCode}).has_value();
+}
+
 AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
                                      const CardImageKey &key) {
   const auto baseValidation = validateAssetBaseUrl(assetBaseUrl);
@@ -236,6 +246,11 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
 
   if (!isMutationSuffix(key.mutationSuffix)) {
     return invalidKey(QStringLiteral("mutation suffix must match _Mutated<N>"));
+  }
+  if (!isClassVariantSuffix(key.classVariantSuffix)) {
+    return invalidKey(QStringLiteral(
+        "class variant suffix must be _Guardian, _Seeker, _Rogue, _Mystic "
+        "or _Survivor"));
   }
 
   const QString artId = stripOneServerCardPrefix(key.cardCode);
@@ -255,15 +270,13 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
           "homebrew card art id contains an invalid campaign or code segment"));
     }
     pathSegments << QStringLiteral("homebrew") << campaign
-                 << QStringLiteral("cards")
-                 << imageFileName(code, key.face, key.mutationSuffix);
+                 << QStringLiteral("cards") << imageFileName(code, key);
   } else {
     if (!isOfficialCardCodeSegment(artId)) {
       return invalidKey(
           QStringLiteral("card code is not a valid asset code segment"));
     }
-    pathSegments << QStringLiteral("cards")
-                 << imageFileName(artId, key.face, key.mutationSuffix);
+    pathSegments << QStringLiteral("cards") << imageFileName(artId, key);
   }
 
   return appendPathSegments(assetBaseUrl, pathSegments);

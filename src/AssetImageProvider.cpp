@@ -18,14 +18,14 @@ AssetError invalidProviderId(const QString &message) {
   return AssetError{AssetErrorCode::InvalidAssetKey, message};
 }
 
-QString normalizedMutationSuffix(QString mutation) {
-  if (mutation.isEmpty()) {
+QString normalizedSuffix(QString suffix) {
+  if (suffix.isEmpty()) {
     return {};
   }
-  if (!mutation.startsWith(u'_')) {
-    mutation.prepend(u'_');
+  if (!suffix.startsWith(u'_')) {
+    suffix.prepend(u'_');
   }
-  return mutation;
+  return suffix;
 }
 
 AssetOutcome<QString> splitMutationSuffix(QString *cardCode) {
@@ -400,14 +400,26 @@ AssetCardImageProvider::parseImageId(const QString &id) {
       return invalidProviderId(
           QStringLiteral("mutation suffix must not be empty"));
     }
-    mutationSuffix = normalizedMutationSuffix(mutationValue);
+    mutationSuffix = normalizedSuffix(mutationValue);
     if (!AssetLocator::isMutationSuffix(mutationSuffix)) {
       return invalidProviderId(
           QStringLiteral("mutation suffix must match _Mutated<N>"));
     }
   }
+  QString classVariantSuffix;
+  if (query.hasQueryItem(QStringLiteral("variant"))) {
+    classVariantSuffix =
+        normalizedSuffix(query.queryItemValue(QStringLiteral("variant")));
+    if (classVariantSuffix.isEmpty() ||
+        !AssetLocator::isClassVariantSuffix(classVariantSuffix)) {
+      return invalidProviderId(QStringLiteral(
+          "class variant must be Guardian, Seeker, Rogue, Mystic or "
+          "Survivor"));
+    }
+  }
 
-  return AssetLocator::CardImageKey{cardCode, face, mutationSuffix};
+  return AssetLocator::CardImageKey{cardCode, face, mutationSuffix,
+                                    classVariantSuffix};
 }
 
 } // namespace Arkham
