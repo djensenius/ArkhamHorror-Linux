@@ -579,26 +579,31 @@ private slots:
     c.reset();
     // Wait for the client to finish the stale reply before the next
     // session starts, so the drop path is exercised rather than raced.
-    // GameClient handles QNetworkReply::finished directly, in the same
-    // emission as the manager's finished signal, so once that has fired
-    // and control is back here the controller has seen (and must have
-    // dropped) the reply. The reply is read inside the emission because
-    // the client deletes it afterwards.
-    int staleFinished = 0;
-    QString stalePath;
-    QNetworkReply::NetworkError staleError = QNetworkReply::UnknownNetworkError;
-    QObject staleWatch;
-    connect(m_nam, &QNetworkAccessManager::finished, &staleWatch,
-            [&](QNetworkReply *reply) {
-              ++staleFinished;
-              stalePath = reply->url().path();
-              staleError = reply->error();
-            });
-    m_server->releaseHeld();
-    QVERIFY(waitUntil([&staleFinished] { return staleFinished == 1; }));
-    QCoreApplication::processEvents();
-    QCOMPARE(stalePath, m_profile->apiUrl(u"arkham/cards").path());
-    QCOMPARE(staleError, QNetworkReply::NoError);
+    // The handler below (via the manager's finished signal) and
+    // GameClient::handleFinished both run synchronously in the same
+    // QNetworkReply::finished emission, ours first; so once the wait sees
+    // it, the controller has already handled and dropped the stale reply.
+    // The reply is read inside the emission because the client deletes it
+    // afterwards. staleWatch is scoped so later replies are not counted.
+    {
+      int staleFinished = 0;
+      QString stalePath;
+      QNetworkReply::NetworkError staleError =
+          QNetworkReply::UnknownNetworkError;
+      QObject staleWatch;
+      connect(m_nam, &QNetworkAccessManager::finished, &staleWatch,
+              [&](QNetworkReply *reply) {
+                ++staleFinished;
+                stalePath = reply->url().path();
+                staleError = reply->error();
+              });
+      m_server->releaseHeld();
+      QVERIFY(waitUntil([&staleFinished] { return staleFinished == 1; }));
+      QCoreApplication::processEvents();
+      QCOMPARE(staleFinished, 1);
+      QCOMPARE(stalePath, m_profile->apiUrl(u"arkham/cards").path());
+      QCOMPARE(staleError, QNetworkReply::NoError);
+    }
 
     m_server->setResponse(cardsTarget(), held(jsonResponse(500, "{}"_ba)));
     QVERIFY(loadList(c));
