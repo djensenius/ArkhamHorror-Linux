@@ -195,8 +195,7 @@ private slots:
     QTRY_VERIFY(!indicator(0)->isVisible());
     board->forceActiveFocus();
     QTRY_VERIFY(indicator(0)->isVisible());
-    // The provider's output is requested at the cell's size (it still
-    // decodes and caches full-resolution art; see TASK-3.3.5).
+    // The art is requested, decoded and cached at the cell's size.
     const QList<QQuickItem *> cards = itemsNamed(board, u"boardCard"_s);
     auto *cardImage = cards.first()->childItems().first();
     QCOMPARE(cardImage->property("sourceSize").toSize(), QSize(150, 210));

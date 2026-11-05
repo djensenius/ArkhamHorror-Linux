@@ -14,8 +14,8 @@ Item {
     property string label
     readonly property int status: image.status
     // Size requested from the image provider (default: full size). The
-    // arkham-card provider scales its output to it but still decodes and
-    // caches the full-resolution art (size-aware decoding: TASK-3.3.5).
+    // arkham-card provider decodes and caches the art fitted to this size
+    // (never upscaled), so smaller sizes hold less decoded memory.
     property alias sourceSize: image.sourceSize
 
     implicitWidth: 150
