@@ -86,9 +86,11 @@ validateJpegDimensions(unsigned int width, unsigned int height,
   return totalPixels;
 }
 
-// libjpeg can scale by 1/2, 1/4, or 1/8 during the IDCT. Pick the largest
-// reduction whose output (rounded up, as libjpeg does) still covers target so
-// the final smooth fit in decodeAssetImage() only ever downscales.
+} // namespace
+
+namespace detail {
+
+// See AssetJpegDecoder.h.
 unsigned int jpegScaleDenominator(unsigned int width, unsigned int height,
                                   const QSize &target) {
   if (target.width() <= 0 || target.height() <= 0 ||
@@ -107,7 +109,7 @@ unsigned int jpegScaleDenominator(unsigned int width, unsigned int height,
   return 1;
 }
 
-} // namespace
+} // namespace detail
 
 AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
                                            const AssetDecodeLimits &limits,
@@ -205,7 +207,8 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
     const QSize target = fittedAssetDecodeSize(
         QSize(static_cast<int>(width), static_cast<int>(height)), bound);
     state->cinfo.scale_num = 1;
-    state->cinfo.scale_denom = jpegScaleDenominator(width, height, target);
+    state->cinfo.scale_denom =
+        detail::jpegScaleDenominator(width, height, target);
   }
   jpeg_start_decompress(&state->cinfo);
 

@@ -13,6 +13,7 @@
 #include <QBuffer>
 #include <QtTest>
 
+#include "AssetJpegDecoder.h"
 #include "AssetTypes.h"
 
 using Arkham::AssetDecodeErrorCode;
@@ -303,6 +304,7 @@ private slots:
   void fittedSizeKeepsAspectAndNeverUpscales();
   void pngDecodesAtRequestedBound();
   void jpegDecodesAtRequestedBound();
+  void jpegScaleDenominatorPicksLargestCoveringReduction();
   void avifDecodesAtRequestedBound();
   void boundLargerThanSourceDoesNotUpscale();
   void emptyBoundDecodesFullSize();
@@ -501,6 +503,30 @@ void AssetDecoderTests::jpegDecodesAtRequestedBound() {
   const QByteArray odd = encodeJpeg(true, JCS_RGB, 601, 841);
   QVERIFY(!odd.isEmpty());
   expectDecodeSuccess(odd, QSize(150, 210), QSize(150, 210));
+}
+
+void AssetDecoderTests::jpegScaleDenominatorPicksLargestCoveringReduction() {
+  using Arkham::fittedAssetDecodeSize;
+  using Arkham::detail::jpegScaleDenominator;
+  // The same call decodeJpegImage() makes: the target is the fitted size.
+  const auto denominator = [](const QSize &source, const QSize &bound) {
+    return jpegScaleDenominator(static_cast<unsigned int>(source.width()),
+                                static_cast<unsigned int>(source.height()),
+                                fittedAssetDecodeSize(source, bound));
+  };
+  // 1/4 lands exactly on the cell; 1/8 (75x105) would not cover it.
+  QCOMPARE(denominator(QSize(600, 840), QSize(150, 210)), 4U);
+  // 1/8 (75x105) is still too small for 100x140, so 1/4 is the largest.
+  QCOMPARE(denominator(QSize(600, 840), QSize(100, 140)), 4U);
+  QCOMPARE(denominator(QSize(600, 840), QSize(300, 420)), 2U);
+  // More than half the source: no reduction covers it, so full resolution.
+  QCOMPARE(denominator(QSize(600, 840), QSize(599, 839)), 1U);
+  // An odd source fits to 149x210. 1/4 gives ceil(599/4) x ceil(839/4) =
+  // 150x210, which covers it only because libjpeg rounds up; rounding down
+  // (149x209) would force 1/2.
+  QCOMPARE(fittedAssetDecodeSize(QSize(599, 839), QSize(150, 210)),
+           QSize(149, 210));
+  QCOMPARE(denominator(QSize(599, 839), QSize(150, 210)), 4U);
 }
 
 void AssetDecoderTests::avifDecodesAtRequestedBound() {
