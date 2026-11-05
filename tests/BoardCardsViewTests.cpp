@@ -184,6 +184,43 @@ private slots:
     QVERIFY(!investigatorPlaceholder->isVisible());
     QVERIFY(actPlaceholder->isVisible());
   }
+
+  // Labels are server data: markup in one is shown literally and never
+  // fetches anything (e.g. an <img> outside the card-art provider).
+  void labelMarkupIsPlainText() {
+    MockHttpServer server;
+    QVERIFY(server.start());
+    const QString label =
+        u"<img src=\""_s + server.url(u"/x.png"_s).toString() + u"\">Study"_s;
+
+    QQmlEngine engine;
+    QQmlComponent component(&engine);
+    component.setData("import QtQuick\n"
+                      "Window {\n"
+                      "  width: 200; height: 260; visible: true\n"
+                      "  CardImage { objectName: \"card\"; anchors.fill: "
+                      "parent }\n"
+                      "}\n",
+                      QUrl::fromLocalFile(QStringLiteral(
+                          ARKHAM_TEST_QML_DIR "/CardImageTest.qml")));
+    std::unique_ptr<QObject> window(component.create());
+    QVERIFY2(window != nullptr, qPrintable(component.errorString()));
+    auto *quickWindow = qobject_cast<QQuickWindow *>(window.get());
+    QVERIFY(quickWindow);
+    auto *card = quickWindow->contentItem()->childItems().value(0);
+    QVERIFY(card && card->objectName() == "card"_L1);
+    QVERIFY(card->setProperty("label", label));
+
+    auto *text = card->findChild<QQuickItem *>(u"cardLabel"_s);
+    QVERIFY(text);
+    QVERIFY(text->isVisible());
+    // Text.PlainText == 0 (Text.AutoText, the default, is 2).
+    QCOMPARE(text->property("textFormat").toInt(), 0);
+    QCOMPARE(text->property("text").toString(), label);
+
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 250);
+    QCOMPARE(server.requestCountForPath(u"/x.png"_s), 0);
+  }
 };
 
 QTEST_MAIN(BoardCardsViewTests)

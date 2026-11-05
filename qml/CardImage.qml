@@ -38,11 +38,15 @@ Item {
         border.color: "#4a6363"
 
         Text {
+            objectName: "cardLabel"
             anchors.fill: parent
             anchors.margins: 8
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             wrapMode: Text.Wrap
+            // The label is server data (location labels, investigator
+            // names); never interpret it as rich text or fetch its images.
+            textFormat: Text.PlainText
             color: "#d8e4e4"
             text: image.status === Image.Error ? qsTr("%1\n(art unavailable)").arg(root.label) : root.label
         }
