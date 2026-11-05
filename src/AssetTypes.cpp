@@ -11,7 +11,8 @@ namespace Arkham {
 AssetDecodeOutcome<QImage> decodePngImage(const QByteArray &encodedBytes,
                                           const AssetDecodeLimits &limits);
 AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
-                                           const AssetDecodeLimits &limits);
+                                           const AssetDecodeLimits &limits,
+                                           const QSize &bound);
 AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
                                            const AssetDecodeLimits &limits);
 
@@ -88,8 +89,47 @@ detectAssetImageFormat(const QByteArray &encodedBytes) {
       QStringLiteral("asset bytes do not match PNG, JPEG, or AVIF magic")};
 }
 
+QSize normalizedAssetDecodeBound(const QSize &bound) {
+  if (!bound.isValid() || bound.isEmpty()) {
+    return {};
+  }
+  return bound;
+}
+
+QSize fittedAssetDecodeSize(const QSize &sourceSize, const QSize &bound) {
+  const QSize normalized = normalizedAssetDecodeBound(bound);
+  if (!normalized.isValid() || sourceSize.isEmpty() ||
+      (sourceSize.width() <= normalized.width() &&
+       sourceSize.height() <= normalized.height())) {
+    return sourceSize;
+  }
+  return sourceSize.scaled(normalized, Qt::KeepAspectRatio)
+      .expandedTo(QSize(1, 1));
+}
+
+namespace {
+
+AssetDecodeOutcome<QImage> decodeFullOrHinted(const QByteArray &encodedBytes,
+                                              AssetImageFormat format,
+                                              const AssetDecodeLimits &limits,
+                                              const QSize &bound) {
+  switch (format) {
+  case AssetImageFormat::Png:
+    return decodePngImage(encodedBytes, limits);
+  case AssetImageFormat::Jpeg:
+    return decodeJpegImage(encodedBytes, limits, bound);
+  case AssetImageFormat::Avif:
+    return decodeAvifImage(encodedBytes, limits);
+  }
+  return AssetDecodeError{AssetDecodeErrorCode::UnrecognizedFormat,
+                          QStringLiteral("unhandled asset image format")};
+}
+
+} // namespace
+
 AssetDecodeOutcome<QImage> decodeAssetImage(const QByteArray &encodedBytes,
-                                            const AssetDecodeLimits &limits) {
+                                            const AssetDecodeLimits &limits,
+                                            const QSize &bound) {
   const auto limitsValidation = validateLimits(limits);
   if (!limitsValidation) {
     return limitsValidation.error();
@@ -109,16 +149,23 @@ AssetDecodeOutcome<QImage> decodeAssetImage(const QByteArray &encodedBytes,
     return format.error();
   }
 
-  switch (*format) {
-  case AssetImageFormat::Png:
-    return decodePngImage(encodedBytes, limits);
-  case AssetImageFormat::Jpeg:
-    return decodeJpegImage(encodedBytes, limits);
-  case AssetImageFormat::Avif:
-    return decodeAvifImage(encodedBytes, limits);
+  auto decoded = decodeFullOrHinted(encodedBytes, *format, limits, bound);
+  if (!decoded) {
+    return decoded;
   }
-  return AssetDecodeError{AssetDecodeErrorCode::UnrecognizedFormat,
-                          QStringLiteral("unhandled asset image format")};
+  const QSize target = fittedAssetDecodeSize(decoded->size(), bound);
+  if (target == decoded->size()) {
+    return decoded;
+  }
+  // Replace the decoded image so only the scaled result stays alive.
+  *decoded =
+      decoded->scaled(target, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+  if (decoded->isNull()) {
+    return AssetDecodeError{
+        AssetDecodeErrorCode::MalformedImage,
+        QStringLiteral("failed to allocate the downscaled asset image")};
+  }
+  return decoded;
 }
 
 } // namespace Arkham

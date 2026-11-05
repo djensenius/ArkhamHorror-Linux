@@ -86,10 +86,32 @@ validateJpegDimensions(unsigned int width, unsigned int height,
   return totalPixels;
 }
 
+// libjpeg can scale by 1/2, 1/4, or 1/8 during the IDCT. Pick the largest
+// reduction whose output (rounded up, as libjpeg does) still covers target so
+// the final smooth fit in decodeAssetImage() only ever downscales.
+unsigned int jpegScaleDenominator(unsigned int width, unsigned int height,
+                                  const QSize &target) {
+  if (target.width() <= 0 || target.height() <= 0 ||
+      (static_cast<unsigned int>(target.width()) >= width &&
+       static_cast<unsigned int>(target.height()) >= height)) {
+    return 1;
+  }
+  for (const unsigned int denominator : {8U, 4U, 2U}) {
+    const unsigned int scaledWidth = (width + denominator - 1) / denominator;
+    const unsigned int scaledHeight = (height + denominator - 1) / denominator;
+    if (scaledWidth >= static_cast<unsigned int>(target.width()) &&
+        scaledHeight >= static_cast<unsigned int>(target.height())) {
+      return denominator;
+    }
+  }
+  return 1;
+}
+
 } // namespace
 
 AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
-                                           const AssetDecodeLimits &limits) {
+                                           const AssetDecodeLimits &limits,
+                                           const QSize &bound) {
   if (encodedBytes.size() < 0 ||
       static_cast<quint64>(encodedBytes.size()) >
           static_cast<quint64>((std::numeric_limits<unsigned long>::max)())) {
@@ -177,6 +199,14 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   }
 
   state->cinfo.out_color_space = JCS_RGB;
+  {
+    const unsigned int width = state->cinfo.image_width;
+    const unsigned int height = state->cinfo.image_height;
+    const QSize target = fittedAssetDecodeSize(
+        QSize(static_cast<int>(width), static_cast<int>(height)), bound);
+    state->cinfo.scale_num = 1;
+    state->cinfo.scale_denom = jpegScaleDenominator(width, height, target);
+  }
   jpeg_start_decompress(&state->cinfo);
 
   if (state->cinfo.output_components != 3) {

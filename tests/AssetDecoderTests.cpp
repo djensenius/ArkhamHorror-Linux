@@ -31,20 +31,33 @@ QImage tinyImage() {
   return image;
 }
 
-QByteArray encodePngWithQt() {
+// A card-art-shaped gradient used by the sized-decode tests.
+QImage cardImage(const QSize &size) {
+  QImage image(size, QImage::Format_RGBA8888);
+  for (int y = 0; y < size.height(); ++y) {
+    for (int x = 0; x < size.width(); ++x) {
+      image.setPixelColor(x, y,
+                          QColor((x * 255) / size.width(),
+                                 (y * 255) / size.height(), 120, 255));
+    }
+  }
+  return image;
+}
+
+QByteArray encodePngWithQt(const QImage &source = tinyImage()) {
   QByteArray bytes;
   QBuffer buffer(&bytes);
   if (!buffer.open(QIODevice::WriteOnly)) {
     return {};
   }
-  if (!tinyImage().save(&buffer, "PNG")) {
+  if (!source.save(&buffer, "PNG")) {
     return {};
   }
   return bytes;
 }
 
-avifImage *createAvifImage() {
-  const QImage source = tinyImage().convertToFormat(QImage::Format_RGBA8888);
+avifImage *createAvifImage(const QImage &sourceImage) {
+  const QImage source = sourceImage.convertToFormat(QImage::Format_RGBA8888);
   avifImage *image = avifImageCreate(static_cast<uint32_t>(source.width()),
                                      static_cast<uint32_t>(source.height()), 8,
                                      AVIF_PIXEL_FORMAT_YUV444);
@@ -79,8 +92,8 @@ QByteArray finishAvifEncode(avifEncoder *encoder) {
   return bytes;
 }
 
-QByteArray encodeAvif() {
-  avifImage *image = createAvifImage();
+QByteArray encodeAvif(const QImage &source = tinyImage()) {
+  avifImage *image = createAvifImage(source);
   if (!image) {
     return {};
   }
@@ -93,6 +106,7 @@ QByteArray encodeAvif() {
   encoder->maxThreads = 1;
   encoder->minQuantizer = 0;
   encoder->maxQuantizer = 4;
+  encoder->speed = AVIF_SPEED_FASTEST;
 
   QByteArray bytes;
   if (avifEncoderAddImage(encoder, image, 1, AVIF_ADD_IMAGE_FLAG_SINGLE) ==
@@ -161,9 +175,8 @@ void jpegWriteErrorExit(j_common_ptr cinfo) {
 }
 
 QByteArray encodeJpeg(bool progressive = false,
-                      J_COLOR_SPACE colorSpace = JCS_RGB) {
-  constexpr int width = 8;
-  constexpr int height = 8;
+                      J_COLOR_SPACE colorSpace = JCS_RGB, int width = 8,
+                      int height = 8) {
   const int components = colorSpace == JCS_CMYK ? 4 : 3;
   std::vector<unsigned char> pixels(
       static_cast<size_t>(width * height * components));
@@ -176,8 +189,8 @@ QByteArray encodeJpeg(bool progressive = false,
         pixels[offset + 2] = 0;
         pixels[offset + 3] = 0;
       } else {
-        pixels[offset] = static_cast<unsigned char>(x * 32);
-        pixels[offset + 1] = static_cast<unsigned char>(y * 32);
+        pixels[offset] = static_cast<unsigned char>((x * 32) % 256);
+        pixels[offset + 1] = static_cast<unsigned char>((y * 32) % 256);
         pixels[offset + 2] = static_cast<unsigned char>(200);
       }
     }
@@ -199,8 +212,8 @@ QByteArray encodeJpeg(bool progressive = false,
 
   jpeg_create_compress(&cinfo);
   jpeg_mem_dest(&cinfo, &output, &outputSize);
-  cinfo.image_width = width;
-  cinfo.image_height = height;
+  cinfo.image_width = static_cast<JDIMENSION>(width);
+  cinfo.image_height = static_cast<JDIMENSION>(height);
   cinfo.input_components = components;
   cinfo.in_color_space = colorSpace;
   jpeg_set_defaults(&cinfo);
@@ -255,8 +268,9 @@ void expectDecodeError(const QByteArray &bytes, const AssetDecodeLimits &limits,
   QCOMPARE(decoded.error().code, code);
 }
 
-void expectDecodeSuccess(const QByteArray &bytes, const QSize &size) {
-  const auto decoded = decodeAssetImage(bytes);
+void expectDecodeSuccess(const QByteArray &bytes, const QSize &size,
+                         const QSize &bound = QSize()) {
+  const auto decoded = decodeAssetImage(bytes, AssetDecodeLimits{}, bound);
   QVERIFY2(decoded.has_value(),
            decoded ? "" : qPrintable(decoded.error().message));
   QCOMPARE(decoded->size(), size);
@@ -286,6 +300,13 @@ private slots:
   void rejectsAvifTruncated();
   void rejectsCmykJpeg();
   void avifWithoutMetaBoxIsRejectedAsMalformed();
+  void fittedSizeKeepsAspectAndNeverUpscales();
+  void pngDecodesAtRequestedBound();
+  void jpegDecodesAtRequestedBound();
+  void avifDecodesAtRequestedBound();
+  void boundLargerThanSourceDoesNotUpscale();
+  void emptyBoundDecodesFullSize();
+  void boundedDecodeStillEnforcesDeclaredLimits();
 };
 
 void AssetDecoderTests::validPngRoundTrip() {
@@ -441,6 +462,103 @@ void AssetDecoderTests::avifWithoutMetaBoxIsRejectedAsMalformed() {
   const AssetDecodeErrorCode code = decoded.error().code;
   QVERIFY(code == AssetDecodeErrorCode::MalformedImage ||
           code == AssetDecodeErrorCode::UnsupportedCodec);
+}
+
+void AssetDecoderTests::fittedSizeKeepsAspectAndNeverUpscales() {
+  using Arkham::fittedAssetDecodeSize;
+  using Arkham::normalizedAssetDecodeBound;
+  QCOMPARE(fittedAssetDecodeSize(QSize(600, 840), QSize(150, 210)),
+           QSize(150, 210));
+  QCOMPARE(fittedAssetDecodeSize(QSize(600, 840), QSize(300, 210)),
+           QSize(150, 210));
+  QCOMPARE(fittedAssetDecodeSize(QSize(600, 840), QSize(100, 1000)),
+           QSize(100, 140));
+  QCOMPARE(fittedAssetDecodeSize(QSize(2, 2), QSize(150, 210)), QSize(2, 2));
+  QCOMPARE(fittedAssetDecodeSize(QSize(600, 840), QSize()), QSize(600, 840));
+  QCOMPARE(fittedAssetDecodeSize(QSize(600, 840), QSize(150, 0)),
+           QSize(600, 840));
+  QCOMPARE(normalizedAssetDecodeBound(QSize(150, 210)), QSize(150, 210));
+  QCOMPARE(normalizedAssetDecodeBound(QSize(150, 0)), QSize());
+  QCOMPARE(normalizedAssetDecodeBound(QSize(-1, -1)), QSize());
+}
+
+void AssetDecoderTests::pngDecodesAtRequestedBound() {
+  const QByteArray png = encodePngWithQt(cardImage(QSize(600, 840)));
+  QVERIFY(!png.isEmpty());
+  expectDecodeSuccess(png, QSize(150, 210), QSize(150, 210));
+  expectDecodeSuccess(png, QSize(100, 140), QSize(100, 1000));
+}
+
+void AssetDecoderTests::jpegDecodesAtRequestedBound() {
+  const QByteArray jpeg = encodeJpeg(false, JCS_RGB, 600, 840);
+  QVERIFY(!jpeg.isEmpty());
+  // 1/4 DCT scaling lands exactly on the bound.
+  expectDecodeSuccess(jpeg, QSize(150, 210), QSize(150, 210));
+  // 1/4 scaling (150x210) covers 100x140; 1/8 (75x105) would not, so the
+  // final fit downsamples from the 1/4 output.
+  expectDecodeSuccess(jpeg, QSize(100, 140), QSize(100, 140));
+  // A bound that is not a power-of-two reduction of an odd-sized source.
+  const QByteArray odd = encodeJpeg(true, JCS_RGB, 601, 841);
+  QVERIFY(!odd.isEmpty());
+  expectDecodeSuccess(odd, QSize(150, 210), QSize(150, 210));
+}
+
+void AssetDecoderTests::avifDecodesAtRequestedBound() {
+  const QByteArray avif = encodeAvif(cardImage(QSize(120, 168)));
+  QVERIFY(!avif.isEmpty());
+  expectDecodeSuccess(avif, QSize(120, 168));
+  expectDecodeSuccess(avif, QSize(30, 42), QSize(30, 42));
+  expectDecodeSuccess(avif, QSize(30, 42), QSize(60, 42));
+}
+
+void AssetDecoderTests::boundLargerThanSourceDoesNotUpscale() {
+  expectDecodeSuccess(encodePngWithQt(), QSize(2, 2), QSize(150, 210));
+  expectDecodeSuccess(encodeJpeg(), QSize(8, 8), QSize(150, 210));
+  expectDecodeSuccess(encodeAvif(), QSize(2, 2), QSize(150, 210));
+  // Fitting one axis exactly must not grow the other.
+  expectDecodeSuccess(encodeJpeg(), QSize(8, 8), QSize(8, 400));
+}
+
+void AssetDecoderTests::emptyBoundDecodesFullSize() {
+  const QByteArray png = encodePngWithQt(cardImage(QSize(600, 840)));
+  QVERIFY(!png.isEmpty());
+  expectDecodeSuccess(png, QSize(600, 840), QSize());
+  expectDecodeSuccess(png, QSize(600, 840), QSize(150, 0));
+  const QByteArray jpeg = encodeJpeg(false, JCS_RGB, 600, 840);
+  QVERIFY(!jpeg.isEmpty());
+  expectDecodeSuccess(jpeg, QSize(600, 840), QSize(0, 210));
+}
+
+void AssetDecoderTests::boundedDecodeStillEnforcesDeclaredLimits() {
+  const QSize bound(150, 210);
+  AssetDecodeLimits limits;
+  limits.maxWidth = 599;
+
+  const QByteArray png = encodePngWithQt(cardImage(QSize(600, 840)));
+  QVERIFY(!png.isEmpty());
+  auto decoded = decodeAssetImage(png, limits, bound);
+  QVERIFY(!decoded);
+  QCOMPARE(decoded.error().code, AssetDecodeErrorCode::DimensionTooLarge);
+
+  const QByteArray jpeg = encodeJpeg(false, JCS_RGB, 600, 840);
+  QVERIFY(!jpeg.isEmpty());
+  decoded = decodeAssetImage(jpeg, limits, bound);
+  QVERIFY(!decoded);
+  QCOMPARE(decoded.error().code, AssetDecodeErrorCode::DimensionTooLarge);
+
+  AssetDecodeLimits pixelLimits;
+  pixelLimits.maxPixelCount = 600 * 840 - 1;
+  decoded = decodeAssetImage(jpeg, pixelLimits, bound);
+  QVERIFY(!decoded);
+  QCOMPARE(decoded.error().code, AssetDecodeErrorCode::PixelBudgetExceeded);
+
+  const QByteArray avif = encodeAvif(cardImage(QSize(120, 168)));
+  QVERIFY(!avif.isEmpty());
+  AssetDecodeLimits avifLimits;
+  avifLimits.maxHeight = 167;
+  decoded = decodeAssetImage(avif, avifLimits, QSize(30, 42));
+  QVERIFY(!decoded);
+  QCOMPARE(decoded.error().code, AssetDecodeErrorCode::DimensionTooLarge);
 }
 
 QTEST_APPLESS_MAIN(AssetDecoderTests)

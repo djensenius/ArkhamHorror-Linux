@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QImage>
+#include <QSize>
 #include <QString>
 #include <QUrl>
 #include <QtAssert>
@@ -126,8 +127,25 @@ struct AssetDecodeLimits {
 [[nodiscard]] AssetDecodeOutcome<AssetImageFormat>
 detectAssetImageFormat(const QByteArray &encodedBytes);
 
+// Normalizes a requested decode bound. An invalid or empty size (including a
+// request that names only one dimension) means "decode at full size" and is
+// returned as QSize().
+[[nodiscard]] QSize normalizedAssetDecodeBound(const QSize &bound);
+
+// The size decodeAssetImage() produces for a source of sourceSize under bound:
+// the largest size that fits inside the bound while keeping the aspect ratio,
+// never larger than the source (the decoder never upscales). A full-size
+// bound (see normalizedAssetDecodeBound) returns sourceSize unchanged.
+[[nodiscard]] QSize fittedAssetDecodeSize(const QSize &sourceSize,
+                                          const QSize &bound);
+
+// Decodes encodedBytes after enforcing limits against the declared full image
+// dimensions. When bound is a non-empty size, the result is downscaled to
+// fittedAssetDecodeSize(fullSize, bound); JPEG additionally uses libjpeg's
+// DCT scaling so the full-resolution image is never materialised.
 [[nodiscard]] AssetDecodeOutcome<QImage>
 decodeAssetImage(const QByteArray &encodedBytes,
-                 const AssetDecodeLimits &limits = AssetDecodeLimits{});
+                 const AssetDecodeLimits &limits = AssetDecodeLimits{},
+                 const QSize &bound = QSize());
 
 } // namespace Arkham
