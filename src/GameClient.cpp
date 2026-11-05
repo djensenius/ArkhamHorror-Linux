@@ -249,8 +249,11 @@ bool GameClient::readAvailable(QNetworkReply *reply) {
 }
 
 void GameClient::handleFinished(QNetworkReply *reply) {
+  // handleMetadataChanged() may complete the reply, and that completion's
+  // callback may destroy this client: touch no member if it did.
+  QPointer<GameClient> self(this);
   handleMetadataChanged(reply);
-  if (!m_pendingReplies.contains(reply) || !readAvailable(reply)) {
+  if (!self || !m_pendingReplies.contains(reply) || !readAvailable(reply)) {
     return;
   }
 
