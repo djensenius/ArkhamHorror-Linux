@@ -23,8 +23,21 @@
 // - Act (Act.vue): the art for its sequence side, e.g. "c01108b" on side B,
 //   "c10607b" for c10607a on side B, and the Threads of Fate ranges.
 //
-// Reprint and variant art (the web's reprintedArt/variantArt) is not
-// covered.
+// The asset file stem rules of the web's imgsrc/cardImgPath (helpers.ts)
+// live in AssetLocator, whose buildCardImageUrl() applies them to every card
+// image:
+//
+// - AssetLocator::reprintedArt (artVariants.ts): a Revised Core encounter
+//   reprint, 01604-01682 with any lowercase face suffix, reads the
+//   original's image, 500 lower: "01615b" -> "01115b".
+// - AssetLocator::homebrewArt (cardImgPath): the Ages Unwound past-selves
+//   acts 164-167 use C/D in game, but their files are front/"b":
+//   "164c" -> "164", "164d" -> "164b".
+//
+// The web's per-card art variants (artVariants/backArtVariants and the
+// useVariants preference, empty by default) are not covered: the catalog
+// contract does not carry those fields, so no variant is ever substituted
+// and reprintedArt never exempts a declared variant.
 namespace Arkham::CardArt {
 
 // The provider id ("<code>", "back/<code>",

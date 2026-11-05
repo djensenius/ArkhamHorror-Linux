@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include "AssetLocator.h"
 #include "Board.h"
 #include "CardArt.h"
 
@@ -240,6 +241,146 @@ private slots:
              u"image://arkham-card/c01001?mutation=Mutated21"_s);
     QCOMPARE(CardArt::imageSource(u"back/c01111"_s),
              u"image://arkham-card/back/c01111"_s);
+  }
+
+  // artVariants.ts's reprintedArt: Revised Core 01604-01682 reads the
+  // original's image, 500 lower, keeping any lowercase face suffix.
+  void reprintedArt_data() {
+    QTest::addColumn<QString>("art");
+    QTest::addColumn<QString>("expected");
+    const auto row = [](const char *name, const QString &art,
+                        const QString &expected) {
+      QTest::newRow(name) << art << expected;
+    };
+    row("first reprint", u"01604"_s, u"01104"_s);
+    row("last reprint", u"01682"_s, u"01182"_s);
+    row("back of a reprint", u"01615b"_s, u"01115b"_s);
+    row("lettered reprint", u"01645ab"_s, u"01145ab"_s);
+    row("below the range", u"01603"_s, u"01603"_s);
+    row("above the range", u"01683"_s, u"01683"_s);
+    row("original card", u"01115"_s, u"01115"_s);
+    row("other cycle", u"02604"_s, u"02604"_s);
+    row("unpadded number", u"1650"_s, u"01150"_s);
+    row("suffixed art", u"01650_Mutated1"_s, u"01650_Mutated1"_s);
+    row("leading letter", u"x01650"_s, u"x01650"_s);
+    row("legacy x art", u"xpolyp"_s, u"xpolyp"_s);
+    row("empty", QString(), QString());
+  }
+
+  void reprintedArt() {
+    QFETCH(QString, art);
+    QFETCH(QString, expected);
+    QCOMPARE(AssetLocator::reprintedArt(art), expected);
+  }
+
+  // helpers.ts's cardImgPath: the Ages Unwound past-selves acts 164-167 use
+  // C/D in game but front/"b" file names.
+  void homebrewArt_data() {
+    QTest::addColumn<QString>("campaign");
+    QTest::addColumn<QString>("art");
+    QTest::addColumn<QString>("expected");
+    const auto row = [](const char *name, const QString &campaign,
+                        const QString &art, const QString &expected) {
+      QTest::newRow(name) << campaign << art << expected;
+    };
+    const auto ages = u"ages-unwound"_s;
+    row("164c", ages, u"164c"_s, u"164"_s);
+    row("164d", ages, u"164d"_s, u"164b"_s);
+    row("167c", ages, u"167c"_s, u"167"_s);
+    row("167d", ages, u"167d"_s, u"167b"_s);
+    row("163c", ages, u"163c"_s, u"163c"_s);
+    row("168d", ages, u"168d"_s, u"168d"_s);
+    row("164a", ages, u"164a"_s, u"164a"_s);
+    row("164b", ages, u"164b"_s, u"164b"_s);
+    row("164 front", ages, u"164"_s, u"164"_s);
+    row("back of 164c", ages, u"164cb"_s, u"164cb"_s);
+    row("other homebrew", u"dark-matter"_s, u"164c"_s, u"164c"_s);
+    row("named card", ages, u"xsoldier"_s, u"xsoldier"_s);
+    row("Ages Unwound mutated", ages, u"164c_Mutated1"_s, u"164c_Mutated1"_s);
+  }
+
+  void homebrewArt() {
+    QFETCH(QString, campaign);
+    QFETCH(QString, art);
+    QFETCH(QString, expected);
+    QCOMPARE(AssetLocator::homebrewArt(campaign, art), expected);
+  }
+
+  // The rules reach the asset URL the image provider fetches, as on the web.
+  void assetUrl_data() {
+    QTest::addColumn<QString>("cardCode");
+    QTest::addColumn<int>("face");
+    QTest::addColumn<QString>("mutation");
+    QTest::addColumn<QString>("path");
+    QTest::addColumn<QString>("classVariant");
+    const auto row = [](const char *name, const QString &cardCode,
+                        AssetLocator::CardFace face, const QString &mutation,
+                        const QString &path,
+                        const QString &classVariant = QString()) {
+      QTest::newRow(name) << cardCode << static_cast<int>(face) << mutation
+                          << path << classVariant;
+    };
+    const auto front = AssetLocator::CardFace::Front;
+    const auto back = AssetLocator::CardFace::Back;
+    row("reprint", u"c01604"_s, front, QString(),
+        u"/img/arkham/cards/01104.avif"_s);
+    row("reprint back", u"c01682"_s, back, QString(),
+        u"/img/arkham/cards/01182b.avif"_s);
+    row("before the reprints", u"c01603"_s, front, QString(),
+        u"/img/arkham/cards/01603.avif"_s);
+    row("after the reprints", u"c01683"_s, back, QString(),
+        u"/img/arkham/cards/01683b.avif"_s);
+    row("mutated reprint number", u"c01650"_s, front, u"_Mutated1"_s,
+        u"/img/arkham/cards/01650_Mutated1.avif"_s);
+    row("class variant reprint number", u"c01650"_s, front, QString(),
+        u"/img/arkham/cards/01650_Guardian.avif"_s, u"_Guardian"_s);
+    row("Ages Unwound C", u"c:ages-unwound:165c"_s, front, QString(),
+        u"/img/arkham/homebrew/ages-unwound/cards/165.avif"_s);
+    row("Ages Unwound D", u"c:ages-unwound:166d"_s, front, QString(),
+        u"/img/arkham/homebrew/ages-unwound/cards/166b.avif"_s);
+    row("Ages Unwound other act", u"c:ages-unwound:168c"_s, front, QString(),
+        u"/img/arkham/homebrew/ages-unwound/cards/168c.avif"_s);
+    row("homebrew reprint number", u"c:fan:01650"_s, front, QString(),
+        u"/img/arkham/homebrew/fan/cards/01650.avif"_s);
+  }
+
+  void assetUrl() {
+    QFETCH(QString, cardCode);
+    QFETCH(int, face);
+    QFETCH(QString, mutation);
+    QFETCH(QString, path);
+    QFETCH(QString, classVariant);
+    const auto url = AssetLocator::buildCardImageUrl(
+        AssetLocator::defaultAssetBaseUrl(),
+        {cardCode, static_cast<AssetLocator::CardFace>(face), mutation,
+         classVariant});
+    QVERIFY(url.has_value());
+    QCOMPARE(url->toString(), u"https://assets.arkhamhorror.app"_s + path);
+  }
+
+  // Act.vue's side C/D ids for the past-selves acts resolve to the files
+  // cardImgPath names.
+  void agesUnwoundActUrl_data() {
+    QTest::addColumn<QString>("id");
+    QTest::addColumn<QString>("side");
+    QTest::addColumn<QString>("path");
+    QTest::newRow("C") << u"c:ages-unwound:164c"_s << u"C"_s
+                       << u"/img/arkham/homebrew/ages-unwound/cards/164.avif"_s;
+    QTest::newRow("D")
+        << u"c:ages-unwound:164c"_s << u"D"_s
+        << u"/img/arkham/homebrew/ages-unwound/cards/164b.avif"_s;
+  }
+
+  void agesUnwoundActUrl() {
+    QFETCH(QString, id);
+    QFETCH(QString, side);
+    QFETCH(QString, path);
+    const auto act =
+        decode<Act>(QString::fromUtf8(kAct).arg(id, side, "false"_L1));
+    const auto url = AssetLocator::buildCardImageUrl(
+        AssetLocator::defaultAssetBaseUrl(), {CardArt::actImageId(act)});
+    QVERIFY(url.has_value());
+    QCOMPARE(url->toString(), u"https://assets.arkhamhorror.app"_s + path);
   }
 };
 

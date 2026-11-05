@@ -37,7 +37,9 @@ namespace Arkham::AssetLocator {
 // /img/arkham/cards/<code>b.avif after stripping one leading 'c' from the
 // card code. Homebrew compound art ids of the form :<campaign>:<code> map to
 // /img/arkham/homebrew/<campaign>/cards/<code>.avif. Both shapes match the
-// web client's cardArt/cardImgPath helpers.
+// web client's cardArt/cardImgPath helpers, including the Revised Core
+// reprint and Ages Unwound act file names (reprintedArt and
+// homebrewArt below).
 enum class CardFace { Front = 1, Back };
 
 struct CardImageKey {
@@ -65,5 +67,17 @@ struct CardImageKey {
 // rejected before the path is assembled.
 [[nodiscard]] AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
                                                    const CardImageKey &key);
+
+// The web's reprintedArt (artVariants.ts) for an official file stem ("<art>"
+// without ".avif"): a Revised Core encounter reprint, 01604-01682 with any
+// lowercase suffix, reads the original's image 500 lower ("01615b" ->
+// "01115b"). Any other stem, including one with a '_' suffix, is unchanged.
+// Declared art variants are not exempted (TASK-3.3.8).
+[[nodiscard]] QString reprintedArt(const QString &art);
+
+// The web's cardImgPath file stem for homebrew art :<campaign>:<art>: the
+// Ages Unwound past-selves acts 164-167 use C/D in game but front/"b" file
+// names ("164c" -> "164", "164d" -> "164b"). Anything else is unchanged.
+[[nodiscard]] QString homebrewArt(const QString &campaign, const QString &art);
 
 } // namespace Arkham::AssetLocator
