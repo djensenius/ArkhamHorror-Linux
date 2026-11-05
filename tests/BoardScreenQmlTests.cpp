@@ -390,7 +390,6 @@ private slots:
     QByteArray list = fixture(u"game-list.json"_s);
     list.replace("\"name\": \"Contract fixture game\""_ba,
                  "\"name\": \""_ba + escaped + '"');
-    ;
     m_server->setResponse(path(u"arkham/games"_s), jsonResponse(200, list));
     m_server->setResponse(path(u"arkham/games/"_s + kGameId),
                           jsonResponse(200, fixture(u"get-game.json"_s)));
@@ -431,6 +430,13 @@ private slots:
     QVERIFY(back->mapToScene(QPointF(0, back->height())).y() <=
             m_view->height() + 0.5);
     QVERIFY(board->height() > 100);
+
+    // Every other line break the server might send is flattened as well.
+    QString flat;
+    QVERIFY(QMetaObject::invokeMethod(
+        m_view->rootObject(), "singleLine", Q_RETURN_ARG(QString, flat),
+        Q_ARG(QString, u"a\r\nb\vc\fd\u0085e\u2028f\u2029g"_s)));
+    QCOMPARE(flat, u"a b c d e f g"_s);
   }
 
   void loadingStateIsShown() {

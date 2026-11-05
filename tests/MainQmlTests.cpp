@@ -454,9 +454,10 @@ void MainQmlTests::yourGamesCardOpensTheBoardScreenAndEscapeReturns() {
 
 void MainQmlTests::destinationsFitAtTheMinimumWidth_data() {
   QTest::addColumn<int>("width"); // 0: the window's minimum width
-  QTest::newRow("minimum width") << 0;
-  QTest::newRow("default width") << 1280;
-  QTest::newRow("wide") << 1700;
+  QTest::addColumn<int>("height");
+  QTest::newRow("minimum width") << 0 << 600;
+  QTest::newRow("Steam Deck") << 1280 << 800;
+  QTest::newRow("wide") << 1700 << 600;
 }
 
 void MainQmlTests::destinationsFitAtTheMinimumWidth() {
@@ -464,7 +465,8 @@ void MainQmlTests::destinationsFitAtTheMinimumWidth() {
   // window from the supported minimum width up, and keys still reach the
   // last card.
   QFETCH(int, width);
-  QQuickWindow *window = load(QString(), 600);
+  QFETCH(int, height);
+  QQuickWindow *window = load(QString(), height);
   QVERIFY(window != nullptr);
   QCOMPARE(window->minimumWidth(), 960);
   const bool minimum = width == 0;
@@ -491,6 +493,20 @@ void MainQmlTests::destinationsFitAtTheMinimumWidth() {
     pending.append(item->childItems());
   }
   QCOMPARE(cards.size(), titles.size());
+  // The design width and spacing, as Main.qml sets them: the cards'
+  // Layout.maximumWidth (Layout's attached object is a child of the card)
+  // and their row's spacing.
+  const auto designWidth = [](const QQuickItem *card) {
+    for (const QObject *attached : card->children()) {
+      if (attached->inherits("QQuickLayoutAttached"))
+        return attached->property("maximumWidth").toReal();
+    }
+    return -1.0;
+  };
+  const qreal cardWidth = designWidth(cards.constFirst());
+  const qreal spacing =
+      cards.constFirst()->parentItem()->property("spacing").toReal();
+  QVERIFY(cardWidth > 0 && spacing > 0);
 
   const QRectF bounds(QPointF(0, 0), window->contentItem()->size());
   const auto inside = [](const QRectF &outer, const QRectF &inner) {
@@ -514,7 +530,7 @@ void MainQmlTests::destinationsFitAtTheMinimumWidth() {
     // With room (the default size and up) the cards keep their full
     // design width.
     if (!minimum)
-      QCOMPARE(card->width(), 280.0);
+      QCOMPARE(card->width(), cardWidth);
     auto *content = card->property("contentItem").value<QQuickItem *>();
     QVERIFY(content != nullptr && !content->childItems().isEmpty());
     QQuickItem *title = content->childItems().constFirst();
@@ -537,7 +553,7 @@ void MainQmlTests::destinationsFitAtTheMinimumWidth() {
             [](QQuickItem *a, QQuickItem *b) { return a->x() < b->x(); });
   for (qsizetype i = 1; i < cards.size(); ++i) {
     const QQuickItem *previous = cards.at(i - 1);
-    QCOMPARE(cards.at(i)->x() - (previous->x() + previous->width()), 20.0);
+    QCOMPARE(cards.at(i)->x() - (previous->x() + previous->width()), spacing);
   }
 
   QTRY_VERIFY(window->activeFocusItem() != nullptr);

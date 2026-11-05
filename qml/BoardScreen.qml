@@ -59,7 +59,7 @@ FocusScope {
     // Game names are server text: show them on one line (a name may hold
     // newlines); accessible names keep the full text.
     function singleLine(text: string): string {
-        return text.replace(/[\r\n\u0085\u2028\u2029]+/g, " ");
+        return text.replace(/[\r\n\v\f\u0085\u2028\u2029]+/g, " ");
     }
 
     // Back to SignedIn while open: reload whatever the session cleared. A
