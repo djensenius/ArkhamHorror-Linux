@@ -14,6 +14,7 @@
 #include <QtTest>
 
 #include <memory>
+#include <utility>
 
 #include "GameBoardController.h"
 #include "GameClient.h"
@@ -42,6 +43,20 @@ MockHttpServer::Response jsonResponse(int status, QByteArray body) {
   return response;
 }
 
+// A property of the item's Accessible attached object (a child of the
+// item it is attached to).
+QVariant accessible(QObject *item, const char *property) {
+  for (QObject *child : item->children()) {
+    if (child->inherits("QQuickAccessibleAttached"))
+      return child->property(property);
+  }
+  return QVariant();
+}
+
+QString accessibleName(QObject *item) {
+  return accessible(item, "name").toString();
+}
+
 QList<QQuickItem *> itemsNamed(QQuickItem *item, const QString &name) {
   QList<QQuickItem *> found;
   if (item->objectName() == name)
@@ -63,6 +78,9 @@ private:
   std::unique_ptr<GameBoardController> m_controller;
   std::unique_ptr<QQuickView> m_view;
   std::optional<ServerProfile> m_profile;
+  // When set, token requests wait in m_heldTokens until the test answers.
+  bool m_holdTokens{false};
+  QList<SessionCoordinator::AccessTokenCallback> m_heldTokens;
 
   QString path(const QString &apiPath) const {
     return m_profile->apiUrl(apiPath).path();
@@ -104,6 +122,10 @@ private slots:
     m_controller = std::make_unique<GameBoardController>(
         *m_client,
         [this, tokenProfile](SessionCoordinator::AccessTokenCallback callback) {
+          if (m_holdTokens) {
+            m_heldTokens.append(std::move(callback));
+            return;
+          }
           QMetaObject::invokeMethod(
               this,
               [callback = std::move(callback), tokenProfile] {
@@ -116,6 +138,8 @@ private slots:
   }
 
   void cleanup() {
+    m_holdTokens = false;
+    m_heldTokens.clear();
     m_view.reset();
     m_controller.reset();
     m_client.reset();
@@ -198,6 +222,8 @@ private slots:
     QCOMPARE(error->property("text").toString(),
              u"The server returned HTTP 500."_s);
     QTRY_VERIFY(retry->hasActiveFocus());
+    // Nothing to scroll: the notice is not a Tab stop.
+    QVERIFY(!child(u"errorNotice"_s)->activeFocusOnTab());
 
     m_server->setResponse(path(u"arkham/games"_s),
                           jsonResponse(200, fixture(u"game-list.json"_s)));
@@ -301,6 +327,8 @@ private slots:
     QVERIFY(text->property("text").toString().startsWith(u"Down.\nDown."_s));
     QVERIFY(notice->clip());
     QVERIFY(notice->height() <= m_view->height() * 0.3 + 0.5);
+    // Something to scroll: the notice is a Tab stop.
+    QTRY_VERIFY(notice->activeFocusOnTab());
     // Retry and Back stay inside the window.
     for (QQuickItem *button : {retry, back}) {
       QVERIFY(button->isVisible());
@@ -324,6 +352,85 @@ private slots:
     for (int i = 0; i < 200 && notice->hasActiveFocus(); ++i)
       QTest::keyClick(m_view.get(), Qt::Key_Down);
     QTRY_VERIFY(retry->hasActiveFocus());
+  }
+
+  void signInWhileTheListAwaitsItsTokenReloads() {
+    // The screen opens while signed out: its list request's token reply
+    // (the signed-out one) is still queued when sign-in completes.
+    m_server->setResponse(path(u"arkham/games"_s),
+                          jsonResponse(200, fixture(u"game-list.json"_s)));
+    m_holdTokens = true;
+    QVERIFY(show(m_controller.get()));
+    QCOMPARE(m_controller->listStatusName(), u"loading"_s);
+    QCOMPARE(m_heldTokens.size(), 1);
+
+    m_controller->setSignedIn(true);
+    // The stale signed-out reply lands first, then every later request
+    // gets a token.
+    const QList<SessionCoordinator::AccessTokenCallback> held =
+        std::exchange(m_heldTokens, {});
+    m_holdTokens = false;
+    held.first()(std::nullopt, u"Not signed in."_s);
+    for (qsizetype i = 1; i < held.size(); ++i)
+      held.at(i)(SessionCoordinator::AccessToken{*m_profile, u"tok-1"_s},
+                 QString());
+
+    QQuickItem *list = child(u"gamesList"_s);
+    QTRY_VERIFY(list->isVisible());
+    QCOMPARE(m_controller->listStatusName(), u"loaded"_s);
+    QVERIFY(m_controller->errorText().isEmpty());
+    QVERIFY(!child(u"errorNotice"_s)->isVisible());
+    QTRY_VERIFY(list->hasActiveFocus());
+  }
+
+  void multilineGameNameStaysOnOneLine() {
+    const QString name = u"Line\n"_s.repeated(200) + u"End"_s;
+    QByteArray escaped = name.toUtf8();
+    escaped.replace("\n", "\\n");
+    QByteArray list = fixture(u"game-list.json"_s);
+    list.replace("\"name\": \"Contract fixture game\""_ba,
+                 "\"name\": \""_ba + escaped + '"');
+    ;
+    m_server->setResponse(path(u"arkham/games"_s), jsonResponse(200, list));
+    m_server->setResponse(path(u"arkham/games/"_s + kGameId),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    QVERIFY(show(m_controller.get()));
+    QQuickItem *gamesList = child(u"gamesList"_s);
+    QTRY_VERIFY(gamesList->hasActiveFocus());
+
+    // The list row: one line, as tall as an ordinary row.
+    QTRY_VERIFY(itemsNamed(gamesList, u"gameRowLabel"_s).size() >= 2);
+    const QList<QQuickItem *> labels = itemsNamed(gamesList, u"gameRowLabel"_s);
+    QQuickItem *longRow = nullptr;
+    QQuickItem *plainRow = nullptr;
+    for (QQuickItem *label : labels) {
+      if (label->property("text").toString().startsWith(u"Line"_s))
+        longRow = label;
+      else
+        plainRow = label;
+    }
+    QVERIFY(longRow && plainRow);
+    QCOMPARE(longRow->property("lineCount").toInt(), 1);
+    QCOMPARE(longRow->height(), plainRow->height());
+    QCOMPARE(accessibleName(longRow->parentItem()), name);
+    // The current row (the first) is the selected one.
+    QVERIFY(accessible(longRow->parentItem(), "selected").toBool());
+    QVERIFY(!accessible(plainRow->parentItem(), "selected").toBool());
+
+    // The board heading: one line, full accessible name, Back on screen.
+    QTest::keyClick(m_view.get(), Qt::Key_Return);
+    QQuickItem *board = child(u"board"_s);
+    QTRY_VERIFY(board->isVisible());
+    QQuickItem *title = child(u"boardTitle"_s);
+    QCOMPARE(m_controller->selectedTitle(), name);
+    QCOMPARE(title->property("lineCount").toInt(), 1);
+    QVERIFY(title->height() < 2 * 32 * 1.5);
+    QCOMPARE(accessibleName(title), name);
+    QQuickItem *back = child(u"backButton"_s);
+    QVERIFY(back->isVisible());
+    QVERIFY(back->mapToScene(QPointF(0, back->height())).y() <=
+            m_view->height() + 0.5);
+    QVERIFY(board->height() > 100);
   }
 
   void loadingStateIsShown() {

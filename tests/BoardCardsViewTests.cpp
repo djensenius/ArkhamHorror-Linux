@@ -185,6 +185,56 @@ private slots:
     QVERIFY(actPlaceholder->isVisible());
   }
 
+  // Refilling the model while the grid has focus leaves a current card, so
+  // the focus mark (currentCardIndicator) still shows where the arrows are.
+  void focusedGridKeepsACurrentCardAcrossAModelReset() {
+    BoardCardsModel model;
+    model.setGame(mutatedGame());
+    QQmlEngine engine;
+    engine.rootContext()->setContextProperty(u"boardCards"_s, &model);
+    QQmlComponent component(&engine);
+    component.setData("import QtQuick\n"
+                      "Window {\n"
+                      "  width: 800; height: 600; visible: true\n"
+                      "  BoardCardsView { objectName: \"grid\";"
+                      " anchors.fill: parent; model: boardCards;"
+                      " focus: true }\n"
+                      "}\n",
+                      QUrl::fromLocalFile(QStringLiteral(
+                          ARKHAM_TEST_QML_DIR "/BoardCardsTest.qml")));
+    std::unique_ptr<QObject> window(component.create());
+    QVERIFY2(window != nullptr, qPrintable(component.errorString()));
+    auto *quickWindow = qobject_cast<QQuickWindow *>(window.get());
+    QVERIFY(quickWindow != nullptr);
+    quickWindow->requestActivate();
+    QVERIFY(QTest::qWaitForWindowActive(quickWindow));
+    auto *grid = window->findChild<QQuickItem *>(u"grid"_s);
+    QVERIFY(grid != nullptr);
+    QTRY_VERIFY(grid->hasActiveFocus());
+    QTRY_COMPARE(grid->property("currentIndex").toInt(), 0);
+    grid->setProperty("currentIndex", 2);
+
+    // As on the board screen: the model empties (closeGame()/reset()) and
+    // the next board resets it while the grid keeps focus.
+    model.clear();
+    QTRY_COMPARE(grid->property("count").toInt(), 0);
+    model.setGame(mutatedGame());
+    QTRY_COMPARE(grid->property("count").toInt(), 4);
+    QTRY_VERIFY(grid->property("currentIndex").toInt() >= 0);
+    const auto marked = [&window] {
+      int shown = 0;
+      for (QQuickItem *card : boardCards(window.get())) {
+        for (QQuickItem *child : card->childItems()) {
+          if (child->objectName() == "currentCardIndicator"_L1 &&
+              child->isVisible())
+            ++shown;
+        }
+      }
+      return shown;
+    };
+    QTRY_COMPARE(marked(), 1);
+  }
+
   // Labels are server data: markup in one is shown literally and never
   // fetches anything (e.g. an <img> outside the card-art provider).
   void labelMarkupIsPlainText() {

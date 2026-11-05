@@ -56,13 +56,22 @@ FocusScope {
         root.focusStage();
     }
 
-    // Back to SignedIn while open: reload whatever the session cleared.
+    // Game names are server text: show them on one line (a name may hold
+    // newlines); accessible names keep the full text.
+    function singleLine(text: string): string {
+        return text.replace(/[\r\n\u0085\u2028\u2029]+/g, " ");
+    }
+
+    // Back to SignedIn while open: reload whatever the session cleared. A
+    // list still "loading" was requested while signed out, so its token
+    // reply can only be the signed-out one: reload it too (loadGames()
+    // starts a new generation, so that stale reply is dropped).
     Connections {
         target: root.controller
         ignoreUnknownSignals: true
 
         function onSignedIn() {
-            if (root.listStatus === "idle" || root.listStatus === "error")
+            if (root.listStatus !== "loaded")
                 root.controller.loadGames();
         }
     }
@@ -84,17 +93,22 @@ FocusScope {
         spacing: 20
 
         Label {
+            id: boardTitle
+
+            readonly property string fullTitle: root.showingBoard && root.controller ? root.controller.selectedTitle : qsTr("Your games")
+
             objectName: "boardTitle"
             Layout.fillWidth: true
-            text: root.showingBoard && root.controller ? root.controller.selectedTitle : qsTr("Your games")
+            text: root.singleLine(boardTitle.fullTitle)
             textFormat: Text.PlainText
             elide: Text.ElideRight
+            maximumLineCount: 1
             color: root.bone
             font {
                 pixelSize: 32
                 weight: Font.DemiBold
             }
-            Accessible.name: text
+            Accessible.name: boardTitle.fullTitle
         }
 
         Label {
@@ -139,8 +153,9 @@ FocusScope {
 
             objectName: "errorNotice"
             visible: root.stageStatus === "error"
-            activeFocusOnTab: true
-            focusPolicy: Qt.StrongFocus
+            // A Tab stop only when there is something to scroll; Up from
+            // Retry still reaches it either way.
+            focusPolicy: errorNotice.contentHeight > errorNotice.availableHeight ? Qt.StrongFocus : Qt.ClickFocus
             Keys.onDownPressed: event => {
                 if (!errorNotice.scrollNotice(errorNotice.scrollStep))
                     retryButton.forceActiveFocus();
@@ -233,9 +248,11 @@ FocusScope {
                 onClicked: root.controller.openGame(gameRow.index)
 
                 contentItem: Label {
-                    text: gameRow.text
+                    objectName: "gameRowLabel"
+                    text: root.singleLine(gameRow.text)
                     textFormat: Text.PlainText
                     elide: Text.ElideRight
+                    maximumLineCount: 1
                     color: gameRow.highlighted ? "#081515" : root.bone
                     font.pixelSize: 20
                 }
@@ -247,6 +264,7 @@ FocusScope {
 
                 Accessible.role: Accessible.ListItem
                 Accessible.name: gameRow.modelData
+                Accessible.selected: gameRow.ListView.isCurrentItem
             }
 
             Accessible.role: Accessible.List
