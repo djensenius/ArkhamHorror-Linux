@@ -29,6 +29,8 @@ public:
 
   // Replaces every row with the cards of `game`.
   void setGame(const PublicGame &game);
+  // Removes every row.
+  void clear();
 
   [[nodiscard]] int
   rowCount(const QModelIndex &parent = QModelIndex()) const override;

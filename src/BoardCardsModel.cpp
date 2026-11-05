@@ -30,6 +30,14 @@ void BoardCardsModel::setGame(const PublicGame &game) {
   endResetModel();
 }
 
+void BoardCardsModel::clear() {
+  if (m_rows.isEmpty())
+    return;
+  beginResetModel();
+  m_rows.clear();
+  endResetModel();
+}
+
 int BoardCardsModel::rowCount(const QModelIndex &parent) const {
   return parent.isValid() ? 0 : static_cast<int>(m_rows.size());
 }

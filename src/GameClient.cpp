@@ -57,11 +57,14 @@ GameRequestStatus transportFailure(QString diagnostic, int httpStatus = 0) {
 }
 
 GameRequestStatus oversizedResponse() {
-  return transportFailure(
-      QStringLiteral("response body exceeds the size limit"));
+  return transportFailure(GameClient::oversizedResponseDiagnostic());
 }
 
 } // namespace
+
+QString GameClient::oversizedResponseDiagnostic() {
+  return QStringLiteral("response body exceeds the size limit");
+}
 
 GameClient::GameClient(QNetworkAccessManager &nam,
                        std::chrono::milliseconds timeout, QObject *parent)

@@ -233,6 +233,7 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/CompatibilityEvaluator.h
     src/ControllerGlyphs.h
     src/FocusController.h
+    src/GameBoardController.h
     src/GameClient.h
     src/IAuthenticationClient.h
     src/ICapabilityProbe.h
@@ -276,6 +277,7 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/CompatibilityEvaluator.cpp
     src/ControllerGlyphs.cpp
     src/FocusController.cpp
+    src/GameBoardController.cpp
     src/GameClient.cpp
     src/InputMapper.cpp
     src/InputRouter.cpp
@@ -579,6 +581,7 @@ qt_add_qml_module(arkham-horror
         qml/Main.qml
         qml/BoardCardsView.qml
         qml/CardImage.qml
+        qml/BoardScreen.qml
     RESOURCES
         packaging/hicolor/256x256/apps/io.github.djensenius.ArkhamHorror.png
 )
@@ -1060,6 +1063,39 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME main_qml COMMAND arkham-main-qml-tests)
+
+    qt_add_executable(arkham-game-board-controller-tests
+        tests/GameBoardControllerTests.cpp
+        tests/MockHttpServer.cpp
+    )
+    target_compile_definitions(arkham-game-board-controller-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-game-board-controller-tests PRIVATE
+        arkham_foundation
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME game_board_controller
+        COMMAND arkham-game-board-controller-tests)
+
+    qt_add_executable(arkham-board-screen-qml-tests
+        tests/BoardScreenQmlTests.cpp
+        tests/MockHttpServer.cpp
+    )
+    target_compile_definitions(arkham-board-screen-qml-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+        ARKHAM_TEST_QML_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml"
+    )
+    target_link_libraries(arkham-board-screen-qml-tests PRIVATE
+        arkham_foundation
+        Qt6::Gui
+        Qt6::Network
+        Qt6::Quick
+        Qt6::QuickControls2
+        Qt6::Test
+    )
+    add_test(NAME board_screen_qml COMMAND arkham-board-screen-qml-tests)
 
     # QtKeychain's kwallet5 backend (the two downstream hardening patches'
     # target) only exists in keychain_unix.cpp, compiled solely for

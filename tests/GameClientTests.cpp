@@ -460,6 +460,15 @@ private slots:
     nam.contentLength = 1024;
     alignas(GameClient) unsigned char storage[sizeof(GameClient)];
     auto *client = new (storage) GameClient(nam);
+    // If a check below fails before the callback runs, destroy the client
+    // here, before |nam| (declared earlier, so destroyed later).
+    struct DestroyIfAlive {
+      GameClient *&client;
+      ~DestroyIfAlive() {
+        if (client)
+          client->~GameClient();
+      }
+    } guard{client};
     client->setMaxResponseBytes(16);
     GameCall result;
     client->getGame(*m_profile, kGameId, kToken,

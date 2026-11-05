@@ -81,6 +81,9 @@ private slots:
   void longProfileNameStaysInsideTheStatusLabel();
   void maintenanceNoticeReturnsFocusToTheCardItWasEnteredFrom();
   void endingMaintenanceReturnsFocusFromTheNoticeToACard();
+  void yourGamesCardOpensTheBoardScreenAndEscapeReturns();
+  void destinationsFitAtTheMinimumWidth_data();
+  void destinationsFitAtTheMinimumWidth();
 
 private:
   QQuickItem *focusNoticeFromThirdCard(QQuickWindow *window,
@@ -407,6 +410,141 @@ void MainQmlTests::endingMaintenanceReturnsFocusFromTheNoticeToACard() {
   QTRY_VERIFY(window->activeFocusItem() != nullptr);
   QCOMPARE(window->activeFocusItem()->property("text").toString(),
            QStringLiteral("Browse fixtures"));
+}
+
+void MainQmlTests::yourGamesCardOpensTheBoardScreenAndEscapeReturns() {
+  // No gameBoard context property here (as in --smoke-test): the screen
+  // still opens, asks the user to sign in, and Escape comes back.
+  QQuickWindow *window =
+      load(QStringLiteral("Back soon. Try again in about 2 minutes."), 800);
+  QVERIFY(window != nullptr);
+  window->requestActivate();
+  QVERIFY(QTest::qWaitForWindowActive(window));
+  QTRY_VERIFY(window->activeFocusItem() != nullptr);
+  for (int i = 0; i < 3; ++i) {
+    QTest::keyClick(window, Qt::Key_Right);
+  }
+  QQuickItem *gamesCard = window->activeFocusItem();
+  QVERIFY(gamesCard != nullptr);
+  QCOMPARE(gamesCard->property("text").toString(),
+           QStringLiteral("Your games"));
+
+  auto *loader = window->findChild<QQuickItem *>(QStringLiteral("boardLoader"));
+  auto *landing = window->findChild<QQuickItem *>(QStringLiteral("landing"));
+  QVERIFY(loader != nullptr);
+  QVERIFY(landing != nullptr);
+  QVERIFY(!loader->property("active").toBool());
+
+  QTest::keyClick(window, Qt::Key_Return);
+  QTRY_VERIFY(loader->property("active").toBool());
+  QVERIFY(!landing->isVisible());
+  auto *screen = loader->property("item").value<QQuickItem *>();
+  QVERIFY(screen != nullptr);
+  auto *signedOut =
+      screen->findChild<QQuickItem *>(QStringLiteral("signedOutLabel"));
+  QVERIFY(signedOut != nullptr);
+  QVERIFY(signedOut->isVisible());
+  QTRY_VERIFY(screen->hasActiveFocus());
+
+  QTest::keyClick(window, Qt::Key_Escape);
+  QTRY_VERIFY(!loader->property("active").toBool());
+  QVERIFY(landing->isVisible());
+  QTRY_VERIFY(gamesCard->hasActiveFocus());
+}
+
+void MainQmlTests::destinationsFitAtTheMinimumWidth_data() {
+  QTest::addColumn<int>("width"); // 0: the window's minimum width
+  QTest::newRow("minimum width") << 0;
+  QTest::newRow("default width") << 1280;
+  QTest::newRow("wide") << 1700;
+}
+
+void MainQmlTests::destinationsFitAtTheMinimumWidth() {
+  // Every landing card, its whole hit area and its title, stays inside the
+  // window from the supported minimum width up, and keys still reach the
+  // last card.
+  QFETCH(int, width);
+  QQuickWindow *window = load(QString(), 600);
+  QVERIFY(window != nullptr);
+  QCOMPARE(window->minimumWidth(), 960);
+  const bool minimum = width == 0;
+  if (minimum)
+    width = window->minimumWidth();
+  window->setWidth(width);
+  window->requestActivate();
+  QVERIFY(QTest::qWaitForWindowActive(window));
+  QTRY_COMPARE(window->contentItem()->width(), qreal(width));
+
+  const QStringList titles{
+      QStringLiteral("Connect"), QStringLiteral("Browse fixtures"),
+      QStringLiteral("Input guide"), QStringLiteral("Your games")};
+  auto *landing = window->findChild<QQuickItem *>(QStringLiteral("landing"));
+  QVERIFY(landing != nullptr);
+  // Repeater delegates are visual (not QObject) children of the row.
+  QList<QQuickItem *> cards;
+  QList<QQuickItem *> pending{landing};
+  while (!pending.isEmpty()) {
+    QQuickItem *item = pending.takeFirst();
+    if (item->inherits("QQuickButton") &&
+        titles.contains(item->property("text").toString()))
+      cards.append(item);
+    pending.append(item->childItems());
+  }
+  QCOMPARE(cards.size(), titles.size());
+
+  const QRectF bounds(QPointF(0, 0), window->contentItem()->size());
+  const auto inside = [](const QRectF &outer, const QRectF &inner) {
+    return inner.left() >= outer.left() - 0.5 &&
+           inner.top() >= outer.top() - 0.5 &&
+           inner.right() <= outer.right() + 0.5 &&
+           inner.bottom() <= outer.bottom() + 0.5;
+  };
+  for (QQuickItem *card : cards) {
+    const QString name = card->property("text").toString();
+    const QRectF cardRect =
+        card->mapRectToScene(QRectF(0, 0, card->width(), card->height()));
+    QVERIFY2(card->width() > 0 && inside(bounds, cardRect),
+             qPrintable(QStringLiteral("%1 card %2,%3 %4x%5 outside %6")
+                            .arg(name)
+                            .arg(cardRect.x())
+                            .arg(cardRect.y())
+                            .arg(cardRect.width())
+                            .arg(cardRect.height())
+                            .arg(bounds.width())));
+    // With room (the default size and up) the cards keep their full
+    // design width.
+    if (!minimum)
+      QCOMPARE(card->width(), 280.0);
+    auto *content = card->property("contentItem").value<QQuickItem *>();
+    QVERIFY(content != nullptr && !content->childItems().isEmpty());
+    QQuickItem *title = content->childItems().constFirst();
+    QCOMPARE(title->property("text").toString(), name);
+    const qreal drawn =
+        qMin(title->width(), title->property("contentWidth").toReal());
+    const QRectF titleRect = title->mapRectToScene(
+        QRectF(0, 0, drawn, title->property("contentHeight").toReal()));
+    QVERIFY2(inside(cardRect, titleRect) && inside(bounds, titleRect),
+             qPrintable(QStringLiteral("%1 title %2..%3 outside card %4..%5")
+                            .arg(name)
+                            .arg(titleRect.left())
+                            .arg(titleRect.right())
+                            .arg(cardRect.left())
+                            .arg(cardRect.right())));
+  }
+
+  // The cards stay packed left to right with the row's spacing.
+  std::sort(cards.begin(), cards.end(),
+            [](QQuickItem *a, QQuickItem *b) { return a->x() < b->x(); });
+  for (qsizetype i = 1; i < cards.size(); ++i) {
+    const QQuickItem *previous = cards.at(i - 1);
+    QCOMPARE(cards.at(i)->x() - (previous->x() + previous->width()), 20.0);
+  }
+
+  QTRY_VERIFY(window->activeFocusItem() != nullptr);
+  for (int i = 0; i < 3; ++i)
+    QTest::keyClick(window, Qt::Key_Right);
+  QCOMPARE(window->activeFocusItem()->property("text").toString(),
+           QStringLiteral("Your games"));
 }
 
 QTEST_MAIN(MainQmlTests)

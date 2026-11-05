@@ -37,6 +37,18 @@ ApplicationWindow {
     }
     // qmllint enable unqualified
 
+    // Shows the games/board screen in place of the landing page (a Loader,
+    // so the screen and its requests exist only while it is open).
+    function openGames() {
+        boardLoader.active = true;
+    }
+    function closeGames() {
+        boardLoader.active = false;
+        const gamesCard = destinations.itemAt(3);
+        if (gamesCard)
+            gamesCard.forceActiveFocus();
+    }
+
     background: Rectangle {
         gradient: Gradient {
             GradientStop {
@@ -51,6 +63,8 @@ ApplicationWindow {
     }
 
     ColumnLayout {
+        objectName: "landing"
+        visible: !boardLoader.active
         anchors {
             fill: parent
             margins: 48
@@ -76,7 +90,10 @@ ApplicationWindow {
             wrapMode: Text.WordWrap
         }
 
+        // The cards share the row: 280 wide when it has room, narrower
+        // (down to minimumWidth) from the 960 px minimum window width.
         RowLayout {
+            Layout.fillWidth: true
             spacing: 20
 
             Repeater {
@@ -94,6 +111,11 @@ ApplicationWindow {
                     {
                         title: qsTr("Input guide"),
                         detail: qsTr("Controller and keyboard")
+                    },
+                    {
+                        title: qsTr("Your games"),
+                        detail: qsTr("Open a game's board"),
+                        opensGames: true
                     }
                 ]
 
@@ -107,10 +129,19 @@ ApplicationWindow {
 
                     required property int index
                     required property var modelData
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 160
                     Layout.preferredWidth: 280
+                    Layout.maximumWidth: 280
                     Layout.preferredHeight: 150
                     activeFocusOnTab: true
                     text: modelData.title
+                    onClicked: {
+                        if (destination.modelData.opensGames === true)
+                            root.openGames();
+                    }
+                    Keys.onReturnPressed: destination.clicked()
+                    Keys.onEnterPressed: destination.clicked()
 
                     KeyNavigation.left: index > 0 ? destinations.itemAt(index - 1) : null
                     KeyNavigation.right: index + 1 < destinations.count ? destinations.itemAt(index + 1) : null
@@ -131,7 +162,11 @@ ApplicationWindow {
                         spacing: 8
 
                         Label {
+                            width: parent.width
                             text: destination.modelData.title
+                            wrapMode: Text.WordWrap
+                            maximumLineCount: 2
+                            elide: Text.ElideRight
                             color: destination.activeFocus ? root.ink : root.bone
                             font {
                                 pixelSize: 24
@@ -305,5 +340,23 @@ ApplicationWindow {
             color: "#a9a189"
             font.pixelSize: 17
         }
+    }
+
+    Loader {
+        id: boardLoader
+
+        objectName: "boardLoader"
+        anchors.fill: parent
+        active: false
+        focus: active
+        sourceComponent: BoardScreen {
+            // gameBoard is only registered during normal startup (see
+            // main.cpp); it is absent in --smoke-test.
+            // qmllint disable unqualified
+            controller: typeof gameBoard !== "undefined" ? gameBoard : null
+            // qmllint enable unqualified
+            onClosed: root.closeGames()
+        }
+        onLoaded: boardLoader.forceActiveFocus()
     }
 }
