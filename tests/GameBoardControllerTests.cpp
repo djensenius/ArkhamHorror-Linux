@@ -26,6 +26,7 @@ using Status = GameBoardController::Status;
 namespace {
 
 const QString kGameId = u"00000000-0000-0000-0000-000000000003"_s;
+const QString kSecondGameId = u"00000000-0000-0000-0000-000000000004"_s;
 
 QByteArray fixture(const QString &name) {
   QFile f(QStringLiteral(ARKHAM_TEST_CONTRACTS_DIR) + u"/fixtures/"_s + name);
@@ -64,6 +65,7 @@ private:
   bool m_holdToken{false};
   bool m_signedIn{true};
   int m_tokenRequests{0};
+  QString m_tokenDiagnostic{u"Not signed in."_s};
   SessionCoordinator::AccessTokenCallback m_heldToken;
 
   QString listPath() const { return m_profile->apiUrl(u"arkham/games").path(); }
@@ -80,14 +82,15 @@ private:
       }
       const ServerProfile profile = *m_profile;
       const bool signedIn = m_signedIn;
+      const QString diagnostic = m_tokenDiagnostic;
       QMetaObject::invokeMethod(
           this,
-          [callback = std::move(callback), profile, signedIn] {
+          [callback = std::move(callback), profile, signedIn, diagnostic] {
             if (signedIn)
               callback(SessionCoordinator::AccessToken{profile, u"tok-1"_s},
                        QString());
             else
-              callback(std::nullopt, u"Not signed in."_s);
+              callback(std::nullopt, diagnostic);
           },
           Qt::QueuedConnection);
     };
@@ -114,6 +117,7 @@ private slots:
     m_holdToken = false;
     m_signedIn = true;
     m_tokenRequests = 0;
+    m_tokenDiagnostic = u"Not signed in."_s;
     m_heldToken = nullptr;
   }
 
@@ -278,6 +282,103 @@ private slots:
     QTest::qWait(400);
     QCOMPARE(c.listStatus(), Status::Idle);
     QVERIFY(c.gameTitles().isEmpty());
+  }
+
+  void secureStoreFailureWhileSignedInIsNotSignIn() {
+    // The session is SignedIn but the token store could not be read.
+    m_signedIn = false; // the stand-in answers with no token
+    m_tokenDiagnostic = u"keyring locked"_s;
+    GameBoardController c(*m_client, tokenSource());
+    c.setSignedIn(true);
+    c.loadGames();
+    QVERIFY(waitUntil([&c] { return c.listStatus() == Status::Error; }));
+    QCOMPARE(c.errorText(),
+             u"Could not read your saved sign-in (keyring locked)."_s);
+  }
+
+  void oversizedReplyHasItsOwnText() {
+    m_client->setMaxResponseBytes(16);
+    GameBoardController c(*m_client, tokenSource());
+    m_server->setResponse(listPath(),
+                          jsonResponse(200, fixture(u"game-list.json"_s)));
+    c.loadGames();
+    QVERIFY(waitUntil([&c] { return c.listStatus() == Status::Error; }));
+    QCOMPARE(c.errorText(), u"The server's response was too large."_s);
+  }
+
+  void closeGameDropsALateBoardReply() {
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    MockHttpServer::Response slow =
+        jsonResponse(200, fixture(u"get-game.json"_s));
+    slow.headerDelayMs = 150;
+    m_server->setResponse(gamePath(), slow);
+    c.openGame(0);
+    QVERIFY(waitUntil(
+        [this] { return m_server->requestCountForPath(gamePath()) == 1; }));
+    c.closeGame();
+    QTest::qWait(400);
+    QCOMPARE(c.boardStatus(), Status::Idle);
+    QCOMPARE(c.boardCards()->rowCount(), 0);
+    QVERIFY(c.selectedTitle().isEmpty());
+    QCOMPARE(c.listStatus(), Status::Loaded);
+  }
+
+  void openingAnotherGameReplacesTheFetchInFlight() {
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    // Game 0 answers late with a body that would fail to decode; only
+    // game 1's board may show.
+    QByteArray broken = fixture(u"get-game.json"_s);
+    broken.replace(R"("multiplayerMode": "Solo")"_ba,
+                   R"("multiplayerMode": "Party")"_ba);
+    MockHttpServer::Response slow = jsonResponse(200, broken);
+    slow.headerDelayMs = 200;
+    m_server->setResponse(gamePath(), slow);
+    const QString secondPath =
+        m_profile->apiUrl(u"arkham/games/"_s + kSecondGameId).path();
+    m_server->setResponse(secondPath,
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    c.openGame(0);
+    QVERIFY(waitUntil(
+        [this] { return m_server->requestCountForPath(gamePath()) == 1; }));
+    c.openGame(1);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QTest::qWait(400);
+    QCOMPARE(c.boardStatus(), Status::Loaded);
+    QCOMPARE(c.selectedTitle(), u"Campaign contract fixture"_s);
+    QVERIFY(c.errorText().isEmpty());
+    QVERIFY(c.boardCards()->rowCount() > 0);
+  }
+
+  void retryAfterABoardErrorRefetchesOnlyTheBoard() {
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    m_server->setResponse(gamePath(), jsonResponse(500, "{}"_ba));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Error; }));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    c.retry();
+    QCOMPARE(c.listStatus(), Status::Loaded);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QCOMPARE(m_server->requestCountForPath(listPath()), 1);
+    QCOMPARE(m_server->requestCountForPath(gamePath()), 2);
+    QCOMPARE(c.gameTitles().size(), 4);
+  }
+
+  void setSignedInResetsAndAnnounces() {
+    GameBoardController c(*m_client, tokenSource());
+    QSignalSpy signedIn(&c, &GameBoardController::signedIn);
+    c.setSignedIn(true);
+    c.setSignedIn(true);
+    QCOMPARE(signedIn.count(), 1);
+    QVERIFY(loadList(c));
+    c.setSignedIn(false);
+    QCOMPARE(c.listStatus(), Status::Idle);
+    QVERIFY(c.gameTitles().isEmpty());
+    c.setSignedIn(true);
+    QCOMPARE(signedIn.count(), 2);
   }
 
   void tokenArrivingAfterResetSendsNothing() {

@@ -23,8 +23,9 @@ class BoardCardsModel;
 // requestAccessToken in production) for the token, then issues one
 // GameClient request with it; the token is never stored here. Every list
 // or board fetch carries a generation number, and reset() bumps both, so a
-// token or HTTP reply that lands after reset() (which the composition calls
-// whenever the session leaves SignedIn) is dropped rather than shown.
+// token or HTTP reply that lands after reset() (which setSignedIn(false)
+// calls whenever the session leaves SignedIn; see bindToSession()) is
+// dropped rather than shown.
 class GameBoardController final : public QObject {
   Q_OBJECT
   // "idle", "loading", "loaded" or "error".
@@ -66,8 +67,20 @@ public:
   // Clears everything and drops every fetch in flight.
   Q_INVOKABLE void reset();
 
+  // Tracks the session: false reset()s; a change to true emits
+  // signedIn() so an open board screen can reload. While signed in, a
+  // failed token read is a secure-store problem, not "sign in".
+  void setSignedIn(bool signedIn);
+  [[nodiscard]] bool isSignedIn() const { return m_signedIn; }
+
+  // Drives setSignedIn() from |coordinator|'s state (now and on every
+  // stateChanged) for as long as both exist.
+  static void bindToSession(SessionCoordinator &coordinator,
+                            GameBoardController &controller);
+
 signals:
   void changed();
+  void signedIn();
 
 private:
   struct Game {
@@ -78,6 +91,7 @@ private:
   void fetchBoard();
   void failList(const QString &text);
   void failBoard(const QString &text);
+  [[nodiscard]] QString tokenFailureText(const QString &diagnostic) const;
   [[nodiscard]] static QString describe(const GameRequestStatus &status);
 
   GameClient &m_client;
@@ -90,6 +104,7 @@ private:
   QString m_errorText;
   quint64 m_listGeneration{0};
   quint64 m_boardGeneration{0};
+  bool m_signedIn{false};
 };
 
 } // namespace Arkham

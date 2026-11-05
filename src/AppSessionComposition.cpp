@@ -37,16 +37,9 @@ std::unique_ptr<ProductionSession> composeProductionSession() {
         }
       });
   // Leaving SignedIn (sign-out, restart, profile switch) clears the board
-  // and drops every fetch still in flight.
-  GameBoardController *gameBoard = session->gameBoard.get();
-  QObject::connect(
-      session->coordinator.get(), &SessionCoordinator::stateChanged, gameBoard,
-      [coordinator, gameBoard] {
-        if (coordinator &&
-            coordinator->state() != SessionCoordinator::State::SignedIn) {
-          gameBoard->reset();
-        }
-      });
+  // and drops every fetch still in flight; returning reloads an open screen.
+  GameBoardController::bindToSession(*session->coordinator,
+                                     *session->gameBoard);
 
   return session;
 }

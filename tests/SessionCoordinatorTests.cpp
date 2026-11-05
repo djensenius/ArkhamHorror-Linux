@@ -12,6 +12,7 @@
 #include <QDeadlineTimer>
 #include <QHash>
 #include <QList>
+#include <QNetworkAccessManager>
 #include <QPair>
 #include <QPointer>
 #include <QSignalSpy>
@@ -25,6 +26,8 @@
 #include <utility>
 
 #include "AuthModels.h"
+#include "GameBoardController.h"
+#include "GameClient.h"
 #include "IAuthenticationClient.h"
 #include "ICapabilityProbe.h"
 #include "IKeychainJobFactory.h"
@@ -870,6 +873,7 @@ private slots:
   void accessTokenReadFailureKeepsSessionState();
   void accessTokenIsWithheldAfterSignOut();
   void accessTokenCallbackSurvivesRestartRestore();
+  void gameBoardFollowsTheSessionState();
   void duplicateSignOutCallsDispatchExactlyOneDelete();
   void
   directReentrantSignOutDuringSigningOutEmissionDispatchesExactlyOneDelete();
@@ -2134,6 +2138,40 @@ void SessionCoordinatorTests::accessTokenCallbackSurvivesRestartRestore() {
   }));
   QCOMPARE(recorder.calls, 1);
   QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
+}
+
+void SessionCoordinatorTests::gameBoardFollowsTheSessionState() {
+  // GameBoardController::bindToSession (what AppSessionComposition uses)
+  // against a real coordinator: SignedIn announces, leaving it resets.
+  Harness h;
+  QNetworkAccessManager nam;
+  GameClient client(nam);
+  SessionCoordinator::AccessTokenCallback held;
+  GameBoardController board(
+      client, [&held](SessionCoordinator::AccessTokenCallback callback) {
+        held = std::move(callback);
+      });
+  GameBoardController::bindToSession(*h.coordinator, board);
+  QVERIFY(!board.isSignedIn());
+  QSignalSpy signedIn(&board, &GameBoardController::signedIn);
+
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  QCOMPARE(signedIn.count(), 1);
+  QVERIFY(board.isSignedIn());
+  board.loadGames(); // stays loading: the token is held
+  QCOMPARE(board.listStatus(), GameBoardController::Status::Loading);
+
+  const QString profileId = h.coordinator->selectedProfileId();
+  h.coordinator->signOut();
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, successWriteResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedOut;
+  }));
+  QVERIFY(!board.isSignedIn());
+  QCOMPARE(board.listStatus(), GameBoardController::Status::Idle);
+  QCOMPARE(signedIn.count(), 1);
 }
 
 void SessionCoordinatorTests::duplicateSignOutCallsDispatchExactlyOneDelete() {

@@ -84,6 +84,10 @@ public:
   // afterwards; production code never calls it.
   void setMaxResponseBytes(qsizetype maxResponseBytes);
 
+  // The Transport diagnostic for a body over the size cap, so callers can
+  // word it apart from a network failure.
+  [[nodiscard]] static QString oversizedResponseDiagnostic();
+
   void listGames(const ServerProfile &profile, const QString &token,
                  GameListCallback callback);
   void getGame(const ServerProfile &profile, const QString &gameId,

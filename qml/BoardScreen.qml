@@ -17,6 +17,9 @@ FocusScope {
     readonly property string boardStatus: root.controller ? root.controller.boardStatus : "idle"
     readonly property bool showingBoard: root.boardStatus !== "idle"
     readonly property string stageStatus: root.showingBoard ? root.boardStatus : root.listStatus
+    // Signed out (or the session reset the list): nothing to show until a
+    // sign-in, or a manual Reload.
+    readonly property bool needsSignIn: !root.controller || (!root.showingBoard && root.listStatus === "idle")
     readonly property color bone: "#ede1c3"
     readonly property color gold: "#b7944c"
 
@@ -33,6 +36,8 @@ FocusScope {
     function focusStage() {
         if (root.stageStatus === "error")
             retryButton.forceActiveFocus();
+        else if (root.needsSignIn && root.controller)
+            reloadButton.forceActiveFocus();
         else if (root.showingBoard && root.boardStatus === "loaded")
             board.forceActiveFocus();
         else if (!root.showingBoard && root.listStatus === "loaded" && gamesList.count > 0)
@@ -49,6 +54,17 @@ FocusScope {
         if (root.controller)
             root.controller.loadGames();
         root.focusStage();
+    }
+
+    // Back to SignedIn while open: reload whatever the session cleared.
+    Connections {
+        target: root.controller
+        ignoreUnknownSignals: true
+
+        function onSignedIn() {
+            if (root.listStatus === "idle" || root.listStatus === "error")
+                root.controller.loadGames();
+        }
     }
 
     Keys.onEscapePressed: event => {
@@ -92,7 +108,7 @@ FocusScope {
 
         Label {
             objectName: "signedOutLabel"
-            visible: !root.controller
+            visible: root.needsSignIn
             text: qsTr("Sign in to see your games.")
             color: root.bone
             font.pixelSize: 20
@@ -127,7 +143,7 @@ FocusScope {
             id: gamesList
 
             objectName: "gamesList"
-            visible: !root.showingBoard && root.listStatus === "loaded"
+            visible: !root.showingBoard && root.listStatus === "loaded" && gamesList.count > 0
             Layout.fillWidth: true
             Layout.fillHeight: true
             Layout.maximumWidth: 780
@@ -202,6 +218,20 @@ FocusScope {
             spacing: 16
 
             Button {
+                id: reloadButton
+
+                objectName: "reloadButton"
+                visible: root.needsSignIn && !!root.controller
+                text: qsTr("Reload")
+                activeFocusOnTab: true
+                KeyNavigation.right: backButton
+                onClicked: root.controller.loadGames()
+                Keys.onReturnPressed: reloadButton.clicked()
+                Keys.onEnterPressed: reloadButton.clicked()
+                Accessible.name: text
+            }
+
+            Button {
                 id: retryButton
 
                 objectName: "retryButton"
@@ -221,7 +251,7 @@ FocusScope {
                 objectName: "backButton"
                 text: root.showingBoard ? qsTr("Back to games") : qsTr("Back")
                 activeFocusOnTab: true
-                KeyNavigation.left: retryButton.visible ? retryButton : null
+                KeyNavigation.left: retryButton.visible ? retryButton : (reloadButton.visible ? reloadButton : null)
                 KeyNavigation.up: gamesList.visible ? gamesList : (board.visible ? board : null)
                 onClicked: root.back()
                 Keys.onReturnPressed: backButton.clicked()

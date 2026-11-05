@@ -185,6 +185,79 @@ private slots:
     QVERIFY(!retry->isVisible());
   }
 
+  void boardErrorOffersRetryAndCloseGameRefocusesTheList() {
+    m_server->setResponse(path(u"arkham/games"_s),
+                          jsonResponse(200, fixture(u"game-list.json"_s)));
+    m_server->setResponse(path(u"arkham/games/"_s + kGameId),
+                          jsonResponse(404, "{}"_ba));
+    QVERIFY(show(m_controller.get()));
+    QQuickItem *list = child(u"gamesList"_s);
+    QTRY_VERIFY(list->hasActiveFocus());
+    QTest::keyClick(m_view.get(), Qt::Key_Return);
+    QQuickItem *error = child(u"errorLabel"_s);
+    QTRY_VERIFY(error->isVisible());
+    QCOMPARE(error->property("text").toString(), u"Game not found."_s);
+    QTRY_VERIFY(child(u"retryButton"_s)->hasActiveFocus());
+    QVERIFY(!child(u"board"_s)->isVisible());
+    QCOMPARE(child(u"backButton"_s)->property("text").toString(),
+             u"Back to games"_s);
+
+    m_controller->closeGame();
+    QTRY_VERIFY(list->isVisible());
+    QTRY_VERIFY(list->hasActiveFocus());
+    QVERIFY(!error->isVisible());
+  }
+
+  void emptyListSaysSo() {
+    m_server->setResponse(path(u"arkham/games"_s), jsonResponse(200, "[]"_ba));
+    QVERIFY(show(m_controller.get()));
+    QQuickItem *empty = child(u"emptyLabel"_s);
+    QTRY_VERIFY(empty->isVisible());
+    QVERIFY(!child(u"gamesList"_s)->isVisible());
+    QTRY_VERIFY(child(u"backButton"_s)->hasActiveFocus());
+  }
+
+  void signOutWhileOpenOffersReloadAndSignInReloads() {
+    m_server->setResponse(path(u"arkham/games"_s),
+                          jsonResponse(200, fixture(u"game-list.json"_s)));
+    m_controller->setSignedIn(true);
+    QVERIFY(show(m_controller.get()));
+    QQuickItem *list = child(u"gamesList"_s);
+    QTRY_VERIFY(list->isVisible());
+
+    // The session leaves SignedIn: a sign-in prompt and Reload, not a
+    // blank screen.
+    m_controller->setSignedIn(false);
+    QQuickItem *signedOut = child(u"signedOutLabel"_s);
+    QQuickItem *reload = child(u"reloadButton"_s);
+    QTRY_VERIFY(signedOut->isVisible());
+    QVERIFY(reload->isVisible());
+    QVERIFY(!list->isVisible());
+    QTRY_VERIFY(reload->hasActiveFocus());
+    QTest::keyClick(m_view.get(), Qt::Key_Right);
+    QTRY_VERIFY(child(u"backButton"_s)->hasActiveFocus());
+    QTest::keyClick(m_view.get(), Qt::Key_Left);
+    QTRY_VERIFY(reload->hasActiveFocus());
+
+    // Back to SignedIn: the open screen reloads by itself.
+    const int before = m_server->requestCountForPath(path(u"arkham/games"_s));
+    m_controller->setSignedIn(true);
+    QTRY_VERIFY(list->isVisible());
+    QTRY_VERIFY(list->hasActiveFocus());
+    QVERIFY(!signedOut->isVisible());
+    QVERIFY(!reload->isVisible());
+    QCOMPARE(m_server->requestCountForPath(path(u"arkham/games"_s)),
+             before + 1);
+
+    // Reload by hand does the same.
+    m_controller->reset();
+    QTRY_VERIFY(reload->hasActiveFocus());
+    QTest::keyClick(m_view.get(), Qt::Key_Return);
+    QTRY_VERIFY(list->isVisible());
+    QCOMPARE(m_server->requestCountForPath(path(u"arkham/games"_s)),
+             before + 2);
+  }
+
   void loadingStateIsShown() {
     MockHttpServer::Response slow =
         jsonResponse(200, fixture(u"game-list.json"_s));
@@ -203,6 +276,7 @@ private slots:
     QQuickItem *signedOut = child(u"signedOutLabel"_s);
     QVERIFY(signedOut != nullptr);
     QVERIFY(signedOut->isVisible());
+    QVERIFY(!child(u"reloadButton"_s)->isVisible());
     QTRY_VERIFY(child(u"backButton"_s)->hasActiveFocus());
     QVERIFY(!child(u"gamesList"_s)->isVisible());
   }

@@ -81,6 +81,8 @@ QString GameBoardController::describe(const GameRequestStatus &status) {
     return QStringLiteral("The server returned HTTP %1.")
         .arg(status.httpStatus);
   case GameRequestOutcome::Transport:
+    if (status.diagnostic == GameClient::oversizedResponseDiagnostic())
+      return QStringLiteral("The server's response was too large.");
     return QStringLiteral("Could not reach the server (%1).")
         .arg(status.diagnostic);
   case GameRequestOutcome::DecodeFailed:
@@ -107,11 +109,11 @@ void GameBoardController::loadGames() {
   QPointer<GameBoardController> self(this);
   m_tokenSource(
       [self, generation](std::optional<SessionCoordinator::AccessToken> token,
-                         const QString &) {
+                         const QString &diagnostic) {
         if (!self || generation != self->m_listGeneration)
           return;
         if (!token) {
-          self->failList(kSignedOutText);
+          self->failList(self->tokenFailureText(diagnostic));
           return;
         }
         self->m_client.listGames(
@@ -154,11 +156,11 @@ void GameBoardController::fetchBoard() {
   QPointer<GameBoardController> self(this);
   m_tokenSource([self, generation,
                  gameId](std::optional<SessionCoordinator::AccessToken> token,
-                         const QString &) {
+                         const QString &diagnostic) {
     if (!self || generation != self->m_boardGeneration)
       return;
     if (!token) {
-      self->failBoard(kSignedOutText);
+      self->failBoard(self->tokenFailureText(diagnostic));
       return;
     }
     self->m_client.getGame(
@@ -206,6 +208,39 @@ void GameBoardController::reset() {
   m_boardStatus = Status::Idle;
   m_errorText.clear();
   emit changed();
+}
+
+void GameBoardController::setSignedIn(bool signedIn) {
+  if (!signedIn) {
+    m_signedIn = false;
+    reset();
+    return;
+  }
+  if (m_signedIn)
+    return;
+  m_signedIn = true;
+  emit this->signedIn();
+}
+
+void GameBoardController::bindToSession(SessionCoordinator &coordinator,
+                                        GameBoardController &controller) {
+  const auto sync = [&coordinator, &controller] {
+    controller.setSignedIn(coordinator.state() ==
+                           SessionCoordinator::State::SignedIn);
+  };
+  sync();
+  // Context |controller|: the connection ends with either object.
+  QObject::connect(&coordinator, &SessionCoordinator::stateChanged, &controller,
+                   sync);
+}
+
+QString GameBoardController::tokenFailureText(const QString &diagnostic) const {
+  // Signed out, or the session changed (which reset() already handles
+  // while bound): ask to sign in. Still signed in: the secure store failed.
+  if (!m_signedIn)
+    return kSignedOutText;
+  return QStringLiteral("Could not read your saved sign-in (%1).")
+      .arg(diagnostic);
 }
 
 void GameBoardController::failList(const QString &text) {
