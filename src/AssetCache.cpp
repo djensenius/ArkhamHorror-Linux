@@ -162,7 +162,7 @@ AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
                                              const QByteArray &encodedBytes,
                                              const QString &contentType,
                                              const QSize &bound) {
-  auto decoded = decodeAssetImage(encodedBytes, m_config.decodeLimits, bound);
+  auto decoded = decode(encodedBytes, bound);
   if (!decoded) {
     return decoded.error();
   }
@@ -195,7 +195,7 @@ AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
 AssetDecodeOutcome<QImage>
 AssetCache::storeMemoryOnly(const QUrl &url, const QByteArray &encodedBytes,
                             const QSize &bound) {
-  auto decoded = decodeAssetImage(encodedBytes, m_config.decodeLimits, bound);
+  auto decoded = decode(encodedBytes, bound);
   if (!decoded) {
     return decoded.error();
   }
@@ -207,6 +207,13 @@ AssetCache::storeMemoryOnly(const QUrl &url, const QByteArray &encodedBytes,
 void AssetCache::clearMemory() {
   m_memoryCache.clear();
   m_memoryPayloadDigests.clear();
+}
+
+AssetDecodeOutcome<QImage> AssetCache::decode(const QByteArray &encodedBytes,
+                                              const QSize &bound) const {
+  const Decoder decoder =
+      m_config.decoder != nullptr ? m_config.decoder : &decodeAssetImage;
+  return decoder(encodedBytes, m_config.decodeLimits, bound);
 }
 
 QByteArray AssetCache::canonicalUrlBytes(const QUrl &url) {
@@ -411,7 +418,7 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
     return {};
   }
 
-  auto decoded = decodeAssetImage(payload, m_config.decodeLimits, bound);
+  auto decoded = decode(payload, bound);
   if (!decoded) {
     removeDiskEntry(diskKey);
     return {};

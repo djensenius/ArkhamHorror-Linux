@@ -28,11 +28,19 @@ namespace Arkham {
 // recency from file mtimes (store times) rather than touching mtimes on hits.
 class AssetCache final {
 public:
+  // Decodes encoded bytes at a bound; see decodeAssetImage().
+  using Decoder = AssetDecodeOutcome<QImage> (*)(const QByteArray &,
+                                                 const AssetDecodeLimits &,
+                                                 const QSize &);
+
   struct Config {
     qint64 memoryMaxCostBytes{128LL * 1024LL * 1024LL};
     qint64 diskMaxBytes{512LL * 1024LL * 1024LL};
     QString rootDirectory;
     AssetDecodeLimits decodeLimits{};
+    // Every decode goes through this function. Production keeps
+    // decodeAssetImage; tests substitute a decoder that fails at chosen bounds.
+    Decoder decoder{&decodeAssetImage};
   };
 
   enum class DiskStatus {
@@ -108,6 +116,8 @@ private:
   void buildIndex();
   void promoteToMemory(const QString &key, const QImage &image);
   void removeMemoryEntriesForUrl(const QUrl &url);
+  [[nodiscard]] AssetDecodeOutcome<QImage>
+  decode(const QByteArray &encodedBytes, const QSize &bound) const;
   void touchDiskEntry(const QString &diskKey);
   [[nodiscard]] LookupResult lookupDisk(const QString &diskKey,
                                         const QString &memoryKey,

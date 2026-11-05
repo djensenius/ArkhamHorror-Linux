@@ -195,40 +195,35 @@ void AssetImageRequestCoordinator::handleFetchFinished(
   }
 
   // Decode once per distinct bound, in waiter order, and finish every decode
-  // before any callback runs. The first bound goes through store(), which
-  // decodes before writing, so undecodable bytes never reach disk and fail
-  // every waiter. Further bounds only add memory entries.
+  // before any callback runs. If any decode fails, the loop stops and every
+  // waiter, including waiters of bounds that already decoded, gets that
+  // DecodeError. The first bound goes through store(), which decodes before
+  // writing, so undecodable bytes never reach disk; further bounds only add
+  // memory entries. Decodes that succeeded before a later failure stay
+  // cached, since they are valid images of these bytes.
   QList<QSize> bounds;
-  QList<AssetOutcome<QImage>> decodes;
-  std::optional<AssetError> firstDecodeError;
+  QList<QImage> decodes;
+  std::optional<AssetError> decodeError;
   for (const Waiter &waiter : std::as_const(flight.waiters)) {
     if (bounds.contains(waiter.bound)) {
       continue;
     }
-    if (bounds.isEmpty()) {
-      auto stored = m_cache->store(flight.url, result->bytes,
-                                   result->contentType, waiter.bound);
-      if (!stored) {
-        firstDecodeError = AssetError{AssetErrorCode::DecodeError,
-                                      stored.error().message, 0, flight.url};
-        break;
-      }
-      decodes.push_back(*stored);
-    } else {
-      auto decoded =
-          m_cache->storeMemoryOnly(flight.url, result->bytes, waiter.bound);
-      if (decoded) {
-        decodes.push_back(*decoded);
-      } else {
-        decodes.push_back(AssetError{AssetErrorCode::DecodeError,
-                                     decoded.error().message, 0, flight.url});
-      }
+    auto decoded =
+        bounds.isEmpty()
+            ? m_cache->store(flight.url, result->bytes, result->contentType,
+                             waiter.bound)
+            : m_cache->storeMemoryOnly(flight.url, result->bytes, waiter.bound);
+    if (!decoded) {
+      decodeError = AssetError{AssetErrorCode::DecodeError,
+                               decoded.error().message, 0, flight.url};
+      break;
     }
+    decodes.push_back(*decoded);
     bounds.push_back(waiter.bound);
   }
 
-  if (firstDecodeError) {
-    completeWaiters(std::move(flight.waiters), *firstDecodeError);
+  if (decodeError) {
+    completeWaiters(std::move(flight.waiters), *decodeError);
     return;
   }
 

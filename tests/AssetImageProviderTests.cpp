@@ -104,6 +104,22 @@ bool fetchSettingsIntoProvider(AssetCardImageProvider &provider,
   return finishedSpy.wait(2000) || finishedSpy.count() == 1;
 }
 
+// Decodes like production but fails any bound wider than 200 pixels (or the
+// full-size bound), standing in for a decode that only the larger bound
+// cannot finish, such as a failed allocation.
+AssetDecodeOutcome<QImage>
+decodeFailingAboveWidth200(const QByteArray &bytes,
+                           const AssetDecodeLimits &limits,
+                           const QSize &bound) {
+  const QSize normalized = normalizedAssetDecodeBound(bound);
+  if (!normalized.isValid() || normalized.width() > 200) {
+    return AssetDecodeError{
+        AssetDecodeErrorCode::MalformedImage,
+        QStringLiteral("test decoder refuses bounds wider than 200")};
+  }
+  return decodeAssetImage(bytes, limits, bound);
+}
+
 bool waitForPendingResponseDrain(const AssetCardImageResponse &response,
                                  int timeoutMs = 2000) {
   const QDeadlineTimer deadline(timeoutMs);
@@ -144,6 +160,7 @@ private slots:
   void coordinatorDecodesEachRequestedSizeFromOneFetch();
   void coordinatorCancelOneSizeKeepsOtherSize();
   void coordinatorFailedFirstDecodeFailsEveryWaiter();
+  void coordinatorFailedLaterDecodeFailsEveryWaiter();
   void coordinatorCachesNotFoundBriefly();
   void coordinatorDoesNotCacheTransientFailures();
   void coordinatorNegativeCacheExpiresAfterTtl();
@@ -371,6 +388,53 @@ void AssetImageProviderTests::coordinatorFailedFirstDecodeFailsEveryWaiter() {
                .entryList(QDir::Files | QDir::Hidden | QDir::System |
                           QDir::NoDotAndDotDot),
            QStringList());
+}
+
+void AssetImageProviderTests::coordinatorFailedLaterDecodeFailsEveryWaiter() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01025.avif");
+  auto delayed = response(200, pngBytes(QSize(600, 840)));
+  delayed.headerDelayMs = 50;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  auto config = configFor(server, cacheRoot);
+  config.cacheConfig.decoder = &decodeFailingAboveWidth200;
+  AssetImageRequestCoordinator coordinator(config);
+
+  // The 150x210 bound decodes first and succeeds; the 300x420 bound decodes
+  // second and fails. Every waiter, including both 150x210 waiters, fails.
+  const std::vector<QSize> sizes{QSize(150, 210), QSize(300, 420),
+                                 QSize(150, 210)};
+  std::vector<std::optional<AssetOutcome<QImage>>> results(sizes.size());
+  std::vector<int> calls(sizes.size(), 0);
+  for (size_t index = 0; index < sizes.size(); ++index) {
+    const quint64 token = coordinator.requestCardImage(
+        {QStringLiteral("01025")}, sizes[index],
+        [&results, &calls, index](AssetOutcome<QImage> result) {
+          ++calls[index];
+          results[index].emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+  }
+
+  QVERIFY(waitUntil([&]() {
+    return std::all_of(results.begin(), results.end(),
+                       [](const auto &result) { return result.has_value(); });
+  }));
+  // Let any stray second completion arrive before counting.
+  QTest::qWait(50);
+  QCOMPARE(server.requestCountForPath(path), 1);
+  for (size_t index = 0; index < results.size(); ++index) {
+    QCOMPARE(calls[index], 1);
+    QVERIFY(!*results[index]);
+    QCOMPARE(static_cast<int>(results[index]->error().code),
+             static_cast<int>(AssetErrorCode::DecodeError));
+    QCOMPARE(results[index]->error().message,
+             QStringLiteral("test decoder refuses bounds wider than 200"));
+  }
 }
 
 void AssetImageProviderTests::coordinatorCachesNotFoundBriefly() {
