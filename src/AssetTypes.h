@@ -144,12 +144,13 @@ detectAssetImageFormat(const QByteArray &encodedBytes);
 // keeps the aspect ratio, and is never upscaled. PNG and AVIF are downscaled
 // to exactly fittedAssetDecodeSize(fullSize, bound). JPEG first uses libjpeg's
 // DCT scaling (1/2, 1/4, or 1/8) to the smallest output that still covers that
-// target, then fits that output to bound. libjpeg rounds scaled sides up, so
-// JPEG output can differ from fittedAssetDecodeSize(fullSize, bound) by about
-// a pixel in one dimension (599x839 at 150x210 gives 150x210, not 149x210),
-// but it never exceeds bound. When the target is more than half the source in
-// either dimension, no DCT reduction covers it and JPEG still decodes at full
-// resolution before the final downscale.
+// target, then fits that output to bound. libjpeg rounds scaled sides up
+// before that final fit, so JPEG output can differ from
+// fittedAssetDecodeSize(fullSize, bound) by up to a few pixels in one
+// dimension (at most 3 at the board's 150x210 bound; 301x419 gives 150x208,
+// not 150x210), but it never exceeds bound or upscales. When the target is
+// more than half the source in either dimension, no DCT reduction covers it
+// and JPEG still decodes at full resolution before the final downscale.
 [[nodiscard]] AssetDecodeOutcome<QImage>
 decodeAssetImage(const QByteArray &encodedBytes,
                  const AssetDecodeLimits &limits = AssetDecodeLimits{},
