@@ -7,10 +7,14 @@
 #include <QDeadlineTimer>
 #include <QFile>
 #include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QTimer>
 #include <QtTest>
 
 #include <chrono>
+#include <cstring>
 #include <functional>
+#include <new>
 #include <optional>
 
 #include "GameClient.h"
@@ -66,6 +70,43 @@ struct ListCall {
   int calls{0};
   GameRequestStatus status;
   std::optional<QList<GameListRow>> rows;
+};
+
+// A reply that never touches the network: it already carries a 200 with
+// |contentLength| and then emits only finished(), never metaDataChanged().
+// That reaches GameClient's finished-time Content-Length check, which a real
+// QNetworkReply (metaDataChanged() always comes first) does not.
+class FinishedOnlyReply final : public QNetworkReply {
+public:
+  FinishedOnlyReply(const QNetworkRequest &request, qint64 contentLength,
+                    QObject *parent)
+      : QNetworkReply(parent) {
+    setRequest(request);
+    setUrl(request.url());
+    setOperation(QNetworkAccessManager::GetOperation);
+    setHeader(QNetworkRequest::ContentLengthHeader, contentLength);
+    setAttribute(QNetworkRequest::HttpStatusCodeAttribute, 200);
+    open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    QTimer::singleShot(0, this, [this] {
+      setFinished(true);
+      emit finished();
+    });
+  }
+  void abort() override {}
+
+protected:
+  qint64 readData(char *, qint64) override { return -1; }
+};
+
+class FinishedOnlyNam final : public QNetworkAccessManager {
+public:
+  qint64 contentLength{0};
+
+protected:
+  QNetworkReply *createRequest(Operation, const QNetworkRequest &request,
+                               QIODevice *) override {
+    return new FinishedOnlyReply(request, contentLength, this);
+  }
 };
 
 } // namespace
@@ -389,6 +430,53 @@ private slots:
     delete client;
     QTest::qWait(100);
     QCOMPARE(calls, 0);
+  }
+
+  void finishedTimeContentLengthOverCapIsOversized() {
+    FinishedOnlyNam nam;
+    nam.contentLength = 1024;
+    GameClient client(nam);
+    client.setMaxResponseBytes(16);
+    GameCall result;
+    client.getGame(*m_profile, kGameId, kToken,
+                   [&result](const GameRequestStatus &status, const GetGame *) {
+                     ++result.calls;
+                     result.status = status;
+                   });
+    QVERIFY(waitUntil([&result] { return result.calls > 0; }));
+    QTest::qWait(50);
+    QCOMPARE(result.calls, 1);
+    QCOMPARE(result.status.outcome, GameRequestOutcome::Transport);
+    QCOMPARE(result.status.diagnostic,
+             u"response body exceeds the size limit"_s);
+  }
+
+  void callbackMayDestroyClientOnFinishedTimeOverflow() {
+    // The client lives in storage the test poisons right after destroying
+    // it, so any member access after the callback (handleFinished() used to
+    // read m_pendingReplies) dereferences garbage and crashes the test
+    // deterministically, without needing ASan.
+    FinishedOnlyNam nam;
+    nam.contentLength = 1024;
+    alignas(GameClient) unsigned char storage[sizeof(GameClient)];
+    auto *client = new (storage) GameClient(nam);
+    client->setMaxResponseBytes(16);
+    GameCall result;
+    client->getGame(*m_profile, kGameId, kToken,
+                    [&result, &client, &storage](
+                        const GameRequestStatus &status, const GetGame *) {
+                      ++result.calls;
+                      result.status = status;
+                      client->~GameClient();
+                      client = nullptr;
+                      std::memset(storage, 0xA5, sizeof(storage));
+                    });
+    QVERIFY(waitUntil([&result] { return result.calls > 0; }));
+    QTest::qWait(50);
+    QCOMPARE(result.calls, 1);
+    QCOMPARE(result.status.diagnostic,
+             u"response body exceeds the size limit"_s);
+    QVERIFY(client == nullptr);
   }
 
   void callbackMayDestroyClientOnTimeout() {
