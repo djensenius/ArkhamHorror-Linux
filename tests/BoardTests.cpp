@@ -488,6 +488,9 @@ private slots:
     QVERIFY(investigator->connectedLocations().isEmpty());
     QCOMPARE(investigator->art(), u"c01001"_s);
     QVERIFY(!investigator->mutated().has_value());
+    QCOMPARE(investigator->form(), InvestigatorForm::Regular);
+    QVERIFY(!investigator->transfiguredCardCode().has_value());
+    QVERIFY(!investigator->metaClassSymbol().has_value());
 
     // The Study lists Roland as its occupant.
     const auto study = Location::fromRawJson(studyOf(game), u"location");
@@ -557,6 +560,72 @@ private slots:
     QCOMPARE(investigator->mutated().has_value(), !mutation.isNull());
     if (!mutation.isNull())
       QCOMPARE(*investigator->mutated(), mutation);
+  }
+
+  // `form` ({tag, contents?}) and `meta` are decoded tolerantly as well: an
+  // unknown or unusable form is Regular, and `meta` is kept only when it is
+  // a class symbol. Neither ever fails the investigator.
+  void investigatorFormAndMeta_data() {
+    QTest::addColumn<QByteArray>("fields");
+    QTest::addColumn<InvestigatorForm>("form");
+    QTest::addColumn<QString>("transfiguredCardCode");
+    QTest::addColumn<std::optional<ClassSymbol>>("meta");
+    const auto row = [](const char *name, const char *fields,
+                        InvestigatorForm form, std::optional<ClassSymbol> meta,
+                        const QString &transfigured = QString()) {
+      QTest::newRow(name) << QByteArray(fields) << form << transfigured << meta;
+    };
+    const std::optional<ClassSymbol> none;
+    row("both absent", "", InvestigatorForm::Regular, none);
+    row("fixture shape", R"("form":{"tag":"RegularForm"},"meta":null,)",
+        InvestigatorForm::Regular, none);
+    row("Yithian", R"("form":{"tag":"YithianForm"},)",
+        InvestigatorForm::Yithian, none);
+    row("Homunculus", R"("form":{"tag":"HomunculusForm"},)",
+        InvestigatorForm::Homunculus, none);
+    row("Shattered", R"("form":{"tag":"ShatteredForm"},)",
+        InvestigatorForm::Shattered, none);
+    row("Transfigured",
+        R"("form":{"tag":"TransfiguredForm","contents":"c10016a"},)",
+        InvestigatorForm::Transfigured, none, u"c10016a"_s);
+    row("Transfigured without contents",
+        R"("form":{"tag":"TransfiguredForm"},)", InvestigatorForm::Regular,
+        none);
+    row("Transfigured into a non-card code",
+        R"("form":{"tag":"TransfiguredForm","contents":"10016/a"},)",
+        InvestigatorForm::Regular, none);
+    row("unknown form tag", R"("form":{"tag":"MoonForm"},)",
+        InvestigatorForm::Regular, none);
+    row("form not an object", R"("form":"YithianForm",)",
+        InvestigatorForm::Regular, none);
+    row("meta Seeker", R"("meta":"Seeker",)", InvestigatorForm::Regular,
+        ClassSymbol::Seeker);
+    row("meta Neutral", R"("meta":"Neutral",)", InvestigatorForm::Regular,
+        ClassSymbol::Neutral);
+    row("meta not a class symbol", R"("meta":"seeker",)",
+        InvestigatorForm::Regular, none);
+    row("meta object", R"("meta":{"role":"Seeker"},)",
+        InvestigatorForm::Regular, none);
+  }
+
+  void investigatorFormAndMeta() {
+    QFETCH(QByteArray, fields);
+    QFETCH(InvestigatorForm, form);
+    QFETCH(QString, transfiguredCardCode);
+    QFETCH(std::optional<ClassSymbol>, meta);
+    const auto investigator = Investigator::fromRawBytes(
+        mutated(u"investigator"_s, R"("cardCode":"c01001",)",
+                QByteArray(R"("cardCode":"c01001",)") + fields),
+        u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->form(), form);
+    QCOMPARE(investigator->transfiguredCardCode().has_value(),
+             !transfiguredCardCode.isNull());
+    if (!transfiguredCardCode.isNull())
+      QCOMPARE(investigator->transfiguredCardCode()->value(),
+               transfiguredCardCode);
+    QCOMPARE(investigator->metaClassSymbol(), meta);
   }
 
   // Unbounded integers: the fork's investigator-unhealed-horror-negative.json

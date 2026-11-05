@@ -151,6 +151,9 @@ private slots:
   void locatorRejectsUnsafeOfficialCodes();
   void locatorRejectsUnsafeHomebrewSegments_data();
   void locatorRejectsUnsafeHomebrewSegments();
+  void locatorChecksCardArtIds_data();
+  void locatorChecksCardArtIds();
+  void locatorBuildsClassVariantUrl();
   void locatorEnforcesHttpsExceptLoopbackHttp();
   void locatorBuildsMutatedBackUrlAndRejectsBadMutation();
 
@@ -272,6 +275,7 @@ void AssetLocatorFetcherTests::locatorRejectsUnsafeOfficialCodes() {
   const auto url = AssetLocator::buildCardImageUrl(
       AssetLocator::defaultAssetBaseUrl(), {cardCode});
   expectErrorCode(url, AssetErrorCode::InvalidAssetKey);
+  QVERIFY(!AssetLocator::isCardArtId(cardCode));
 }
 
 void AssetLocatorFetcherTests::locatorRejectsUnsafeHomebrewSegments_data() {
@@ -294,6 +298,69 @@ void AssetLocatorFetcherTests::locatorRejectsUnsafeHomebrewSegments() {
   const auto url = AssetLocator::buildCardImageUrl(
       AssetLocator::defaultAssetBaseUrl(), {cardCode});
   expectErrorCode(url, AssetErrorCode::InvalidAssetKey);
+  QVERIFY(!AssetLocator::isCardArtId(cardCode));
+}
+
+void AssetLocatorFetcherTests::locatorChecksCardArtIds_data() {
+  QTest::addColumn<QString>("artId");
+  QTest::addColumn<bool>("valid");
+
+  QTest::newRow("server code") << QStringLiteral("c01001") << true;
+  QTest::newRow("stripped code") << QStringLiteral("01001") << true;
+  QTest::newRow("side letter") << QStringLiteral("c11068b") << true;
+  QTest::newRow("letter-prefixed") << QStringLiteral("cx03185") << true;
+  QTest::newRow("homebrew") << QStringLiteral(":circus-ex-mortis:001") << true;
+  QTest::newRow("server homebrew")
+      << QStringLiteral("c:circus-ex-mortis:001") << true;
+  QTest::newRow("slash") << QStringLiteral("c01001/../c02002") << false;
+  QTest::newRow("question mark") << QStringLiteral("c01001?face=back") << false;
+  QTest::newRow("hash") << QStringLiteral("c01001#x") << false;
+  QTest::newRow("percent-encoded slash")
+      << QStringLiteral("c01001%2F") << false;
+  QTest::newRow("homebrew code with slash")
+      << QStringLiteral(":fan:1/2") << false;
+  QTest::newRow("just c") << QStringLiteral("c") << false;
+}
+
+void AssetLocatorFetcherTests::locatorChecksCardArtIds() {
+  QFETCH(QString, artId);
+  QFETCH(bool, valid);
+  QCOMPARE(AssetLocator::isCardArtId(artId), valid);
+}
+
+void AssetLocatorFetcherTests::locatorBuildsClassVariantUrl() {
+  const auto variant = AssetLocator::buildCardImageUrl(
+      AssetLocator::defaultAssetBaseUrl(),
+      {QStringLiteral("c03006"), AssetLocator::CardFace::Front,
+       QStringLiteral("_Mutated20"), QStringLiteral("_Seeker")});
+  QVERIFY(variant);
+  QCOMPARE(variant->path(),
+           QStringLiteral("/img/arkham/cards/03006_Seeker_Mutated20.avif"));
+
+  const auto back = AssetLocator::buildCardImageUrl(
+      AssetLocator::defaultAssetBaseUrl(),
+      {QStringLiteral("c90087"), AssetLocator::CardFace::Back, QString(),
+       QStringLiteral("_Survivor")});
+  QVERIFY(back);
+  QCOMPARE(back->path(),
+           QStringLiteral("/img/arkham/cards/90087b_Survivor.avif"));
+
+  for (const QString &suffix :
+       {QStringLiteral("_Neutral"), QStringLiteral("_Mythos"),
+        QStringLiteral("Seeker"), QStringLiteral("_seeker"),
+        QStringLiteral("_Seeker/x")}) {
+    QVERIFY2(!AssetLocator::isClassVariantSuffix(suffix), qPrintable(suffix));
+    const auto rejected = AssetLocator::buildCardImageUrl(
+        AssetLocator::defaultAssetBaseUrl(),
+        {QStringLiteral("c03006"), AssetLocator::CardFace::Front, QString(),
+         suffix});
+    expectErrorCode(rejected, AssetErrorCode::InvalidAssetKey);
+  }
+  for (const QString &suffix :
+       {QString(), QStringLiteral("_Guardian"), QStringLiteral("_Seeker"),
+        QStringLiteral("_Rogue"), QStringLiteral("_Mystic"),
+        QStringLiteral("_Survivor")})
+    QVERIFY2(AssetLocator::isClassVariantSuffix(suffix), qPrintable(suffix));
 }
 
 void AssetLocatorFetcherTests::locatorEnforcesHttpsExceptLoopbackHttp() {

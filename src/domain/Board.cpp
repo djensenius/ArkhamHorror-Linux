@@ -123,6 +123,15 @@ constexpr std::array<std::pair<QLatin1StringView, LocationSymbol>, 16>
         {"NoSymbol"_L1, LocationSymbol::NoSymbol},
     }};
 
+constexpr std::array<std::pair<QLatin1StringView, InvestigatorForm>, 5>
+    kInvestigatorFormTable{{
+        {"RegularForm"_L1, InvestigatorForm::Regular},
+        {"YithianForm"_L1, InvestigatorForm::Yithian},
+        {"HomunculusForm"_L1, InvestigatorForm::Homunculus},
+        {"ShatteredForm"_L1, InvestigatorForm::Shattered},
+        {"TransfiguredForm"_L1, InvestigatorForm::Transfigured},
+    }};
+
 // Arkham.Token core names the board reads counts for.
 constexpr auto kClueToken = u"Clue";
 constexpr auto kDoomToken = u"Doom";
@@ -1019,10 +1028,33 @@ ValueOrError<Investigator> Investigator::fromRawJson(const Json::Value &v,
       mutatedValue && mutatedValue->isString() &&
       isMutationName(mutatedValue->toString()))
     mutatedArt = mutatedValue->toString();
+  // `form` ({tag, contents?}) and `meta` are decoded tolerantly too: an
+  // unknown or unusable form is the regular form, and `meta` is kept only
+  // when it is a class symbol (Lola Hayes' role).
+  const Json::Value formValue = obj.value("form"_L1);
+  InvestigatorForm form = InvestigatorForm::Regular;
+  if (auto tag = Json::decodeClosedEnum(formValue.value("tag"_L1), u"form.tag",
+                                        kInvestigatorFormTable))
+    form = *tag;
+  std::optional<CardCode> transfiguredCardCode;
+  if (form == InvestigatorForm::Transfigured) {
+    if (auto code = decodeBoardCardCode(formValue.value("contents"_L1),
+                                        u"form.contents"))
+      transfiguredCardCode = *code;
+    else
+      form = InvestigatorForm::Regular;
+  }
+  std::optional<ClassSymbol> metaClassSymbol;
+  if (auto meta = Json::decodeClosedEnum(obj.value("meta"_L1), u"meta",
+                                         kClassSymbolTable))
+    metaClassSymbol = *meta;
 
   Investigator result(*id, *cardCode, *tokens);
   result.m_art = std::move(art);
   result.m_mutated = std::move(mutatedArt);
+  result.m_form = form;
+  result.m_transfiguredCardCode = std::move(transfiguredCardCode);
+  result.m_metaClassSymbol = metaClassSymbol;
   result.m_playerId = *playerId;
   result.m_name = *name;
   result.m_classSymbol = *classSymbol;

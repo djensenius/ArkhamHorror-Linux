@@ -398,12 +398,23 @@ private:
   QList<CardCode> m_investigators;
 };
 
+// Arkham.Investigator.Types' InvestigatorForm: the alternate form whose card
+// the investigator currently shows.
+enum class InvestigatorForm {
+  Regular,
+  Yithian,
+  Homunculus,
+  Shattered,
+  Transfigured
+};
+
 // investigator.schema.json: one entry of PublicGame.investigators. Only the
 // core fields a board view needs are modeled: identity, printed health and
 // sanity, base skills, token counts (damage and horror are tokens), the
 // action and elimination state, the placement and the server-computed
-// connections, plus the card art and its mutation. Deck, hand, discard,
-// slots, modifiers, prohibitions and per-scenario fields are not parsed.
+// connections, plus the card art, its mutation, the form and the class
+// symbol `meta`. Deck, hand, discard, slots, modifiers, prohibitions and
+// per-scenario fields are not parsed.
 class Investigator {
 public:
   [[nodiscard]] static ValueOrError<Investigator>
@@ -424,6 +435,24 @@ public:
   // string or not "Mutated" followed by digits; never fails the decode.
   [[nodiscard]] const std::optional<QString> &mutated() const noexcept {
     return m_mutated;
+  }
+  // The `form` object's tag ({tag, contents?}). Decoded tolerantly: Regular
+  // when `form` is absent, not an object, or has an unknown tag, and when a
+  // TransfiguredForm's `contents` is not a board card code; never fails the
+  // decode.
+  [[nodiscard]] InvestigatorForm form() const noexcept { return m_form; }
+  // The TransfiguredForm card (its `contents`, e.g. "c10016a"); set only when
+  // form() is Transfigured.
+  [[nodiscard]] const std::optional<CardCode> &
+  transfiguredCardCode() const noexcept {
+    return m_transfiguredCardCode;
+  }
+  // `meta` when it is a ClassSymbol string, e.g. Lola Hayes' current role
+  // ("Seeker"). `meta` is free-form per investigator, so it is decoded
+  // tolerantly: std::nullopt for anything else; never fails the decode.
+  [[nodiscard]] const std::optional<ClassSymbol> &
+  metaClassSymbol() const noexcept {
+    return m_metaClassSymbol;
   }
   // The seated player. std::nullopt when the wire carries the all-zero
   // UUID: the backend builds killed and other-campaign investigators with
@@ -492,6 +521,9 @@ private:
   CardCode m_cardCode;
   QString m_art;
   std::optional<QString> m_mutated;
+  InvestigatorForm m_form = InvestigatorForm::Regular;
+  std::optional<CardCode> m_transfiguredCardCode;
+  std::optional<ClassSymbol> m_metaClassSymbol;
   std::optional<PlayerId> m_playerId;
   CardName m_name;
   ClassSymbol m_classSymbol = ClassSymbol::Neutral;

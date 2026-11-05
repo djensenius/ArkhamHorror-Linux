@@ -20,6 +20,18 @@ namespace Arkham::AssetLocator {
 // frontend convention _Mutated<N>; game-state-to-N mapping belongs elsewhere.
 [[nodiscard]] bool isMutationSuffix(const QString &suffix);
 
+// Class-variant suffix validation: empty, or one of _Guardian, _Seeker,
+// _Rogue, _Mystic and _Survivor (the web's c03006/c90087 role art, e.g.
+// /img/arkham/cards/03006_Seeker.avif).
+[[nodiscard]] bool isClassVariantSuffix(const QString &suffix);
+
+// True when a server card art id matches the grammar buildCardImageUrl()
+// accepts: an official code, or :<campaign>:<code> for homebrew, after
+// stripping one leading 'c'. Anything else, including '/', '?', '#', '%' and
+// whitespace, is rejected, so a validated id can go into an image provider
+// id verbatim.
+[[nodiscard]] bool isCardArtId(const QString &cardCode);
+
 // Card faces served by the web asset host. Official cards map to
 // /img/arkham/cards/<code>.avif and Back maps to
 // /img/arkham/cards/<code>b.avif after stripping one leading 'c' from the
@@ -40,6 +52,10 @@ struct CardImageKey {
   // supplies the game-state-to-suffix mapping; the locator only validates and
   // routes the resulting asset id.
   QString mutationSuffix;
+  // Optional class-variant suffix, e.g. _Seeker. The file name is
+  // <code>[b]<classVariantSuffix><mutationSuffix>.avif, as in the web's
+  // Investigator.vue.
+  QString classVariantSuffix;
 };
 
 // Builds a single canonical AVIF card-art URL under the supplied asset base.
