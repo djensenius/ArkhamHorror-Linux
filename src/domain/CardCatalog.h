@@ -613,12 +613,15 @@ struct CatalogCardNames {
 };
 
 // The names in a card-catalog response: every entry whose cardCode and name
-// decoded, in wire order, plus how many entries were skipped and the first
-// skipped entry's field-path error.
+// decoded, in wire order, plus how many entries were skipped and how many
+// kept their name but lost a malformed revealedName, each with the first
+// such entry's field-path error.
 struct CatalogNames {
   QList<CatalogCardNames> cards;
   qsizetype skippedCount{0};
   QString firstSkipDiagnostic;
+  qsizetype degradedCount{0};
+  QString firstDegradeDiagnostic;
 };
 
 // Names-only decode of the same top-level array response shape as
@@ -628,8 +631,8 @@ struct CatalogNames {
 // field is looked at, so a value this client does not model never costs a
 // card its name. An entry that is not an object, or whose cardCode or name
 // is missing or invalid, is skipped and counted; a malformed revealedName
-// keeps the entry with its name only. Fails only when the bytes do not
-// parse or the top level is not an array.
+// keeps the entry with its name only and is counted as degraded. Fails only
+// when the bytes do not parse or the top level is not an array.
 [[nodiscard]] ValueOrError<CatalogNames>
 decodeCatalogNamesFromRawBytes(QByteArrayView bytes, QStringView path);
 

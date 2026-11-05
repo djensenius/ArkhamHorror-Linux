@@ -1493,6 +1493,8 @@ ValueOrError<CatalogNames> decodeCatalogNamesFromRawBytes(QByteArrayView bytes,
                                    Json::joinPath(itemPath, u"revealedName"));
       if (r)
         revealedName = *r;
+      else if (result.degradedCount++ == 0)
+        result.firstDegradeDiagnostic = r.error();
     }
     result.cards.append({*cardCode, *name, revealedName});
   }

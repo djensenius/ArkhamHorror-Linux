@@ -1843,6 +1843,8 @@ void CardCatalogTests::catalogNamesIgnoreUnknownEnumValues() {
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->skippedCount, 0);
   QCOMPARE(result->firstSkipDiagnostic, QString());
+  QCOMPARE(result->degradedCount, 0);
+  QCOMPARE(result->firstDegradeDiagnostic, QString());
   QCOMPARE(result->cards.size(), 3);
   QCOMPARE(result->cards[0].cardCode.value(), QStringLiteral("c00001"));
   QCOMPARE(result->cards[0].name.title, QStringLiteral("First"));
@@ -1911,6 +1913,10 @@ void CardCatalogTests::catalogNamesDegradeMalformedRevealedName() {
   if (!result)
     QFAIL(qPrintable(result.error()));
   QCOMPARE(result->skippedCount, 0);
+  QCOMPARE(result->degradedCount, 2);
+  QCOMPARE(result->firstDegradeDiagnostic,
+           QStringLiteral("catalog[0].revealedName: expected object, got "
+                          "string"));
   QCOMPARE(result->cards.size(), 2);
   QCOMPARE(result->cards[0].cardCode.value(), QStringLiteral("c00001"));
   QCOMPARE(result->cards[0].name.title, QStringLiteral("First"));
