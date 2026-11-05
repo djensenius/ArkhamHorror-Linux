@@ -5,6 +5,7 @@
 #include <QCache>
 #include <QHash>
 #include <QImage>
+#include <QSize>
 #include <QString>
 #include <QUrl>
 
@@ -12,8 +13,12 @@
 
 namespace Arkham {
 
-// Thread-confined decoded-image asset cache. AssetCache is intended to be used
-// from one owner thread (the GUI thread in production); it does not start
+// Thread-confined decoded-image asset cache. Memory entries are keyed by the
+// canonical URL plus the requested decode bound ("@WxH", or "@full" for an
+// invalid or empty bound), so each cell size holds only its own downscaled
+// decode. The disk cache stores the raw encoded bytes keyed by URL only, and a
+// disk hit decodes at the bound being looked up. AssetCache is intended to be
+// used from one owner thread (the GUI thread in production); it does not start
 // background work and does not synchronize concurrent callers. Disk operations
 // are deliberately small and synchronous: lookup reads at most one cache file,
 // store atomically writes at most one cache file, and eviction uses the
@@ -56,10 +61,20 @@ public:
   [[nodiscard]] static QString defaultRootDirectory();
   [[nodiscard]] static QString diskCacheFileNameForUrl(const QUrl &url);
 
-  [[nodiscard]] LookupResult lookup(const QUrl &url);
+  [[nodiscard]] LookupResult lookup(const QUrl &url,
+                                    const QSize &bound = QSize());
+  // Decodes encodedBytes at bound, caches the decode in memory, and writes
+  // the encoded bytes to disk. Bytes that fail to decode never reach disk.
+  // Memory entries for the same URL at other bounds are dropped because they
+  // were decoded from the bytes this call replaces.
   [[nodiscard]] AssetDecodeOutcome<QImage>
   store(const QUrl &url, const QByteArray &encodedBytes,
-        const QString &contentType = {});
+        const QString &contentType = {}, const QSize &bound = QSize());
+  // Decodes encodedBytes at bound and caches the decode in memory only. Used
+  // for additional bounds of bytes that store() has already written to disk.
+  [[nodiscard]] AssetDecodeOutcome<QImage>
+  storeMemoryOnly(const QUrl &url, const QByteArray &encodedBytes,
+                  const QSize &bound);
 
   void clearMemory();
 
@@ -67,6 +82,10 @@ public:
   [[nodiscard]] QString diagnostic() const { return m_diagnostic; }
   [[nodiscard]] QString rootDirectory() const { return m_rootDirectory; }
   [[nodiscard]] qint64 indexedDiskBytes() const noexcept { return m_diskBytes; }
+  // Total cost (decoded image bytes) of the in-memory entries.
+  [[nodiscard]] qint64 memoryCostBytes() const {
+    return m_memoryCache.totalCost();
+  }
 
 private:
   struct DiskEntry {
@@ -75,6 +94,8 @@ private:
   };
 
   [[nodiscard]] static QByteArray canonicalUrlBytes(const QUrl &url);
+  [[nodiscard]] static QString memoryKeyFor(const QUrl &url,
+                                            const QSize &bound);
   [[nodiscard]] QString filePathForName(const QString &fileName) const;
   [[nodiscard]] int imageCost(const QImage &image) const;
 
@@ -83,9 +104,11 @@ private:
   void disableDisk(QString diagnostic, bool warn);
   void buildIndex();
   void promoteToMemory(const QString &key, const QImage &image);
+  void removeMemoryEntriesForUrl(const QUrl &url);
   void touchDiskEntry(const QString &diskKey);
   [[nodiscard]] LookupResult lookupDisk(const QString &diskKey,
-                                        const QString &memoryKey);
+                                        const QString &memoryKey,
+                                        const QSize &bound);
   void storeDisk(const QString &diskKey, const QByteArray &encodedBytes,
                  const QString &contentType);
   void removeDiskEntry(const QString &key);

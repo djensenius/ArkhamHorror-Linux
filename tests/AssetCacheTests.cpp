@@ -104,6 +104,10 @@ private slots:
   void unwritableRootFallsBackToMemoryOnlyWithDiagnostic();
   void differentUrlsUseDifferentDiskEntries();
   void restoreOverwritesExistingEntry();
+  void sizedEntriesForOneUrlDoNotCollide();
+  void diskHitDecodesAtLookedUpBound();
+  void storingNewBytesDropsOtherSizedEntries();
+  void sizedBoardDecodesCostAtMostATenthOfFullResolution();
 };
 
 void AssetCacheTests::memoryHitReturnsDecodedImage() {
@@ -524,6 +528,121 @@ void AssetCacheTests::restoreOverwritesExistingEntry() {
   const auto hit = cache.lookup(url);
   QCOMPARE(hit.source, Arkham::AssetCache::LookupSource::Disk);
   QVERIFY(firstPixelMatches(hit.image, blue));
+}
+
+void AssetCacheTests::sizedEntriesForOneUrlDoNotCollide() {
+  const QByteArray png = encodePatternPng(QSize(600, 840));
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"sized-keys");
+  const QSize cell(150, 210);
+
+  Arkham::AssetCache cache({.diskMaxBytes = 0});
+  QCOMPARE(cache.diskStatus(), Arkham::AssetCache::DiskStatus::MemoryOnly);
+  QCOMPARE(cache.memoryCostBytes(), 0);
+
+  const auto full = cache.storeMemoryOnly(url, png, QSize());
+  expectStored(full);
+  QCOMPARE(full->size(), QSize(600, 840));
+  const auto sized = cache.storeMemoryOnly(url, png, cell);
+  expectStored(sized);
+  QCOMPARE(sized->size(), cell);
+
+  const auto fullHit = cache.lookup(url);
+  QCOMPARE(fullHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(fullHit.image.size(), QSize(600, 840));
+  // Empty bounds share the full-size entry.
+  QCOMPARE(cache.lookup(url, QSize(150, 0)).image.size(), QSize(600, 840));
+
+  const auto sizedHit = cache.lookup(url, cell);
+  QCOMPARE(sizedHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(sizedHit.image.size(), cell);
+
+  // A different cell size is a different key; memory-only means a miss.
+  QCOMPARE(cache.lookup(url, QSize(300, 420)).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  QCOMPARE(cache.memoryCostBytes(), 600 * 840 * 4 + 150 * 210 * 4);
+}
+
+void AssetCacheTests::diskHitDecodesAtLookedUpBound() {
+  QTemporaryDir root;
+  QVERIFY(root.isValid());
+  const QByteArray png = encodePatternPng(QSize(600, 840));
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"sized-disk");
+  const QSize cell(150, 210);
+
+  Arkham::AssetCache cache({.rootDirectory = root.path()});
+  QCOMPARE(cache.diskStatus(), Arkham::AssetCache::DiskStatus::Enabled);
+  const auto stored =
+      cache.store(url, png, QStringLiteral("image/png"), QSize(300, 420));
+  expectStored(stored);
+  QCOMPARE(stored->size(), QSize(300, 420));
+  QCOMPARE(cache.memoryCostBytes(), 300 * 420 * 4);
+
+  // The disk file holds the raw encoded bytes, keyed by URL only.
+  QFile file(cachePath(root, url));
+  QVERIFY(file.open(QIODevice::ReadOnly));
+  QVERIFY(file.readAll().endsWith(png));
+
+  const auto diskHit = cache.lookup(url, cell);
+  QCOMPARE(diskHit.source, Arkham::AssetCache::LookupSource::Disk);
+  QCOMPARE(diskHit.image.size(), cell);
+  const auto memoryHit = cache.lookup(url, cell);
+  QCOMPARE(memoryHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(memoryHit.image.size(), cell);
+  QCOMPARE(cache.memoryCostBytes(), 300 * 420 * 4 + 150 * 210 * 4);
+
+  cache.clearMemory();
+  const auto fullHit = cache.lookup(url);
+  QCOMPARE(fullHit.source, Arkham::AssetCache::LookupSource::Disk);
+  QCOMPARE(fullHit.image.size(), QSize(600, 840));
+}
+
+void AssetCacheTests::storingNewBytesDropsOtherSizedEntries() {
+  const QColor red(220, 20, 20, 255);
+  const QColor blue(20, 20, 220, 255);
+  const QByteArray redPng = encodePng(red, QSize(60, 84));
+  const QByteArray bluePng = encodePng(blue, QSize(60, 84));
+  QVERIFY(!redPng.isEmpty());
+  QVERIFY(!bluePng.isEmpty());
+  const QUrl url = assetUrl(u"sized-replace");
+  const QSize cell(15, 21);
+
+  Arkham::AssetCache cache({.diskMaxBytes = 0});
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), cell));
+  QVERIFY(firstPixelMatches(cache.lookup(url, cell).image, red));
+
+  expectStored(cache.store(url, bluePng, QStringLiteral("image/png")));
+  QCOMPARE(cache.lookup(url, cell).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  const auto fullHit = cache.lookup(url);
+  QCOMPARE(fullHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(fullHit.image, blue));
+  QCOMPARE(cache.memoryCostBytes(), 60 * 84 * 4);
+}
+
+void AssetCacheTests::sizedBoardDecodesCostAtMostATenthOfFullResolution() {
+  // A full board: N distinct 600x840 card images shown in 150x210 cells.
+  constexpr int kCards = 20;
+  const QByteArray png = encodePatternPng(QSize(600, 840));
+  QVERIFY(!png.isEmpty());
+
+  Arkham::AssetCache fullCache({.diskMaxBytes = 0});
+  Arkham::AssetCache sizedCache({.diskMaxBytes = 0});
+  for (int card = 0; card < kCards; ++card) {
+    const QUrl url = assetUrl(QStringLiteral("board-%1").arg(card));
+    expectStored(fullCache.store(url, png, QStringLiteral("image/png")));
+    expectStored(sizedCache.store(url, png, QStringLiteral("image/png"),
+                                  QSize(150, 210)));
+  }
+
+  const qint64 fullBytes = fullCache.memoryCostBytes();
+  const qint64 sizedBytes = sizedCache.memoryCostBytes();
+  qInfo("board decode cost: full=%lld bytes, sized=%lld bytes", fullBytes,
+        sizedBytes);
+  QCOMPARE(fullBytes, qint64{kCards} * 600 * 840 * 4);  // 40,320,000
+  QCOMPARE(sizedBytes, qint64{kCards} * 150 * 210 * 4); // 2,520,000
+  QVERIFY(sizedBytes * 10 <= fullBytes);
 }
 
 QTEST_APPLESS_MAIN(AssetCacheTests)

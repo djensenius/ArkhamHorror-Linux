@@ -143,32 +143,48 @@ QString AssetCache::diskCacheFileNameForUrl(const QUrl &url) {
           .toHex());
 }
 
-AssetCache::LookupResult AssetCache::lookup(const QUrl &url) {
-  const QString memoryKey = QString::fromLatin1(canonicalUrlBytes(url));
+AssetCache::LookupResult AssetCache::lookup(const QUrl &url,
+                                            const QSize &bound) {
+  const QString memoryKey = memoryKeyFor(url, bound);
   const QString diskKey = diskCacheFileNameForUrl(url);
   if (const QImage *cached = m_memoryCache.object(memoryKey)) {
     touchDiskEntry(diskKey);
     return LookupResult{LookupSource::Memory, *cached};
   }
   if (m_diskStatus == DiskStatus::Enabled) {
-    return lookupDisk(diskKey, memoryKey);
+    return lookupDisk(diskKey, memoryKey, bound);
   }
   return {};
 }
 
 AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
                                              const QByteArray &encodedBytes,
-                                             const QString &contentType) {
-  auto decoded = decodeAssetImage(encodedBytes, m_config.decodeLimits);
+                                             const QString &contentType,
+                                             const QSize &bound) {
+  auto decoded = decodeAssetImage(encodedBytes, m_config.decodeLimits, bound);
   if (!decoded) {
     return decoded.error();
   }
 
-  promoteToMemory(QString::fromLatin1(canonicalUrlBytes(url)), *decoded);
+  removeMemoryEntriesForUrl(url);
+  promoteToMemory(memoryKeyFor(url, bound), *decoded);
+
   if (m_diskStatus == DiskStatus::Enabled) {
     storeDisk(diskCacheFileNameForUrl(url), encodedBytes, contentType);
   }
-  return *decoded;
+  return decoded;
+}
+
+AssetDecodeOutcome<QImage>
+AssetCache::storeMemoryOnly(const QUrl &url, const QByteArray &encodedBytes,
+                            const QSize &bound) {
+  auto decoded = decodeAssetImage(encodedBytes, m_config.decodeLimits, bound);
+  if (!decoded) {
+    return decoded.error();
+  }
+
+  promoteToMemory(memoryKeyFor(url, bound), *decoded);
+  return decoded;
 }
 
 void AssetCache::clearMemory() { m_memoryCache.clear(); }
@@ -176,6 +192,17 @@ void AssetCache::clearMemory() { m_memoryCache.clear(); }
 QByteArray AssetCache::canonicalUrlBytes(const QUrl &url) {
   const QUrl canonical = url.adjusted(QUrl::NormalizePathSegments);
   return canonical.toEncoded(QUrl::FullyEncoded);
+}
+
+QString AssetCache::memoryKeyFor(const QUrl &url, const QSize &bound) {
+  const QSize normalized = normalizedAssetDecodeBound(bound);
+  QString key = QString::fromLatin1(canonicalUrlBytes(url));
+  if (!normalized.isValid()) {
+    return key + QStringLiteral("@full");
+  }
+  return key + QStringLiteral("@%1x%2")
+                   .arg(normalized.width())
+                   .arg(normalized.height());
 }
 
 QString AssetCache::filePathForName(const QString &fileName) const {
@@ -303,6 +330,17 @@ void AssetCache::promoteToMemory(const QString &key, const QImage &image) {
   m_memoryCache.insert(key, new QImage(image), cost);
 }
 
+void AssetCache::removeMemoryEntriesForUrl(const QUrl &url) {
+  const QString prefix =
+      QString::fromLatin1(canonicalUrlBytes(url)) + QLatin1Char('@');
+  const QList<QString> keys = m_memoryCache.keys();
+  for (const QString &key : keys) {
+    if (key.startsWith(prefix)) {
+      m_memoryCache.remove(key);
+    }
+  }
+}
+
 void AssetCache::touchDiskEntry(const QString &diskKey) {
   if (m_index.contains(diskKey)) {
     setDiskEntryAccess(diskKey, nextAccess());
@@ -310,7 +348,8 @@ void AssetCache::touchDiskEntry(const QString &diskKey) {
 }
 
 AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
-                                                const QString &memoryKey) {
+                                                const QString &memoryKey,
+                                                const QSize &bound) {
   if (!m_index.contains(diskKey)) {
     return {};
   }
@@ -352,7 +391,7 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
     return {};
   }
 
-  auto decoded = decodeAssetImage(payload, m_config.decodeLimits);
+  auto decoded = decodeAssetImage(payload, m_config.decodeLimits, bound);
   if (!decoded) {
     removeDiskEntry(diskKey);
     return {};
