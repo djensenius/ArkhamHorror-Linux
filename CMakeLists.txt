@@ -228,6 +228,8 @@ set(ARKHAM_FOUNDATION_HEADERS
     src/AssetTypes.h
     src/AuthModels.h
     src/AuthTransportSecurity.h
+    src/BoardCardsModel.h
+    src/CardArt.h
     src/CompatibilityEvaluator.h
     src/ControllerGlyphs.h
     src/FocusController.h
@@ -268,6 +270,8 @@ set(ARKHAM_FOUNDATION_SOURCES
     src/AssetTypes.cpp
     src/AuthModels.cpp
     src/AuthTransportSecurity.cpp
+    src/BoardCardsModel.cpp
+    src/CardArt.cpp
     src/CompatibilityEvaluator.cpp
     src/ControllerGlyphs.cpp
     src/FocusController.cpp
@@ -571,6 +575,8 @@ qt_add_qml_module(arkham-horror
     VERSION 1.0
     QML_FILES
         qml/Main.qml
+        qml/BoardCardsView.qml
+        qml/CardImage.qml
     RESOURCES
         packaging/hicolor/256x256/apps/io.github.djensenius.ArkhamHorror.png
 )
@@ -753,6 +759,44 @@ if(BUILD_TESTING)
         Qt6::Test
     )
     add_test(NAME board COMMAND arkham-board-tests)
+
+    qt_add_executable(arkham-card-art-tests
+        tests/CardArtTests.cpp
+    )
+    target_link_libraries(arkham-card-art-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME card_art COMMAND arkham-card-art-tests)
+
+    qt_add_executable(arkham-board-cards-model-tests
+        tests/BoardCardsModelTests.cpp
+    )
+    target_compile_definitions(arkham-board-cards-model-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+    )
+    target_link_libraries(arkham-board-cards-model-tests PRIVATE
+        arkham_foundation
+        Qt6::Test
+    )
+    add_test(NAME board_cards_model COMMAND arkham-board-cards-model-tests)
+
+    qt_add_executable(arkham-board-cards-view-tests
+        tests/BoardCardsViewTests.cpp
+        tests/MockHttpServer.cpp
+    )
+    target_compile_definitions(arkham-board-cards-view-tests PRIVATE
+        ARKHAM_TEST_CONTRACTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/contracts"
+        ARKHAM_TEST_QML_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml"
+    )
+    target_link_libraries(arkham-board-cards-view-tests PRIVATE
+        arkham_foundation
+        Qt6::Gui
+        Qt6::Network
+        Qt6::Quick
+        Qt6::Test
+    )
+    add_test(NAME board_cards_view COMMAND arkham-board-cards-view-tests)
 
     qt_add_executable(arkham-raw-json-tests
         tests/RawJsonTests.cpp
