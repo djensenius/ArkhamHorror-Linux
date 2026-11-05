@@ -115,19 +115,77 @@ FocusScope {
             Accessible.name: text
         }
 
-        Label {
-            objectName: "errorLabel"
+        // The error, which may be a server-written maintenance notice of many
+        // lines: height-bounded and scrolling (as Main.qml's
+        // maintenanceNotice) so Retry and Back stay on screen. Up from the
+        // buttons focuses it; Up/Down scroll it, and Down at the end returns
+        // to the buttons.
+        ScrollView {
+            id: errorNotice
+
+            readonly property real scrollStep: Math.max(errorText.font.pixelSize * 2, availableHeight * 0.75)
+
+            function scrollNotice(delta: real): bool {
+                const flick = contentItem as Flickable;
+                if (!flick)
+                    return false;
+                const maximumY = Math.max(0, flick.contentHeight - flick.height);
+                const nextY = Math.min(maximumY, Math.max(0, flick.contentY + delta));
+                if (nextY === flick.contentY)
+                    return false;
+                flick.contentY = nextY;
+                return true;
+            }
+
+            objectName: "errorNotice"
             visible: root.stageStatus === "error"
+            activeFocusOnTab: true
+            focusPolicy: Qt.StrongFocus
+            Keys.onDownPressed: event => {
+                if (!errorNotice.scrollNotice(errorNotice.scrollStep))
+                    retryButton.forceActiveFocus();
+                event.accepted = true;
+            }
+            Keys.onUpPressed: event => {
+                errorNotice.scrollNotice(-errorNotice.scrollStep);
+                event.accepted = true;
+            }
+            Accessible.role: Accessible.AlertMessage
+            Accessible.name: errorText.text
+            Accessible.focusable: true
+            background: Rectangle {
+                color: "transparent"
+                radius: 6
+                border {
+                    color: root.bone
+                    width: errorNotice.activeFocus ? 2 : 0
+                }
+            }
+            clip: true
             Layout.fillWidth: true
             Layout.maximumWidth: 780
-            text: root.controller ? root.controller.errorText : ""
-            // Server-written text (maintenance notices): never markup.
-            textFormat: Text.PlainText
-            wrapMode: Text.Wrap
-            color: root.gold
-            font.pixelSize: 20
-            Accessible.role: Accessible.AlertMessage
-            Accessible.name: text
+            // At most a third of the screen; never below about two lines.
+            Layout.fillHeight: true
+            Layout.minimumHeight: Math.min(errorText.implicitHeight, errorText.font.pixelSize * 2.5)
+            Layout.preferredHeight: Layout.minimumHeight
+            Layout.maximumHeight: Math.min(errorText.implicitHeight, root.height * 0.3)
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            Label {
+                id: errorText
+
+                objectName: "errorLabel"
+                width: errorNotice.availableWidth
+                text: root.controller ? root.controller.errorText : ""
+                // Server-written text (maintenance notices): never markup.
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: root.gold
+                font.pixelSize: 20
+                // The notice announces the whole text; don't read it twice.
+                Accessible.ignored: true
+            }
         }
 
         Label {
@@ -239,6 +297,7 @@ FocusScope {
                 text: qsTr("Retry")
                 activeFocusOnTab: true
                 KeyNavigation.right: backButton
+                KeyNavigation.up: errorNotice
                 onClicked: root.controller.retry()
                 Keys.onReturnPressed: retryButton.clicked()
                 Keys.onEnterPressed: retryButton.clicked()
@@ -252,7 +311,7 @@ FocusScope {
                 text: root.showingBoard ? qsTr("Back to games") : qsTr("Back")
                 activeFocusOnTab: true
                 KeyNavigation.left: retryButton.visible ? retryButton : (reloadButton.visible ? reloadButton : null)
-                KeyNavigation.up: gamesList.visible ? gamesList : (board.visible ? board : null)
+                KeyNavigation.up: errorNotice.visible ? errorNotice : (gamesList.visible ? gamesList : (board.visible ? board : null))
                 onClicked: root.back()
                 Keys.onReturnPressed: backButton.clicked()
                 Keys.onEnterPressed: backButton.clicked()

@@ -148,7 +148,31 @@ private slots:
     QCOMPARE(child(u"boardTitle"_s)->property("text").toString(),
              u"Contract fixture game"_s);
     QTRY_VERIFY(!itemsNamed(board, u"boardCard"_s).isEmpty());
-    // Card art is decoded at the cell's size, not full size.
+    // The current card is marked while the board has focus, and the mark
+    // follows the arrow keys.
+    const auto indicator = [board](int index) -> QQuickItem * {
+      const QList<QQuickItem *> cards = itemsNamed(board, u"boardCard"_s);
+      for (QQuickItem *card : cards) {
+        if (card->property("index").toInt() == index)
+          return itemsNamed(card, u"currentCardIndicator"_s).value(0);
+      }
+      return nullptr;
+    };
+    QTRY_VERIFY(indicator(0) && indicator(1));
+    QTRY_VERIFY(indicator(0)->isVisible());
+    QVERIFY(!indicator(1)->isVisible());
+    QTest::keyClick(m_view.get(), Qt::Key_Right);
+    QTRY_VERIFY(indicator(1)->isVisible());
+    QVERIFY(!indicator(0)->isVisible());
+    QTest::keyClick(m_view.get(), Qt::Key_Left);
+    QTRY_VERIFY(indicator(0)->isVisible());
+    // No mark once focus leaves the board.
+    child(u"backButton"_s)->forceActiveFocus();
+    QTRY_VERIFY(!indicator(0)->isVisible());
+    board->forceActiveFocus();
+    QTRY_VERIFY(indicator(0)->isVisible());
+    // The provider's output is requested at the cell's size (it still
+    // decodes and caches full-resolution art; see TASK-3.3.5).
     const QList<QQuickItem *> cards = itemsNamed(board, u"boardCard"_s);
     auto *cardImage = cards.first()->childItems().first();
     QCOMPARE(cardImage->property("sourceSize").toSize(), QSize(150, 210));
@@ -256,6 +280,50 @@ private slots:
     QTRY_VERIFY(list->isVisible());
     QCOMPARE(m_server->requestCountForPath(path(u"arkham/games"_s)),
              before + 2);
+  }
+
+  void longMaintenanceNoticeIsBoundedAndKeepsTheButtons() {
+    // A message the maintenance parser accepts that is still 160 lines.
+    const QString message = u"Down.\n"_s.repeated(160);
+    QByteArray body = R"({"maintenance":true,"message":)"_ba;
+    body += '"' + message.toUtf8().replace("\n", "\\n") + '"';
+    body += R"(,"since":"2026-11-03T22:15:00Z"})"_ba;
+    m_server->setResponse(path(u"arkham/games"_s), jsonResponse(503, body));
+    QVERIFY(show(m_controller.get()));
+
+    QQuickItem *notice = child(u"errorNotice"_s);
+    QQuickItem *text = child(u"errorLabel"_s);
+    QQuickItem *retry = child(u"retryButton"_s);
+    QQuickItem *back = child(u"backButton"_s);
+    QVERIFY(notice && text && retry && back);
+    QTRY_VERIFY(notice->isVisible());
+    QTRY_VERIFY(text->height() > notice->height());
+    QVERIFY(text->property("text").toString().startsWith(u"Down.\nDown."_s));
+    QVERIFY(notice->clip());
+    QVERIFY(notice->height() <= m_view->height() * 0.3 + 0.5);
+    // Retry and Back stay inside the window.
+    for (QQuickItem *button : {retry, back}) {
+      QVERIFY(button->isVisible());
+      const QPointF bottom = button->mapToScene(QPointF(0, button->height()));
+      QVERIFY2(bottom.y() <= m_view->height() + 0.5,
+               qPrintable(u"%1 bottom %2 > %3"_s.arg(button->objectName())
+                              .arg(bottom.y())
+                              .arg(m_view->height())));
+    }
+
+    // Keys alone: Up from Retry focuses the notice, Down scrolls it, and
+    // Down at the end returns to Retry.
+    QTRY_VERIFY(retry->hasActiveFocus());
+    QTest::keyClick(m_view.get(), Qt::Key_Up);
+    QTRY_VERIFY(notice->hasActiveFocus());
+    auto *flick = notice->property("contentItem").value<QQuickItem *>();
+    QVERIFY(flick != nullptr);
+    QCOMPARE(flick->property("contentY").toReal(), 0.0);
+    QTest::keyClick(m_view.get(), Qt::Key_Down);
+    QTRY_VERIFY(flick->property("contentY").toReal() > 0.0);
+    for (int i = 0; i < 200 && notice->hasActiveFocus(); ++i)
+      QTest::keyClick(m_view.get(), Qt::Key_Down);
+    QTRY_VERIFY(retry->hasActiveFocus());
   }
 
   void loadingStateIsShown() {
