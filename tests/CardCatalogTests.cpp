@@ -142,6 +142,12 @@ private slots:
   void rawBytesPreserveNumericPrecisionInUnconstrainedFields();
   void rawBytesRejectDuplicateKeyNestedInUnconstrainedField();
   void decodeCatalogFromRawBytesRoundTripsArray();
+  // TASK-3.3.6: the board's names-only catalog decode reads each entry on
+  // its own and never reads an enum.
+  void catalogNamesIgnoreUnknownEnumValues();
+  void catalogNamesSkipEntryWithoutCardCode();
+  void catalogNamesDegradeMalformedRevealedName();
+  void catalogNamesRejectNonArray();
   // Round 7 item 4: the ENCODE side must be equally lossless -- decoding a
   // fixture with a huge/long-fraction number nested inside an
   // unconstrained field, then re-encoding via toJsonBytes() (never
@@ -1803,6 +1809,129 @@ void CardCatalogTests::decodeCatalogFromRawBytesRoundTripsArray() {
   const auto notArray =
       decodeCatalogFromRawBytes(QByteArrayLiteral("{}"), u"catalog");
   QVERIFY(!notArray.has_value());
+}
+
+void CardCatalogTests::catalogNamesIgnoreUnknownEnumValues() {
+  const QByteArray bytes = R"([
+    {
+      "cardCode": "c00001",
+      "name": {"title": "First", "subtitle": null},
+      "cardType": "SomeFutureCardType",
+      "art": "1"
+    },
+    {
+      "cardCode": "c00002",
+      "name": {"title": "Second", "subtitle": "Sub"},
+      "cardType": "AssetType",
+      "art": "2",
+      "classSymbols": ["NotARealClass"]
+    },
+    {
+      "cardCode": "c00003",
+      "name": {"title": "Third", "subtitle": null},
+      "cardType": "LocationType",
+      "art": "3",
+      "slots": ["NotARealSlot"],
+      "revealedName": {"title": "Third Revealed", "subtitle": null}
+    }
+  ])";
+  // The strict decoder rejects this pool outright.
+  QVERIFY(!decodeCatalogFromRawBytes(bytes, u"catalog").has_value());
+
+  const auto result = decodeCatalogNamesFromRawBytes(bytes, u"catalog");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->skippedCount, 0);
+  QCOMPARE(result->firstSkipDiagnostic, QString());
+  QCOMPARE(result->degradedCount, 0);
+  QCOMPARE(result->firstDegradeDiagnostic, QString());
+  QCOMPARE(result->cards.size(), 3);
+  QCOMPARE(result->cards[0].cardCode.value(), QStringLiteral("c00001"));
+  QCOMPARE(result->cards[0].name.title, QStringLiteral("First"));
+  QVERIFY(!result->cards[0].name.subtitle.has_value());
+  QVERIFY(!result->cards[0].revealedName.has_value());
+  QCOMPARE(result->cards[1].cardCode.value(), QStringLiteral("c00002"));
+  QCOMPARE(result->cards[1].name.title, QStringLiteral("Second"));
+  QCOMPARE(result->cards[1].name.subtitle.value_or(QString()), u"Sub"_s);
+  QCOMPARE(result->cards[2].cardCode.value(), QStringLiteral("c00003"));
+  QCOMPARE(result->cards[2].name.title, QStringLiteral("Third"));
+  QVERIFY(result->cards[2].revealedName.has_value());
+  QCOMPARE(result->cards[2].revealedName->title,
+           QStringLiteral("Third Revealed"));
+}
+
+void CardCatalogTests::catalogNamesSkipEntryWithoutCardCode() {
+  const QByteArray bytes = R"([
+    {"cardCode": "c00001", "name": {"title": "First", "subtitle": null}},
+    {"name": {"title": "No Code", "subtitle": null}},
+    {"cardCode": "c00003", "name": {"title": "Third", "subtitle": null}}
+  ])";
+  const auto result = decodeCatalogNamesFromRawBytes(bytes, u"catalog");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->skippedCount, 1);
+  QCOMPARE(result->firstSkipDiagnostic,
+           QStringLiteral(
+               R"(catalog[1].cardCode: missing required field "cardCode")"));
+  QCOMPARE(result->cards.size(), 2);
+  QCOMPARE(result->cards[0].cardCode.value(), QStringLiteral("c00001"));
+  QCOMPARE(result->cards[0].name.title, QStringLiteral("First"));
+  QCOMPARE(result->cards[1].cardCode.value(), QStringLiteral("c00003"));
+  QCOMPARE(result->cards[1].name.title, QStringLiteral("Third"));
+
+  // Several bad entries (a non-object and a nameless one too): every one
+  // is counted, and the first one's error is kept.
+  const QByteArray several = R"([
+    42,
+    {"cardCode": "c00002"},
+    {"cardCode": "c00003", "name": {"title": "Third", "subtitle": null}}
+  ])";
+  const auto many = decodeCatalogNamesFromRawBytes(several, u"catalog");
+  if (!many)
+    QFAIL(qPrintable(many.error()));
+  QCOMPARE(many->skippedCount, 2);
+  QVERIFY2(many->firstSkipDiagnostic.startsWith(QStringLiteral("catalog[0]")),
+           qPrintable(many->firstSkipDiagnostic));
+  QCOMPARE(many->cards.size(), 1);
+  QCOMPARE(many->cards[0].cardCode.value(), QStringLiteral("c00003"));
+}
+
+void CardCatalogTests::catalogNamesDegradeMalformedRevealedName() {
+  const QByteArray bytes = R"([
+    {
+      "cardCode": "c00001",
+      "name": {"title": "First", "subtitle": null},
+      "revealedName": "not an object"
+    },
+    {
+      "cardCode": "c00002",
+      "name": {"title": "Second", "subtitle": null},
+      "revealedName": null
+    }
+  ])";
+  const auto result = decodeCatalogNamesFromRawBytes(bytes, u"catalog");
+  if (!result)
+    QFAIL(qPrintable(result.error()));
+  QCOMPARE(result->skippedCount, 0);
+  QCOMPARE(result->degradedCount, 2);
+  QCOMPARE(result->firstDegradeDiagnostic,
+           QStringLiteral("catalog[0].revealedName: expected object, got "
+                          "string"));
+  QCOMPARE(result->cards.size(), 2);
+  QCOMPARE(result->cards[0].cardCode.value(), QStringLiteral("c00001"));
+  QCOMPARE(result->cards[0].name.title, QStringLiteral("First"));
+  QVERIFY(!result->cards[0].revealedName.has_value());
+  QCOMPARE(result->cards[1].cardCode.value(), QStringLiteral("c00002"));
+  QCOMPARE(result->cards[1].name.title, QStringLiteral("Second"));
+  QVERIFY(!result->cards[1].revealedName.has_value());
+}
+
+void CardCatalogTests::catalogNamesRejectNonArray() {
+  const auto result =
+      decodeCatalogNamesFromRawBytes(QByteArrayLiteral("{}"), u"catalog");
+  QVERIFY(!result.has_value());
+  QCOMPARE(result.error(),
+           QStringLiteral("catalog: expected array, got object"));
 }
 
 void CardCatalogTests::

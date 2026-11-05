@@ -73,7 +73,7 @@ struct GameCall {
 struct CardsCall {
   int calls{0};
   GameRequestStatus status;
-  std::optional<QList<CardDef>> cards;
+  std::optional<CatalogNames> cards;
 };
 
 // catalog.json's "cards" array: the bare GET /arkham/cards response shape.
@@ -189,14 +189,14 @@ private:
   CardsCall fetchCards() {
     GameClient client(*m_nam);
     CardsCall result;
-    client.listCampaignCards(*m_profile, kToken,
-                             [&result](const GameRequestStatus &status,
-                                       const QList<CardDef> *cards) {
-                               ++result.calls;
-                               result.status = status;
-                               if (cards)
-                                 result.cards = *cards;
-                             });
+    client.listCampaignCards(
+        *m_profile, kToken,
+        [&result](const GameRequestStatus &status, const CatalogNames *cards) {
+          ++result.calls;
+          result.status = status;
+          if (cards)
+            result.cards = *cards;
+        });
     if (result.calls != 0)
       qFatal("GameClient invoked its callback synchronously");
     if (!waitUntil([&result] { return result.calls > 0; }))
@@ -410,9 +410,10 @@ private slots:
     QCOMPARE(call.calls, 1);
     QCOMPARE(call.status.outcome, GameRequestOutcome::Success);
     QVERIFY(call.cards.has_value());
-    QCOMPARE(call.cards->size(), 1);
-    QCOMPARE(call.cards->first().cardCode.value(), u"c01020"_s);
-    QCOMPARE(call.cards->first().name.title, u"Machete"_s);
+    QCOMPARE(call.cards->skippedCount, 0);
+    QCOMPARE(call.cards->cards.size(), 1);
+    QCOMPARE(call.cards->cards.first().cardCode.value(), u"c01020"_s);
+    QCOMPARE(call.cards->cards.first().name.title, u"Machete"_s);
 
     const QByteArray request = m_server->lastRequest();
     QVERIFY2(request.startsWith(
@@ -420,6 +421,29 @@ private slots:
              request.constData());
     QVERIFY(request.contains("\r\nAuthorization: Token test-token-123\r\n"));
     QCOMPARE(m_server->requestCountForPath(cardsTarget()), 1);
+  }
+
+  // TASK-3.3.6: a value this client has no enum case for costs no card its
+  // name; only names are decoded.
+  void listCampaignCardsKeepsNamesPastUnknownEnums() {
+    const QByteArray body =
+        R"([{"cardCode": "c01105", "name": {"title": "Agenda", )"
+        R"("subtitle": null}, "cardType": "FutureType", "art": "01105"}, )"
+        R"({"cardCode": "c01108", "name": {"title": "Trapped", )"
+        R"("subtitle": null}, "cardType": "ActType", "art": "01108", )"
+        R"("slots": ["FutureSlot"]}])"_ba;
+    m_server->setResponse(cardsTarget(), jsonResponse(200, body));
+    const CardsCall call = fetchCards();
+    QCOMPARE(call.calls, 1);
+    QCOMPARE(call.status.outcome, GameRequestOutcome::Success);
+    QVERIFY(call.status.diagnostic.isEmpty());
+    QVERIFY(call.cards.has_value());
+    QCOMPARE(call.cards->skippedCount, 0);
+    QCOMPARE(call.cards->cards.size(), 2);
+    QCOMPARE(call.cards->cards.at(0).cardCode.value(), u"c01105"_s);
+    QCOMPARE(call.cards->cards.at(0).name.title, u"Agenda"_s);
+    QCOMPARE(call.cards->cards.at(1).cardCode.value(), u"c01108"_s);
+    QCOMPARE(call.cards->cards.at(1).name.title, u"Trapped"_s);
   }
 
   void listCampaignCardsFailures() {

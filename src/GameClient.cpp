@@ -149,7 +149,7 @@ void GameClient::getGame(const ServerProfile &profile, const QString &gameId,
 
 void GameClient::listCampaignCards(const ServerProfile &profile,
                                    const QString &token,
-                                   CardListCallback callback) {
+                                   CatalogNamesCallback callback) {
   QUrlQuery query;
   query.addQueryItem(QStringLiteral("cardPool"), QStringLiteral("campaign"));
   issue(profile, QStringLiteral("arkham/cards"), query, token,
@@ -160,15 +160,15 @@ void GameClient::listCampaignCards(const ServerProfile &profile,
             callback(status, nullptr);
             return;
           }
-          const auto cards = decodeCatalogFromRawBytes(body, u"cards");
-          if (!cards) {
+          const auto names = decodeCatalogNamesFromRawBytes(body, u"cards");
+          if (!names) {
             callback(GameRequestStatus{GameRequestOutcome::DecodeFailed,
-                                       cards.error(), status.httpStatus,
+                                       names.error(), status.httpStatus,
                                        std::nullopt},
                      nullptr);
             return;
           }
-          callback(status, &*cards);
+          callback(status, &*names);
         });
 }
 

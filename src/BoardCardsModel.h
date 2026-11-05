@@ -31,7 +31,7 @@ public:
   };
   Q_ENUM(Role)
 
-  // One catalog card's printed names (CardDef.name and revealedName).
+  // One catalog card's printed names (its name and revealedName).
   struct CardNames {
     CardName name;
     std::optional<CardName> revealedName;
@@ -41,9 +41,10 @@ public:
 
   explicit BoardCardsModel(QObject *parent = nullptr);
 
-  // The names of every card in |cards| (a GET /arkham/cards response).
+  // The names of every card in |catalog| (a GET /arkham/cards response,
+  // see decodeCatalogNamesFromRawBytes()).
   [[nodiscard]] static CardNameTable
-  cardNamesFromCatalog(const QList<CardDef> &cards);
+  cardNamesFromCatalog(const CatalogNames &catalog);
 
   // Replaces every row with the cards of `game`.
   void setGame(const PublicGame &game);
