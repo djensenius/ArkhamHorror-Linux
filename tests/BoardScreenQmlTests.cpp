@@ -420,6 +420,9 @@ private slots:
     QTest::keyClick(m_view.get(), Qt::Key_Return);
     QQuickItem *board = child(u"board"_s);
     QTRY_VERIFY(board->isVisible());
+    // The layout sizes the board on a later polish pass; wait for it so the
+    // geometry checks below read the settled layout.
+    QTRY_VERIFY(board->height() > 100);
     QQuickItem *title = child(u"boardTitle"_s);
     QCOMPARE(m_controller->selectedTitle(), name);
     QCOMPARE(title->property("lineCount").toInt(), 1);
@@ -429,7 +432,6 @@ private slots:
     QVERIFY(back->isVisible());
     QVERIFY(back->mapToScene(QPointF(0, back->height())).y() <=
             m_view->height() + 0.5);
-    QVERIFY(board->height() > 100);
 
     // Every other line break the server might send is flattened as well.
     QString flat;
