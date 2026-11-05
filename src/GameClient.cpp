@@ -41,14 +41,14 @@ void applyAuthenticatedRequestSettings(QNetworkRequest &request) {
   request.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);
 }
 
-bool contentLengthExceedsCap(QNetworkReply *reply) {
+bool contentLengthExceedsCap(QNetworkReply *reply, qsizetype cap) {
   const QVariant header = reply->header(QNetworkRequest::ContentLengthHeader);
   if (!header.isValid()) {
     return false;
   }
   bool ok = false;
   const qlonglong contentLength = header.toLongLong(&ok);
-  return ok && contentLength > GameClient::kMaxResponseBytes;
+  return ok && contentLength > cap;
 }
 
 GameRequestStatus transportFailure(QString diagnostic, int httpStatus = 0) {
@@ -71,6 +71,13 @@ GameClient::GameClient(QNetworkAccessManager &nam,
   }
 }
 
+void GameClient::setMaxResponseBytes(qsizetype maxResponseBytes) {
+  if (maxResponseBytes <= 0) {
+    throw std::invalid_argument("game client response cap must be positive");
+  }
+  m_maxResponseBytes = maxResponseBytes;
+}
+
 GameClient::~GameClient() {
   for (auto it = m_pendingReplies.begin(); it != m_pendingReplies.end(); ++it) {
     if (QTimer *timer = it.value().timer) {
@@ -87,6 +94,7 @@ GameClient::~GameClient() {
 void GameClient::listGames(const ServerProfile &profile, const QString &token,
                            GameListCallback callback) {
   issue(profile, QStringLiteral("arkham/games"), token,
+        QStringLiteral("games list not found"),
         [callback = std::move(callback)](const GameRequestStatus &status,
                                          const QByteArray &body) {
           if (status.outcome != GameRequestOutcome::Success) {
@@ -115,6 +123,7 @@ void GameClient::getGame(const ServerProfile &profile, const QString &gameId,
     return;
   }
   issue(profile, QStringLiteral("arkham/games/") + id->value(), token,
+        QStringLiteral("game not found"),
         [callback = std::move(callback)](const GameRequestStatus &status,
                                          const QByteArray &body) {
           if (status.outcome != GameRequestOutcome::Success) {
@@ -134,7 +143,8 @@ void GameClient::getGame(const ServerProfile &profile, const QString &gameId,
 }
 
 void GameClient::issue(const ServerProfile &profile, const QString &path,
-                       const QString &token, Completion completion) {
+                       const QString &token, QString notFoundDiagnostic,
+                       Completion completion) {
   // Same request-time guards as NetworkAuthenticationClient::whoAmI(): a
   // validated profile, a token that is safe to place in a header, and a
   // secure (or loopback-only cleartext) transport.
@@ -167,7 +177,7 @@ void GameClient::issue(const ServerProfile &profile, const QString &path,
   request.setRawHeader("Authorization", ("Token " + token).toUtf8());
 
   QNetworkReply *reply = m_nam.get(request);
-  reply->setReadBufferSize(kMaxResponseBytes + 1);
+  reply->setReadBufferSize(m_maxResponseBytes + 1);
 
   QTimer *timer = nullptr;
   if (m_timeout.count() > 0) {
@@ -178,8 +188,9 @@ void GameClient::issue(const ServerProfile &profile, const QString &path,
                true);
     });
   }
-  m_pendingReplies.insert(
-      reply, PendingReply{timer, QByteArray{}, std::move(completion)});
+  m_pendingReplies.insert(reply, PendingReply{timer, QByteArray{},
+                                              std::move(notFoundDiagnostic),
+                                              std::move(completion)});
 
   connect(reply, &QNetworkReply::metaDataChanged, this,
           [this, reply]() { handleMetadataChanged(reply); });
@@ -209,7 +220,8 @@ void GameClient::rejectQueued(Completion completion, QString diagnostic) {
 }
 
 void GameClient::handleMetadataChanged(QNetworkReply *reply) {
-  if (m_pendingReplies.contains(reply) && contentLengthExceedsCap(reply)) {
+  if (m_pendingReplies.contains(reply) &&
+      contentLengthExceedsCap(reply, m_maxResponseBytes)) {
     complete(reply, oversizedResponse(), true);
   }
 }
@@ -220,7 +232,7 @@ bool GameClient::readAvailable(QNetworkReply *reply) {
     if (it == m_pendingReplies.end()) {
       return false;
     }
-    const qsizetype remaining = kMaxResponseBytes - it.value().body.size();
+    const qsizetype remaining = m_maxResponseBytes - it.value().body.size();
     const QByteArray chunk = reply->read(static_cast<qint64>(remaining) + 1);
     if (chunk.isEmpty()) {
       return true;
@@ -261,8 +273,8 @@ void GameClient::handleFinished(QNetworkReply *reply) {
   if (status == 404) {
     complete(reply,
              GameRequestStatus{GameRequestOutcome::NotFound,
-                               QStringLiteral("game not found"), status,
-                               std::nullopt},
+                               m_pendingReplies.value(reply).notFoundDiagnostic,
+                               status, std::nullopt},
              false);
     return;
   }
@@ -322,6 +334,8 @@ void GameClient::complete(QNetworkReply *reply, GameRequestStatus status,
   }
   reply->deleteLater();
 
+  // Last statement: the callback may destroy this client, so no member is
+  // touched after it runs (the timeout path ends here too).
   if (pending.completion) {
     pending.completion(status, pending.body);
   }

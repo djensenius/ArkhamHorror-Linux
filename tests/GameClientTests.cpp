@@ -302,13 +302,90 @@ private slots:
     m_server->setResponse(listPath(), jsonResponse(200, "{}"_ba));
     const ListCall bad = fetchList();
     QCOMPARE(bad.status.outcome, GameRequestOutcome::DecodeFailed);
-    QVERIFY(!bad.status.diagnostic.isEmpty());
+    QCOMPARE(bad.status.diagnostic, u"games: expected array, got object"_s);
     QVERIFY(!bad.rows.has_value());
 
     m_server->setResponse(listPath(), jsonResponse(401, "{}"_ba));
     const ListCall unauthorized = fetchList();
     QCOMPARE(unauthorized.status.outcome, GameRequestOutcome::Unauthorized);
     QCOMPARE(unauthorized.status.httpStatus, 401);
+  }
+
+  void listGamesNotFoundNamesTheList() {
+    m_server->setResponse(listPath(), jsonResponse(404, "{}"_ba));
+    const ListCall call = fetchList();
+    QCOMPARE(call.status.outcome, GameRequestOutcome::NotFound);
+    QCOMPARE(call.status.diagnostic, u"games list not found"_s);
+  }
+
+  void streamedBodyOverCapWithoutContentLength() {
+    // No Content-Length, so only the streaming check in readAvailable()
+    // can catch the overflow.
+    MockHttpServer::Response response = jsonResponse(200, QByteArray{});
+    response.includeContentLength = false;
+    response.chunks = {QByteArray(40, 'a'), QByteArray(40, 'b')};
+    m_server->setResponse(gamePath(), response);
+    GameClient client(*m_nam);
+    client.setMaxResponseBytes(64);
+    GameCall result;
+    client.getGame(*m_profile, kGameId, kToken,
+                   [&result](const GameRequestStatus &status, const GetGame *) {
+                     ++result.calls;
+                     result.status = status;
+                   });
+    QVERIFY(waitUntil([&result] { return result.calls > 0; }));
+    QCOMPARE(result.calls, 1);
+    QCOMPARE(result.status.outcome, GameRequestOutcome::Transport);
+    QCOMPARE(result.status.diagnostic,
+             u"response body exceeds the size limit"_s);
+  }
+
+  void truncatedSuccessBodyIsTransportFailure() {
+    // A 200 whose connection closes before the declared length arrives.
+    MockHttpServer::Response response = jsonResponse(200, R"({"id":)"_ba);
+    response.contentLengthOverride = 1000;
+    m_server->setResponse(gamePath(), response);
+    const GameCall call = fetchGame();
+    QCOMPARE(call.calls, 1);
+    QCOMPARE(call.status.outcome, GameRequestOutcome::Transport);
+    QCOMPARE(call.status.httpStatus, 200);
+    QCOMPARE(call.status.diagnostic, u"network transport error"_s);
+  }
+
+  void destroyingClientSuppressesPendingCallback() {
+    MockHttpServer::Response response;
+    response.hang = true;
+    m_server->setResponse(gamePath(), response);
+    int calls = 0;
+    auto *client = new GameClient(*m_nam);
+    client->getGame(
+        *m_profile, kGameId, kToken,
+        [&calls](const GameRequestStatus &, const GetGame *) { ++calls; });
+    QVERIFY(waitUntil([this] { return m_server->requestCount() == 1; }));
+    delete client;
+    QTest::qWait(100);
+    QCOMPARE(calls, 0);
+  }
+
+  void callbackMayDestroyClientOnTimeout() {
+    MockHttpServer::Response response;
+    response.hang = true;
+    m_server->setResponse(gamePath(), response);
+    auto *client = new GameClient(*m_nam, std::chrono::milliseconds(100));
+    GameCall result;
+    client->getGame(
+        *m_profile, kGameId, kToken,
+        [&result, &client](const GameRequestStatus &status, const GetGame *) {
+          ++result.calls;
+          result.status = status;
+          delete client;
+          client = nullptr;
+        });
+    QVERIFY(waitUntil([&result] { return result.calls > 0; }));
+    QTest::qWait(50);
+    QCOMPARE(result.calls, 1);
+    QCOMPARE(result.status.diagnostic, u"request timed out"_s);
+    QVERIFY(client == nullptr);
   }
 };
 

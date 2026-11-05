@@ -585,6 +585,7 @@ void SessionCoordinator::startCredentialRestore() {
     const quint64 currentEndpointEpoch = profileEndpointEpoch(profileId);
     for (int i = 0; i < queueIt->size(); ++i) {
       if ((*queueIt)[i].kind == TokenOpKind::Read &&
+          (*queueIt)[i].restoreEligible &&
           (*queueIt)[i].admissionEndpointEpoch == currentEndpointEpoch) {
         (*queueIt)[i].onComplete = std::move(onComplete);
         return;
@@ -677,7 +678,8 @@ void SessionCoordinator::requestAccessToken(AccessTokenCallback callback) {
           return;
         }
         callback(AccessToken{profile, std::move(result.token)}, QString());
-      });
+      },
+      /*restoreEligible=*/false);
 }
 
 // ─── whoami validation (shared by restore and fresh sign-in/register) ───
@@ -1125,12 +1127,15 @@ void SessionCoordinator::cancelPendingAuthRequest() {
 
 // ─── Per-profile FIFO token-store queue ─────────────────────────────────
 
-void SessionCoordinator::enqueueTokenOp(
-    const QString &profileId, TokenOpKind kind, QString token,
-    QString endpointIdentity, ITokenStore::ResultCallback onComplete) {
+void SessionCoordinator::enqueueTokenOp(const QString &profileId,
+                                        TokenOpKind kind, QString token,
+                                        QString endpointIdentity,
+                                        ITokenStore::ResultCallback onComplete,
+                                        bool restoreEligible) {
   auto &queue = m_tokenQueues[profileId];
   const bool wasEmpty = queue.isEmpty();
   TokenOp op{kind, std::move(token), std::move(onComplete)};
+  op.restoreEligible = restoreEligible;
   op.admissionEpoch = profileCredentialEpoch(profileId);
   op.admissionEndpointEpoch = profileEndpointEpoch(profileId);
   op.opId = m_nextTokenOpId++;

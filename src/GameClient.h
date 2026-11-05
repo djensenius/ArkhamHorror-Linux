@@ -56,6 +56,9 @@ struct GameRequestStatus {
 // destroyed first (pending requests are then aborted and their callbacks
 // never run). The decoded pointer is non-null only for Success and is
 // valid only for the duration of the callback.
+//
+// The QNetworkAccessManager must outlive this client: pending replies are
+// owned by it, and the destructor aborts them through raw pointers.
 class GameClient final : public QObject {
   Q_OBJECT
 
@@ -75,6 +78,10 @@ public:
                       QObject *parent = nullptr);
   ~GameClient() override;
 
+  // Lowers (or raises) the response-body cap; defaults to
+  // kMaxResponseBytes. Applies to requests issued afterwards.
+  void setMaxResponseBytes(qsizetype maxResponseBytes);
+
   void listGames(const ServerProfile &profile, const QString &token,
                  GameListCallback callback);
   void getGame(const ServerProfile &profile, const QString &gameId,
@@ -87,11 +94,13 @@ private:
   struct PendingReply {
     QTimer *timer{nullptr};
     QByteArray body;
+    QString notFoundDiagnostic;
     Completion completion;
   };
 
   void issue(const ServerProfile &profile, const QString &path,
-             const QString &token, Completion completion);
+             const QString &token, QString notFoundDiagnostic,
+             Completion completion);
   void rejectQueued(Completion completion, QString diagnostic);
   void handleMetadataChanged(QNetworkReply *reply);
   bool readAvailable(QNetworkReply *reply);
@@ -101,6 +110,7 @@ private:
 
   QNetworkAccessManager &m_nam;
   std::chrono::milliseconds m_timeout;
+  qsizetype m_maxResponseBytes{kMaxResponseBytes};
   QHash<QNetworkReply *, PendingReply> m_pendingReplies;
 };
 

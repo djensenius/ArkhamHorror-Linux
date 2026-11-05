@@ -230,13 +230,13 @@ public:
   // Reads the current profile's token through the same per-profile
   // token-store FIFO as credential restore (so it is ordered behind any
   // pending save/delete), only while state() is SignedIn. The callback runs
-  // asynchronously, at most once: with the token only if the session is
-  // still the same SignedIn session when the read completes, otherwise
-  // with std::nullopt. A failed read never changes the session state. It
-  // does not run if this coordinator is destroyed first, or if a later
-  // start()/switchProfile() restore takes over the queued read (both of
-  // which leave SignedIn first, so callers should also watch
-  // stateChanged()).
+  // asynchronously, exactly once when the store answers: with the token
+  // only if the session is still the same SignedIn session when the read
+  // completes, otherwise with std::nullopt. A failed read never changes the
+  // session state. A later start()/switchProfile() restore never takes
+  // over this read (it queues its own), so a restart while the read is
+  // pending still runs the callback, with std::nullopt. The only case in
+  // which it does not run is when this coordinator is destroyed first.
   void requestAccessToken(AccessTokenCallback callback);
 
 public slots:
@@ -386,6 +386,10 @@ private:
     // this field is the durable, cross-process, cross-restart identity
     // that ITokenStore itself authoritatively enforces.
     QString endpointIdentity;
+    // False only for a requestAccessToken() Read: startCredentialRestore()
+    // must never take over that op's onComplete (which would silently drop
+    // the access-token callback), so its dedup only rebinds restore Reads.
+    bool restoreEligible{true};
   };
 
   // Per-profile bookkeeping for the single ITokenStore operation (if any)
@@ -577,7 +581,8 @@ private:
   // class's existing single-profile behavior exactly.
   void enqueueTokenOp(const QString &profileId, TokenOpKind kind, QString token,
                       QString endpointIdentity,
-                      ITokenStore::ResultCallback onComplete);
+                      ITokenStore::ResultCallback onComplete,
+                      bool restoreEligible = true);
   void startFrontTokenOp(const QString &profileId);
   void retryStuckProfileTokenOp(const QString &profileId);
 

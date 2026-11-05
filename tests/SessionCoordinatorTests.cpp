@@ -869,6 +869,7 @@ private slots:
   void accessTokenIsRefusedWhenNotSignedIn();
   void accessTokenReadFailureKeepsSessionState();
   void accessTokenIsWithheldAfterSignOut();
+  void accessTokenCallbackSurvivesRestartRestore();
   void duplicateSignOutCallsDispatchExactlyOneDelete();
   void
   directReentrantSignOutDuringSigningOutEmissionDispatchesExactlyOneDelete();
@@ -2084,6 +2085,54 @@ void SessionCoordinatorTests::accessTokenIsWithheldAfterSignOut() {
   QVERIFY(pumpEventsUntil(
       [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
   QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
+  QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
+}
+
+void SessionCoordinatorTests::accessTokenCallbackSurvivesRestartRestore() {
+  // A restart while the access-token read is pending must not take over
+  // that read: the callback still runs exactly once (with nullopt), and
+  // restore queues and completes its own read.
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  AccessTokenRecorder recorder;
+  h.coordinator->requestAccessToken(recorder.callback());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  const int readsBefore = h.tokenStore.calls.size();
+
+  h.coordinator->start();
+  QVERIFY(
+      pumpEventsUntil([&h] { return h.probeFactory.current() != nullptr; }));
+  h.probeFactory.current()->complete(compatibleProbeResult());
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() ==
+           SessionCoordinator::State::RestoringCredential;
+  }));
+  QCOMPARE(h.tokenStore.calls.size(), readsBefore); // queued, not dispatched
+
+  h.tokenStore.complete(profileId,
+                        successReadResult(QStringLiteral("session-token")));
+  QVERIFY(pumpEventsUntil([&recorder] { return recorder.calls == 1; }));
+  QVERIFY(!recorder.token.has_value());
+  QCOMPARE(recorder.diagnostic,
+           QStringLiteral("The session changed before the request could be "
+                          "sent."));
+
+  // Restore's own read is dispatched next and still signs back in.
+  QVERIFY(pumpEventsUntil([&h, readsBefore] {
+    return h.tokenStore.calls.size() == readsBefore + 1;
+  }));
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("read"));
+  h.tokenStore.complete(profileId,
+                        successReadResult(QStringLiteral("session-token")));
+  QVERIFY(pumpEventsUntil([&h] { return h.authClient.calls.size() == 3; }));
+  h.authClient.completeUser(3, userSuccess(QStringLiteral("bob"),
+                                           QStringLiteral("bob@example.test")));
+  QVERIFY(pumpEventsUntil([&h] {
+    return h.coordinator->state() == SessionCoordinator::State::SignedIn;
+  }));
+  QCOMPARE(recorder.calls, 1);
   QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
 }
 
