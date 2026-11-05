@@ -199,6 +199,19 @@ ValueOrError<CardId> requireCardId(const Json::Value &obj,
                             });
 }
 
+// "Mutated" followed by one or more ASCII digits, e.g. "Mutated21".
+bool isMutationName(const QString &text) {
+  constexpr QLatin1StringView kPrefix = "Mutated"_L1;
+  if (!text.startsWith(kPrefix) || text.size() == kPrefix.size())
+    return false;
+  for (qsizetype i = kPrefix.size(); i < text.size(); ++i) {
+    const char16_t c = text.at(i).unicode();
+    if (c < u'0' || c > u'9')
+      return false;
+  }
+  return true;
+}
+
 // Decodes a required array of chaos tokens, in wire order.
 ValueOrError<QList<ChaosToken>> requireChaosTokens(const Json::Value &obj,
                                                    QLatin1StringView key,
@@ -1002,7 +1015,26 @@ ValueOrError<Investigator> Investigator::fromRawJson(const Json::Value &v,
   if (!connectedLocations)
     return failure(connectedLocations.error());
 
+  // Card art is optional presentation data, decoded tolerantly (never fails
+  // the investigator): `art` falls back to the investigator id when absent,
+  // null, non-string or empty. It may be a homebrew ":campaign:code" id, so
+  // it is kept verbatim and validated only when an asset URL is built.
+  QString art = id->value();
+  if (const auto artValue = obj.find("art"_L1);
+      artValue && artValue->isString() && !artValue->toString().isEmpty())
+    art = artValue->toString();
+  // `mutated` (Maybe Text, e.g. "Mutated21") is kept only when it matches
+  // Mutated<N>; anything else (null, absent, malformed, non-string) means
+  // the plain art is shown.
+  std::optional<QString> mutatedArt;
+  if (const auto mutatedValue = obj.find("mutated"_L1);
+      mutatedValue && mutatedValue->isString() &&
+      isMutationName(mutatedValue->toString()))
+    mutatedArt = mutatedValue->toString();
+
   Investigator result(*id, *cardCode, *tokens);
+  result.m_art = std::move(art);
+  result.m_mutated = std::move(mutatedArt);
   result.m_playerId = *playerId;
   result.m_name = *name;
   result.m_classSymbol = *classSymbol;

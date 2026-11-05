@@ -402,8 +402,8 @@ private:
 // core fields a board view needs are modeled: identity, printed health and
 // sanity, base skills, token counts (damage and horror are tokens), the
 // action and elimination state, the placement and the server-computed
-// connections. Deck, hand, discard, slots, modifiers, prohibitions, art and
-// per-scenario fields are not parsed.
+// connections, plus the card art and its mutation. Deck, hand, discard,
+// slots, modifiers, prohibitions and per-scenario fields are not parsed.
 class Investigator {
 public:
   [[nodiscard]] static ValueOrError<Investigator>
@@ -414,6 +414,17 @@ public:
   // The InvestigatorId (a board card code, e.g. "c01001").
   [[nodiscard]] const CardCode &id() const noexcept { return m_id; }
   [[nodiscard]] const CardCode &cardCode() const noexcept { return m_cardCode; }
+  // The art id the web client renders (InvestigatorAttrs.investigatorArt),
+  // e.g. "c01001" or a homebrew ":campaign:code". Never empty: decoded
+  // tolerantly, it falls back to id() when `art` is absent, null, not a
+  // string or empty. Kept verbatim; AssetLocator validates it.
+  [[nodiscard]] const QString &art() const noexcept { return m_art; }
+  // The art mutation, e.g. "Mutated21" (the asset is <art>_Mutated21).
+  // Decoded tolerantly: std::nullopt when `mutated` is absent, null, not a
+  // string or not "Mutated" followed by digits; never fails the decode.
+  [[nodiscard]] const std::optional<QString> &mutated() const noexcept {
+    return m_mutated;
+  }
   // The seated player. std::nullopt when the wire carries the all-zero
   // UUID: the backend builds killed and other-campaign investigators with
   // `PlayerId nil` (Arkham.Game's lookupInvestigator iid (PlayerId nil)).
@@ -479,6 +490,8 @@ private:
 
   CardCode m_id;
   CardCode m_cardCode;
+  QString m_art;
+  std::optional<QString> m_mutated;
   std::optional<PlayerId> m_playerId;
   CardName m_name;
   ClassSymbol m_classSymbol = ClassSymbol::Neutral;

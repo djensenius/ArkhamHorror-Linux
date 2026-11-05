@@ -486,6 +486,8 @@ private slots:
     QCOMPARE(investigator->placementLocation()->value(),
              QLatin1StringView(kStudyId));
     QVERIFY(investigator->connectedLocations().isEmpty());
+    QCOMPARE(investigator->art(), u"c01001"_s);
+    QVERIFY(!investigator->mutated().has_value());
 
     // The Study lists Roland as its occupant.
     const auto study = Location::fromRawJson(studyOf(game), u"location");
@@ -507,6 +509,54 @@ private slots:
     QCOMPARE(investigator->connectedLocations().size(), 1);
     QCOMPARE(investigator->connectedLocations().first().value(),
              u"00000000-0000-0000-0000-000000000032"_s);
+  }
+
+  // `art` and `mutated` are presentation data decoded tolerantly: a missing
+  // or unusable value falls back (art to the id, mutated to no mutation)
+  // and never fails the investigator.
+  void investigatorArtAndMutation_data() {
+    QTest::addColumn<QByteArray>("fields");
+    QTest::addColumn<QString>("art");
+    QTest::addColumn<QString>("mutation");
+    QTest::newRow("both absent") << QByteArray() << u"c01001"_s << QString();
+    QTest::newRow("present, mutated null")
+        << QByteArray(R"("art":"c01001b","mutated":null,)") << u"c01001b"_s
+        << QString();
+    QTest::newRow("homebrew art")
+        << QByteArray(R"("art":":fan:12345",)") << u":fan:12345"_s << QString();
+    QTest::newRow("valid Mutated21")
+        << QByteArray(R"("art":"c01001","mutated":"Mutated21",)") << u"c01001"_s
+        << u"Mutated21"_s;
+    QTest::newRow("malformed suffix")
+        << QByteArray(R"("mutated":"Mutated2x",)") << u"c01001"_s << QString();
+    QTest::newRow("prefix only")
+        << QByteArray(R"("mutated":"Mutated",)") << u"c01001"_s << QString();
+    QTest::newRow("leading underscore")
+        << QByteArray(R"("mutated":"_Mutated21",)") << u"c01001"_s << QString();
+    QTest::newRow("non-string mutated")
+        << QByteArray(R"("mutated":21,)") << u"c01001"_s << QString();
+    QTest::newRow("null art")
+        << QByteArray(R"("art":null,)") << u"c01001"_s << QString();
+    QTest::newRow("empty art")
+        << QByteArray(R"("art":"",)") << u"c01001"_s << QString();
+    QTest::newRow("non-string art")
+        << QByteArray(R"("art":{"x":1},)") << u"c01001"_s << QString();
+  }
+
+  void investigatorArtAndMutation() {
+    QFETCH(QByteArray, fields);
+    QFETCH(QString, art);
+    QFETCH(QString, mutation);
+    const auto investigator = Investigator::fromRawBytes(
+        mutated(u"investigator"_s, R"("cardCode":"c01001",)",
+                QByteArray(R"("cardCode":"c01001",)") + fields),
+        u"inv");
+    QVERIFY2(investigator,
+             qPrintable(investigator ? QString() : investigator.error()));
+    QCOMPARE(investigator->art(), art);
+    QCOMPARE(investigator->mutated().has_value(), !mutation.isNull());
+    if (!mutation.isNull())
+      QCOMPARE(*investigator->mutated(), mutation);
   }
 
   // Unbounded integers: the fork's investigator-unhealed-horror-negative.json
