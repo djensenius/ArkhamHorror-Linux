@@ -3,6 +3,7 @@
 #include <QNetworkAccessManager>
 #include <QTimer>
 
+#include <optional>
 #include <utility>
 
 namespace Arkham {
@@ -199,6 +200,7 @@ void AssetImageRequestCoordinator::handleFetchFinished(
   // every waiter. Further bounds only add memory entries.
   QList<QSize> bounds;
   QList<AssetOutcome<QImage>> decodes;
+  std::optional<AssetError> firstDecodeError;
   for (const Waiter &waiter : std::as_const(flight.waiters)) {
     if (bounds.contains(waiter.bound)) {
       continue;
@@ -207,10 +209,9 @@ void AssetImageRequestCoordinator::handleFetchFinished(
       auto stored = m_cache->store(flight.url, result->bytes,
                                    result->contentType, waiter.bound);
       if (!stored) {
-        completeWaiters(std::move(flight.waiters),
-                        AssetError{AssetErrorCode::DecodeError,
-                                   stored.error().message, 0, flight.url});
-        return;
+        firstDecodeError = AssetError{AssetErrorCode::DecodeError,
+                                      stored.error().message, 0, flight.url};
+        break;
       }
       decodes.push_back(*stored);
     } else {
@@ -224,6 +225,11 @@ void AssetImageRequestCoordinator::handleFetchFinished(
       }
     }
     bounds.push_back(waiter.bound);
+  }
+
+  if (firstDecodeError) {
+    completeWaiters(std::move(flight.waiters), *firstDecodeError);
+    return;
   }
 
   for (Waiter &waiter : flight.waiters) {

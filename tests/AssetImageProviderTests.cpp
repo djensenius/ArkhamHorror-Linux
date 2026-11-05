@@ -3,6 +3,7 @@
 #include <QBuffer>
 #include <QCoreApplication>
 #include <QDeadlineTimer>
+#include <QDir>
 #include <QEvent>
 #include <QEventLoop>
 #include <QNetworkAccessManager>
@@ -121,6 +122,19 @@ bool waitForPendingResponseDrain(const AssetCardImageResponse &response,
 
 } // namespace
 
+namespace Arkham {
+// Reads the coordinator's private cache (see the friend declaration and its
+// rationale in AssetImageRequestCoordinator.h) so the decode-failure test can
+// prove that nothing reached the memory cache.
+class AssetImageRequestCoordinatorTestSupport {
+public:
+  static const AssetCache *
+  cache(const AssetImageRequestCoordinator &coordinator) {
+    return coordinator.m_cache.get();
+  }
+};
+} // namespace Arkham
+
 class AssetImageProviderTests final : public QObject {
   Q_OBJECT
 
@@ -129,6 +143,7 @@ private slots:
   void coordinatorCancelOneCoalescedWaiterKeepsOtherWaiter();
   void coordinatorDecodesEachRequestedSizeFromOneFetch();
   void coordinatorCancelOneSizeKeepsOtherSize();
+  void coordinatorFailedFirstDecodeFailsEveryWaiter();
   void coordinatorCachesNotFoundBriefly();
   void coordinatorDoesNotCacheTransientFailures();
   void coordinatorNegativeCacheExpiresAfterTtl();
@@ -306,6 +321,56 @@ void AssetImageProviderTests::coordinatorCancelOneSizeKeepsOtherSize() {
   QCOMPARE((*second)->size(), QSize(300, 420));
   QVERIFY(!firstCalled);
   QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::coordinatorFailedFirstDecodeFailsEveryWaiter() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01024.avif");
+  // A PNG cut off inside its first chunks: sniffed as PNG, fails to decode.
+  const QByteArray undecodable = pngBytes(QSize(600, 840)).left(64);
+  QCOMPARE(undecodable.size(), 64);
+  auto delayed = response(200, undecodable);
+  delayed.headerDelayMs = 50;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  std::vector<std::optional<AssetOutcome<QImage>>> results(2);
+  const std::vector<QSize> sizes{QSize(150, 210), QSize()};
+  for (size_t index = 0; index < sizes.size(); ++index) {
+    const quint64 token = coordinator.requestCardImage(
+        {QStringLiteral("01024")}, sizes[index],
+        [&results, index](AssetOutcome<QImage> result) {
+          results[index].emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+  }
+
+  QVERIFY(waitUntil([&]() {
+    return std::all_of(results.begin(), results.end(),
+                       [](const auto &result) { return result.has_value(); });
+  }));
+  QCOMPARE(server.requestCountForPath(path), 1);
+  for (const auto &result : results) {
+    QVERIFY(!*result);
+    QCOMPARE(static_cast<int>(result->error().code),
+             static_cast<int>(AssetErrorCode::DecodeError));
+  }
+
+  const AssetCache *cache =
+      AssetImageRequestCoordinatorTestSupport::cache(coordinator);
+  QVERIFY(cache != nullptr);
+  QCOMPARE(cache->memoryCostBytes(), 0);
+  // The disk cache was usable, yet the undecodable bytes never reached it.
+  QCOMPARE(cache->diskStatus(), AssetCache::DiskStatus::Enabled);
+  QCOMPARE(cache->indexedDiskBytes(), 0);
+  QCOMPARE(QDir(cacheRoot.path())
+               .entryList(QDir::Files | QDir::Hidden | QDir::System |
+                          QDir::NoDotAndDotDot),
+           QStringList());
 }
 
 void AssetImageProviderTests::coordinatorCachesNotFoundBriefly() {

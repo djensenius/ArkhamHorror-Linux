@@ -58,6 +58,11 @@ public:
   void cancelAll();
 
 private:
+  // Test-only read access to the coordinator's cache, used by the regression
+  // test that proves a failed first decode leaves no memory entry behind.
+  // Production code never reaches the cache through this grant.
+  friend class AssetImageRequestCoordinatorTestSupport;
+
   struct Waiter {
     quint64 requestId{0};
     QSize bound;
