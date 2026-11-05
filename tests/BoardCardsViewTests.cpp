@@ -218,7 +218,9 @@ private slots:
     QCOMPARE(text->property("textFormat").toInt(), 0);
     QCOMPARE(text->property("text").toString(), label);
 
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 250);
+    // Spin the event loop for the full interval so a delayed rich-text
+    // image fetch would reach the mock server before the check.
+    QTest::qWait(250);
     QCOMPARE(server.requestCountForPath(u"/x.png"_s), 0);
   }
 };
