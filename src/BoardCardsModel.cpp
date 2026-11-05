@@ -10,10 +10,10 @@ BoardCardsModel::BoardCardsModel(QObject *parent)
     : QAbstractListModel(parent) {}
 
 BoardCardsModel::CardNameTable
-BoardCardsModel::cardNamesFromCatalog(const QList<CardDef> &cards) {
+BoardCardsModel::cardNamesFromCatalog(const CatalogNames &catalog) {
   CardNameTable names;
-  names.reserve(cards.size());
-  for (const CardDef &card : cards)
+  names.reserve(catalog.cards.size());
+  for (const CatalogCardNames &card : catalog.cards)
     names.insert(card.cardCode.value(), {card.name, card.revealedName});
   return names;
 }

@@ -604,4 +604,33 @@ struct CardDef {
 [[nodiscard]] ValueOrError<QList<CardDef>>
 decodeCatalogFromRawBytes(QByteArrayView bytes, QStringView path);
 
+// One catalog entry's printed names (CardDef's cardCode, name and
+// revealedName), as decodeCatalogNamesFromRawBytes() reads them.
+struct CatalogCardNames {
+  CardCode cardCode;
+  CardName name;
+  std::optional<CardName> revealedName;
+};
+
+// The names in a card-catalog response: every entry whose cardCode and name
+// decoded, in wire order, plus how many entries were skipped and the first
+// skipped entry's field-path error.
+struct CatalogNames {
+  QList<CatalogCardNames> cards;
+  qsizetype skippedCount{0};
+  QString firstSkipDiagnostic;
+};
+
+// Names-only decode of the same top-level array response shape as
+// decodeCatalogFromRawBytes(), for callers that only label cards. Each
+// entry is decoded on its own and only its cardCode, name and revealedName
+// are read: no closed enum (cardType, classSymbols, slots, ...) or other
+// field is looked at, so a value this client does not model never costs a
+// card its name. An entry that is not an object, or whose cardCode or name
+// is missing or invalid, is skipped and counted; a malformed revealedName
+// keeps the entry with its name only. Fails only when the bytes do not
+// parse or the top level is not an array.
+[[nodiscard]] ValueOrError<CatalogNames>
+decodeCatalogNamesFromRawBytes(QByteArrayView bytes, QStringView path);
+
 } // namespace Arkham

@@ -150,10 +150,10 @@ void GameBoardController::fetchCatalog(
   m_client.listCampaignCards(
       token.profile, token.token,
       [self, generation](const GameRequestStatus &status,
-                         const QList<CardDef> *cards) {
+                         const CatalogNames *catalog) {
         if (!self || generation != self->m_catalogGeneration)
           return;
-        if (status.outcome != GameRequestOutcome::Success || !cards) {
+        if (status.outcome != GameRequestOutcome::Success || !catalog) {
           // Not shown: the board still works, labelled with card codes.
           self->m_catalogStatus = CatalogStatus::None;
           qWarning().noquote()
@@ -161,9 +161,15 @@ void GameBoardController::fetchCatalog(
               << describe(status);
           return;
         }
+        if (catalog->skippedCount > 0)
+          qWarning().noquote()
+              << QStringLiteral("Card catalog: skipped %1 unreadable entries; "
+                                "those cards show card codes. First: %2")
+                     .arg(QString::number(catalog->skippedCount),
+                          catalog->firstSkipDiagnostic);
         self->m_catalogStatus = CatalogStatus::Loaded;
         self->m_board->setCardNames(
-            BoardCardsModel::cardNamesFromCatalog(*cards));
+            BoardCardsModel::cardNamesFromCatalog(*catalog));
       });
 }
 
