@@ -214,6 +214,31 @@ public:
     return m_profiles;
   }
 
+  // The signed-in profile and its access token, for exactly one
+  // authenticated request. Callers pass it straight to that request and
+  // must not store it; the coordinator itself never keeps the token in
+  // memory either (it is re-read from the secure store for every call).
+  struct AccessToken {
+    ServerProfile profile;
+    QString token;
+  };
+  // |token| is engaged on success; otherwise |diagnostic| is a secret-free
+  // reason (not signed in, session changed, or the secure-store error).
+  using AccessTokenCallback = std::function<void(
+      std::optional<AccessToken> token, const QString &diagnostic)>;
+
+  // Reads the current profile's token through the same per-profile
+  // token-store FIFO as credential restore (so it is ordered behind any
+  // pending save/delete), only while state() is SignedIn. The callback runs
+  // asynchronously, at most once: with the token only if the session is
+  // still the same SignedIn session when the read completes, otherwise
+  // with std::nullopt. A failed read never changes the session state. It
+  // does not run if this coordinator is destroyed first, or if a later
+  // start()/switchProfile() restore takes over the queued read (both of
+  // which leave SignedIn first, so callers should also watch
+  // stateChanged()).
+  void requestAccessToken(AccessTokenCallback callback);
+
 public slots:
   // Loads profiles and the selected profile ID, seeding and persisting
   // hostedDefault()+its selection on a genuinely empty first run (and

@@ -865,6 +865,10 @@ private slots:
   void signOutDeletesTokenAndBecomesSignedOut();
   void signOutDeletionFailurePreservesIdentityAndIsRetryable();
   void signOutNoOpWhenNotSignedIn();
+  void accessTokenIsReadThroughTokenStoreWhileSignedIn();
+  void accessTokenIsRefusedWhenNotSignedIn();
+  void accessTokenReadFailureKeepsSessionState();
+  void accessTokenIsWithheldAfterSignOut();
   void duplicateSignOutCallsDispatchExactlyOneDelete();
   void
   directReentrantSignOutDuringSigningOutEmissionDispatchesExactlyOneDelete();
@@ -1976,6 +1980,111 @@ void SessionCoordinatorTests::signOutNoOpWhenNotSignedIn() {
   h.coordinator->signOut();
   QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
   QCOMPARE(h.tokenStore.calls.size(), 1); // only the earlier restore read
+}
+
+namespace {
+// Records every requestAccessToken() callback invocation.
+struct AccessTokenRecorder {
+  int calls{0};
+  std::optional<SessionCoordinator::AccessToken> token;
+  QString diagnostic;
+
+  SessionCoordinator::AccessTokenCallback callback() {
+    return [this](std::optional<SessionCoordinator::AccessToken> received,
+                  const QString &receivedDiagnostic) {
+      ++calls;
+      token = std::move(received);
+      diagnostic = receivedDiagnostic;
+    };
+  }
+};
+} // namespace
+
+void SessionCoordinatorTests::
+    accessTokenIsReadThroughTokenStoreWhileSignedIn() {
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  const int callsBefore = h.tokenStore.calls.size();
+  AccessTokenRecorder recorder;
+  h.coordinator->requestAccessToken(recorder.callback());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), callsBefore + 1);
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("read"));
+  QCOMPARE(h.tokenStore.calls.last().profileId, profileId);
+  QCOMPARE(h.tokenStore.calls.last().endpointIdentity,
+           ServerProfile::hostedDefault().credentialEndpointIdentity());
+  QCOMPARE(recorder.calls, 0);
+
+  const QString expectedToken = QStringLiteral("session-token");
+  h.tokenStore.complete(profileId, successReadResult(expectedToken));
+  QVERIFY(pumpEventsUntil([&recorder] { return recorder.calls == 1; }));
+  QVERIFY(recorder.token.has_value());
+  const QString actualToken = recorder.token->token;
+  QVERIFY(actualToken == expectedToken);
+  QCOMPARE(recorder.token->profile.profileId(), profileId);
+  QVERIFY(recorder.diagnostic.isEmpty());
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedIn);
+  // A second request re-reads the store: nothing was cached.
+  h.coordinator->requestAccessToken(recorder.callback());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.size(), callsBefore + 2);
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("read"));
+}
+
+void SessionCoordinatorTests::accessTokenIsRefusedWhenNotSignedIn() {
+  Harness h;
+  h.bootToSignedOut();
+  AccessTokenRecorder recorder;
+  h.coordinator->requestAccessToken(recorder.callback());
+  // Asynchronous, never reentrant.
+  QCOMPARE(recorder.calls, 0);
+  QVERIFY(pumpEventsUntil([&recorder] { return recorder.calls == 1; }));
+  QVERIFY(!recorder.token.has_value());
+  QCOMPARE(recorder.diagnostic, QStringLiteral("Not signed in."));
+  QCOMPARE(h.tokenStore.calls.size(), 1); // only the earlier restore read
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedOut);
+}
+
+void SessionCoordinatorTests::accessTokenReadFailureKeepsSessionState() {
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  AccessTokenRecorder recorder;
+  h.coordinator->requestAccessToken(recorder.callback());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  h.tokenStore.complete(profileId, accessDeniedResult());
+  QVERIFY(pumpEventsUntil([&recorder] { return recorder.calls == 1; }));
+  QVERIFY(!recorder.token.has_value());
+  QCOMPARE(recorder.diagnostic, QStringLiteral("keyring locked"));
+  QCOMPARE(h.coordinator->state(), SessionCoordinator::State::SignedIn);
+  QVERIFY(h.coordinator->diagnostic().isEmpty());
+}
+
+void SessionCoordinatorTests::accessTokenIsWithheldAfterSignOut() {
+  Harness h;
+  bootToSignedIn(h, QStringLiteral("session-token"));
+  const QString profileId = h.coordinator->selectedProfileId();
+  AccessTokenRecorder recorder;
+  h.coordinator->requestAccessToken(recorder.callback());
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  // Sign out while the read is in flight: the delete queues behind it.
+  h.coordinator->signOut();
+  h.tokenStore.complete(profileId,
+                        successReadResult(QStringLiteral("session-token")));
+  QVERIFY(pumpEventsUntil([&recorder] { return recorder.calls == 1; }));
+  QVERIFY(!recorder.token.has_value());
+  QCOMPARE(recorder.diagnostic,
+           QStringLiteral("The session changed before the request could be "
+                          "sent."));
+  QVERIFY(pumpEventsUntil(
+      [&h, profileId] { return h.tokenStore.hasPending(profileId); }));
+  QCOMPARE(h.tokenStore.calls.last().kind, QStringLiteral("delete"));
+  QCOMPARE(h.tokenStore.overlappingDispatchCount(), 0);
 }
 
 void SessionCoordinatorTests::duplicateSignOutCallsDispatchExactlyOneDelete() {
