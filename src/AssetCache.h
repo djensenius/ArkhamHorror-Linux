@@ -18,8 +18,9 @@ namespace Arkham {
 // invalid or empty bound), so each cell size holds only its own downscaled
 // decode. The disk cache stores the raw encoded bytes keyed by URL only, and a
 // disk hit decodes at the bound being looked up. AssetCache is intended to be
-// used from one owner thread (the GUI thread in production); it does not start
-// background work and does not synchronize concurrent callers. Disk operations
+// used from one owner thread (in production, AssetImageRequestCoordinator's
+// "arkham-card-image-provider" worker thread); it does not start background
+// work and does not synchronize concurrent callers. Disk operations
 // are deliberately small and synchronous: lookup reads at most one cache file,
 // store atomically writes at most one cache file, and eviction uses the
 // in-memory index built once from the cache root's immediate directory entries.
