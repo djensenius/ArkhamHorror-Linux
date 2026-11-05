@@ -270,7 +270,7 @@ private slots:
   void reprintedArt() {
     QFETCH(QString, art);
     QFETCH(QString, expected);
-    QCOMPARE(CardArt::reprintedArt(art), expected);
+    QCOMPARE(AssetLocator::reprintedArt(art), expected);
   }
 
   // helpers.ts's cardImgPath: the Ages Unwound past-selves acts 164-167 use
@@ -296,14 +296,14 @@ private slots:
     row("back of 164c", ages, u"164cb"_s, u"164cb"_s);
     row("other homebrew", u"dark-matter"_s, u"164c"_s, u"164c"_s);
     row("named card", ages, u"xsoldier"_s, u"xsoldier"_s);
-    row("homebrew is not reprinted", u"fan"_s, u"01650"_s, u"01650"_s);
+    row("Ages Unwound mutated", ages, u"164c_Mutated1"_s, u"164c_Mutated1"_s);
   }
 
   void homebrewArt() {
     QFETCH(QString, campaign);
     QFETCH(QString, art);
     QFETCH(QString, expected);
-    QCOMPARE(CardArt::homebrewArt(campaign, art), expected);
+    QCOMPARE(AssetLocator::homebrewArt(campaign, art), expected);
   }
 
   // The rules reach the asset URL the image provider fetches, as on the web.
@@ -312,11 +312,13 @@ private slots:
     QTest::addColumn<int>("face");
     QTest::addColumn<QString>("mutation");
     QTest::addColumn<QString>("path");
+    QTest::addColumn<QString>("classVariant");
     const auto row = [](const char *name, const QString &cardCode,
                         AssetLocator::CardFace face, const QString &mutation,
-                        const QString &path) {
+                        const QString &path,
+                        const QString &classVariant = QString()) {
       QTest::newRow(name) << cardCode << static_cast<int>(face) << mutation
-                          << path;
+                          << path << classVariant;
     };
     const auto front = AssetLocator::CardFace::Front;
     const auto back = AssetLocator::CardFace::Back;
@@ -330,6 +332,8 @@ private slots:
         u"/img/arkham/cards/01683b.avif"_s);
     row("mutated reprint number", u"c01650"_s, front, u"_Mutated1"_s,
         u"/img/arkham/cards/01650_Mutated1.avif"_s);
+    row("class variant reprint number", u"c01650"_s, front, QString(),
+        u"/img/arkham/cards/01650_Guardian.avif"_s, u"_Guardian"_s);
     row("Ages Unwound C", u"c:ages-unwound:165c"_s, front, QString(),
         u"/img/arkham/homebrew/ages-unwound/cards/165.avif"_s);
     row("Ages Unwound D", u"c:ages-unwound:166d"_s, front, QString(),
@@ -345,9 +349,11 @@ private slots:
     QFETCH(int, face);
     QFETCH(QString, mutation);
     QFETCH(QString, path);
+    QFETCH(QString, classVariant);
     const auto url = AssetLocator::buildCardImageUrl(
         AssetLocator::defaultAssetBaseUrl(),
-        {cardCode, static_cast<AssetLocator::CardFace>(face), mutation});
+        {cardCode, static_cast<AssetLocator::CardFace>(face), mutation,
+         classVariant});
     QVERIFY(url.has_value());
     QCOMPARE(url->toString(), u"https://assets.arkhamhorror.app"_s + path);
   }

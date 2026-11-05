@@ -1,7 +1,6 @@
 #include "AssetLocator.h"
 
 #include "AuthTransportSecurity.h"
-#include "CardArt.h"
 
 #include <QStringList>
 
@@ -78,6 +77,11 @@ bool isHomebrewCampaignSegment(const QString &segment) {
   }
   return true;
 }
+
+// The Revised Core Set reprints the original's encounter cards 500 higher.
+constexpr qint64 kRevisedCoreEncounterMin = 1604;
+constexpr qint64 kRevisedCoreEncounterMax = 1682;
+constexpr qint64 kRevisedCoreEncounterOffset = 500;
 
 AssetError invalidKey(const QString &message) {
   return AssetError{AssetErrorCode::InvalidAssetKey, message};
@@ -236,6 +240,38 @@ bool isClassVariantSuffix(const QString &suffix) {
          suffix == "_Mystic"_L1 || suffix == "_Survivor"_L1;
 }
 
+QString reprintedArt(const QString &art) {
+  // art.match(/^(\d+)([a-z]*)$/)
+  qsizetype digits = 0;
+  while (digits < art.size() && isAsciiDigit(art.at(digits)))
+    ++digits;
+  if (digits == 0)
+    return art;
+  for (qsizetype i = digits; i < art.size(); ++i) {
+    if (!isAsciiLower(art.at(i)))
+      return art;
+  }
+
+  // Too many digits to parse is far outside the range, as on the web.
+  bool ok = false;
+  const qint64 number = QStringView(art).left(digits).toLongLong(&ok);
+  if (!ok || number < kRevisedCoreEncounterMin ||
+      number > kRevisedCoreEncounterMax)
+    return art;
+  return QString::number(number - kRevisedCoreEncounterOffset)
+             .rightJustified(5, u'0') +
+         art.mid(digits);
+}
+
+QString homebrewArt(const QString &campaign, const QString &art) {
+  // /^16[4-7][cd]$/ on the ages-unwound campaign.
+  if (campaign == "ages-unwound"_L1 && art.size() == 4 &&
+      art.startsWith("16"_L1) && art.at(2) >= u'4' && art.at(2) <= u'7' &&
+      (art.at(3) == u'c' || art.at(3) == u'd'))
+    return art.left(3) + (art.at(3) == u'd' ? u"b"_s : QString());
+  return art;
+}
+
 bool isCardArtId(const QString &cardCode) {
   return buildCardImageUrl(defaultAssetBaseUrl(), {cardCode}).has_value();
 }
@@ -274,7 +310,7 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
     }
     pathSegments << QStringLiteral("homebrew") << campaign
                  << QStringLiteral("cards")
-                 << CardArt::homebrewArt(campaign, imageFileStem(code, key)) +
+                 << homebrewArt(campaign, imageFileStem(code, key)) +
                         ".avif"_L1;
   } else {
     if (!isOfficialCardCodeSegment(artId)) {
@@ -282,8 +318,7 @@ AssetOutcome<QUrl> buildCardImageUrl(const QUrl &assetBaseUrl,
           QStringLiteral("card code is not a valid asset code segment"));
     }
     pathSegments << QStringLiteral("cards")
-                 << CardArt::reprintedArt(imageFileStem(artId, key)) +
-                        ".avif"_L1;
+                 << reprintedArt(imageFileStem(artId, key)) + ".avif"_L1;
   }
 
   return appendPathSegments(assetBaseUrl, pathSegments);

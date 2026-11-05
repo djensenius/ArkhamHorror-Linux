@@ -61,15 +61,6 @@ qint64 leadingNumber(const QString &text) {
   return ok ? number : -1;
 }
 
-bool isAsciiDigit(QChar c) { return c >= u'0' && c <= u'9'; }
-
-bool isAsciiLower(QChar c) { return c >= u'a' && c <= u'z'; }
-
-// The Revised Core Set reprints the original's encounter cards 500 higher.
-constexpr qint64 kRevisedCoreEncounterMin = 1604;
-constexpr qint64 kRevisedCoreEncounterMax = 1682;
-constexpr qint64 kRevisedCoreEncounterOffset = 500;
-
 } // namespace
 
 QString investigatorImageId(const Investigator &investigator) {
@@ -149,35 +140,6 @@ QString actImageId(const Act &act) {
            replaceFirstOf(replaceFirstOf(sidePart, u"g", QString()), u"h",
                           u"b"_s);
   return u"c"_s + newId + sidePart;
-}
-
-QString reprintedArt(const QString &art) {
-  // art.match(/^(\d+)([a-z]*)$/)
-  qsizetype digits = 0;
-  while (digits < art.size() && isAsciiDigit(art.at(digits)))
-    ++digits;
-  if (digits == 0)
-    return art;
-  for (qsizetype i = digits; i < art.size(); ++i) {
-    if (!isAsciiLower(art.at(i)))
-      return art;
-  }
-
-  const qint64 number = leadingNumber(art);
-  if (number < kRevisedCoreEncounterMin || number > kRevisedCoreEncounterMax)
-    return art;
-  return QString::number(number - kRevisedCoreEncounterOffset)
-             .rightJustified(5, u'0') +
-         art.mid(digits);
-}
-
-QString homebrewArt(const QString &campaign, const QString &art) {
-  // /^16[4-7][cd]$/ on the ages-unwound campaign.
-  if (campaign == "ages-unwound"_L1 && art.size() == 4 &&
-      art.startsWith("16"_L1) && art.at(2) >= u'4' && art.at(2) <= u'7' &&
-      (art.at(3) == u'c' || art.at(3) == u'd'))
-    return art.left(3) + (art.at(3) == u'd' ? u"b"_s : QString());
-  return art;
 }
 
 QString imageSource(const QString &imageId) {

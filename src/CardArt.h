@@ -23,13 +23,16 @@
 // - Act (Act.vue): the art for its sequence side, e.g. "c01108b" on side B,
 //   "c10607b" for c10607a on side B, and the Threads of Fate ranges.
 //
-// The asset file stem rules of the web's imgsrc/cardImgPath (helpers.ts),
-// which AssetLocator::buildCardImageUrl() applies to every card image:
+// The asset file stem rules of the web's imgsrc/cardImgPath (helpers.ts)
+// live in AssetLocator, whose buildCardImageUrl() applies them to every card
+// image:
 //
-// - reprintedArt (artVariants.ts): a Revised Core encounter reprint,
+// - AssetLocator::reprintedArt (artVariants.ts): a Revised Core encounter
+// reprint,
 //   01604-01682 with any lowercase face suffix, reads the original's image,
 //   500 lower: "01615b" -> "01115b".
-// - homebrewArt (cardImgPath): the Ages Unwound past-selves acts 164-167 use
+// - AssetLocator::homebrewArt (cardImgPath): the Ages Unwound past-selves acts
+// 164-167 use
 //   C/D in game, but their files are front/"b": "164c" -> "164",
 //   "164d" -> "164b".
 //
@@ -45,13 +48,6 @@ namespace Arkham::CardArt {
 [[nodiscard]] QString locationImageId(const Location &location);
 [[nodiscard]] QString agendaImageId(const Agenda &agenda);
 [[nodiscard]] QString actImageId(const Act &act);
-
-// The web's reprintedArt for an official file stem ("<art>" without
-// ".avif"); any other stem, including one with a '_' suffix, is unchanged.
-[[nodiscard]] QString reprintedArt(const QString &art);
-
-// The web's cardImgPath file stem for homebrew art :<campaign>:<art>.
-[[nodiscard]] QString homebrewArt(const QString &campaign, const QString &art);
 
 // "image://arkham-card/" + imageId, ready for an Image's `source`.
 [[nodiscard]] QString imageSource(const QString &imageId);
