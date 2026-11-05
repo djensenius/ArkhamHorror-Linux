@@ -90,7 +90,10 @@ ApplicationWindow {
             wrapMode: Text.WordWrap
         }
 
+        // The cards share the row: 280 wide when it has room, narrower
+        // (down to minimumWidth) from the 960 px minimum window width.
         RowLayout {
+            Layout.fillWidth: true
             spacing: 20
 
             Repeater {
@@ -126,7 +129,10 @@ ApplicationWindow {
 
                     required property int index
                     required property var modelData
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 160
                     Layout.preferredWidth: 280
+                    Layout.maximumWidth: 280
                     Layout.preferredHeight: 150
                     activeFocusOnTab: true
                     text: modelData.title
@@ -156,7 +162,11 @@ ApplicationWindow {
                         spacing: 8
 
                         Label {
+                            width: parent.width
                             text: destination.modelData.title
+                            wrapMode: Text.WordWrap
+                            maximumLineCount: 2
+                            elide: Text.ElideRight
                             color: destination.activeFocus ? root.ink : root.bone
                             font {
                                 pixelSize: 24
