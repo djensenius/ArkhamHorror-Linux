@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <utility>
 
@@ -63,6 +64,10 @@ private slots:
   // Closed enums ─────────────────────────────────────────────────────────────
   void unrecognizedCardTypeRejected();
   void unrecognizedClassSymbolRejected();
+  void classSymbolTableIsTheSevenWireNames();
+  void classSymbolsRoundTripEveryValue_data();
+  void classSymbolsRoundTripEveryValue();
+  void wrongCaseClassSymbolRejected();
 
   // Tagged variants (cardCost/gameValue/skillIcon) ──────────────────────────
   void allCardCostVariantsRoundTrip();
@@ -554,6 +559,66 @@ void CardCatalogTests::unrecognizedClassSymbolRejected() {
   const auto result = CardDef::fromJson(obj, u"card");
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("classSymbols")),
+           qPrintable(result.error()));
+}
+
+// TASK-3.2.14: Board, Games and CardCatalog all decode/encode class symbols
+// through this one shared table, so its exact contents and order are pinned
+// here once for all three.
+void CardCatalogTests::classSymbolTableIsTheSevenWireNames() {
+  const std::array<std::pair<QLatin1StringView, ClassSymbol>, 7> expected{{
+      {"Guardian"_L1, ClassSymbol::Guardian},
+      {"Seeker"_L1, ClassSymbol::Seeker},
+      {"Survivor"_L1, ClassSymbol::Survivor},
+      {"Rogue"_L1, ClassSymbol::Rogue},
+      {"Mystic"_L1, ClassSymbol::Mystic},
+      {"Neutral"_L1, ClassSymbol::Neutral},
+      {"Mythos"_L1, ClassSymbol::Mythos},
+  }};
+  QCOMPARE(kClassSymbolTable.size(), expected.size());
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    QCOMPARE(QString(kClassSymbolTable.at(i).first),
+             QString(expected.at(i).first));
+    QCOMPARE(kClassSymbolTable.at(i).second, expected.at(i).second);
+  }
+}
+
+void CardCatalogTests::classSymbolsRoundTripEveryValue_data() {
+  QTest::addColumn<QString>("wire");
+  QTest::addColumn<ClassSymbol>("expected");
+  const std::initializer_list<std::pair<const char *, ClassSymbol>> rows{
+      {"Guardian", ClassSymbol::Guardian}, {"Seeker", ClassSymbol::Seeker},
+      {"Survivor", ClassSymbol::Survivor}, {"Rogue", ClassSymbol::Rogue},
+      {"Mystic", ClassSymbol::Mystic},     {"Neutral", ClassSymbol::Neutral},
+      {"Mythos", ClassSymbol::Mythos},
+  };
+  for (const auto &[wire, expected] : rows)
+    QTest::newRow(wire) << QString::fromLatin1(wire) << expected;
+}
+
+void CardCatalogTests::classSymbolsRoundTripEveryValue() {
+  QFETCH(QString, wire);
+  QFETCH(ClassSymbol, expected);
+  QJsonObject obj = minimalCardObject();
+  obj.insert(QStringLiteral("classSymbols"), QJsonArray{wire});
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY2(result, qPrintable(result ? QString() : result.error()));
+  QCOMPARE(result->classSymbols, (QList<ClassSymbol>{expected}));
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
+  QVERIFY2(encoded, qPrintable(encoded ? QString() : encoded.error()));
+  QCOMPARE(encoded->value(QStringLiteral("classSymbols")),
+           QJsonValue(QJsonArray{wire}));
+}
+
+void CardCatalogTests::wrongCaseClassSymbolRejected() {
+  QJsonObject obj = minimalCardObject();
+  obj.insert(QStringLiteral("classSymbols"),
+             QJsonArray{QStringLiteral("guardian")});
+  const auto result = CardDef::fromJson(obj, u"card");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("classSymbols")),
+           qPrintable(result.error()));
+  QVERIFY2(result.error().contains(uR"(unrecognized value "guardian")"_s),
            qPrintable(result.error()));
 }
 

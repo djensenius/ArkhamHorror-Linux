@@ -289,6 +289,9 @@ private slots:
   void wholeValueNotObjectRejected();
   void unrecognizedUltimatumOrBoonRejected();
   void unrecognizedClassSymbolInInvestigatorSummaryRejected();
+  void wrongCaseClassSymbolInInvestigatorSummaryRejected();
+  void investigatorSummaryClassSymbolRoundTripsEveryValue_data();
+  void investigatorSummaryClassSymbolRoundTripsEveryValue();
 
   // UUID text grammar (pinned backend's exact Data.UUID.fromText format,
   // exercised through the real CreateGameRequest::fromJson() deckIds
@@ -2793,6 +2796,46 @@ void GamesTests::unrecognizedClassSymbolInInvestigatorSummaryRejected() {
   QVERIFY(!result.has_value());
   QVERIFY2(result.error().contains(QStringLiteral("classSymbol")),
            qPrintable(result.error()));
+}
+
+void GamesTests::wrongCaseClassSymbolInInvestigatorSummaryRejected() {
+  const QJsonObject obj{
+      {QStringLiteral("id"), QStringLiteral("c01001")},
+      {QStringLiteral("classSymbol"), QStringLiteral("guardian")}};
+  const auto result = InvestigatorSummary::fromJson(obj, u"investigator");
+  QVERIFY(!result.has_value());
+  QVERIFY2(result.error().contains(QStringLiteral("classSymbol")),
+           qPrintable(result.error()));
+  QVERIFY2(result.error().contains(uR"(unrecognized value "guardian")"_s),
+           qPrintable(result.error()));
+}
+
+// TASK-3.2.14: decodes and re-encodes through the shared kClassSymbolTable
+// (CardCatalog.h), whose exact contents CardCatalogTests pins.
+void GamesTests::investigatorSummaryClassSymbolRoundTripsEveryValue_data() {
+  QTest::addColumn<QString>("wire");
+  QTest::addColumn<ClassSymbol>("expected");
+  const std::initializer_list<std::pair<const char *, ClassSymbol>> rows{
+      {"Guardian", ClassSymbol::Guardian}, {"Seeker", ClassSymbol::Seeker},
+      {"Survivor", ClassSymbol::Survivor}, {"Rogue", ClassSymbol::Rogue},
+      {"Mystic", ClassSymbol::Mystic},     {"Neutral", ClassSymbol::Neutral},
+      {"Mythos", ClassSymbol::Mythos},
+  };
+  for (const auto &[wire, expected] : rows)
+    QTest::newRow(wire) << QString::fromLatin1(wire) << expected;
+}
+
+void GamesTests::investigatorSummaryClassSymbolRoundTripsEveryValue() {
+  QFETCH(QString, wire);
+  QFETCH(ClassSymbol, expected);
+  const QJsonObject obj{{QStringLiteral("id"), QStringLiteral("c01001")},
+                        {QStringLiteral("classSymbol"), wire}};
+  const auto result = InvestigatorSummary::fromJson(obj, u"investigator");
+  QVERIFY2(result, qPrintable(result ? QString() : result.error()));
+  QCOMPARE(result->classSymbol, expected);
+  const auto encoded = Arkham::TestOnly::objectJson(*result);
+  QVERIFY2(encoded, qPrintable(encoded ? QString() : encoded.error()));
+  QCOMPARE(encoded->value(QStringLiteral("classSymbol")), QJsonValue(wire));
 }
 
 void GamesTests::additiveUnknownFieldsIgnoredInChooseDeck() {
