@@ -137,6 +137,8 @@ private slots:
   void coordinatorRerequestAfterCancelCompletesNewFlight();
   void providerLoadsMutatedCardImage();
   void providerLoadsClassVariantCardImage();
+  void providerDecodesAtRequestedSourceSize();
+  void providerCachesOnlyTheSizedDecode();
   void providerUsesSiteSettingsAssetHost();
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable_data();
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable();
@@ -570,6 +572,66 @@ void AssetImageProviderTests::providerLoadsClassVariantCardImage() {
   std::unique_ptr<QQuickTextureFactory> factory(
       imageResponse->textureFactory());
   QVERIFY(factory != nullptr);
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::providerDecodesAtRequestedSourceSize() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01022.avif");
+  server.setResponse(path, response(200, pngBytes(QSize(600, 840))));
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetCardImageProvider provider(configFor(server, cacheRoot));
+
+  const auto loadedSize = [&provider](const QSize &requestedSize) {
+    std::unique_ptr<QQuickImageResponse> imageResponse(
+        provider.requestImageResponse(QStringLiteral("01022"), requestedSize));
+    QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
+    if (!finishedSpy.wait(2000) && finishedSpy.count() != 1) {
+      return QSize(-2, -2);
+    }
+    if (!imageResponse->errorString().isEmpty()) {
+      return QSize(-3, -3);
+    }
+    std::unique_ptr<QQuickTextureFactory> factory(
+        imageResponse->textureFactory());
+    return factory ? factory->image().size() : QSize(-4, -4);
+  };
+
+  QCOMPARE(loadedSize(QSize(150, 210)), QSize(150, 210));
+  QCOMPARE(loadedSize(QSize()), QSize(600, 840));
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::providerCachesOnlyTheSizedDecode() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01023.avif");
+  server.setResponse(path, response(200, pngBytes(QSize(600, 840))));
+
+  // Memory-only cache too small for one full 600x840 decode: the second
+  // request is a cache hit only if the requested size reached the decoder.
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  auto config = configFor(server, cacheRoot);
+  config.cacheConfig.diskMaxBytes = 0;
+  config.cacheConfig.memoryMaxCostBytes = 600 * 840 * 4 - 1;
+  AssetCardImageProvider provider(std::move(config));
+
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::unique_ptr<QQuickImageResponse> imageResponse(
+        provider.requestImageResponse(QStringLiteral("01023"),
+                                      QSize(150, 210)));
+    QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
+    QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+    QCOMPARE(imageResponse->errorString(), QString());
+    std::unique_ptr<QQuickTextureFactory> factory(
+        imageResponse->textureFactory());
+    QVERIFY(factory != nullptr);
+    QCOMPARE(factory->image().size(), QSize(150, 210));
+  }
   QCOMPARE(server.requestCountForPath(path), 1);
 }
 

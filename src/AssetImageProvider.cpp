@@ -308,7 +308,8 @@ AssetCardImageProvider::requestImageResponse(const QString &id,
     }
     QMetaObject::invokeMethod(
         coordinatorHandle->coordinator,
-        [coordinatorHandle, responseState, key = *key]() mutable {
+        [coordinatorHandle, responseState, key = *key,
+         requestedSize]() mutable {
           AssetImageRequestCoordinator *coordinator = nullptr;
           {
             std::lock_guard coordinatorLock(coordinatorHandle->mutex);
@@ -318,8 +319,11 @@ AssetCardImageProvider::requestImageResponse(const QString &id,
             coordinator = coordinatorHandle->coordinator;
           }
 
+          // Qt already passes the device-pixel-scaled sourceSize, so the
+          // requested size goes to the decoder unchanged.
           const quint64 requestId = coordinator->requestCardImage(
-              key, [responseState](AssetOutcome<QImage> result) mutable {
+              key, requestedSize,
+              [responseState](AssetOutcome<QImage> result) mutable {
                 AssetCardImageResponse::completeState(responseState,
                                                       std::move(result));
               });
