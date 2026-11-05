@@ -8,6 +8,7 @@
 #include <QList>
 #include <QObject>
 #include <QString>
+#include <QThreadPool>
 
 #include <chrono>
 #include <functional>
@@ -61,6 +62,13 @@ struct GameRequestStatus {
 // never run). The decoded pointer is non-null only for Success and is
 // valid only for the duration of the callback.
 //
+// The card catalog is large, so a successful listCampaignCards() body is
+// decoded off the GUI thread, on this client's own one-thread pool (so
+// decodes finish in the order their replies did). Its callback is still
+// delivered on this client's thread, exactly once, unless this client is
+// destroyed first. The destructor waits for a decode already running
+// (dropping queued ones) so no worker touches a destroyed client.
+//
 // The QNetworkAccessManager must outlive this client: pending replies are
 // owned by it, and the destructor aborts them through raw pointers.
 class GameClient final : public QObject {
@@ -89,6 +97,13 @@ public:
   // cap when it is issued, so this applies only to requests issued
   // afterwards; production code never calls it.
   void setMaxResponseBytes(qsizetype maxResponseBytes);
+
+  // Test-only: |observer| runs on the decode worker thread just before each
+  // successful catalog body is decoded, so a test can see which thread
+  // decodes and hold a decode in flight. Snapshotted per request like the
+  // response cap. An observer that blocks must be released before this
+  // client is destroyed: the destructor waits for a running decode.
+  void setCatalogDecodeObserverForTesting(std::function<void()> observer);
 
   // The Transport diagnostic for a body over the size cap, so callers can
   // word it apart from a network failure.
@@ -133,6 +148,9 @@ private:
   std::chrono::milliseconds m_timeout;
   qsizetype m_maxResponseBytes{kMaxResponseBytes};
   QHash<QNetworkReply *, PendingReply> m_pendingReplies;
+  std::function<void()> m_catalogDecodeObserver;
+  // One thread, so catalog decodes run (and deliver) in FIFO order.
+  QThreadPool m_decodePool;
 };
 
 } // namespace Arkham
