@@ -1,12 +1,16 @@
 // GameBoardController over a real GameClient and a loopback MockHttpServer,
 // with a stand-in for SessionCoordinator::requestAccessToken: list then
 // board, every error text, retry, and dropping replies that land after
-// reset() (what the app does when the session leaves SignedIn).
+// reset() (what the app does when the session leaves SignedIn), and the
+// card catalog behind the board's card names.
 
 #include <QAbstractItemModel>
 #include <QCoreApplication>
 #include <QDeadlineTimer>
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMetaObject>
 #include <QNetworkAccessManager>
 #include <QtTest>
@@ -43,6 +47,55 @@ MockHttpServer::Response jsonResponse(int status, QByteArray body) {
   return response;
 }
 
+// A GET /arkham/cards?cardPool=campaign body naming get-game.json's
+// agenda, act and location: catalog.json's one card with its code, type
+// and names replaced.
+QByteArray catalogBody() {
+  const QJsonObject card = QJsonDocument::fromJson(fixture(u"catalog.json"_s))
+                               .object()
+                               .value("cards"_L1)
+                               .toArray()
+                               .first()
+                               .toObject();
+  if (card.isEmpty())
+    qFatal("catalog.json has no cards");
+  const auto entry = [&card](const QString &code, const QString &type,
+                             const QString &title, const QString &revealed) {
+    QJsonObject edited = card;
+    edited.insert("cardCode"_L1, code);
+    edited.insert("cardType"_L1, type);
+    edited.insert("name"_L1, QJsonObject{{"title"_L1, title},
+                                         {"subtitle"_L1, QJsonValue()}});
+    if (!revealed.isEmpty())
+      edited.insert(
+          "revealedName"_L1,
+          QJsonObject{{"title"_L1, revealed}, {"subtitle"_L1, QJsonValue()}});
+    return edited;
+  };
+  return QJsonDocument(
+             QJsonArray{
+                 entry(u"c01105"_s, u"AgendaType"_s, u"What's Going On?!"_s,
+                       QString()),
+                 entry(u"c01108"_s, u"ActType"_s, u"Trapped"_s, QString()),
+                 entry(u"c01111"_s, u"LocationType"_s, u"Study (unrevealed)"_s,
+                       u"Study"_s),
+             })
+      .toJson(QJsonDocument::Compact);
+}
+
+QStringList labelsOf(const QAbstractItemModel *model) {
+  QStringList labels;
+  for (int row = 0; row < model->rowCount(); ++row)
+    labels.append(model->data(model->index(row, 0), BoardCardsModel::LabelRole)
+                      .toString());
+  return labels;
+}
+
+const QStringList kCodeLabels{u"c01105"_s, u"c01108"_s, u"c01111"_s,
+                              u"Roland Banks"_s};
+const QStringList kNameLabels{u"What's Going On?!"_s, u"Trapped"_s, u"Study"_s,
+                              u"Roland Banks"_s};
+
 bool waitUntil(const std::function<bool()> &condition, int timeoutMs = 5000) {
   const QDeadlineTimer deadline(timeoutMs);
   while (!condition() && !deadline.hasExpired())
@@ -71,6 +124,13 @@ private:
   QString listPath() const { return m_profile->apiUrl(u"arkham/games").path(); }
   QString gamePath() const {
     return m_profile->apiUrl(u"arkham/games/"_s + kGameId).path();
+  }
+  // The request target, query included, as MockHttpServer keys it.
+  QString cardsTarget() const {
+    return m_profile->apiUrl(u"arkham/cards").path() + u"?cardPool=campaign"_s;
+  }
+  int catalogRequests() const {
+    return m_server->requestCountForPath(cardsTarget());
   }
 
   GameBoardController::AccessTokenSource tokenSource() {
@@ -112,6 +172,8 @@ private slots:
         u"Mock"_s, u"http://127.0.0.1:%1"_s.arg(m_server->serverPort()));
     QVERIFY(profile.has_value());
     m_profile = *profile;
+    // An empty catalog unless a test sets one: no names, nothing logged.
+    m_server->setResponse(cardsTarget(), jsonResponse(200, "[]"_ba));
     m_nam = new QNetworkAccessManager(this);
     m_client = new GameClient(*m_nam, std::chrono::seconds(5), this);
     m_holdToken = false;
@@ -379,6 +441,101 @@ private slots:
     QVERIFY(c.gameTitles().isEmpty());
     c.setSignedIn(true);
     QCOMPARE(signedIn.count(), 2);
+  }
+
+  // The first list fetch also fetches the catalog, with the same token;
+  // the board is labelled with its names, and later fetches reuse it.
+  void catalogIsFetchedOncePerSession() {
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogBody()));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return catalogRequests() == 1; }));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
+    QCOMPARE(m_tokenRequests, 2); // no extra token read for the catalog
+
+    c.closeGame();
+    QVERIFY(loadList(c));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QCOMPARE(labelsOf(c.boardCards()), kNameLabels);
+    QTest::qWait(100);
+    QCOMPARE(catalogRequests(), 1);
+
+    // Leaving the session drops the cache; the next one fetches again.
+    c.reset();
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return catalogRequests() == 2; }));
+  }
+
+  // A catalog slower than the board relabels the open board in place.
+  void lateCatalogRelabelsTheBoard() {
+    MockHttpServer::Response slow = jsonResponse(200, catalogBody());
+    slow.headerDelayMs = 300;
+    m_server->setResponse(cardsTarget(), slow);
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
+    QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
+  }
+
+  // A failed catalog is logged, never shown: the board loads with card
+  // codes, and a later list fetch tries the catalog again.
+  void catalogFailureKeepsCodeLabels() {
+    m_server->setResponse(cardsTarget(), jsonResponse(500, "{}"_ba));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QTest::ignoreMessage(QtWarningMsg,
+                         "Card catalog unavailable; board cards show card "
+                         "codes: The server returned HTTP 500.");
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return catalogRequests() == 1; }));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QTest::qWait(100);
+    QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
+    QVERIFY(c.errorText().isEmpty());
+    QCOMPARE(c.listStatus(), Status::Loaded);
+
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogBody()));
+    c.closeGame();
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return catalogRequests() == 2; }));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
+  }
+
+  // A catalog reply that lands after reset() names nothing.
+  void lateCatalogAfterResetIsDropped() {
+    MockHttpServer::Response slow = jsonResponse(200, catalogBody());
+    slow.headerDelayMs = 150;
+    m_server->setResponse(cardsTarget(), slow);
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return catalogRequests() == 1; }));
+    c.reset();
+    QTest::qWait(400);
+    m_server->setResponse(cardsTarget(), jsonResponse(500, "{}"_ba));
+    QTest::ignoreMessage(QtWarningMsg,
+                         "Card catalog unavailable; board cards show card "
+                         "codes: The server returned HTTP 500.");
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return catalogRequests() == 2; }));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QTest::qWait(100);
+    QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
   }
 
   void tokenArrivingAfterResetSendsNothing() {

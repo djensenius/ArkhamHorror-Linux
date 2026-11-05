@@ -1,6 +1,7 @@
 #include "GameClient.h"
 
 #include "AuthTransportSecurity.h"
+#include "CardCatalog.h"
 #include "Games.h"
 #include "TokenValidation.h"
 
@@ -11,6 +12,7 @@
 #include <QPointer>
 #include <QTimer>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QVariant>
 
 #include <stdexcept>
@@ -96,7 +98,7 @@ GameClient::~GameClient() {
 
 void GameClient::listGames(const ServerProfile &profile, const QString &token,
                            GameListCallback callback) {
-  issue(profile, QStringLiteral("arkham/games"), token,
+  issue(profile, QStringLiteral("arkham/games"), QUrlQuery(), token,
         QStringLiteral("games list not found"),
         [callback = std::move(callback)](const GameRequestStatus &status,
                                          const QByteArray &body) {
@@ -125,8 +127,8 @@ void GameClient::getGame(const ServerProfile &profile, const QString &gameId,
                  QStringLiteral("game ID is not a valid UUID"));
     return;
   }
-  issue(profile, QStringLiteral("arkham/games/") + id->value(), token,
-        QStringLiteral("game not found"),
+  issue(profile, QStringLiteral("arkham/games/") + id->value(), QUrlQuery(),
+        token, QStringLiteral("game not found"),
         [callback = std::move(callback)](const GameRequestStatus &status,
                                          const QByteArray &body) {
           if (status.outcome != GameRequestOutcome::Success) {
@@ -145,9 +147,34 @@ void GameClient::getGame(const ServerProfile &profile, const QString &gameId,
         });
 }
 
+void GameClient::listCampaignCards(const ServerProfile &profile,
+                                   const QString &token,
+                                   CardListCallback callback) {
+  QUrlQuery query;
+  query.addQueryItem(QStringLiteral("cardPool"), QStringLiteral("campaign"));
+  issue(profile, QStringLiteral("arkham/cards"), query, token,
+        QStringLiteral("card catalog not found"),
+        [callback = std::move(callback)](const GameRequestStatus &status,
+                                         const QByteArray &body) {
+          if (status.outcome != GameRequestOutcome::Success) {
+            callback(status, nullptr);
+            return;
+          }
+          const auto cards = decodeCatalogFromRawBytes(body, u"cards");
+          if (!cards) {
+            callback(GameRequestStatus{GameRequestOutcome::DecodeFailed,
+                                       cards.error(), status.httpStatus,
+                                       std::nullopt},
+                     nullptr);
+            return;
+          }
+          callback(status, &*cards);
+        });
+}
+
 void GameClient::issue(const ServerProfile &profile, const QString &path,
-                       const QString &token, QString notFoundDiagnostic,
-                       Completion completion) {
+                       const QUrlQuery &query, const QString &token,
+                       QString notFoundDiagnostic, Completion completion) {
   // Same request-time guards as NetworkAuthenticationClient::whoAmI(): a
   // validated profile, a token that is safe to place in a header, and a
   // secure (or loopback-only cleartext) transport.
@@ -163,7 +190,9 @@ void GameClient::issue(const ServerProfile &profile, const QString &path,
                                 "used in an HTTP header"));
     return;
   }
-  const QUrl url = profile.apiUrl(path);
+  QUrl url = profile.apiUrl(path);
+  if (!query.isEmpty())
+    url.setQuery(query);
   if (!isSecureOrLoopbackAuthTransport(url)) {
     rejectQueued(std::move(completion),
                  QStringLiteral("cleartext HTTP is only permitted to a "

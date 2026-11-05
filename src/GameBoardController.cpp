@@ -1,8 +1,10 @@
 #include "GameBoardController.h"
 
 #include "BoardCardsModel.h"
+#include "CardCatalog.h"
 #include "Games.h"
 
+#include <QDebug>
 #include <QPointer>
 
 #include <utility>
@@ -116,6 +118,8 @@ void GameBoardController::loadGames() {
           self->failList(self->tokenFailureText(diagnostic));
           return;
         }
+        if (self->m_catalogStatus == CatalogStatus::None)
+          self->fetchCatalog(*token);
         self->m_client.listGames(
             token->profile, token->token,
             [self, generation](const GameRequestStatus &status,
@@ -135,6 +139,31 @@ void GameBoardController::loadGames() {
               self->m_listStatus = Status::Loaded;
               emit self->changed();
             });
+      });
+}
+
+void GameBoardController::fetchCatalog(
+    const SessionCoordinator::AccessToken &token) {
+  m_catalogStatus = CatalogStatus::Loading;
+  const quint64 generation = m_catalogGeneration;
+  QPointer<GameBoardController> self(this);
+  m_client.listCampaignCards(
+      token.profile, token.token,
+      [self, generation](const GameRequestStatus &status,
+                         const QList<CardDef> *cards) {
+        if (!self || generation != self->m_catalogGeneration)
+          return;
+        if (status.outcome != GameRequestOutcome::Success || !cards) {
+          // Not shown: the board still works, labelled with card codes.
+          self->m_catalogStatus = CatalogStatus::None;
+          qWarning().noquote()
+              << "Card catalog unavailable; board cards show card codes:"
+              << describe(status);
+          return;
+        }
+        self->m_cardNames = BoardCardsModel::cardNamesFromCatalog(*cards);
+        self->m_catalogStatus = CatalogStatus::Loaded;
+        self->m_board->setCardNames(self->m_cardNames);
       });
 }
 
@@ -201,7 +230,11 @@ void GameBoardController::closeGame() {
 void GameBoardController::reset() {
   ++m_listGeneration;
   ++m_boardGeneration;
+  ++m_catalogGeneration;
+  m_catalogStatus = CatalogStatus::None;
+  m_cardNames.clear();
   m_board->clear();
+  m_board->setCardNames({});
   m_games.clear();
   m_selected = -1;
   m_listStatus = Status::Idle;
