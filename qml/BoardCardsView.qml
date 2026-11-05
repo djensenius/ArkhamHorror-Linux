@@ -30,6 +30,8 @@ GridView {
             anchors.fill: parent
             anchors.margins: 5
             source: delegate.imageSource
+            // Decode only as large as the cell needs.
+            sourceSize: Qt.size(root.cellWidth - 10, root.cellHeight - 10)
             label: delegate.label
         }
     }

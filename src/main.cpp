@@ -112,6 +112,8 @@ int main(int argc, char *argv[]) {
     session = Arkham::composeProductionSession();
     engine.rootContext()->setContextProperty(
         QStringLiteral("sessionCoordinator"), session->coordinator.get());
+    engine.rootContext()->setContextProperty(QStringLiteral("gameBoard"),
+                                             session->gameBoard.get());
   });
 
   engine.loadFromModule(QStringLiteral("ArkhamHorror"), QStringLiteral("Main"));

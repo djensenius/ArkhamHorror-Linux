@@ -1,5 +1,7 @@
 #pragma once
 
+#include "GameBoardController.h"
+#include "GameClient.h"
 #include "IAuthenticationClient.h"
 #include "IProfileStore.h"
 #include "ITokenStore.h"
@@ -18,19 +20,26 @@ namespace Arkham {
 // a dedicated QNetworkAccessManager for capability probing (isolated from
 // NetworkAuthenticationClient's own internally owned manager -- see its
 // production constructor), a QSettingsProfileStore, a QtKeychainTokenStore,
-// a NetworkAuthenticationClient, and the SessionCoordinator itself.
+// a NetworkAuthenticationClient, and the SessionCoordinator itself, plus the
+// game board stack on top of it (a GameClient on its own manager and the
+// GameBoardController that QML drives).
 //
 // Field declaration order is deliberate and load-bearing: C++ destroys
-// members in REVERSE declaration order, and SessionCoordinator only
-// borrows references to everything above it, so it must be destroyed
-// before any of them -- hence it is declared LAST, which means it is
-// destroyed FIRST.
+// members in REVERSE declaration order. SessionCoordinator only borrows
+// references to everything above it, so it must be destroyed before any of
+// them. The game stack is declared after it so it is destroyed first:
+// gameBoard borrows gameClient, gameClient aborts its replies through
+// gameNam, and gameBoard's token source only holds a QPointer to the
+// coordinator.
 struct ProductionSession {
   std::unique_ptr<QNetworkAccessManager> capabilityNam;
   std::unique_ptr<QSettingsProfileStore> profileStore;
   std::unique_ptr<QtKeychainTokenStore> tokenStore;
   std::unique_ptr<NetworkAuthenticationClient> authClient;
   std::unique_ptr<SessionCoordinator> coordinator;
+  std::unique_ptr<QNetworkAccessManager> gameNam;
+  std::unique_ptr<GameClient> gameClient;
+  std::unique_ptr<GameBoardController> gameBoard;
 };
 
 // Constructs the full production dependency graph and a SessionCoordinator

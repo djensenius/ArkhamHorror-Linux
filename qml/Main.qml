@@ -37,6 +37,18 @@ ApplicationWindow {
     }
     // qmllint enable unqualified
 
+    // Shows the games/board screen in place of the landing page (a Loader,
+    // so the screen and its requests exist only while it is open).
+    function openGames() {
+        boardLoader.active = true;
+    }
+    function closeGames() {
+        boardLoader.active = false;
+        const gamesCard = destinations.itemAt(3);
+        if (gamesCard)
+            gamesCard.forceActiveFocus();
+    }
+
     background: Rectangle {
         gradient: Gradient {
             GradientStop {
@@ -51,6 +63,8 @@ ApplicationWindow {
     }
 
     ColumnLayout {
+        objectName: "landing"
+        visible: !boardLoader.active
         anchors {
             fill: parent
             margins: 48
@@ -94,6 +108,11 @@ ApplicationWindow {
                     {
                         title: qsTr("Input guide"),
                         detail: qsTr("Controller and keyboard")
+                    },
+                    {
+                        title: qsTr("Your games"),
+                        detail: qsTr("Open a game's board"),
+                        opensGames: true
                     }
                 ]
 
@@ -111,6 +130,12 @@ ApplicationWindow {
                     Layout.preferredHeight: 150
                     activeFocusOnTab: true
                     text: modelData.title
+                    onClicked: {
+                        if (destination.modelData.opensGames === true)
+                            root.openGames();
+                    }
+                    Keys.onReturnPressed: destination.clicked()
+                    Keys.onEnterPressed: destination.clicked()
 
                     KeyNavigation.left: index > 0 ? destinations.itemAt(index - 1) : null
                     KeyNavigation.right: index + 1 < destinations.count ? destinations.itemAt(index + 1) : null
@@ -305,5 +330,23 @@ ApplicationWindow {
             color: "#a9a189"
             font.pixelSize: 17
         }
+    }
+
+    Loader {
+        id: boardLoader
+
+        objectName: "boardLoader"
+        anchors.fill: parent
+        active: false
+        focus: active
+        sourceComponent: BoardScreen {
+            // gameBoard is only registered during normal startup (see
+            // main.cpp); it is absent in --smoke-test.
+            // qmllint disable unqualified
+            controller: typeof gameBoard !== "undefined" ? gameBoard : null
+            // qmllint enable unqualified
+            onClosed: root.closeGames()
+        }
+        onLoaded: boardLoader.forceActiveFocus()
     }
 }

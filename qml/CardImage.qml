@@ -13,6 +13,8 @@ Item {
     // accessible name.
     property string label
     readonly property int status: image.status
+    // Decode size requested from the image provider (default: full size).
+    property alias sourceSize: image.sourceSize
 
     implicitWidth: 150
     implicitHeight: 210

@@ -81,6 +81,7 @@ private slots:
   void longProfileNameStaysInsideTheStatusLabel();
   void maintenanceNoticeReturnsFocusToTheCardItWasEnteredFrom();
   void endingMaintenanceReturnsFocusFromTheNoticeToACard();
+  void yourGamesCardOpensTheBoardScreenAndEscapeReturns();
 
 private:
   QQuickItem *focusNoticeFromThirdCard(QQuickWindow *window,
@@ -407,6 +408,46 @@ void MainQmlTests::endingMaintenanceReturnsFocusFromTheNoticeToACard() {
   QTRY_VERIFY(window->activeFocusItem() != nullptr);
   QCOMPARE(window->activeFocusItem()->property("text").toString(),
            QStringLiteral("Browse fixtures"));
+}
+
+void MainQmlTests::yourGamesCardOpensTheBoardScreenAndEscapeReturns() {
+  // No gameBoard context property here (as in --smoke-test): the screen
+  // still opens, asks the user to sign in, and Escape comes back.
+  QQuickWindow *window =
+      load(QStringLiteral("Back soon. Try again in about 2 minutes."), 800);
+  QVERIFY(window != nullptr);
+  window->requestActivate();
+  QVERIFY(QTest::qWaitForWindowActive(window));
+  QTRY_VERIFY(window->activeFocusItem() != nullptr);
+  for (int i = 0; i < 3; ++i) {
+    QTest::keyClick(window, Qt::Key_Right);
+  }
+  QQuickItem *gamesCard = window->activeFocusItem();
+  QVERIFY(gamesCard != nullptr);
+  QCOMPARE(gamesCard->property("text").toString(),
+           QStringLiteral("Your games"));
+
+  auto *loader = window->findChild<QQuickItem *>(QStringLiteral("boardLoader"));
+  auto *landing = window->findChild<QQuickItem *>(QStringLiteral("landing"));
+  QVERIFY(loader != nullptr);
+  QVERIFY(landing != nullptr);
+  QVERIFY(!loader->property("active").toBool());
+
+  QTest::keyClick(window, Qt::Key_Return);
+  QTRY_VERIFY(loader->property("active").toBool());
+  QVERIFY(!landing->isVisible());
+  auto *screen = loader->property("item").value<QQuickItem *>();
+  QVERIFY(screen != nullptr);
+  auto *signedOut =
+      screen->findChild<QQuickItem *>(QStringLiteral("signedOutLabel"));
+  QVERIFY(signedOut != nullptr);
+  QVERIFY(signedOut->isVisible());
+  QTRY_VERIFY(screen->hasActiveFocus());
+
+  QTest::keyClick(window, Qt::Key_Escape);
+  QTRY_VERIFY(!loader->property("active").toBool());
+  QVERIFY(landing->isVisible());
+  QTRY_VERIFY(gamesCard->hasActiveFocus());
 }
 
 QTEST_MAIN(MainQmlTests)
