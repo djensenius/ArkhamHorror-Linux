@@ -13,6 +13,7 @@
 #include <QThread>
 #include <QtTest>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -126,6 +127,8 @@ class AssetImageProviderTests final : public QObject {
 private slots:
   void coordinatorCoalescesInFlightRequestsAndUsesCache();
   void coordinatorCancelOneCoalescedWaiterKeepsOtherWaiter();
+  void coordinatorDecodesEachRequestedSizeFromOneFetch();
+  void coordinatorCancelOneSizeKeepsOtherSize();
   void coordinatorCachesNotFoundBriefly();
   void coordinatorDoesNotCacheTransientFailures();
   void coordinatorNegativeCacheExpiresAfterTtl();
@@ -215,6 +218,90 @@ void AssetImageProviderTests::
 
   QVERIFY(waitUntil([&]() { return second.has_value(); }));
   QVERIFY(*second);
+  QVERIFY(!firstCalled);
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::
+    coordinatorDecodesEachRequestedSizeFromOneFetch() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01020.avif");
+  auto delayed = response(200, pngBytes(QSize(600, 840)));
+  delayed.headerDelayMs = 50;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  std::vector<std::optional<AssetOutcome<QImage>>> results(4);
+  const std::vector<QSize> sizes{QSize(150, 210), QSize(300, 420),
+                                 QSize(150, 210), QSize()};
+  for (size_t index = 0; index < sizes.size(); ++index) {
+    const quint64 token = coordinator.requestCardImage(
+        {QStringLiteral("01020")}, sizes[index],
+        [&results, index](AssetOutcome<QImage> result) {
+          results[index].emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+  }
+
+  QVERIFY(waitUntil([&]() {
+    return std::all_of(results.begin(), results.end(),
+                       [](const auto &result) { return result.has_value(); });
+  }));
+  QCOMPARE(server.requestCountForPath(path), 1);
+  const std::vector<QSize> expected{QSize(150, 210), QSize(300, 420),
+                                    QSize(150, 210), QSize(600, 840)};
+  for (size_t index = 0; index < results.size(); ++index) {
+    QVERIFY(*results[index]);
+    QCOMPARE((*results[index])->size(), expected[index]);
+  }
+
+  // A new size after the flight is served from the disk cache, decoded at
+  // that size, without another fetch.
+  std::optional<AssetOutcome<QImage>> later;
+  const quint64 laterToken =
+      coordinator.requestCardImage({QStringLiteral("01020")}, QSize(60, 84),
+                                   [&later](AssetOutcome<QImage> result) {
+                                     later.emplace(std::move(result));
+                                   });
+  Q_UNUSED(laterToken);
+  QVERIFY(waitUntil([&]() { return later.has_value(); }));
+  QVERIFY(*later);
+  QCOMPARE((*later)->size(), QSize(60, 84));
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::coordinatorCancelOneSizeKeepsOtherSize() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01021.avif");
+  auto delayed = response(200, pngBytes(QSize(600, 840)));
+  delayed.headerDelayMs = 75;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  bool firstCalled = false;
+  std::optional<AssetOutcome<QImage>> second;
+  const quint64 firstToken = coordinator.requestCardImage(
+      {QStringLiteral("01021")}, QSize(150, 210),
+      [&firstCalled](AssetOutcome<QImage>) { firstCalled = true; });
+  const quint64 secondToken =
+      coordinator.requestCardImage({QStringLiteral("01021")}, QSize(300, 420),
+                                   [&second](AssetOutcome<QImage> result) {
+                                     second.emplace(std::move(result));
+                                   });
+  Q_UNUSED(secondToken);
+  coordinator.cancel(firstToken);
+
+  QVERIFY(waitUntil([&]() { return second.has_value(); }));
+  QVERIFY(*second);
+  QCOMPARE((*second)->size(), QSize(300, 420));
   QVERIFY(!firstCalled);
   QCOMPARE(server.requestCountForPath(path), 1);
 }
