@@ -28,13 +28,11 @@
 // image:
 //
 // - AssetLocator::reprintedArt (artVariants.ts): a Revised Core encounter
-// reprint,
-//   01604-01682 with any lowercase face suffix, reads the original's image,
-//   500 lower: "01615b" -> "01115b".
-// - AssetLocator::homebrewArt (cardImgPath): the Ages Unwound past-selves acts
-// 164-167 use
-//   C/D in game, but their files are front/"b": "164c" -> "164",
-//   "164d" -> "164b".
+//   reprint, 01604-01682 with any lowercase face suffix, reads the
+//   original's image, 500 lower: "01615b" -> "01115b".
+// - AssetLocator::homebrewArt (cardImgPath): the Ages Unwound past-selves
+//   acts 164-167 use C/D in game, but their files are front/"b":
+//   "164c" -> "164", "164d" -> "164b".
 //
 // The web's per-card art variants (artVariants/backArtVariants and the
 // useVariants preference, empty by default) are not covered: the catalog
