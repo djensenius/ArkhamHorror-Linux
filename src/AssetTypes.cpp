@@ -55,7 +55,10 @@ bool hasAvifBrand(const QByteArray &bytes) {
   return false;
 }
 
-AssetDecodeOutcome<bool> validateLimits(const AssetDecodeLimits &limits) {
+} // namespace
+
+AssetDecodeOutcome<bool>
+validateAssetDecodeLimits(const AssetDecodeLimits &limits) {
   if (limits.maxEncodedBytes <= 0 || limits.maxWidth <= 0 ||
       limits.maxHeight <= 0 || limits.maxPixelCount <= 0 ||
       limits.maxProgressiveJpegScans <= 0) {
@@ -66,8 +69,6 @@ AssetDecodeOutcome<bool> validateLimits(const AssetDecodeLimits &limits) {
   }
   return true;
 }
-
-} // namespace
 
 AssetDecodeOutcome<AssetImageFormat>
 detectAssetImageFormat(const QByteArray &encodedBytes) {
@@ -130,7 +131,7 @@ AssetDecodeOutcome<QImage> decodeFullOrHinted(const QByteArray &encodedBytes,
 AssetDecodeOutcome<QImage> decodeAssetImage(const QByteArray &encodedBytes,
                                             const AssetDecodeLimits &limits,
                                             const QSize &bound) {
-  const auto limitsValidation = validateLimits(limits);
+  const auto limitsValidation = validateAssetDecodeLimits(limits);
   if (!limitsValidation) {
     return limitsValidation.error();
   }

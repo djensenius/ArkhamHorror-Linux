@@ -127,6 +127,11 @@ struct AssetDecodeLimits {
   int maxProgressiveJpegScans = 100;
 };
 
+// Every limit must be positive. Fails with InvalidLimits otherwise; that is a
+// configuration error, never a property of any encoded bytes.
+[[nodiscard]] AssetDecodeOutcome<bool>
+validateAssetDecodeLimits(const AssetDecodeLimits &limits);
+
 [[nodiscard]] AssetDecodeOutcome<AssetImageFormat>
 detectAssetImageFormat(const QByteArray &encodedBytes);
 

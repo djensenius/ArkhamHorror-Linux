@@ -383,6 +383,12 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
   if (!m_index.contains(diskKey)) {
     return {};
   }
+  // Invalid limits are a configuration error; the size and header checks
+  // below depend on them, so checking first keeps them from deleting valid
+  // entries.
+  if (!validateAssetDecodeLimits(m_config.decodeLimits)) {
+    return {};
+  }
 
   const QString path = filePathForName(diskKey);
   const QFileInfo fileInfo(path);

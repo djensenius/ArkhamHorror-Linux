@@ -133,6 +133,7 @@ private slots:
   void sizedBoardDecodesCostAtMostATenthOfFullResolution();
   void evictionMatchesOnlyOneUrlWhenPathContinuesWithAt();
   void diskLookupDropsEntryOnlyForByteErrors();
+  void invalidDecodeLimitsKeepDiskEntries();
   void failedLargerDecodeKeepsSmallerDecodesCached();
   void evictionStaysCorrectAfterDigestTableReset();
 };
@@ -823,6 +824,40 @@ void AssetCacheTests::diskLookupDropsEntryOnlyForByteErrors() {
   QCOMPARE(cache.indexedDiskBytes(), 0);
   QCOMPARE(cache.lookup(url, small).source,
            Arkham::AssetCache::LookupSource::Miss);
+}
+
+void AssetCacheTests::invalidDecodeLimitsKeepDiskEntries() {
+  QTemporaryDir root;
+  QVERIFY(root.isValid());
+  const QColor teal(20, 160, 160, 255);
+  const QByteArray png = encodePng(teal);
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"invalid-limits");
+  qint64 storedBytes = 0;
+  {
+    Arkham::AssetCache cache({.rootDirectory = root.path()});
+    expectStored(cache.store(url, png, QStringLiteral("image/png")));
+    storedBytes = QFileInfo(cachePath(root, url)).size();
+    QVERIFY(storedBytes > png.size());
+  }
+
+  // The size and header checks depend on maxEncodedBytes, so they must not
+  // run, and delete the entry, under limits that are themselves invalid.
+  for (const qsizetype maxEncodedBytes : {qsizetype{0}, qsizetype{-1}}) {
+    Arkham::AssetCache invalid(
+        {.rootDirectory = root.path(),
+         .decodeLimits = {.maxEncodedBytes = maxEncodedBytes}});
+    QCOMPARE(invalid.diskStatus(), Arkham::AssetCache::DiskStatus::Enabled);
+    QCOMPARE(invalid.lookup(url).source,
+             Arkham::AssetCache::LookupSource::Miss);
+    QCOMPARE(QFileInfo(cachePath(root, url)).size(), storedBytes);
+    QCOMPARE(invalid.indexedDiskBytes(), storedBytes);
+  }
+
+  Arkham::AssetCache valid({.rootDirectory = root.path()});
+  const auto hit = valid.lookup(url);
+  QCOMPARE(hit.source, Arkham::AssetCache::LookupSource::Disk);
+  QVERIFY(firstPixelMatches(hit.image, teal));
 }
 
 void AssetCacheTests::failedLargerDecodeKeepsSmallerDecodesCached() {
