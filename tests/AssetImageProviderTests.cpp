@@ -467,6 +467,12 @@ void AssetImageProviderTests::coordinatorFailedLaterDecodeFailsEveryWaiter() {
   Q_UNUSED(largeToken);
   QVERIFY(waitUntil([&]() { return largeAgain.has_value(); }));
   QVERIFY(!*largeAgain);
+  QCOMPARE(static_cast<int>(largeAgain->error().code),
+           static_cast<int>(AssetErrorCode::DecodeError));
+  QCOMPARE(largeAgain->error().message,
+           QStringLiteral("test decoder refuses bounds wider than 200"));
+  // The disk miss refetched once; the refetched bytes failed the same way.
+  QCOMPARE(server.requestCountForPath(path), 2);
   QCOMPARE(cache->indexedDiskBytes(), diskBytes);
   QCOMPARE(QDir(cacheRoot.path())
                .entryList(QDir::Files | QDir::NoDotAndDotDot)

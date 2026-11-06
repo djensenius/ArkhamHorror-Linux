@@ -111,6 +111,7 @@ class AssetCacheTests final : public QObject {
   Q_OBJECT
 
 private slots:
+  void init();
   void memoryHitReturnsDecodedImage();
   void diskHitAfterRestartReportsDiskSource();
   void diskEvictsLeastRecentlyUsedEntry();
@@ -135,6 +136,11 @@ private slots:
   void failedLargerDecodeKeepsSmallerDecodesCached();
   void evictionStaysCorrectAfterDigestTableReset();
 };
+
+void AssetCacheTests::init() {
+  // Runs before every test, so a failed test can't leak its decode error.
+  failingDecodeCode = Arkham::AssetDecodeErrorCode::AllocationFailed;
+}
 
 void AssetCacheTests::memoryHitReturnsDecodedImage() {
   QTemporaryDir root;
@@ -817,7 +823,6 @@ void AssetCacheTests::diskLookupDropsEntryOnlyForByteErrors() {
   QCOMPARE(cache.indexedDiskBytes(), 0);
   QCOMPARE(cache.lookup(url, small).source,
            Arkham::AssetCache::LookupSource::Miss);
-  failingDecodeCode = Arkham::AssetDecodeErrorCode::AllocationFailed;
 }
 
 void AssetCacheTests::failedLargerDecodeKeepsSmallerDecodesCached() {
@@ -828,7 +833,6 @@ void AssetCacheTests::failedLargerDecodeKeepsSmallerDecodesCached() {
   const QUrl url = assetUrl(u"later-bound-fails");
   const QSize small(150, 210);
   const QSize large(300, 420);
-  failingDecodeCode = Arkham::AssetDecodeErrorCode::AllocationFailed;
 
   Arkham::AssetCache cache(
       {.rootDirectory = root.path(), .decoder = &decodeFailingAboveWidth200});
