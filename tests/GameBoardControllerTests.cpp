@@ -285,10 +285,16 @@ private slots:
   }
 
   void cleanup() {
-    m_decodeGate->release(1000);
+    // cleanup() must tolerate a partial init(): the gate and the objects
+    // below may not exist yet, or may already have been deleted.
+    if (m_decodeGate)
+      m_decodeGate->release(1000);
     delete m_client;
+    m_client = nullptr;
     delete m_nam;
+    m_nam = nullptr;
     delete m_server;
+    m_server = nullptr;
     m_profile.reset();
   }
 
