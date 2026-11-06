@@ -24,6 +24,11 @@ AssetDecodeErrorCode errorCodeForAvifResult(avifResult result) {
   case AVIF_RESULT_NO_IMAGES_REMAINING:
   case AVIF_RESULT_NO_CONTENT:
     return AssetDecodeErrorCode::UnsupportedCodec;
+#if AVIF_VERSION >= 100000
+  // libavif 0.10.0 added this result; 0.9.x (Ubuntu 22.04) lacks it.
+  case AVIF_RESULT_OUT_OF_MEMORY:
+    return AssetDecodeErrorCode::AllocationFailed;
+#endif
   default:
     return AssetDecodeErrorCode::MalformedImage;
   }
@@ -70,7 +75,7 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   avifDecoder *decoder = avifDecoderCreate();
   if (!decoder) {
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("libavif decoder allocation failed")};
   }
 
@@ -143,7 +148,7 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   if (!rgb.pixels) {
     avifDecoderDestroy(decoder);
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("failed to allocate AVIF RGB buffer")};
   }
 
@@ -167,10 +172,11 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   avifRGBImageFreePixels(&rgb);
   avifDecoderDestroy(decoder);
 
+  // The RGB buffer was valid, so a null copy is a failed allocation.
   if (owned.isNull()) {
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
-        QStringLiteral("AVIF decode produced an empty image")};
+        AssetDecodeErrorCode::AllocationFailed,
+        QStringLiteral("failed to allocate decoded AVIF image")};
   }
   return owned;
 }

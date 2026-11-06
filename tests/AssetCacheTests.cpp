@@ -1,4 +1,5 @@
 #include <QBuffer>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -85,12 +86,32 @@ QString cachePath(const QTemporaryDir &dir, const QUrl &url) {
       .filePath(Arkham::AssetCache::diskCacheFileNameForUrl(url));
 }
 
+// The error decodeFailingAboveWidth200() reports; tests set it per case.
+Arkham::AssetDecodeErrorCode failingDecodeCode =
+    Arkham::AssetDecodeErrorCode::AllocationFailed;
+
+// Decodes like production but fails any bound wider than 200 pixels (or the
+// full-size bound) with failingDecodeCode.
+Arkham::AssetDecodeOutcome<QImage>
+decodeFailingAboveWidth200(const QByteArray &bytes,
+                           const Arkham::AssetDecodeLimits &limits,
+                           const QSize &bound) {
+  const QSize normalized = Arkham::normalizedAssetDecodeBound(bound);
+  if (!normalized.isValid() || normalized.width() > 200) {
+    return Arkham::AssetDecodeError{
+        failingDecodeCode,
+        QStringLiteral("test decoder refuses bounds wider than 200")};
+  }
+  return Arkham::decodeAssetImage(bytes, limits, bound);
+}
+
 } // namespace
 
 class AssetCacheTests final : public QObject {
   Q_OBJECT
 
 private slots:
+  void init();
   void memoryHitReturnsDecodedImage();
   void diskHitAfterRestartReportsDiskSource();
   void diskEvictsLeastRecentlyUsedEntry();
@@ -110,7 +131,17 @@ private slots:
   void restoringSameBytesKeepsOtherSizedEntries();
   void restoringChangedBytesDropsEverySizedEntry();
   void sizedBoardDecodesCostAtMostATenthOfFullResolution();
+  void evictionMatchesOnlyOneUrlWhenPathContinuesWithAt();
+  void diskLookupDropsEntryOnlyForByteErrors();
+  void invalidDecodeLimitsKeepDiskEntries();
+  void failedLargerDecodeKeepsSmallerDecodesCached();
+  void evictionStaysCorrectAfterDigestTableReset();
 };
+
+void AssetCacheTests::init() {
+  // Runs before every test, so a failed test can't leak its decode error.
+  failingDecodeCode = Arkham::AssetDecodeErrorCode::AllocationFailed;
+}
 
 void AssetCacheTests::memoryHitReturnsDecodedImage() {
   QTemporaryDir root;
@@ -584,7 +615,12 @@ void AssetCacheTests::diskHitDecodesAtLookedUpBound() {
   // The disk file holds the raw encoded bytes, keyed by URL only.
   QFile file(cachePath(root, url));
   QVERIFY(file.open(QIODevice::ReadOnly));
-  QVERIFY(file.readAll().endsWith(png));
+  const QByteArray fileBytes = file.readAll();
+  QVERIFY(fileBytes.endsWith(png));
+  QVERIFY(fileBytes.contains(
+      "\npayload-sha256:" +
+      QCryptographicHash::hash(png, QCryptographicHash::Sha256).toHex() +
+      "\n"));
 
   const auto diskHit = cache.lookup(url, cell);
   QCOMPARE(diskHit.source, Arkham::AssetCache::LookupSource::Disk);
@@ -716,6 +752,187 @@ void AssetCacheTests::sizedBoardDecodesCostAtMostATenthOfFullResolution() {
   QCOMPARE(fullBytes, qint64{kCards} * 600 * 840 * 4);  // 40,320,000
   QCOMPARE(sizedBytes, qint64{kCards} * 150 * 210 * 4); // 2,520,000
   QVERIFY(sizedBytes * 10 <= fullBytes);
+}
+
+void AssetCacheTests::evictionMatchesOnlyOneUrlWhenPathContinuesWithAt() {
+  const QColor red(220, 20, 20, 255);
+  const QColor blue(20, 20, 220, 255);
+  const QByteArray redPng = encodePng(red, QSize(60, 84));
+  const QByteArray bluePng = encodePng(blue, QSize(60, 84));
+  QVERIFY(!redPng.isEmpty());
+  QVERIFY(!bluePng.isEmpty());
+  const QUrl plain(QStringLiteral("https://assets.example.test/img/a"));
+  const QUrl at(QStringLiteral("https://assets.example.test/img/a@x"));
+  QVERIFY(at.toEncoded().endsWith("/img/a@x"));
+  const QSize cell(15, 21);
+
+  Arkham::AssetCache cache({.diskMaxBytes = 0});
+  expectStored(cache.store(at, bluePng, QStringLiteral("image/png"), cell));
+  // A first store for plain evicts plain's sizes, never a@x's.
+  expectStored(cache.store(plain, redPng, QStringLiteral("image/png"), cell));
+  const auto atHit = cache.lookup(at, cell);
+  QCOMPARE(atHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(atHit.image, blue));
+
+  // Changed bytes for a@x evict only a@x's sizes.
+  expectStored(cache.store(at, redPng, QStringLiteral("image/png")));
+  QCOMPARE(cache.lookup(at, cell).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  const auto plainHit = cache.lookup(plain, cell);
+  QCOMPARE(plainHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(plainHit.image, red));
+  QCOMPARE(cache.memoryCostBytes(), 15 * 21 * 4 + 60 * 84 * 4);
+}
+
+void AssetCacheTests::diskLookupDropsEntryOnlyForByteErrors() {
+  QTemporaryDir root;
+  QVERIFY(root.isValid());
+  const QByteArray png = encodePatternPng(QSize(600, 840));
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"bound-specific-failure");
+  const QSize small(150, 210);
+  const QSize large(300, 420);
+
+  Arkham::AssetCache cache(
+      {.rootDirectory = root.path(), .decoder = &decodeFailingAboveWidth200});
+  QCOMPARE(cache.diskStatus(), Arkham::AssetCache::DiskStatus::Enabled);
+  expectStored(cache.store(url, png, QStringLiteral("image/png"), small));
+  const qint64 diskBytes = cache.indexedDiskBytes();
+  QVERIFY(diskBytes > png.size());
+
+  // Failed allocations and invalid limits say nothing about the bytes: the
+  // entry stays and a smaller bound still decodes from disk.
+  for (const auto code : {Arkham::AssetDecodeErrorCode::AllocationFailed,
+                          Arkham::AssetDecodeErrorCode::InvalidLimits}) {
+    failingDecodeCode = code;
+    cache.clearMemory();
+    QCOMPARE(cache.lookup(url, large).source,
+             Arkham::AssetCache::LookupSource::Miss);
+    QVERIFY(QFileInfo::exists(cachePath(root, url)));
+    QCOMPARE(cache.indexedDiskBytes(), diskBytes);
+    const auto smallHit = cache.lookup(url, small);
+    QCOMPARE(smallHit.source, Arkham::AssetCache::LookupSource::Disk);
+    QCOMPARE(smallHit.image.size(), small);
+  }
+
+  // Malformed bytes fail at every bound, so the entry goes.
+  failingDecodeCode = Arkham::AssetDecodeErrorCode::MalformedImage;
+  cache.clearMemory();
+  QCOMPARE(cache.lookup(url, large).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  QVERIFY(!QFileInfo::exists(cachePath(root, url)));
+  QCOMPARE(cache.indexedDiskBytes(), 0);
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Miss);
+}
+
+void AssetCacheTests::invalidDecodeLimitsKeepDiskEntries() {
+  QTemporaryDir root;
+  QVERIFY(root.isValid());
+  const QColor teal(20, 160, 160, 255);
+  const QByteArray png = encodePng(teal);
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"invalid-limits");
+  qint64 storedBytes = 0;
+  {
+    Arkham::AssetCache cache({.rootDirectory = root.path()});
+    expectStored(cache.store(url, png, QStringLiteral("image/png")));
+    storedBytes = QFileInfo(cachePath(root, url)).size();
+    QVERIFY(storedBytes > png.size());
+  }
+
+  // The size and header checks depend on maxEncodedBytes, so they must not
+  // run, and delete the entry, under limits that are themselves invalid.
+  for (const qsizetype maxEncodedBytes : {qsizetype{0}, qsizetype{-1}}) {
+    Arkham::AssetCache invalid(
+        {.rootDirectory = root.path(),
+         .decodeLimits = {.maxEncodedBytes = maxEncodedBytes}});
+    QCOMPARE(invalid.diskStatus(), Arkham::AssetCache::DiskStatus::Enabled);
+    QCOMPARE(invalid.lookup(url).source,
+             Arkham::AssetCache::LookupSource::Miss);
+    QCOMPARE(QFileInfo(cachePath(root, url)).size(), storedBytes);
+    QCOMPARE(invalid.indexedDiskBytes(), storedBytes);
+  }
+
+  Arkham::AssetCache valid({.rootDirectory = root.path()});
+  const auto hit = valid.lookup(url);
+  QCOMPARE(hit.source, Arkham::AssetCache::LookupSource::Disk);
+  QVERIFY(firstPixelMatches(hit.image, teal));
+}
+
+void AssetCacheTests::failedLargerDecodeKeepsSmallerDecodesCached() {
+  QTemporaryDir root;
+  QVERIFY(root.isValid());
+  const QByteArray png = encodePatternPng(QSize(600, 840));
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"later-bound-fails");
+  const QSize small(150, 210);
+  const QSize large(300, 420);
+
+  Arkham::AssetCache cache(
+      {.rootDirectory = root.path(), .decoder = &decodeFailingAboveWidth200});
+  expectStored(cache.store(url, png, QStringLiteral("image/png"), small));
+  const auto failedStore =
+      cache.store(url, png, QStringLiteral("image/png"), large);
+  QVERIFY(!failedStore);
+  QCOMPARE(failedStore.error().code,
+           Arkham::AssetDecodeErrorCode::AllocationFailed);
+  const auto failedMemoryOnly = cache.storeMemoryOnly(url, png, large);
+  QVERIFY(!failedMemoryOnly);
+  QCOMPARE(cache.lookup(url, large).source,
+           Arkham::AssetCache::LookupSource::Miss);
+
+  const auto smallHit = cache.lookup(url, small);
+  QCOMPARE(smallHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(smallHit.image.size(), small);
+  QCOMPARE(cache.memoryCostBytes(), 150 * 210 * 4);
+  QVERIFY(QFileInfo::exists(cachePath(root, url)));
+}
+
+void AssetCacheTests::evictionStaysCorrectAfterDigestTableReset() {
+  const QColor red(220, 20, 20, 255);
+  const QColor blue(20, 20, 220, 255);
+  const QByteArray redPng = encodePng(red, QSize(60, 84));
+  const QByteArray bluePng = encodePng(blue, QSize(60, 84));
+  const QByteArray tinyPng = encodePng(red, QSize(1, 1));
+  QVERIFY(!redPng.isEmpty());
+  QVERIFY(!bluePng.isEmpty());
+  QVERIFY(!tinyPng.isEmpty());
+  const QUrl url = assetUrl(u"digest-reset");
+  const QSize small(15, 21);
+  const QSize large(30, 42);
+
+  QCOMPARE(Arkham::AssetCache::Config{}.maxPayloadDigests, 4096);
+  Arkham::AssetCache cache({.diskMaxBytes = 0, .maxPayloadDigests = 4});
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), small));
+  // url plus 4 more URLs passes the 4-digest cap, so the table resets and
+  // forgets url's digest.
+  for (int index = 0; index < 4; ++index) {
+    expectStored(cache.store(assetUrl(QStringLiteral("filler-%1").arg(index)),
+                             tinyPng, QStringLiteral("image/png")));
+  }
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Memory);
+
+  // With no digest known, even the same bytes count as changed.
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), large));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  // The digest is known again, so the same bytes keep the other size.
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), small));
+  const auto largeHit = cache.lookup(url, large);
+  QCOMPARE(largeHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(largeHit.image, red));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Memory);
+
+  // Changed bytes evict both sizes.
+  expectStored(cache.store(url, bluePng, QStringLiteral("image/png")));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  QCOMPARE(cache.lookup(url, large).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  QVERIFY(firstPixelMatches(cache.lookup(url).image, blue));
 }
 
 QTEST_APPLESS_MAIN(AssetCacheTests)

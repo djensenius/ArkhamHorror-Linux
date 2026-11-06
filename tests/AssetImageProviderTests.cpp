@@ -105,8 +105,8 @@ bool fetchSettingsIntoProvider(AssetCardImageProvider &provider,
 }
 
 // Decodes like production but fails any bound wider than 200 pixels (or the
-// full-size bound), standing in for a decode that only the larger bound
-// cannot finish, such as a failed allocation.
+// full-size bound) with AllocationFailed, standing in for a decode that only
+// the larger bound cannot finish.
 AssetDecodeOutcome<QImage>
 decodeFailingAboveWidth200(const QByteArray &bytes,
                            const AssetDecodeLimits &limits,
@@ -114,7 +114,7 @@ decodeFailingAboveWidth200(const QByteArray &bytes,
   const QSize normalized = normalizedAssetDecodeBound(bound);
   if (!normalized.isValid() || normalized.width() > 200) {
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("test decoder refuses bounds wider than 200")};
   }
   return decodeAssetImage(bytes, limits, bound);
@@ -435,6 +435,49 @@ void AssetImageProviderTests::coordinatorFailedLaterDecodeFailsEveryWaiter() {
     QCOMPARE(results[index]->error().message,
              QStringLiteral("test decoder refuses bounds wider than 200"));
   }
+
+  // The failed 300x420 decode leaves the earlier 150x210 decode cached in
+  // memory and the encoded bytes on disk.
+  const AssetCache *cache =
+      AssetImageRequestCoordinatorTestSupport::cache(coordinator);
+  QVERIFY(cache != nullptr);
+  QCOMPARE(cache->memoryCostBytes(), 150 * 210 * 4);
+  const qint64 diskBytes = cache->indexedDiskBytes();
+  QVERIFY(diskBytes > 0);
+
+  std::optional<AssetOutcome<QImage>> smallAgain;
+  const quint64 smallToken =
+      coordinator.requestCardImage({QStringLiteral("01025")}, QSize(150, 210),
+                                   [&smallAgain](AssetOutcome<QImage> result) {
+                                     smallAgain.emplace(std::move(result));
+                                   });
+  Q_UNUSED(smallToken);
+  QVERIFY(waitUntil([&]() { return smallAgain.has_value(); }));
+  QVERIFY(*smallAgain);
+  QCOMPARE((*smallAgain)->size(), QSize(150, 210));
+  QCOMPARE(server.requestCountForPath(path), 1);
+
+  // A disk lookup that fails to allocate at 300x420 keeps the disk entry.
+  std::optional<AssetOutcome<QImage>> largeAgain;
+  const quint64 largeToken =
+      coordinator.requestCardImage({QStringLiteral("01025")}, QSize(300, 420),
+                                   [&largeAgain](AssetOutcome<QImage> result) {
+                                     largeAgain.emplace(std::move(result));
+                                   });
+  Q_UNUSED(largeToken);
+  QVERIFY(waitUntil([&]() { return largeAgain.has_value(); }));
+  QVERIFY(!*largeAgain);
+  QCOMPARE(static_cast<int>(largeAgain->error().code),
+           static_cast<int>(AssetErrorCode::DecodeError));
+  QCOMPARE(largeAgain->error().message,
+           QStringLiteral("test decoder refuses bounds wider than 200"));
+  // The disk miss refetched once; the refetched bytes failed the same way.
+  QCOMPARE(server.requestCountForPath(path), 2);
+  QCOMPARE(cache->indexedDiskBytes(), diskBytes);
+  QCOMPARE(QDir(cacheRoot.path())
+               .entryList(QDir::Files | QDir::NoDotAndDotDot)
+               .size(),
+           1);
 }
 
 void AssetImageProviderTests::coordinatorCachesNotFoundBriefly() {

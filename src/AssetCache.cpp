@@ -21,7 +21,6 @@ namespace {
 
 constexpr qsizetype kMaxHeaderBytes = 4096;
 constexpr auto kFileMagic = "ARKHAM-ASSET-CACHE 1";
-constexpr qsizetype kMaxMemoryPayloadDigests = 4096;
 
 [[nodiscard]] bool isLowerHexSha256FileName(const QString &fileName) {
   if (fileName.size() != 64) {
@@ -41,6 +40,7 @@ constexpr qsizetype kMaxMemoryPayloadDigests = 4096;
 }
 
 [[nodiscard]] QByteArray buildHeader(const QByteArray &payload,
+                                     const QByteArray &payloadSha256,
                                      const QString &contentType) {
   QByteArray header;
   header += kFileMagic;
@@ -53,7 +53,7 @@ constexpr qsizetype kMaxMemoryPayloadDigests = 4096;
   header += QByteArray::number(payload.size());
   header += '\n';
   header += "payload-sha256:";
-  header += payloadSha256Hex(payload);
+  header += payloadSha256.toHex();
   header += '\n';
   header += "stored-at-ms:";
   header += QByteArray::number(QDateTime::currentMSecsSinceEpoch());
@@ -178,7 +178,7 @@ AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
       knownDigest.value() != digest) {
     removeMemoryEntriesForUrl(url);
     if (knownDigest == m_memoryPayloadDigests.cend() &&
-        m_memoryPayloadDigests.size() >= kMaxMemoryPayloadDigests) {
+        m_memoryPayloadDigests.size() >= m_config.maxPayloadDigests) {
       // Forgetting digests is safe: a URL without one is treated as changed.
       m_memoryPayloadDigests.clear();
     }
@@ -187,7 +187,7 @@ AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
   promoteToMemory(memoryKeyFor(url, bound), *decoded);
 
   if (m_diskStatus == DiskStatus::Enabled) {
-    storeDisk(diskCacheFileNameForUrl(url), encodedBytes, contentType);
+    storeDisk(diskCacheFileNameForUrl(url), encodedBytes, digest, contentType);
   }
   return decoded;
 }
@@ -358,11 +358,14 @@ void AssetCache::promoteToMemory(const QString &key, const QImage &image) {
 }
 
 void AssetCache::removeMemoryEntriesForUrl(const QUrl &url) {
-  const QString prefix =
-      QString::fromLatin1(canonicalUrlBytes(url)) + QLatin1Char('@');
+  // A key is the canonical URL, '@', and a suffix without '@' (see
+  // memoryKeyFor). Split at the last '@' so a URL whose path continues with
+  // '@' never matches another URL's keys.
+  const QString urlKey = QString::fromLatin1(canonicalUrlBytes(url));
   const QList<QString> keys = m_memoryCache.keys();
   for (const QString &key : keys) {
-    if (key.startsWith(prefix)) {
+    if (key.lastIndexOf(QLatin1Char('@')) == urlKey.size() &&
+        key.startsWith(urlKey)) {
       m_memoryCache.remove(key);
     }
   }
@@ -378,6 +381,12 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
                                                 const QString &memoryKey,
                                                 const QSize &bound) {
   if (!m_index.contains(diskKey)) {
+    return {};
+  }
+  // Invalid limits are a configuration error; the size and header checks
+  // below depend on them, so checking first keeps them from deleting valid
+  // entries.
+  if (!validateAssetDecodeLimits(m_config.decodeLimits)) {
     return {};
   }
 
@@ -420,7 +429,15 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
 
   auto decoded = decode(payload, bound);
   if (!decoded) {
-    removeDiskEntry(diskKey);
+    // A failed allocation depends on the bound and on memory pressure, and
+    // invalid limits are a configuration error; neither says these bytes are
+    // bad, so a smaller bound may still decode them. Every other decode error
+    // is fixed for these bytes.
+    const AssetDecodeErrorCode code = decoded.error().code;
+    if (code != AssetDecodeErrorCode::AllocationFailed &&
+        code != AssetDecodeErrorCode::InvalidLimits) {
+      removeDiskEntry(diskKey);
+    }
     return {};
   }
 
@@ -435,9 +452,11 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
 
 void AssetCache::storeDisk(const QString &diskKey,
                            const QByteArray &encodedBytes,
+                           const QByteArray &payloadSha256,
                            const QString &contentType) {
   const QString path = filePathForName(diskKey);
-  const QByteArray header = buildHeader(encodedBytes, contentType);
+  const QByteArray header =
+      buildHeader(encodedBytes, payloadSha256, contentType);
   const qint64 entrySize = header.size() + encodedBytes.size();
   if (entrySize > m_config.diskMaxBytes) {
     m_diagnostic =

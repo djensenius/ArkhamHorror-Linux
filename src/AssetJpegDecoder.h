@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AssetTypes.h"
+
 #include <QSize>
 
 // Implementation-detail header declared only for the project's src/ header
@@ -20,5 +22,12 @@ namespace Arkham::detail {
 [[nodiscard]] unsigned int jpegScaleDenominator(unsigned int width,
                                                 unsigned int height,
                                                 const QSize &target);
+
+// Maps the libjpeg message code of a fatal error to a decode error code.
+// JERR_OUT_OF_MEMORY is AllocationFailed, because it depends on memory
+// pressure rather than on the bytes; every other fatal error is
+// MalformedImage. Declared here so the decoder tests can check the mapping
+// without having to exhaust memory.
+[[nodiscard]] AssetDecodeErrorCode jpegFatalErrorCode(int messageCode);
 
 } // namespace Arkham::detail

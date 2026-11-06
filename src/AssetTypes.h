@@ -86,6 +86,9 @@ enum class AssetDecodeErrorCode : int {
   ProgressiveScanLimitExceeded,
   UnsupportedCodec,
   MalformedImage,
+  // Memory for a decode could not be allocated. Depends on the requested
+  // bound and on memory pressure, not on the encoded bytes being bad.
+  AllocationFailed,
 };
 
 struct AssetDecodeError {
@@ -123,6 +126,11 @@ struct AssetDecodeLimits {
   qint64 maxPixelCount = 32LL * 1024LL * 1024LL;
   int maxProgressiveJpegScans = 100;
 };
+
+// Every limit must be positive. Fails with InvalidLimits otherwise; that is a
+// configuration error, never a property of any encoded bytes.
+[[nodiscard]] AssetDecodeOutcome<bool>
+validateAssetDecodeLimits(const AssetDecodeLimits &limits);
 
 [[nodiscard]] AssetDecodeOutcome<AssetImageFormat>
 detectAssetImageFormat(const QByteArray &encodedBytes);

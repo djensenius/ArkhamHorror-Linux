@@ -41,6 +41,9 @@ public:
     // Every decode goes through this function. Production keeps
     // decodeAssetImage; tests substitute a decoder that fails at chosen bounds.
     Decoder decoder{&decodeAssetImage};
+    // Payload digests kept before the table resets (see
+    // m_memoryPayloadDigests). Tests lower it to reach a reset quickly.
+    qsizetype maxPayloadDigests{4096};
   };
 
   enum class DiskStatus {
@@ -122,8 +125,10 @@ private:
   [[nodiscard]] LookupResult lookupDisk(const QString &diskKey,
                                         const QString &memoryKey,
                                         const QSize &bound);
+  // payloadSha256 is the raw SHA-256 of encodedBytes, computed once by
+  // store().
   void storeDisk(const QString &diskKey, const QByteArray &encodedBytes,
-                 const QString &contentType);
+                 const QByteArray &payloadSha256, const QString &contentType);
   void removeDiskEntry(const QString &key);
   void setDiskEntryAccess(const QString &key, quint64 access);
   void evictIfNeeded();
@@ -133,7 +138,7 @@ private:
   QCache<QString, QImage> m_memoryCache;
   // SHA-256 of the bytes the last store() decoded, keyed by canonical URL.
   // A URL without a digest is treated as changed. Cleared with the memory
-  // cache, and reset when it reaches kMaxMemoryPayloadDigests entries.
+  // cache, and reset when it reaches Config::maxPayloadDigests entries.
   QHash<QString, QByteArray> m_memoryPayloadDigests;
   QHash<QString, DiskEntry> m_index;
   std::multimap<quint64, QString> m_lruQueue;
