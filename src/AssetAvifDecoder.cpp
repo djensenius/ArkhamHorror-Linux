@@ -70,7 +70,7 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   avifDecoder *decoder = avifDecoderCreate();
   if (!decoder) {
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("libavif decoder allocation failed")};
   }
 
@@ -143,7 +143,7 @@ AssetDecodeOutcome<QImage> decodeAvifImage(const QByteArray &encodedBytes,
   if (!rgb.pixels) {
     avifDecoderDestroy(decoder);
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("failed to allocate AVIF RGB buffer")};
   }
 

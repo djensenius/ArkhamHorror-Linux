@@ -126,7 +126,7 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
       static_cast<JpegDecodeState *>(std::malloc(sizeof(JpegDecodeState)));
   if (!state) {
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("failed to allocate JPEG decoder state")};
   }
   std::memset(state, 0, sizeof(*state));
@@ -229,7 +229,7 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
     jpeg_destroy_decompress(&state->cinfo);
     std::free(state);
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("failed to allocate JPEG scanline buffer")};
   }
 
@@ -260,7 +260,7 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
   if (image.isNull()) {
     std::free(scanlineBuffer);
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("failed to allocate decoded JPEG image")};
   }
   for (int row = 0; row < outHeight; ++row) {

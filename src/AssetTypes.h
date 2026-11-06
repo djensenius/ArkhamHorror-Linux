@@ -86,6 +86,9 @@ enum class AssetDecodeErrorCode : int {
   ProgressiveScanLimitExceeded,
   UnsupportedCodec,
   MalformedImage,
+  // Memory for a decode could not be allocated. Depends on the requested
+  // bound and on memory pressure, not on the encoded bytes being bad.
+  AllocationFailed,
 };
 
 struct AssetDecodeError {

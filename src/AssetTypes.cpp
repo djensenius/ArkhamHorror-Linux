@@ -162,7 +162,7 @@ AssetDecodeOutcome<QImage> decodeAssetImage(const QByteArray &encodedBytes,
       decoded->scaled(target, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
   if (decoded->isNull()) {
     return AssetDecodeError{
-        AssetDecodeErrorCode::MalformedImage,
+        AssetDecodeErrorCode::AllocationFailed,
         QStringLiteral("failed to allocate the downscaled asset image")};
   }
   return decoded;

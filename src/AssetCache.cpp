@@ -424,7 +424,15 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
 
   auto decoded = decode(payload, bound);
   if (!decoded) {
-    removeDiskEntry(diskKey);
+    // A failed allocation depends on the bound and on memory pressure, and
+    // invalid limits are a configuration error; neither says these bytes are
+    // bad, so a smaller bound may still decode them. Every other decode error
+    // is fixed for these bytes.
+    const AssetDecodeErrorCode code = decoded.error().code;
+    if (code != AssetDecodeErrorCode::AllocationFailed &&
+        code != AssetDecodeErrorCode::InvalidLimits) {
+      removeDiskEntry(diskKey);
+    }
     return {};
   }
 
