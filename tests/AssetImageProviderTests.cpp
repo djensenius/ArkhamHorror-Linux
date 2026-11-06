@@ -3,6 +3,7 @@
 #include <QBuffer>
 #include <QCoreApplication>
 #include <QDeadlineTimer>
+#include <QDir>
 #include <QEvent>
 #include <QEventLoop>
 #include <QNetworkAccessManager>
@@ -13,6 +14,7 @@
 #include <QThread>
 #include <QtTest>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -102,6 +104,22 @@ bool fetchSettingsIntoProvider(AssetCardImageProvider &provider,
   return finishedSpy.wait(2000) || finishedSpy.count() == 1;
 }
 
+// Decodes like production but fails any bound wider than 200 pixels (or the
+// full-size bound), standing in for a decode that only the larger bound
+// cannot finish, such as a failed allocation.
+AssetDecodeOutcome<QImage>
+decodeFailingAboveWidth200(const QByteArray &bytes,
+                           const AssetDecodeLimits &limits,
+                           const QSize &bound) {
+  const QSize normalized = normalizedAssetDecodeBound(bound);
+  if (!normalized.isValid() || normalized.width() > 200) {
+    return AssetDecodeError{
+        AssetDecodeErrorCode::MalformedImage,
+        QStringLiteral("test decoder refuses bounds wider than 200")};
+  }
+  return decodeAssetImage(bytes, limits, bound);
+}
+
 bool waitForPendingResponseDrain(const AssetCardImageResponse &response,
                                  int timeoutMs = 2000) {
   const QDeadlineTimer deadline(timeoutMs);
@@ -120,12 +138,29 @@ bool waitForPendingResponseDrain(const AssetCardImageResponse &response,
 
 } // namespace
 
+namespace Arkham {
+// Reads the coordinator's private cache (see the friend declaration and its
+// rationale in AssetImageRequestCoordinator.h) so the decode-failure test can
+// prove that nothing reached the memory cache.
+class AssetImageRequestCoordinatorTestSupport {
+public:
+  static const AssetCache *
+  cache(const AssetImageRequestCoordinator &coordinator) {
+    return coordinator.m_cache.get();
+  }
+};
+} // namespace Arkham
+
 class AssetImageProviderTests final : public QObject {
   Q_OBJECT
 
 private slots:
   void coordinatorCoalescesInFlightRequestsAndUsesCache();
   void coordinatorCancelOneCoalescedWaiterKeepsOtherWaiter();
+  void coordinatorDecodesEachRequestedSizeFromOneFetch();
+  void coordinatorCancelOneSizeKeepsOtherSize();
+  void coordinatorFailedFirstDecodeFailsEveryWaiter();
+  void coordinatorFailedLaterDecodeFailsEveryWaiter();
   void coordinatorCachesNotFoundBriefly();
   void coordinatorDoesNotCacheTransientFailures();
   void coordinatorNegativeCacheExpiresAfterTtl();
@@ -134,6 +169,8 @@ private slots:
   void coordinatorRerequestAfterCancelCompletesNewFlight();
   void providerLoadsMutatedCardImage();
   void providerLoadsClassVariantCardImage();
+  void providerDecodesAtRequestedSourceSize();
+  void providerCachesOnlyTheSizedDecode();
   void providerUsesSiteSettingsAssetHost();
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable_data();
   void providerFallsBackWhenSiteSettingsAssetHostUnavailable();
@@ -217,6 +254,187 @@ void AssetImageProviderTests::
   QVERIFY(*second);
   QVERIFY(!firstCalled);
   QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::
+    coordinatorDecodesEachRequestedSizeFromOneFetch() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01020.avif");
+  auto delayed = response(200, pngBytes(QSize(600, 840)));
+  delayed.headerDelayMs = 50;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  std::vector<std::optional<AssetOutcome<QImage>>> results(4);
+  const std::vector<QSize> sizes{QSize(150, 210), QSize(300, 420),
+                                 QSize(150, 210), QSize()};
+  for (size_t index = 0; index < sizes.size(); ++index) {
+    const quint64 token = coordinator.requestCardImage(
+        {QStringLiteral("01020")}, sizes[index],
+        [&results, index](AssetOutcome<QImage> result) {
+          results[index].emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+  }
+
+  QVERIFY(waitUntil([&]() {
+    return std::all_of(results.begin(), results.end(),
+                       [](const auto &result) { return result.has_value(); });
+  }));
+  QCOMPARE(server.requestCountForPath(path), 1);
+  const std::vector<QSize> expected{QSize(150, 210), QSize(300, 420),
+                                    QSize(150, 210), QSize(600, 840)};
+  for (size_t index = 0; index < results.size(); ++index) {
+    QVERIFY(*results[index]);
+    QCOMPARE((*results[index])->size(), expected[index]);
+  }
+
+  // A new size after the flight is served from the disk cache, decoded at
+  // that size, without another fetch.
+  std::optional<AssetOutcome<QImage>> later;
+  const quint64 laterToken =
+      coordinator.requestCardImage({QStringLiteral("01020")}, QSize(60, 84),
+                                   [&later](AssetOutcome<QImage> result) {
+                                     later.emplace(std::move(result));
+                                   });
+  Q_UNUSED(laterToken);
+  QVERIFY(waitUntil([&]() { return later.has_value(); }));
+  QVERIFY(*later);
+  QCOMPARE((*later)->size(), QSize(60, 84));
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::coordinatorCancelOneSizeKeepsOtherSize() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01021.avif");
+  auto delayed = response(200, pngBytes(QSize(600, 840)));
+  delayed.headerDelayMs = 75;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  bool firstCalled = false;
+  std::optional<AssetOutcome<QImage>> second;
+  const quint64 firstToken = coordinator.requestCardImage(
+      {QStringLiteral("01021")}, QSize(150, 210),
+      [&firstCalled](AssetOutcome<QImage>) { firstCalled = true; });
+  const quint64 secondToken =
+      coordinator.requestCardImage({QStringLiteral("01021")}, QSize(300, 420),
+                                   [&second](AssetOutcome<QImage> result) {
+                                     second.emplace(std::move(result));
+                                   });
+  Q_UNUSED(secondToken);
+  coordinator.cancel(firstToken);
+
+  QVERIFY(waitUntil([&]() { return second.has_value(); }));
+  QVERIFY(*second);
+  QCOMPARE((*second)->size(), QSize(300, 420));
+  QVERIFY(!firstCalled);
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::coordinatorFailedFirstDecodeFailsEveryWaiter() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01024.avif");
+  // A PNG cut off inside its first chunks: sniffed as PNG, fails to decode.
+  const QByteArray undecodable = pngBytes(QSize(600, 840)).left(64);
+  QCOMPARE(undecodable.size(), 64);
+  auto delayed = response(200, undecodable);
+  delayed.headerDelayMs = 50;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetImageRequestCoordinator coordinator(configFor(server, cacheRoot));
+
+  std::vector<std::optional<AssetOutcome<QImage>>> results(2);
+  const std::vector<QSize> sizes{QSize(150, 210), QSize()};
+  for (size_t index = 0; index < sizes.size(); ++index) {
+    const quint64 token = coordinator.requestCardImage(
+        {QStringLiteral("01024")}, sizes[index],
+        [&results, index](AssetOutcome<QImage> result) {
+          results[index].emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+  }
+
+  QVERIFY(waitUntil([&]() {
+    return std::all_of(results.begin(), results.end(),
+                       [](const auto &result) { return result.has_value(); });
+  }));
+  QCOMPARE(server.requestCountForPath(path), 1);
+  for (const auto &result : results) {
+    QVERIFY(!*result);
+    QCOMPARE(static_cast<int>(result->error().code),
+             static_cast<int>(AssetErrorCode::DecodeError));
+  }
+
+  const AssetCache *cache =
+      AssetImageRequestCoordinatorTestSupport::cache(coordinator);
+  QVERIFY(cache != nullptr);
+  QCOMPARE(cache->memoryCostBytes(), 0);
+  // The disk cache was usable, yet the undecodable bytes never reached it.
+  QCOMPARE(cache->diskStatus(), AssetCache::DiskStatus::Enabled);
+  QCOMPARE(cache->indexedDiskBytes(), 0);
+  QCOMPARE(QDir(cacheRoot.path())
+               .entryList(QDir::Files | QDir::Hidden | QDir::System |
+                          QDir::NoDotAndDotDot),
+           QStringList());
+}
+
+void AssetImageProviderTests::coordinatorFailedLaterDecodeFailsEveryWaiter() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01025.avif");
+  auto delayed = response(200, pngBytes(QSize(600, 840)));
+  delayed.headerDelayMs = 50;
+  server.setResponse(path, delayed);
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  auto config = configFor(server, cacheRoot);
+  config.cacheConfig.decoder = &decodeFailingAboveWidth200;
+  AssetImageRequestCoordinator coordinator(config);
+
+  // The 150x210 bound decodes first and succeeds; the 300x420 bound decodes
+  // second and fails. Every waiter, including both 150x210 waiters, fails.
+  const std::vector<QSize> sizes{QSize(150, 210), QSize(300, 420),
+                                 QSize(150, 210)};
+  std::vector<std::optional<AssetOutcome<QImage>>> results(sizes.size());
+  std::vector<int> calls(sizes.size(), 0);
+  for (size_t index = 0; index < sizes.size(); ++index) {
+    const quint64 token = coordinator.requestCardImage(
+        {QStringLiteral("01025")}, sizes[index],
+        [&results, &calls, index](AssetOutcome<QImage> result) {
+          ++calls[index];
+          results[index].emplace(std::move(result));
+        });
+    Q_UNUSED(token);
+  }
+
+  QVERIFY(waitUntil([&]() {
+    return std::all_of(results.begin(), results.end(),
+                       [](const auto &result) { return result.has_value(); });
+  }));
+  // Let any stray second completion arrive before counting.
+  QTest::qWait(50);
+  QCOMPARE(server.requestCountForPath(path), 1);
+  for (size_t index = 0; index < results.size(); ++index) {
+    QCOMPARE(calls[index], 1);
+    QVERIFY(!*results[index]);
+    QCOMPARE(static_cast<int>(results[index]->error().code),
+             static_cast<int>(AssetErrorCode::DecodeError));
+    QCOMPARE(results[index]->error().message,
+             QStringLiteral("test decoder refuses bounds wider than 200"));
+  }
 }
 
 void AssetImageProviderTests::coordinatorCachesNotFoundBriefly() {
@@ -483,6 +701,66 @@ void AssetImageProviderTests::providerLoadsClassVariantCardImage() {
   std::unique_ptr<QQuickTextureFactory> factory(
       imageResponse->textureFactory());
   QVERIFY(factory != nullptr);
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::providerDecodesAtRequestedSourceSize() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01022.avif");
+  server.setResponse(path, response(200, pngBytes(QSize(600, 840))));
+
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  AssetCardImageProvider provider(configFor(server, cacheRoot));
+
+  const auto loadedSize = [&provider](const QSize &requestedSize) {
+    std::unique_ptr<QQuickImageResponse> imageResponse(
+        provider.requestImageResponse(QStringLiteral("01022"), requestedSize));
+    QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
+    if (!finishedSpy.wait(2000) && finishedSpy.count() != 1) {
+      return QSize(-2, -2);
+    }
+    if (!imageResponse->errorString().isEmpty()) {
+      return QSize(-3, -3);
+    }
+    std::unique_ptr<QQuickTextureFactory> factory(
+        imageResponse->textureFactory());
+    return factory ? factory->image().size() : QSize(-4, -4);
+  };
+
+  QCOMPARE(loadedSize(QSize(150, 210)), QSize(150, 210));
+  QCOMPARE(loadedSize(QSize()), QSize(600, 840));
+  QCOMPARE(server.requestCountForPath(path), 1);
+}
+
+void AssetImageProviderTests::providerCachesOnlyTheSizedDecode() {
+  MockHttpServer server;
+  QVERIFY(server.start());
+  const QString path = QStringLiteral("/img/arkham/cards/01023.avif");
+  server.setResponse(path, response(200, pngBytes(QSize(600, 840))));
+
+  // Memory-only cache too small for one full 600x840 decode: the second
+  // request is a cache hit only if the requested size reached the decoder.
+  QTemporaryDir cacheRoot;
+  QVERIFY(cacheRoot.isValid());
+  auto config = configFor(server, cacheRoot);
+  config.cacheConfig.diskMaxBytes = 0;
+  config.cacheConfig.memoryMaxCostBytes = 600 * 840 * 4 - 1;
+  AssetCardImageProvider provider(std::move(config));
+
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::unique_ptr<QQuickImageResponse> imageResponse(
+        provider.requestImageResponse(QStringLiteral("01023"),
+                                      QSize(150, 210)));
+    QSignalSpy finishedSpy(imageResponse.get(), &QQuickImageResponse::finished);
+    QVERIFY(finishedSpy.wait(2000) || finishedSpy.count() == 1);
+    QCOMPARE(imageResponse->errorString(), QString());
+    std::unique_ptr<QQuickTextureFactory> factory(
+        imageResponse->textureFactory());
+    QVERIFY(factory != nullptr);
+    QCOMPARE(factory->image().size(), QSize(150, 210));
+  }
   QCOMPARE(server.requestCountForPath(path), 1);
 }
 
