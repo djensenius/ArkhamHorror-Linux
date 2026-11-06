@@ -1,6 +1,8 @@
 #include <cstdio>
 
 #include <jpeglib.h>
+// jerror.h needs jpeglib.h first; it defines the JERR_* message codes.
+#include <jerror.h>
 
 #include <avif/avif.h>
 
@@ -305,6 +307,7 @@ private slots:
   void pngDecodesAtRequestedBound();
   void jpegDecodesAtRequestedBound();
   void jpegScaleDenominatorPicksLargestCoveringReduction();
+  void jpegFatalOutOfMemoryIsAllocationFailure();
   void avifDecodesAtRequestedBound();
   void boundLargerThanSourceDoesNotUpscale();
   void emptyBoundDecodesFullSize();
@@ -527,6 +530,22 @@ void AssetDecoderTests::jpegScaleDenominatorPicksLargestCoveringReduction() {
   QCOMPARE(fittedAssetDecodeSize(QSize(599, 839), QSize(150, 210)),
            QSize(149, 210));
   QCOMPARE(denominator(QSize(599, 839), QSize(150, 210)), 4U);
+}
+
+void AssetDecoderTests::jpegFatalOutOfMemoryIsAllocationFailure() {
+  using Arkham::detail::jpegFatalErrorCode;
+  // Out of memory is transient, so callers such as the disk cache keep the
+  // entry; every other fatal libjpeg error means the bytes are bad.
+  QCOMPARE(jpegFatalErrorCode(JERR_OUT_OF_MEMORY),
+           AssetDecodeErrorCode::AllocationFailed);
+  QCOMPARE(jpegFatalErrorCode(JERR_NO_SOI),
+           AssetDecodeErrorCode::MalformedImage);
+  QCOMPARE(jpegFatalErrorCode(JERR_INPUT_EOF),
+           AssetDecodeErrorCode::MalformedImage);
+  QCOMPARE(jpegFatalErrorCode(JERR_BAD_HUFF_TABLE),
+           AssetDecodeErrorCode::MalformedImage);
+  QCOMPARE(jpegFatalErrorCode(JMSG_NOMESSAGE),
+           AssetDecodeErrorCode::MalformedImage);
 }
 
 void AssetDecoderTests::avifDecodesAtRequestedBound() {

@@ -5,6 +5,8 @@
 #include <cstdio>
 
 #include <jpeglib.h>
+// jerror.h needs jpeglib.h first; it defines the JERR_* message codes.
+#include <jerror.h>
 
 #include <csetjmp>
 #include <cstdlib>
@@ -109,6 +111,14 @@ unsigned int jpegScaleDenominator(unsigned int width, unsigned int height,
   return 1;
 }
 
+// See AssetJpegDecoder.h.
+AssetDecodeErrorCode jpegFatalErrorCode(int messageCode) {
+  if (messageCode == JERR_OUT_OF_MEMORY) {
+    return AssetDecodeErrorCode::AllocationFailed;
+  }
+  return AssetDecodeErrorCode::MalformedImage;
+}
+
 } // namespace detail
 
 AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
@@ -144,6 +154,7 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
     char messageCopy[JMSG_LENGTH_MAX];
     std::memcpy(messageCopy, failedState->errorManager.fatalMessage,
                 sizeof(messageCopy));
+    const int messageCode = failedState->errorManager.pub.msg_code;
     const bool scanLimitExceeded = failedState->progressiveScanLimitExceeded;
     const int maxScans = failedState->progressManager.maxProgressiveScans;
     std::free(failedState->scanlineBuffer);
@@ -155,6 +166,14 @@ AssetDecodeOutcome<QImage> decodeJpegImage(const QByteArray &encodedBytes,
           QStringLiteral(
               "progressive JPEG exceeded the configured cap of %1 scans")
               .arg(maxScans),
+      };
+    }
+    if (detail::jpegFatalErrorCode(messageCode) ==
+        AssetDecodeErrorCode::AllocationFailed) {
+      return AssetDecodeError{
+          AssetDecodeErrorCode::AllocationFailed,
+          QStringLiteral("libjpeg ran out of memory decoding the JPEG: %1")
+              .arg(QString::fromLatin1(messageCopy)),
       };
     }
     return AssetDecodeError{
