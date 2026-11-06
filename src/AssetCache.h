@@ -122,8 +122,10 @@ private:
   [[nodiscard]] LookupResult lookupDisk(const QString &diskKey,
                                         const QString &memoryKey,
                                         const QSize &bound);
+  // payloadSha256 is the raw SHA-256 of encodedBytes, computed once by
+  // store().
   void storeDisk(const QString &diskKey, const QByteArray &encodedBytes,
-                 const QString &contentType);
+                 const QByteArray &payloadSha256, const QString &contentType);
   void removeDiskEntry(const QString &key);
   void setDiskEntryAccess(const QString &key, quint64 access);
   void evictIfNeeded();

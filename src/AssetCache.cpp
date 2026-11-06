@@ -41,6 +41,7 @@ constexpr qsizetype kMaxMemoryPayloadDigests = 4096;
 }
 
 [[nodiscard]] QByteArray buildHeader(const QByteArray &payload,
+                                     const QByteArray &payloadSha256,
                                      const QString &contentType) {
   QByteArray header;
   header += kFileMagic;
@@ -53,7 +54,7 @@ constexpr qsizetype kMaxMemoryPayloadDigests = 4096;
   header += QByteArray::number(payload.size());
   header += '\n';
   header += "payload-sha256:";
-  header += payloadSha256Hex(payload);
+  header += payloadSha256.toHex();
   header += '\n';
   header += "stored-at-ms:";
   header += QByteArray::number(QDateTime::currentMSecsSinceEpoch());
@@ -187,7 +188,7 @@ AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
   promoteToMemory(memoryKeyFor(url, bound), *decoded);
 
   if (m_diskStatus == DiskStatus::Enabled) {
-    storeDisk(diskCacheFileNameForUrl(url), encodedBytes, contentType);
+    storeDisk(diskCacheFileNameForUrl(url), encodedBytes, digest, contentType);
   }
   return decoded;
 }
@@ -438,9 +439,11 @@ AssetCache::LookupResult AssetCache::lookupDisk(const QString &diskKey,
 
 void AssetCache::storeDisk(const QString &diskKey,
                            const QByteArray &encodedBytes,
+                           const QByteArray &payloadSha256,
                            const QString &contentType) {
   const QString path = filePathForName(diskKey);
-  const QByteArray header = buildHeader(encodedBytes, contentType);
+  const QByteArray header =
+      buildHeader(encodedBytes, payloadSha256, contentType);
   const qint64 entrySize = header.size() + encodedBytes.size();
   if (entrySize > m_config.diskMaxBytes) {
     m_diagnostic =

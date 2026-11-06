@@ -1,4 +1,5 @@
 #include <QBuffer>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -585,7 +586,12 @@ void AssetCacheTests::diskHitDecodesAtLookedUpBound() {
   // The disk file holds the raw encoded bytes, keyed by URL only.
   QFile file(cachePath(root, url));
   QVERIFY(file.open(QIODevice::ReadOnly));
-  QVERIFY(file.readAll().endsWith(png));
+  const QByteArray fileBytes = file.readAll();
+  QVERIFY(fileBytes.endsWith(png));
+  QVERIFY(fileBytes.contains(
+      "\npayload-sha256:" +
+      QCryptographicHash::hash(png, QCryptographicHash::Sha256).toHex() +
+      "\n"));
 
   const auto diskHit = cache.lookup(url, cell);
   QCOMPARE(diskHit.source, Arkham::AssetCache::LookupSource::Disk);
