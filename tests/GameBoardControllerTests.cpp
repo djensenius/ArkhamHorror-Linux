@@ -13,10 +13,12 @@
 #include <QJsonObject>
 #include <QMetaObject>
 #include <QNetworkAccessManager>
-#include <QNetworkReply>
+#include <QSemaphore>
 #include <QtTest>
 
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -99,6 +101,24 @@ const QStringList kCodeLabels{u"c01105"_s, u"c01108"_s, u"c01111"_s,
 const QStringList kNameLabels{u"What's Going On?!"_s, u"Trapped"_s, u"Study"_s,
                               u"Roland Banks"_s};
 
+// catalogBody() with the same codes retitled B1, B2 and B3.
+QByteArray catalogBodyB() {
+  QByteArray body = catalogBody();
+  const auto retitle = [&body](const QByteArray &from, const QByteArray &to) {
+    if (body.count(from) != 1)
+      qFatal("catalog retitle target not unique: %s", from.constData());
+    body.replace(from, to);
+  };
+  retitle(R"("title":"What's Going On?!")"_ba, R"("title":"B1")"_ba);
+  retitle(R"("title":"Trapped")"_ba, R"("title":"B2")"_ba);
+  retitle(R"j("title":"Study (unrevealed)")j"_ba,
+          R"j("title":"B3 (unrevealed)")j"_ba);
+  retitle(R"("title":"Study")"_ba, R"("title":"B3")"_ba);
+  return body;
+}
+
+const QStringList kNameLabelsB{u"B1"_s, u"B2"_s, u"B3"_s, u"Roland Banks"_s};
+
 // Counts the controller's "catalog unavailable" warnings (or those with
 // another |prefix|) while alive, and passes every message on to QtTest's
 // own handler (so QTest::ignoreMessage() still applies). Lets a test wait
@@ -167,6 +187,11 @@ private:
   int m_tokenRequests{0};
   QString m_tokenDiagnostic{u"Not signed in."_s};
   SessionCoordinator::AccessTokenCallback m_heldToken;
+  // Gates the catalog decodes holdCatalogDecodes() holds; cleanup() frees
+  // them before deleting m_client, whose destructor waits for a running
+  // decode.
+  std::unique_ptr<QSemaphore> m_decodeGate;
+  std::atomic<int> m_decodesEntered{0};
 
   QString listPath() const { return m_profile->apiUrl(u"arkham/games").path(); }
   QString gamePath() const {
@@ -203,6 +228,33 @@ private:
     };
   }
 
+  // Every catalog request issued from now on holds its decode on
+  // m_client's worker until releaseCatalogDecodes() frees it.
+  void holdCatalogDecodes() {
+    QSemaphore *gate = m_decodeGate.get();
+    std::atomic<int> *entered = &m_decodesEntered;
+    m_client->setCatalogDecodeObserverForTesting([gate, entered] {
+      ++*entered;
+      gate->acquire();
+    });
+  }
+  void releaseCatalogDecodes(int count) { m_decodeGate->release(count); }
+
+  // Returns once every catalog decode m_client had started has been
+  // delivered: m_client decodes one reply at a time, in order, so a fresh
+  // (unheld) catalog request issued now is delivered after all of them.
+  bool drainCatalogDecodes() {
+    m_client->setCatalogDecodeObserverForTesting(nullptr);
+    m_server->setResponse(cardsTarget(), jsonResponse(200, "[]"_ba));
+    auto delivered = std::make_shared<bool>(false);
+    m_client->listCampaignCards(
+        *m_profile, u"tok-1"_s,
+        [delivered](const GameRequestStatus &, const CatalogNames *) {
+          *delivered = true;
+        });
+    return waitUntil([delivered] { return *delivered; });
+  }
+
   // Loads the fixture list into |c| and returns whether it loaded.
   bool loadList(GameBoardController &c) {
     m_server->setResponse(listPath(),
@@ -228,12 +280,21 @@ private slots:
     m_tokenRequests = 0;
     m_tokenDiagnostic = u"Not signed in."_s;
     m_heldToken = nullptr;
+    m_decodeGate = std::make_unique<QSemaphore>();
+    m_decodesEntered = 0;
   }
 
   void cleanup() {
+    // cleanup() must tolerate a partial init(): the gate and the objects
+    // below may not exist yet, or may already have been deleted.
+    if (m_decodeGate)
+      m_decodeGate->release(1000);
     delete m_client;
+    m_client = nullptr;
     delete m_nam;
+    m_nam = nullptr;
     delete m_server;
+    m_server = nullptr;
     m_profile.reset();
   }
 
@@ -697,47 +758,112 @@ private slots:
     m_server->setResponse(gamePath(),
                           jsonResponse(200, fixture(u"get-game.json"_s)));
     GameBoardController c(*m_client, tokenSource());
+    // The counter is a member (reset by init()), so it outlives m_client's
+    // worker even if this test returns early.
+    std::atomic<int> *entered = &m_decodesEntered;
+    m_client->setCatalogDecodeObserverForTesting([entered] { ++*entered; });
     QVERIFY(loadList(c));
     QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
     c.reset();
-    // Wait for the client to finish the stale reply before the next
-    // session starts, so the drop path is exercised rather than raced.
-    // The handler below (via the manager's finished signal) and
-    // GameClient::handleFinished both run synchronously in the same
-    // QNetworkReply::finished emission, ours first; so once the wait sees
-    // it, the controller has already handled and dropped the stale reply.
-    // The reply is read inside the emission because the client deletes it
-    // afterwards. staleWatch is scoped so later replies are not counted.
-    {
-      int staleFinished = 0;
-      QString stalePath;
-      QNetworkReply::NetworkError staleError =
-          QNetworkReply::UnknownNetworkError;
-      QObject staleWatch;
-      connect(m_nam, &QNetworkAccessManager::finished, &staleWatch,
-              [&](QNetworkReply *reply) {
-                ++staleFinished;
-                stalePath = reply->url().path();
-                staleError = reply->error();
-              });
-      m_server->releaseHeld();
-      QVERIFY(waitUntil([&staleFinished] { return staleFinished == 1; }));
-      QCoreApplication::processEvents();
-      QCOMPARE(staleFinished, 1);
-      QCOMPARE(stalePath, m_profile->apiUrl(u"arkham/cards").path());
-      QCOMPARE(staleError, QNetworkReply::NoError);
-    }
+    // The stale reply is decoded off the GUI thread and delivered later,
+    // so wait for that delivery (not just the reply) before the next
+    // session starts: the drop path is then exercised rather than raced.
+    m_server->releaseHeld();
+    QVERIFY(waitUntil([this] { return m_decodesEntered.load() == 1; }));
+    QVERIFY(drainCatalogDecodes());
+    QCOMPARE(m_decodesEntered.load(), 1);
 
     m_server->setResponse(cardsTarget(), held(jsonResponse(500, "{}"_ba)));
     QVERIFY(loadList(c));
     QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
-    QCOMPARE(catalogRequests(), 2);
+    // The stale reply, the drain request and this session's.
+    QCOMPARE(catalogRequests(), 3);
     c.openGame(0);
     QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
     QTest::ignoreMessage(QtWarningMsg, kCatalog500Warning);
     m_server->releaseHeld();
     QVERIFY(waitUntil([&warnings] { return warnings.count() == 1; }));
     QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
+  }
+
+  // TASK-3.3.9: a controller destroyed while its catalog is decoding is
+  // never called back; the body has an unreadable entry, so a delivery that
+  // reached it would log a "Card catalog:" warning.
+  void catalogDecodedAfterControllerDestroyedIsDropped() {
+    CatalogWarningCounter warnings("Card catalog"_L1);
+    QByteArray body = catalogBody();
+    const QByteArray trappedName = R"({"subtitle":null,"title":"Trapped"})"_ba;
+    QCOMPARE(body.count(trappedName), 1);
+    body.replace(trappedName, "null"_ba);
+    m_server->setResponse(cardsTarget(), jsonResponse(200, body));
+    holdCatalogDecodes();
+    auto *c = new GameBoardController(*m_client, tokenSource());
+    QVERIFY(loadList(*c));
+    QVERIFY(waitUntil([this] { return m_decodesEntered.load() == 1; }));
+    delete c;
+    releaseCatalogDecodes(1);
+    QVERIFY(drainCatalogDecodes());
+    QCOMPARE(m_decodesEntered.load(), 1);
+    QCOMPARE(warnings.count(), 0);
+  }
+
+  // After reset() the next session's catalog wins: the earlier session's
+  // catalog (A), still decoding, is delivered first and dropped, so its
+  // names never reach the board.
+  void catalogDecodedAfterResetNeverNamesTheBoard() {
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogBody()));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    holdCatalogDecodes();
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return m_decodesEntered.load() == 1; }));
+    c.reset();
+
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogBodyB()));
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return catalogRequests() == 2; }));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
+
+    QList<QStringList> seen;
+    QSignalSpy changed(c.boardCards(), &QAbstractItemModel::dataChanged);
+    connect(c.boardCards(), &QAbstractItemModel::dataChanged, &c,
+            [&seen, &c] { seen.append(labelsOf(c.boardCards())); });
+    releaseCatalogDecodes(2);
+    QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabelsB);
+    QVERIFY(drainCatalogDecodes());
+    QCOMPARE(m_decodesEntered.load(), 2);
+    QCOMPARE(labelsOf(c.boardCards()), kNameLabelsB);
+    // Only B renamed cards: one dataChanged per card, never to A's names.
+    QCOMPARE(changed.count(), 3);
+    for (const QStringList &labels : std::as_const(seen)) {
+      for (const QString &name : kNameLabels.first(3))
+        QVERIFY2(!labels.contains(name), qPrintable(labels.join(u", ")));
+    }
+  }
+
+  // The catalog is per session, not per game: leaving and reopening a game
+  // while the catalog decodes still names the board.
+  void catalogDecodedAcrossGameSwitchStillNamesTheBoard() {
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogBody()));
+    m_server->setResponse(gamePath(),
+                          jsonResponse(200, fixture(u"get-game.json"_s)));
+    holdCatalogDecodes();
+    GameBoardController c(*m_client, tokenSource());
+    QVERIFY(loadList(c));
+    QVERIFY(waitUntil([this] { return m_decodesEntered.load() == 1; }));
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    c.closeGame();
+    c.openGame(0);
+    QVERIFY(waitUntil([&c] { return c.boardStatus() == Status::Loaded; }));
+    QCOMPARE(labelsOf(c.boardCards()), kCodeLabels);
+
+    releaseCatalogDecodes(1);
+    QTRY_COMPARE(labelsOf(c.boardCards()), kNameLabels);
+    QCOMPARE(m_decodesEntered.load(), 1);
   }
 
   void tokenArrivingAfterResetSendsNothing() {

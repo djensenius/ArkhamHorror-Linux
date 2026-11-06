@@ -173,6 +173,9 @@ void GameBoardController::fetchCatalog(
       token.profile, token.token,
       [self, generation](const GameRequestStatus &status,
                          const CatalogNames *catalog) {
+        // Runs on the GUI thread once GameClient has decoded the reply off
+        // it. A catalog from before reset() (the session's end) is dropped;
+        // game switches leave m_catalogGeneration alone, so they keep it.
         if (!self || generation != self->m_catalogGeneration)
           return;
         if (status.outcome != GameRequestOutcome::Success || !catalog) {

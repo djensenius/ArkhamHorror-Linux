@@ -11,9 +11,12 @@
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QSemaphore>
+#include <QThread>
 #include <QTimer>
 #include <QtTest>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -85,6 +88,33 @@ QByteArray catalogCards() {
   if (cards.isEmpty())
     qFatal("catalog.json has no cards");
   return QJsonDocument(cards).toJson(QJsonDocument::Compact);
+}
+
+// Holds GameClient's catalog decodes on its worker thread: each decode
+// counts itself in |entered| and then waits for one permit.
+struct DecodeGate {
+  QSemaphore permits;
+  std::atomic<int> entered{0};
+  std::function<void()> observer() {
+    return [this] {
+      ++entered;
+      permits.acquire();
+    };
+  }
+};
+
+// Declared after the client, so it is destroyed first: frees any held
+// decode even when a check fails, as GameClient's destructor waits for a
+// running decode.
+struct ReleaseGateOnExit {
+  DecodeGate &gate;
+  ~ReleaseGateOnExit() { gate.permits.release(1000); }
+};
+
+// A one-entry GET /arkham/cards body naming |code| |title|.
+QByteArray oneCardCatalog(const char *code, const char *title) {
+  return QByteArray(R"([{"cardCode": ")") + code + R"(", "name": {"title": ")" +
+         title + R"(", "subtitle": null}}])";
 }
 
 struct ListCall {
@@ -444,6 +474,133 @@ private slots:
     QCOMPARE(call.cards->cards.at(0).name.title, u"Agenda"_s);
     QCOMPARE(call.cards->cards.at(1).cardCode.value(), u"c01108"_s);
     QCOMPARE(call.cards->cards.at(1).name.title, u"Trapped"_s);
+  }
+
+  // TASK-3.3.9: the body is decoded on a worker thread, and the callback
+  // runs once, later, on the client's (GUI) thread.
+  void catalogDecodeRunsOffTheGuiThread() {
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogCards()));
+    // Declared before the client, so they outlive its worker even if this
+    // test returns early.
+    std::atomic<QThread *> decodeThread{nullptr};
+    std::atomic<int> decodes{0};
+    CardsCall result;
+    QThread *callbackThread = nullptr;
+    GameClient client(*m_nam);
+    client.setCatalogDecodeObserverForTesting([&decodeThread, &decodes] {
+      decodeThread = QThread::currentThread();
+      ++decodes;
+    });
+    client.listCampaignCards(
+        *m_profile, kToken,
+        [&result, &callbackThread](const GameRequestStatus &status,
+                                   const CatalogNames *cards) {
+          ++result.calls;
+          callbackThread = QThread::currentThread();
+          result.status = status;
+          if (cards)
+            result.cards = *cards;
+        });
+    QCOMPARE(result.calls, 0);
+    QVERIFY(waitUntil([&result] { return result.calls > 0; }));
+    QTest::qWait(50);
+    QCOMPARE(result.calls, 1);
+    QCOMPARE(decodes.load(), 1);
+    QVERIFY(decodeThread.load() != nullptr);
+    QVERIFY(decodeThread.load() != QThread::currentThread());
+    QCOMPARE(callbackThread, QThread::currentThread());
+    QCOMPARE(result.status.outcome, GameRequestOutcome::Success);
+    QVERIFY(result.cards.has_value());
+    QCOMPARE(result.cards->cards.size(), 1);
+    QCOMPARE(result.cards->cards.first().cardCode.value(), u"c01020"_s);
+    QCOMPARE(result.cards->cards.first().name.title, u"Machete"_s);
+  }
+
+  // Decodes run one at a time in reply order, so a reply that finishes
+  // while an earlier one is still decoding is delivered after it. A's
+  // decode is held until B's reply has finished.
+  void catalogDeliveriesKeepReplyOrder() {
+    DecodeGate gate;
+    GameClient client(*m_nam);
+    ReleaseGateOnExit releaseGate{gate};
+    client.setCatalogDecodeObserverForTesting(gate.observer());
+    QStringList titles;
+    int calls = 0;
+    const auto record = [&titles, &calls](const GameRequestStatus &status,
+                                          const CatalogNames *cards) {
+      ++calls;
+      titles.append(status.outcome == GameRequestOutcome::Success && cards &&
+                            cards->cards.size() == 1
+                        ? cards->cards.first().name.title
+                        : u"<failed>"_s);
+    };
+
+    m_server->setResponse(
+        cardsTarget(), jsonResponse(200, oneCardCatalog("c01105", "Agenda")));
+    client.listCampaignCards(*m_profile, kToken, record);
+    QVERIFY(waitUntil([&gate] { return gate.entered.load() == 1; }));
+
+    int finished = 0;
+    QObject finishedWatch;
+    connect(m_nam, &QNetworkAccessManager::finished, &finishedWatch,
+            [&finished](QNetworkReply *) { ++finished; });
+    m_server->setResponse(
+        cardsTarget(), jsonResponse(200, oneCardCatalog("c01108", "Trapped")));
+    client.listCampaignCards(*m_profile, kToken, record);
+    QVERIFY(waitUntil([&finished] { return finished == 1; }));
+    QTest::qWait(50);
+    // B waits behind A rather than decoding beside it.
+    QCOMPARE(gate.entered.load(), 1);
+    QCOMPARE(calls, 0);
+
+    gate.permits.release(2);
+    QVERIFY(waitUntil([&calls] { return calls == 2; }));
+    QTest::qWait(50);
+    QCOMPARE(calls, 2);
+    QCOMPARE(titles, QStringList({u"Agenda"_s, u"Trapped"_s}));
+    QCOMPARE(gate.entered.load(), 2);
+  }
+
+  // Destroying the client while one decode runs and another waits for the
+  // pool runs neither callback. The client lives in storage poisoned right
+  // after its destructor, so a worker that touched it later would crash.
+  void destroyingClientDuringCatalogDecodeSuppressesCallbacks() {
+    DecodeGate gate;
+    alignas(GameClient) unsigned char storage[sizeof(GameClient)];
+    auto *client = new (storage) GameClient(*m_nam);
+    struct DestroyIfAlive {
+      GameClient *&client;
+      DecodeGate &gate;
+      ~DestroyIfAlive() {
+        gate.permits.release(1000);
+        if (client)
+          client->~GameClient();
+      }
+    } guard{client, gate};
+    client->setCatalogDecodeObserverForTesting(gate.observer());
+    int calls = 0;
+    const auto count = [&calls](const GameRequestStatus &,
+                                const CatalogNames *) { ++calls; };
+    int finished = 0;
+    QObject finishedWatch;
+    connect(m_nam, &QNetworkAccessManager::finished, &finishedWatch,
+            [&finished](QNetworkReply *) { ++finished; });
+
+    m_server->setResponse(cardsTarget(), jsonResponse(200, catalogCards()));
+    client->listCampaignCards(*m_profile, kToken, count);
+    QVERIFY(waitUntil([&gate] { return gate.entered.load() == 1; }));
+    client->listCampaignCards(*m_profile, kToken, count);
+    QVERIFY(waitUntil([&finished] { return finished == 2; }));
+
+    // Let the running decode finish (and post its delivery) while the
+    // client is being destroyed; the destructor waits for it.
+    gate.permits.release(1000);
+    client->~GameClient();
+    client = nullptr;
+    std::memset(storage, 0xA5, sizeof(storage));
+    QCoreApplication::processEvents();
+    QTest::qWait(100);
+    QCOMPARE(calls, 0);
   }
 
   void listCampaignCardsFailures() {

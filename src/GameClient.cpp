@@ -74,6 +74,12 @@ GameClient::GameClient(QNetworkAccessManager &nam,
   if (timeout < std::chrono::milliseconds::zero()) {
     throw std::invalid_argument("game client timeout cannot be negative");
   }
+  m_decodePool.setMaxThreadCount(1);
+}
+
+void GameClient::setCatalogDecodeObserverForTesting(
+    std::function<void()> observer) {
+  m_catalogDecodeObserver = std::move(observer);
 }
 
 void GameClient::setMaxResponseBytes(qsizetype maxResponseBytes) {
@@ -84,6 +90,11 @@ void GameClient::setMaxResponseBytes(qsizetype maxResponseBytes) {
 }
 
 GameClient::~GameClient() {
+  // First, so no decode task can post to this client once it is gone: drop
+  // the queued ones and wait for a running one. A delivery it already
+  // posted is discarded with this QObject, so its callback never runs.
+  m_decodePool.clear();
+  m_decodePool.waitForDone();
   for (auto it = m_pendingReplies.begin(); it != m_pendingReplies.end(); ++it) {
     if (QTimer *timer = it.value().timer) {
       timer->stop();
@@ -154,21 +165,38 @@ void GameClient::listCampaignCards(const ServerProfile &profile,
   query.addQueryItem(QStringLiteral("cardPool"), QStringLiteral("campaign"));
   issue(profile, QStringLiteral("arkham/cards"), query, token,
         QStringLiteral("card catalog not found"),
-        [callback = std::move(callback)](const GameRequestStatus &status,
-                                         const QByteArray &body) {
+        [this, callback = std::move(callback),
+         observer = m_catalogDecodeObserver](const GameRequestStatus &status,
+                                             const QByteArray &body) mutable {
           if (status.outcome != GameRequestOutcome::Success) {
             callback(status, nullptr);
             return;
           }
-          const auto names = decodeCatalogNamesFromRawBytes(body, u"cards");
-          if (!names) {
-            callback(GameRequestStatus{GameRequestOutcome::DecodeFailed,
-                                       names.error(), status.httpStatus,
-                                       std::nullopt},
-                     nullptr);
-            return;
-          }
-          callback(status, &*names);
+          // Decoded on the pool from an owned (implicitly shared) copy of
+          // the body; only the decoded value comes back, and the callback
+          // runs on this client's thread. The worker never calls
+          // |callback|, it only moves it into the delivery.
+          m_decodePool.start([this, callback = std::move(callback),
+                              observer = std::move(observer), status,
+                              body = QByteArray(body)]() mutable {
+            if (observer)
+              observer();
+            auto names = decodeCatalogNamesFromRawBytes(body, u"cards");
+            QMetaObject::invokeMethod(
+                this,
+                [callback = std::move(callback), status,
+                 names = std::move(names)]() {
+                  if (!names) {
+                    callback(GameRequestStatus{GameRequestOutcome::DecodeFailed,
+                                               names.error(), status.httpStatus,
+                                               std::nullopt},
+                             nullptr);
+                    return;
+                  }
+                  callback(status, &*names);
+                },
+                Qt::QueuedConnection);
+          });
         });
 }
 
