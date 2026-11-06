@@ -480,15 +480,17 @@ private slots:
   // runs once, later, on the client's (GUI) thread.
   void catalogDecodeRunsOffTheGuiThread() {
     m_server->setResponse(cardsTarget(), jsonResponse(200, catalogCards()));
-    GameClient client(*m_nam);
+    // Declared before the client, so they outlive its worker even if this
+    // test returns early.
     std::atomic<QThread *> decodeThread{nullptr};
     std::atomic<int> decodes{0};
+    CardsCall result;
+    QThread *callbackThread = nullptr;
+    GameClient client(*m_nam);
     client.setCatalogDecodeObserverForTesting([&decodeThread, &decodes] {
       decodeThread = QThread::currentThread();
       ++decodes;
     });
-    CardsCall result;
-    QThread *callbackThread = nullptr;
     client.listCampaignCards(
         *m_profile, kToken,
         [&result, &callbackThread](const GameRequestStatus &status,

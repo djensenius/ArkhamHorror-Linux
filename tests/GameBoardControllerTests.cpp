@@ -752,8 +752,10 @@ private slots:
     m_server->setResponse(gamePath(),
                           jsonResponse(200, fixture(u"get-game.json"_s)));
     GameBoardController c(*m_client, tokenSource());
-    std::atomic<int> decodes{0};
-    m_client->setCatalogDecodeObserverForTesting([&decodes] { ++decodes; });
+    // The counter is a member (reset by init()), so it outlives m_client's
+    // worker even if this test returns early.
+    std::atomic<int> *entered = &m_decodesEntered;
+    m_client->setCatalogDecodeObserverForTesting([entered] { ++*entered; });
     QVERIFY(loadList(c));
     QVERIFY(waitUntil([this] { return m_server->heldCount() == 1; }));
     c.reset();
@@ -761,9 +763,9 @@ private slots:
     // so wait for that delivery (not just the reply) before the next
     // session starts: the drop path is then exercised rather than raced.
     m_server->releaseHeld();
-    QVERIFY(waitUntil([&decodes] { return decodes.load() == 1; }));
+    QVERIFY(waitUntil([this] { return m_decodesEntered.load() == 1; }));
     QVERIFY(drainCatalogDecodes());
-    QCOMPARE(decodes.load(), 1);
+    QCOMPARE(m_decodesEntered.load(), 1);
 
     m_server->setResponse(cardsTarget(), held(jsonResponse(500, "{}"_ba)));
     QVERIFY(loadList(c));
