@@ -333,7 +333,8 @@ only `cardCode`, `name` and `revealedName` are read. An entry that is not an
 object, or has no readable code or name, is skipped, and a malformed
 `revealedName` is dropped; both counts are reported in one warning per
 catalog response. Everything else the client models stays strict, including
-the full catalog decoder.
+the full catalog decoder. The board's catalog is decoded off the GUI thread
+and its names are applied on it.
 
 `Json::requireExactKeys` in `src/domain/JsonDecode.h` is reserved for the
 exact tagged-union branches and the campaign-option request case above.
