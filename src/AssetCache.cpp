@@ -358,11 +358,14 @@ void AssetCache::promoteToMemory(const QString &key, const QImage &image) {
 }
 
 void AssetCache::removeMemoryEntriesForUrl(const QUrl &url) {
-  const QString prefix =
-      QString::fromLatin1(canonicalUrlBytes(url)) + QLatin1Char('@');
+  // A key is the canonical URL, '@', and a suffix without '@' (see
+  // memoryKeyFor). Split at the last '@' so a URL whose path continues with
+  // '@' never matches another URL's keys.
+  const QString urlKey = QString::fromLatin1(canonicalUrlBytes(url));
   const QList<QString> keys = m_memoryCache.keys();
   for (const QString &key : keys) {
-    if (key.startsWith(prefix)) {
+    if (key.lastIndexOf(QLatin1Char('@')) == urlKey.size() &&
+        key.startsWith(urlKey)) {
       m_memoryCache.remove(key);
     }
   }

@@ -110,6 +110,7 @@ private slots:
   void restoringSameBytesKeepsOtherSizedEntries();
   void restoringChangedBytesDropsEverySizedEntry();
   void sizedBoardDecodesCostAtMostATenthOfFullResolution();
+  void evictionMatchesOnlyOneUrlWhenPathContinuesWithAt();
 };
 
 void AssetCacheTests::memoryHitReturnsDecodedImage() {
@@ -716,6 +717,36 @@ void AssetCacheTests::sizedBoardDecodesCostAtMostATenthOfFullResolution() {
   QCOMPARE(fullBytes, qint64{kCards} * 600 * 840 * 4);  // 40,320,000
   QCOMPARE(sizedBytes, qint64{kCards} * 150 * 210 * 4); // 2,520,000
   QVERIFY(sizedBytes * 10 <= fullBytes);
+}
+
+void AssetCacheTests::evictionMatchesOnlyOneUrlWhenPathContinuesWithAt() {
+  const QColor red(220, 20, 20, 255);
+  const QColor blue(20, 20, 220, 255);
+  const QByteArray redPng = encodePng(red, QSize(60, 84));
+  const QByteArray bluePng = encodePng(blue, QSize(60, 84));
+  QVERIFY(!redPng.isEmpty());
+  QVERIFY(!bluePng.isEmpty());
+  const QUrl plain(QStringLiteral("https://assets.example.test/img/a"));
+  const QUrl at(QStringLiteral("https://assets.example.test/img/a@x"));
+  QVERIFY(at.toEncoded().endsWith("/img/a@x"));
+  const QSize cell(15, 21);
+
+  Arkham::AssetCache cache({.diskMaxBytes = 0});
+  expectStored(cache.store(at, bluePng, QStringLiteral("image/png"), cell));
+  // A first store for plain evicts plain's sizes, never a@x's.
+  expectStored(cache.store(plain, redPng, QStringLiteral("image/png"), cell));
+  const auto atHit = cache.lookup(at, cell);
+  QCOMPARE(atHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(atHit.image, blue));
+
+  // Changed bytes for a@x evict only a@x's sizes.
+  expectStored(cache.store(at, redPng, QStringLiteral("image/png")));
+  QCOMPARE(cache.lookup(at, cell).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  const auto plainHit = cache.lookup(plain, cell);
+  QCOMPARE(plainHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(plainHit.image, red));
+  QCOMPARE(cache.memoryCostBytes(), 15 * 21 * 4 + 60 * 84 * 4);
 }
 
 QTEST_APPLESS_MAIN(AssetCacheTests)
