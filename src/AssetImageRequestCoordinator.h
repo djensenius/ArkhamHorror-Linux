@@ -8,6 +8,7 @@
 #include <QImage>
 #include <QList>
 #include <QObject>
+#include <QSize>
 #include <QUrl>
 
 #include <chrono>
@@ -21,9 +22,11 @@ namespace Arkham {
 // Thread-affine coordinator for card image requests. Callers may keep this on
 // a dedicated worker thread so AssetCache disk/decode work and QNetworkAccess-
 // Manager activity never run in the QML/GUI thread. Identical in-flight URLs
-// are coalesced; cancelled waiters are detached so late fetches cannot complete
-// dropped QML image responses; 404s are remembered briefly to avoid refetching
-// known-missing art while still allowing newly-published assets to appear.
+// are coalesced across requested sizes: one network fetch serves every waiter,
+// and the bytes are decoded once per distinct requested bound; cancelled
+// waiters are detached so late fetches cannot complete dropped QML image
+// responses; 404s are remembered briefly to avoid refetching known-missing art
+// while still allowing newly-published assets to appear.
 class AssetImageRequestCoordinator final : public QObject {
 public:
   using ImageCallback = std::function<void(AssetOutcome<QImage>)>;
@@ -43,6 +46,11 @@ public:
                                         QObject *parent = nullptr);
   ~AssetImageRequestCoordinator() override;
 
+  // Requests the card image decoded to fit requestedSize (never upscaled).
+  // An invalid or empty requestedSize requests the full-size decode.
+  [[nodiscard]] quint64 requestCardImage(const AssetLocator::CardImageKey &key,
+                                         const QSize &requestedSize,
+                                         ImageCallback callback);
   [[nodiscard]] quint64 requestCardImage(const AssetLocator::CardImageKey &key,
                                          ImageCallback callback);
   void setAssetBaseUrl(QUrl assetBaseUrl);
@@ -50,8 +58,14 @@ public:
   void cancelAll();
 
 private:
+  // Test-only read access to the coordinator's cache, used by the regression
+  // test that proves a failed first decode leaves no memory entry behind.
+  // Production code never reaches the cache through this grant.
+  friend class AssetImageRequestCoordinatorTestSupport;
+
   struct Waiter {
     quint64 requestId{0};
+    QSize bound;
     ImageCallback callback;
   };
 
@@ -64,7 +78,8 @@ private:
   [[nodiscard]] static QString normalizedRequestKey(const QUrl &url);
   [[nodiscard]] quint64 nextRequestId();
   void ensureInitialized();
-  void requestUrl(const QUrl &url, quint64 requestId, ImageCallback callback);
+  void requestUrl(const QUrl &url, const QSize &bound, quint64 requestId,
+                  ImageCallback callback);
   void completeOne(ImageCallback callback, AssetOutcome<QImage> result);
   void completeWaiters(QList<Waiter> waiters, AssetOutcome<QImage> result);
   void handleFetchFinished(const QString &requestKey,

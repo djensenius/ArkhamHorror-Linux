@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QImage>
+#include <QSize>
 #include <QString>
 #include <QUrl>
 #include <QtAssert>
@@ -126,8 +127,33 @@ struct AssetDecodeLimits {
 [[nodiscard]] AssetDecodeOutcome<AssetImageFormat>
 detectAssetImageFormat(const QByteArray &encodedBytes);
 
+// Normalizes a requested decode bound. An invalid or empty size (including a
+// request that names only one dimension) means "decode at full size" and is
+// returned as QSize().
+[[nodiscard]] QSize normalizedAssetDecodeBound(const QSize &bound);
+
+// The size decodeAssetImage() produces for a source of sourceSize under bound:
+// the largest size that fits inside the bound while keeping the aspect ratio,
+// never larger than the source (the decoder never upscales). A full-size
+// bound (see normalizedAssetDecodeBound) returns sourceSize unchanged.
+[[nodiscard]] QSize fittedAssetDecodeSize(const QSize &sourceSize,
+                                          const QSize &bound);
+
+// Decodes encodedBytes after enforcing limits against the declared full image
+// dimensions. When bound is a non-empty size, the result fits inside bound,
+// keeps the aspect ratio, and is never upscaled. PNG and AVIF are downscaled
+// to exactly fittedAssetDecodeSize(fullSize, bound). JPEG first uses libjpeg's
+// DCT scaling (1/2, 1/4, or 1/8) to the smallest output that still covers that
+// target, then fits that output to bound. libjpeg rounds scaled sides up
+// before that final fit, so JPEG output can differ from
+// fittedAssetDecodeSize(fullSize, bound) by up to a few pixels in one
+// dimension (at most 3 at the board's 150x210 bound; 301x419 gives 150x208,
+// not 150x210), but it never exceeds bound or upscales. When the target is
+// more than half the source in either dimension, no DCT reduction covers it
+// and JPEG still decodes at full resolution before the final downscale.
 [[nodiscard]] AssetDecodeOutcome<QImage>
 decodeAssetImage(const QByteArray &encodedBytes,
-                 const AssetDecodeLimits &limits = AssetDecodeLimits{});
+                 const AssetDecodeLimits &limits = AssetDecodeLimits{},
+                 const QSize &bound = QSize());
 
 } // namespace Arkham

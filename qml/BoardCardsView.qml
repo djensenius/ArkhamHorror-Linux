@@ -44,10 +44,9 @@ GridView {
             anchors.fill: parent
             anchors.margins: 5
             source: delegate.imageSource
-            // Scales the provider's output to the cell. The provider still
-            // decodes and caches the full-resolution art first (AssetCache),
-            // so this does not save decode or cache memory; size-aware
-            // decoding is TASK-3.3.5.
+            // The provider decodes and caches the art at the cell's size
+            // (AssetCache keys entries by size), so a full board holds only
+            // cell-sized decodes rather than full-resolution art.
             sourceSize: Qt.size(root.cellWidth - 10, root.cellHeight - 10)
             label: delegate.label
         }

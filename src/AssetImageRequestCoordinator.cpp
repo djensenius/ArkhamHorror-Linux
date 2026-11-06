@@ -3,6 +3,7 @@
 #include <QNetworkAccessManager>
 #include <QTimer>
 
+#include <optional>
 #include <utility>
 
 namespace Arkham {
@@ -23,6 +24,12 @@ AssetImageRequestCoordinator::~AssetImageRequestCoordinator() { cancelAll(); }
 
 quint64 AssetImageRequestCoordinator::requestCardImage(
     const AssetLocator::CardImageKey &key, ImageCallback callback) {
+  return requestCardImage(key, QSize(), std::move(callback));
+}
+
+quint64 AssetImageRequestCoordinator::requestCardImage(
+    const AssetLocator::CardImageKey &key, const QSize &requestedSize,
+    ImageCallback callback) {
   const quint64 requestId = nextRequestId();
   if (!callback) {
     return requestId;
@@ -34,7 +41,8 @@ quint64 AssetImageRequestCoordinator::requestCardImage(
     return requestId;
   }
 
-  requestUrl(*url, requestId, std::move(callback));
+  requestUrl(*url, normalizedAssetDecodeBound(requestedSize), requestId,
+             std::move(callback));
   return requestId;
 }
 
@@ -109,6 +117,7 @@ void AssetImageRequestCoordinator::ensureInitialized() {
 }
 
 void AssetImageRequestCoordinator::requestUrl(const QUrl &url,
+                                              const QSize &bound,
                                               quint64 requestId,
                                               ImageCallback callback) {
   ensureInitialized();
@@ -122,7 +131,7 @@ void AssetImageRequestCoordinator::requestUrl(const QUrl &url,
     return;
   }
 
-  const AssetCache::LookupResult cached = m_cache->lookup(url);
+  const AssetCache::LookupResult cached = m_cache->lookup(url, bound);
   if (cached.hit()) {
     completeOne(std::move(callback), cached.image);
     return;
@@ -131,13 +140,13 @@ void AssetImageRequestCoordinator::requestUrl(const QUrl &url,
   m_requestKeys.insert(requestId, requestKey);
   auto flightIt = m_flights.find(requestKey);
   if (flightIt != m_flights.end()) {
-    flightIt->waiters.push_back(Waiter{requestId, std::move(callback)});
+    flightIt->waiters.push_back(Waiter{requestId, bound, std::move(callback)});
     return;
   }
 
   Flight flight;
   flight.url = url;
-  flight.waiters.push_back(Waiter{requestId, std::move(callback)});
+  flight.waiters.push_back(Waiter{requestId, bound, std::move(callback)});
   m_flights.insert(requestKey, std::move(flight));
 
   auto insertedFlightIt = m_flights.find(requestKey);
@@ -185,15 +194,44 @@ void AssetImageRequestCoordinator::handleFetchFinished(
     return;
   }
 
-  auto stored = m_cache->store(flight.url, result->bytes, result->contentType);
-  if (!stored) {
-    completeWaiters(std::move(flight.waiters),
-                    AssetError{AssetErrorCode::DecodeError,
-                               stored.error().message, 0, flight.url});
+  // Decode once per distinct bound, in waiter order, and finish every decode
+  // before any callback runs. If any decode fails, the loop stops and every
+  // waiter, including waiters of bounds that already decoded, gets that
+  // DecodeError. The first bound goes through store(), which decodes before
+  // writing, so undecodable bytes never reach disk; further bounds only add
+  // memory entries. Decodes that succeeded before a later failure stay
+  // cached, since they are valid images of these bytes.
+  QList<QSize> bounds;
+  QList<QImage> decodes;
+  std::optional<AssetError> decodeError;
+  for (const Waiter &waiter : std::as_const(flight.waiters)) {
+    if (bounds.contains(waiter.bound)) {
+      continue;
+    }
+    auto decoded =
+        bounds.isEmpty()
+            ? m_cache->store(flight.url, result->bytes, result->contentType,
+                             waiter.bound)
+            : m_cache->storeMemoryOnly(flight.url, result->bytes, waiter.bound);
+    if (!decoded) {
+      decodeError = AssetError{AssetErrorCode::DecodeError,
+                               decoded.error().message, 0, flight.url};
+      break;
+    }
+    decodes.push_back(*decoded);
+    bounds.push_back(waiter.bound);
+  }
+
+  if (decodeError) {
+    completeWaiters(std::move(flight.waiters), *decodeError);
     return;
   }
 
-  completeWaiters(std::move(flight.waiters), *stored);
+  for (Waiter &waiter : flight.waiters) {
+    m_requestKeys.remove(waiter.requestId);
+    completeOne(std::move(waiter.callback),
+                decodes.at(bounds.indexOf(waiter.bound)));
+  }
 }
 
 void AssetImageRequestCoordinator::pruneNegativeCache() {
