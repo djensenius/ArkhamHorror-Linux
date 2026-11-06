@@ -132,6 +132,8 @@ private slots:
   void sizedBoardDecodesCostAtMostATenthOfFullResolution();
   void evictionMatchesOnlyOneUrlWhenPathContinuesWithAt();
   void diskLookupDropsEntryOnlyForByteErrors();
+  void failedLargerDecodeKeepsSmallerDecodesCached();
+  void evictionStaysCorrectAfterDigestTableReset();
 };
 
 void AssetCacheTests::memoryHitReturnsDecodedImage() {
@@ -816,6 +818,82 @@ void AssetCacheTests::diskLookupDropsEntryOnlyForByteErrors() {
   QCOMPARE(cache.lookup(url, small).source,
            Arkham::AssetCache::LookupSource::Miss);
   failingDecodeCode = Arkham::AssetDecodeErrorCode::AllocationFailed;
+}
+
+void AssetCacheTests::failedLargerDecodeKeepsSmallerDecodesCached() {
+  QTemporaryDir root;
+  QVERIFY(root.isValid());
+  const QByteArray png = encodePatternPng(QSize(600, 840));
+  QVERIFY(!png.isEmpty());
+  const QUrl url = assetUrl(u"later-bound-fails");
+  const QSize small(150, 210);
+  const QSize large(300, 420);
+  failingDecodeCode = Arkham::AssetDecodeErrorCode::AllocationFailed;
+
+  Arkham::AssetCache cache(
+      {.rootDirectory = root.path(), .decoder = &decodeFailingAboveWidth200});
+  expectStored(cache.store(url, png, QStringLiteral("image/png"), small));
+  const auto failedStore =
+      cache.store(url, png, QStringLiteral("image/png"), large);
+  QVERIFY(!failedStore);
+  QCOMPARE(failedStore.error().code,
+           Arkham::AssetDecodeErrorCode::AllocationFailed);
+  const auto failedMemoryOnly = cache.storeMemoryOnly(url, png, large);
+  QVERIFY(!failedMemoryOnly);
+  QCOMPARE(cache.lookup(url, large).source,
+           Arkham::AssetCache::LookupSource::Miss);
+
+  const auto smallHit = cache.lookup(url, small);
+  QCOMPARE(smallHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QCOMPARE(smallHit.image.size(), small);
+  QCOMPARE(cache.memoryCostBytes(), 150 * 210 * 4);
+  QVERIFY(QFileInfo::exists(cachePath(root, url)));
+}
+
+void AssetCacheTests::evictionStaysCorrectAfterDigestTableReset() {
+  const QColor red(220, 20, 20, 255);
+  const QColor blue(20, 20, 220, 255);
+  const QByteArray redPng = encodePng(red, QSize(60, 84));
+  const QByteArray bluePng = encodePng(blue, QSize(60, 84));
+  const QByteArray tinyPng = encodePng(red, QSize(1, 1));
+  QVERIFY(!redPng.isEmpty());
+  QVERIFY(!bluePng.isEmpty());
+  QVERIFY(!tinyPng.isEmpty());
+  const QUrl url = assetUrl(u"digest-reset");
+  const QSize small(15, 21);
+  const QSize large(30, 42);
+
+  QCOMPARE(Arkham::AssetCache::Config{}.maxPayloadDigests, 4096);
+  Arkham::AssetCache cache({.diskMaxBytes = 0, .maxPayloadDigests = 4});
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), small));
+  // url plus 4 more URLs passes the 4-digest cap, so the table resets and
+  // forgets url's digest.
+  for (int index = 0; index < 4; ++index) {
+    expectStored(cache.store(assetUrl(QStringLiteral("filler-%1").arg(index)),
+                             tinyPng, QStringLiteral("image/png")));
+  }
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Memory);
+
+  // With no digest known, even the same bytes count as changed.
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), large));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  // The digest is known again, so the same bytes keep the other size.
+  expectStored(cache.store(url, redPng, QStringLiteral("image/png"), small));
+  const auto largeHit = cache.lookup(url, large);
+  QCOMPARE(largeHit.source, Arkham::AssetCache::LookupSource::Memory);
+  QVERIFY(firstPixelMatches(largeHit.image, red));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Memory);
+
+  // Changed bytes evict both sizes.
+  expectStored(cache.store(url, bluePng, QStringLiteral("image/png")));
+  QCOMPARE(cache.lookup(url, small).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  QCOMPARE(cache.lookup(url, large).source,
+           Arkham::AssetCache::LookupSource::Miss);
+  QVERIFY(firstPixelMatches(cache.lookup(url).image, blue));
 }
 
 QTEST_APPLESS_MAIN(AssetCacheTests)

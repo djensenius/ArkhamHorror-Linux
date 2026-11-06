@@ -21,7 +21,6 @@ namespace {
 
 constexpr qsizetype kMaxHeaderBytes = 4096;
 constexpr auto kFileMagic = "ARKHAM-ASSET-CACHE 1";
-constexpr qsizetype kMaxMemoryPayloadDigests = 4096;
 
 [[nodiscard]] bool isLowerHexSha256FileName(const QString &fileName) {
   if (fileName.size() != 64) {
@@ -179,7 +178,7 @@ AssetDecodeOutcome<QImage> AssetCache::store(const QUrl &url,
       knownDigest.value() != digest) {
     removeMemoryEntriesForUrl(url);
     if (knownDigest == m_memoryPayloadDigests.cend() &&
-        m_memoryPayloadDigests.size() >= kMaxMemoryPayloadDigests) {
+        m_memoryPayloadDigests.size() >= m_config.maxPayloadDigests) {
       // Forgetting digests is safe: a URL without one is treated as changed.
       m_memoryPayloadDigests.clear();
     }
